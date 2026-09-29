@@ -38636,6 +38636,195 @@ class TestAC22TelemetryLinks:
         assert [f["Status"] for f in findings] == ["Passed", "Failed"]
 
 
+class TestAC22OrgMemberWithoutLink:
+    """AIR-ACR-OBS-06: an organization member that runs AgentCore in a region
+    with no sink and no link keeps that telemetry out of the monitoring account,
+    which is a gap, not a single-account deployment."""
+
+    _ORG = {"Organization": {"Id": "o-a1b2c3d4e5", "MasterAccountId": "999988887777"}}
+
+    @staticmethod
+    def _run(mock_oam, mock_orgs, mock_agentcore, runtimes=(), memories=()):
+        mock_oam.list_sinks.return_value = {"Items": []}
+        mock_oam.list_links.return_value = {"Items": []}
+        mock_agentcore.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": r} for r in runtimes]
+        }
+        mock_agentcore.list_memories.return_value = {
+            "memories": [{"id": m} for m in memories]
+        }
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-22"
+            assert_finding_schema(finding)
+        return findings
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_org_member_with_a_runtime_and_no_link_fails(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        (finding,) = self._run(mock_oam, mock_orgs, mock_agentcore, runtimes=["rt-1"])
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "Medium"
+        assert finding["Finding"] == "AgentCore Telemetry Not Centralized"
+        assert "o-a1b2c3d4e5" in finding["Finding_Details"]
+        assert "1 AgentCore resource(s)" in finding["Finding_Details"]
+        assert "CreateLink" in finding["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_resources_are_counted_across_families(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        (finding,) = self._run(
+            mock_oam,
+            mock_orgs,
+            mock_agentcore,
+            runtimes=["rt-1", "rt-2"],
+            memories=["mem-1"],
+        )
+        assert finding["Status"] == "Failed"
+        assert "3 AgentCore resource(s)" in finding["Finding_Details"]
+        assert "Memory" in finding["Finding_Details"]
+        assert "Runtime" in finding["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_memory_alone_is_enough_to_fail(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        (finding,) = self._run(
+            mock_oam, mock_orgs, mock_agentcore, memories=["mem-1", "mem-2"]
+        )
+        assert finding["Status"] == "Failed"
+        assert "2 AgentCore resource(s)" in finding["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_org_member_with_no_agentcore_resource_is_na(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        (finding,) = self._run(mock_oam, mock_orgs, mock_agentcore)
+        assert finding["Status"] == "N/A"
+        assert "no AgentCore resource" in finding["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_account_outside_any_organization_stays_na(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.side_effect = _make_client_error(
+            "AWSOrganizationsNotInUseException", "not in use"
+        )
+        (finding,) = self._run(mock_oam, mock_orgs, mock_agentcore, runtimes=["rt-1"])
+        assert finding["Status"] == "N/A"
+        assert "returned no link" in finding["Finding_Details"]
+        assert "single-account" in finding["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_denied_organization_read_is_na_naming_the_action(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        (finding,) = self._run(mock_oam, mock_orgs, mock_agentcore, runtimes=["rt-1"])
+        assert finding["Status"] == "N/A"
+        assert "AccessDeniedException" in finding["Finding_Details"]
+        assert "organizations:DescribeOrganization" in finding["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_unreadable_inventory_with_nothing_found_is_na(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        mock_oam.list_sinks.return_value = {"Items": []}
+        mock_oam.list_links.return_value = {"Items": []}
+        mock_agentcore.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        mock_agentcore.list_memories.return_value = {"memories": []}
+        (finding,) = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert finding["Status"] == "N/A"
+        assert "Runtime" in finding["Finding_Details"]
+        assert "AccessDeniedException" in finding["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_link_pass_says_the_sink_account_membership_is_not_read(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        mock_oam.list_sinks.return_value = {"Items": []}
+        mock_oam.list_links.return_value = {
+            "Items": [
+                TestAC22TelemetryLinks._link("src", TestAC22TelemetryLinks._ALL_TYPES)
+            ]
+        }
+        (finding,) = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert finding["Status"] == "Passed"
+        assert (
+            "Whether account 444455556666 belongs to this account's organization "
+            "is not read" in finding["Finding_Details"]
+        )
+
+    @staticmethod
+    def _tools(system, custom):
+        def lister(key):
+            def call(**kwargs):
+                ids = system if kwargs.get("type") == "SYSTEM" else custom
+                return {key: [{"id": i} for i in ids]}
+
+            return call
+
+        return lister("codeInterpreterSummaries"), lister("browserSummaries")
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_aws_managed_tools_alone_are_not_the_accounts_resources(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        interpreters, browsers = self._tools(["aws.codeinterpreter.v1"], [])
+        mock_agentcore.list_code_interpreters.side_effect = interpreters
+        mock_agentcore.list_browsers.side_effect = browsers
+        (finding,) = self._run(mock_oam, mock_orgs, mock_agentcore)
+        assert finding["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_custom_tool_counts_and_the_managed_ones_do_not(
+        self, mock_oam, mock_orgs, mock_agentcore
+    ):
+        mock_orgs.describe_organization.return_value = self._ORG
+        interpreters, browsers = self._tools(
+            ["aws.codeinterpreter.v1"], ["my-interpreter"]
+        )
+        mock_agentcore.list_code_interpreters.side_effect = interpreters
+        mock_agentcore.list_browsers.side_effect = browsers
+        (finding,) = self._run(mock_oam, mock_orgs, mock_agentcore)
+        assert finding["Status"] == "Failed"
+        # one custom interpreter plus one custom browser from the same list
+        assert "2 AgentCore resource(s)" in finding["Finding_Details"]
+
+
 class TestAC46CostAnomalyAlerting:
     """AIR-ACR-RT-04: spend is the one per-session limit AgentCore does not carry,
     so the account must alert on anomalous spend across AWS services."""

@@ -12198,6 +12198,162 @@ AGENTCORE_OAM_TELEMETRY_TYPES = (
     "AWS::CloudWatch::Metric",
 )
 
+# The data-event types an account creates itself. The unsuffixed CodeInterpreter
+# and Browser types are the AWS-managed SYSTEM tools every account lists, and the
+# directory, vault and runtime endpoint types count a resource already counted.
+AGENTCORE_ACCOUNT_OWNED_TYPES = (
+    "AWS::BedrockAgentCore::Runtime",
+    "AWS::BedrockAgentCore::Memory",
+    "AWS::BedrockAgentCore::CodeInterpreterCustom",
+    "AWS::BedrockAgentCore::BrowserCustom",
+    "AWS::BedrockAgentCore::Gateway",
+    "AWS::BedrockAgentCore::WorkloadIdentity",
+    "AWS::BedrockAgentCore::OAuth2CredentialProvider",
+    "AWS::BedrockAgentCore::APIKeyCredentialProvider",
+    "AWS::BedrockAgentCore::PolicyEngine",
+    "AWS::BedrockAgentCore::Policy",
+    "AWS::BedrockAgentCore::Evaluator",
+)
+
+
+def _agentcore_unlinked_member_findings() -> List[Dict[str, Any]]:
+    """Judge a region with no sink and no link.
+
+    Outside an organization this is a single-account deployment. Inside one, the
+    region's AgentCore telemetry never reaches the monitoring account.
+    """
+    single_account = create_finding(
+        check_id="AC-22",
+        finding_name="AgentCore Telemetry Sink Scope",
+        finding_details=(
+            "No observability sink found in this region, so no telemetry is "
+            "aggregated into this account, and ListLinks returned no link, so this "
+            "region's telemetry is not shared with a monitoring account."
+        ),
+        resolution=(
+            "No action required for a single-account deployment. For a "
+            "multi-account one, link this account to a sink in the "
+            "monitoring account."
+        ),
+        reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+        severity=SeverityEnum.INFORMATIONAL,
+        status=StatusEnum.NA,
+    )
+    if organizations_client is None:
+        return [single_account]
+    try:
+        organization_id = (
+            organizations_client.describe_organization()
+            .get("Organization", {})
+            .get("Id", "")
+        )
+    except ClientError as error:
+        if (
+            error.response.get("Error", {}).get("Code")
+            == "AWSOrganizationsNotInUseException"
+        ):
+            return [single_account]
+        organization_error = _assessment_error_label(error)
+    except BotoCoreError as error:
+        organization_error = _assessment_error_label(error)
+    else:
+        if not organization_id:
+            return [single_account]
+        organization_error = ""
+    if organization_error:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    "No observability sink or link found in this region. Whether "
+                    "this account belongs to an organization whose monitoring "
+                    "account should receive its telemetry was not read: "
+                    f"organizations:DescribeOrganization failed with "
+                    f"{organization_error}."
+                ),
+                resolution="Grant organizations:DescribeOrganization and retry.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    owned: Dict[str, int] = {}
+    unread = []
+    for family in AGENTCORE_DATA_EVENT_FAMILIES:
+        try:
+            type_counts, _ = _agentcore_family_inventory(family)
+        except (BotoCoreError, ClientError) as error:
+            unread.append(f"{family['label']} ({_assessment_error_label(error)})")
+            continue
+        count = sum(
+            type_counts.get(resource_type, 0)
+            for resource_type in AGENTCORE_ACCOUNT_OWNED_TYPES
+        )
+        if count:
+            owned[family["label"]] = count
+    total = sum(owned.values())
+    if total:
+        per_family = ", ".join(f"{label} {count}" for label, count in owned.items())
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Not Centralized",
+                finding_details=(
+                    f"This account belongs to organization {organization_id} and "
+                    f"holds {total} AgentCore resource(s) in this region "
+                    f"({per_family}), but the region has no observability sink "
+                    "and ListLinks returned no link, so their logs, traces and "
+                    "metrics never reach a monitoring account."
+                ),
+                resolution=(
+                    "Link this account to the organization's monitoring sink with "
+                    "CreateLink, sharing AWS::Logs::LogGroup, AWS::XRay::Trace and "
+                    "AWS::CloudWatch::Metric."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+    if unread:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    f"This account belongs to organization {organization_id} and "
+                    "this region has no observability sink or link. Whether it "
+                    "holds AgentCore resources whose telemetry should be shared "
+                    f"was not read for {', '.join(unread)}."
+                ),
+                resolution=(
+                    "Grant the AgentCore list permissions for these resource "
+                    "families and retry."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="AC-22",
+            finding_name="AgentCore Telemetry Sink Scope",
+            finding_details=(
+                f"This account belongs to organization {organization_id} and this "
+                "region has no observability sink or link, but it holds no "
+                "AgentCore resource of its own, so there is no AgentCore "
+                "telemetry to share."
+            ),
+            resolution="No action required.",
+            reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    ]
+
 
 def _agentcore_telemetry_link_findings() -> List[Dict[str, Any]]:
     """Judge the links an account with no sink uses to share its telemetry.
@@ -12231,25 +12387,7 @@ def _agentcore_telemetry_link_findings() -> List[Dict[str, Any]]:
             )
         ]
     if not links:
-        return [
-            create_finding(
-                check_id="AC-22",
-                finding_name="AgentCore Telemetry Sink Scope",
-                finding_details=(
-                    f"{no_sink}aggregated into this account, and ListLinks "
-                    "returned no link, so this region's telemetry is not shared "
-                    "with a monitoring account."
-                ),
-                resolution=(
-                    "No action required for a single-account deployment. For a "
-                    "multi-account one, link this account to a sink in the "
-                    "monitoring account."
-                ),
-                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            )
-        ]
+        return _agentcore_unlinked_member_findings()
     findings = []
     for link in links:
         label = link.get("Label") or link.get("Arn") or "unnamed link"
@@ -12284,7 +12422,11 @@ def _agentcore_telemetry_link_findings() -> List[Dict[str, Any]]:
                     f"Link '{label}' shares {', '.join(AGENTCORE_OAM_TELEMETRY_TYPES)} "
                     f"with {sink_arn}. That sink's policy is judged by AC-22 in "
                     "the account that owns it, and the link's log group and "
-                    "metric filters are not read."
+                    "metric filters are not read. Whether account "
+                    f"{_arn_account(sink_arn) or 'unknown'} belongs to this "
+                    "account's organization is not read, because "
+                    "organizations:DescribeAccount answers only in the management "
+                    "account or a delegated administrator."
                 ),
                 resolution="No action required.",
                 reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
