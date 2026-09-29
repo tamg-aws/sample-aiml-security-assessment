@@ -11353,6 +11353,115 @@ class TestAC25GatewayTargetAuthorization:
         assert findings[0]["Status"] == "N/A"
 
 
+def _oauth_target(grant_type, return_url=None):
+    provider = {
+        "providerArn": (
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/"
+            "default/oauth2credentialprovider/github"
+        ),
+        "scopes": ["repo"],
+        "grantType": grant_type,
+    }
+    if return_url is not None:
+        provider["defaultReturnUrl"] = return_url
+    return {
+        "credentialProviderType": "OAUTH",
+        "credentialProvider": {"oauthCredentialProvider": provider},
+    }
+
+
+class TestAC25OAuthReturnUrl:
+    """AC-25: an AUTHORIZATION_CODE target returns the user to an HTTPS endpoint."""
+
+    @staticmethod
+    def _run(mock_ac, configurations_by_target):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.list_gateway_targets.return_value = {
+            "items": [
+                {"targetId": target_id, "name": target_id}
+                for target_id in configurations_by_target
+            ]
+        }
+        mock_ac.get_gateway_target.side_effect = lambda gatewayIdentifier, targetId: {
+            "credentialProviderConfigurations": configurations_by_target[targetId]
+        }
+        findings = agentcore_app.check_agentcore_gateway_target_authorization()
+        return {
+            finding["Finding_Details"].split("'")[1]: finding for finding in findings
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_authorization_code_target_without_a_return_url_fails(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            {
+                "bound": [
+                    _oauth_target(
+                        "AUTHORIZATION_CODE", "https://app.example.com/callback"
+                    )
+                ],
+                "unbound": [_oauth_target("AUTHORIZATION_CODE")],
+            },
+        )
+
+        assert rows["bound"]["Status"] == "Passed"
+        assert "grantType AUTHORIZATION_CODE" in rows["bound"]["Finding_Details"]
+        assert "https://app.example.com/callback" in rows["bound"]["Finding_Details"]
+        assert "consent portal" in rows["bound"]["Finding_Details"]
+        unbound = rows["unbound"]
+        assert unbound["Status"] == "Failed"
+        assert unbound["Severity"] == "High"
+        assert unbound["Finding"] == "AgentCore Gateway Target OAuth Return URL"
+        assert "no defaultReturnUrl" in unbound["Finding_Details"]
+        assert "defaultReturnUrl" in unbound["Resolution"]
+        for finding in rows.values():
+            assert_finding_schema(finding)
+
+    @pytest.mark.parametrize(
+        "return_url, status",
+        [
+            ("http://app.example.com/callback", "Failed"),
+            ("https://localhost:8081/callback", "Failed"),
+            ("http://127.0.0.1:8081/callback", "Failed"),
+            ("https://app.example.com/connect/callback", "Passed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_return_url_must_be_a_public_https_endpoint(
+        self, mock_ac, return_url, status
+    ):
+        rows = self._run(
+            mock_ac, {"t": [_oauth_target("AUTHORIZATION_CODE", return_url)]}
+        )
+
+        assert rows["t"]["Status"] == status
+        if status == "Failed":
+            assert return_url in rows["t"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_client_credentials_target_needs_no_return_url(self, mock_ac):
+        rows = self._run(mock_ac, {"m2m": [_oauth_target("CLIENT_CREDENTIALS")]})
+
+        assert rows["m2m"]["Status"] == "Passed"
+        assert "grantType CLIENT_CREDENTIALS" in rows["m2m"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_oauth_configuration_on_a_target_is_judged(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            {
+                "mixed": [
+                    _oauth_target("CLIENT_CREDENTIALS"),
+                    _oauth_target("AUTHORIZATION_CODE"),
+                ]
+            },
+        )
+
+        assert rows["mixed"]["Status"] == "Failed"
+
+
 class TestAC26LogRetentionAndKeyScope:
     """AC-26: retention on every AgentCore log group, scoped key policy on its CMK."""
 

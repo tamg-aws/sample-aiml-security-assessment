@@ -13655,6 +13655,25 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
     return findings
 
 
+def _oauth_return_url_problem(provider: Dict[str, Any]) -> Optional[str]:
+    """Say why an AUTHORIZATION_CODE provider's return URL cannot bind consent.
+
+    The AgentCore guide has the user's browser return to a publicly reachable
+    HTTPS endpoint that checks the session before calling
+    CompleteResourceTokenAuth. A missing URL, plain http and a loopback host
+    (what `agentcore dev` serves) cannot be that endpoint in production.
+    """
+    return_url = provider.get("defaultReturnUrl")
+    if not return_url:
+        return "sets grantType AUTHORIZATION_CODE with no defaultReturnUrl"
+    parts = urlsplit(str(return_url))
+    if parts.scheme != "https":
+        return f"returns the user to {return_url}, which is not HTTPS"
+    if (parts.hostname or "") in {"localhost", "127.0.0.1", "::1"}:
+        return f"returns the user to {return_url}, a loopback address"
+    return None
+
+
 def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
     """AC-25: Report the outbound credential each gateway target reaches out with.
 
@@ -13754,22 +13773,69 @@ def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
                 )
                 continue
 
-            provider_types = [
-                str(configuration.get("credentialProviderType"))
-                for configuration in detail.get("credentialProviderConfigurations")
-                or []
-                if isinstance(configuration, dict)
-                and configuration.get("credentialProviderType")
-            ]
+            provider_types = []
+            return_url_problems = []
+            for configuration in detail.get("credentialProviderConfigurations") or []:
+                if not isinstance(configuration, dict) or not configuration.get(
+                    "credentialProviderType"
+                ):
+                    continue
+                provider_type = str(configuration["credentialProviderType"])
+                oauth = (configuration.get("credentialProvider") or {}).get(
+                    "oauthCredentialProvider"
+                ) or {}
+                grant_type = oauth.get("grantType")
+                if grant_type:
+                    provider_type += f" (grantType {grant_type}"
+                    if grant_type == "AUTHORIZATION_CODE":
+                        problem = _oauth_return_url_problem(oauth)
+                        if problem:
+                            return_url_problems.append(problem)
+                        else:
+                            provider_type += (
+                                f", returning the user to {oauth['defaultReturnUrl']}"
+                            )
+                    provider_type += ")"
+                provider_types.append(provider_type)
 
-            if provider_types:
+            if return_url_problems:
+                findings.append(
+                    create_finding(
+                        check_id="AC-25",
+                        finding_name="AgentCore Gateway Target OAuth Return URL",
+                        finding_details=(
+                            f"{label} {'; it '.join(return_url_problems)}, so the "
+                            "user who grants consent does not reach an endpoint "
+                            "that checks the session before "
+                            "CompleteResourceTokenAuth, and the grant can bind to "
+                            "another user."
+                        ),
+                        resolution=(
+                            "Set the OAuth credential provider's defaultReturnUrl "
+                            "to the public HTTPS callback that verifies the user "
+                            "session, or to <portalUrl>/connect/callback when a "
+                            "consent portal serves this target."
+                        ),
+                        reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            elif provider_types:
+                portal_note = (
+                    " Whether a return URL is the consent portal's "
+                    "<portalUrl>/connect/callback is not compared, because the "
+                    "pinned botocore model has no consent portal operation."
+                    if any("AUTHORIZATION_CODE" in text for text in provider_types)
+                    else ""
+                )
                 findings.append(
                     create_finding(
                         check_id="AC-25",
                         finding_name="AgentCore Gateway Target Authorization",
                         finding_details=(
                             f"{label} authenticates outbound calls with "
-                            f"{', '.join(provider_types)}."
+                            f"{', '.join(provider_types)}.{portal_note}"
                         ),
                         resolution=(
                             "No action required. Confirm the credential the "
