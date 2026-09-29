@@ -8687,6 +8687,15 @@ def _schedule_cadence(expression: str) -> timedelta:
     return timedelta(days=1)
 
 
+# The describe that returns each monitoring type's {type}BaselineConfig.
+MONITORING_JOB_DEFINITION_DESCRIBES = {
+    "DataQuality": "describe_data_quality_job_definition",
+    "ModelQuality": "describe_model_quality_job_definition",
+    "ModelBias": "describe_model_bias_job_definition",
+    "ModelExplainability": "describe_model_explainability_job_definition",
+}
+
+
 def _schedule_baseline_constraints(
     sagemaker_client: Any, name: str, detail: Dict[str, Any]
 ) -> tuple:
@@ -8694,9 +8703,8 @@ def _schedule_baseline_constraints(
     Where a described monitoring schedule's baseline constraints file is.
 
     Returns ("baselined", uri), ("missing", text) when the job definition
-    names no constraints file, or ("unread", text) when that was not read. Only the DataQuality job definition describe is granted, so a
-    schedule naming a ModelQuality, ModelBias, or ModelExplainability
-    definition is unread.
+    names no constraints file, or ("unread", text) when that was not read.
+    A named job definition is read with the describe of its monitoring type.
     """
     config = detail.get("MonitoringScheduleConfig") or {}
     if "MonitoringJobDefinition" in config:
@@ -8707,22 +8715,22 @@ def _schedule_baseline_constraints(
     elif config.get("MonitoringJobDefinitionName"):
         definition = config["MonitoringJobDefinitionName"]
         kind = config.get("MonitoringType") or detail.get("MonitoringType")
-        if kind != "DataQuality":
+        if kind not in MONITORING_JOB_DEFINITION_DESCRIBES:
             return "unread", (
                 f"schedule '{name}': its {kind or 'untyped'} job definition "
-                f"'{definition}' was not read (only "
-                "sagemaker:DescribeDataQualityJobDefinition is granted)"
+                f"'{definition}' was not read: no describe is known for that type"
             )
+        method = MONITORING_JOB_DEFINITION_DESCRIBES[kind]
         try:
             baseline = (
-                sagemaker_client.describe_data_quality_job_definition(
-                    JobDefinitionName=definition
-                ).get("DataQualityBaselineConfig")
+                getattr(sagemaker_client, method)(JobDefinitionName=definition).get(
+                    f"{kind}BaselineConfig"
+                )
                 or {}
             )
         except Exception as error:
             return "unread", (
-                f"sagemaker:DescribeDataQualityJobDefinition {definition} of "
+                f"sagemaker:Describe{kind}JobDefinition {definition} of "
                 f"schedule '{name}' ({get_assessment_error_label(error)})"
             )
         where = f"its job definition '{definition}'"
@@ -8954,7 +8962,9 @@ def _monitor_report_and_alarm_findings(
                 finding_name=MONITOR_ALARM_FINDING,
                 finding_details=(
                     f"All {len(schedules)} monitoring schedule(s) have an enabled "
-                    "alarm with an action on their Model Monitor metrics."
+                    "alarm with an action on their Model Monitor metrics. Which "
+                    "Model Monitor metric each alarm evaluates, and whether its "
+                    "threshold marks drift for the model, are not judged."
                 ),
                 resolution="No action required",
                 reference=MONITOR_CLOUDWATCH_REFERENCE,
@@ -13252,6 +13262,20 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
         )
         return findings
 
+    enabled_principals = set()
+    trusted_access_error = ""
+    try:
+        paginator = orgs_client.get_paginator(
+            "list_aws_service_access_for_organization"
+        )
+        for page in paginator.paginate():
+            enabled_principals.update(
+                item.get("ServicePrincipal")
+                for item in page.get("EnabledServicePrincipals", [])
+            )
+    except Exception as error:
+        trusted_access_error = get_assessment_error_label(error)
+
     admins_by_service = {}
     unread_services = []
     for service_name, principal in SECURITY_SERVICE_PRINCIPALS:
@@ -13301,12 +13325,41 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
             if admin.get("Id") and admin.get("Id") != master_account_id
         )
         admins_by_service[service_name] = dedicated
-        if dedicated:
+        administered = (
+            f"{service_name} ({principal}) is administered from delegated "
+            f"administrator account {', '.join(dedicated)}, which is not "
+            "the organization management account."
+        )
+        if dedicated and trusted_access_error:
             findings["csv_data"].append(
                 _row(
-                    f"{service_name} ({principal}) is administered from delegated "
-                    f"administrator account {', '.join(dedicated)}, which is not "
-                    "the organization management account.",
+                    f"{administered} Whether trusted access is enabled for "
+                    f"{principal} was not read "
+                    "(organizations:ListAWSServiceAccessForOrganization: "
+                    f"{trusted_access_error}).",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif dedicated and principal not in enabled_principals:
+            findings["csv_data"].append(
+                _row(
+                    f"{administered} Trusted access for {principal} is not "
+                    "enabled: the principal is absent from the organization's "
+                    "enabled service principals "
+                    "(ListAWSServiceAccessForOrganization).",
+                    f"Enable trusted access for {service_name} in AWS "
+                    "Organizations so the delegated administrator can act "
+                    "across member accounts.",
+                    "High",
+                    "Failed",
+                )
+            )
+        elif dedicated:
+            findings["csv_data"].append(
+                _row(
+                    f"{administered} Trusted access for {principal} is enabled.",
                     "No action required",
                     "High",
                     "Passed",
@@ -15767,9 +15820,13 @@ WORKLOAD_SEGMENTATION_REFERENCE = (
     "https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/"
     "security-network.html"
 )
-# A CIDR wider than a /24 (IPv6 /64) is not read as a declared dependency.
-BROAD_IPV4_PREFIX = 23
-BROAD_IPV6_PREFIX = 63
+# AIR-SLF-RT-05 asks for security groups that reference each other in place of
+# broad CIDR allowances and names no width. A CIDR of /16 (IPv6 /48) or wider
+# fails; one wider than a /24 (IPv6 /64) but narrower than that is not judged.
+BROAD_IPV4_PREFIX = 16
+BROAD_IPV6_PREFIX = 48
+UNJUDGED_IPV4_PREFIX = 23
+UNJUDGED_IPV6_PREFIX = 63
 
 
 def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
@@ -15795,24 +15852,103 @@ def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
         return entry.group(1) if entry else None
 
 
-def _broad_rule_targets(permission: Dict[str, Any]) -> List[str]:
-    """CIDRs in one rule wider than BROAD_IPV4_PREFIX or BROAD_IPV6_PREFIX."""
-    broad = []
-    for entry in permission.get("IpRanges") or []:
-        cidr = entry.get("CidrIp") or ""
+def _broad_rule_targets(
+    permission: Dict[str, Any], prefix_lists: Dict[str, Optional[List[str]]]
+) -> Tuple[List[str], List[str]]:
+    """(broad, unjudged) CIDRs in one rule, split at the BROAD_ and UNJUDGED_ bounds.
+
+    A customer-managed prefix list the rule names adds each of its entries,
+    labelled with the list. An AWS-managed list (None) adds none.
+    """
+    cidrs = [
+        (entry.get(field) or "", family, "")
+        for key, field, family in (
+            ("IpRanges", "CidrIp", "IPv4"),
+            ("Ipv6Ranges", "CidrIpv6", "IPv6"),
+        )
+        for entry in permission.get(key) or []
+    ]
+    for entry in permission.get("PrefixListIds") or []:
+        prefix_list_id = entry.get("PrefixListId")
+        cidrs.extend(
+            (cidr, "prefix list", f" in {prefix_list_id}")
+            for cidr in prefix_lists.get(prefix_list_id) or []
+        )
+    broad, unjudged = [], []
+    for cidr, family, where in cidrs:
         try:
-            if ipaddress.ip_network(cidr, strict=False).prefixlen <= BROAD_IPV4_PREFIX:
-                broad.append(cidr)
+            network = ipaddress.ip_network(cidr, strict=False)
         except ValueError:
-            broad.append(cidr or "an unparsed IPv4 range")
-    for entry in permission.get("Ipv6Ranges") or []:
-        cidr = entry.get("CidrIpv6") or ""
+            broad.append((cidr or f"an unparsed {family} range") + where)
+            continue
+        if network.version == 4:
+            broad_prefix, unjudged_prefix = BROAD_IPV4_PREFIX, UNJUDGED_IPV4_PREFIX
+        else:
+            broad_prefix, unjudged_prefix = BROAD_IPV6_PREFIX, UNJUDGED_IPV6_PREFIX
+        if network.prefixlen <= broad_prefix:
+            broad.append(cidr + where)
+        elif network.prefixlen <= unjudged_prefix:
+            unjudged.append(cidr + where)
+    return broad, unjudged
+
+
+def _prefix_list_cidrs(
+    ec2_client: Any, users: Dict[str, List[str]]
+) -> Tuple[Dict[str, Optional[List[str]]], List[str]]:
+    """The entries of each customer-managed prefix list; None for AWS-managed.
+
+    users maps each prefix list to the security groups whose rules name it.
+    An AWS-managed list names one AWS service's published ranges, which are
+    as wide as that service's address space, so its entries are not judged
+    by width. A list whose owner or entries were not read is left out and
+    named in the unread list.
+    """
+    if not users:
+        return {}, []
+
+    def where(prefix_list_id: str) -> str:
+        return f"prefix list {prefix_list_id} in {', '.join(users[prefix_list_id][:3])}"
+
+    owners = {}
+    try:
+        for page in ec2_client.get_paginator("describe_managed_prefix_lists").paginate(
+            PrefixListIds=sorted(users)
+        ):
+            for prefix_list in page.get("PrefixLists", []):
+                owners[prefix_list.get("PrefixListId")] = prefix_list.get("OwnerId")
+    except Exception as error:
+        label = get_assessment_error_label(error)
+        return {}, [
+            f"{where(prefix_list_id)} (ec2:DescribeManagedPrefixLists: {label})"
+            for prefix_list_id in sorted(users)
+        ]
+    prefix_lists, unread = {}, []
+    for prefix_list_id in sorted(users):
+        if prefix_list_id not in owners:
+            unread.append(
+                f"{where(prefix_list_id)} (not returned by "
+                "ec2:DescribeManagedPrefixLists)"
+            )
+            continue
+        if owners[prefix_list_id] == "AWS":
+            prefix_lists[prefix_list_id] = None
+            continue
         try:
-            if ipaddress.ip_network(cidr, strict=False).prefixlen <= BROAD_IPV6_PREFIX:
-                broad.append(cidr)
-        except ValueError:
-            broad.append(cidr or "an unparsed IPv6 range")
-    return broad
+            entries = []
+            for page in ec2_client.get_paginator(
+                "get_managed_prefix_list_entries"
+            ).paginate(PrefixListId=prefix_list_id):
+                entries.extend(page.get("Entries", []))
+        except Exception as error:
+            unread.append(
+                f"{where(prefix_list_id)} (ec2:GetManagedPrefixListEntries: "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        prefix_lists[prefix_list_id] = [
+            str(entry.get("Cidr") or "") for entry in entries
+        ]
+    return prefix_lists, unread
 
 
 def _rule_ports(permission: Dict[str, Any]) -> str:
@@ -15835,16 +15971,23 @@ def _security_group_permissions(group: Dict[str, Any], check_ingress: bool):
 
 
 def _security_group_problems(
-    group: Dict[str, Any], check_ingress: bool, referenced: Dict[str, Any]
+    group: Dict[str, Any],
+    check_ingress: bool,
+    referenced: Dict[str, Any],
+    unjudged: List[str],
+    prefix_lists: Dict[str, Optional[List[str]]],
 ) -> List[str]:
+    """Rule problems of one group; rules to an unjudged CIDR go to unjudged."""
     problems = []
     for direction, preposition, permission in _security_group_permissions(
         group, check_ingress
     ):
         rule = f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)}"
-        broad = _broad_rule_targets(permission)
+        broad, between = _broad_rule_targets(permission, prefix_lists)
         if broad:
             problems.append(f"{rule} {preposition} {', '.join(broad[:3])}")
+        if between:
+            unjudged.append(f"{rule} {preposition} {', '.join(between[:3])}")
         for pair in permission.get("UserIdGroupPairs") or []:
             target = referenced.get(pair.get("GroupId")) or {}
             if target.get("GroupName") == "default":
@@ -16061,19 +16204,21 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
         groups = None
 
     referenced = {}
+    prefix_lists = {}
     if groups:
         pending = {}
+        prefix_list_users = {}
         for group_id in group_ids:
             group = groups.get(group_id)
             if group is None:
                 continue
             for _, _, permission in _security_group_permissions(group, True):
                 for entry in permission.get("PrefixListIds") or []:
-                    unread.append(
-                        f"prefix list {entry.get('PrefixListId')} in {group_id} (its "
-                        "entries are not read: ec2:GetManagedPrefixListEntries is "
-                        "not granted)"
+                    named_by = prefix_list_users.setdefault(
+                        entry.get("PrefixListId") or "(no id)", []
                     )
+                    if group_id not in named_by:
+                        named_by.append(group_id)
                 for pair in permission.get("UserIdGroupPairs") or []:
                     target = pair.get("GroupId")
                     if not target or target == group_id:
@@ -16106,12 +16251,15 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 for target in targets
                 if target not in referenced
             )
+        prefix_lists, prefix_unread = _prefix_list_cidrs(ec2_client, prefix_list_users)
+        unread.extend(prefix_unread)
 
     users = {}
     for workload in workloads:
         for group in workload["groups"]:
             users.setdefault(group, []).append(workload["label"])
     problems = []
+    unjudged = []
     outside_vpc = []
     for workload in workloads:
         if not workload["awsvpc"]:
@@ -16136,11 +16284,17 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 if group not in groups:
                     unread.append(f"security group {group}")
                     continue
+                between = []
                 found.extend(
                     _security_group_problems(
-                        groups[group], workload["ingress"], referenced
+                        groups[group],
+                        workload["ingress"],
+                        referenced,
+                        between,
+                        prefix_lists,
                     )
                 )
+                unjudged.extend(f"{workload['label']}: {rule}" for rule in between)
         if found:
             problems.append(f"{workload['label']}: {'; '.join(found[:4])}")
     if outside_vpc:
@@ -16160,12 +16314,15 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                     "when its own security group allows traffic to and from the "
                     "dependency's security group or prefix list, not the VPC "
                     f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
-                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider."
+                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider, named directly or as "
+                    "an entry of a customer-managed prefix list."
                 ),
                 resolution=(
                     "Give every agent service and function its own security group, "
                     "and replace CIDR rules with rules that reference the "
-                    "dependency's security group or a managed prefix list."
+                    "dependency's security group, the AWS-managed prefix list of "
+                    "the AWS service it calls, or a customer-managed prefix list "
+                    "that holds only the dependency's ranges."
                 ),
                 reference=WORKLOAD_SEGMENTATION_REFERENCE,
                 severity="Medium",
@@ -16189,6 +16346,37 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 region=region,
             )
         )
+    if unjudged:
+        shown = "; ".join(unjudged[:10])
+        if len(unjudged) > 10:
+            shown += f"; and {len(unjudged) - 10} more"
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=f"{WORKLOAD_SEGMENTATION_FINDING} CIDR Width Not Judged",
+                finding_details=(
+                    f"{len(unjudged)} rule(s) name a CIDR narrower than "
+                    f"/{BROAD_IPV4_PREFIX} (IPv6 /{BROAD_IPV6_PREFIX}) and wider "
+                    f"than /{UNJUDGED_IPV4_PREFIX + 1} "
+                    f"(IPv6 /{UNJUDGED_IPV6_PREFIX + 1}): {shown}. AIR-SLF-RT-05 "
+                    "asks for security groups that reference each other in place "
+                    "of broad CIDR allowances and names no width, so this check "
+                    f"fails /{BROAD_IPV4_PREFIX} (IPv6 /{BROAD_IPV6_PREFIX}) or "
+                    f"wider, passes /{UNJUDGED_IPV4_PREFIX + 1} "
+                    f"(IPv6 /{UNJUDGED_IPV6_PREFIX + 1}) or narrower, and does not "
+                    "judge the ranges between."
+                ),
+                resolution=(
+                    "Replace each CIDR named with a rule that references the "
+                    "dependency's security group, or confirm the range holds only "
+                    "the workload's declared dependencies."
+                ),
+                reference=WORKLOAD_SEGMENTATION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
     if unread:
         rows.append(
             _unread_resources_finding(
@@ -16200,7 +16388,7 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 region,
             )
         )
-    elif not problems:
+    elif not problems and not unjudged:
         rows.append(
             create_finding(
                 check_id="SM-39",
@@ -16208,9 +16396,12 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 finding_details=(
                     f"All {len(workloads)} ECS service(s) and Lambda function(s) run "
                     "in their own security groups with no rule to or from the VPC "
-                    f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
-                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider, and none that names a "
-                    "prefix list. Standalone EC2 instances are not read."
+                    "default security group or a CIDR wider than "
+                    f"/{UNJUDGED_IPV4_PREFIX + 1} (IPv6 /{UNJUDGED_IPV6_PREFIX + 1}), "
+                    "named directly or as an entry of a customer-managed prefix "
+                    "list. A rule to an AWS-managed prefix list names one AWS "
+                    "service's published ranges and is not judged by width. "
+                    "Standalone EC2 instances are not read."
                     if workloads
                     else "No ECS services or Lambda functions found in this region."
                 ),

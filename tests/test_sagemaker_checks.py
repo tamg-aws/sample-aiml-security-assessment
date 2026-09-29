@@ -4422,13 +4422,24 @@ class TestSM23MonitorReportAndAlarm:
 
         mock_sm.describe_monitoring_schedule.side_effect = describe
 
-        def describe_definition(JobDefinitionName):
-            value = job_definitions[JobDefinitionName]
-            if isinstance(value, str):
-                raise _make_client_error(value, "DescribeDataQualityJobDefinition")
-            return value
+        def describer(operation):
+            def describe_definition(JobDefinitionName):
+                value = job_definitions[JobDefinitionName]
+                if isinstance(value, str):
+                    raise _make_client_error(value, operation)
+                return value
 
-        mock_sm.describe_data_quality_job_definition.side_effect = describe_definition
+            return describe_definition
+
+        for kind, method in (
+            ("DataQuality", "describe_data_quality_job_definition"),
+            ("ModelQuality", "describe_model_quality_job_definition"),
+            ("ModelBias", "describe_model_bias_job_definition"),
+            ("ModelExplainability", "describe_model_explainability_job_definition"),
+        ):
+            getattr(mock_sm, method).side_effect = describer(
+                f"Describe{kind}JobDefinition"
+            )
         return mock_sm
 
     @staticmethod
@@ -4576,6 +4587,21 @@ class TestSM23MonitorReportAndAlarm:
             ],
         )
         assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_the_alarm_pass_names_the_unjudged_metric_and_threshold(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=[self._alarm("dq"), self._alarm("mq")],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Which Model Monitor metric each alarm evaluates, and whether its "
+            "threshold marks drift for the model, are not judged."
+        ) in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_one_unalarmed_schedule_among_alarmed_fails(self, mock_client):
@@ -4748,21 +4774,116 @@ class TestSM23MonitorReportAndAlarm:
         assert "dq-def" in rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
+        "kind,method",
+        [
+            ("ModelQuality", "describe_model_quality_job_definition"),
+            ("ModelBias", "describe_model_bias_job_definition"),
+            ("ModelExplainability", "describe_model_explainability_job_definition"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_other_named_definitions_are_read_with_their_own_describe(
+        self, mock_client, kind, method
+    ):
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[self._schedule("dq", "DataQuality"), self._schedule("mq", kind)],
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._named("other-def", kind),
+            },
+            job_definitions={
+                "other-def": {
+                    f"{kind}BaselineConfig": {"ConstraintsResource": self.CONSTRAINTS}
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        getattr(mock_client.return_value, method).assert_called_once_with(
+            JobDefinitionName="other-def"
+        )
+
+    @pytest.mark.parametrize(
+        "kind", ["ModelQuality", "ModelBias", "ModelExplainability"]
+    )
+    @pytest.mark.parametrize(
+        "baseline_key",
+        ["", "DataQualityBaselineConfig"],
+        ids=["no-baseline", "another-type's-key"],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_other_named_definition_without_constraints_fails_only_itself(
+        self, mock_client, kind, baseline_key
+    ):
+        definition = (
+            {baseline_key: {"ConstraintsResource": self.CONSTRAINTS}}
+            if baseline_key
+            else {}
+        )
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[
+                self._schedule("dq", "DataQuality"),
+                self._schedule("mq", kind),
+                self._schedule("ok", kind),
+            ],
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._named("bare-def", kind),
+                "ok": self._named("good-def", kind),
+            },
+            job_definitions={
+                "bare-def": definition,
+                "good-def": {
+                    f"{kind}BaselineConfig": {"ConstraintsResource": self.CONSTRAINTS}
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "bare-def" in rows[0]["Finding_Details"]
+        assert "good-def" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
         "kind", ["ModelQuality", "ModelBias", "ModelExplainability"]
     )
     @patch("sagemaker_app.boto3.client")
-    def test_other_named_definitions_are_not_read(self, mock_client, kind):
+    def test_unread_other_definition_is_named_and_withholds_the_pass(
+        self, mock_client, kind
+    ):
         rows = self._baseline_rows(
             mock_client,
+            schedules=[self._schedule("dq", "DataQuality"), self._schedule("mq", kind)],
             details={
-                "dq": self._inline(None),
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
                 "mq": self._named("other-def", kind),
             },
+            job_definitions={"other-def": "AccessDeniedException"},
         )
-        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
-        assert "'dq'" in rows[0]["Finding_Details"]
-        assert "other-def" in rows[1]["Finding_Details"]
-        assert kind in rows[1]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            f"sagemaker:Describe{kind}JobDefinition other-def"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unread_definition_does_not_hide_a_bare_one(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[
+                self._schedule("mq", "ModelQuality"),
+                self._schedule("mb", "ModelBias"),
+            ],
+            details={
+                "mq": self._named("mq-def", "ModelQuality"),
+                "mb": self._named("mb-def", "ModelBias"),
+            },
+            job_definitions={
+                "mq-def": "AccessDeniedException",
+                "mb-def": {"ModelBiasBaselineConfig": {}},
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A"]
 
     @patch("sagemaker_app.boto3.client")
     def test_baselining_job_without_constraints_file_is_not_a_pass(self, mock_client):
@@ -7101,7 +7222,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
     MANAGEMENT = "111122223333"
     SECURITY = "444455556666"
 
-    def _client(self, pages_by_principal):
+    def _client(self, pages_by_principal, trusted_access=None):
         client = MagicMock()
         client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": self.MANAGEMENT}
@@ -7113,8 +7234,26 @@ class TestSM35SecurityServiceDelegatedAdmin:
                 raise value
             return value
 
+        if trusted_access is None:
+            trusted_access = [
+                {
+                    "EnabledServicePrincipals": [
+                        {"ServicePrincipal": principal}
+                        for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+                    ]
+                }
+            ]
+
+        def enabled_pages():
+            if isinstance(trusted_access, Exception):
+                raise trusted_access
+            return trusted_access
+
         client.get_paginator.side_effect = _pager(
-            {"list_delegated_administrators": pages}
+            {
+                "list_delegated_administrators": pages,
+                "list_aws_service_access_for_organization": enabled_pages,
+            }
         )
         return client
 
@@ -7255,6 +7394,138 @@ class TestSM35SecurityServiceDelegatedAdmin:
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
         assert len(rows) == 1
         assert_could_not_assess_finding(rows[0])
+
+
+class TestSM35TrustedAccess:
+    """AIR-FND-ACC-09: a delegated administrator passes only with trusted access."""
+
+    MANAGEMENT = TestSM35SecurityServiceDelegatedAdmin.MANAGEMENT
+    SECURITY = TestSM35SecurityServiceDelegatedAdmin.SECURITY
+
+    def _rows(self, mock_client, trusted_access, admin_overrides=None):
+        pages = {
+            principal: [
+                {"DelegatedAdministrators": [{"Id": self.SECURITY, "Status": "ACTIVE"}]}
+            ]
+            for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+        }
+        pages.update(admin_overrides or {})
+        mock_client.return_value = TestSM35SecurityServiceDelegatedAdmin()._client(
+            pages, trusted_access
+        )
+        return _rows(sagemaker_app.check_security_service_delegated_admin())
+
+    @staticmethod
+    def _enabled(*excluded):
+        return [
+            {
+                "EnabledServicePrincipals": [
+                    {"ServicePrincipal": principal}
+                    for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+                    if principal not in excluded
+                ]
+            }
+        ]
+
+    @staticmethod
+    def _service_rows(rows):
+        return {
+            principal: [
+                r for r in rows[:-1] if f"({principal})" in r["Finding_Details"]
+            ]
+            for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_administrator_without_trusted_access_fails(self, mock_client):
+        rows = self._rows(mock_client, self._enabled("guardduty.amazonaws.com"))
+        by_principal = self._service_rows(rows)
+        guardduty = by_principal.pop("guardduty.amazonaws.com")
+        assert [r["Status"] for r in guardduty] == ["Failed"]
+        assert (
+            "Trusted access for guardduty.amazonaws.com is not enabled"
+            in guardduty[0]["Finding_Details"]
+        )
+        assert self.SECURITY in guardduty[0]["Finding_Details"]
+        assert "Enable trusted access" in guardduty[0]["Resolution"]
+        assert all(
+            [r["Status"] for r in v] == ["Passed"] for v in by_principal.values()
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_service_without_trusted_access_fails_on_its_own_row(
+        self, mock_client
+    ):
+        off = ("guardduty.amazonaws.com", "cloudtrail.amazonaws.com")
+        rows = self._rows(mock_client, self._enabled(*off))
+        statuses = {
+            p: [r["Status"] for r in v] for p, v in self._service_rows(rows).items()
+        }
+        assert {p for p, s in statuses.items() if s == ["Failed"]} == set(off)
+        assert all(s == ["Passed"] for p, s in statuses.items() if p not in off)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_principal_enabled_on_the_second_page_passes(self, mock_client):
+        pages = self._enabled("guardduty.amazonaws.com") + [
+            {
+                "EnabledServicePrincipals": [
+                    {"ServicePrincipal": "guardduty.amazonaws.com"}
+                ]
+            }
+        ]
+        rows = self._rows(mock_client, pages)
+        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 12
+
+    @patch("sagemaker_app.boto3.client")
+    def test_the_passed_row_states_trusted_access_is_enabled(self, mock_client):
+        rows = self._rows(mock_client, self._enabled())
+        assert (
+            "Trusted access for guardduty.amazonaws.com is enabled"
+            in rows[0]["Finding_Details"]
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_trusted_access_withholds_every_pass(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            _make_client_error("AccessDeniedException"),
+            {
+                "securityhub.amazonaws.com": [{"DelegatedAdministrators": []}],
+                "macie.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ],
+            },
+        )
+        by_principal = self._service_rows(rows)
+        assert [r["Status"] for r in by_principal.pop("securityhub.amazonaws.com")] == [
+            "Failed"
+        ]
+        assert [r["Status"] for r in by_principal.pop("macie.amazonaws.com")] == [
+            "Failed"
+        ]
+        for service_rows in by_principal.values():
+            assert [r["Status"] for r in service_rows] == ["N/A"]
+            details = service_rows[0]["Finding_Details"]
+            assert "organizations:ListAWSServiceAccessForOrganization" in details
+            assert "AccessDeniedException" in details
+            assert self.SECURITY in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_administrator_and_no_trusted_access_keeps_the_admin_failure(
+        self, mock_client
+    ):
+        rows = self._rows(
+            mock_client,
+            self._enabled("detective.amazonaws.com"),
+            {"detective.amazonaws.com": [{"DelegatedAdministrators": []}]},
+        )
+        detective = self._service_rows(rows)["detective.amazonaws.com"]
+        assert [r["Status"] for r in detective] == ["Failed"]
+        assert "No active delegated administrator" in detective[0]["Finding_Details"]
 
 
 class TestSM35DelegatedAdminConsolidation:
@@ -9778,8 +10049,13 @@ class TestSM39WorkloadSegmentation:
         groups=None,
         eks=None,
         errors=None,
+        prefix_lists=None,
     ):
-        """services: {cluster: [service dicts]}; eks: {cluster: config string}."""
+        """services: {cluster: [service dicts]}; eks: {cluster: config string}.
+
+        prefix_lists: {id: (owner, [cidrs] or an exception the entries read raises)}.
+        """
+        prefix_lists = prefix_lists or {}
         errors = errors or {}
         by_cluster = services or {}
         functions = functions or []
@@ -9858,6 +10134,34 @@ class TestSM39WorkloadSegmentation:
                     }
 
                 client.describe_security_groups.side_effect = describe_security_groups
+
+                def describe_prefix_lists(PrefixListIds):
+                    if "prefix_lists" in errors:
+                        raise errors["prefix_lists"]
+                    return [
+                        {
+                            "PrefixLists": [
+                                {"PrefixListId": p, "OwnerId": prefix_lists[p][0]}
+                                for p in PrefixListIds
+                                if p in prefix_lists
+                            ]
+                        }
+                    ]
+
+                def prefix_list_entries(PrefixListId):
+                    entries = prefix_lists[PrefixListId][1]
+                    if isinstance(entries, Exception):
+                        raise entries
+                    # One entry per page, so a reader of only the first page
+                    # misses every later entry.
+                    return [{"Entries": [{"Cidr": cidr}]} for cidr in entries]
+
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "describe_managed_prefix_lists": describe_prefix_lists,
+                        "get_managed_prefix_list_entries": prefix_list_entries,
+                    }
+                )
             return client
 
         with patch("sagemaker_app.boto3.client", side_effect=factory):
@@ -9955,19 +10259,14 @@ class TestSM39WorkloadSegmentation:
         assert "allows ingress tcp 443 from 10.0.0.0/16" in details
         assert "10.0.12.0/24" not in details
 
-    @pytest.mark.parametrize(
-        ("cidr", "v6"),
-        [("10.0.0.0/17", False), ("10.0.0.0/23", False), ("2001:db8::/56", True)],
-    )
-    @pytest.mark.parametrize("wide_first", [True, False])
-    def test_a_cidr_wider_than_a_24_fails_only_its_workload(self, cidr, v6, wide_first):
+    def _wide_and_narrow(self, cidr, v6, wide_first):
         services = [
             self._service("wide", ["sg-w"]),
             self._service("narrow", ["sg-n"]),
         ]
         if not wide_first:
             services.reverse()
-        seg = self._seg(
+        return self._seg(
             self._run(
                 services={"agents": services},
                 groups=[
@@ -9982,12 +10281,130 @@ class TestSM39WorkloadSegmentation:
                 ],
             )
         )
+
+    @pytest.mark.parametrize(
+        ("cidr", "v6"),
+        [("10.0.0.0/16", False), ("10.0.0.0/8", False), ("2001:db8::/48", True)],
+    )
+    @pytest.mark.parametrize("wide_first", [True, False])
+    def test_a_cidr_of_16_or_wider_fails_only_its_workload(self, cidr, v6, wide_first):
+        seg = self._wide_and_narrow(cidr, v6, wide_first)
         assert [r["Status"] for r in seg] == ["Failed"]
         details = seg[0]["Finding_Details"]
         assert f"sg-w allows egress tcp 443 to {cidr}" in details
+        assert "a CIDR of /16 (IPv6 /48) or wider" in details
         assert "narrow" not in details
 
-    def test_a_prefix_list_rule_withholds_the_pass(self):
+    @pytest.mark.parametrize(
+        ("cidr", "v6"),
+        [
+            ("10.0.0.0/17", False),
+            ("10.0.0.0/23", False),
+            ("2001:db8::/49", True),
+            ("2001:db8::/63", True),
+        ],
+    )
+    @pytest.mark.parametrize("wide_first", [True, False])
+    def test_a_cidr_between_16_and_24_is_not_judged_and_withholds_the_pass(
+        self, cidr, v6, wide_first
+    ):
+        # AIR-SLF-RT-05 names no CIDR width, so neither verdict is claimed.
+        seg = self._wide_and_narrow(cidr, v6, wide_first)
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert seg[0]["Finding"] == (
+            f"{sagemaker_app.WORKLOAD_SEGMENTATION_FINDING} CIDR Width Not Judged"
+        )
+        details = seg[0]["Finding_Details"]
+        assert f"ECS service wide in agents: sg-w allows egress tcp 443 to {cidr}" in (
+            details
+        )
+        assert "narrower than /16 (IPv6 /48) and wider than /24 (IPv6 /64)" in details
+        assert "AIR-SLF-RT-05" in details
+        assert "names no width" in details
+        assert "narrow in agents" not in details
+
+    def test_each_workload_with_an_unjudged_cidr_is_named(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("one", ["sg-a"]),
+                    self._function("two", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._open("10.0.0.0/20", "tcp", 443)]),
+                    self._sg("sg-b", egress=[self._open("10.1.0.0/22", "tcp", 443)]),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        details = seg[0]["Finding_Details"]
+        assert details.startswith("2 rule(s)")
+        assert "Lambda function one: sg-a allows egress tcp 443 to 10.0.0.0/20" in (
+            details
+        )
+        assert "Lambda function two: sg-b allows egress tcp 443 to 10.1.0.0/22" in (
+            details
+        )
+
+    def test_a_broad_cidr_fails_beside_an_unjudged_one(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("broad", ["sg-a"]),
+                    self._function("between", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._open("10.0.0.0/16", "tcp", 443)]),
+                    self._sg("sg-b", egress=[self._open("10.1.0.0/20", "tcp", 443)]),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed", "N/A"]
+        assert "Lambda function broad:" in seg[0]["Finding_Details"]
+        assert "between" not in seg[0]["Finding_Details"]
+        assert "Lambda function between:" in seg[1]["Finding_Details"]
+        assert "Lambda function broad" not in seg[1]["Finding_Details"]
+
+    def test_the_passed_row_names_the_24_bound(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[
+                    self._sg("sg-a", egress=[self._open("10.0.12.0/24", "tcp", 443)])
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+        assert "a CIDR wider than /24 (IPv6 /64)" in seg[0]["Finding_Details"]
+
+    @staticmethod
+    def _to_list(*prefix_list_ids):
+        return {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "PrefixListIds": [{"PrefixListId": p} for p in prefix_list_ids],
+        }
+
+    @pytest.mark.parametrize(
+        ("prefix_lists", "errors", "action"),
+        [
+            (
+                {"pl-1": ("111122223333", _make_client_error("AccessDenied"))},
+                {},
+                "ec2:GetManagedPrefixListEntries: ",
+            ),
+            (
+                {"pl-1": ("111122223333", ["10.0.1.0/24"])},
+                {"prefix_lists": _make_client_error("AccessDenied")},
+                "ec2:DescribeManagedPrefixLists: ",
+            ),
+            ({}, {}, "not returned by ec2:DescribeManagedPrefixLists"),
+        ],
+    )
+    def test_an_unread_prefix_list_withholds_the_pass(
+        self, prefix_lists, errors, action
+    ):
         seg = self._seg(
             self._run(
                 functions=[
@@ -9995,26 +10412,119 @@ class TestSM39WorkloadSegmentation:
                     self._function("other", ["sg-b"]),
                 ],
                 groups=[
-                    self._sg(
-                        "sg-a",
-                        egress=[
-                            {
-                                "IpProtocol": "tcp",
-                                "FromPort": 443,
-                                "ToPort": 443,
-                                "PrefixListIds": [{"PrefixListId": "pl-1"}],
-                            }
-                        ],
-                    ),
+                    self._sg("sg-a", egress=[self._to_list("pl-1")]),
                     self._sg("sg-b"),
                 ],
+                prefix_lists=prefix_lists,
+                errors=errors,
             )
         )
         assert [r["Status"] for r in seg] == ["N/A"]
         details = seg[0]["Finding_Details"]
         assert "prefix list pl-1 in sg-a" in details
-        assert "ec2:GetManagedPrefixListEntries" in details
+        assert action in details
         assert "sg-b" not in details
+
+    def test_an_aws_managed_prefix_list_is_credited(self):
+        # AWS's S3 list holds /15 and /16 ranges; they are not judged by width.
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-63a5400a")])],
+                prefix_lists={"pl-63a5400a": ("AWS", ["52.216.0.0/15"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+        assert "customer-managed prefix list" in seg[0]["Finding_Details"]
+
+    def test_a_customer_prefix_list_of_narrow_entries_passes(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-1")])],
+                prefix_lists={"pl-1": ("111122223333", ["10.0.1.0/24", "10.0.2.9/32"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+
+    @pytest.mark.parametrize("broad_last", [True, False])
+    def test_a_broad_entry_in_a_customer_prefix_list_fails_only_its_workload(
+        self, broad_last
+    ):
+        # The broad entry sits on a later page of a later list, and the
+        # passing workload uses an AWS-managed list, so neither the first
+        # page nor the first list alone decides the verdict.
+        entries = ["10.0.1.0/24", "10.0.0.0/16"]
+        if not broad_last:
+            entries.reverse()
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("tool", ["sg-a"]),
+                    self._function("other", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._to_list("pl-0", "pl-1")]),
+                    self._sg("sg-b", egress=[self._to_list("pl-aws")]),
+                ],
+                prefix_lists={
+                    "pl-0": ("111122223333", ["10.0.9.0/24"]),
+                    "pl-1": ("111122223333", entries),
+                    "pl-aws": ("AWS", ["52.216.0.0/15"]),
+                },
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert "10.0.0.0/16 in pl-1" in details
+        assert "an entry of a customer-managed prefix list" in details
+        assert "tool" in details
+        assert "other" not in details
+        assert "pl-aws" not in details
+
+    def test_a_broad_ipv6_entry_in_a_customer_prefix_list_fails(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-1")])],
+                prefix_lists={"pl-1": ("111122223333", ["2600:1f18::/40"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        assert "2600:1f18::/40 in pl-1" in seg[0]["Finding_Details"]
+
+    def test_a_between_width_prefix_list_entry_is_unjudged(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-1")])],
+                prefix_lists={"pl-1": ("111122223333", ["10.0.0.0/20"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert "10.0.0.0/20 in pl-1" in seg[0]["Finding_Details"]
+
+    def test_an_unread_prefix_list_does_not_hide_a_broad_one(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("tool", ["sg-a"]),
+                    self._function("other", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._to_list("pl-1")]),
+                    self._sg("sg-b", egress=[self._to_list("pl-2")]),
+                ],
+                prefix_lists={
+                    "pl-1": ("111122223333", _make_client_error("AccessDenied")),
+                    "pl-2": ("111122223333", ["0.0.0.0/0"]),
+                },
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed", "N/A"]
+        assert "0.0.0.0/0 in pl-2" in seg[0]["Finding_Details"]
+        assert "pl-1" not in seg[0]["Finding_Details"]
+        assert "prefix list pl-1 in sg-a" in seg[1]["Finding_Details"]
 
     @pytest.mark.parametrize("default_first", [True, False])
     def test_a_rule_to_the_vpc_default_group_fails_only_its_workload(

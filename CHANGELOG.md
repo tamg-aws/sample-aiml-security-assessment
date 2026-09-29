@@ -261,6 +261,14 @@ section.
 
 ### Fixed
 
+- `SM-35` security service delegated administrator passes a service only
+  when its principal also has trusted access in the organization, read with
+  `organizations:ListAWSServiceAccessForOrganization` (newly granted to the
+  SageMaker function on `*`, because the action has no resource type). A
+  registered non-management administrator whose service principal lacks
+  trusted access fails, and an unread trusted-access list makes each such
+  service `N/A`. Trusted access used to go unread.
+
 - `SM-41` AWS IoT device-scoped policy adds an `AWS IoT Role Alias Device
   Scope` row. It lists and describes each credentials-provider role alias
   (`iot:ListRoleAliases` on `*`, which has no resource type, and
@@ -308,13 +316,20 @@ section.
 
 - `SM-23` model drift detection adds a `Model Monitor Baseline Constraints`
   row. Each Scheduled monitoring schedule on an InService endpoint must name a
-  baseline `ConstraintsResource`, read from its inline job definition or, for
-  a DataQuality schedule, from `DescribeDataQualityJobDefinition`. A schedule
-  with no constraints file fails, because its reports have nothing to be
-  validated against. A ModelQuality, ModelBias, or ModelExplainability
-  schedule that names a job definition is `N/A`, since only the DataQuality
-  describe is granted, and so is one that names a baselining job but no
-  constraints file.
+  baseline `ConstraintsResource`, read from its inline job definition or from
+  the named job definition's describe for its monitoring type
+  (`DescribeDataQualityJobDefinition`, `DescribeModelQualityJobDefinition`,
+  `DescribeModelBiasJobDefinition` or
+  `DescribeModelExplainabilityJobDefinition`). A schedule with no constraints
+  file fails, because its reports have nothing to be validated against. A job
+  definition that could not be described is `N/A` naming the describe, and so
+  is one that names a baselining job but no constraints file.
+
+- `SM-23` `Model Monitor Violation Alarm` passed row now says that which
+  Model Monitor metric each alarm evaluates, and whether its threshold marks
+  drift for the model, are not judged. The row used to read as a drift
+  verdict when the check credits any enabled alarm with an action on the
+  schedule's metrics.
 
 - `SM-11` endpoint model network path also judges the model each inference
   component names, from `Specification` and every `Specifications` entry,
@@ -330,40 +345,6 @@ section.
   `region` filter that matches the rule's own account or Region, read from
   the rule ARN, no longer narrows, because every Registry event the check
   judges carries those values.
-- `SM-38` runtime monitoring coverage adds a `GuardDuty EKS Audit Log
-  Monitoring` row in each Region that has an EKS cluster. It passes only when
-  the detector is `ENABLED` with its `EKS_AUDIT_LOGS` feature `ENABLED`, and
-  it is judged whether or not Runtime Monitoring is on. The feature used to go
-  unread. A Region whose EKS clusters could not be listed gets an `N/A` row.
-
-- `SM-09` execution role privilege also judges each Studio domain's
-  `DefaultSpaceSettings.ExecutionRole`, the default execution role for spaces,
-  beside the domain's default user role and each user profile's role. A
-  broad grant on the space role used to go unread.
-
-- `SM-22` deployed model registration also judges the model each batch
-  transform job ran, read from `DescribeTransformJob`, beside the models
-  serving on endpoints. An unregistered or unapproved model used only by a
-  transform job used to go unread, and the row said so. A transform job that
-  could not be listed or described now leaves the row `N/A`, and an account
-  with transform jobs but no endpoint now gets the row.
-
-- `SM-23` model drift detection adds a `Model Monitor Baseline Constraints`
-  row. Each Scheduled monitoring schedule on an InService endpoint must name a
-  baseline `ConstraintsResource`, read from its inline job definition or, for
-  a DataQuality schedule, from `DescribeDataQualityJobDefinition`. A schedule
-  with no constraints file fails, because its reports have nothing to be
-  validated against. A ModelQuality, ModelBias, or ModelExplainability
-  schedule that names a job definition is `N/A`, since only the DataQuality
-  describe is granted, and so is one that names a baselining job but no
-  constraints file.
-
-- `SM-11` endpoint model network path also judges the model each inference
-  component names, from `Specification` and every `Specifications` entry,
-  beside the endpoint config's own `EnableNetworkIsolation` and
-  `VpcConfig`. A component model with isolation off or no `VpcConfig` used
-  to pass behind a compliant endpoint config, and a component that could not
-  be listed or described now leaves its endpoint `N/A`.
 
 - `SM-35` security service delegated administrator also reads
   `config-multiaccountsetup.amazonaws.com`, the principal AWS Config rules
@@ -392,12 +373,21 @@ section.
   `Deny` on such values fires only when the key is absent, and an
   `IpAddress` `Allow` on them admits any caller.
 
-- `SM-39` workload segmentation fails a security group rule to or from a
-  CIDR wider than a /24 (IPv6 /64), where only /16 (IPv6 /48) or wider
-  failed, and a rule that references the VPC's default security group. A
-  rule that names a prefix list, whose entries need the ungranted
-  `ec2:GetManagedPrefixListEntries`, or references a group that was not
-  read now withholds `Passed` in an `N/A` row.
+- `SM-39` workload segmentation fails a rule that references the VPC's
+  default security group. A CIDR of /16 (IPv6 /48) or wider still fails. A
+  CIDR narrower than that and wider than a /24 (IPv6 /64) used to pass; it
+  now withholds `Passed` in a `CIDR Width Not Judged` `N/A` row that names
+  both bounds, because AIR-SLF-RT-05 asks for security group references in
+  place of broad CIDR allowances and names no width. A rule that
+  references a group that was not read also withholds `Passed` in an `N/A`
+  row. A rule that names a customer-managed prefix list is judged on each
+  of the list's entries with the same bounds, labelled with the list, so a
+  list holding `0.0.0.0/0` fails the workload that uses it. A rule that
+  names an AWS-managed prefix list, one AWS service's published ranges such
+  as the S3 list's /15 and /16 entries, is credited without a width
+  judgment. A prefix list whose owner or entries were not read withholds
+  `Passed` in an `N/A` row naming the list, the groups whose rules name it
+  and the failed action.
 
 - `SM-40` fails a secret whose rotation schedule allows a gap longer than 90
   days, the default of Security Hub control `SecretsManager.4`, so
@@ -1322,6 +1312,25 @@ ARNs (`BR-46`, `BR-47`, `BR-52`). `aoss:ListAccessPolicies`,
 in the IAM service authorization reference. All six are read-only. Each
 stack creates one more customer managed policy, named with the stack name as
 its prefix.
+
+Both SAM templates add `SageMakerAssessmentReadsPolicy`, an
+`AWS::IAM::ManagedPolicy` attached only to the SageMaker assessment function
+through its `Policies` list, for reads that do not fit that function's
+9000-character inline budget. It renders to under 5500 of IAM's
+6144-character managed policy limit and holds
+`organizations:ListAWSServiceAccessForOrganization` on `*` (`SM-35`), which
+has no resource type and moves out of the inline
+`OrganizationsInventoryPermissions` statement, and
+`sagemaker:DescribeModelQualityJobDefinition`,
+`sagemaker:DescribeModelBiasJobDefinition` and
+`sagemaker:DescribeModelExplainabilityJobDefinition` on the account's
+`model-quality-job-definition/*`, `model-bias-job-definition/*` and
+`model-explainability-job-definition/*` ARNs (`SM-23`), and
+`ec2:DescribeManagedPrefixLists` on `*`, which has no resource type, and
+`ec2:GetManagedPrefixListEntries` on `prefix-list/*` with the account
+segment open, because a list can be shared through AWS RAM from another
+account (`SM-39`). All are read-only. The deployment role permissions added
+for `BedrockAssessmentReadsPolicy` cover this policy too.
 
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a
