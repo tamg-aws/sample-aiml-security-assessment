@@ -302,6 +302,7 @@ _EXPECTED_ACTIONS = {
         "iot:ListTargetsForPolicy",
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
+        "organizations:ListAWSServiceAccessForOrganization",
         "organizations:ListDelegatedAdministrators",
         "organizations:ListParents",
         "organizations:ListPolicies",
@@ -1103,7 +1104,10 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
     for sid, actions in (
         (
             "OrganizationsInventoryPermissions",
-            ("organizations:ListDelegatedAdministrators",),
+            (
+                "organizations:ListDelegatedAdministrators",
+                "organizations:ListAWSServiceAccessForOrganization",
+            ),
         ),
         (
             "AccountInventoryWithoutResourceType",

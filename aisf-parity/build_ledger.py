@@ -1593,9 +1593,13 @@ FOUNDATION_ROWS = [
         "(config-multiaccountsetup.amazonaws.com), IAM Access Analyzer, "
         "CloudTrail, Detective, Security Lake, Firewall Manager and Audit "
         "Manager, which the finding states. One row per service passes "
-        "when an ACTIVE delegated administrator is not the management account, "
-        "and fails when there is none or it is the management account. A member "
-        "account that cannot call the API is Not Applicable with the reason",
+        "when an ACTIVE delegated administrator is not the management account "
+        "and ListAWSServiceAccessForOrganization lists the service principal as "
+        "having trusted access. It fails when there is no such administrator, "
+        "when it is the management account, or when trusted access for the "
+        "principal is not enabled; an unread trusted-access list makes each "
+        "administered service Not Applicable. A member account that cannot call "
+        "the API is Not Applicable with the reason",
         [],
         6,
     ),

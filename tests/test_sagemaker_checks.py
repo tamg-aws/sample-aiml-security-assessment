@@ -7101,7 +7101,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
     MANAGEMENT = "111122223333"
     SECURITY = "444455556666"
 
-    def _client(self, pages_by_principal):
+    def _client(self, pages_by_principal, trusted_access=None):
         client = MagicMock()
         client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": self.MANAGEMENT}
@@ -7113,8 +7113,26 @@ class TestSM35SecurityServiceDelegatedAdmin:
                 raise value
             return value
 
+        if trusted_access is None:
+            trusted_access = [
+                {
+                    "EnabledServicePrincipals": [
+                        {"ServicePrincipal": principal}
+                        for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+                    ]
+                }
+            ]
+
+        def enabled_pages():
+            if isinstance(trusted_access, Exception):
+                raise trusted_access
+            return trusted_access
+
         client.get_paginator.side_effect = _pager(
-            {"list_delegated_administrators": pages}
+            {
+                "list_delegated_administrators": pages,
+                "list_aws_service_access_for_organization": enabled_pages,
+            }
         )
         return client
 
@@ -7255,6 +7273,138 @@ class TestSM35SecurityServiceDelegatedAdmin:
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
         assert len(rows) == 1
         assert_could_not_assess_finding(rows[0])
+
+
+class TestSM35TrustedAccess:
+    """AIR-FND-ACC-09: a delegated administrator passes only with trusted access."""
+
+    MANAGEMENT = TestSM35SecurityServiceDelegatedAdmin.MANAGEMENT
+    SECURITY = TestSM35SecurityServiceDelegatedAdmin.SECURITY
+
+    def _rows(self, mock_client, trusted_access, admin_overrides=None):
+        pages = {
+            principal: [
+                {"DelegatedAdministrators": [{"Id": self.SECURITY, "Status": "ACTIVE"}]}
+            ]
+            for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+        }
+        pages.update(admin_overrides or {})
+        mock_client.return_value = TestSM35SecurityServiceDelegatedAdmin()._client(
+            pages, trusted_access
+        )
+        return _rows(sagemaker_app.check_security_service_delegated_admin())
+
+    @staticmethod
+    def _enabled(*excluded):
+        return [
+            {
+                "EnabledServicePrincipals": [
+                    {"ServicePrincipal": principal}
+                    for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+                    if principal not in excluded
+                ]
+            }
+        ]
+
+    @staticmethod
+    def _service_rows(rows):
+        return {
+            principal: [
+                r for r in rows[:-1] if f"({principal})" in r["Finding_Details"]
+            ]
+            for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_administrator_without_trusted_access_fails(self, mock_client):
+        rows = self._rows(mock_client, self._enabled("guardduty.amazonaws.com"))
+        by_principal = self._service_rows(rows)
+        guardduty = by_principal.pop("guardduty.amazonaws.com")
+        assert [r["Status"] for r in guardduty] == ["Failed"]
+        assert (
+            "Trusted access for guardduty.amazonaws.com is not enabled"
+            in guardduty[0]["Finding_Details"]
+        )
+        assert self.SECURITY in guardduty[0]["Finding_Details"]
+        assert "Enable trusted access" in guardduty[0]["Resolution"]
+        assert all(
+            [r["Status"] for r in v] == ["Passed"] for v in by_principal.values()
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_service_without_trusted_access_fails_on_its_own_row(
+        self, mock_client
+    ):
+        off = ("guardduty.amazonaws.com", "cloudtrail.amazonaws.com")
+        rows = self._rows(mock_client, self._enabled(*off))
+        statuses = {
+            p: [r["Status"] for r in v] for p, v in self._service_rows(rows).items()
+        }
+        assert {p for p, s in statuses.items() if s == ["Failed"]} == set(off)
+        assert all(s == ["Passed"] for p, s in statuses.items() if p not in off)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_principal_enabled_on_the_second_page_passes(self, mock_client):
+        pages = self._enabled("guardduty.amazonaws.com") + [
+            {
+                "EnabledServicePrincipals": [
+                    {"ServicePrincipal": "guardduty.amazonaws.com"}
+                ]
+            }
+        ]
+        rows = self._rows(mock_client, pages)
+        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 12
+
+    @patch("sagemaker_app.boto3.client")
+    def test_the_passed_row_states_trusted_access_is_enabled(self, mock_client):
+        rows = self._rows(mock_client, self._enabled())
+        assert (
+            "Trusted access for guardduty.amazonaws.com is enabled"
+            in rows[0]["Finding_Details"]
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_trusted_access_withholds_every_pass(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            _make_client_error("AccessDeniedException"),
+            {
+                "securityhub.amazonaws.com": [{"DelegatedAdministrators": []}],
+                "macie.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ],
+            },
+        )
+        by_principal = self._service_rows(rows)
+        assert [r["Status"] for r in by_principal.pop("securityhub.amazonaws.com")] == [
+            "Failed"
+        ]
+        assert [r["Status"] for r in by_principal.pop("macie.amazonaws.com")] == [
+            "Failed"
+        ]
+        for service_rows in by_principal.values():
+            assert [r["Status"] for r in service_rows] == ["N/A"]
+            details = service_rows[0]["Finding_Details"]
+            assert "organizations:ListAWSServiceAccessForOrganization" in details
+            assert "AccessDeniedException" in details
+            assert self.SECURITY in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_administrator_and_no_trusted_access_keeps_the_admin_failure(
+        self, mock_client
+    ):
+        rows = self._rows(
+            mock_client,
+            self._enabled("detective.amazonaws.com"),
+            {"detective.amazonaws.com": [{"DelegatedAdministrators": []}]},
+        )
+        detective = self._service_rows(rows)["detective.amazonaws.com"]
+        assert [r["Status"] for r in detective] == ["Failed"]
+        assert "No active delegated administrator" in detective[0]["Finding_Details"]
 
 
 class TestSM35DelegatedAdminConsolidation:

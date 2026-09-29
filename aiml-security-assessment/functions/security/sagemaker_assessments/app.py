@@ -13252,6 +13252,20 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
         )
         return findings
 
+    enabled_principals = set()
+    trusted_access_error = ""
+    try:
+        paginator = orgs_client.get_paginator(
+            "list_aws_service_access_for_organization"
+        )
+        for page in paginator.paginate():
+            enabled_principals.update(
+                item.get("ServicePrincipal")
+                for item in page.get("EnabledServicePrincipals", [])
+            )
+    except Exception as error:
+        trusted_access_error = get_assessment_error_label(error)
+
     admins_by_service = {}
     unread_services = []
     for service_name, principal in SECURITY_SERVICE_PRINCIPALS:
@@ -13301,12 +13315,41 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
             if admin.get("Id") and admin.get("Id") != master_account_id
         )
         admins_by_service[service_name] = dedicated
-        if dedicated:
+        administered = (
+            f"{service_name} ({principal}) is administered from delegated "
+            f"administrator account {', '.join(dedicated)}, which is not "
+            "the organization management account."
+        )
+        if dedicated and trusted_access_error:
             findings["csv_data"].append(
                 _row(
-                    f"{service_name} ({principal}) is administered from delegated "
-                    f"administrator account {', '.join(dedicated)}, which is not "
-                    "the organization management account.",
+                    f"{administered} Whether trusted access is enabled for "
+                    f"{principal} was not read "
+                    "(organizations:ListAWSServiceAccessForOrganization: "
+                    f"{trusted_access_error}).",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif dedicated and principal not in enabled_principals:
+            findings["csv_data"].append(
+                _row(
+                    f"{administered} Trusted access for {principal} is not "
+                    "enabled: the principal is absent from the organization's "
+                    "enabled service principals "
+                    "(ListAWSServiceAccessForOrganization).",
+                    f"Enable trusted access for {service_name} in AWS "
+                    "Organizations so the delegated administrator can act "
+                    "across member accounts.",
+                    "High",
+                    "Failed",
+                )
+            )
+        elif dedicated:
+            findings["csv_data"].append(
+                _row(
+                    f"{administered} Trusted access for {principal} is enabled.",
                     "No action required",
                     "High",
                     "Passed",

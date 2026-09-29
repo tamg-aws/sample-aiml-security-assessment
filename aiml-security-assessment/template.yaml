@@ -873,12 +873,13 @@ Resources:
                 - config:DescribeConformancePackCompliance # SM-32
               Resource: !Sub 'arn:${AWS::Partition}:config:*:${AWS::AccountId}:conformance-pack/*/*'
             - Sid: OrganizationsInventoryPermissions
-              # None of these three Organizations actions has a resource type in IAM.
+              # None of these four Organizations actions has a resource type in IAM.
               Effect: Allow
               Action:
                 - organizations:DescribeOrganization # SM-34, SM-35
                 - organizations:ListPolicies # SM-34
                 - organizations:ListDelegatedAdministrators # SM-35
+                - organizations:ListAWSServiceAccessForOrganization # SM-35
               Resource: '*'
             - Sid: EC2SubnetExposureInventory
               # SM-10, SM-11, SM-28 and SM-33 resolve whether a subnet routes to an

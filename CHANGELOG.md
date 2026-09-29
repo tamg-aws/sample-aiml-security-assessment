@@ -261,6 +261,14 @@ section.
 
 ### Fixed
 
+- `SM-35` security service delegated administrator passes a service only
+  when its principal also has trusted access in the organization, read with
+  `organizations:ListAWSServiceAccessForOrganization` (newly granted to the
+  SageMaker function on `*`, because the action has no resource type). A
+  registered non-management administrator whose service principal lacks
+  trusted access fails, and an unread trusted-access list makes each such
+  service `N/A`. Trusted access used to go unread.
+
 - `SM-41` AWS IoT device-scoped policy adds an `AWS IoT Role Alias Device
   Scope` row. It lists and describes each credentials-provider role alias
   (`iot:ListRoleAliases` on `*`, which has no resource type, and
