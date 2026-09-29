@@ -16904,12 +16904,15 @@ def _deny_requires_vpc_placement(
 
 
 def _deny_pins_vpc_placement(
-    statement: Dict[str, Any], action: str, context: Dict[str, str]
+    statement: Dict[str, Any], action: str, context: Dict[str, str], key: str
 ) -> bool:
-    """Return whether a Deny fires on any subnet or group outside a fixed list.
+    """Return whether a Deny fires on any value of `key`, subnets or security
+    groups, outside a fixed list.
 
-    A listed value with a wildcard admits every subnet or group it matches, so
-    it pins nothing.
+    Every condition entry must be on `key`. Entries are ANDed, so a deny that
+    also names the other key fires only when both are outside their lists, and
+    an approved subnet then admits any security group. A listed value with a
+    wildcard admits every subnet or group it matches, so it pins nothing.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict) or not condition:
@@ -16921,8 +16924,8 @@ def _deny_pins_vpc_placement(
             name = name[: -len("ifexists")]
         if name not in AGENTCORE_VPC_PIN_OPERATORS or not isinstance(entries, dict):
             return False
-        for key, raw in entries.items():
-            if str(key).strip().lower() not in AGENTCORE_VPC_PLACEMENT_KEYS:
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != key:
                 return False
             values = [value.strip() for value in _condition_values(raw)]
             if not values or any("*" in value or "?" in value for value in values):
@@ -16962,18 +16965,38 @@ def check_agentcore_vpc_placement_scp() -> List[Dict[str, Any]]:
                 ),
             },
             {
-                "finding_name": "VPC Pin Guardrail",
+                "finding_name": "VPC Subnet Pin Guardrail",
                 "actions": AGENTCORE_VPC_PLACEMENT_ACTIONS,
-                "denies": _deny_pins_vpc_placement,
-                "guard_text": (
-                    "when a subnet or security group is outside a fixed list"
+                "denies": lambda statement, action, context: _deny_pins_vpc_placement(
+                    statement, action, context, "bedrock-agentcore:subnets"
                 ),
+                "guard_text": "when a subnet is outside a fixed list",
                 "remediation": (
                     "Attach a service control policy that denies the four "
                     "actions with ForAnyValue:StringNotEquals on "
-                    "bedrock-agentcore:subnets and "
-                    "bedrock-agentcore:securityGroups, listing the approved "
-                    "subnet and security group IDs without wildcards."
+                    "bedrock-agentcore:subnets alone, listing the approved "
+                    "subnet IDs without wildcards. A statement that also names "
+                    "bedrock-agentcore:securityGroups denies only when both are "
+                    "outside their lists."
+                ),
+            },
+            {
+                "finding_name": "VPC Security Group Pin Guardrail",
+                "actions": AGENTCORE_VPC_PLACEMENT_ACTIONS,
+                "denies": lambda statement, action, context: _deny_pins_vpc_placement(
+                    statement,
+                    action,
+                    context,
+                    "bedrock-agentcore:securitygroups",
+                ),
+                "guard_text": "when a security group is outside a fixed list",
+                "remediation": (
+                    "Attach a service control policy that denies the four "
+                    "actions with ForAnyValue:StringNotEquals on "
+                    "bedrock-agentcore:securityGroups alone, listing the "
+                    "approved security group IDs without wildcards. A "
+                    "statement that also names bedrock-agentcore:subnets "
+                    "denies only when both are outside their lists."
                 ),
             },
         ],

@@ -13423,19 +13423,26 @@ def _vpc_null_guard(condition=None, action=None, resource="*"):
     ]
 
 
-def _vpc_pin_guard(operator="ForAnyValue:StringNotEquals", values=None, action=None):
+def _vpc_pin_guard(
+    operator="ForAnyValue:StringNotEquals",
+    values=None,
+    action=None,
+    keys=("bedrock-agentcore:subnets", "bedrock-agentcore:securityGroups"),
+):
+    """One Deny per key: keys in one condition block are ANDed, so a deny
+    naming both fires only when both are outside their lists."""
+    defaults = {
+        "bedrock-agentcore:subnets": ["subnet-0a1b2c3d"],
+        "bedrock-agentcore:securityGroups": ["sg-0a1b2c3d"],
+    }
     return [
         {
             "Effect": "Deny",
             "Action": action or _VPC_PLACEMENT_ACTIONS,
             "Resource": "*",
-            "Condition": {
-                operator: {
-                    "bedrock-agentcore:subnets": values or ["subnet-0a1b2c3d"],
-                    "bedrock-agentcore:securityGroups": values or ["sg-0a1b2c3d"],
-                }
-            },
+            "Condition": {operator: {key: values or defaults[key]}},
         }
+        for key in keys
     ]
 
 
@@ -13913,7 +13920,8 @@ class TestAC01VPCPlacementSCP:
         )
 
         assert findings["VPC Placement"]["Status"] == "Passed"
-        assert findings["VPC Pin"]["Status"] == "Passed"
+        assert findings["VPC Subnet Pin"]["Status"] == "Passed"
+        assert findings["VPC Security Group Pin"]["Status"] == "Passed"
         assert findings["VPC Placement"]["Check_ID"] == "AC-01"
 
     @patch("agentcore_app.organizations_client")
@@ -13924,7 +13932,8 @@ class TestAC01VPCPlacementSCP:
 
         assert findings["VPC Placement"]["Status"] == "Failed"
         assert findings["VPC Placement"]["Finding"].endswith("Missing")
-        assert findings["VPC Pin"]["Status"] == "Passed"
+        assert findings["VPC Subnet Pin"]["Status"] == "Passed"
+        assert findings["VPC Security Group Pin"]["Status"] == "Passed"
 
     @pytest.mark.parametrize(
         "condition",
@@ -14014,7 +14023,92 @@ class TestAC01VPCPlacementSCP:
         )
 
         assert findings["VPC Placement"]["Status"] == "Passed"
-        assert findings["VPC Pin"]["Status"] == "Failed"
+        assert findings["VPC Subnet Pin"]["Status"] == "Failed"
+        assert findings["VPC Security Group Pin"]["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_subnet_only_pin_leaves_the_security_group_leg_missing(self, mock_orgs):
+        # A subnet fixes the VPC, not which of its security groups, and so not
+        # the egress rules the runtime or tool runs with.
+        findings = self._findings(
+            mock_orgs,
+            {"PinVpc": _vpc_pin_guard(keys=("bedrock-agentcore:subnets",))},
+        )
+
+        assert findings["VPC Subnet Pin"]["Status"] == "Passed"
+        assert findings["VPC Security Group Pin"]["Status"] == "Failed"
+        assert findings["VPC Security Group Pin"]["Finding"].endswith("Missing")
+        assert (
+            "bedrock-agentcore:securityGroups"
+            in findings["VPC Security Group Pin"]["Resolution"]
+        )
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {
+                "ForAnyValue:StringNotEquals": {
+                    "bedrock-agentcore:subnets": ["subnet-0a1b2c3d"],
+                    "bedrock-agentcore:securityGroups": ["sg-0a1b2c3d"],
+                }
+            },
+            {
+                "ForAnyValue:StringNotEquals": {
+                    "bedrock-agentcore:subnets": ["subnet-0a1b2c3d"]
+                },
+                "ForAnyValue:StringNotLike": {
+                    "bedrock-agentcore:securityGroups": ["sg-0a1b2c3d"]
+                },
+            },
+        ],
+        ids=["one-block", "two-blocks"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_both_keys_anded_in_one_deny_pin_neither(self, mock_orgs, condition):
+        # Condition entries are ANDed, so the deny fires only when a subnet and
+        # a security group are both outside their lists: an approved subnet
+        # with any security group, or the reverse, is allowed.
+        findings = self._findings(
+            mock_orgs,
+            {
+                "RequireVpc": _vpc_null_guard(),
+                "PinVpc": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _VPC_PLACEMENT_ACTIONS,
+                        "Resource": "*",
+                        "Condition": condition,
+                    }
+                ],
+            },
+        )
+
+        assert findings["VPC Placement"]["Status"] == "Passed"
+        assert findings["VPC Subnet Pin"]["Status"] == "Failed"
+        assert findings["VPC Security Group Pin"]["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_each_key_is_judged_per_action_across_policies(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {
+                "PinSubnets": _vpc_pin_guard(keys=("bedrock-agentcore:subnets",)),
+                "PinGroups": _vpc_pin_guard(
+                    keys=("bedrock-agentcore:securityGroups",),
+                    action=_VPC_PLACEMENT_ACTIONS[:3],
+                ),
+            },
+        )
+
+        assert findings["VPC Subnet Pin"]["Status"] == "Passed"
+        assert (
+            findings["VPC Security Group Pin"]["Finding"]
+            == "VPC Security Group Pin Guardrail Partial"
+        )
+        assert (
+            "but not bedrock-agentcore:CreateBrowser"
+            in findings["VPC Security Group Pin"]["Finding_Details"]
+        )
 
     @patch("agentcore_app.organizations_client")
     def test_an_ifexists_pin_passes(self, mock_orgs):
@@ -14023,7 +14117,8 @@ class TestAC01VPCPlacementSCP:
             {"PinVpc": _vpc_pin_guard(operator="ForAnyValue:StringNotEqualsIfExists")},
         )
 
-        assert findings["VPC Pin"]["Status"] == "Passed"
+        assert findings["VPC Subnet Pin"]["Status"] == "Passed"
+        assert findings["VPC Security Group Pin"]["Status"] == "Passed"
 
     @patch("agentcore_app.organizations_client")
     def test_a_detached_pin_fails_unattached(self, mock_orgs):
@@ -14034,7 +14129,14 @@ class TestAC01VPCPlacementSCP:
         )
 
         assert findings["VPC Placement"]["Status"] == "Passed"
-        assert findings["VPC Pin"]["Finding"] == "VPC Pin Guardrail Unattached"
+        assert (
+            findings["VPC Subnet Pin"]["Finding"]
+            == "VPC Subnet Pin Guardrail Unattached"
+        )
+        assert (
+            findings["VPC Security Group Pin"]["Finding"]
+            == "VPC Security Group Pin Guardrail Unattached"
+        )
 
     @patch("agentcore_app.organizations_client")
     def test_unreadable_targets_of_the_only_guard_are_incomplete(self, mock_orgs):
