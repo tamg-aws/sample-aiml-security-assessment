@@ -3333,6 +3333,13 @@ def _normalized_condition_operator(operator: str) -> str:
     return name
 
 
+def _operator_admits_an_absent_key(operator: str) -> bool:
+    """True when a condition operator is met by a request without the key: the
+    IfExists form, and ForAllValues, which holds for an empty set of values."""
+    name = str(operator).strip().lower()
+    return name.endswith("ifexists") or name.startswith("forallvalues:")
+
+
 def _condition_pins_value(
     statement: Dict[str, Any], key: str, expected: str, if_exists_counts: bool = True
 ) -> bool:
@@ -3342,7 +3349,9 @@ def _condition_pins_value(
     wildcard value in StringLike reaches more than the one value, so it does not
     pin it. The IfExists form counts only where the key is always in the
     request, which the caller decides by the key it passes or by passing
-    `if_exists_counts=False` for a key a request can omit.
+    `if_exists_counts=False` for a key a request can omit. ForAllValues is read
+    the same way, because it is true for a request that carries no value for
+    the key.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict):
@@ -3351,7 +3360,7 @@ def _condition_pins_value(
     for operator, entries in condition.items():
         if not isinstance(entries, dict):
             continue
-        if not if_exists_counts and str(operator).strip().lower().endswith("ifexists"):
+        if not if_exists_counts and _operator_admits_an_absent_key(operator):
             continue
         if _normalized_condition_operator(operator) not in CONDITION_EQUALS_OPERATORS:
             continue
@@ -19110,8 +19119,9 @@ def _binds_policy_engine_context(statement: Dict[str, Any], engine_arn: str) -> 
     Every value of the kms:EncryptionContext entry must name the
     bedrock-agentcore service and a policy-engine resource and match this
     engine's ARN, so `*` or a value naming another resource type binds nothing.
-    The IfExists form is not read, because a call without the context then
-    passes it.
+    The IfExists and ForAllValues forms are not read, because a call without
+    the context then passes them. A wildcard region and account are credited:
+    the policy encryption guide's key policy names the engines that way.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict):
@@ -19120,7 +19130,7 @@ def _binds_policy_engine_context(statement: Dict[str, Any], engine_arn: str) -> 
     for operator, entries in condition.items():
         if not isinstance(entries, dict):
             continue
-        if str(operator).strip().lower().endswith("ifexists"):
+        if _operator_admits_an_absent_key(operator):
             continue
         if _normalized_condition_operator(operator) not in CONDITION_EQUALS_OPERATORS:
             continue
@@ -19256,18 +19266,21 @@ def _event_pattern_matches(pattern: Dict[str, Any], event: Dict[str, Any]) -> bo
     return True
 
 
-def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
+def _kms_key_loss_alarm_leg() -> Tuple[str, List[str], List[str]]:
     """Return what alarms on a key's DisableKey and ScheduleKeyDeletion calls in
-    this region, or "", and each read that failed.
+    this region, or "", each read that failed, and each matching rule that has
+    no target.
 
     An enabled rule on the default bus counts when its pattern matches both
-    calls as CloudTrail delivers them, so a rule that also filters on the key id
-    is not credited: the id's form depends on how the caller named the key. A
+    calls as CloudTrail delivers them and it has a target, so a rule that also
+    filters on the key id is not credited: the id's form depends on how the
+    caller named the key. What the target does with the event is not read. A
     metric filter counts when its pattern names both calls and an alarm with an
-    action watches its metric. Neither the rule's targets nor which trail feeds
-    the filter's log group is read.
+    action watches its metric. Which trail feeds the filter's log group is not
+    read.
     """
     unread: List[str] = []
+    untargeted: List[str] = []
     if events_client is None:
         unread.append("events:ListRules (no EventBridge client)")
     else:
@@ -19303,9 +19316,28 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
                     )
                     for event_name in KMS_KEY_LOSS_EVENTS
                 ):
+                    try:
+                        targets = _paginate_aws_list(
+                            events_client,
+                            "list_targets_by_rule",
+                            "Targets",
+                            token_request_key="NextToken",
+                            token_response_key="NextToken",
+                            Rule=rule.get("Name"),
+                        )
+                    except Exception as error:
+                        unread.append(
+                            f"events:ListTargetsByRule on rule {rule.get('Name')} "
+                            f"({_assessment_error_label(error)})"
+                        )
+                        continue
+                    if not targets:
+                        untargeted.append(str(rule.get("Name")))
+                        continue
                     return (
                         f"enabled EventBridge rule {rule.get('Name')} matches its "
                         f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
+                        [],
                         [],
                     )
     alarm, alarm_unread = _metric_filter_alarm(
@@ -19322,8 +19354,9 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
             f"{alarm}, whose pattern names its "
             f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
             [],
+            [],
         )
-    return "", unread + alarm_unread
+    return "", unread + alarm_unread, untargeted
 
 
 FILTER_PATTERN_COMPARISON = re.compile(
@@ -19864,7 +19897,7 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                     problems.append(grant_gap)
         if alarm_leg is None:
             alarm_leg = _kms_key_loss_alarm_leg()
-        alarm, alarm_unread = alarm_leg
+        alarm, alarm_unread, untargeted = alarm_leg
         if alarm_unread and not alarm:
             unread.append(
                 "whether an alarm in this region covers the key's "
@@ -19879,7 +19912,13 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
             problems.append(
                 "is watched by no alarm in this region on its "
                 f"{' or '.join(KMS_KEY_LOSS_EVENTS)} calls: no enabled EventBridge "
-                "rule matches both, and no metric filter naming both feeds an "
+                "rule that matches both has a target"
+                + (
+                    f" (rule {', '.join(untargeted)} matches both and has no target)"
+                    if untargeted
+                    else ""
+                )
+                + ", and no metric filter naming both feeds an "
                 "alarm with an action, so losing the key, which denies every "
                 "Cedar decision, raises nothing"
             )

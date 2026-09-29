@@ -16635,10 +16635,15 @@ _KEY_LOSS_RULE_PATTERN = {
 }
 
 
-def _key_loss_events(*rules):
-    """An EventBridge client listing the given rules on the default bus."""
+def _key_loss_events(*rules, targets=None):
+    """An EventBridge client listing the given rules on the default bus, each
+    with one SNS target unless `targets` maps a rule name to its own list."""
     client = MagicMock()
     client.list_rules.return_value = {"Rules": list(rules)}
+    default = [{"Id": "notify", "Arn": "arn:aws:sns:us-east-1:123456789012:security"}]
+    client.list_targets_by_rule.side_effect = lambda Rule, **_: {
+        "Targets": (targets or {}).get(Rule, default)
+    }
     return client
 
 
@@ -18168,6 +18173,150 @@ class TestAC36KeyLossAlarmAndServiceBounds:
         assert [f["Status"] for f in findings] == ["Passed", "Failed", "Passed"]
         assert "kms:EncryptionContext" in findings[1]["Finding_Details"]
         assert "(pe-2)" in findings[1]["Finding_Details"]
+
+
+class TestAC36SetOperatorsAndRuleTargets:
+    """AC-36 credits no ForAllValues condition on a key a request can omit,
+    and no EventBridge rule that has no target."""
+
+    _base = TestAC36KeyLossAlarmAndServiceBounds()
+
+    @staticmethod
+    def _for_all_values(statements, key):
+        """Move `key` in every statement's StringEquals or StringLike under the
+        ForAllValues form of the same operator."""
+        moved = []
+        for statement in statements:
+            condition = {
+                operator: dict(entries)
+                for operator, entries in statement.get("Condition", {}).items()
+            }
+            for operator in ("StringEquals", "StringLike"):
+                if key in condition.get(operator, {}):
+                    value = condition[operator].pop(key)
+                    condition.setdefault(f"ForAllValues:{operator}", {})[key] = value
+            moved.append({**statement, "Condition": condition})
+        return moved
+
+    @pytest.mark.parametrize(
+        "key, operator, status",
+        [
+            ("kms:ViaService", "ForAllValues", "Failed"),
+            ("kms:ViaService", "ForAnyValue", "Passed"),
+            (_ENGINE_CONTEXT_KEY, "ForAllValues", "Failed"),
+            (_ENGINE_CONTEXT_KEY, "ForAnyValue", "Passed"),
+        ],
+        ids=["via-all", "via-any", "context-all", "context-any"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_for_all_values_on_a_key_a_request_can_omit_scopes_nothing(
+        self, mock_ac, mock_kms, key, operator, status
+    ):
+        # ForAllValues is true for a request without the key, so a direct
+        # kms:Decrypt call, which carries no kms:ViaService, passes it.
+        # ForAnyValue is false for such a request, so it scopes as the plain
+        # operator does.
+        statements = self._for_all_values(_engine_service_use(), key)
+        if operator == "ForAnyValue":
+            statements = [
+                {
+                    **statement,
+                    "Condition": {
+                        name.replace("ForAllValues:", "ForAnyValue:"): entries
+                        for name, entries in statement["Condition"].items()
+                    },
+                }
+                for statement in statements
+            ]
+        findings = self._base._run(
+            mock_ac, mock_kms, statements=[self._base._ADMIN, *statements]
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        if key == "kms:ViaService" and status == "Failed":
+            assert (
+                "kms:CreateGrant only with kms:ViaService"
+                in findings[0]["Finding_Details"]
+            )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_engine_with_a_for_all_values_scope_fails_alone(
+        self, mock_ac, mock_kms
+    ):
+        findings = self._base._run(
+            mock_ac,
+            mock_kms,
+            engines=("pe-1", "pe-2"),
+            policies={
+                "pe-1": [self._base._ADMIN, *_engine_service_use()],
+                "pe-2": [
+                    self._base._ADMIN,
+                    *self._for_all_values(_engine_service_use(), "kms:ViaService"),
+                ],
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "pe-2" in findings[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "targets, status",
+        [({"kms-key-loss": []}, "Failed"), (None, "Passed")],
+        ids=["no-target", "sns-target"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rule_with_no_target_raises_nothing(
+        self, mock_ac, mock_kms, targets, status
+    ):
+        events = _key_loss_events(_key_loss_rule(), targets=targets)
+        findings = self._base._run(
+            mock_ac,
+            mock_kms,
+            events=events,
+            logs=self._base._logs(),
+            cloudwatch=self._base._cloudwatch(),
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        events.list_targets_by_rule.assert_called_with(Rule="kms-key-loss")
+        if status == "Failed":
+            assert "has no target" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_targeted_rule_after_an_untargeted_one_is_credited(
+        self, mock_ac, mock_kms
+    ):
+        events = _key_loss_events(
+            _key_loss_rule(name="first"),
+            _key_loss_rule(name="second"),
+            targets={"first": []},
+        )
+        findings = self._base._run(mock_ac, mock_kms, events=events)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "enabled EventBridge rule second" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_unlistable_targets_are_reported_unread(self, mock_ac, mock_kms):
+        events = _key_loss_events(_key_loss_rule())
+        events.list_targets_by_rule.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        findings = self._base._run(
+            mock_ac,
+            mock_kms,
+            events=events,
+            logs=self._base._logs(),
+            cloudwatch=self._base._cloudwatch(),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "events:ListTargetsByRule" in findings[0]["Finding_Details"]
 
 
 class TestAC36CheckRegistration:
