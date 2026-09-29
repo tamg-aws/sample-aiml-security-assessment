@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-11` endpoint model network path also judges the model each inference
+  component names, from `Specification` and every `Specifications` entry,
+  beside the endpoint config's own `EnableNetworkIsolation` and
+  `VpcConfig`. A component model with isolation off or no `VpcConfig` used
+  to pass behind a compliant endpoint config, and a component that could not
+  be listed or described now leaves its endpoint `N/A`.
+
 - `SM-35` security service delegated administrator also reads
   `config-multiaccountsetup.amazonaws.com`, the principal AWS Config rules
   and conformance packs are delegated through, beside

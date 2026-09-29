@@ -11421,10 +11421,13 @@ def _sm11_rows(
     extra_pages=None,
     permission_cache=None,
     key_managers=None,
+    components=None,
 ):
     """Run SM-11 against models {name: DescribeModel}, endpoints {name: config}.
 
     kms:DescribeKey reports CUSTOMER for any key not in key_managers.
+    components is {name: (endpoint, DescribeInferenceComponent)}, listed on
+    one page.
     """
     endpoints = endpoints or {}
     key_managers = key_managers or {}
@@ -11457,11 +11460,32 @@ def _sm11_rows(
     def describe_endpoint_config(EndpointConfigName):
         return configs[EndpointConfigName]
 
+    components = components or {}
+    if components:
+        # The mock ignores EndpointNameEquals; the check keeps its own.
+        pages["list_inference_components"] = [
+            {
+                "InferenceComponents": [
+                    {"InferenceComponentName": name, "EndpointName": endpoint}
+                    for name, (endpoint, _) in components.items()
+                ]
+            }
+        ]
+
+    def describe_inference_component(InferenceComponentName):
+        value = components[InferenceComponentName][1]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
     sm = _pages_client(
         pages,
         describe_model=MagicMock(side_effect=describe_model),
         describe_endpoint=MagicMock(side_effect=describe_endpoint),
         describe_endpoint_config=MagicMock(side_effect=describe_endpoint_config),
+        describe_inference_component=MagicMock(
+            side_effect=describe_inference_component
+        ),
     )
     ec2_pages = {
         "describe_subnets": [{"Subnets": PRIVATE_SUBNET_FIXTURE[0]}],
@@ -11635,6 +11659,138 @@ class TestSM11EndpointModelNetworkPath:
         rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "inference-component" in rows[0]["Finding_Details"]
+
+    IC_CONFIG = {
+        "ProductionVariants": [{"VariantName": "ic", "InstanceType": "ml.g5"}],
+        "EnableNetworkIsolation": True,
+        "VpcConfig": {"Subnets": ["subnet-private"], "SecurityGroupIds": ["sg-1"]},
+    }
+
+    def _component(self, endpoint, model=None, specifications=None):
+        component = {"EndpointName": endpoint, "VariantName": "ic"}
+        if not model and not specifications:
+            return endpoint, component
+        if model:
+            component["Specification"] = {"ModelName": model}
+        if specifications:
+            component["Specifications"] = [
+                {"InstanceType": "ml.g5", "ModelName": m} for m in specifications
+            ]
+        return endpoint, component
+
+    def _ic_rows(self, models, components):
+        rows, _ = _sm11_rows(
+            models,
+            endpoints={"ep-a": "cfg", "ep-b": "cfg"},
+            configs={"cfg": self.IC_CONFIG},
+            components=components,
+        )
+        return rows
+
+    @pytest.mark.parametrize(
+        "open_model, gap",
+        [
+            (
+                {"EnableNetworkIsolation": False, "VpcConfig": {"Subnets": ["s"]}},
+                "EnableNetworkIsolation off",
+            ),
+            ({"EnableNetworkIsolation": True}, "no VpcConfig"),
+        ],
+    )
+    @pytest.mark.parametrize("open_first", [True, False])
+    def test_an_inference_component_model_fails_only_its_endpoint(
+        self, open_model, gap, open_first
+    ):
+        components = [
+            ("ic-a", self._component("ep-a", "good")),
+            ("ic-b", self._component("ep-b", "open")),
+        ]
+        if open_first:
+            components.reverse()
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL, "open": open_model}, dict(components)
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "Endpoint 'ep-b'" in details
+        assert "ep-a" not in details
+        assert f"model 'open' of inference component 'ic-b' has {gap}" in details
+
+    def test_a_second_specification_model_is_judged(self):
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL, "open": {"EnableNetworkIsolation": False}},
+            {
+                "ic-a": self._component("ep-a", "good"),
+                "ic-b": self._component("ep-b", specifications=["good", "open"]),
+            },
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "model 'open' of inference component 'ic-b'" in (rows[0]["Finding_Details"])
+        )
+
+    def test_inference_components_on_isolated_models_pass(self):
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            {
+                "ic-a": self._component("ep-a", "good"),
+                "ic-b": self._component("ep-b", "good"),
+            },
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 endpoint(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "component_b, named",
+        [
+            (("ep-b", _make_client_error("ThrottlingException")), "ic-b"),
+            (("ep-b", {"Specification": {"ModelName": "gone"}}), "gone"),
+        ],
+    )
+    def test_an_unread_inference_component_model_withholds_the_pass(
+        self, component_b, named
+    ):
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            {"ic-a": self._component("ep-a", "good"), "ic-b": component_b},
+        )
+        assert not [
+            r
+            for r in _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+            if r["Status"] == "Passed"
+        ]
+        incomplete = _by_finding(
+            rows, f"{sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING} Incomplete"
+        )
+        assert [r["Status"] for r in incomplete] == ["N/A"]
+        assert named in incomplete[0]["Finding_Details"]
+        assert "1 endpoint(s) serve" in incomplete[0]["Finding_Details"]
+
+    def test_an_unlisted_inference_component_withholds_the_pass(self):
+        rows, _ = _sm11_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-a": "cfg-a", "ep-b": "cfg"},
+            configs={"cfg-a": _config(["good"]), "cfg": self.IC_CONFIG},
+            extra_pages={
+                "list_inference_components": _make_client_error("AccessDenied")
+            },
+        )
+        assert not [
+            r
+            for r in _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+            if r["Status"] == "Passed"
+        ]
+        incomplete = _by_finding(
+            rows, f"{sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING} Incomplete"
+        )
+        assert (
+            "inference components of endpoint 'ep-b'"
+            in (incomplete[0]["Finding_Details"])
+        )
+        assert "1 endpoint(s) serve" in incomplete[0]["Finding_Details"]
 
     def test_list_endpoints_error_is_not_no_endpoints(self):
         pages = {"list_endpoints": _make_client_error("AccessDeniedException")}
