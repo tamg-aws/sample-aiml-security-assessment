@@ -337,7 +337,7 @@ investigation and remediation.
 ### SM-41: AWS IoT Device-Scoped Policy
 
 - **Severity:** High
-- **Description:** For each AWS IoT policy attached to a certificate or other principal, fails an Allow statement that reaches `Publish`, `Subscribe`, `Receive` or `Connect` on `*`, on all topics, topic filters or client IDs, or through `NotResource`, unless the resource embeds `${iot:Connection.Thing.ThingName}`. `NotAction` Allow statements are expanded to the device actions they reach. A statement allowing `Connect` also needs a `Bool` condition requiring `iot:Connection.Thing.IsAttached` to be `true`. Unattached policies are skipped. No attached policy produces `N/A`.
+- **Description:** For each AWS IoT policy attached to a certificate or other principal, fails an Allow statement that reaches `Publish`, `Subscribe`, `Receive` or `Connect` on `*`, on all topics, topic filters or client IDs, or through `NotResource`, unless the resource embeds `${iot:Connection.Thing.ThingName}` as a whole path segment, with no wildcard or other text before or after it in that segment. `NotAction` Allow statements are expanded to the device actions they reach. A statement allowing `Connect` also needs a `Bool` condition requiring `iot:Connection.Thing.IsAttached` to be `true`. Unattached policies are skipped. No attached policy produces `N/A`. A policy attached to a thing group makes the unique-certificate row `N/A`, because the certificates of the group's things are listed only with `iot:ListThingsInThingGroup` and `iot:ListThingPrincipals`, which the role does not hold.
 
 ### SM-42: Batch Transform Creation Guardrail
 

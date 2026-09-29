@@ -16309,12 +16309,15 @@ def _iot_resource_bounded_to_thing(resource: str) -> bool:
 
     A resource without the variable reaches every device's topic, and a
     wildcard or other text right after it (topic/${ThingName}*) reaches the
-    topics of every thing whose name starts with this one.
+    topics of every thing whose name starts with this one. Right before it
+    (topic/*${ThingName}) it reaches every thing whose name ends with this one.
     """
     parts = resource.split(IOT_THING_NAME_VARIABLE)
     if len(parts) < 2:
         return False
-    return all(part == "" or part.startswith("/") for part in parts[1:])
+    return all(part.endswith("/") for part in parts[:-1]) and all(
+        part == "" or part.startswith("/") for part in parts[1:]
+    )
 
 
 def _iot_broad_resource(statement: Dict[str, Any]) -> Optional[str]:
@@ -16408,6 +16411,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
 
     failed, passed, errors = [], [], []
     certificates = set()
+    thing_groups = set()
     for policy in policies:
         name = policy.get("policyName")
         if not name:
@@ -16420,6 +16424,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
             if not targets:
                 continue
             certificates.update(t for t in targets if ":cert/" in str(t))
+            thing_groups.update(t for t in targets if ":thinggroup/" in str(t))
             document = iot_client.get_policy(policyName=name).get("policyDocument")
         except Exception as error:
             errors.append((name, error))
@@ -16484,16 +16489,24 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
             )
         )
     findings["csv_data"].append(
-        _iot_unique_certificate_finding(iot_client, sorted(certificates), region)
+        _iot_unique_certificate_finding(
+            iot_client, sorted(certificates), region, sorted(thing_groups)
+        )
     )
     findings["csv_data"].append(_iot_audit_finding(iot_client, region))
     return findings
 
 
 def _iot_unique_certificate_finding(
-    iot_client, certificates: List[str], region: str
+    iot_client, certificates: List[str], region: str, thing_groups: List[str]
 ) -> Dict[str, Any]:
-    """SM-41: each certificate a device policy is attached to serves one thing."""
+    """
+    SM-41: each certificate a device policy is attached to serves one thing.
+
+    A policy attached to a thing group reaches the certificates of the group's
+    things, which iot:ListThingsInThingGroup and iot:ListThingPrincipals would
+    list. The role holds neither, so each such group withholds the Passed.
+    """
 
     def _row(details, resolution, severity, status):
         return create_finding(
@@ -16507,7 +16520,7 @@ def _iot_unique_certificate_finding(
             region=region,
         )
 
-    if not certificates:
+    if not certificates and not thing_groups:
         return _row(
             "No attached AWS IoT policy in this region is attached to a "
             "certificate, so there is no device certificate to assess.",
@@ -16540,6 +16553,15 @@ def _iot_unique_certificate_finding(
         f"{IOT_SHARED_CERTIFICATE_CHECK} infers it from concurrent connections "
         "and is reported in the audit row."
     )
+    groups = ""
+    if thing_groups:
+        names = ", ".join(g.rsplit("/", 1)[-1] for g in thing_groups[:10])
+        groups = (
+            f" {len(thing_groups)} thing group(s) an attached policy is attached "
+            f"to ({names}) reach the certificates of their things, which were not "
+            "listed: iot:ListThingsInThingGroup and iot:ListThingPrincipals are "
+            "not granted, so those certificates are not assessed."
+        )
     if shared:
         return _row(
             f"{len(shared)} of {len(certificates)} device certificate(s) are shared "
@@ -16556,9 +16578,24 @@ def _iot_unique_certificate_finding(
             IOT_UNIQUE_CERTIFICATE_FINDING,
             unread,
             f"{len(certificates) - len(unread)} certificate(s) read are each "
-            "attached to at most one thing." + ceiling,
+            "attached to at most one thing." + groups + ceiling,
             IOT_UNIQUE_CERTIFICATE_REFERENCE,
             region,
+        )
+    if thing_groups:
+        direct = (
+            f"Each of the {len(certificates)} certificate(s) that an attached AWS "
+            "IoT policy is attached to directly is attached to at most one thing."
+            if certificates
+            else "No attached AWS IoT policy is attached to a certificate directly."
+        )
+        return _row(
+            direct + groups + ceiling,
+            "Attach device policies to certificates, or grant "
+            "iot:ListThingsInThingGroup and iot:ListThingPrincipals so the "
+            "certificates of each thing group can be assessed.",
+            "Informational",
+            "N/A",
         )
     return _row(
         f"Each of the {len(certificates)} certificate(s) that an attached AWS IoT "

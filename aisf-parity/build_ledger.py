@@ -1733,9 +1733,13 @@ FOUNDATION_ROWS = [
         "SM-41 reads each AWS IoT policy that is attached to a target and fails "
         "an Allow on iot:Publish, iot:Subscribe, iot:Receive or iot:Connect whose "
         "Resource ends in topic/*, topicfilter/*, client/* or is * without the "
-        "${iot:Connection.Thing.ThingName} variable, since that policy grants "
-        "every device the same reach. It also fails a Connect Allow with no "
-        "iot:Connection.Thing.IsAttached condition",
+        "${iot:Connection.Thing.ThingName} variable filling a whole path "
+        "segment, since that policy grants every device the same reach, or a "
+        "device the reach of every thing whose name starts or ends with its "
+        "own. It also fails a Connect Allow with no "
+        "iot:Connection.Thing.IsAttached condition. A policy attached to a "
+        "thing group withholds the unique-certificate Passed, since the "
+        "certificates of the group's things are not listed",
         [],
         6,
     ),

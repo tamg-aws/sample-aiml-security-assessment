@@ -261,6 +261,14 @@ section.
 
 ### Fixed
 
+- `SM-41` requires `${iot:Connection.Thing.ThingName}` to fill a whole path
+  segment of a device policy resource. `topic/*${iot:Connection.Thing.ThingName}`
+  and `topic/x-${iot:Connection.Thing.ThingName}` used to pass, and they reach
+  the topics of every thing whose name ends with the device's own. A device
+  policy attached to a thing group now makes the unique-certificate row
+  `N/A` and names the group, where the check read only certificates that a
+  policy is attached to directly and could pass without the group's.
+
 - `SM-23` reports a Region with no InService endpoint as `N/A`, where it used
   to pass with no endpoint to judge.
 

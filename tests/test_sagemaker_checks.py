@@ -9955,6 +9955,99 @@ class TestSM41DeviceIdentityAndAudit:
     def test_resource_bounded_to_the_thing(self, resource):
         assert sagemaker_app._iot_resource_bounded_to_thing(resource)
 
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            _IOT_TOPIC + "*${iot:Connection.Thing.ThingName}",
+            _IOT_TOPIC + "devices/*${iot:Connection.Thing.ThingName}/*",
+            _IOT_TOPIC + "devices/x-${iot:Connection.Thing.ThingName}",
+            _IOT_CLIENT + "*${iot:Connection.Thing.ThingName}",
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_wildcard_or_text_before_the_variable_is_not_bounded(
+        self, mock_client, resource
+    ):
+        # topic/*${ThingName} matches the topic of every thing whose name ends
+        # with this one, so the segment must start at the variable too.
+        assert not sagemaker_app._iot_resource_bounded_to_thing(resource)
+        by_name, rows = self._run(
+            mock_client,
+            _iot_document(
+                json.loads(_scoped_iot_document())["Statement"][0],
+                {"Effect": "Allow", "Action": "iot:Publish", "Resource": resource},
+            ),
+        )
+        failed = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.IOT_DEVICE_POLICY_FINDING
+            and r["Status"] == "Failed"
+        ]
+        assert len(failed) == 1
+        assert "policy 'p'" in failed[0]["Finding_Details"]
+        assert f"on '{resource}'" in failed[0]["Finding_Details"]
+        passed = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.IOT_DEVICE_POLICY_FINDING
+            and r["Status"] == "Passed"
+        ]
+        assert "q" in passed[0]["Finding_Details"]
+
+    THING_GROUP = "arn:aws:iot:us-east-1:123456789012:thinggroup/fleet"
+
+    @pytest.mark.parametrize("group_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_policy_on_a_thing_group_withholds_the_certificate_pass(
+        self, mock_client, group_first
+    ):
+        q_targets = [self.CERT_B, self.THING_GROUP]
+        if group_first:
+            q_targets.reverse()
+        by_name, _ = self._run(
+            mock_client,
+            targets={"p": [{"targets": [self.CERT_A]}], "q": [{"targets": q_targets}]},
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "N/A"
+        assert (
+            "thing group(s) an attached policy is attached to (fleet)"
+            in row["Finding_Details"]
+        )
+        assert "iot:ListThingsInThingGroup" in row["Finding_Details"]
+        assert "b" * 64 not in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_thing_group_does_not_hide_a_shared_certificate(self, mock_client):
+        by_name, _ = self._run(
+            mock_client,
+            targets={
+                "p": [{"targets": [self.THING_GROUP]}],
+                "q": [{"targets": [self.CERT_B]}],
+            },
+            principal_things={self.CERT_B: ["thing-1", "thing-2"]},
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "Failed"
+        assert "b" * 64 in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_only_thing_group_targets_are_not_read_as_no_certificate(self, mock_client):
+        by_name, _ = self._run(
+            mock_client,
+            targets={
+                "p": [{"targets": [self.THING_GROUP]}],
+                "q": [{"targets": []}],
+            },
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "N/A"
+        assert (
+            "thing group(s) an attached policy is attached to (fleet)"
+            in row["Finding_Details"]
+        )
+
     @patch("sagemaker_app.boto3.client")
     def test_every_certificate_on_one_thing_passes(self, mock_client):
         by_name, rows = self._run(mock_client)
