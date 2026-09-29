@@ -280,6 +280,8 @@ _EXPECTED_ACTIONS = {
         "tag:GetResources",
     },
     "SageMakerAssessmentReadsPolicy": {
+        "ec2:DescribeManagedPrefixLists",
+        "ec2:GetManagedPrefixListEntries",
         "organizations:ListAWSServiceAccessForOrganization",
         "sagemaker:DescribeModelBiasJobDefinition",
         "sagemaker:DescribeModelExplainabilityJobDefinition",
@@ -808,6 +810,12 @@ _SAGEMAKER_MONITORING_JOB_DEFINITIONS = json.dumps(
 )
 _SAGEMAKER_MANAGED_GRANTS = [
     ("Allow", "organizations:ListAWSServiceAccessForOrganization", '"*"'),
+    ("Allow", "ec2:DescribeManagedPrefixLists", '"*"'),
+    (
+        "Allow",
+        "ec2:GetManagedPrefixListEntries",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:ec2:*:*:prefix-list/*"}),
+    ),
     *(
         ("Allow", action, _SAGEMAKER_MONITORING_JOB_DEFINITIONS)
         for action in (

@@ -10049,8 +10049,13 @@ class TestSM39WorkloadSegmentation:
         groups=None,
         eks=None,
         errors=None,
+        prefix_lists=None,
     ):
-        """services: {cluster: [service dicts]}; eks: {cluster: config string}."""
+        """services: {cluster: [service dicts]}; eks: {cluster: config string}.
+
+        prefix_lists: {id: (owner, [cidrs] or an exception the entries read raises)}.
+        """
+        prefix_lists = prefix_lists or {}
         errors = errors or {}
         by_cluster = services or {}
         functions = functions or []
@@ -10129,6 +10134,34 @@ class TestSM39WorkloadSegmentation:
                     }
 
                 client.describe_security_groups.side_effect = describe_security_groups
+
+                def describe_prefix_lists(PrefixListIds):
+                    if "prefix_lists" in errors:
+                        raise errors["prefix_lists"]
+                    return [
+                        {
+                            "PrefixLists": [
+                                {"PrefixListId": p, "OwnerId": prefix_lists[p][0]}
+                                for p in PrefixListIds
+                                if p in prefix_lists
+                            ]
+                        }
+                    ]
+
+                def prefix_list_entries(PrefixListId):
+                    entries = prefix_lists[PrefixListId][1]
+                    if isinstance(entries, Exception):
+                        raise entries
+                    # One entry per page, so a reader of only the first page
+                    # misses every later entry.
+                    return [{"Entries": [{"Cidr": cidr}]} for cidr in entries]
+
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "describe_managed_prefix_lists": describe_prefix_lists,
+                        "get_managed_prefix_list_entries": prefix_list_entries,
+                    }
+                )
             return client
 
         with patch("sagemaker_app.boto3.client", side_effect=factory):
@@ -10344,7 +10377,34 @@ class TestSM39WorkloadSegmentation:
         assert [r["Status"] for r in seg] == ["Passed"]
         assert "a CIDR wider than /24 (IPv6 /64)" in seg[0]["Finding_Details"]
 
-    def test_a_prefix_list_rule_withholds_the_pass(self):
+    @staticmethod
+    def _to_list(*prefix_list_ids):
+        return {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "PrefixListIds": [{"PrefixListId": p} for p in prefix_list_ids],
+        }
+
+    @pytest.mark.parametrize(
+        ("prefix_lists", "errors", "action"),
+        [
+            (
+                {"pl-1": ("111122223333", _make_client_error("AccessDenied"))},
+                {},
+                "ec2:GetManagedPrefixListEntries: ",
+            ),
+            (
+                {"pl-1": ("111122223333", ["10.0.1.0/24"])},
+                {"prefix_lists": _make_client_error("AccessDenied")},
+                "ec2:DescribeManagedPrefixLists: ",
+            ),
+            ({}, {}, "not returned by ec2:DescribeManagedPrefixLists"),
+        ],
+    )
+    def test_an_unread_prefix_list_withholds_the_pass(
+        self, prefix_lists, errors, action
+    ):
         seg = self._seg(
             self._run(
                 functions=[
@@ -10352,26 +10412,119 @@ class TestSM39WorkloadSegmentation:
                     self._function("other", ["sg-b"]),
                 ],
                 groups=[
-                    self._sg(
-                        "sg-a",
-                        egress=[
-                            {
-                                "IpProtocol": "tcp",
-                                "FromPort": 443,
-                                "ToPort": 443,
-                                "PrefixListIds": [{"PrefixListId": "pl-1"}],
-                            }
-                        ],
-                    ),
+                    self._sg("sg-a", egress=[self._to_list("pl-1")]),
                     self._sg("sg-b"),
                 ],
+                prefix_lists=prefix_lists,
+                errors=errors,
             )
         )
         assert [r["Status"] for r in seg] == ["N/A"]
         details = seg[0]["Finding_Details"]
         assert "prefix list pl-1 in sg-a" in details
-        assert "ec2:GetManagedPrefixListEntries" in details
+        assert action in details
         assert "sg-b" not in details
+
+    def test_an_aws_managed_prefix_list_is_credited(self):
+        # AWS's S3 list holds /15 and /16 ranges; they are not judged by width.
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-63a5400a")])],
+                prefix_lists={"pl-63a5400a": ("AWS", ["52.216.0.0/15"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+        assert "customer-managed prefix list" in seg[0]["Finding_Details"]
+
+    def test_a_customer_prefix_list_of_narrow_entries_passes(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-1")])],
+                prefix_lists={"pl-1": ("111122223333", ["10.0.1.0/24", "10.0.2.9/32"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+
+    @pytest.mark.parametrize("broad_last", [True, False])
+    def test_a_broad_entry_in_a_customer_prefix_list_fails_only_its_workload(
+        self, broad_last
+    ):
+        # The broad entry sits on a later page of a later list, and the
+        # passing workload uses an AWS-managed list, so neither the first
+        # page nor the first list alone decides the verdict.
+        entries = ["10.0.1.0/24", "10.0.0.0/16"]
+        if not broad_last:
+            entries.reverse()
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("tool", ["sg-a"]),
+                    self._function("other", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._to_list("pl-0", "pl-1")]),
+                    self._sg("sg-b", egress=[self._to_list("pl-aws")]),
+                ],
+                prefix_lists={
+                    "pl-0": ("111122223333", ["10.0.9.0/24"]),
+                    "pl-1": ("111122223333", entries),
+                    "pl-aws": ("AWS", ["52.216.0.0/15"]),
+                },
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert "10.0.0.0/16 in pl-1" in details
+        assert "an entry of a customer-managed prefix list" in details
+        assert "tool" in details
+        assert "other" not in details
+        assert "pl-aws" not in details
+
+    def test_a_broad_ipv6_entry_in_a_customer_prefix_list_fails(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-1")])],
+                prefix_lists={"pl-1": ("111122223333", ["2600:1f18::/40"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        assert "2600:1f18::/40 in pl-1" in seg[0]["Finding_Details"]
+
+    def test_a_between_width_prefix_list_entry_is_unjudged(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._to_list("pl-1")])],
+                prefix_lists={"pl-1": ("111122223333", ["10.0.0.0/20"])},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert "10.0.0.0/20 in pl-1" in seg[0]["Finding_Details"]
+
+    def test_an_unread_prefix_list_does_not_hide_a_broad_one(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("tool", ["sg-a"]),
+                    self._function("other", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._to_list("pl-1")]),
+                    self._sg("sg-b", egress=[self._to_list("pl-2")]),
+                ],
+                prefix_lists={
+                    "pl-1": ("111122223333", _make_client_error("AccessDenied")),
+                    "pl-2": ("111122223333", ["0.0.0.0/0"]),
+                },
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed", "N/A"]
+        assert "0.0.0.0/0 in pl-2" in seg[0]["Finding_Details"]
+        assert "pl-1" not in seg[0]["Finding_Details"]
+        assert "prefix list pl-1 in sg-a" in seg[1]["Finding_Details"]
 
     @pytest.mark.parametrize("default_first", [True, False])
     def test_a_rule_to_the_vpc_default_group_fails_only_its_workload(

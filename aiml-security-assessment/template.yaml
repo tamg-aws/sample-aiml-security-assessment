@@ -733,7 +733,16 @@ Resources:
             Effect: Allow
             Action:
               - organizations:ListAWSServiceAccessForOrganization # SM-35
+              - ec2:DescribeManagedPrefixLists # SM-39
             Resource: '*'
+          - Sid: PrefixListEntriesRead
+            # SM-39 judges the entries of each customer-managed prefix list a
+            # workload's rules name. The account segment is open because a
+            # list can be shared through AWS RAM from another account.
+            Effect: Allow
+            Action:
+              - ec2:GetManagedPrefixListEntries # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:prefix-list/*'
           - Sid: MonitoringJobDefinitionRead
             # SM-23 reads the baseline constraints file each named ModelQuality,
             # ModelBias and ModelExplainability job definition names.

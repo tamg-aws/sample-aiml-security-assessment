@@ -378,10 +378,16 @@ section.
   CIDR narrower than that and wider than a /24 (IPv6 /64) used to pass; it
   now withholds `Passed` in a `CIDR Width Not Judged` `N/A` row that names
   both bounds, because AIR-SLF-RT-05 asks for security group references in
-  place of broad CIDR allowances and names no width. A rule that names a
-  prefix list, whose entries need the ungranted
-  `ec2:GetManagedPrefixListEntries`, or references a group that was not
-  read also withholds `Passed` in an `N/A` row.
+  place of broad CIDR allowances and names no width. A rule that
+  references a group that was not read also withholds `Passed` in an `N/A`
+  row. A rule that names a customer-managed prefix list is judged on each
+  of the list's entries with the same bounds, labelled with the list, so a
+  list holding `0.0.0.0/0` fails the workload that uses it. A rule that
+  names an AWS-managed prefix list, one AWS service's published ranges such
+  as the S3 list's /15 and /16 entries, is credited without a width
+  judgment. A prefix list whose owner or entries were not read withholds
+  `Passed` in an `N/A` row naming the list, the groups whose rules name it
+  and the failed action.
 
 - `SM-40` fails a secret whose rotation schedule allows a gap longer than 90
   days, the default of Security Hub control `SecretsManager.4`, so
@@ -1319,9 +1325,12 @@ has no resource type and moves out of the inline
 `sagemaker:DescribeModelBiasJobDefinition` and
 `sagemaker:DescribeModelExplainabilityJobDefinition` on the account's
 `model-quality-job-definition/*`, `model-bias-job-definition/*` and
-`model-explainability-job-definition/*` ARNs (`SM-23`). All are read-only. The
-deployment role permissions added for `BedrockAssessmentReadsPolicy` cover
-this policy too.
+`model-explainability-job-definition/*` ARNs (`SM-23`), and
+`ec2:DescribeManagedPrefixLists` on `*`, which has no resource type, and
+`ec2:GetManagedPrefixListEntries` on `prefix-list/*` with the account
+segment open, because a list can be shared through AWS RAM from another
+account (`SM-39`). All are read-only. The deployment role permissions added
+for `BedrockAssessmentReadsPolicy` cover this policy too.
 
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a

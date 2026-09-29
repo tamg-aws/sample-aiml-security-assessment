@@ -15852,25 +15852,103 @@ def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
         return entry.group(1) if entry else None
 
 
-def _broad_rule_targets(permission: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    """(broad, unjudged) CIDRs in one rule, split at the BROAD_ and UNJUDGED_ bounds."""
+def _broad_rule_targets(
+    permission: Dict[str, Any], prefix_lists: Dict[str, Optional[List[str]]]
+) -> Tuple[List[str], List[str]]:
+    """(broad, unjudged) CIDRs in one rule, split at the BROAD_ and UNJUDGED_ bounds.
+
+    A customer-managed prefix list the rule names adds each of its entries,
+    labelled with the list. An AWS-managed list (None) adds none.
+    """
+    cidrs = [
+        (entry.get(field) or "", family, "")
+        for key, field, family in (
+            ("IpRanges", "CidrIp", "IPv4"),
+            ("Ipv6Ranges", "CidrIpv6", "IPv6"),
+        )
+        for entry in permission.get(key) or []
+    ]
+    for entry in permission.get("PrefixListIds") or []:
+        prefix_list_id = entry.get("PrefixListId")
+        cidrs.extend(
+            (cidr, "prefix list", f" in {prefix_list_id}")
+            for cidr in prefix_lists.get(prefix_list_id) or []
+        )
     broad, unjudged = [], []
-    for key, field, broad_prefix, unjudged_prefix, family in (
-        ("IpRanges", "CidrIp", BROAD_IPV4_PREFIX, UNJUDGED_IPV4_PREFIX, "IPv4"),
-        ("Ipv6Ranges", "CidrIpv6", BROAD_IPV6_PREFIX, UNJUDGED_IPV6_PREFIX, "IPv6"),
-    ):
-        for entry in permission.get(key) or []:
-            cidr = entry.get(field) or ""
-            try:
-                prefixlen = ipaddress.ip_network(cidr, strict=False).prefixlen
-            except ValueError:
-                broad.append(cidr or f"an unparsed {family} range")
-                continue
-            if prefixlen <= broad_prefix:
-                broad.append(cidr)
-            elif prefixlen <= unjudged_prefix:
-                unjudged.append(cidr)
+    for cidr, family, where in cidrs:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            broad.append((cidr or f"an unparsed {family} range") + where)
+            continue
+        if network.version == 4:
+            broad_prefix, unjudged_prefix = BROAD_IPV4_PREFIX, UNJUDGED_IPV4_PREFIX
+        else:
+            broad_prefix, unjudged_prefix = BROAD_IPV6_PREFIX, UNJUDGED_IPV6_PREFIX
+        if network.prefixlen <= broad_prefix:
+            broad.append(cidr + where)
+        elif network.prefixlen <= unjudged_prefix:
+            unjudged.append(cidr + where)
     return broad, unjudged
+
+
+def _prefix_list_cidrs(
+    ec2_client: Any, users: Dict[str, List[str]]
+) -> Tuple[Dict[str, Optional[List[str]]], List[str]]:
+    """The entries of each customer-managed prefix list; None for AWS-managed.
+
+    users maps each prefix list to the security groups whose rules name it.
+    An AWS-managed list names one AWS service's published ranges, which are
+    as wide as that service's address space, so its entries are not judged
+    by width. A list whose owner or entries were not read is left out and
+    named in the unread list.
+    """
+    if not users:
+        return {}, []
+
+    def where(prefix_list_id: str) -> str:
+        return f"prefix list {prefix_list_id} in {', '.join(users[prefix_list_id][:3])}"
+
+    owners = {}
+    try:
+        for page in ec2_client.get_paginator("describe_managed_prefix_lists").paginate(
+            PrefixListIds=sorted(users)
+        ):
+            for prefix_list in page.get("PrefixLists", []):
+                owners[prefix_list.get("PrefixListId")] = prefix_list.get("OwnerId")
+    except Exception as error:
+        label = get_assessment_error_label(error)
+        return {}, [
+            f"{where(prefix_list_id)} (ec2:DescribeManagedPrefixLists: {label})"
+            for prefix_list_id in sorted(users)
+        ]
+    prefix_lists, unread = {}, []
+    for prefix_list_id in sorted(users):
+        if prefix_list_id not in owners:
+            unread.append(
+                f"{where(prefix_list_id)} (not returned by "
+                "ec2:DescribeManagedPrefixLists)"
+            )
+            continue
+        if owners[prefix_list_id] == "AWS":
+            prefix_lists[prefix_list_id] = None
+            continue
+        try:
+            entries = []
+            for page in ec2_client.get_paginator(
+                "get_managed_prefix_list_entries"
+            ).paginate(PrefixListId=prefix_list_id):
+                entries.extend(page.get("Entries", []))
+        except Exception as error:
+            unread.append(
+                f"{where(prefix_list_id)} (ec2:GetManagedPrefixListEntries: "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        prefix_lists[prefix_list_id] = [
+            str(entry.get("Cidr") or "") for entry in entries
+        ]
+    return prefix_lists, unread
 
 
 def _rule_ports(permission: Dict[str, Any]) -> str:
@@ -15897,6 +15975,7 @@ def _security_group_problems(
     check_ingress: bool,
     referenced: Dict[str, Any],
     unjudged: List[str],
+    prefix_lists: Dict[str, Optional[List[str]]],
 ) -> List[str]:
     """Rule problems of one group; rules to an unjudged CIDR go to unjudged."""
     problems = []
@@ -15904,7 +15983,7 @@ def _security_group_problems(
         group, check_ingress
     ):
         rule = f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)}"
-        broad, between = _broad_rule_targets(permission)
+        broad, between = _broad_rule_targets(permission, prefix_lists)
         if broad:
             problems.append(f"{rule} {preposition} {', '.join(broad[:3])}")
         if between:
@@ -16125,19 +16204,21 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
         groups = None
 
     referenced = {}
+    prefix_lists = {}
     if groups:
         pending = {}
+        prefix_list_users = {}
         for group_id in group_ids:
             group = groups.get(group_id)
             if group is None:
                 continue
             for _, _, permission in _security_group_permissions(group, True):
                 for entry in permission.get("PrefixListIds") or []:
-                    unread.append(
-                        f"prefix list {entry.get('PrefixListId')} in {group_id} (its "
-                        "entries are not read: ec2:GetManagedPrefixListEntries is "
-                        "not granted)"
+                    named_by = prefix_list_users.setdefault(
+                        entry.get("PrefixListId") or "(no id)", []
                     )
+                    if group_id not in named_by:
+                        named_by.append(group_id)
                 for pair in permission.get("UserIdGroupPairs") or []:
                     target = pair.get("GroupId")
                     if not target or target == group_id:
@@ -16170,6 +16251,8 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 for target in targets
                 if target not in referenced
             )
+        prefix_lists, prefix_unread = _prefix_list_cidrs(ec2_client, prefix_list_users)
+        unread.extend(prefix_unread)
 
     users = {}
     for workload in workloads:
@@ -16204,7 +16287,11 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 between = []
                 found.extend(
                     _security_group_problems(
-                        groups[group], workload["ingress"], referenced, between
+                        groups[group],
+                        workload["ingress"],
+                        referenced,
+                        between,
+                        prefix_lists,
                     )
                 )
                 unjudged.extend(f"{workload['label']}: {rule}" for rule in between)
@@ -16227,12 +16314,15 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                     "when its own security group allows traffic to and from the "
                     "dependency's security group or prefix list, not the VPC "
                     f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
-                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider."
+                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider, named directly or as "
+                    "an entry of a customer-managed prefix list."
                 ),
                 resolution=(
                     "Give every agent service and function its own security group, "
                     "and replace CIDR rules with rules that reference the "
-                    "dependency's security group or a managed prefix list."
+                    "dependency's security group, the AWS-managed prefix list of "
+                    "the AWS service it calls, or a customer-managed prefix list "
+                    "that holds only the dependency's ranges."
                 ),
                 reference=WORKLOAD_SEGMENTATION_REFERENCE,
                 severity="Medium",
@@ -16308,8 +16398,10 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                     "in their own security groups with no rule to or from the VPC "
                     "default security group or a CIDR wider than "
                     f"/{UNJUDGED_IPV4_PREFIX + 1} (IPv6 /{UNJUDGED_IPV6_PREFIX + 1}), "
-                    "and none that names a prefix list. Standalone EC2 instances "
-                    "are not read."
+                    "named directly or as an entry of a customer-managed prefix "
+                    "list. A rule to an AWS-managed prefix list names one AWS "
+                    "service's published ranges and is not judged by width. "
+                    "Standalone EC2 instances are not read."
                     if workloads
                     else "No ECS services or Lambda functions found in this region."
                 ),
