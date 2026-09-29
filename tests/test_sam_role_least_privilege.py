@@ -142,6 +142,7 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockAssessmentReadsPolicy": {
+        "account:ListRegions",
         "aoss:GetAccessPolicy",
         "aoss:ListAccessPolicies",
         "bedrock:ListIngestionJobs",
@@ -749,6 +750,16 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     {
                         "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
                         "${AWS::AccountId}:training-job/*"
+                    }
+                ),
+            ),
+            (
+                "Allow",
+                "account:ListRegions",
+                json.dumps(
+                    {
+                        "Fn::Sub": "arn:${AWS::Partition}:account::"
+                        "${AWS::AccountId}:account"
                     }
                 ),
             ),
@@ -1579,6 +1590,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockAssessmentReadsPolicy", "CloudTrailEventDataStoreRead"): (
             "cloudtrail:GetEventDataStore",
             "cloudtrail:*:${AWS::AccountId}:eventdatastore/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "AccountListRegions"): (
+            "account:ListRegions",
+            "account::${AWS::AccountId}:account",
         ),
         ("BedrockSecurityAssessmentFunction", "SSOPermissionSetRead"): (
             "sso:GetInlinePolicyForPermissionSet",

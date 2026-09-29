@@ -322,6 +322,13 @@ Resources:
             Action:
               - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
             Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
+          - Sid: AccountListRegions
+            # BR-51 lists the Regions enabled for this account and sweeps each
+            # for an IAM Identity Center instance.
+            Effect: Allow
+            Action:
+              - account:ListRegions # BR-51
+            Resource: !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

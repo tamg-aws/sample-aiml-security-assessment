@@ -23776,6 +23776,32 @@ def _identity_center_instances(region: str) -> Dict[str, Any]:
     }
 
 
+def _identity_center_regions() -> Dict[str, Any]:
+    """List the Regions enabled for this account, where an instance may be homed."""
+    try:
+        regions = _list_all_items(
+            boto3.client("account", config=boto3_config),
+            "list_regions",
+            "Regions",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+            max_results=50,
+            RegionOptStatusContains=["ENABLED", "ENABLED_BY_DEFAULT"],
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "regions": [],
+            "error": f"account:ListRegions ({get_assessment_error_label(error)})",
+        }
+    return {
+        "regions": sorted(
+            {region["RegionName"] for region in regions if region.get("RegionName")}
+        ),
+        "error": None,
+    }
+
+
 def _identity_center_ai_permission_sets(
     instance_arns: List[str], region: str
 ) -> Dict[str, List[str]]:
@@ -23861,41 +23887,74 @@ def _identity_center_ai_permission_sets(
 
 def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
     """
-    Read the IAM Identity Center leg of BR-51: the instances visible in
-    sso_region and, for each, the permission sets that grant AI writes and
-    whether each carries an aws:PrincipalTag Deny over those writes.
+    Read the IAM Identity Center leg of BR-51: the instances visible in every
+    Region enabled for this account and, for each, the permission sets that
+    grant AI writes and whether each carries an aws:PrincipalTag Deny over
+    those writes. When the enabled Regions cannot be listed, only sso_region
+    is read and the leg cannot pass.
 
     The instance's MFA mode is returned by no sso-admin operation, so a visible
     instance keeps the row at N/A even when every permission set is covered.
     """
-    identity_center = _identity_center_instances(sso_region)
-    if identity_center["error"]:
+    enabled = _identity_center_regions()
+    regions = enabled["regions"] or [sso_region]
+    listed = {region: _identity_center_instances(region) for region in regions}
+    errors = [result["error"] for result in listed.values() if result["error"]]
+    found = {region: result for region, result in listed.items() if result["arns"]}
+    if enabled["error"]:
+        region_note = (
+            f"The enabled Regions were not listed with {enabled['error']}, so "
+            f"only {sso_region} was read. "
+        )
+    else:
+        region_note = ""
+    if errors:
+        region_note += (
+            "Identity Center instances were not listed with {}, so people who "
+            "sign in through one may hold AI write access. ".format("; ".join(errors))
+        )
+    if not found:
+        empty = sorted(
+            region for region, result in listed.items() if not result["error"]
+        )
+        if not region_note:
+            return {
+                "note": (
+                    "sso:ListInstances returned no IAM Identity Center instance "
+                    "in any of the {} Region(s) enabled for this account "
+                    "({}).".format(len(empty), ", ".join(empty))
+                ),
+                "status": "Passed",
+                "severity": "High",
+                "unguarded": [],
+            }
+        if not errors:
+            note = (
+                f"{region_note}sso:ListInstances in {sso_region} returned no IAM "
+                "Identity Center instance. An instance homed only in another "
+                "Region is not listed here, so this is not reported as Passed: "
+                "whether people sign in through an instance in another Region "
+                "was not read."
+            )
+        elif empty:
+            note = (
+                "{}sso:ListInstances returned no IAM Identity Center instance "
+                "in {}.".format(region_note, ", ".join(empty))
+            )
+        else:
+            note = region_note.rstrip()
         return {
-            "note": (
-                "Identity Center instances were not listed with "
-                f"{identity_center['error']}, so people who sign in through "
-                "one may hold AI write access."
-            ),
+            "note": note,
             "status": "N/A",
             "severity": "Informational",
             "unguarded": [],
         }
-    if not identity_center["instances"]:
-        return {
-            "note": (
-                f"sso:ListInstances in {sso_region} returned no IAM Identity "
-                "Center instance. An instance homed only in another Region is "
-                "not listed here, so this is not reported as Passed: whether "
-                "people sign in through an instance in another Region was not "
-                "read."
-            ),
-            "status": "N/A",
-            "severity": "Informational",
-            "unguarded": [],
-        }
-    permission_sets = _identity_center_ai_permission_sets(
-        identity_center["arns"], sso_region
-    )
+    permission_sets = {"granting": [], "guarded": [], "unguarded": [], "unread": []}
+    for region, result in sorted(found.items()):
+        for key, values in _identity_center_ai_permission_sets(
+            result["arns"], region
+        ).items():
+            permission_sets[key].extend(values)
     if permission_sets["granting"]:
         sets_note = (
             " {} permission set(s) grant AI writes in their inline policy: {}.".format(
@@ -23922,17 +23981,22 @@ def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
         sets_note += " These reads failed: {}.".format(
             "; ".join(permission_sets["unread"][:5])
         )
+    instances = [
+        instance for result in found.values() for instance in result["instances"]
+    ]
     return {
         "note": (
-            "IAM Identity Center instance(s) {} are visible to this "
-            "account, and the people who sign in through them are judged "
-            "by no row.{} Partial, ceiling reached: the instance's MFA "
-            "settings are returned by no sso-admin operation ({}); the "
+            "{}IAM Identity Center instance(s) {} are visible to this "
+            "account (listed in {}), and the people who sign in through them "
+            "are judged by no row.{} Partial, ceiling reached: the instance's "
+            "MFA settings are returned by no sso-admin operation ({}). The "
             "attributes for access control that set the tag "
             "(sso:DescribeInstanceAccessControlAttributeConfiguration) and "
             "the managed policies attached to a permission set are not "
             "read.".format(
-                ", ".join(identity_center["instances"][:5]),
+                region_note,
+                ", ".join(sorted(instances)[:5]),
+                ", ".join(sorted(found)),
                 sets_note,
                 IDENTITY_CENTER_MFA_REFERENCE,
             )

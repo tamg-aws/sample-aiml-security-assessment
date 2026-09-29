@@ -26235,10 +26235,15 @@ class TestBR51AIUserConsoleMFA:
         instances=None,
         permission_sets=None,
         inline=None,
+        regions=None,
     ):
         iam = MagicMock()
         login = login or {}
         permission_sets = permission_sets or {}
+        if regions is None:
+            iam.list_regions.side_effect = _make_client_error("AccessDeniedException")
+        else:
+            iam.list_regions.side_effect = list(regions)
         inline = inline or {}
 
         def list_permission_sets(InstanceArn, **kwargs):
@@ -26309,6 +26314,120 @@ class TestBR51AIUserConsoleMFA:
             "through an instance in another Region was not read."
             in rows[0]["Finding_Details"]
         )
+
+    ENABLED_FILTER = ["ENABLED", "ENABLED_BY_DEFAULT"]
+
+    def test_br51_an_instance_in_a_later_enabled_region_is_found(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            regions=[
+                {
+                    "Regions": [
+                        {
+                            "RegionName": "eu-west-1",
+                            "RegionOptStatus": "ENABLED_BY_DEFAULT",
+                        }
+                    ],
+                    "NextToken": "r2",
+                },
+                {
+                    "Regions": [
+                        {"RegionName": "ap-south-2", "RegionOptStatus": "ENABLED"}
+                    ]
+                },
+            ],
+            instances=[
+                {"Instances": [{"InstanceArn": "arn:aws:sso:::instance/ssoins-far"}]},
+                {"Instances": []},
+            ],
+        )
+        self.iam.list_regions.assert_has_calls(
+            [
+                call(MaxResults=50, RegionOptStatusContains=self.ENABLED_FILTER),
+                call(
+                    MaxResults=50,
+                    RegionOptStatusContains=self.ENABLED_FILTER,
+                    NextToken="r2",
+                ),
+            ]
+        )
+        assert ("sso-admin", "ap-south-2") in self.clients
+        assert ("sso-admin", "eu-west-1") in self.clients
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "arn:aws:sso:::instance/ssoins-far (owner unknown) are visible" in details
+        )
+        assert "listed in ap-south-2" in details
+        self.iam.list_permission_sets.assert_called_once_with(
+            InstanceArn="arn:aws:sso:::instance/ssoins-far", MaxResults=100
+        )
+        assert self.clients.count(("sso-admin", "ap-south-2")) == 2
+
+    def test_br51_no_instance_in_any_enabled_region_passes(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            regions=[
+                {
+                    "Regions": [
+                        {
+                            "RegionName": "us-east-1",
+                            "RegionOptStatus": "ENABLED_BY_DEFAULT",
+                        },
+                        {"RegionName": "ap-south-2", "RegionOptStatus": "ENABLED"},
+                    ]
+                }
+            ],
+            instances=[{"Instances": []}, {"Instances": []}],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "sso:ListInstances returned no IAM Identity Center instance in any of "
+            "the 2 Region(s) enabled for this account (ap-south-2, us-east-1)."
+            in rows[0]["Finding_Details"]
+        )
+        assert self.iam.list_instances.call_count == 2
+
+    def test_br51_an_unread_region_is_not_passed(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            regions=[
+                {
+                    "Regions": [
+                        {
+                            "RegionName": "us-east-1",
+                            "RegionOptStatus": "ENABLED_BY_DEFAULT",
+                        },
+                        {"RegionName": "ap-south-2", "RegionOptStatus": "ENABLED"},
+                    ]
+                }
+            ],
+            instances=[{"Instances": []}, _make_client_error("AccessDeniedException")],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert "sso:ListInstances in us-east-1 (" in details
+        assert "returned no IAM Identity Center instance in ap-south-2" in details
+
+    def test_br51_unlisted_regions_read_only_the_home_region(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "The enabled Regions were not listed with account:ListRegions (" in details
+        )
+        assert "so only eu-west-1 was read" in details
+        self.iam.list_instances.assert_called_once_with(MaxResults=100)
 
     def test_br51_identity_center_instance_on_any_page_stops_passed(self):
         _, rows = self._run(
