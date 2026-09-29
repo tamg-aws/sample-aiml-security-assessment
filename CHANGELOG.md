@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-03` reads the `KeyState` that `kms:DescribeKey` returns beside
+  `KeyManager`. A notebook, domain, training job output or volume, training
+  file system, or training data bucket whose customer managed key has a
+  state other than `Enabled`, for example `PendingDeletion` or `Disabled`,
+  now fails in a `Customer Managed Key Not Enabled` row or its bucket row,
+  where it used to pass as customer managed.
+
 - `SM-26` reads the GuardDuty detector `Status`. A detector whose status is
   `DISABLED` now fails even when its `AI_PROTECTION` feature is `ENABLED`,
   where it used to pass, and a Region with no detector fails where it used to

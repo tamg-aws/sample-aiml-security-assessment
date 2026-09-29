@@ -12232,6 +12232,8 @@ def _sm03_rows(
         value = keys.get(KeyId, "CUSTOMER")
         if isinstance(value, Exception):
             raise value
+        if isinstance(value, dict):
+            return {"KeyMetadata": dict(value, KeyId=KeyId)}
         return {"KeyMetadata": {"KeyId": KeyId, "KeyManager": value}}
 
     def bucket_part(part, Bucket):
@@ -12589,6 +12591,76 @@ class TestSM03KeyManagerAndUnreadLegs:
             "sagemaker:DescribeNotebookInstance nb" in incomplete[0]["Finding_Details"]
         )
         assert not _by_finding(rows, "Data Protection Check")
+
+
+_PENDING_CMK = "arn:aws:kms:us-east-1:123456789012:key/3333"
+
+
+class TestSM03KeyState:
+    """DAT-01: a customer managed key that cannot be used protects nothing."""
+
+    @pytest.mark.parametrize("state", ["PendingDeletion", "Disabled"])
+    @pytest.mark.parametrize("leg", ["output", "volume"])
+    @pytest.mark.parametrize("bad_first", [True, False])
+    def test_a_key_not_enabled_fails_only_its_job(self, state, leg, bad_first):
+        jobs = [
+            ("good", _training_job()),
+            ("bad", _training_job(**{leg: _PENDING_CMK})),
+        ]
+        if bad_first:
+            jobs.reverse()
+        rows = _sm03_rows(
+            dict(jobs),
+            keys={_PENDING_CMK: {"KeyManager": "CUSTOMER", "KeyState": state}},
+        )
+        unusable = _by_finding(rows, sagemaker_app.KEY_NOT_ENABLED_FINDING)
+        assert [r["Status"] for r in unusable] == ["Failed"]
+        assert "'bad'" in unusable[0]["Finding_Details"]
+        assert "'good'" not in unusable[0]["Finding_Details"]
+        assert _PENDING_CMK in unusable[0]["Finding_Details"]
+        assert state in unusable[0]["Finding_Details"]
+        assert not _by_finding(rows, "Data Protection Check")
+        if leg == "volume":
+            volume = _by_finding(rows, sagemaker_app.TRAINING_VOLUME_ENCRYPTION_FINDING)
+            passed = [r for r in volume if r["Status"] == "Passed"]
+            assert passed and all("bad" not in r["Finding_Details"] for r in passed)
+
+    def test_an_enabled_customer_key_still_passes(self):
+        rows = _sm03_rows(
+            {"a": _training_job(output=_PENDING_CMK, volume=_PENDING_CMK)},
+            keys={_PENDING_CMK: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}},
+        )
+        assert [r["Status"] for r in _by_finding(rows, "Data Protection Check")] == [
+            "Passed"
+        ]
+        assert not _by_finding(rows, sagemaker_app.KEY_NOT_ENABLED_FINDING)
+
+    def test_a_bucket_default_key_not_enabled_fails_the_bucket(self):
+        pending_bucket = {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [
+                    {
+                        "ApplyServerSideEncryptionByDefault": {
+                            "SSEAlgorithm": "aws:kms",
+                            "KMSMasterKeyID": _PENDING_CMK,
+                        }
+                    }
+                ]
+            }
+        }
+        rows = _sm03_rows(
+            {"a": _training_job(bucket="one"), "b": _training_job(bucket="two")},
+            keys={
+                _PENDING_CMK: {"KeyManager": "CUSTOMER", "KeyState": "PendingDeletion"}
+            },
+            buckets={"two": {"encryption": pending_bucket}},
+        )
+        bucket_rows = _by_finding(rows, sagemaker_app.TRAINING_BUCKET_FINDING)
+        failed = [r for r in bucket_rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Bucket 'two'" in failed[0]["Finding_Details"]
+        assert "PendingDeletion" in failed[0]["Finding_Details"]
+        assert "Bucket 'one'" not in failed[0]["Finding_Details"]
 
 
 class TestSM03TrainingBucketProtection:

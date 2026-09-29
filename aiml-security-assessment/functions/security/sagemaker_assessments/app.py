@@ -2573,7 +2573,8 @@ def _kms_key_alias(key_id: str) -> Optional[str]:
 
 def _kms_key_managers(key_ids: List[str], region: str) -> Dict[str, Dict[str, Any]]:
     """
-    Return {key id: {"manager": "AWS" | "CUSTOMER" | None, "error": label}}.
+    Return {key id: {"manager": "AWS" | "CUSTOMER" | None, "state": KeyState,
+    "error": label}}. The state is None for a key not described.
 
     A key ARN is described in the Region the ARN names, since kms:DescribeKey
     answers only for keys in the Region it is called in.
@@ -2583,7 +2584,7 @@ def _kms_key_managers(key_ids: List[str], region: str) -> Dict[str, Dict[str, An
     for key_id in sorted({str(k) for k in key_ids if k}):
         alias = _kms_key_alias(key_id)
         if alias and alias.startswith(AWS_MANAGED_ALIAS_PREFIX):
-            results[key_id] = {"manager": "AWS", "error": None}
+            results[key_id] = {"manager": "AWS", "state": None, "error": None}
             continue
         key_region = region
         if key_id.startswith("arn:"):
@@ -2599,11 +2600,13 @@ def _kms_key_managers(key_ids: List[str], region: str) -> Dict[str, Dict[str, An
             manager = metadata.get("KeyManager")
             results[key_id] = {
                 "manager": manager if manager in ("AWS", "CUSTOMER") else None,
+                "state": metadata.get("KeyState"),
                 "error": None if manager in ("AWS", "CUSTOMER") else "no KeyManager",
             }
         except Exception as error:
             results[key_id] = {
                 "manager": None,
+                "state": None,
                 "error": get_assessment_error_label(error),
             }
     return results
@@ -2799,6 +2802,11 @@ def _bucket_protection_findings(
             )
         elif manager["manager"] is None:
             read["unread"].append(f"kms:DescribeKey {read['key']} ({manager['error']})")
+        elif manager["state"] not in (None, "Enabled"):
+            read["problems"].append(
+                f"default encryption key {read['key']} has KeyState "
+                f"{manager['state']}, not Enabled"
+            )
 
     emitted = []
     clean = []
@@ -2890,6 +2898,7 @@ def _bucket_protection_findings(
 
 
 TRAINING_VOLUME_ENCRYPTION_FINDING = "Training Job Volume Encryption"
+KEY_NOT_ENABLED_FINDING = "Customer Managed Key Not Enabled"
 TRAINING_BUCKET_FINDING = "Training Job Data Bucket Protection"
 TRAINING_VOLUME_ENCRYPTION_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/train-encrypt.html"
@@ -3076,6 +3085,7 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
 
         # Track resources with encryption issues
         resources_with_aws_managed_keys = []
+        resources_with_keys_not_enabled = []
         resources_without_encryption = []
         resources_without_vpc_encryption = []
         training_jobs_with_volume_key = []
@@ -3323,6 +3333,13 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
             manager = managers[str(item["key_id"])]
             if manager["manager"] == "AWS":
                 resources_with_aws_managed_keys.append(item)
+            elif manager["manager"] == "CUSTOMER" and manager["state"] not in (
+                None,
+                "Enabled",
+            ):
+                resources_with_keys_not_enabled.append(
+                    dict(item, state=manager["state"])
+                )
             elif manager["manager"] is None:
                 unread.append(
                     f"kms:DescribeKey {item['key_id']} for {item['type']} "
@@ -3331,7 +3348,19 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
         volume_keys_read = []
         for job in training_jobs_with_volume_key:
             manager = managers[str(job["key_id"])]
-            if manager["manager"] == "CUSTOMER":
+            if manager["manager"] == "CUSTOMER" and manager["state"] not in (
+                None,
+                "Enabled",
+            ):
+                resources_with_keys_not_enabled.append(
+                    {
+                        "type": "Training Job volume",
+                        "name": job["name"],
+                        "key_id": job["key_id"],
+                        "state": manager["state"],
+                    }
+                )
+            elif manager["manager"] == "CUSTOMER":
                 volume_keys_read.append(job)
             elif manager["manager"] == "AWS":
                 resources_with_aws_managed_keys.append(
@@ -3358,6 +3387,7 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
         if (
             resources_without_encryption
             or resources_with_aws_managed_keys
+            or resources_with_keys_not_enabled
             or resources_without_vpc_encryption
             or training_jobs_without_volume_key
             or unread
@@ -3388,6 +3418,28 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                         resolution="Consider using customer managed keys for better control over encryption",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/key-management.html",
                         severity="Low",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+            for resource in resources_with_keys_not_enabled:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-03",
+                        finding_name=KEY_NOT_ENABLED_FINDING,
+                        finding_details=(
+                            f"{resource['type']} '{resource['name']}' uses customer "
+                            f"managed key {resource['key_id']}, whose "
+                            f"kms:DescribeKey KeyState is {resource['state']}, "
+                            "not Enabled."
+                        ),
+                        resolution=(
+                            "Enable the key, or cancel its scheduled deletion, or "
+                            "move the resource to an enabled customer managed key."
+                        ),
+                        reference="https://docs.aws.amazon.com/kms/latest/developerguide/key-state.html",
+                        severity="High",
                         status="Failed",
                         region=region,
                     )
