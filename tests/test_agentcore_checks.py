@@ -38410,3 +38410,384 @@ class TestAG25AlwaysTrueConditionAllowsAll:
         )
 
         assert [f["Status"] for f in findings] == ["Passed"]
+
+
+_NFW_STATELESS_ARN = (
+    "arn:aws:network-firewall:us-east-1:123456789012:stateless-rulegroup/sl"
+)
+_NFW_PASS_ARN = (
+    "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/pass"
+)
+
+
+def _nfw_stateless_pass(destination="0.0.0.0/0", protocols=(6,), ports=((443, 443),)):
+    return {
+        "RulesSource": {
+            "StatelessRulesAndCustomActions": {
+                "StatelessRules": [
+                    {
+                        "Priority": 1,
+                        "RuleDefinition": {
+                            "Actions": ["aws:pass"],
+                            "MatchAttributes": {
+                                "Sources": [{"AddressDefinition": "10.0.0.0/16"}],
+                                "Destinations": [{"AddressDefinition": destination}],
+                                "Protocols": list(protocols),
+                                "DestinationPorts": [
+                                    {"FromPort": low, "ToPort": high}
+                                    for low, high in ports
+                                ],
+                            },
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+
+def _nfw_stateful_pass(destination="ANY", port="443", protocol="TCP"):
+    return {
+        "RulesSource": {
+            "StatefulRules": [
+                {
+                    "Action": "PASS",
+                    "Header": {
+                        "Protocol": protocol,
+                        "Source": "$HOME_NET",
+                        "SourcePort": "ANY",
+                        "Direction": "FORWARD",
+                        "Destination": destination,
+                        "DestinationPort": port,
+                    },
+                    "RuleOptions": [{"Keyword": "sid", "Settings": ["1"]}],
+                }
+            ]
+        }
+    }
+
+
+class TestAC49FirewallBypasses:
+    """AC-49 follows every route toward an internet address and reads what the
+    firewall passes without stateful inspection."""
+
+    _base = TestAC49NetworkFirewallEgress()
+
+    def _run_with_routes(self, mock_ac, mock_ec2, mock_nfw, extra_routes, **kwargs):
+        """Wire the default fixture, then give each subnet in extra_routes the
+        listed (destination, target key, target id) routes in place of its
+        0.0.0.0/0 route when the destination list replaces it."""
+        self._base._wire(mock_ac, mock_ec2, mock_nfw, **kwargs)
+        tables = mock_ec2.describe_route_tables.return_value["RouteTables"]
+        for table in tables:
+            subnet_id = table["Associations"][0]["SubnetId"]
+            if subnet_id not in extra_routes:
+                continue
+            replace, routes = extra_routes[subnet_id]
+            if replace:
+                table["Routes"] = [
+                    r
+                    for r in table["Routes"]
+                    if r["DestinationCidrBlock"] != "0.0.0.0/0"
+                ]
+            table["Routes"].extend(
+                {"DestinationCidrBlock": d, key: target, "State": "active"}
+                for d, key, target in routes
+            )
+        return self._base._rows(agentcore_app.check_agentcore_network_firewall_egress())
+
+    _SPLIT_TO_NAT = (
+        True,
+        [
+            ("0.0.0.0/1", "NatGatewayId", "nat-1"),
+            ("128.0.0.0/1", "NatGatewayId", "nat-1"),
+        ],
+    )
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_split_routes_through_a_nat_to_the_internet_fail(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {"subnet-a": self._SPLIT_TO_NAT},
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-pub": ("GatewayId", "igw-1"),
+            },
+            nat_subnets={"nat-1": "subnet-pub"},
+        )
+
+        assert rows["egress"]["Status"] == "Failed"
+        assert rows["threat"]["Status"] == "Failed"
+        details = rows["egress"]["Finding_Details"]
+        assert "subnet-a (0.0.0.0/1 to nat-1), then to igw-1" in details
+        assert "subnet-a (128.0.0.0/1 to nat-1), then to igw-1" in details
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_split_routes_through_a_nat_to_the_firewall_pass(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {"subnet-a": self._SPLIT_TO_NAT},
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-pub": ("VpcEndpointId", "vpce-fw1"),
+            },
+            nat_subnets={"nat-1": "subnet-pub"},
+        )
+
+        assert rows["egress"]["Status"] == "Passed"
+        assert rows["threat"]["Status"] == "Passed"
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_narrower_internet_route_beside_the_firewall_route_fails(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {"subnet-b": (False, [("52.0.0.0/8", "GatewayId", "igw-1")])},
+            subnets={
+                "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                "subnet-b": ("vpc-a", "10.0.2.0/24"),
+            },
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-b": ("VpcEndpointId", "vpce-fw1"),
+            },
+        )
+
+        assert rows["egress"]["Status"] == "Failed"
+        details = rows["egress"]["Finding_Details"]
+        assert "subnet-b (52.0.0.0/8 to igw-1)" in details
+        assert "subnet-a (" not in details
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_private_and_local_routes_are_not_egress(self, mock_ac, mock_ec2, mock_nfw):
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {
+                "subnet-a": (
+                    False,
+                    [
+                        ("10.1.0.0/16", "TransitGatewayId", "tgw-1"),
+                        ("192.168.0.0/16", "VpcPeeringConnectionId", "pcx-1"),
+                        ("100.64.0.0/10", "TransitGatewayId", "tgw-1"),
+                    ],
+                )
+            },
+        )
+
+        assert rows["egress"]["Status"] == "Passed"
+        assert rows["threat"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "defaults, status", [(["aws:pass"], "Failed"), (["aws:drop"], "Passed")]
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_stateless_default_pass_skips_the_stateful_groups(
+        self, mock_ac, mock_ec2, mock_nfw, defaults, status
+    ):
+        policy = _nfw_policy()
+        policy["StatelessDefaultActions"] = defaults
+        rows = self._run_with_routes(
+            mock_ac, mock_ec2, mock_nfw, {}, policies={"p1": policy}
+        )
+
+        assert rows["egress"]["Status"] == status
+        assert rows["threat"]["Status"] == status
+        if status == "Failed":
+            assert "aws:pass" in rows["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_firewall_with_a_stateless_default_pass_fails(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        passing = _nfw_policy()
+        passing["StatelessDefaultActions"] = ["aws:pass"]
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {},
+            subnets={
+                "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                "subnet-b": ("vpc-a", "10.0.2.0/24"),
+            },
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-b": ("VpcEndpointId", "vpce-fw2"),
+            },
+            firewalls={
+                "fw1": ("vpc-a", ["vpce-fw1"], "p1"),
+                "fw2": ("vpc-a", ["vpce-fw2"], "p2"),
+            },
+            policies={"p1": _nfw_policy(), "p2": passing},
+        )
+
+        assert rows["egress"]["Status"] == "Failed"
+        assert "firewall fw2's" in rows["egress"]["Finding_Details"]
+        assert "fw1's" not in rows["egress"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "group, egress, threat",
+        [
+            (_nfw_stateless_pass(), "Failed", "Failed"),
+            (_nfw_stateless_pass(protocols=()), "Failed", "Failed"),
+            (_nfw_stateless_pass(destination="10.0.0.0/8"), "Passed", "Passed"),
+            (
+                _nfw_stateless_pass(protocols=(17,), ports=((123, 123),)),
+                "Passed",
+                "Failed",
+            ),
+            (_nfw_stateless_pass(ports=((22, 22),)), "Passed", "Failed"),
+        ],
+        ids=["tcp-443-any", "every-protocol", "private", "udp-ntp", "tcp-22"],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_stateless_pass_rule_to_the_internet_skips_inspection(
+        self, mock_ac, mock_ec2, mock_nfw, group, egress, threat
+    ):
+        policy = _nfw_policy()
+        policy["StatelessRuleGroupReferences"] = [
+            {"ResourceArn": _NFW_STATELESS_ARN, "Priority": 1}
+        ]
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {},
+            policies={"p1": policy},
+            groups={_NFW_ALLOW_ARN: _nfw_allow_group(), _NFW_STATELESS_ARN: group},
+        )
+
+        assert rows["egress"]["Status"] == egress
+        assert rows["threat"]["Status"] == threat
+        if threat == "Failed":
+            assert "stateless rule group sl" in rows["threat"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "group, order, priority, egress, threat",
+        [
+            (_nfw_stateful_pass(), None, 20, "Failed", "Failed"),
+            (_nfw_stateful_pass(), "STRICT_ORDER", 5, "Failed", "Failed"),
+            (_nfw_stateful_pass(), "STRICT_ORDER", 20, "Passed", "Failed"),
+            (_nfw_stateful_pass(), "STRICT_ORDER", 950, "Passed", "Passed"),
+            (
+                _nfw_stateful_pass(destination="10.2.0.0/16"),
+                None,
+                20,
+                "Passed",
+                "Passed",
+            ),
+            (_nfw_stateful_pass(port="22"), None, 20, "Passed", "Failed"),
+            (
+                {
+                    "RulesSource": {
+                        "RulesString": "pass ip $HOME_NET any -> any any (sid:1;)"
+                    }
+                },
+                None,
+                20,
+                "Failed",
+                "Failed",
+            ),
+            (
+                {
+                    "RulesSource": {
+                        "RulesString": (
+                            "# comment\n"
+                            "pass tls $HOME_NET any -> $EXTERNAL_NET 443 (tls.sni; "
+                            'content:"example.com"; sid:1;)'
+                        )
+                    }
+                },
+                None,
+                20,
+                "Passed",
+                "Passed",
+            ),
+        ],
+        ids=[
+            "default-order",
+            "strict-before-allow",
+            "strict-between",
+            "strict-after-all",
+            "private-destination",
+            "port-22",
+            "suricata-ip-any",
+            "suricata-sni-scoped",
+        ],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_customer_stateful_pass_rule_before_the_drops_skips_them(
+        self, mock_ac, mock_ec2, mock_nfw, group, order, priority, egress, threat
+    ):
+        policy = _nfw_policy(order=order)
+        policy["StatefulRuleGroupReferences"].append(
+            {"ResourceArn": _NFW_PASS_ARN, "Priority": priority}
+        )
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {},
+            policies={"p1": policy},
+            groups={_NFW_ALLOW_ARN: _nfw_allow_group(), _NFW_PASS_ARN: group},
+        )
+
+        assert rows["egress"]["Status"] == egress
+        assert rows["threat"]["Status"] == threat
+        if egress == "Failed":
+            assert "stateful rule group pass" in rows["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pass_rule_whose_destination_is_not_read_withholds_the_pass(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        policy = _nfw_policy(order=None)
+        policy["StatefulRuleGroupReferences"].append(
+            {"ResourceArn": _NFW_PASS_ARN, "Priority": 20}
+        )
+        rows = self._run_with_routes(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            {},
+            policies={"p1": policy},
+            groups={
+                _NFW_ALLOW_ARN: _nfw_allow_group(),
+                _NFW_PASS_ARN: _nfw_stateful_pass(destination="$PARTNERS"),
+            },
+        )
+
+        assert rows["egress"]["Status"] == "N/A"
+        assert rows["threat"]["Status"] == "N/A"
+        assert "$PARTNERS" in rows["egress"]["Finding_Details"]

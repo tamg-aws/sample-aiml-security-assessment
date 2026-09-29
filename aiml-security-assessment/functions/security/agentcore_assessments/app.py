@@ -25913,7 +25913,7 @@ def check_agentcore_dns_egress_control(
 
 
 # AC-49's second leg reads the AWS Network Firewall each hosting subnet's
-# default route reaches. A domain allow-list rule group names the hosts agents
+# internet routes reach. A domain allow-list rule group names the hosts agents
 # may reach by TLS SNI and by HTTP Host header, and drops the traffic of those
 # protocols that matches no name. The AWS managed threat signature groups and
 # the domain reputation groups are the inspection AIR-FND-NET-04 names. A
@@ -25935,6 +25935,15 @@ NETWORK_FIREWALL_REPUTATION_GROUPS = (
     "AbusedLegitMalwareDomains",
 )
 NETWORK_FIREWALL_ORDER_SUFFIXES = ("StrictOrder", "ActionOrder")
+# A pass rule over these protocols and ports can carry the TLS and HTTP traffic
+# the domain allow-list judges. Stateless rules name protocols by IANA number.
+NETWORK_FIREWALL_WEB_PROTOCOLS = ("ip", "tcp", "tls", "http", "http2")
+NETWORK_FIREWALL_WEB_PORTS = (80, 443)
+NETWORK_FIREWALL_TCP_PROTOCOL_NUMBER = 6
+# A pass rule scoped by one of these sticky buffers admits named hosts, as the
+# allow-list's own pass rules do.
+NETWORK_FIREWALL_NAME_KEYWORDS = re.compile(r"\b(?:tls\.sni|http\.host|tls_sni)\b")
+SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _network_firewall_managed_group_name(arn: str) -> Optional[str]:
@@ -25963,17 +25972,35 @@ def _route_table_for_subnet(
     return main
 
 
-def _default_routes(table: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
-    """Return (destination, target key, target id) for a table's default routes.
+def _network_reaches_internet(network: Any) -> bool:
+    """Return whether a network holds an address outside the private, link-local
+    and shared (100.64.0.0/10) ranges, so traffic to it can leave the network."""
+    return not network.is_private and not (
+        network.version == 4 and network.subnet_of(SHARED_ADDRESS_SPACE)
+    )
 
-    A blackhole route drops what it matches, so it sends nothing anywhere.
+
+def _egress_routes(table: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
+    """Return (destination, target key, target id) for a table's internet routes.
+
+    A route carries internet traffic when its destination holds an internet
+    address, so 0.0.0.0/1 plus 128.0.0.0/1 is followed as 0.0.0.0/0 is, and a
+    narrower public range beside 0.0.0.0/0 is followed too. The VPC's local
+    route stays inside the VPC, and a blackhole route drops what it matches, so
+    neither sends anything anywhere. A prefix-list destination is not read.
     """
     routes = []
     for route in (table or {}).get("Routes") or []:
         destination = route.get("DestinationCidrBlock") or route.get(
             "DestinationIpv6CidrBlock"
         )
-        if destination not in ("0.0.0.0/0", "::/0"):
+        if not destination or route.get("GatewayId") == "local":
+            continue
+        try:
+            network = ipaddress.ip_network(str(destination), strict=False)
+        except ValueError:
+            continue
+        if not _network_reaches_internet(network):
             continue
         if route.get("State") == "blackhole":
             continue
@@ -25996,6 +26023,170 @@ def _default_routes(table: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str
         else:
             routes.append((destination, "no target", "none"))
     return routes
+
+
+def _network_firewall_address_reach(
+    value: str, subnet_cidrs: Dict[str, str], side: str
+) -> Optional[bool]:
+    """Return whether a rule address reaches the side it stands for, or None.
+
+    For the destination side that is an internet address; for the source side it
+    is a hosting subnet. ANY and the HOME_NET and EXTERNAL_NET variables are
+    read at their defaults: HOME_NET is the firewall's VPC and EXTERNAL_NET is
+    everything outside it. A negation or another variable is not read.
+    """
+    value = str(value).strip()
+    if value.startswith("[") and value.endswith("]"):
+        results = [
+            _network_firewall_address_reach(part, subnet_cidrs, side)
+            for part in value[1:-1].split(",")
+            if part.strip()
+        ]
+        if any(results):
+            return True
+        return None if None in results else False
+    if value.lower() == "any":
+        return True
+    if value == "$HOME_NET":
+        return side == "source"
+    if value == "$EXTERNAL_NET":
+        return side == "destination"
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+    if side == "destination":
+        return _network_reaches_internet(network)
+    for cidr in subnet_cidrs.values():
+        try:
+            subnet = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if subnet.version == network.version and subnet.overlaps(network):
+            return True
+    return False
+
+
+def _network_firewall_port_reach(value: str) -> Optional[bool]:
+    """Return whether a stateful rule port spec holds port 80 or 443, or None."""
+    value = str(value).strip()
+    if value.startswith("[") and value.endswith("]"):
+        results = [
+            _network_firewall_port_reach(part)
+            for part in value[1:-1].split(",")
+            if part.strip()
+        ]
+        if any(results):
+            return True
+        return None if None in results else False
+    if value.lower() == "any":
+        return True
+    low, separator, high = value.partition(":")
+    try:
+        first = int(low) if low else 0
+        last = (int(high) if high else 65535) if separator else first
+    except ValueError:
+        return None
+    return any(first <= port <= last for port in NETWORK_FIREWALL_WEB_PORTS)
+
+
+def _network_firewall_pass_rules(
+    group: Dict[str, Any],
+) -> List[Tuple[str, str, str, str, str, bool]]:
+    """Return (protocol, source, destination, port, text, name scoped) for every
+    pass rule of a customer stateful group, from StatefulRules or RulesString.
+
+    A rule string line that is not a whole Suricata header comes back with an
+    empty protocol, so the caller reports it as not read.
+    """
+    source = group.get("RulesSource") or {}
+    rules = []
+    for rule in source.get("StatefulRules") or []:
+        if str(rule.get("Action") or "").upper() != "PASS":
+            continue
+        header = rule.get("Header") or {}
+        options = " ".join(
+            str(option.get("Keyword") or "") for option in rule.get("RuleOptions") or []
+        )
+        rules.append(
+            (
+                str(header.get("Protocol") or ""),
+                str(header.get("Source") or ""),
+                str(header.get("Destination") or ""),
+                str(header.get("DestinationPort") or ""),
+                f"PASS {header.get('Protocol')} to {header.get('Destination')} "
+                f"port {header.get('DestinationPort')}",
+                bool(NETWORK_FIREWALL_NAME_KEYWORDS.search(options)),
+            )
+        )
+    for line in str(source.get("RulesString") or "").splitlines():
+        line = line.strip()
+        if not line.startswith("pass"):
+            continue
+        head, _, options = line.partition("(")
+        tokens = re.findall(r"\[[^\]]*\]|\S+", head)
+        if len(tokens) != 7 or tokens[0] != "pass":
+            rules.append(("", "", "", "", line, False))
+            continue
+        rules.append(
+            (
+                tokens[1],
+                tokens[2],
+                tokens[5],
+                tokens[6],
+                " ".join(tokens),
+                bool(NETWORK_FIREWALL_NAME_KEYWORDS.search(options)),
+            )
+        )
+    return rules
+
+
+def _network_firewall_stateless_passes(
+    group: Dict[str, Any], subnet_cidrs: Dict[str, str]
+) -> Tuple[bool, bool]:
+    """Return (web traffic passed, any traffic passed) to internet addresses from
+    the hosting subnets by a customer stateless group's aws:pass rules.
+
+    Every field is a list of numbers or CIDRs, and an empty list matches
+    everything. A higher-priority rule that drops or forwards the same packets
+    first is not read, so such a pass is reported as it is written.
+    """
+    web = everything = False
+    stateless = (group.get("RulesSource") or {}).get(
+        "StatelessRulesAndCustomActions"
+    ) or {}
+    for rule in stateless.get("StatelessRules") or []:
+        definition = rule.get("RuleDefinition") or {}
+        if "aws:pass" not in (definition.get("Actions") or []):
+            continue
+        match = definition.get("MatchAttributes") or {}
+
+        def reaches(field: str, side: str) -> bool:
+            entries = match.get(field) or []
+            return not entries or any(
+                _network_firewall_address_reach(
+                    entry.get("AddressDefinition"), subnet_cidrs, side
+                )
+                for entry in entries
+            )
+
+        if not (
+            reaches("Sources", "source") and reaches("Destinations", "destination")
+        ):
+            continue
+        everything = True
+        protocols = match.get("Protocols") or []
+        ports = match.get("DestinationPorts") or []
+        if (not protocols or NETWORK_FIREWALL_TCP_PROTOCOL_NUMBER in protocols) and (
+            not ports
+            or any(
+                (port.get("FromPort") or 0) <= web_port <= (port.get("ToPort") or 0)
+                for port in ports
+                for web_port in NETWORK_FIREWALL_WEB_PORTS
+            )
+        ):
+            web = True
+    return web, everything
 
 
 def _network_firewall_policy_gaps(
@@ -26117,6 +26308,7 @@ def _network_firewall_policy_gaps(
     signatures: List[str] = []
     reputation: List[str] = []
     alerting: List[str] = []
+    threat_priorities: List[int] = []
     for reference in references:
         name = _network_firewall_managed_group_name(reference.get("ResourceArn"))
         if not name:
@@ -26128,6 +26320,111 @@ def _network_firewall_policy_gaps(
             signatures.append(name)
         elif name in NETWORK_FIREWALL_REPUTATION_GROUPS:
             reputation.append(name)
+        else:
+            continue
+        threat_priorities.append(int(reference.get("Priority") or 0))
+
+    defaults = policy.get("StatelessDefaultActions")
+    if defaults is None:
+        unread.append(
+            f"firewall {firewall_name}'s policy reports no stateless default "
+            "action, so whether unmatched packets reach the stateful groups is "
+            "not read"
+        )
+    elif "aws:pass" in defaults:
+        skipped = (
+            f"firewall {firewall_name}'s stateless default action is aws:pass, so "
+            "packets no stateless rule forwards leave without reaching the "
+            "stateful rule groups"
+        )
+        allow_gaps.append(skipped)
+        threat_gaps.append(skipped)
+    for reference in policy.get("StatelessRuleGroupReferences") or []:
+        arn = str(reference.get("ResourceArn") or "")
+        group = rule_groups.get(arn)
+        if group is None:
+            continue
+        web, everything = _network_firewall_stateless_passes(group, subnet_cidrs)
+        label = (
+            f"firewall {firewall_name}'s stateless rule group {arn.rsplit('/', 1)[-1]}"
+        )
+        if web:
+            allow_gaps.append(
+                f"{label} passes TCP traffic on port 80 or 443 from the hosting "
+                "subnets to internet addresses past the stateful engine, so the "
+                "domain allow-list never checks it"
+            )
+        if everything:
+            threat_gaps.append(
+                f"{label} passes traffic from the hosting subnets to internet "
+                "addresses past the stateful engine, so the threat groups never "
+                "inspect it"
+            )
+
+    strict = rule_order == "STRICT_ORDER"
+    allow_priority = min(
+        (
+            int(reference.get("Priority") or 0)
+            for reference in references
+            if rule_groups.get(str(reference.get("ResourceArn") or "")) in allow_groups
+        ),
+        default=0,
+    )
+    threat_priority = min(threat_priorities, default=0)
+    for reference in references:
+        arn = str(reference.get("ResourceArn") or "")
+        group = rule_groups.get(arn)
+        if group is None:
+            continue
+        priority = int(reference.get("Priority") or 0)
+        label = (
+            f"firewall {firewall_name}'s stateful rule group {arn.rsplit('/', 1)[-1]}"
+        )
+        for (
+            protocol,
+            rule_source,
+            destination,
+            port,
+            text,
+            named,
+        ) in _network_firewall_pass_rules(group):
+            if not protocol:
+                unread.append(f"{label} holds the pass rule {text}, which is not read")
+                continue
+            if named:
+                continue
+            source_reach = _network_firewall_address_reach(
+                rule_source, subnet_cidrs, "source"
+            )
+            destination_reach = _network_firewall_address_reach(
+                destination, subnet_cidrs, "destination"
+            )
+            if source_reach is False or destination_reach is False:
+                continue
+            if source_reach is None or destination_reach is None:
+                unread.append(
+                    f"{label} holds the pass rule {text}, whose addresses are not read"
+                )
+                continue
+            web_reach = (
+                _network_firewall_port_reach(port)
+                if protocol.lower() in NETWORK_FIREWALL_WEB_PROTOCOLS
+                else False
+            )
+            if web_reach and (not strict or priority < allow_priority):
+                allow_gaps.append(
+                    f"{label} holds the pass rule {text}, which lets that "
+                    "traffic leave before the domain allow-list checks its name"
+                )
+            elif web_reach is None and (not strict or priority < allow_priority):
+                unread.append(
+                    f"{label} holds the pass rule {text}, whose ports are not read"
+                )
+            if not strict or priority < threat_priority:
+                threat_gaps.append(
+                    f"{label} holds the pass rule {text}, which lets that "
+                    "traffic leave before the threat groups inspect it"
+                )
     alert_note = (
         f" ({', '.join(sorted(alerting))} are overridden to DROP_TO_ALERT, so they "
         "only alert)"
@@ -26159,22 +26456,29 @@ def check_agentcore_network_firewall_egress(
     elsewhere, so the recommendation pairs DNS Firewall with an AWS Network
     Firewall domain allow-list over TLS SNI and HTTP Host.
 
-    Each hosting subnet's default routes are followed one hop: to a firewall
-    endpoint in the VPC, or through a NAT gateway to the endpoint the NAT
-    gateway's subnet routes to. A route to an internet gateway, or a NAT gateway
-    whose subnet routes to one, bypasses inspection and fails. A transit gateway,
-    a Gateway Load Balancer endpoint or any other target is not followed and is
-    not judged. A subnet with no default route reaches only its routed
-    destinations, which this leg does not judge.
+    Each hosting subnet's internet routes, every route whose destination holds
+    an internet address (see _egress_routes), are followed one hop: to a
+    firewall endpoint in the VPC, or through a NAT gateway to the endpoint the
+    NAT gateway's subnet routes to. A route to an internet gateway, or a NAT
+    gateway whose subnet routes to one, bypasses inspection and fails. A transit
+    gateway, a Gateway Load Balancer endpoint or any other target is not
+    followed and is not judged. A subnet with no internet route reaches only
+    private destinations, which this leg does not judge.
 
     Two rows are reported for each VPC. The egress row judges each reached
     firewall's policy for an ALLOWLIST domain group matching TLS_SNI and
     HTTP_HOST, no REJECTLIST or ALERTLIST domain group beside it under
     DEFAULT_ACTION_ORDER, and a HOME_NET that holds the hosting subnets where one
     is set. The threat row requires an AWS managed ThreatSignatures group and a
-    domain reputation group that are not overridden to DROP_TO_ALERT. A denied
-    network-firewall or ec2 read makes the rows informational N/A naming the
-    action, never Passed.
+    domain reputation group that are not overridden to DROP_TO_ALERT. Both rows
+    fail a stateless default action of aws:pass, a customer stateless aws:pass
+    rule from the hosting subnets to internet addresses, and a customer stateful
+    pass rule that is not scoped to a TLS SNI or HTTP Host name and acts before
+    the row's drops: always under DEFAULT_ACTION_ORDER, and under STRICT_ORDER
+    when its group's priority comes first. The egress row counts only passes
+    that can carry TCP on port 80 or 443. A pass rule whose addresses or ports
+    are not read makes the rows N/A. A denied network-firewall or ec2 read makes
+    the rows informational N/A naming the action, never Passed.
     """
     egress_name = "AgentCore Network Firewall Egress"
     threat_name = "AgentCore Network Firewall Threat Inspection"
@@ -26366,7 +26670,7 @@ def check_agentcore_network_firewall_egress(
         nat_error = None
         nat_subnets: Dict[str, Optional[str]] = {}
         for subnet_id in sorted(hosting):
-            routes = _default_routes(_route_table_for_subnet(tables, subnet_id))
+            routes = _egress_routes(_route_table_for_subnet(tables, subnet_id))
             if not routes:
                 unrouted.append(subnet_id)
             for destination, key, target in routes:
@@ -26387,7 +26691,7 @@ def check_agentcore_network_firewall_egress(
                             )
                         except (BotoCoreError, ClientError) as error:
                             nat_error = (
-                                f"NAT gateway {target}, the default route of "
+                                f"NAT gateway {target}, an internet route of "
                                 f"hosting subnet {subnet_id}, could not be read: "
                                 f"{_assessment_error_label(error)}"
                             )
@@ -26404,9 +26708,7 @@ def check_agentcore_network_firewall_egress(
                     if not nat_subnet:
                         unresolved.append(f"{where}, whose subnet is not reported")
                         continue
-                    onward = _default_routes(
-                        _route_table_for_subnet(tables, nat_subnet)
-                    )
+                    onward = _egress_routes(_route_table_for_subnet(tables, nat_subnet))
                     for _, onward_key, onward_target in onward:
                         if onward_key == "VpcEndpointId" and onward_target in endpoints:
                             firewall = endpoints[onward_target]
@@ -26459,7 +26761,9 @@ def check_agentcore_network_firewall_egress(
                 continue
             groups: Dict[str, Dict[str, Any]] = {}
             group_error = None
-            for group_reference in policy.get("StatefulRuleGroupReferences") or []:
+            for group_reference in (policy.get("StatefulRuleGroupReferences") or []) + (
+                policy.get("StatelessRuleGroupReferences") or []
+            ):
                 group_arn = str(group_reference.get("ResourceArn") or "")
                 if not group_arn or _network_firewall_managed_group_name(group_arn):
                     continue
@@ -26490,13 +26794,13 @@ def check_agentcore_network_firewall_egress(
         route_text = ""
         if unresolved:
             route_text += (
-                f" Default route(s) {'; '.join(unresolved)} are not followed, so "
+                f" Internet route(s) {'; '.join(unresolved)} are not followed, so "
                 "whether that traffic is inspected is not judged."
             )
         if unrouted:
             route_text += (
                 f" Hosting subnet(s) {', '.join(sorted(set(unrouted)))} have no "
-                "default route past the VPC."
+                "route toward an internet address."
             )
         reached_text = ", ".join(
             sorted(str(f.get("FirewallName") or arn) for arn, f in reached.items())
@@ -26510,18 +26814,18 @@ def check_agentcore_network_firewall_egress(
             if bypassing:
                 problems.insert(
                     0,
-                    f"default route(s) {'; '.join(bypassing)} reach the internet "
+                    f"internet route(s) {'; '.join(bypassing)} reach the internet "
                     "through no Network Firewall",
                 )
             if problems:
                 status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
                 details = f"{subject} {'; and '.join(problems)}.{route_text}"
                 resolution = (
-                    "Route each hosting subnet's default route through a Network "
+                    "Route each hosting subnet's internet routes through a Network "
                     "Firewall endpoint whose policy holds an ALLOWLIST domain rule "
                     "group matching TLS_SNI and HTTP_HOST"
                     if row_name == egress_name
-                    else "Route each hosting subnet's default route through a "
+                    else "Route each hosting subnet's internet routes through a "
                     "Network Firewall whose policy references an AWS managed "
                     "ThreatSignatures rule group and a domain reputation group, "
                     "neither overridden to DROP_TO_ALERT"
@@ -26540,7 +26844,7 @@ def check_agentcore_network_firewall_egress(
             elif not reached:
                 status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
                 details = (
-                    f"{subject} has no hosting subnet whose default route reaches "
+                    f"{subject} has no hosting subnet whose internet route reaches "
                     f"a Network Firewall in the VPC ({len(endpoints)} firewall "
                     f"endpoint(s) listed).{route_text}"
                 )
@@ -26561,7 +26865,7 @@ def check_agentcore_network_firewall_egress(
             else:
                 status, severity = StatusEnum.PASSED, SeverityEnum.MEDIUM
                 details = (
-                    f"{subject} routes every hosting subnet's default route through "
+                    f"{subject} routes every hosting subnet's internet routes through "
                     f"firewall(s) {reached_text}, "
                     + (
                         "whose policy holds a domain allow-list over TLS_SNI and "
