@@ -8954,7 +8954,9 @@ def _monitor_report_and_alarm_findings(
                 finding_name=MONITOR_ALARM_FINDING,
                 finding_details=(
                     f"All {len(schedules)} monitoring schedule(s) have an enabled "
-                    "alarm with an action on their Model Monitor metrics."
+                    "alarm with an action on their Model Monitor metrics. Which "
+                    "Model Monitor metric each alarm evaluates, and whether its "
+                    "threshold marks drift for the model, are not judged."
                 ),
                 resolution="No action required",
                 reference=MONITOR_CLOUDWATCH_REFERENCE,

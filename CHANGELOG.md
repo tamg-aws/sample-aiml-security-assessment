@@ -324,6 +324,12 @@ section.
   describe is granted, and so is one that names a baselining job but no
   constraints file.
 
+- `SM-23` `Model Monitor Violation Alarm` passed row now says that which
+  Model Monitor metric each alarm evaluates, and whether its threshold marks
+  drift for the model, are not judged. The row used to read as a drift
+  verdict when the check credits any enabled alarm with an action on the
+  schedule's metrics.
+
 - `SM-11` endpoint model network path also judges the model each inference
   component names, from `Specification` and every `Specifications` entry,
   beside the endpoint config's own `EnableNetworkIsolation` and

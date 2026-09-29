@@ -4578,6 +4578,21 @@ class TestSM23MonitorReportAndAlarm:
         assert [r["Status"] for r in rows] == ["Passed"]
 
     @patch("sagemaker_app.boto3.client")
+    def test_the_alarm_pass_names_the_unjudged_metric_and_threshold(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=[self._alarm("dq"), self._alarm("mq")],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Which Model Monitor metric each alarm evaluates, and whether its "
+            "threshold marks drift for the model, are not judged."
+        ) in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
     def test_one_unalarmed_schedule_among_alarmed_fails(self, mock_client):
         other = self._alarm("mq", "AWS/SageMaker")
         other["Dimensions"] = [{"Name": "MonitoringSchedule", "Value": "mq"}]
