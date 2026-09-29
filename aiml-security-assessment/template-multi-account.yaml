@@ -867,6 +867,19 @@ Resources:
             Action:
               - ec2:GetManagedPrefixListEntries # SM-39
             Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:prefix-list/*'
+          - Sid: IoTThingGroupThingsRead
+            # SM-41 lists the things of each thing group an IoT policy is
+            # attached to, child groups included.
+            Effect: Allow
+            Action:
+              - iot:ListThingsInThingGroup # SM-41
+            Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:thinggroup/*'
+          - Sid: IoTThingPrincipalsRead
+            # SM-41 lists the certificates attached to each of those things.
+            Effect: Allow
+            Action:
+              - iot:ListThingPrincipals # SM-41
+            Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:thing/*'
           - Sid: MonitoringJobDefinitionRead
             # SM-23 reads the baseline constraints file each named ModelQuality,
             # ModelBias and ModelExplainability job definition names.
