@@ -15390,9 +15390,10 @@ def _sm43_rows(
     buckets=None,
     components=None,
     deployed=None,
+    keys=None,
 ):
     """
-    Run SM-43 over mocked SageMaker, ECR and S3 clients.
+    Run SM-43 over mocked SageMaker, ECR, S3 and KMS clients.
 
     endpoints maps a name to {"models": [...], "status": ..., "components":
     [variant names]}. Every other map is keyed by resource name, and an
@@ -15555,7 +15556,17 @@ def _sm43_rows(
         return {"ServerSideEncryptionConfiguration": value}
 
     s3.get_bucket_encryption.side_effect = get_bucket_encryption
-    clients = {"sagemaker": sagemaker, "ecr": ecr, "s3": s3}
+    keys = keys or {}
+    kms = MagicMock()
+
+    def describe_key(KeyId):
+        value = keys.get(KeyId, {"KeyManager": "CUSTOMER", "KeyState": "Enabled"})
+        if isinstance(value, Exception):
+            raise value
+        return {"KeyMetadata": dict(value, KeyId=KeyId)}
+
+    kms.describe_key.side_effect = describe_key
+    clients = {"sagemaker": sagemaker, "ecr": ecr, "s3": s3, "kms": kms}
     with patch("sagemaker_app.boto3.client") as mock_client:
         mock_client.side_effect = lambda service, **_: clients[service]
         return _rows(
@@ -15900,6 +15911,83 @@ class TestSM43ModelArtifactIntegrity:
             in details
         )
         assert "one.tar.gz" not in details
+
+    @staticmethod
+    def _kms_rules(key_id):
+        return {
+            "Rules": [
+                {
+                    "ApplyServerSideEncryptionByDefault": {
+                        "SSEAlgorithm": "aws:kms",
+                        "KMSMasterKeyID": key_id,
+                    }
+                }
+            ]
+        }
+
+    @pytest.mark.parametrize(
+        "key_id, keys",
+        [
+            ("alias/aws/s3", {}),
+            (
+                "arn:aws:kms:us-east-1:111122223333:alias/aws/s3",
+                {},
+            ),
+            (
+                "arn:aws:kms:us-east-1:111122223333:key/aws-owned",
+                {
+                    "arn:aws:kms:us-east-1:111122223333:key/aws-owned": {
+                        "KeyManager": "AWS",
+                        "KeyState": "Enabled",
+                    }
+                },
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("weak_first", [True, False])
+    def test_a_named_aws_managed_bucket_key_fails_only_its_endpoint(
+        self, key_id, keys, weak_first
+    ):
+        uris = ["s3://weak/m/", "s3://good/m/"]
+        if not weak_first:
+            uris.reverse()
+        rows = _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container(uri=uris[0])},
+                "m-2": {"PrimaryContainer": _sm43_container(uri=uris[1])},
+            },
+            buckets={"weak": self._kms_rules(key_id)},
+            keys=keys,
+        )
+        weak_endpoint = "ep-1" if weak_first else "ep-2"
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert details.startswith(f"Endpoint '{weak_endpoint}'")
+        assert (
+            f"artifact bucket weak: default encryption key {key_id} is an AWS "
+            "managed key"
+        ) in details
+        assert "bucket good" not in details
+
+    def test_a_named_customer_managed_bucket_key_passes(self):
+        rows = _sm43_rows(buckets={"artifacts": self._kms_rules("alias/team-key")})
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_an_unread_bucket_key_withholds_the_pass(self):
+        key_id = "arn:aws:kms:us-east-1:444455556666:key/other"
+        rows = _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container(uri="s3://good/m/")},
+                "m-2": {"PrimaryContainer": _sm43_container(uri="s3://far/m/")},
+            },
+            buckets={"far": self._kms_rules(key_id)},
+            keys={key_id: _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            f"artifact bucket far encryption was not read (kms:DescribeKey on "
+            f"{key_id}: AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
 
     def test_an_unread_model_package_is_na(self):
         rows = _sm43_rows(

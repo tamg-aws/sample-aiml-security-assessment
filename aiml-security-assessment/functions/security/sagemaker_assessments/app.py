@@ -13976,8 +13976,8 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
     managed signing rule covers the repository; its S3 model data records an
     ETag, ManifestEtag or ModelDataETag, or comes from SageMaker hub content;
     it does not name an HF_MODEL_ID with no model data; and each artifact
-    bucket defaults to SSE-KMS with a named key. A denied read leaves that
-    endpoint N/A, never Failed.
+    bucket defaults to SSE-KMS with a named customer managed key. A denied
+    read leaves that endpoint N/A, never Failed.
     """
     findings = {"csv_data": []}
 
@@ -14187,7 +14187,21 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                         "it uses the AWS managed key aws/s3",
                     )
                 else:
-                    buckets[bucket] = (None, None)
+                    key_id = str(kms_defaults[0]["KMSMasterKeyID"])
+                    key = _kms_key_managers([key_id], region)[key_id]
+                    if key["manager"] == "AWS":
+                        buckets[bucket] = (
+                            "failed",
+                            f"default encryption key {key_id} is an AWS managed "
+                            "key, not a customer managed key",
+                        )
+                    elif key["manager"] is None:
+                        buckets[bucket] = (
+                            "unread",
+                            f"kms:DescribeKey on {key_id}: {key['error']}",
+                        )
+                    else:
+                        buckets[bucket] = (None, None)
             except Exception as error:
                 label = get_assessment_error_label(error)
                 buckets[bucket] = (

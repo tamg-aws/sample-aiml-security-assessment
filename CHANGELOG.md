@@ -261,6 +261,11 @@ section.
 
 ### Fixed
 
+- `SM-43` resolves an artifact bucket's default `KMSMasterKeyID` with
+  `kms:DescribeKey` and fails a bucket whose key is AWS managed, such as
+  `alias/aws/s3` named explicitly, which used to pass as a named key. A key
+  the call cannot describe leaves the endpoint `N/A`.
+
 - `SM-41` requires `${iot:Connection.Thing.ThingName}` to fill a whole path
   segment of a device policy resource. `topic/*${iot:Connection.Thing.ThingName}`
   and `topic/x-${iot:Connection.Thing.ThingName}` used to pass, and they reach

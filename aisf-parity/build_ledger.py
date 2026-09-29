@@ -1842,7 +1842,7 @@ FOUNDATION_ROWS = [
         "additional model data source fails without an ETag or ManifestEtag unless it "
         "is SageMaker hub content. A container with an HF_MODEL_ID environment key and no model "
         "data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse "
-        "with a named key. An endpoint with an unread repository, signing status, "
+        "with a named key whose kms:DescribeKey KeyManager is CUSTOMER. An endpoint with an unread repository, signing status, "
         "model or bucket reports N/A, never Passed. Partial, ceiling reached: a "
         "recorded ETag says an expected value is recorded, and no AWS API returns "
         "whether SageMaker or the container compared it with the object at load "
