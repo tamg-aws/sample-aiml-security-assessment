@@ -5858,10 +5858,48 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                 status=StatusEnum.NA,
             )
         ]
+    not_judged = []
     try:
-        runtime_images, _ = _agentcore_runtime_images()
-    except ClientError:
-        runtime_images = {}
+        runtime_images, unread_runtimes = _agentcore_runtime_images()
+    except ClientError as error:
+        runtime_images, unread_runtimes = {}, []
+        not_judged.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details=(
+                    "AgentCore runtimes could not be listed, so the repositories "
+                    "their container images come from were not identified and "
+                    "only repositories named for AgentCore were judged: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:ListAgentRuntimes and "
+                    "bedrock-agentcore:GetAgentRuntime, then rerun the assessment."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    for note in unread_runtimes:
+        not_judged.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details=(
+                    f"The container image of AgentCore {note}, so whether "
+                    "Inspector scans the repository it comes from was not judged."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:GetAgentRuntime, then rerun the "
+                    "assessment."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
     try:
         repositories, _ = _agentcore_ecr_repositories(runtime_images)
     except (BotoCoreError, ClientError) as error:
@@ -5873,9 +5911,31 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                 reference=reference,
             )
         ]
+    for key, runtimes in runtime_images.items():
+        registry, region, repo_name = key.split("/", 2)
+        not_judged.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details=(
+                    f"AgentCore runtime(s) {', '.join(runtimes)} run images from "
+                    f"repository '{repo_name}' in registry {registry} in "
+                    f"{region}, which is not a repository this assessment listed "
+                    "in this account and region, so whether Inspector scans it "
+                    "was not judged."
+                ),
+                resolution=(
+                    "Assess the registry that holds the repository, or move the "
+                    "image into this account's registry in this region."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
     names = sorted({str(repo.get("repositoryName")) for repo in repositories if repo})
     if not names:
-        return [
+        return not_judged or [
             create_finding(
                 check_id="AC-50",
                 finding_name=coverage_name,
@@ -5890,7 +5950,7 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
             )
         ]
 
-    findings = []
+    findings = not_judged
     coverage_error = None
     covered: Dict[str, Dict[str, Any]] = {}
     if inspector2_client is None:

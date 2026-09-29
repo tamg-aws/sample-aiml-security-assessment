@@ -40152,6 +40152,120 @@ class TestAC50ImageScanGate:
         assert [f["Status"] for f in findings] == ["N/A"]
 
 
+class TestAC50ImageScanGateRuntimeReads:
+    """CMP-01: the Inspector legs read the same runtime population as the
+    enhanced scanning leg, so a runtime read that fails is reported, not
+    dropped while the name-matched repositories pass."""
+
+    def _run(self, mock_ac, repos, images=None, runtimes_error=None):
+        if runtimes_error is not None:
+            mock_ac.list_agent_runtimes.side_effect = runtimes_error
+        else:
+            _runtimes_with_images(mock_ac, images or {})
+        with (
+            patch("agentcore_app.ecr_client") as mock_ecr,
+            patch("agentcore_app.inspector2_client") as mock_insp,
+            patch("agentcore_app.events_client") as mock_events,
+        ):
+            mock_ecr.meta.region_name = "us-east-1"
+            mock_ecr.describe_repositories.return_value = {
+                "repositories": [_owned_repo(name) for name in repos]
+            }
+            mock_insp.list_coverage.return_value = {
+                "coveredResources": [_coverage(name) for name in repos]
+            }
+            mock_events.list_rules.return_value = {"Rules": [_inspector_rule()]}
+            mock_events.list_targets_by_rule.return_value = {
+                "Targets": [{"Id": "t1", "Arn": "arn:aws:sqs:us-east-1:123456789012:q"}]
+            }
+            findings = agentcore_app.check_agentcore_image_scan_gate()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-50"
+            assert_finding_schema(finding)
+        return findings
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_runtime_list_is_reported_beside_the_named_repos(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            ["agentcore-a"],
+            runtimes_error=_make_client_error("AccessDeniedException", "no"),
+        )
+        assert [(f["Finding"], f["Status"]) for f in findings] == [
+            ("AgentCore ECR Inspector Coverage", "N/A"),
+            ("AgentCore ECR Inspector Coverage", "Passed"),
+            ("AgentCore Image Finding Gate", "Passed"),
+        ]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert "only repositories named for AgentCore" in findings[0]["Finding_Details"]
+        assert "bedrock-agentcore:ListAgentRuntimes" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_runtime_list_with_no_named_repo_does_not_say_none_exist(
+        self, mock_ac
+    ):
+        findings = self._run(
+            mock_ac,
+            ["my-app"],
+            runtimes_error=_make_client_error("AccessDeniedException", "no"),
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "could not be listed" in findings[0]["Finding_Details"]
+        assert "No AgentCore ECR repositories" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_unreadable_runtime_is_reported_and_readable_ones_judged(
+        self, mock_ac
+    ):
+        findings = self._run(
+            mock_ac,
+            ["my-app", "other-app"],
+            images={
+                "rt-1": _make_client_error("AccessDeniedException", "no"),
+                "rt-2": _image_uri("my-app"),
+                "rt-3": _make_client_error("ThrottlingException", "slow"),
+            },
+        )
+        coverage = [
+            f for f in findings if f["Finding"] == "AgentCore ECR Inspector Coverage"
+        ]
+        assert [f["Status"] for f in coverage] == ["N/A", "N/A", "Passed"]
+        assert "rt-1" in coverage[0]["Finding_Details"]
+        assert "AccessDeniedException" in coverage[0]["Finding_Details"]
+        assert "rt-3" in coverage[1]["Finding_Details"]
+        assert "'my-app'" in coverage[2]["Finding_Details"]
+        assert all("other-app" not in f["Finding_Details"] for f in coverage)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_in_another_registry_is_reported_as_not_judged(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            ["agentcore-a"],
+            images={
+                "rt-1": _image_uri("shared-images", account="444455556666"),
+                "rt-2": _image_uri("agentcore-a"),
+            },
+        )
+        coverage = [
+            f for f in findings if f["Finding"] == "AgentCore ECR Inspector Coverage"
+        ]
+        assert [f["Status"] for f in coverage] == ["N/A", "Passed"]
+        assert "'shared-images'" in coverage[0]["Finding_Details"]
+        assert "444455556666" in coverage[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_readable_runtimes_add_no_not_judged_row(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            ["my-app"],
+            images={"rt-1": _image_uri("my-app"), "rt-2": None},
+        )
+        assert [(f["Finding"], f["Status"]) for f in findings] == [
+            ("AgentCore ECR Inspector Coverage", "Passed"),
+            ("AgentCore Image Finding Gate", "Passed"),
+        ]
+
+
 class TestAC53CoordinationAnomalyAlarms:
     """AC-53: every AgentCore caller and callee pair needs an anomaly band alarm."""
 
