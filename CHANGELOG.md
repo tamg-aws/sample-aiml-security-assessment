@@ -261,6 +261,68 @@ section.
 
 ### Fixed
 
+- `SM-41` AWS IoT device-scoped policy adds an `AWS IoT Role Alias Device
+  Scope` row. It lists and describes each credentials-provider role alias
+  (`iot:ListRoleAliases` on `*`, which has no resource type, and
+  `iot:DescribeRoleAlias` on `rolealias/*`, both newly granted to the
+  SageMaker function) and fails an alias whose IAM role, read from the
+  permissions cache, names no `credentials-iot:` policy variable in the
+  `Resource` or `Condition` of any Allow statement. The role a device assumes
+  through the credentials provider used to go unread.
+
+- `SM-26` GuardDuty AI Protection adds a `GuardDuty AI Protection
+  Organization Auto-Enable` row for an `ENABLED` detector. It reads
+  `guardduty:DescribeOrganizationConfiguration` (newly granted to the
+  SageMaker function on `*`, because the action has no resource type) and
+  passes only when `AutoEnableOrganizationMembers` and the `AI_PROTECTION`
+  feature's `AutoEnable` are both `ALL`. Outside the GuardDuty delegated
+  administrator the read fails and the row is `N/A`. Whether AI Protection
+  reached every member account used to go unread.
+
+- `SM-38` runtime monitoring coverage compares every running EC2 instance
+  (`ec2:DescribeInstances`, newly granted to the SageMaker function on `*`
+  because the action has no resource type) with the EC2 instances in
+  GuardDuty coverage, and fails an instance that is absent. An instance
+  tagged `eks:cluster-name` or `kubernetes.io/cluster/*` is left to its
+  cluster's covered-node count, and a Windows instance is not compared; both
+  counts are stated. An instance list that could not be read gives `N/A`. An
+  unenrolled standalone instance used to go uncounted.
+
+- `SM-38` runtime monitoring coverage adds a `GuardDuty EKS Audit Log
+  Monitoring` row in each Region that has an EKS cluster. It passes only when
+  the detector is `ENABLED` with its `EKS_AUDIT_LOGS` feature `ENABLED`, and
+  it is judged whether or not Runtime Monitoring is on. The feature used to go
+  unread. A Region whose EKS clusters could not be listed gets an `N/A` row.
+
+- `SM-09` execution role privilege also judges each Studio domain's
+  `DefaultSpaceSettings.ExecutionRole`, the default execution role for spaces,
+  beside the domain's default user role and each user profile's role. A
+  broad grant on the space role used to go unread.
+
+- `SM-22` deployed model registration also judges the model each batch
+  transform job ran, read from `DescribeTransformJob`, beside the models
+  serving on endpoints. An unregistered or unapproved model used only by a
+  transform job used to go unread, and the row said so. A transform job that
+  could not be listed or described now leaves the row `N/A`, and an account
+  with transform jobs but no endpoint now gets the row.
+
+- `SM-23` model drift detection adds a `Model Monitor Baseline Constraints`
+  row. Each Scheduled monitoring schedule on an InService endpoint must name a
+  baseline `ConstraintsResource`, read from its inline job definition or, for
+  a DataQuality schedule, from `DescribeDataQualityJobDefinition`. A schedule
+  with no constraints file fails, because its reports have nothing to be
+  validated against. A ModelQuality, ModelBias, or ModelExplainability
+  schedule that names a job definition is `N/A`, since only the DataQuality
+  describe is granted, and so is one that names a baselining job but no
+  constraints file.
+
+- `SM-11` endpoint model network path also judges the model each inference
+  component names, from `Specification` and every `Specifications` entry,
+  beside the endpoint config's own `EnableNetworkIsolation` and
+  `VpcConfig`. A component model with isolation off or no `VpcConfig` used
+  to pass behind a compliant endpoint config, and a component that could not
+  be listed or described now leaves its endpoint `N/A`.
+
 - `AR-10` credited a rule filtered on `region`, `time`, `id` or any other
   top-level field beyond `source`, `detail-type`, `detail`, `resources` and
   `account` as routing every approval transition. Every such field now

@@ -575,7 +575,10 @@ class TestSM04SecurityHubRouting:
 class TestProposedSageMakerChecks:
     """SM-26 through SM-30 proposal checks (SM-29 remains reserved/deferred)."""
 
-    def test_sm26_ai_protection_enabled_passes(self):
+    # SM-26 reads the organization auto-enable configuration once the detector
+    # is ENABLED, so boto3 is patched here to keep these tests off the network.
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_ai_protection_enabled_passes(self, mock_client):
         inventory = {
             "detector_id": "detector-1",
             "detail": {
@@ -590,7 +593,8 @@ class TestProposedSageMakerChecks:
         assert finding["Check_ID"] == "SM-26"
         assert finding["Status"] == "Passed"
 
-    def test_sm26_ai_protection_disabled_fails(self):
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_ai_protection_disabled_fails(self, mock_client):
         inventory = {
             "detector_id": "detector-1",
             "detail": {"Status": "ENABLED", "Features": []},
@@ -618,6 +622,105 @@ class TestProposedSageMakerChecks:
         assert "detector-1" in finding["Finding_Details"]
         assert "DISABLED" in finding["Finding_Details"]
         assert "AI Protection is enabled" not in finding["Finding_Details"]
+
+    ENABLED_INVENTORY = {
+        "detector_id": "detector-1",
+        "detail": {
+            "Status": "ENABLED",
+            "Features": [{"Name": "AI_PROTECTION", "Status": "ENABLED"}],
+        },
+        "error": None,
+    }
+
+    def _org_rows(self, mock_client, pages=None, error=None, inventory=None):
+        client = mock_client.return_value
+        if error is not None:
+            client.describe_organization_configuration.side_effect = error
+        else:
+            client.describe_organization_configuration.side_effect = list(pages)
+        rows = extract_csv_data(
+            sagemaker_app.check_guardduty_ai_protection(
+                "us-east-1", inventory or self.ENABLED_INVENTORY
+            )
+        )
+        return [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.GUARDDUTY_ORG_AUTO_ENABLE_FINDING
+        ]
+
+    @staticmethod
+    def _org_page(members="ALL", ai="ALL", token=None, others=("S3_DATA_EVENTS",)):
+        features = [{"Name": name, "AutoEnable": "NONE"} for name in others]
+        if ai is not None:
+            features.append({"Name": "AI_PROTECTION", "AutoEnable": ai})
+        page = {"AutoEnableOrganizationMembers": members, "Features": features}
+        if token:
+            page["NextToken"] = token
+        return page
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_auto_enable_all_passes(self, mock_client):
+        rows = self._org_rows(mock_client, [self._org_page()])
+        assert [r["Status"] for r in rows] == ["Passed"]
+        mock_client.return_value.describe_organization_configuration.assert_called_once_with(
+            DetectorId="detector-1"
+        )
+
+    @pytest.mark.parametrize(
+        "members,ai",
+        [("ALL", "NEW"), ("ALL", "NONE"), ("NEW", "ALL"), ("NONE", "ALL")],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_auto_enable_short_of_all_fails(self, mock_client, members, ai):
+        rows = self._org_rows(mock_client, [self._org_page(members=members, ai=ai)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"AutoEnableOrganizationMembers is {members}" in rows[0]["Finding_Details"]
+        )
+        assert f"AI_PROTECTION feature AutoEnable is {ai}" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_without_an_ai_protection_entry_fails(self, mock_client):
+        rows = self._org_rows(mock_client, [self._org_page(ai=None)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "AutoEnable is not returned" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_ai_protection_on_a_later_page_is_read(self, mock_client):
+        rows = self._org_rows(
+            mock_client,
+            [
+                self._org_page(ai=None, token="t1"),
+                self._org_page(ai="ALL", others=("EKS_AUDIT_LOGS",)),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            mock_client.return_value.describe_organization_configuration.call_args_list[
+                1
+            ].kwargs
+            == {"DetectorId": "detector-1", "NextToken": "t1"}
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_read_error_is_na_naming_the_delegated_admin(self, mock_client):
+        rows = self._org_rows(
+            mock_client, error=_make_client_error("BadRequestException")
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "DescribeOrganizationConfiguration" in rows[0]["Finding_Details"]
+        assert "delegated administrator" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_leg_is_not_read_for_a_suspended_detector(self, mock_client):
+        inventory = {
+            "detector_id": "detector-1",
+            "detail": {"Status": "DISABLED", "Features": []},
+            "error": None,
+        }
+        assert self._org_rows(mock_client, [], inventory=inventory) == []
+        mock_client.return_value.describe_organization_configuration.assert_not_called()
 
     def test_sm26_no_detector_fails(self):
         finding = extract_csv_data(
@@ -8966,6 +9069,26 @@ class TestSM38RuntimeCoverageAndLambdaTier:
             "resourceMetadata": {"lambdaFunction": {"functionName": name}},
         }
 
+    @staticmethod
+    def _ec2(instance_id, status="HEALTHY"):
+        return {
+            "ResourceId": f"arn:aws:ec2:us-east-1:111122223333:instance/{instance_id}",
+            "CoverageStatus": status,
+            "ResourceDetails": {
+                "ResourceType": "EC2",
+                "Ec2InstanceDetails": {"InstanceId": instance_id},
+            },
+        }
+
+    @staticmethod
+    def _instance(instance_id, tags=None, platform=None):
+        instance = {"InstanceId": instance_id, "State": {"Name": "running"}}
+        if tags:
+            instance["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
+        if platform:
+            instance["Platform"] = platform
+        return instance
+
     def _run(
         self,
         detector,
@@ -8976,8 +9099,10 @@ class TestSM38RuntimeCoverageAndLambdaTier:
         fn_coverage=None,
         lambda_state=None,
         errors=None,
+        instances=None,
     ):
         errors = errors or {}
+        self.ec2_calls = []
         coverage = coverage or []
         functions = functions if functions is not None else [{"FunctionName": "fn"}]
         fn_coverage = (
@@ -9036,6 +9161,17 @@ class TestSM38RuntimeCoverageAndLambdaTier:
             elif service == "lambda":
                 client.get_paginator.side_effect = _pager(
                     {"list_functions": source("lambda", [{"Functions": functions}])}
+                )
+            elif service == "ec2":
+
+                def describe_instances(**kwargs):
+                    self.ec2_calls.append(kwargs)
+                    if "ec2" in errors:
+                        raise errors["ec2"]
+                    return [{"Reservations": [{"Instances": instances or []}]}]
+
+                client.get_paginator.side_effect = _pager(
+                    {"describe_instances": describe_instances}
                 )
             return client
 
@@ -9206,6 +9342,101 @@ class TestSM38RuntimeCoverageAndLambdaTier:
     def test_runtime_disabled_skips_coverage_leg(self):
         rows = self._run(self._detail(runtime="DISABLED"))
         assert self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING) == []
+
+    def test_running_instances_all_in_healthy_coverage_pass(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a"), self._ec2("i-b")],
+                instances=[self._instance("i-a"), self._instance("i-b")],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Passed"]
+        assert "every running EC2 instance (2)" in cov[0]["Finding_Details"]
+        assert "instance population is not compared" not in cov[0]["Finding_Details"]
+        assert self.ec2_calls == [
+            {"Filters": [{"Name": "instance-state-name", "Values": ["running"]}]}
+        ]
+
+    def test_one_unenrolled_instance_among_covered_ones_fails(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a"), self._eks("prod")],
+                eks=["prod"],
+                instances=[self._instance("i-a"), self._instance("i-new")],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert (
+            "EC2 instance i-new has no Runtime Monitoring coverage"
+            in cov[0]["Finding_Details"]
+        )
+
+    def test_unenrolled_instance_with_no_coverage_at_all_fails(self):
+        # With nothing in coverage the leg used to read as "no host yet".
+        cov = self._named(
+            self._run(self._detail(), instances=[self._instance("i-new")]),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert "EC2 instance i-new has no" in cov[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tags",
+        [{"eks:cluster-name": "prod"}, {"kubernetes.io/cluster/prod": "owned"}],
+        ids=["managed-node-group", "self-managed"],
+    )
+    def test_eks_node_is_judged_by_its_cluster_not_as_an_instance(self, tags):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._eks("prod")],
+                eks=["prod"],
+                instances=[self._instance("i-node", tags=tags)],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Passed"]
+        assert "1 EKS node instance(s)" in cov[0]["Finding_Details"]
+
+    def test_windows_instance_is_not_compared_and_is_named(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a")],
+                instances=[
+                    self._instance("i-a"),
+                    self._instance("i-win", platform="windows"),
+                ],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Passed"]
+        assert "1 Windows instance(s)" in cov[0]["Finding_Details"]
+
+    def test_instance_list_denied_withholds_passed(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a")],
+                instances=[self._instance("i-a")],
+                errors={"ec2": _make_client_error("UnauthorizedOperation")},
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert "ec2:DescribeInstances" in cov[0]["Finding_Details"]
+
+    def test_no_instance_and_no_host_na_names_the_instance_read(self):
+        cov = self._named(
+            self._run(self._detail()), sagemaker_app.RUNTIME_COVERAGE_FINDING
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert "no running EC2 instance" in cov[0]["Finding_Details"]
+        assert "instance population is not compared" not in cov[0]["Finding_Details"]
 
     def test_one_function_missing_from_inspector_coverage_fails(self):
         functions = [
@@ -10717,6 +10948,7 @@ class TestSM41IoTDeviceScopedPolicies:
                 "list_audit_findings": raising(
                     "list_audit_findings", [{"findings": audit_findings or []}]
                 ),
+                "list_role_aliases": [{"roleAliases": []}],
             }
         )
 
@@ -10875,6 +11107,139 @@ class TestSM41IoTDeviceScopedPolicies:
         rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
         assert len(rows) == 1
         assert_could_not_assess_finding(rows[0])
+
+
+_ALIAS_ROLE = "arn:aws:iam::123456789012:role/"
+_THING_SCOPED = {
+    "Effect": "Allow",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::telemetry/${credentials-iot:ThingName}/*",
+}
+_FLEET_WIDE = {
+    "Effect": "Allow",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::telemetry/*",
+}
+
+
+class TestSM41RoleAliasDeviceScope:
+    """AIR-PHY-EDG-01: a credentials-provider role alias scoped per device."""
+
+    def _run(self, aliases, cache, errors=None, policies=None):
+        errors = errors or {}
+        self.described = []
+        client = MagicMock()
+
+        def list_role_aliases(**kwargs):
+            if "list" in errors:
+                raise errors["list"]
+            return [{"roleAliases": []}, {"roleAliases": list(aliases)}]
+
+        client.get_paginator.side_effect = _pager(
+            {
+                "list_policies": [{"policies": policies or []}],
+                "list_role_aliases": list_role_aliases,
+            }
+        )
+
+        def describe_role_alias(roleAlias):
+            self.described.append(roleAlias)
+            if roleAlias in errors:
+                raise errors[roleAlias]
+            description = {"roleAlias": roleAlias}
+            if aliases[roleAlias]:
+                description["roleArn"] = _ALIAS_ROLE + aliases[roleAlias]
+            return {"roleAliasDescription": description}
+
+        client.describe_role_alias.side_effect = describe_role_alias
+        with patch("sagemaker_app.boto3.client", return_value=client):
+            rows = _rows(
+                sagemaker_app.check_iot_device_scoped_policies(
+                    "us-east-1", permission_cache=cache
+                )
+            )
+        return [
+            r
+            for r in rows
+            if r["Finding"].startswith(sagemaker_app.IOT_ROLE_ALIAS_FINDING)
+        ]
+
+    @staticmethod
+    def _cache(**roles):
+        return _environment_cache(
+            {
+                name: [(name, f"arn:aws:iam::123456789012:policy/{name}", stmts)]
+                for name, stmts in roles.items()
+            }
+        )
+
+    def test_every_alias_role_scoped_by_a_device_variable_passes(self):
+        condition_scoped = {
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::telemetry",
+            "Condition": {
+                "StringLike": {"s3:prefix": "${credentials-iot:AwsCertificateId}/*"}
+            },
+        }
+        rows = self._run(
+            {"a": "role-a", "b": "role-b"},
+            self._cache(**{"role-a": [_THING_SCOPED], "role-b": [condition_scoped]}),
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 role alias(es)" in rows[0]["Finding_Details"]
+        assert self.described == ["a", "b"]
+
+    def test_one_fleet_wide_alias_role_among_scoped_ones_fails(self):
+        rows = self._run(
+            {"a": "role-a", "b": "role-b"},
+            self._cache(**{"role-a": [_THING_SCOPED], "role-b": [_FLEET_WIDE]}),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "role alias 'b'" in rows[0]["Finding_Details"]
+        assert "role-b" in rows[0]["Finding_Details"]
+
+    def test_variable_only_in_a_deny_statement_does_not_scope(self):
+        deny = dict(_THING_SCOPED, Effect="Deny")
+        rows = self._run(
+            {"a": "role-a"}, self._cache(**{"role-a": [_FLEET_WIDE, deny]})
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_role_alias_is_judged_with_no_iot_policy_in_the_region(self):
+        rows = self._run({"a": "role-a"}, self._cache(**{"role-a": [_FLEET_WIDE]}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_no_role_alias_adds_no_row(self):
+        assert self._run({}, self._cache()) == []
+
+    @pytest.mark.parametrize(
+        "case", ["no-cache", "role-missing", "describe-denied", "no-role-arn"]
+    )
+    def test_unread_alias_withholds_passed(self, case):
+        aliases = {"a": "role-a", "b": "role-b"}
+        cache = self._cache(**{"role-a": [_THING_SCOPED], "role-b": [_THING_SCOPED]})
+        errors = {}
+        if case == "no-cache":
+            cache = None
+        elif case == "role-missing":
+            cache = self._cache(**{"role-a": [_THING_SCOPED]})
+        elif case == "describe-denied":
+            errors = {"b": _make_client_error("AccessDeniedException")}
+        else:
+            aliases["b"] = None
+        rows = self._run(aliases, cache, errors=errors)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "role alias 'b'" in rows[0]["Finding_Details"]
+
+    def test_role_alias_list_denied_is_na(self):
+        rows = self._run(
+            {"a": "role-a"},
+            self._cache(**{"role-a": [_THING_SCOPED]}),
+            errors={"list": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "iot:ListRoleAliases" in rows[0]["Finding_Details"]
 
 
 class TestSM41DeviceIdentityAndAudit:
@@ -11169,9 +11534,14 @@ class TestScope27HandlerWiring:
             "check_security_hub_ai_standard",
             "check_eks_vpc_cni_network_policy",
             "check_secrets_manager_rotation",
-            "check_iot_device_scoped_policies",
         ):
             assert f"{name}(region)" in handler or f"{name}(region=region)" in handler
+        # SM-41 judges each role alias's IAM role from the permissions cache.
+        assert (
+            "check_iot_device_scoped_policies(\n"
+            "                region=region, permission_cache=permission_cache\n"
+            "            )" in handler
+        )
         for name in (
             "check_guardduty_lambda_network_logs",
             "check_guardduty_runtime_monitoring",

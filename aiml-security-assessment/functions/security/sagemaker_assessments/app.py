@@ -1147,6 +1147,89 @@ def _guardduty_eventbridge_routing_finding(region: str) -> Dict[str, Any]:
     )
 
 
+GUARDDUTY_ORG_AUTO_ENABLE_FINDING = "GuardDuty AI Protection Organization Auto-Enable"
+
+
+def _guardduty_org_auto_enable_finding(region: str, detector_id: str) -> Dict[str, Any]:
+    """GuardDuty and its AI_PROTECTION plan auto-enabled for ALL member accounts."""
+    reference = "https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html"
+    try:
+        client = boto3.client("guardduty", config=boto3_config, region_name=region)
+        response = client.describe_organization_configuration(DetectorId=detector_id)
+        features = list(response.get("Features") or [])
+        token = response.get("NextToken")
+        while isinstance(token, str) and token:
+            page = client.describe_organization_configuration(
+                DetectorId=detector_id, NextToken=token
+            )
+            features.extend(page.get("Features") or [])
+            token = page.get("NextToken")
+    except Exception as error:
+        return create_finding(
+            check_id="SM-26",
+            finding_name=GUARDDUTY_ORG_AUTO_ENABLE_FINDING,
+            finding_details=(
+                "guardduty:DescribeOrganizationConfiguration failed "
+                f"({get_assessment_error_label(error)}). Only the GuardDuty "
+                "delegated administrator account can read whether GuardDuty and "
+                "AI Protection are auto-enabled for member accounts, so this leg "
+                "is judged when the assessment runs there."
+            ),
+            resolution=(
+                "Run the assessment in the GuardDuty delegated administrator "
+                "account to judge organization auto-enable."
+            ),
+            reference=reference,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+    members = response.get("AutoEnableOrganizationMembers")
+    ai_protection = next(
+        (
+            feature.get("AutoEnable")
+            for feature in features
+            if feature.get("Name") == "AI_PROTECTION"
+        ),
+        None,
+    )
+    if members == "ALL" and ai_protection == "ALL":
+        return create_finding(
+            check_id="SM-26",
+            finding_name=GUARDDUTY_ORG_AUTO_ENABLE_FINDING,
+            finding_details=(
+                "The organization configuration auto-enables GuardDuty "
+                "(AutoEnableOrganizationMembers ALL) and the AI_PROTECTION feature "
+                "(AutoEnable ALL) for every existing and new member account. Each "
+                "member's own detector is not read."
+            ),
+            resolution="No action required",
+            reference=reference,
+            severity="High",
+            status="Passed",
+            region=region,
+        )
+    return create_finding(
+        check_id="SM-26",
+        finding_name=GUARDDUTY_ORG_AUTO_ENABLE_FINDING,
+        finding_details=(
+            f"AutoEnableOrganizationMembers is {members or 'not returned'} and the "
+            f"AI_PROTECTION feature AutoEnable is {ai_protection or 'not returned'}. "
+            "Both must be ALL: NEW enables only accounts that join later, and NONE "
+            "enables none, so a member account can host AI workloads without AI "
+            "Protection."
+        ),
+        resolution=(
+            "From the GuardDuty delegated administrator, set auto-enable to ALL for "
+            "the organization and for the AI Protection plan."
+        ),
+        reference=reference,
+        severity="High",
+        status="Failed",
+        region=region,
+    )
+
+
 def check_guardduty_ai_protection(
     region: str = "", detector_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
@@ -1216,6 +1299,9 @@ def check_guardduty_ai_protection(
                 status="Passed" if enabled else "Failed",
                 region=region,
             )
+        )
+        findings["csv_data"].append(
+            _guardduty_org_auto_enable_finding(region, inventory["detector_id"])
         )
     except Exception as error:
         findings["csv_data"].append(
@@ -15045,9 +15131,36 @@ def _runtime_coverage_findings(
             )
     except Exception as error:
         unread.append(f"ecs:ListClusters ({get_assessment_error_label(error)})")
+    instances = []
+    eks_nodes = 0
+    windows = 0
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        for page in ec2_client.get_paginator("describe_instances").paginate(
+            Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
+        ):
+            for reservation in page.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    tag_keys = [
+                        tag.get("Key") or "" for tag in instance.get("Tags") or []
+                    ]
+                    if "eks:cluster-name" in tag_keys or any(
+                        key.startswith("kubernetes.io/cluster/") for key in tag_keys
+                    ):
+                        eks_nodes += 1
+                    elif instance.get("Platform") == "windows":
+                        windows += 1
+                    elif instance.get("InstanceId"):
+                        instances.append(instance["InstanceId"])
+    except Exception as error:
+        unread.append(f"ec2:DescribeInstances ({get_assessment_error_label(error)})")
+    excluded = (
+        f"{eks_nodes} EKS node instance(s) are judged by their cluster's node count "
+        f"and {windows} Windows instance(s) are not compared"
+    )
 
     problems = []
-    covered = {"EKS": set(), "ECS": set()}
+    covered = {"EKS": set(), "ECS": set(), "EC2": set()}
     healthy = []
     for resource in resources:
         details = resource.get("ResourceDetails") or {}
@@ -15089,6 +15202,11 @@ def _runtime_coverage_findings(
     for cluster in ecs_clusters:
         if cluster not in covered["ECS"]:
             problems.append(f"ECS cluster {cluster} has no Runtime Monitoring coverage")
+    for instance_id in instances:
+        if instance_id not in covered["EC2"]:
+            problems.append(
+                f"EC2 instance {instance_id} has no Runtime Monitoring coverage"
+            )
 
     states = {
         config.get("Name"): config.get("Status")
@@ -15100,7 +15218,13 @@ def _runtime_coverage_findings(
         if states.get(name) != "ENABLED"
     ]
     rows = []
-    if not resources and not eks_clusters and not ecs_clusters and not unread:
+    if (
+        not resources
+        and not eks_clusters
+        and not ecs_clusters
+        and not instances
+        and not unread
+    ):
         if unmanaged:
             problems.append(
                 "no host reports a Runtime Monitoring agent, and automated agent "
@@ -15113,9 +15237,8 @@ def _runtime_coverage_findings(
                     finding_name=RUNTIME_COVERAGE_FINDING,
                     finding_details=(
                         "Automated agent management is enabled for EKS, ECS Fargate "
-                        "and EC2, and no host is in coverage yet. The EC2 instance "
-                        "population is not compared against coverage, so an "
-                        "instance GuardDuty has not enrolled is not counted."
+                        "and EC2, no host is in coverage yet, and no running EC2 "
+                        f"instance was found outside coverage ({excluded})."
                     ),
                     resolution="No action required",
                     reference=RUNTIME_COVERAGE_REFERENCE,
@@ -15177,10 +15300,9 @@ def _runtime_coverage_findings(
                 finding_name=RUNTIME_COVERAGE_FINDING,
                 finding_details=(
                     f"All {len(healthy)} resource(s) in Runtime Monitoring coverage "
-                    f"are HEALTHY, including every EKS and ECS cluster listed: "
-                    f"{', '.join(healthy[:10])}. The EC2 instance population is not "
-                    "compared against coverage, so a standalone instance GuardDuty "
-                    "has not enrolled is not counted."
+                    "are HEALTHY, including every EKS and ECS cluster listed and "
+                    f"every running EC2 instance ({len(instances)}): "
+                    f"{', '.join(healthy[:10])}. {excluded}."
                 ),
                 resolution="No action required",
                 reference=RUNTIME_COVERAGE_REFERENCE,
@@ -16862,6 +16984,10 @@ IOT_AUDIT_REFERENCE = (
     "device-defender-audit.html"
 )
 IOT_SHARED_CERTIFICATE_CHECK = "DEVICE_CERTIFICATE_SHARED_CHECK"
+IOT_ROLE_ALIAS_FINDING = "AWS IoT Role Alias Device Scope"
+IOT_ROLE_ALIAS_REFERENCE = (
+    "https://docs.aws.amazon.com/iot/latest/developerguide/authorizing-direct-aws.html"
+)
 IOT_AUDIT_FINDING_WINDOW_DAYS = 31
 
 
@@ -16953,11 +17079,148 @@ def _iot_policy_problems(document: Any) -> List[str]:
     return problems
 
 
-def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
+def _iot_role_alias_findings(
+    iot_client, region: str, permission_cache: Optional[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    SM-41: each credentials-provider role alias's IAM role scopes a device by a
+    credentials-iot policy variable in at least one Allow statement.
+    """
+    try:
+        aliases = []
+        for page in iot_client.get_paginator("list_role_aliases").paginate():
+            aliases.extend(page.get("roleAliases") or [])
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-41",
+                IOT_ROLE_ALIAS_FINDING,
+                [f"iot:ListRoleAliases ({get_assessment_error_label(error)})"],
+                "no role alias was read.",
+                IOT_ROLE_ALIAS_REFERENCE,
+                region,
+            )
+        ]
+    if not aliases:
+        return []
+    cached = (permission_cache or {}).get("role_permissions") or {}
+    unread_principals = (
+        set(_principal_read_errors(permission_cache) or [])
+        if permission_cache
+        else set()
+    )
+    scoped, unscoped, unread = [], [], []
+    for alias in aliases:
+        try:
+            description = (
+                iot_client.describe_role_alias(roleAlias=alias).get(
+                    "roleAliasDescription"
+                )
+                or {}
+            )
+        except Exception as error:
+            unread.append(f"role alias '{alias}' ({get_assessment_error_label(error)})")
+            continue
+        role_arn = description.get("roleArn")
+        name = _role_name_from_arn(role_arn) if role_arn else None
+        if not name:
+            unread.append(f"role alias '{alias}' (no roleArn returned)")
+        elif permission_cache is None:
+            unread.append(
+                f"role alias '{alias}' role {role_arn} (the IAM permissions cache "
+                "was not available)"
+            )
+        elif name not in cached:
+            unread.append(
+                f"role alias '{alias}' role {role_arn} (not in the IAM cache)"
+            )
+        elif any(p.startswith(f"role '{name}' ") for p in unread_principals):
+            unread.append(
+                f"role alias '{alias}' role {role_arn} (IAM cache read error)"
+            )
+        elif any(
+            str(statement.get("Effect", "")).upper() == "ALLOW"
+            and "credentials-iot:"
+            in json.dumps([statement.get("Resource"), statement.get("Condition")])
+            for policy in (cached[name].get("attached_policies") or [])
+            + (cached[name].get("inline_policies") or [])
+            for statement in _sm_policy_statements(policy.get("document"))
+        ):
+            scoped.append(alias)
+        else:
+            unscoped.append((alias, name))
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-41",
+            finding_name=IOT_ROLE_ALIAS_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=IOT_ROLE_ALIAS_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    rows = []
+    for alias, name in unscoped[:20]:
+        rows.append(
+            _row(
+                f"AWS IoT role alias '{alias}' hands devices credentials for role "
+                f"'{name}', and no Allow statement of that role names a "
+                "credentials-iot policy variable in its Resource or Condition, so "
+                "every device that assumes the alias gets the same AWS access.",
+                "Scope the role's Resource or Condition to the calling device with "
+                "${credentials-iot:ThingName}, ${credentials-iot:ThingTypeName} or "
+                "${credentials-iot:AwsCertificateId}.",
+                "High",
+                "Failed",
+            )
+        )
+    if len(unscoped) > 20:
+        rows.append(
+            _row(
+                f"{len(unscoped)} role aliases hand out an unscoped role (the first "
+                "20 are reported individually above).",
+                "Scope each role to the calling device.",
+                "High",
+                "Failed",
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-41",
+                IOT_ROLE_ALIAS_FINDING,
+                unread,
+                f"{len(scoped) + len(unscoped)} role alias(es) were judged.",
+                IOT_ROLE_ALIAS_REFERENCE,
+                region,
+            )
+        )
+    elif scoped and not unscoped:
+        rows.append(
+            _row(
+                f"The roles of all {len(scoped)} role alias(es) name a "
+                "credentials-iot policy variable in the Resource or Condition of "
+                f"at least one Allow statement: {', '.join(sorted(scoped)[:5])}. "
+                "Whether every statement of the role is device-scoped is not "
+                "judged.",
+                "No action required",
+                "High",
+                "Passed",
+            )
+        )
+    return rows
+
+
+def check_iot_device_scoped_policies(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     SM-41: Verify attached AWS IoT policies scope each device to its own topics
-    and client ID, and require the certificate to be attached to a thing
-    (AIR-PHY-EDG-01).
+    and client ID, require the certificate to be attached to a thing, and that
+    each role alias's IAM role is scoped per device (AIR-PHY-EDG-01).
     """
     logger.debug("Starting check for AWS IoT device-scoped policies")
     findings = {"csv_data": []}
@@ -17016,6 +17279,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
         else:
             passed.append(name)
 
+    role_alias_rows = _iot_role_alias_findings(iot_client, region, permission_cache)
     if not failed and not passed and not errors:
         findings["csv_data"].append(
             _row(
@@ -17026,6 +17290,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
                 "N/A",
             )
         )
+        findings["csv_data"].extend(role_alias_rows)
         return findings
 
     for name, problems in failed[:20]:
@@ -17069,6 +17334,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
                 "N/A",
             )
         )
+    findings["csv_data"].extend(role_alias_rows)
     findings["csv_data"].append(
         _iot_unique_certificate_finding(
             iot_client, sorted(certificates), region, sorted(thing_groups)
@@ -17774,7 +18040,11 @@ def lambda_handler(event, context):
         )
 
         logger.info("Running AWS IoT device-scoped policy check (SM-41)")
-        all_findings.append(check_iot_device_scoped_policies(region=region))
+        all_findings.append(
+            check_iot_device_scoped_policies(
+                region=region, permission_cache=permission_cache
+            )
+        )
 
         logger.info("Running sagemaker.runtime VPC endpoint policy check (SM-02)")
         all_findings.append(check_sagemaker_runtime_endpoint_policy(region=region))
