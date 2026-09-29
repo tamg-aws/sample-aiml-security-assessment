@@ -514,6 +514,40 @@ class TestSM04SecurityHubRouting:
         assert row["Status"] == "Failed"
         assert "none has a target" in row["Finding_Details"]
 
+    @pytest.mark.parametrize(
+        "detail_type",
+        [["AWS API Call via CloudTrail"], "AWS API Call via CloudTrail", []],
+    )
+    @pytest.mark.parametrize("wrong_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_rule_on_another_detail_type_does_not_route_findings(
+        self, mock_client, detail_type, wrong_first
+    ):
+        wrong = json.dumps({"source": ["aws.guardduty"], "detail-type": detail_type})
+        rules = [self._rule("api", wrong), self._rule("gd")]
+        if not wrong_first:
+            rules.reverse()
+        row = self._eventbridge(mock_client, rules, targets={"api": [{"Id": "sns"}]})
+        assert row["Status"] == "Failed"
+        assert "none has a target" in row["Finding_Details"]
+        assert "GuardDuty Finding" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            '{"source": ["aws.guardduty"]}',
+            '{"source": "aws.guardduty", "detail-type": "GuardDuty Finding"}',
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_rule_admitting_the_finding_detail_type_passes(
+        self, mock_client, pattern
+    ):
+        row = self._eventbridge(
+            mock_client, [self._rule("gd", pattern)], targets={"gd": [{"Id": "sns"}]}
+        )
+        assert row["Status"] == "Passed"
+
     @patch("sagemaker_app.boto3.client")
     def test_list_rules_failure_is_incomplete(self, mock_client):
         row = self._eventbridge(
@@ -567,6 +601,33 @@ class TestProposedSageMakerChecks:
         )[0]
         assert finding["Status"] == "Failed"
         assert finding["Severity"] == "High"
+
+    def test_sm26_a_suspended_detector_fails_despite_the_feature(self):
+        inventory = {
+            "detector_id": "detector-1",
+            "detail": {
+                "Status": "DISABLED",
+                "Features": [{"Name": "AI_PROTECTION", "Status": "ENABLED"}],
+            },
+            "error": None,
+        }
+        finding = extract_csv_data(
+            sagemaker_app.check_guardduty_ai_protection("us-east-1", inventory)
+        )[0]
+        assert finding["Status"] == "Failed"
+        assert "detector-1" in finding["Finding_Details"]
+        assert "DISABLED" in finding["Finding_Details"]
+        assert "AI Protection is enabled" not in finding["Finding_Details"]
+
+    def test_sm26_no_detector_fails(self):
+        finding = extract_csv_data(
+            sagemaker_app.check_guardduty_ai_protection(
+                "us-east-1", {"detector_id": None, "detail": None, "error": None}
+            )
+        )[0]
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "High"
+        assert "No GuardDuty detector" in finding["Finding_Details"]
 
     # SM-28 now reads the route tables of the effective VPC subnets, so boto3 is
     # patched here to keep this unit test off the network.
@@ -1774,6 +1835,76 @@ class TestSM14ContainerRepository:
         assert_could_not_assess_finding(findings[0])
 
 
+def _sm14_rows(models, pages=None):
+    """Run SM-14 over {model name: DescribeModel response or exception}."""
+
+    def describe_model(ModelName):
+        value = models[ModelName]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    listing = {"list_models": [{"Models": [{"ModelName": n} for n in models]}]}
+    listing.update(pages or {})
+    sm = _pages_client(listing, describe_model=MagicMock(side_effect=describe_model))
+    with patch("sagemaker_app.boto3.client", return_value=sm):
+        return extract_csv_data(
+            sagemaker_app.check_sagemaker_model_container_repository("us-east-1")
+        )
+
+
+def _sm14_model(mode):
+    return {
+        "PrimaryContainer": {
+            "Image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/m:1",
+            "ImageConfig": {"RepositoryAccessMode": mode},
+        }
+    }
+
+
+class TestSM14UnreadModels:
+    """EP-03: a model whose description failed is not counted as passing."""
+
+    def test_every_model_in_vpc_mode_passes(self):
+        rows = _sm14_rows({"a": _sm14_model("Vpc"), "b": _sm14_model("Vpc")})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 2 models" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("broken_first", [True, False])
+    def test_a_failed_describe_withholds_passed_and_is_named(self, broken_first):
+        models = [
+            ("good", _sm14_model("Vpc")),
+            ("broken", _make_client_error("AccessDeniedException")),
+        ]
+        if broken_first:
+            models.reverse()
+        rows = _sm14_rows(dict(models))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sagemaker:DescribeModel broken" in rows[0]["Finding_Details"]
+        assert "AccessDenied" in rows[0]["Finding_Details"]
+
+    def test_a_failed_describe_beside_a_platform_model_keeps_both_rows(self):
+        rows = _sm14_rows(
+            {
+                "open": _sm14_model("Platform"),
+                "broken": _make_client_error("ThrottlingException"),
+            }
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A"]
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert "'open'" in failed[0]["Finding_Details"]
+        unread = [r for r in rows if r["Status"] == "N/A"]
+        assert "sagemaker:DescribeModel broken" in unread[0]["Finding_Details"]
+
+    def test_a_failed_list_is_not_reported_as_no_models(self):
+        rows = _sm14_rows(
+            {}, pages={"list_models": _make_client_error("AccessDeniedException")}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sagemaker:ListModels" in rows[0]["Finding_Details"]
+        assert "No models found" not in rows[0]["Finding_Details"]
+
+
 # ===================================================================
 # SM-15: check_sagemaker_feature_store_encryption
 # ===================================================================
@@ -2316,6 +2447,48 @@ class TestSM23DriftDetection:
         result = check()
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+class TestSM23NoEndpointToJudge:
+    """EP-06: a Region with no InService endpoint has nothing drift can pass on."""
+
+    @staticmethod
+    def _rows(endpoints):
+        sm = _pages_client(
+            {
+                "list_endpoints": [{"Endpoints": endpoints}],
+                "list_monitoring_schedules": [{"MonitoringScheduleSummaries": []}],
+            }
+        )
+        with patch("sagemaker_app.boto3.client", return_value=sm):
+            return extract_csv_data(
+                sagemaker_app.check_model_drift_detection(region="us-east-1")
+            )
+
+    @pytest.mark.parametrize(
+        "endpoints",
+        [
+            [],
+            [
+                {"EndpointName": "a", "EndpointStatus": "Creating"},
+                {"EndpointName": "b", "EndpointStatus": "Failed"},
+            ],
+        ],
+    )
+    def test_no_in_service_endpoint_is_na(self, endpoints):
+        rows = self._rows(endpoints)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "No InService endpoints" in rows[0]["Finding_Details"]
+
+    def test_an_in_service_endpoint_without_a_schedule_fails(self):
+        rows = self._rows(
+            [
+                {"EndpointName": "a", "EndpointStatus": "Creating"},
+                {"EndpointName": "live", "EndpointStatus": "InService"},
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'live'" in rows[0]["Finding_Details"]
 
 
 # ===================================================================
@@ -6576,6 +6749,9 @@ class TestSM35SecurityServiceDelegatedAdmin:
                         ]
                     }
                 ],
+                "config-multiaccountsetup.amazonaws.com": [
+                    {"DelegatedAdministrators": [active]}
+                ],
                 # The active admin arrives on the second page.
                 "access-analyzer.amazonaws.com": [
                     {"DelegatedAdministrators": []},
@@ -6606,11 +6782,13 @@ class TestSM35SecurityServiceDelegatedAdmin:
             "Passed",
             "Passed",
             "Passed",
+            "Passed",
             "Failed",
             "Passed",
             "Failed",
             "Failed",
         ]
+        assert "config-multiaccountsetup.amazonaws.com" in rows[5]["Finding_Details"]
         assert all(r["Check_ID"] == "SM-35" for r in rows)
         assert all(
             "Services checked (fixed list): Amazon GuardDuty" in r["Finding_Details"]
@@ -6640,7 +6818,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
             }
         )
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert [r["Status"] for r in rows] == ["Passed"] * 12
+        assert [r["Status"] for r in rows] == ["Passed"] * 13
         assert self.MANAGEMENT not in rows[0]["Finding_Details"].split(".")[0]
         assert (
             f"one non-management account {self.SECURITY}"
@@ -6658,7 +6836,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
         pages["guardduty.amazonaws.com"] = _make_client_error("TooManyRequests")
         mock_client.return_value = self._client(pages)
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert len(rows) == 12
+        assert len(rows) == 13
         assert_could_not_assess_finding(rows[0])
         assert "readable only from" not in rows[0]["Finding_Details"]
         assert rows[1]["Status"] == "Failed"
@@ -6725,6 +6903,45 @@ class TestSM35DelegatedAdminConsolidation:
     def test_acc09_services_are_checked(self, service):
         assert service in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
 
+    def test_config_multi_account_setup_is_a_checked_service(self):
+        # Config rules and conformance packs are delegated through their own
+        # principal, apart from the aggregator's config.amazonaws.com.
+        assert (
+            "AWS Config multi-account setup",
+            "config-multiaccountsetup.amazonaws.com",
+        ) in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+
+    @pytest.mark.parametrize(
+        "management, dedicated",
+        [
+            ("config-multiaccountsetup.amazonaws.com", "config.amazonaws.com"),
+            ("config.amazonaws.com", "config-multiaccountsetup.amazonaws.com"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_each_config_principal_is_judged_on_its_own_administrator(
+        self, mock_client, management, dedicated
+    ):
+        rows = self._rows(
+            mock_client,
+            {
+                management: [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ]
+            },
+        )
+        by_principal = {
+            principal: [r for r in rows if f"({principal})" in r["Finding_Details"]]
+            for principal in (management, dedicated)
+        }
+        assert [r["Status"] for r in by_principal[management]] == ["Failed"]
+        assert [r["Status"] for r in by_principal[dedicated]] == ["Passed"]
+        assert rows[-1]["Status"] == "Failed"
+
     @patch("sagemaker_app.boto3.client")
     def test_a_management_administered_audit_manager_fails(self, mock_client):
         rows = self._rows(
@@ -6748,7 +6965,7 @@ class TestSM35DelegatedAdminConsolidation:
     def test_one_shared_administrator_passes(self, mock_client):
         rows = self._rows(mock_client)
         assert rows[-1]["Status"] == "Passed"
-        assert "11 security services" in rows[-1]["Finding_Details"]
+        assert "12 security services" in rows[-1]["Finding_Details"]
         assert "not recorded by any Organizations API" in rows[-1]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
@@ -6766,7 +6983,7 @@ class TestSM35DelegatedAdminConsolidation:
             },
         )
         # Every per-service row passes; only the cross-service row sees the split.
-        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 11
+        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 12
         assert rows[-1]["Status"] == "Failed"
         assert f"account {self.OTHER}: Amazon Inspector" in rows[-1]["Finding_Details"]
 
@@ -7897,6 +8114,342 @@ class TestSM37EndpointFlowLogAlerting:
         assert "2 endpoint(s) have no network anomaly alerting" in details
         assert self.history_calls == []
 
+    def _split_groups(self, a_filters, b_filters, b_alarms=None):
+        """ep-1 on /flow/a, ep-2 on /flow/b, each with its own filters."""
+        return {
+            "flow_logs": [
+                self._flow_log("vpc-1"),
+                self._flow_log("vpc-2", group="/flow/b"),
+            ],
+            "filters": {
+                "/flow/a": [dict(f, logGroupName="/flow/a") for f in a_filters],
+                "/flow/b": [dict(f, logGroupName="/flow/b") for f in b_filters],
+            },
+        }
+
+    def _transform(self, pattern="", name="Egress", **transformation):
+        return {
+            "filterName": f"f-{name}",
+            "filterPattern": pattern,
+            "metricTransformations": [
+                {"metricNamespace": "Flow", "metricName": name, **transformation}
+            ],
+        }
+
+    FLOW_FIELDS = (
+        "[version, account, eni, source, destination, srcport, destport, "
+        "protocol, packets, bytes, start, end, {action}, {status}]"
+    )
+
+    @pytest.mark.parametrize(
+        "action, status",
+        [
+            ('action="DENY"', "status"),
+            ("action=REJECT && action=ERROR", "status"),
+            ("action", "status=FAILED"),
+        ],
+    )
+    @pytest.mark.parametrize("dead_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_bracketed_condition_no_flow_record_carries_fails_only_its_endpoint(
+        self, mock_client, action, status, dead_first
+    ):
+        dead = self._transform(self.FLOW_FIELDS.format(action=action, status=status))
+        other = self._transform("", name="Ingress")
+        b_filters = [dead, other] if dead_first else [other, dead]
+        alarms = [self._alarm(), self._alarm(metric="Egress", AlarmName="egress-2")]
+        rows = self._run(
+            mock_client,
+            alarms=alarms,
+            **self._split_groups([self._transform("REJECT")], b_filters),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert "endpoint 'ep-2'" in details
+        assert "endpoint 'ep-1'" not in details
+        assert "pattern matches no flow-log record" in details
+        assert "'f-Egress'" in details
+
+    @pytest.mark.parametrize(
+        "action, status",
+        [
+            ('action="REJECT"', "status"),
+            ("action=ACCEPT || action=DENY", "status"),
+            ("action=*EJECT", "status"),
+            ("action", "status=-"),
+            ("action", "status=NODATA"),
+            ("action", "status"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_bracketed_condition_a_flow_record_carries_passes(
+        self, mock_client, action, status
+    ):
+        rows = self._run(
+            mock_client,
+            filters={
+                "/flow/a": [
+                    dict(
+                        self._transform(
+                            self.FLOW_FIELDS.format(action=action, status=status)
+                        ),
+                        logGroupName="/flow/a",
+                    )
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_bracketed_ipv6_source_passes(self, mock_client):
+        pattern = (
+            "[version, account, eni, source=fe80::1, destination, srcport, "
+            "destport, protocol, packets, bytes, start, end, action, status]"
+        )
+        rows = self._run(
+            mock_client,
+            filters={
+                "/flow/a": [dict(self._transform(pattern), logGroupName="/flow/a")]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    DEAD_ALARMS = [
+        # The alarm reads a dimension the filter never publishes.
+        ({}, {"Dimensions": [{"Name": "eni", "Value": "eni-1"}]}, "dimension"),
+        # The filter publishes a dimension the alarm does not read.
+        ({"dimensions": {"eni": "$eni"}}, {}, "dimension"),
+        # The alarm reads a unit the filter never publishes.
+        ({}, {"Unit": "Bytes"}, "unit Bytes"),
+        ({"unit": "Count"}, {"Unit": "Bytes"}, "unit Bytes"),
+        # A count can never fall below zero.
+        (
+            {"metricValue": "1"},
+            {
+                "Statistic": "Sum",
+                "ComparisonOperator": "LessThanThreshold",
+                "Threshold": 0.0,
+            },
+            "never",
+        ),
+        (
+            {"metricValue": "1"},
+            {
+                "Statistic": "Sum",
+                "ComparisonOperator": "LessThanOrEqualToThreshold",
+                "Threshold": -1.0,
+            },
+            "never",
+        ),
+        # The largest value the filter publishes is 1.
+        (
+            {"metricValue": "1"},
+            {
+                "Statistic": "Maximum",
+                "ComparisonOperator": "GreaterThanThreshold",
+                "Threshold": 1.0,
+            },
+            "never",
+        ),
+        (
+            {"metricValue": "1", "defaultValue": 0.0},
+            {
+                "ExtendedStatistic": "p99",
+                "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+                "Threshold": 2.0,
+            },
+            "never",
+        ),
+        # A filter that publishes only zeros sums to zero.
+        (
+            {"metricValue": "0"},
+            {
+                "Statistic": "Sum",
+                "ComparisonOperator": "GreaterThanThreshold",
+                "Threshold": 0.0,
+            },
+            "never",
+        ),
+    ]
+
+    @pytest.mark.parametrize("transformation, alarm, reason", DEAD_ALARMS)
+    @patch("sagemaker_app.boto3.client")
+    def test_an_alarm_that_can_never_fire_fails_only_its_endpoint(
+        self, mock_client, transformation, alarm, reason
+    ):
+        # ep-1's group publishes Egress, which the live alarm reads. ep-2's
+        # group publishes Dead, which only the dead alarm reads.
+        alarms = [
+            self._alarm(),
+            self._alarm(metric="Dead", AlarmName="dead", **alarm),
+        ]
+        rows = self._run(
+            mock_client,
+            alarms=alarms,
+            **self._split_groups(
+                [self._transform()], [self._transform(name="Dead", **transformation)]
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert "endpoint 'ep-2'" in details
+        assert "endpoint 'ep-1'" not in details
+        assert "alarm 'dead' on Flow/Dead can never fire" in details
+        assert reason in details.split("alarm 'dead' on Flow/Dead can never fire")[1]
+
+    @pytest.mark.parametrize("transformation, alarm, reason", DEAD_ALARMS)
+    @pytest.mark.parametrize("dead_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_live_alarm_beside_a_dead_one_passes(
+        self, mock_client, transformation, alarm, reason, dead_first
+    ):
+        dead = self._alarm(AlarmName="dead", **alarm)
+        live_overrides = {
+            k: v for k, v in alarm.items() if k not in ("Dimensions", "Unit")
+        }
+        live_overrides.pop("ComparisonOperator", None)
+        live_overrides.pop("Threshold", None)
+        live_overrides.pop("Statistic", None)
+        live_overrides.pop("ExtendedStatistic", None)
+        dims = transformation.get("dimensions")
+        if dims:
+            live_overrides["Dimensions"] = [
+                {"Name": key, "Value": "eni-1"} for key in dims
+            ]
+        live = self._alarm(AlarmName="live", **live_overrides)
+        rows = self._run(
+            mock_client,
+            alarms=[dead, live] if dead_first else [live, dead],
+            filters={
+                "/flow/a": [
+                    dict(self._transform(**transformation), logGroupName="/flow/a")
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "alarm 'live'" in rows[0]["Finding_Details"]
+        assert "alarm 'dead'" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "transformation, alarm",
+        [
+            (
+                {"dimensions": {"eni": "$eni"}},
+                {"Dimensions": [{"Name": "eni", "Value": "eni-1"}]},
+            ),
+            ({}, {"Unit": "None"}),
+            ({"unit": "Count"}, {"Unit": "Count"}),
+            (
+                {"metricValue": "1"},
+                {
+                    "Statistic": "Sum",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 100.0,
+                },
+            ),
+            (
+                {"metricValue": "1"},
+                {
+                    "Statistic": "Maximum",
+                    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+                    "Threshold": 1.0,
+                },
+            ),
+            (
+                {"metricValue": "1", "defaultValue": 5.0},
+                {
+                    "Statistic": "Maximum",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 1.0,
+                },
+            ),
+            (
+                {"metricValue": "0"},
+                {
+                    "Statistic": "SampleCount",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 0.0,
+                },
+            ),
+            (
+                {"metricValue": "$bytes"},
+                {
+                    "Statistic": "Maximum",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 1e9,
+                },
+            ),
+            (
+                {"metricValue": "1"},
+                {
+                    "Statistic": "Sum",
+                    "ComparisonOperator": "LessThanThreshold",
+                    "Threshold": 1.0,
+                },
+            ),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_an_alarm_that_can_fire_passes(self, mock_client, transformation, alarm):
+        rows = self._run(
+            mock_client,
+            alarms=[self._alarm(**alarm)],
+            filters={
+                "/flow/a": [
+                    dict(self._transform(**transformation), logGroupName="/flow/a")
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_dead_alarm_on_an_alarmed_subnet_is_not_named(self, mock_client):
+        # subnet-1's group is alarmed by 'live' beside 'dead'; subnet-2's
+        # group has no filter. Only subnet-2 is named.
+        rows = self._run(
+            mock_client,
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": ["subnet-1", "subnet-2"]},
+            alarms=[
+                self._alarm(AlarmName="dead", Unit="Bytes"),
+                self._alarm(AlarmName="live"),
+            ],
+            flow_logs=[
+                self._flow_log("vpc-1"),
+                self._flow_log("vpc-2", group="/flow/b"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "/flow/b covering subnet-2" in details
+        assert "alarm 'dead'" not in details
+
+    @pytest.mark.parametrize(
+        "stat",
+        [
+            {"Dimensions": [{"Name": "eni", "Value": "eni-1"}]},
+            {"Unit": "Bytes"},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_metric_math_alarm_on_another_series_fails(self, mock_client, stat):
+        band = self._alarm(MetricName=None, Namespace=None)
+        metric = {"Namespace": "Flow", "MetricName": "Egress"}
+        metric_stat = {"Metric": metric}
+        if "Dimensions" in stat:
+            metric["Dimensions"] = stat["Dimensions"]
+        else:
+            metric_stat["Unit"] = stat["Unit"]
+        band["Metrics"] = [
+            {"Id": "m1", "MetricStat": metric_stat},
+            {"Id": "ad1", "Expression": "ANOMALY_DETECTION_BAND(m1, 2)"},
+        ]
+        rows = self._run(mock_client, alarms=[band])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "can never fire" in rows[0]["Finding_Details"]
+
 
 class TestSM37GuardDutyLambdaNetworkLogs:
     """AIR-FND-NET-07: GuardDuty Lambda Protection."""
@@ -8651,7 +9204,12 @@ class TestSM39WorkloadSegmentation:
         errors = errors or {}
         by_cluster = services or {}
         functions = functions or []
-        groups = {g["GroupId"]: g for g in groups or []}
+        # The dependency groups the fixtures' rules reference, readable unless a
+        # test passes its own copy.
+        groups = {
+            g: {"GroupId": g, "GroupName": g[len("sg-") :]}
+            for g in ("sg-dep", "sg-alb")
+        } | {g["GroupId"]: g for g in groups or []}
         eks = eks or {}
 
         def source(key, pages):
@@ -8817,6 +9375,133 @@ class TestSM39WorkloadSegmentation:
         details = seg[0]["Finding_Details"]
         assert "allows ingress tcp 443 from 10.0.0.0/16" in details
         assert "10.0.12.0/24" not in details
+
+    @pytest.mark.parametrize(
+        ("cidr", "v6"),
+        [("10.0.0.0/17", False), ("10.0.0.0/23", False), ("2001:db8::/56", True)],
+    )
+    @pytest.mark.parametrize("wide_first", [True, False])
+    def test_a_cidr_wider_than_a_24_fails_only_its_workload(self, cidr, v6, wide_first):
+        services = [
+            self._service("wide", ["sg-w"]),
+            self._service("narrow", ["sg-n"]),
+        ]
+        if not wide_first:
+            services.reverse()
+        seg = self._seg(
+            self._run(
+                services={"agents": services},
+                groups=[
+                    self._sg("sg-w", egress=[self._open(cidr, "tcp", 443, v6=v6)]),
+                    self._sg(
+                        "sg-n",
+                        egress=[
+                            self._open("10.0.12.0/24", "tcp", 5432),
+                            self._open("2001:db8:0:1::/64", "tcp", 5432, v6=True),
+                        ],
+                    ),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert f"sg-w allows egress tcp 443 to {cidr}" in details
+        assert "narrow" not in details
+
+    def test_a_prefix_list_rule_withholds_the_pass(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("tool", ["sg-a"]),
+                    self._function("other", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg(
+                        "sg-a",
+                        egress=[
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 443,
+                                "ToPort": 443,
+                                "PrefixListIds": [{"PrefixListId": "pl-1"}],
+                            }
+                        ],
+                    ),
+                    self._sg("sg-b"),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        details = seg[0]["Finding_Details"]
+        assert "prefix list pl-1 in sg-a" in details
+        assert "ec2:GetManagedPrefixListEntries" in details
+        assert "sg-b" not in details
+
+    @pytest.mark.parametrize("default_first", [True, False])
+    def test_a_rule_to_the_vpc_default_group_fails_only_its_workload(
+        self, default_first
+    ):
+        functions = [
+            self._function("loose", ["sg-a"]),
+            self._function("scoped", ["sg-b"]),
+        ]
+        if not default_first:
+            functions.reverse()
+        seg = self._seg(
+            self._run(
+                functions=functions,
+                groups=[
+                    self._sg(
+                        "sg-a",
+                        egress=[
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 443,
+                                "ToPort": 443,
+                                "UserIdGroupPairs": [{"GroupId": "sg-def"}],
+                            }
+                        ],
+                    ),
+                    self._sg("sg-b"),
+                    {"GroupId": "sg-def", "GroupName": "default"},
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert details.startswith("Lambda function loose:")
+        assert (
+            "sg-a allows egress tcp 443 to sg-def, the default security group of "
+            "its VPC"
+        ) in details
+        assert "scoped" not in details
+
+    def test_an_unread_referenced_group_withholds_the_pass(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[
+                    self._sg(
+                        "sg-a",
+                        egress=[
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 443,
+                                "ToPort": 443,
+                                "UserIdGroupPairs": [
+                                    {"GroupId": "sg-gone"},
+                                    {"GroupId": "sg-far", "UserId": "444455556666"},
+                                ],
+                            }
+                        ],
+                    )
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        details = seg[0]["Finding_Details"]
+        assert "security group sg-gone referenced by sg-a" in details
+        assert "security group sg-far referenced by sg-a" in details
 
     def test_ipv6_any_egress_fails(self):
         seg = self._seg(
@@ -9066,6 +9751,63 @@ class TestSM40SecretsManagerRotation:
             ],
         )
         assert [r["Status"] for r in rows] == [expected]
+
+    @pytest.mark.parametrize(
+        "rules",
+        [
+            {"ScheduleExpression": "rate(365 days)"},
+            {"ScheduleExpression": "rate(2184 hours)"},
+            {"AutomaticallyAfterDays": 91},
+            {"ScheduleExpression": "cron(0 0 1 1 ? *)"},
+        ],
+    )
+    @pytest.mark.parametrize("long_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_schedule_longer_than_90_days_fails_only_its_secret(
+        self, mock_client, rules, long_first
+    ):
+        secrets = [
+            {
+                "Name": "yearly",
+                "RotationEnabled": True,
+                "LastRotatedDate": self._ago(1),
+                "RotationRules": rules,
+            },
+            {
+                "Name": "monthly",
+                "RotationEnabled": True,
+                "LastRotatedDate": self._ago(1),
+                "RotationRules": {"ScheduleExpression": "rate(30 days)"},
+            },
+        ]
+        if not long_first:
+            secrets.reverse()
+        rows = self._run(mock_client, [{"SecretList": secrets}])
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "Secret 'yearly'" in rows[0]["Finding_Details"]
+        assert "longer than 90 days" in rows[0]["Finding_Details"]
+        assert "SecretsManager.4" in rows[0]["Finding_Details"]
+        assert "monthly" in rows[1]["Finding_Details"]
+        assert "yearly" not in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_90_day_schedule_passes(self, mock_client):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "SecretList": [
+                        {
+                            "Name": "quarterly",
+                            "RotationEnabled": True,
+                            "LastRotatedDate": self._ago(1),
+                            "RotationRules": {"AutomaticallyAfterDays": 90},
+                        }
+                    ]
+                }
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
 
     @patch("sagemaker_app.boto3.client")
     def test_naive_last_rotated_date_is_read_as_utc(self, mock_client):
@@ -9380,8 +10122,38 @@ class TestSM40RotationHistoryAndPropagation:
                 **self._ecs_injecting(self.ARN),
             )
         )
-        assert [r["Status"] for r in prop] == ["Passed"]
+        # A target is listed, never read for what it does, so it earns no Passed.
+        assert [r["Status"] for r in prop] == ["N/A"]
         assert "1 injection(s) of a rotating secret" in prop[0]["Finding_Details"]
+        assert "rule(s) r1" in prop[0]["Finding_Details"]
+        assert "r0" not in prop[0]["Finding_Details"]
+        assert "whether a target redeploys" in prop[0]["Finding_Details"]
+
+    def test_a_rotation_rule_target_does_not_hide_a_parameter_store_injection(self):
+        ecs = self._ecs_injecting(self.ARN)
+        ecs["task_defs"]["td:1"] = self._task(
+            [
+                {
+                    "name": "app",
+                    "secrets": [
+                        {
+                            "name": "KEY",
+                            "valueFrom": "arn:aws:ssm:us-east-1:111122223333:"
+                            "parameter/key",
+                        }
+                    ],
+                }
+            ]
+        )
+        prop = self._propagation(
+            self._run(
+                rules=[({"source": ["aws.secretsmanager"]}, [{"Id": "t"}])], **ecs
+            )
+        )
+        assert [r["Status"] for r in prop] == ["Failed", "N/A"]
+        assert "ECS service planner" in prop[0]["Finding_Details"]
+        assert "from Parameter Store" in prop[0]["Finding_Details"]
+        assert "ECS service tools" in prop[1]["Finding_Details"]
 
     def test_rotation_rule_without_targets_or_on_other_events_does_not_cover(self):
         prop = self._propagation(
@@ -9816,6 +10588,99 @@ class TestSM41DeviceIdentityAndAudit:
     def test_resource_bounded_to_the_thing(self, resource):
         assert sagemaker_app._iot_resource_bounded_to_thing(resource)
 
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            _IOT_TOPIC + "*${iot:Connection.Thing.ThingName}",
+            _IOT_TOPIC + "devices/*${iot:Connection.Thing.ThingName}/*",
+            _IOT_TOPIC + "devices/x-${iot:Connection.Thing.ThingName}",
+            _IOT_CLIENT + "*${iot:Connection.Thing.ThingName}",
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_wildcard_or_text_before_the_variable_is_not_bounded(
+        self, mock_client, resource
+    ):
+        # topic/*${ThingName} matches the topic of every thing whose name ends
+        # with this one, so the segment must start at the variable too.
+        assert not sagemaker_app._iot_resource_bounded_to_thing(resource)
+        by_name, rows = self._run(
+            mock_client,
+            _iot_document(
+                json.loads(_scoped_iot_document())["Statement"][0],
+                {"Effect": "Allow", "Action": "iot:Publish", "Resource": resource},
+            ),
+        )
+        failed = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.IOT_DEVICE_POLICY_FINDING
+            and r["Status"] == "Failed"
+        ]
+        assert len(failed) == 1
+        assert "policy 'p'" in failed[0]["Finding_Details"]
+        assert f"on '{resource}'" in failed[0]["Finding_Details"]
+        passed = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.IOT_DEVICE_POLICY_FINDING
+            and r["Status"] == "Passed"
+        ]
+        assert "q" in passed[0]["Finding_Details"]
+
+    THING_GROUP = "arn:aws:iot:us-east-1:123456789012:thinggroup/fleet"
+
+    @pytest.mark.parametrize("group_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_policy_on_a_thing_group_withholds_the_certificate_pass(
+        self, mock_client, group_first
+    ):
+        q_targets = [self.CERT_B, self.THING_GROUP]
+        if group_first:
+            q_targets.reverse()
+        by_name, _ = self._run(
+            mock_client,
+            targets={"p": [{"targets": [self.CERT_A]}], "q": [{"targets": q_targets}]},
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "N/A"
+        assert (
+            "thing group(s) an attached policy is attached to (fleet)"
+            in row["Finding_Details"]
+        )
+        assert "iot:ListThingsInThingGroup" in row["Finding_Details"]
+        assert "b" * 64 not in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_thing_group_does_not_hide_a_shared_certificate(self, mock_client):
+        by_name, _ = self._run(
+            mock_client,
+            targets={
+                "p": [{"targets": [self.THING_GROUP]}],
+                "q": [{"targets": [self.CERT_B]}],
+            },
+            principal_things={self.CERT_B: ["thing-1", "thing-2"]},
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "Failed"
+        assert "b" * 64 in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_only_thing_group_targets_are_not_read_as_no_certificate(self, mock_client):
+        by_name, _ = self._run(
+            mock_client,
+            targets={
+                "p": [{"targets": [self.THING_GROUP]}],
+                "q": [{"targets": []}],
+            },
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "N/A"
+        assert (
+            "thing group(s) an attached policy is attached to (fleet)"
+            in row["Finding_Details"]
+        )
+
     @patch("sagemaker_app.boto3.client")
     def test_every_certificate_on_one_thing_passes(self, mock_client):
         by_name, rows = self._run(mock_client)
@@ -10135,6 +11000,55 @@ class TestSM02EndpointInvocationScopingFullGrade:
             _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
         )
         assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize("value", ["*", "?*", ["fraud", "*"]])
+    def test_a_like_tag_condition_that_matches_any_value_does_not_scope(self, value):
+        policy = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": value}},
+        )
+        cache = _v2_cache({"TagRole": [("Inv", policy)]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_a_like_tag_condition_on_a_value_prefix_scopes(self):
+        policy = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": "fraud-*"}},
+        )
+        cache = _v2_cache({"TagRole": [("Inv", policy)]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize("any_value_first", [True, False])
+    def test_only_the_role_whose_tag_matches_any_value_fails(self, any_value_first):
+        scoped = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": "fraud-*"}},
+        )
+        open_tag = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": "*"}},
+        )
+        roles = [("ScopedRole", [("Inv", scoped)]), ("AnyTagRole", [("Inv", open_tag)])]
+        if any_value_first:
+            roles.reverse()
+        rows = _by_finding(
+            _sm02_rows(_v2_cache(dict(roles))),
+            sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING,
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "AnyTagRole" in failed[0]["Finding_Details"]
+        assert "ScopedRole" not in failed[0]["Finding_Details"]
 
     def test_boundary_on_named_endpoint_scopes_a_wildcard_grant(self):
         boundary = _identity_policy(
@@ -10979,6 +11893,51 @@ class TestSM02RuntimeVpcEndpointPolicy:
         )
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "vpce-1" in rows[0]["Finding_Details"]
+
+    @staticmethod
+    def _tag_policy(value):
+        return json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "sagemaker:InvokeEndpoint",
+                        "Resource": "*",
+                        "Condition": {"StringLike": {"aws:ResourceTag/team": value}},
+                    }
+                ]
+            }
+        )
+
+    @pytest.mark.parametrize("any_tag_first", [True, False])
+    def test_a_tag_condition_matching_any_value_fails_only_its_endpoint(
+        self, any_tag_first
+    ):
+        vpces = [
+            dict(
+                _PRIVATE_RUNTIME_VPCE,
+                VpcEndpointId="vpce-prefix",
+                PolicyDocument=self._tag_policy("fraud-*"),
+            ),
+            dict(
+                _PRIVATE_RUNTIME_VPCE,
+                VpcEndpointId="vpce-anytag",
+                PolicyDocument=self._tag_policy("*"),
+            ),
+        ]
+        if any_tag_first:
+            vpces.reverse()
+        rows = self._run(vpces)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "vpce-anytag" in rows[0]["Finding_Details"]
+        assert "vpce-prefix" not in rows[0]["Finding_Details"]
+
+    def test_a_tag_condition_on_a_value_prefix_passes(self):
+        rows = self._run(
+            [dict(_PRIVATE_RUNTIME_VPCE, PolicyDocument=self._tag_policy("fraud-*"))]
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
 
     def test_unparsable_policy_blocks_the_pass(self):
         rows = self._run(
@@ -12111,6 +13070,8 @@ def _sm03_rows(
         value = keys.get(KeyId, "CUSTOMER")
         if isinstance(value, Exception):
             raise value
+        if isinstance(value, dict):
+            return {"KeyMetadata": dict(value, KeyId=KeyId)}
         return {"KeyMetadata": {"KeyId": KeyId, "KeyManager": value}}
 
     def bucket_part(part, Bucket):
@@ -12468,6 +13429,76 @@ class TestSM03KeyManagerAndUnreadLegs:
             "sagemaker:DescribeNotebookInstance nb" in incomplete[0]["Finding_Details"]
         )
         assert not _by_finding(rows, "Data Protection Check")
+
+
+_PENDING_CMK = "arn:aws:kms:us-east-1:123456789012:key/3333"
+
+
+class TestSM03KeyState:
+    """DAT-01: a customer managed key that cannot be used protects nothing."""
+
+    @pytest.mark.parametrize("state", ["PendingDeletion", "Disabled"])
+    @pytest.mark.parametrize("leg", ["output", "volume"])
+    @pytest.mark.parametrize("bad_first", [True, False])
+    def test_a_key_not_enabled_fails_only_its_job(self, state, leg, bad_first):
+        jobs = [
+            ("good", _training_job()),
+            ("bad", _training_job(**{leg: _PENDING_CMK})),
+        ]
+        if bad_first:
+            jobs.reverse()
+        rows = _sm03_rows(
+            dict(jobs),
+            keys={_PENDING_CMK: {"KeyManager": "CUSTOMER", "KeyState": state}},
+        )
+        unusable = _by_finding(rows, sagemaker_app.KEY_NOT_ENABLED_FINDING)
+        assert [r["Status"] for r in unusable] == ["Failed"]
+        assert "'bad'" in unusable[0]["Finding_Details"]
+        assert "'good'" not in unusable[0]["Finding_Details"]
+        assert _PENDING_CMK in unusable[0]["Finding_Details"]
+        assert state in unusable[0]["Finding_Details"]
+        assert not _by_finding(rows, "Data Protection Check")
+        if leg == "volume":
+            volume = _by_finding(rows, sagemaker_app.TRAINING_VOLUME_ENCRYPTION_FINDING)
+            passed = [r for r in volume if r["Status"] == "Passed"]
+            assert passed and all("bad" not in r["Finding_Details"] for r in passed)
+
+    def test_an_enabled_customer_key_still_passes(self):
+        rows = _sm03_rows(
+            {"a": _training_job(output=_PENDING_CMK, volume=_PENDING_CMK)},
+            keys={_PENDING_CMK: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}},
+        )
+        assert [r["Status"] for r in _by_finding(rows, "Data Protection Check")] == [
+            "Passed"
+        ]
+        assert not _by_finding(rows, sagemaker_app.KEY_NOT_ENABLED_FINDING)
+
+    def test_a_bucket_default_key_not_enabled_fails_the_bucket(self):
+        pending_bucket = {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [
+                    {
+                        "ApplyServerSideEncryptionByDefault": {
+                            "SSEAlgorithm": "aws:kms",
+                            "KMSMasterKeyID": _PENDING_CMK,
+                        }
+                    }
+                ]
+            }
+        }
+        rows = _sm03_rows(
+            {"a": _training_job(bucket="one"), "b": _training_job(bucket="two")},
+            keys={
+                _PENDING_CMK: {"KeyManager": "CUSTOMER", "KeyState": "PendingDeletion"}
+            },
+            buckets={"two": {"encryption": pending_bucket}},
+        )
+        bucket_rows = _by_finding(rows, sagemaker_app.TRAINING_BUCKET_FINDING)
+        failed = [r for r in bucket_rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Bucket 'two'" in failed[0]["Finding_Details"]
+        assert "PendingDeletion" in failed[0]["Finding_Details"]
+        assert "Bucket 'one'" not in failed[0]["Finding_Details"]
 
 
 class TestSM03TrainingBucketProtection:
@@ -13232,6 +14263,64 @@ class TestSM09NotebookAccessGuardrails:
         }
         rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [conjunctive])
         assert [r["Status"] for r in rows] == ["N/A"]
+
+    @staticmethod
+    def _ip_deny(ranges):
+        return _scp_deny(
+            [
+                "sagemaker:CreatePresignedNotebookInstanceUrl",
+                "sagemaker:CreatePresignedDomainUrl",
+            ],
+            "NotIpAddress",
+            "aws:SourceIp",
+            ranges,
+        )
+
+    @pytest.mark.parametrize(
+        "ranges",
+        [
+            ["0.0.0.0/0"],
+            ["203.0.113.0/24", "0.0.0.0/0"],
+            ["0.0.0.0/1", "128.0.0.0/1"],
+            ["203.0.113.0/24", "::/0"],
+        ],
+    )
+    def test_an_ip_deny_that_admits_every_address_does_not_hold(self, ranges):
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [self._ip_deny(ranges)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Role 'Admin'" in rows[0]["Finding_Details"]
+
+    def test_an_ip_deny_on_bounded_v4_and_v6_ranges_holds(self):
+        deny = self._ip_deny(["203.0.113.0/24", "2001:db8::/32"])
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [deny])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        ("ranges", "expected"),
+        [
+            ("0.0.0.0/0", "Failed"),
+            (["::/0", "203.0.113.0/24"], "Failed"),
+            ("203.0.113.0/24", "Passed"),
+        ],
+    )
+    def test_an_ip_allow_is_judged_on_its_ranges(self, ranges, expected):
+        cache = _creation_cache(
+            {
+                "DataScientist": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "sagemaker:CreatePresignedNotebookInstanceUrl",
+                            "sagemaker:CreatePresignedDomainUrl",
+                        ],
+                        "Resource": "*",
+                        "Condition": {"IpAddress": {"aws:SourceIp": ranges}},
+                    }
+                ]
+            }
+        )
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1], cache=cache)
+        assert [r["Status"] for r in rows] == [expected]
 
     def test_source_vpce_deny_on_profile_arns_passes(self):
         vpce = _scp_deny(
@@ -14269,6 +15358,48 @@ class TestSM34ValuePinning:
                 in (row["Finding_Details"])
             )
 
+    @pytest.mark.parametrize(
+        "operator", ["ArnNotEquals", "ArnNotEqualsIfExists", "ArnNotLike"]
+    )
+    def test_a_wildcard_key_arn_under_any_arn_operator_does_not_pin_it(self, operator):
+        # ArnEquals and ArnNotEquals match a wildcard exactly as ArnLike does,
+        # so a key/* value admits every key in the account.
+        wildcard = _scp_deny(
+            ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+            operator,
+            "sagemaker:VolumeKmsKeyArn",
+            ["arn:aws:kms:us-east-1:123456789012:key/*"],
+        )
+        row = self._rows([wildcard] + SCP_ENCRYPTION_DENIES[1:])["encryption"]
+        assert row["Status"] == "Failed"
+        assert (
+            "CreateTrainingJob on sagemaker:VolumeKmsKeyArn" in (row["Finding_Details"])
+        )
+
+    def test_a_literal_key_arn_under_arn_not_equals_still_pins_it(self):
+        row = self._rows(SCP_ENCRYPTION_DENIES)["encryption"]
+        assert row["Status"] == "Passed"
+
+    @pytest.mark.parametrize("wildcard_first", [True, False])
+    def test_an_allow_with_a_wildcard_arn_equals_key_does_not_guard(
+        self, wildcard_first
+    ):
+        loose = json.loads(json.dumps(GUARDED_CREATE_ALLOWS))
+        loose[0]["Condition"]["ArnEquals"]["sagemaker:VolumeKmsKeyArn"] = (
+            "arn:aws:kms:*:*:key/?*"
+        )
+        roles = [("Builder", GUARDED_CREATE_ALLOWS), ("Loose", loose)]
+        if wildcard_first:
+            roles.reverse()
+        rows = self._sm34._by_category(
+            self._sm34._run(self._sm34._inventory(), cache=_creation_cache(dict(roles)))
+        )
+        encryption = rows["encryption"]
+        assert encryption["Status"] == "Failed"
+        assert "Role 'Loose'" in encryption["Finding_Details"]
+        assert "Role 'Builder'" not in encryption["Finding_Details"]
+        assert rows["approved network"]["Status"] == "Passed"
+
     def test_the_model_and_transform_job_actions_are_guarded(self):
         three_actions = [
             "sagemaker:CreateTrainingJob",
@@ -14603,6 +15734,28 @@ class TestSM42BatchCreationGuardrails:
         assert "'ModelGuard'" in rows["approved network"]["Finding_Details"]
         assert rows["no direct internet access"]["Status"] == "Passed"
 
+    def test_a_wildcard_arn_not_equals_key_leaves_the_batch_path_failed(self):
+        wildcard = _scp_deny(
+            "sagemaker:CreateTransformJob",
+            "ArnNotEquals",
+            "sagemaker:OutputKmsKeyArn",
+            ["arn:aws:kms:us-east-1:123456789012:key/*"],
+        )
+        inventory = self._policies(
+            ("Guard", BATCH_SCP_DENIES[:1] + [wildcard] + BATCH_SCP_DENIES[2:])
+        )
+        encryption = self._sm34._by_category(self._run(inventory))["encryption"]
+        assert encryption["Status"] == "Failed"
+        assert "1 of 2 encryption requirements" in encryption["Finding_Details"]
+        assert (
+            "CreateTransformJob on sagemaker:OutputKmsKeyArn"
+            in (encryption["Finding_Details"])
+        )
+        assert (
+            "CreateTransformJob on sagemaker:VolumeKmsKeyArn"
+            not in (encryption["Finding_Details"])
+        )
+
     def test_a_guard_on_training_only_leaves_the_batch_path_failed(self):
         training_only = [
             _scp_deny(
@@ -14928,9 +16081,10 @@ def _sm43_rows(
     buckets=None,
     components=None,
     deployed=None,
+    keys=None,
 ):
     """
-    Run SM-43 over mocked SageMaker, ECR and S3 clients.
+    Run SM-43 over mocked SageMaker, ECR, S3 and KMS clients.
 
     endpoints maps a name to {"models": [...], "status": ..., "components":
     [variant names]}. Every other map is keyed by resource name, and an
@@ -15093,7 +16247,17 @@ def _sm43_rows(
         return {"ServerSideEncryptionConfiguration": value}
 
     s3.get_bucket_encryption.side_effect = get_bucket_encryption
-    clients = {"sagemaker": sagemaker, "ecr": ecr, "s3": s3}
+    keys = keys or {}
+    kms = MagicMock()
+
+    def describe_key(KeyId):
+        value = keys.get(KeyId, {"KeyManager": "CUSTOMER", "KeyState": "Enabled"})
+        if isinstance(value, Exception):
+            raise value
+        return {"KeyMetadata": dict(value, KeyId=KeyId)}
+
+    kms.describe_key.side_effect = describe_key
+    clients = {"sagemaker": sagemaker, "ecr": ecr, "s3": s3, "kms": kms}
     with patch("sagemaker_app.boto3.client") as mock_client:
         mock_client.side_effect = lambda service, **_: clients[service]
         return _rows(
@@ -15438,6 +16602,83 @@ class TestSM43ModelArtifactIntegrity:
             in details
         )
         assert "one.tar.gz" not in details
+
+    @staticmethod
+    def _kms_rules(key_id):
+        return {
+            "Rules": [
+                {
+                    "ApplyServerSideEncryptionByDefault": {
+                        "SSEAlgorithm": "aws:kms",
+                        "KMSMasterKeyID": key_id,
+                    }
+                }
+            ]
+        }
+
+    @pytest.mark.parametrize(
+        "key_id, keys",
+        [
+            ("alias/aws/s3", {}),
+            (
+                "arn:aws:kms:us-east-1:111122223333:alias/aws/s3",
+                {},
+            ),
+            (
+                "arn:aws:kms:us-east-1:111122223333:key/aws-owned",
+                {
+                    "arn:aws:kms:us-east-1:111122223333:key/aws-owned": {
+                        "KeyManager": "AWS",
+                        "KeyState": "Enabled",
+                    }
+                },
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("weak_first", [True, False])
+    def test_a_named_aws_managed_bucket_key_fails_only_its_endpoint(
+        self, key_id, keys, weak_first
+    ):
+        uris = ["s3://weak/m/", "s3://good/m/"]
+        if not weak_first:
+            uris.reverse()
+        rows = _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container(uri=uris[0])},
+                "m-2": {"PrimaryContainer": _sm43_container(uri=uris[1])},
+            },
+            buckets={"weak": self._kms_rules(key_id)},
+            keys=keys,
+        )
+        weak_endpoint = "ep-1" if weak_first else "ep-2"
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert details.startswith(f"Endpoint '{weak_endpoint}'")
+        assert (
+            f"artifact bucket weak: default encryption key {key_id} is an AWS "
+            "managed key"
+        ) in details
+        assert "bucket good" not in details
+
+    def test_a_named_customer_managed_bucket_key_passes(self):
+        rows = _sm43_rows(buckets={"artifacts": self._kms_rules("alias/team-key")})
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_an_unread_bucket_key_withholds_the_pass(self):
+        key_id = "arn:aws:kms:us-east-1:444455556666:key/other"
+        rows = _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container(uri="s3://good/m/")},
+                "m-2": {"PrimaryContainer": _sm43_container(uri="s3://far/m/")},
+            },
+            buckets={"far": self._kms_rules(key_id)},
+            keys={key_id: _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            f"artifact bucket far encryption was not read (kms:DescribeKey on "
+            f"{key_id}: AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
 
     def test_an_unread_model_package_is_na(self):
         rows = _sm43_rows(

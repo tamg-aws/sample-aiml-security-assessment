@@ -1340,7 +1340,8 @@ FOUNDATION_ROWS = [
         "BR-42 fails each cached role or user whose Bedrock invocation grant reaches "
         "every model instead of naming foundation-model or inference-profile ARNs. "
         "SM-02 fails each cached role or user whose sagemaker:InvokeEndpoint grant "
-        "reaches every endpoint with no aws:ResourceTag condition. Together they "
+        "reaches every endpoint with no aws:ResourceTag condition that narrows "
+        "it; a Like value made only of wildcards narrows nothing. Together they "
         "cover the model and the inference endpoint; which identities should hold "
         "those grants is a workload decision, so a grant that names its resources "
         "is not judged further",
@@ -1490,7 +1491,8 @@ FOUNDATION_ROWS = [
         ["SM-26", "SM-04", "SM-36"],
         "SM-04 ('GuardDuty Enabled') and SM-26 ('GuardDuty AI Protection') read "
         "the GuardDuty detector and its AI_PROTECTION feature, which is threat "
-        "detection for the account. SM-36 covers the Security Hub AI security "
+        "detection for the account. SM-26 fails a Region with no detector or a "
+        "detector whose Status is not ENABLED. SM-36 covers the Security Hub AI security "
         "standard the control also asks for: it reads GetEnabledStandards in each "
         "Region and passes when a StandardsArn contains "
         "standards/ai-security-best-practices/v/1.0.0 with StandardsStatus READY "
@@ -1585,9 +1587,12 @@ FOUNDATION_ROWS = [
         "sagemaker_assessments",
         ["SM-35"],
         "SM-35 reads the management account id from DescribeOrganization and "
-        "calls ListDelegatedAdministrators for each of a fixed list of six service "
-        "principals: GuardDuty, Security Hub, Inspector, Macie, Config and IAM "
-        "Access Analyzer, which the finding states. One row per service passes "
+        "calls ListDelegatedAdministrators for each of a fixed list of 12 service "
+        "principals: GuardDuty, Security Hub, Inspector, Macie, Config "
+        "(config.amazonaws.com), Config multi-account setup "
+        "(config-multiaccountsetup.amazonaws.com), IAM Access Analyzer, "
+        "CloudTrail, Detective, Security Lake, Firewall Manager and Audit "
+        "Manager, which the finding states. One row per service passes "
         "when an ACTIVE delegated administrator is not the management account, "
         "and fails when there is none or it is the management account. A member "
         "account that cannot call the API is Not Applicable with the reason",
@@ -1744,9 +1749,13 @@ FOUNDATION_ROWS = [
         "SM-41 reads each AWS IoT policy that is attached to a target and fails "
         "an Allow on iot:Publish, iot:Subscribe, iot:Receive or iot:Connect whose "
         "Resource ends in topic/*, topicfilter/*, client/* or is * without the "
-        "${iot:Connection.Thing.ThingName} variable, since that policy grants "
-        "every device the same reach. It also fails a Connect Allow with no "
-        "iot:Connection.Thing.IsAttached condition",
+        "${iot:Connection.Thing.ThingName} variable filling a whole path "
+        "segment, since that policy grants every device the same reach, or a "
+        "device the reach of every thing whose name starts or ends with its "
+        "own. It also fails a Connect Allow with no "
+        "iot:Connection.Thing.IsAttached condition. A policy attached to a "
+        "thing group withholds the unique-certificate Passed, since the "
+        "certificates of the group's things are not listed",
         [],
         6,
     ),
@@ -1776,7 +1785,9 @@ FOUNDATION_ROWS = [
         "SM-40 lists Secrets Manager secrets, skipping those another service "
         "owns, and passes a secret when rotation is enabled and the last rotation "
         "falls within its schedule plus one day. It fails a secret with rotation "
-        "off and one that has never rotated",
+        "off, one that has never rotated, and one whose schedule allows a gap "
+        "longer than 90 days, the default of Security Hub control "
+        "SecretsManager.4",
         [],
         6,
     ),
@@ -1849,7 +1860,7 @@ FOUNDATION_ROWS = [
         "additional model data source fails without an ETag or ManifestEtag unless it "
         "is SageMaker hub content. A container with an HF_MODEL_ID environment key and no model "
         "data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse "
-        "with a named key. An endpoint with an unread repository, signing status, "
+        "with a named key whose kms:DescribeKey KeyManager is CUSTOMER. An endpoint with an unread repository, signing status, "
         "model or bucket reports N/A, never Passed. Partial, ceiling reached: a "
         "recorded ETag says an expected value is recorded, and no AWS API returns "
         "whether SageMaker or the container compared it with the object at load "

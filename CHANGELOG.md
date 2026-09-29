@@ -268,6 +268,94 @@ section.
   `region` filter that matches the rule's own account or Region, read from
   the rule ARN, no longer narrows, because every Registry event the check
   judges carries those values.
+- `SM-35` security service delegated administrator also reads
+  `config-multiaccountsetup.amazonaws.com`, the principal AWS Config rules
+  and conformance packs are delegated through, beside
+  `config.amazonaws.com`. A Config rules administrator left on the
+  management account, or on a second account, used to go unread, so the
+  consolidation row could pass.
+
+- `SM-37` endpoint network alerting no longer passes on an alarm that can
+  never fire. An alarm is credited only when it reads the dimension names
+  and unit its metric filter publishes, and, when the filter publishes
+  literal values, only when its static threshold can be crossed: a
+  `LessThanThreshold 0` alarm on a count, or a `Maximum` above the largest
+  value the filter publishes, is named as unable to fire. A space-delimited
+  (bracketed) pattern whose field equality names a value no flow-log record
+  carries, such as `action="DENY"`, now counts as matching no record.
+
+- `SM-04` credits an EventBridge rule on `aws.guardduty` only when its
+  pattern sets no `detail-type` or lists `GuardDuty Finding`. A rule on
+  another detail-type, such as `AWS API Call via CloudTrail`, used to pass
+  as routing findings to alerting.
+
+- `SM-09` no longer credits an `aws:SourceIp` condition on the presigned
+  notebook and domain URL actions when its ranges together cover every IPv4
+  or every IPv6 address, such as `0.0.0.0/0` or `::/0`. A `NotIpAddress`
+  `Deny` on such values fires only when the key is absent, and an
+  `IpAddress` `Allow` on them admits any caller.
+
+- `SM-39` workload segmentation fails a security group rule to or from a
+  CIDR wider than a /24 (IPv6 /64), where only /16 (IPv6 /48) or wider
+  failed, and a rule that references the VPC's default security group. A
+  rule that names a prefix list, whose entries need the ungranted
+  `ec2:GetManagedPrefixListEntries`, or references a group that was not
+  read now withholds `Passed` in an `N/A` row.
+
+- `SM-40` fails a secret whose rotation schedule allows a gap longer than 90
+  days, the default of Security Hub control `SecretsManager.4`, so
+  `rate(365 days)` no longer passes. An ECS service that injects a rotating
+  secret and relies on an EventBridge rotation rule with a target is now
+  `N/A` naming the rule, where it passed without reading what the target
+  runs.
+
+- `SM-43` resolves an artifact bucket's default `KMSMasterKeyID` with
+  `kms:DescribeKey` and fails a bucket whose key is AWS managed, such as
+  `alias/aws/s3` named explicitly, which used to pass as a named key. A key
+  the call cannot describe leaves the endpoint `N/A`.
+
+- `SM-41` requires `${iot:Connection.Thing.ThingName}` to fill a whole path
+  segment of a device policy resource. `topic/*${iot:Connection.Thing.ThingName}`
+  and `topic/x-${iot:Connection.Thing.ThingName}` used to pass, and they reach
+  the topics of every thing whose name ends with the device's own. A device
+  policy attached to a thing group now makes the unique-certificate row
+  `N/A` and names the group, where the check read only certificates that a
+  policy is attached to directly and could pass without the group's.
+
+- `SM-23` reports a Region with no InService endpoint as `N/A`, where it used
+  to pass with no endpoint to judge.
+
+- `SM-14` names a model whose `DescribeModel` call failed, or a failed
+  `ListModels`, in an `N/A` Incomplete row and withholds `Passed`. Such a
+  model used to be logged and dropped, so the rest could pass, and a failed
+  list read as no models found.
+
+- `SM-03` reads the `KeyState` that `kms:DescribeKey` returns beside
+  `KeyManager`. A notebook, domain, training job output or volume, training
+  file system, or training data bucket whose customer managed key has a
+  state other than `Enabled`, for example `PendingDeletion` or `Disabled`,
+  now fails in a `Customer Managed Key Not Enabled` row or its bucket row,
+  where it used to pass as customer managed.
+
+- `SM-26` reads the GuardDuty detector `Status`. A detector whose status is
+  `DISABLED` now fails even when its `AI_PROTECTION` feature is `ENABLED`,
+  where it used to pass, and a Region with no detector fails where it used to
+  report `N/A`. Neither produces an AI Protection finding.
+
+- `SM-02` no longer counts an `aws:ResourceTag` condition as scoping an
+  endpoint invocation grant when a `Like` operator's value is made only of
+  wildcards, such as `*` or `?*`, because that value matches every tag value.
+  This applies to identity policies and to the `sagemaker.runtime` VPC
+  endpoint policy. A `Like` value with a fixed part, such as `fraud-*`, still
+  scopes the grant.
+
+- `SM-34` and `SM-42` no longer credit an `ArnEquals` or `ArnNotEquals`
+  condition whose KMS key ARN holds a `*` or `?`. Those operators match
+  wildcards as `ArnLike` does, so `arn:aws:kms:*:*:key/*` admits every key.
+  Such an Allow no longer guards creation, and such a Deny only requires the
+  key to be present, which is how a wildcard under `ArnLike` or `ArnNotLike`
+  was already read.
+
 - `BR-10` counts a guardrail direction only from a content filter with
   strength `LOW`, `MEDIUM` or `HIGH` and action `BLOCK`, where any configured
   element used to count. An identity that names no guardrail passes when a

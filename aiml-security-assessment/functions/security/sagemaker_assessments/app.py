@@ -1045,8 +1045,14 @@ GUARDDUTY_EVENTBRIDGE_REFERENCE = (
 )
 
 
+GUARDDUTY_FINDING_DETAIL_TYPE = "GuardDuty Finding"
+
+
 def _rule_matches_guardduty(rule: Dict[str, Any]) -> bool:
-    """True for an ENABLED rule whose pattern names the aws.guardduty source."""
+    """
+    True for an ENABLED rule whose pattern names the aws.guardduty source and
+    either sets no detail-type or lists the GuardDuty Finding detail-type.
+    """
     if rule.get("State") != "ENABLED":
         return False
     try:
@@ -1056,7 +1062,16 @@ def _rule_matches_guardduty(rule: Dict[str, Any]) -> bool:
     sources = pattern.get("source") if isinstance(pattern, dict) else None
     if isinstance(sources, str):
         sources = [sources]
-    return isinstance(sources, list) and "aws.guardduty" in sources
+    if not isinstance(sources, list) or "aws.guardduty" not in sources:
+        return False
+    if "detail-type" not in pattern:
+        return True
+    detail_types = pattern["detail-type"]
+    if isinstance(detail_types, str):
+        detail_types = [detail_types]
+    return (
+        isinstance(detail_types, list) and GUARDDUTY_FINDING_DETAIL_TYPE in detail_types
+    )
 
 
 def _guardduty_eventbridge_routing_finding(region: str) -> Dict[str, Any]:
@@ -1121,9 +1136,10 @@ def _guardduty_eventbridge_routing_finding(region: str) -> Dict[str, Any]:
         )
     return _row(
         f"Of {len(rules)} EventBridge rule(s) on the default event bus, "
-        f"{len(matching)} ENABLED rule(s) name the source aws.guardduty and none "
+        f"{len(matching)} ENABLED rule(s) match GuardDuty findings and none "
         "has a target, so no GuardDuty finding raises an alert. Only a rule whose "
-        "pattern lists aws.guardduty under source is credited.",
+        "pattern lists aws.guardduty under source, and sets no detail-type or "
+        f"lists {GUARDDUTY_FINDING_DETAIL_TYPE} under it, is credited.",
         "Create an ENABLED EventBridge rule with the pattern "
         '{"source": ["aws.guardduty"]} and an alerting target such as an SNS topic.',
         "Medium",
@@ -1145,11 +1161,31 @@ def check_guardduty_ai_protection(
                 create_finding(
                     check_id="SM-26",
                     finding_name="GuardDuty AI Protection",
-                    finding_details="No GuardDuty detector found; AI Protection cannot be assessed separately.",
+                    finding_details="No GuardDuty detector exists in this region, so GuardDuty AI Protection produces no findings.",
                     resolution="Enable GuardDuty first, then enable the AI Protection feature.",
                     reference="https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html",
-                    severity="Informational",
-                    status="N/A",
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+            return findings
+
+        detector_status = (inventory.get("detail") or {}).get("Status")
+        if detector_status != "ENABLED":
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-26",
+                    finding_name="GuardDuty AI Protection",
+                    finding_details=(
+                        f"GuardDuty detector {inventory['detector_id']} has status "
+                        f"{detector_status}, so it produces no AI Protection "
+                        "findings whatever its AI_PROTECTION feature status."
+                    ),
+                    resolution="Re-enable the GuardDuty detector, then enable the AI Protection feature.",
+                    reference="https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html",
+                    severity="High",
+                    status="Failed",
                     region=region,
                 )
             )
@@ -1277,7 +1313,8 @@ def _statement_has_resource_tag_condition(statement: Dict[str, Any]) -> bool:
     Return whether a statement narrows its resources by tag.
 
     An IfExists or ForAllValues operator passes a resource that lacks the tag,
-    and a negated operator passes every resource without the named value, so
+    a negated operator passes every resource without the named value, and a
+    Like value made only of wildcards, such as "*", matches every value, so
     none of them narrows the grant.
     """
     condition = statement.get("Condition", {})
@@ -1294,9 +1331,15 @@ def _statement_has_resource_tag_condition(statement: Dict[str, Any]) -> bool:
             or "not" in normalized
         ):
             continue
-        for key in condition_keys:
-            if str(key).lower().startswith("aws:resourcetag/"):
-                return True
+        for key, values in condition_keys.items():
+            if not str(key).lower().startswith("aws:resourcetag/"):
+                continue
+            if "like" in normalized and any(
+                "*" in str(value) and not str(value).strip("*?")
+                for value in _policy_values(values)
+            ):
+                continue
+            return True
     return False
 
 
@@ -1419,7 +1462,9 @@ def _endpoint_invocation_scoping_findings(
                     f"{entry['label']} can invoke any SageMaker endpoint in the "
                     f"account: policy '{entry['policy']}' allows endpoint "
                     f"invocation on resource '{entry['resource']}' with no "
-                    "endpoint ARN and no aws:ResourceTag condition."
+                    "endpoint ARN and no aws:ResourceTag condition that narrows "
+                    "it: a Like value made only of wildcards matches every tag "
+                    "value."
                     f"{boundary_text} {SCP_NOT_EVALUATED_NOTE}"
                 ),
                 resolution=ENDPOINT_INVOCATION_SCOPING_RESOLUTION,
@@ -2544,7 +2589,8 @@ def _kms_key_alias(key_id: str) -> Optional[str]:
 
 def _kms_key_managers(key_ids: List[str], region: str) -> Dict[str, Dict[str, Any]]:
     """
-    Return {key id: {"manager": "AWS" | "CUSTOMER" | None, "error": label}}.
+    Return {key id: {"manager": "AWS" | "CUSTOMER" | None, "state": KeyState,
+    "error": label}}. The state is None for a key not described.
 
     A key ARN is described in the Region the ARN names, since kms:DescribeKey
     answers only for keys in the Region it is called in.
@@ -2554,7 +2600,7 @@ def _kms_key_managers(key_ids: List[str], region: str) -> Dict[str, Dict[str, An
     for key_id in sorted({str(k) for k in key_ids if k}):
         alias = _kms_key_alias(key_id)
         if alias and alias.startswith(AWS_MANAGED_ALIAS_PREFIX):
-            results[key_id] = {"manager": "AWS", "error": None}
+            results[key_id] = {"manager": "AWS", "state": None, "error": None}
             continue
         key_region = region
         if key_id.startswith("arn:"):
@@ -2570,11 +2616,13 @@ def _kms_key_managers(key_ids: List[str], region: str) -> Dict[str, Dict[str, An
             manager = metadata.get("KeyManager")
             results[key_id] = {
                 "manager": manager if manager in ("AWS", "CUSTOMER") else None,
+                "state": metadata.get("KeyState"),
                 "error": None if manager in ("AWS", "CUSTOMER") else "no KeyManager",
             }
         except Exception as error:
             results[key_id] = {
                 "manager": None,
+                "state": None,
                 "error": get_assessment_error_label(error),
             }
     return results
@@ -2770,6 +2818,11 @@ def _bucket_protection_findings(
             )
         elif manager["manager"] is None:
             read["unread"].append(f"kms:DescribeKey {read['key']} ({manager['error']})")
+        elif manager["state"] not in (None, "Enabled"):
+            read["problems"].append(
+                f"default encryption key {read['key']} has KeyState "
+                f"{manager['state']}, not Enabled"
+            )
 
     emitted = []
     clean = []
@@ -2861,6 +2914,7 @@ def _bucket_protection_findings(
 
 
 TRAINING_VOLUME_ENCRYPTION_FINDING = "Training Job Volume Encryption"
+KEY_NOT_ENABLED_FINDING = "Customer Managed Key Not Enabled"
 TRAINING_BUCKET_FINDING = "Training Job Data Bucket Protection"
 TRAINING_VOLUME_ENCRYPTION_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/train-encrypt.html"
@@ -3047,6 +3101,7 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
 
         # Track resources with encryption issues
         resources_with_aws_managed_keys = []
+        resources_with_keys_not_enabled = []
         resources_without_encryption = []
         resources_without_vpc_encryption = []
         training_jobs_with_volume_key = []
@@ -3294,6 +3349,13 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
             manager = managers[str(item["key_id"])]
             if manager["manager"] == "AWS":
                 resources_with_aws_managed_keys.append(item)
+            elif manager["manager"] == "CUSTOMER" and manager["state"] not in (
+                None,
+                "Enabled",
+            ):
+                resources_with_keys_not_enabled.append(
+                    dict(item, state=manager["state"])
+                )
             elif manager["manager"] is None:
                 unread.append(
                     f"kms:DescribeKey {item['key_id']} for {item['type']} "
@@ -3302,7 +3364,19 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
         volume_keys_read = []
         for job in training_jobs_with_volume_key:
             manager = managers[str(job["key_id"])]
-            if manager["manager"] == "CUSTOMER":
+            if manager["manager"] == "CUSTOMER" and manager["state"] not in (
+                None,
+                "Enabled",
+            ):
+                resources_with_keys_not_enabled.append(
+                    {
+                        "type": "Training Job volume",
+                        "name": job["name"],
+                        "key_id": job["key_id"],
+                        "state": manager["state"],
+                    }
+                )
+            elif manager["manager"] == "CUSTOMER":
                 volume_keys_read.append(job)
             elif manager["manager"] == "AWS":
                 resources_with_aws_managed_keys.append(
@@ -3329,6 +3403,7 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
         if (
             resources_without_encryption
             or resources_with_aws_managed_keys
+            or resources_with_keys_not_enabled
             or resources_without_vpc_encryption
             or training_jobs_without_volume_key
             or unread
@@ -3359,6 +3434,28 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                         resolution="Consider using customer managed keys for better control over encryption",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/key-management.html",
                         severity="Low",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+            for resource in resources_with_keys_not_enabled:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-03",
+                        finding_name=KEY_NOT_ENABLED_FINDING,
+                        finding_details=(
+                            f"{resource['type']} '{resource['name']}' uses customer "
+                            f"managed key {resource['key_id']}, whose "
+                            f"kms:DescribeKey KeyState is {resource['state']}, "
+                            "not Enabled."
+                        ),
+                        resolution=(
+                            "Enable the key, or cancel its scheduled deletion, or "
+                            "move the resource to an enabled customer managed key."
+                        ),
+                        reference="https://docs.aws.amazon.com/kms/latest/developerguide/key-state.html",
+                        severity="High",
                         status="Failed",
                         region=region,
                     )
@@ -6222,6 +6319,7 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
 
         models_platform_mode = []
         models_vpc_mode = []
+        unread = []
 
         try:
             paginator = sagemaker_client.get_paginator("list_models")
@@ -6283,9 +6381,14 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                             logger.warning(
                                 f"Error describing model {model_name}: {str(e)}"
                             )
+                            unread.append(
+                                f"sagemaker:DescribeModel {model_name} "
+                                f"({get_assessment_error_label(e)})"
+                            )
 
         except Exception as e:
             logger.error(f"Error listing models: {str(e)}")
+            unread.append(f"sagemaker:ListModels ({get_assessment_error_label(e)})")
 
         if models_platform_mode:
             # Limit findings
@@ -6316,7 +6419,7 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                         region=region,
                     )
                 )
-        else:
+        elif not unread:
             if models_vpc_mode:
                 # Models exist and all use VPC repository access - Passed
                 findings["csv_data"].append(
@@ -6345,6 +6448,19 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                         region=region,
                     )
                 )
+
+        if unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-14",
+                    "SageMaker Model Repository Access Check",
+                    unread,
+                    f"{len(models_vpc_mode)} model(s) have a primary container "
+                    "with VPC repository access.",
+                    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-container-repositories.html",
+                    region,
+                )
+            )
 
         return findings
 
@@ -8738,8 +8854,8 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
                         finding_details="No InService endpoints found to monitor.",
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor.html",
-                        severity="Medium",
-                        status="Passed",
+                        severity="Informational",
+                        status="N/A",
                         region=region,
                     )
                 )
@@ -11966,9 +12082,10 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
 
     "enforced": it fires when the key is absent or holds a non-compliant value.
     "presence": it fires when the key is absent but admits a non-compliant
-    value: a Null test, a negated Like on a wildcard value, or ForAllValues on a
-    multivalued key, which admits a request that mixes an approved value with
-    an unapproved one. "value": it fires only for one named value whose
+    value: a Null test, a negated Like or Arn operator on a wildcard value, a
+    NotIpAddress on aws:SourceIp values that cover every address, or
+    ForAllValues on a multivalued key, which admits a request that mixes an
+    approved value with an unapproved one. "value": it fires only for one named value whose
     compliance this check does not judge. "absent-open": it fires for a
     non-compliant value but not when the request omits the key. A "presence"
     and an "absent-open" Deny together enforce the key. "conjunctive": the key
@@ -11992,7 +12109,9 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
             return "undefined-operator"
         # A negated operator is true for an absent key, except under
         # ForAnyValue, which is false over an empty set.
-        if _like_values_unbounded(base, values):
+        if _like_values_unbounded(base, values) or _source_ip_values_unbounded(
+            key, values
+        ):
             return "value" if prefix == "foranyvalue" else "presence"
         if prefix == "foranyvalue":
             return "absent-open"
@@ -12014,9 +12133,32 @@ def _deny_pair_enforces(strengths: set) -> bool:
 
 
 def _like_values_unbounded(base: str, values: List[str]) -> bool:
-    """Return whether a Like operator's values hold a wildcard, which admits
-    values beyond any approved list."""
-    return "like" in base and any("*" in v or "?" in v for v in values)
+    """Return whether a Like or Arn operator's values hold a wildcard, which
+    admits values beyond any approved list. ArnEquals and ArnNotEquals match
+    wildcards exactly as ArnLike and ArnNotLike do."""
+    return ("like" in base or base.startswith("arn")) and any(
+        "*" in v or "?" in v for v in values
+    )
+
+
+def _source_ip_values_unbounded(key: str, values: List[str]) -> bool:
+    """Return whether aws:SourceIp values together cover every IPv4 or every
+    IPv6 address, as 0.0.0.0/0 or ::/0 do, so they approve no range."""
+    if key != "aws:sourceip":
+        return False
+    networks = {4: [], 6: []}
+    for value in values:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            continue
+        networks[network.version].append(network)
+    return any(
+        [str(n) for n in ipaddress.collapse_addresses(found)]
+        == [("0.0.0.0/0" if version == 4 else "::/0")]
+        for version, found in networks.items()
+        if found
+    )
 
 
 def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
@@ -12025,7 +12167,8 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
 
     IfExists and negated operators match a request that omits the key, so
     neither enforces it. ForAllValues does too, unless the statement also holds
-    a Null false test on the same key. A Null test and a Like on a wildcard value
+    a Null false test on the same key. A Null test, a Like or Arn operator
+    on a wildcard value, and aws:SourceIp values that cover every address
     require only that the key is present. ForAnyValue on a multivalued key
     admits a request that mixes an approved value with an unapproved one, and
     IAM does not define a multivalued key under no set operator.
@@ -12042,7 +12185,11 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
         prefix, base, if_exists = _condition_operator_parts(operator)
         if if_exists or "not" in base:
             continue
-        if base == "null" or _like_values_unbounded(base, values):
+        if (
+            base == "null"
+            or _like_values_unbounded(base, values)
+            or _source_ip_values_unbounded(key, values)
+        ):
             continue
         if prefix == "forallvalues" and key not in required:
             continue
@@ -12730,6 +12877,7 @@ SECURITY_SERVICE_PRINCIPALS = (
     ("Amazon Inspector", "inspector2.amazonaws.com"),
     ("Amazon Macie", "macie.amazonaws.com"),
     ("AWS Config", "config.amazonaws.com"),
+    ("AWS Config multi-account setup", "config-multiaccountsetup.amazonaws.com"),
     ("IAM Access Analyzer", "access-analyzer.amazonaws.com"),
     ("AWS CloudTrail", "cloudtrail.amazonaws.com"),
     ("Amazon Detective", "detective.amazonaws.com"),
@@ -13341,12 +13489,40 @@ ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "CompositeAlarm type. Neither history result changes the status: an alarm that "
     "has never entered ALARM still passes, and a history read that fails is "
     "named in the row without holding back Passed. Whether a fired alarm was "
-    "triaged is not recorded by any CloudWatch API."
+    "triaged is not recorded by any CloudWatch API. An alarm is credited only "
+    "when it reads the dimension names and unit the filter publishes, and its "
+    "static threshold is judged only when the filter publishes literal values. "
+    "Pattern terms and field equalities are matched against the tokens of the "
+    "default flow-log format, so a field only a custom log format carries is "
+    "not recognized."
 )
 FLOW_LOG_ALERTING_TRAFFIC_TYPES = ("ALL", "ACCEPT")
 FLOW_LOG_RECORD_TERM = re.compile(
-    r"^(ACCEPT|REJECT|OK|NODATA|SKIPDATA|\d[\d.:]*|(eni|vpc|subnet|i)-[0-9a-f]+)$"
+    r"^(ACCEPT|REJECT|OK|NODATA|SKIPDATA|-|\d[\d.:]*|[0-9a-f]*:[0-9a-f:]*"
+    r"|(eni|vpc|subnet|i)-[0-9a-f]+)$"
 )
+FLOW_LOG_FIELD_CONDITION = re.compile(r"^\s*[\w.-]*\s*(!=|>=|<=|=|>|<)\s*(.*?)\s*$")
+
+
+def _bracketed_pattern_selects_flow_records(pattern: str) -> bool:
+    """
+    Whether a space-delimited pattern's field conditions can hold on a record.
+
+    Only an equality to a literal no flow-log record carries rules a field out;
+    a wildcard value, an OR (||) of conditions and every comparison other than
+    = are taken to hold.
+    """
+    for field in pattern[1 : pattern.rfind("]")].split(","):
+        if "||" in field:
+            continue
+        for condition in field.split("&&"):
+            match = FLOW_LOG_FIELD_CONDITION.match(condition)
+            if not match or match.group(1) != "=":
+                continue
+            value = match.group(2).strip('"')
+            if "*" not in value and not FLOW_LOG_RECORD_TERM.match(value):
+                return False
+    return True
 
 
 def _filter_pattern_selects_flow_records(metric_filter: Dict[str, Any]) -> bool:
@@ -13360,8 +13536,10 @@ def _filter_pattern_selects_flow_records(metric_filter: Dict[str, Any]) -> bool:
     flow-log record carries; exclusion (-) terms never stop a match.
     """
     pattern = (metric_filter.get("filterPattern") or "").strip()
-    if not pattern or pattern.startswith("["):
+    if not pattern:
         return True
+    if pattern.startswith("["):
+        return _bracketed_pattern_selects_flow_records(pattern)
     if pattern.startswith("{"):
         return bool(metric_filter.get("applyOnTransformedLogs"))
     required, optional = [], []
@@ -13462,15 +13640,98 @@ def _alarm_last_fired(
 
 
 def _alarm_metrics(alarm: Dict[str, Any]) -> List[tuple]:
-    """Every (namespace, metric name) a metric alarm evaluates."""
+    """
+    Every (namespace, metric name) a metric alarm evaluates, with the series
+    it reads: its dimension names, its unit, and, for a single-metric alarm,
+    the statistic it compares with its threshold.
+    """
     metrics = []
     if alarm.get("MetricName"):
-        metrics.append((alarm.get("Namespace"), alarm.get("MetricName")))
+        metrics.append(
+            (
+                (alarm.get("Namespace"), alarm.get("MetricName")),
+                {
+                    "dimensions": {
+                        d.get("Name") for d in alarm.get("Dimensions") or []
+                    },
+                    "unit": alarm.get("Unit"),
+                    "statistic": alarm.get("Statistic")
+                    or alarm.get("ExtendedStatistic"),
+                    "operator": alarm.get("ComparisonOperator"),
+                    "threshold": alarm.get("Threshold"),
+                },
+            )
+        )
     for query in alarm.get("Metrics") or []:
-        metric = (query.get("MetricStat") or {}).get("Metric") or {}
+        metric_stat = query.get("MetricStat") or {}
+        metric = metric_stat.get("Metric") or {}
         if metric.get("MetricName"):
-            metrics.append((metric.get("Namespace"), metric.get("MetricName")))
+            metrics.append(
+                (
+                    (metric.get("Namespace"), metric.get("MetricName")),
+                    {
+                        "dimensions": {
+                            d.get("Name") for d in metric.get("Dimensions") or []
+                        },
+                        "unit": metric_stat.get("Unit"),
+                    },
+                )
+            )
     return metrics
+
+
+BOUNDED_ALARM_STATISTIC = re.compile(r"^(Maximum|Minimum|Average|p\d+(\.\d+)?)$")
+
+
+def _alarm_cannot_fire(
+    transformation: Dict[str, Any], series: Dict[str, Any]
+) -> Optional[str]:
+    """
+    Why an alarm on a metric filter's metric can never enter ALARM, or None.
+
+    The alarm reads nothing when its dimension names differ from those the
+    filter publishes, or when it names a unit other than the filter's (None
+    when the filter sets none). When the filter publishes only literal values,
+    a static threshold that no statistic of those values can cross is never
+    breached: no statistic of values at or above zero falls below zero, and a
+    Maximum, Minimum, Average or percentile never exceeds the largest value.
+    """
+    published = set(transformation.get("dimensions") or {})
+    if series["dimensions"] != published:
+        return (
+            f"it reads dimension(s) {', '.join(sorted(series['dimensions'])) or 'none'}"
+            f" and the filter publishes {', '.join(sorted(published)) or 'none'}"
+        )
+    unit = transformation.get("unit") or "None"
+    if series["unit"] and series["unit"] != unit:
+        return f"it reads unit {series['unit']} and the filter publishes unit {unit}"
+    operator, threshold = series.get("operator"), series.get("threshold")
+    if threshold is None:
+        return None
+    values = [transformation.get("metricValue")]
+    if transformation.get("defaultValue") is not None:
+        values.append(transformation["defaultValue"])
+    try:
+        values = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    statistic = series.get("statistic") or ""
+    bounded = BOUNDED_ALARM_STATISTIC.match(statistic) or (
+        statistic == "Sum" and not any(values)
+    )
+    compare = f"{statistic or 'its statistic'} {operator} {threshold:g}"
+    shown = ", ".join(f"{value:g}" for value in values)
+    if min(values) >= 0 and (
+        (operator == "LessThanThreshold" and threshold <= 0)
+        or (operator == "LessThanOrEqualToThreshold" and threshold < 0)
+    ):
+        return f"it compares {compare} and the filter publishes only {shown}"
+    if bounded and (
+        (operator == "GreaterThanThreshold" and threshold >= max(values))
+        or (operator == "GreaterThanOrEqualToThreshold" and threshold > max(values))
+    ):
+        return f"it compares {compare} and the filter publishes only {shown}"
+    return None
 
 
 def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, Any]:
@@ -13479,8 +13740,9 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
 
     An endpoint passes only when each subnet it runs in is covered by an ACTIVE
     VPC or subnet flow log that captures accepted traffic into CloudWatch Logs,
-    and that log group has a metric filter whose metric an alarm with an action
-    evaluates.
+    and that log group has a metric filter whose pattern can match a flow-log
+    record and whose metric an alarm with an action evaluates on the series the
+    filter publishes, with a threshold the published values can cross.
     """
     findings = {"csv_data": []}
 
@@ -13595,7 +13857,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
     unmatched_filters = {}
     for group in sorted({g for groups in alerting_logs.values() for g in groups}):
         try:
-            metrics = set()
+            metrics = {}
             for page in logs_client.get_paginator("describe_metric_filters").paginate(
                 logGroupName=group
             ):
@@ -13611,12 +13873,13 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                     for transformation in (
                         metric_filter.get("metricTransformations") or []
                     ):
-                        metrics.add(
+                        metrics.setdefault(
                             (
                                 transformation.get("metricNamespace"),
                                 transformation.get("metricName"),
-                            )
-                        )
+                            ),
+                            [],
+                        ).append(transformation)
             group_metrics[group] = metrics
         except Exception as error:
             group_errors[group] = get_assessment_error_label(error)
@@ -13645,9 +13908,9 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 )
                 if composite:
                     label += f", actioned through composite alarm '{composite}'"
-                for metric in _alarm_metrics(alarm):
-                    alarmed_metrics.setdefault(
-                        metric, (label, alarm["AlarmName"], composite)
+                for metric, series in _alarm_metrics(alarm):
+                    alarmed_metrics.setdefault(metric, []).append(
+                        (label, alarm["AlarmName"], composite, series)
                     )
         except Exception as error:
             alarm_error = get_assessment_error_label(error)
@@ -13678,6 +13941,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
         uncovered = []
         unalarmed = {}
         alarmed = []
+        dead_alarms = []
         for subnet in subnets:
             covering = alerting_logs.get(subnet, set()) | alerting_logs.get(
                 subnet_vpc.get(subnet), set()
@@ -13685,16 +13949,27 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             if not covering:
                 uncovered.append(subnet)
                 continue
-            hits = [
-                (g, *alarmed_metrics[metric])
-                for g in sorted(covering)
-                for metric in sorted(group_metrics.get(g, set()), key=str)
-                if metric in alarmed_metrics
-            ]
+            hits = []
+            dead = []
+            for g in sorted(covering):
+                for metric in sorted(group_metrics.get(g, {}), key=str):
+                    for transformation in group_metrics[g][metric]:
+                        for label, alarm, composite, series in alarmed_metrics.get(
+                            metric, []
+                        ):
+                            reason = _alarm_cannot_fire(transformation, series)
+                            if reason is None:
+                                hits.append((g, label, alarm, composite))
+                                continue
+                            dead.append(
+                                f"alarm '{alarm}' on {metric[0]}/{metric[1]} can "
+                                f"never fire: {reason}"
+                            )
             if hits:
                 alarmed.append(hits[0])
             else:
                 unalarmed[subnet] = covering
+                dead_alarms.extend(d for d in dead if d not in dead_alarms)
         if uncovered:
             failed.append(
                 f"endpoint '{name}': no ACTIVE flow log capturing accepted traffic "
@@ -13730,6 +14005,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                     if unmatched
                     else ""
                 )
+                + (f" ({'; '.join(dead_alarms)})" if dead_alarms else "")
             )
 
     history = {
@@ -13873,8 +14149,8 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
     managed signing rule covers the repository; its S3 model data records an
     ETag, ManifestEtag or ModelDataETag, or comes from SageMaker hub content;
     it does not name an HF_MODEL_ID with no model data; and each artifact
-    bucket defaults to SSE-KMS with a named key. A denied read leaves that
-    endpoint N/A, never Failed.
+    bucket defaults to SSE-KMS with a named customer managed key. A denied
+    read leaves that endpoint N/A, never Failed.
     """
     findings = {"csv_data": []}
 
@@ -14084,7 +14360,21 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                         "it uses the AWS managed key aws/s3",
                     )
                 else:
-                    buckets[bucket] = (None, None)
+                    key_id = str(kms_defaults[0]["KMSMasterKeyID"])
+                    key = _kms_key_managers([key_id], region)[key_id]
+                    if key["manager"] == "AWS":
+                        buckets[bucket] = (
+                            "failed",
+                            f"default encryption key {key_id} is an AWS managed "
+                            "key, not a customer managed key",
+                        )
+                    elif key["manager"] is None:
+                        buckets[bucket] = (
+                            "unread",
+                            f"kms:DescribeKey on {key_id}: {key['error']}",
+                        )
+                    else:
+                        buckets[bucket] = (None, None)
             except Exception as error:
                 label = get_assessment_error_label(error)
                 buckets[bucket] = (
@@ -15057,8 +15347,9 @@ WORKLOAD_SEGMENTATION_REFERENCE = (
     "https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/"
     "security-network.html"
 )
-BROAD_IPV4_PREFIX = 16
-BROAD_IPV6_PREFIX = 48
+# A CIDR wider than a /24 (IPv6 /64) is not read as a declared dependency.
+BROAD_IPV4_PREFIX = 23
+BROAD_IPV6_PREFIX = 63
 
 
 def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
@@ -15085,7 +15376,7 @@ def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
 
 
 def _broad_rule_targets(permission: Dict[str, Any]) -> List[str]:
-    """CIDRs in one rule that cover a whole VPC or more."""
+    """CIDRs in one rule wider than BROAD_IPV4_PREFIX or BROAD_IPV6_PREFIX."""
     broad = []
     for entry in permission.get("IpRanges") or []:
         cidr = entry.get("CidrIp") or ""
@@ -15113,18 +15404,34 @@ def _rule_ports(permission: Dict[str, Any]) -> str:
     return f"{protocol} {ports}"
 
 
-def _security_group_problems(group: Dict[str, Any], check_ingress: bool) -> List[str]:
-    problems = []
+def _security_group_permissions(group: Dict[str, Any], check_ingress: bool):
+    """(direction, preposition, permission) for each rule the check judges."""
     directions = [("egress", "IpPermissionsEgress", "to")]
     if check_ingress:
         directions.insert(0, ("ingress", "IpPermissions", "from"))
     for direction, key, preposition in directions:
         for permission in group.get(key) or []:
-            broad = _broad_rule_targets(permission)
-            if broad:
+            yield direction, preposition, permission
+
+
+def _security_group_problems(
+    group: Dict[str, Any], check_ingress: bool, referenced: Dict[str, Any]
+) -> List[str]:
+    problems = []
+    for direction, preposition, permission in _security_group_permissions(
+        group, check_ingress
+    ):
+        rule = f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)}"
+        broad = _broad_rule_targets(permission)
+        if broad:
+            problems.append(f"{rule} {preposition} {', '.join(broad[:3])}")
+        for pair in permission.get("UserIdGroupPairs") or []:
+            target = referenced.get(pair.get("GroupId")) or {}
+            if target.get("GroupName") == "default":
                 problems.append(
-                    f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)} "
-                    f"{preposition} {', '.join(broad[:3])}"
+                    f"{rule} {preposition} {pair.get('GroupId')}, the default "
+                    "security group of its VPC, which holds every resource "
+                    "launched there without a security group of its own"
                 )
     return problems
 
@@ -15333,6 +15640,53 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
         )
         groups = None
 
+    referenced = {}
+    if groups:
+        pending = {}
+        for group_id in group_ids:
+            group = groups.get(group_id)
+            if group is None:
+                continue
+            for _, _, permission in _security_group_permissions(group, True):
+                for entry in permission.get("PrefixListIds") or []:
+                    unread.append(
+                        f"prefix list {entry.get('PrefixListId')} in {group_id} (its "
+                        "entries are not read: ec2:GetManagedPrefixListEntries is "
+                        "not granted)"
+                    )
+                for pair in permission.get("UserIdGroupPairs") or []:
+                    target = pair.get("GroupId")
+                    if not target or target == group_id:
+                        continue
+                    if target in groups:
+                        referenced[target] = groups[target]
+                    elif pair.get("UserId") in (None, group.get("OwnerId")):
+                        pending.setdefault(target, group_id)
+                    else:
+                        unread.append(
+                            f"security group {target} referenced by {group_id} "
+                            f"(owned by account {pair.get('UserId')})"
+                        )
+        targets = sorted(pending)
+        try:
+            for start in range(0, len(targets), 100):
+                response = ec2_client.describe_security_groups(
+                    GroupIds=targets[start : start + 100]
+                )
+                for group in response.get("SecurityGroups", []):
+                    referenced[group.get("GroupId")] = group
+        except Exception as error:
+            unread.append(
+                "ec2:DescribeSecurityGroups on referenced groups "
+                f"({get_assessment_error_label(error)})"
+            )
+        else:
+            unread.extend(
+                f"security group {target} referenced by {pending[target]}"
+                for target in targets
+                if target not in referenced
+            )
+
     users = {}
     for workload in workloads:
         for group in workload["groups"]:
@@ -15363,7 +15717,9 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                     unread.append(f"security group {group}")
                     continue
                 found.extend(
-                    _security_group_problems(groups[group], workload["ingress"])
+                    _security_group_problems(
+                        groups[group], workload["ingress"], referenced
+                    )
                 )
         if found:
             problems.append(f"{workload['label']}: {'; '.join(found[:4])}")
@@ -15382,8 +15738,9 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 finding_details=(
                     f"{problem}. A workload reaches only its declared dependencies "
                     "when its own security group allows traffic to and from the "
-                    "dependency's security group or prefix list, not a CIDR "
-                    f"of /{BROAD_IPV4_PREFIX} (IPv6 /{BROAD_IPV6_PREFIX}) or wider."
+                    "dependency's security group or prefix list, not the VPC "
+                    f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
+                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider."
                 ),
                 resolution=(
                     "Give every agent service and function its own security group, "
@@ -15430,9 +15787,10 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 finding_name=WORKLOAD_SEGMENTATION_FINDING,
                 finding_details=(
                     f"All {len(workloads)} ECS service(s) and Lambda function(s) run "
-                    "in their own security groups with no rule to or from a CIDR "
-                    f"of /{BROAD_IPV4_PREFIX} or wider. Standalone EC2 instances "
-                    "are not read."
+                    "in their own security groups with no rule to or from the VPC "
+                    f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
+                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider, and none that names a "
+                    "prefix list. Standalone EC2 instances are not read."
                     if workloads
                     else "No ECS services or Lambda functions found in this region."
                 ),
@@ -15612,12 +15970,16 @@ def _rotation_interval_days(rotation_rules: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+# The default maxDaysSinceRotation of Security Hub control SecretsManager.4.
+SECRET_ROTATION_MAX_DAYS = 90
+
+
 def check_secrets_manager_rotation(region: str = "") -> Dict[str, Any]:
     """
-    SM-40: Verify customer-managed secrets rotate automatically on a schedule and
-    the last rotation happened within that schedule. Secrets owned by another
-    AWS service (OwningService set) rotate under that service's control and are
-    skipped.
+    SM-40: Verify customer-managed secrets rotate automatically on a schedule of
+    at most SECRET_ROTATION_MAX_DAYS and the last rotation happened within that
+    schedule. Secrets owned by another AWS service (OwningService set) rotate
+    under that service's control and are skipped.
     """
     logger.debug("Starting check for Secrets Manager rotation")
     findings = {"csv_data": []}
@@ -15689,6 +16051,13 @@ def check_secrets_manager_rotation(region: str = "") -> Dict[str, Any]:
         interval = _rotation_interval_days(secret.get("RotationRules") or {})
         if interval is None:
             uninterpretable.append(name)
+            continue
+        if interval > SECRET_ROTATION_MAX_DAYS:
+            failed.append(
+                f"Secret '{name}' rotates on a schedule with a gap of up to "
+                f"{interval:g} days, longer than {SECRET_ROTATION_MAX_DAYS} days, "
+                "the default maximum of Security Hub control SecretsManager.4."
+            )
             continue
         age_days = (now - last_rotated).total_seconds() / 86400
         if age_days > interval + 1:
@@ -16038,6 +16407,7 @@ def _propagation_and_plaintext_findings(
 
     rows = []
     stale = []
+    redeploy = None
     if injected:
         try:
             redeploy = _rotation_redeploy_rules(region)
@@ -16095,21 +16465,37 @@ def _propagation_and_plaintext_findings(
                 region,
             )
         )
-    elif not stale and not parameters:
-        wired = (
-            f" {len(injected)} injection(s) of a rotating secret are covered by an "
-            "EventBridge rotation rule with a target; whether that target "
-            "redeploys the service is not read."
-            if injected
-            else ""
-        )
+    elif redeploy:
+        shown = "; ".join(injected[:10])
         rows.append(
             create_finding(
                 check_id="SM-40",
                 finding_name=SECRET_PROPAGATION_FINDING,
                 finding_details=(
-                    f"No ECS task injects a rotating secret without a redeploy path, "
-                    f"and none injects from Parameter Store.{wired} Lambda functions "
+                    f"{len(injected)} injection(s) of a rotating secret rely on "
+                    f"ENABLED EventBridge rotation rule(s) {', '.join(redeploy[:10])} "
+                    "with a target: "
+                    f"{shown}. This check lists each target but does not read what "
+                    "it runs, so whether a target redeploys the service after a "
+                    "rotation was not assessed."
+                ),
+                resolution="Confirm that each rule's target forces a new "
+                "deployment of the services that inject the secret, or fetch the "
+                "secret from Secrets Manager at runtime.",
+                reference=SECRET_PROPAGATION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    elif not stale and not parameters:
+        rows.append(
+            create_finding(
+                check_id="SM-40",
+                finding_name=SECRET_PROPAGATION_FINDING,
+                finding_details=(
+                    "No ECS task injects a rotating secret, and none injects from "
+                    "Parameter Store. Lambda functions "
                     "are not graded: no API shows whether a function re-fetches per "
                     "invocation or caches at init; "
                     f"{extension_users} of {len(functions)} use the Parameters and "
@@ -16206,12 +16592,15 @@ def _iot_resource_bounded_to_thing(resource: str) -> bool:
 
     A resource without the variable reaches every device's topic, and a
     wildcard or other text right after it (topic/${ThingName}*) reaches the
-    topics of every thing whose name starts with this one.
+    topics of every thing whose name starts with this one. Right before it
+    (topic/*${ThingName}) it reaches every thing whose name ends with this one.
     """
     parts = resource.split(IOT_THING_NAME_VARIABLE)
     if len(parts) < 2:
         return False
-    return all(part == "" or part.startswith("/") for part in parts[1:])
+    return all(part.endswith("/") for part in parts[:-1]) and all(
+        part == "" or part.startswith("/") for part in parts[1:]
+    )
 
 
 def _iot_broad_resource(statement: Dict[str, Any]) -> Optional[str]:
@@ -16305,6 +16694,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
 
     failed, passed, errors = [], [], []
     certificates = set()
+    thing_groups = set()
     for policy in policies:
         name = policy.get("policyName")
         if not name:
@@ -16317,6 +16707,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
             if not targets:
                 continue
             certificates.update(t for t in targets if ":cert/" in str(t))
+            thing_groups.update(t for t in targets if ":thinggroup/" in str(t))
             document = iot_client.get_policy(policyName=name).get("policyDocument")
         except Exception as error:
             errors.append((name, error))
@@ -16381,16 +16772,24 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
             )
         )
     findings["csv_data"].append(
-        _iot_unique_certificate_finding(iot_client, sorted(certificates), region)
+        _iot_unique_certificate_finding(
+            iot_client, sorted(certificates), region, sorted(thing_groups)
+        )
     )
     findings["csv_data"].append(_iot_audit_finding(iot_client, region))
     return findings
 
 
 def _iot_unique_certificate_finding(
-    iot_client, certificates: List[str], region: str
+    iot_client, certificates: List[str], region: str, thing_groups: List[str]
 ) -> Dict[str, Any]:
-    """SM-41: each certificate a device policy is attached to serves one thing."""
+    """
+    SM-41: each certificate a device policy is attached to serves one thing.
+
+    A policy attached to a thing group reaches the certificates of the group's
+    things, which iot:ListThingsInThingGroup and iot:ListThingPrincipals would
+    list. The role holds neither, so each such group withholds the Passed.
+    """
 
     def _row(details, resolution, severity, status):
         return create_finding(
@@ -16404,7 +16803,7 @@ def _iot_unique_certificate_finding(
             region=region,
         )
 
-    if not certificates:
+    if not certificates and not thing_groups:
         return _row(
             "No attached AWS IoT policy in this region is attached to a "
             "certificate, so there is no device certificate to assess.",
@@ -16437,6 +16836,15 @@ def _iot_unique_certificate_finding(
         f"{IOT_SHARED_CERTIFICATE_CHECK} infers it from concurrent connections "
         "and is reported in the audit row."
     )
+    groups = ""
+    if thing_groups:
+        names = ", ".join(g.rsplit("/", 1)[-1] for g in thing_groups[:10])
+        groups = (
+            f" {len(thing_groups)} thing group(s) an attached policy is attached "
+            f"to ({names}) reach the certificates of their things, which were not "
+            "listed: iot:ListThingsInThingGroup and iot:ListThingPrincipals are "
+            "not granted, so those certificates are not assessed."
+        )
     if shared:
         return _row(
             f"{len(shared)} of {len(certificates)} device certificate(s) are shared "
@@ -16453,9 +16861,24 @@ def _iot_unique_certificate_finding(
             IOT_UNIQUE_CERTIFICATE_FINDING,
             unread,
             f"{len(certificates) - len(unread)} certificate(s) read are each "
-            "attached to at most one thing." + ceiling,
+            "attached to at most one thing." + groups + ceiling,
             IOT_UNIQUE_CERTIFICATE_REFERENCE,
             region,
+        )
+    if thing_groups:
+        direct = (
+            f"Each of the {len(certificates)} certificate(s) that an attached AWS "
+            "IoT policy is attached to directly is attached to at most one thing."
+            if certificates
+            else "No attached AWS IoT policy is attached to a certificate directly."
+        )
+        return _row(
+            direct + groups + ceiling,
+            "Attach device policies to certificates, or grant "
+            "iot:ListThingsInThingGroup and iot:ListThingPrincipals so the "
+            "certificates of each thing group can be assessed.",
+            "Informational",
+            "N/A",
         )
     return _row(
         f"Each of the {len(certificates)} certificate(s) that an attached AWS IoT "
