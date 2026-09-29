@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-22` deployed model registration also judges the model each batch
+  transform job ran, read from `DescribeTransformJob`, beside the models
+  serving on endpoints. An unregistered or unapproved model used only by a
+  transform job used to go unread, and the row said so. A transform job that
+  could not be listed or described now leaves the row `N/A`, and an account
+  with transform jobs but no endpoint now gets the row.
+
 - `SM-23` model drift detection adds a `Model Monitor Baseline Constraints`
   row. Each Scheduled monitoring schedule on an InService endpoint must name a
   baseline `ConstraintsResource`, read from its inline job definition or, for

@@ -8056,12 +8056,42 @@ def _endpoint_variant_models(
     return models, endpoints
 
 
+def _transform_job_models(
+    sagemaker_client: Any, models: Dict[str, List[str]], unread: List[str]
+) -> int:
+    """Add the model each batch transform job ran to models; return the job count."""
+    jobs = 0
+    try:
+        for page in sagemaker_client.get_paginator("list_transform_jobs").paginate():
+            for summary in page.get("TransformJobSummaries", []):
+                name = summary.get("TransformJobName")
+                jobs += 1
+                try:
+                    model_name = sagemaker_client.describe_transform_job(
+                        TransformJobName=name
+                    ).get("ModelName")
+                except Exception as error:
+                    unread.append(
+                        f"transform job {name} ({get_assessment_error_label(error)})"
+                    )
+                    continue
+                if not model_name:
+                    unread.append(f"transform job {name} (no ModelName returned)")
+                    continue
+                models.setdefault(model_name, []).append(f"transform job {name}")
+    except Exception as error:
+        unread.append(
+            f"sagemaker:ListTransformJobs ({get_assessment_error_label(error)})"
+        )
+    return jobs
+
+
 def _deployed_model_registration_findings(
     sagemaker_client: Any, region: str
 ) -> List[Dict[str, Any]]:
     """
-    Report whether every model serving on an endpoint was created from an
-    Approved version in a model package group.
+    Report whether every model serving on an endpoint or run by a batch
+    transform job was created from an Approved version in a model package group.
     """
     unread = []
     try:
@@ -8077,7 +8107,8 @@ def _deployed_model_registration_findings(
                 region,
             )
         ]
-    if not endpoints:
+    transform_jobs = _transform_job_models(sagemaker_client, models, unread)
+    if not endpoints and not transform_jobs and not unread:
         return []
     problems = []
     registered = 0
@@ -8166,8 +8197,8 @@ def _deployed_model_registration_findings(
                 "SM-22",
                 DEPLOYED_MODEL_REGISTRATION_FINDING,
                 unread,
-                f"{endpoints} endpoint(s) and {len(models)} serving model(s) were "
-                "found.",
+                f"{endpoints} endpoint(s), {transform_jobs} batch transform job(s), "
+                f"and {len(models)} model(s) they use were found.",
                 DEPLOYED_MODEL_REGISTRATION_REFERENCE,
                 region,
             )
@@ -8179,8 +8210,8 @@ def _deployed_model_registration_findings(
                 finding_name=DEPLOYED_MODEL_REGISTRATION_FINDING,
                 finding_details=(
                     f"All {registered} model(s) serving on the {endpoints} endpoint(s) "
-                    "read were created from an Approved version in a model package "
-                    "group. Batch transform jobs are not part of this population."
+                    f"and run by the {transform_jobs} batch transform job(s) read were "
+                    "created from an Approved version in a model package group."
                 ),
                 resolution="No action required",
                 reference=DEPLOYED_MODEL_REGISTRATION_REFERENCE,

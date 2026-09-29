@@ -3511,9 +3511,11 @@ class TestSM22RegistryLegs:
         components=None,
         ram=None,
         errors=None,
+        transform_jobs=None,
     ):
         errors = errors or {}
         endpoints = endpoints or {}
+        transform_jobs = transform_jobs or {}
         models = models or {}
         components = components or {}
         ram = ram if ram is not None else {"SELF": ["arn:grp"], "OTHER-ACCOUNTS": []}
@@ -3568,6 +3570,14 @@ class TestSM22RegistryLegs:
                             ]
                         }
                     ]
+                if name == "list_transform_jobs":
+                    return [
+                        {
+                            "TransformJobSummaries": [
+                                {"TransformJobName": j} for j in transform_jobs
+                            ]
+                        }
+                    ]
                 return [{}]
 
             pager.paginate.side_effect = paginate
@@ -3592,6 +3602,12 @@ class TestSM22RegistryLegs:
             return models[ModelName]
 
         mock_sm.describe_model.side_effect = describe_model
+
+        def describe_transform_job(TransformJobName):
+            fail("describe_transform_job")
+            return {"ModelName": transform_jobs[TransformJobName]}
+
+        mock_sm.describe_transform_job.side_effect = describe_transform_job
         mock_sm.describe_inference_component.side_effect = (
             lambda InferenceComponentName: {
                 "Specification": {
@@ -3803,6 +3819,101 @@ class TestSM22RegistryLegs:
     def test_no_endpoints_adds_no_deployment_row(self, mock_client):
         self._client(mock_client, {"p1": self._good_package()})
         assert self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING) == []
+
+    REGISTERED = {"PrimaryContainer": {"ModelPackageName": "p1"}}
+    UNREGISTERED = {"PrimaryContainer": {"Image": "img"}}
+
+    @patch("sagemaker_app.boto3.client")
+    def test_registered_endpoint_and_transform_models_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            transform_jobs={"batch-1": "m2"},
+            models={"m1": self.REGISTERED, "m2": self.REGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "1 batch transform job(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("bad", ["batch-1", "batch-2"])
+    @patch("sagemaker_app.boto3.client")
+    def test_one_unregistered_transform_model_fails_only_its_job(
+        self, mock_client, bad
+    ):
+        jobs = {"batch-1": "m1", "batch-2": "m1"}
+        jobs[bad] = "m2"
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            transform_jobs=jobs,
+            models={"m1": self.REGISTERED, "m2": self.UNREGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        good = "batch-2" if bad == "batch-1" else "batch-1"
+        assert "'m2'" in rows[0]["Finding_Details"]
+        assert f"transform job {bad}" in rows[0]["Finding_Details"]
+        assert good not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_transform_model_is_judged_without_any_endpoint(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            transform_jobs={"batch-1": "m2"},
+            models={"m2": self.UNREGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "transform job batch-1" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_model_on_an_endpoint_and_a_job_names_both(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m2"}]},
+            transform_jobs={"batch-1": "m2"},
+            models={"m2": self.UNREGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ep/v" in rows[0]["Finding_Details"]
+        assert "transform job batch-1" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_undescribed_transform_job_withholds_the_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            transform_jobs={"batch-1": "m1"},
+            models={"m1": self.REGISTERED},
+            errors={"describe_transform_job": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "batch-1" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("with_endpoint", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_transform_list_denied_withholds_the_pass(self, mock_client, with_endpoint):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints=(
+                {"ep": [{"VariantName": "v", "ModelName": "m1"}]}
+                if with_endpoint
+                else None
+            ),
+            models={"m1": self.REGISTERED},
+            errors={"list_transform_jobs": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "ListTransformJobs" in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_describe_package_denied_withholds_the_aggregate_pass(self, mock_client):
