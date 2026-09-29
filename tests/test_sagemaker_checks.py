@@ -4422,13 +4422,24 @@ class TestSM23MonitorReportAndAlarm:
 
         mock_sm.describe_monitoring_schedule.side_effect = describe
 
-        def describe_definition(JobDefinitionName):
-            value = job_definitions[JobDefinitionName]
-            if isinstance(value, str):
-                raise _make_client_error(value, "DescribeDataQualityJobDefinition")
-            return value
+        def describer(operation):
+            def describe_definition(JobDefinitionName):
+                value = job_definitions[JobDefinitionName]
+                if isinstance(value, str):
+                    raise _make_client_error(value, operation)
+                return value
 
-        mock_sm.describe_data_quality_job_definition.side_effect = describe_definition
+            return describe_definition
+
+        for kind, method in (
+            ("DataQuality", "describe_data_quality_job_definition"),
+            ("ModelQuality", "describe_model_quality_job_definition"),
+            ("ModelBias", "describe_model_bias_job_definition"),
+            ("ModelExplainability", "describe_model_explainability_job_definition"),
+        ):
+            getattr(mock_sm, method).side_effect = describer(
+                f"Describe{kind}JobDefinition"
+            )
         return mock_sm
 
     @staticmethod
@@ -4763,21 +4774,116 @@ class TestSM23MonitorReportAndAlarm:
         assert "dq-def" in rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
+        "kind,method",
+        [
+            ("ModelQuality", "describe_model_quality_job_definition"),
+            ("ModelBias", "describe_model_bias_job_definition"),
+            ("ModelExplainability", "describe_model_explainability_job_definition"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_other_named_definitions_are_read_with_their_own_describe(
+        self, mock_client, kind, method
+    ):
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[self._schedule("dq", "DataQuality"), self._schedule("mq", kind)],
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._named("other-def", kind),
+            },
+            job_definitions={
+                "other-def": {
+                    f"{kind}BaselineConfig": {"ConstraintsResource": self.CONSTRAINTS}
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        getattr(mock_client.return_value, method).assert_called_once_with(
+            JobDefinitionName="other-def"
+        )
+
+    @pytest.mark.parametrize(
+        "kind", ["ModelQuality", "ModelBias", "ModelExplainability"]
+    )
+    @pytest.mark.parametrize(
+        "baseline_key",
+        ["", "DataQualityBaselineConfig"],
+        ids=["no-baseline", "another-type's-key"],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_other_named_definition_without_constraints_fails_only_itself(
+        self, mock_client, kind, baseline_key
+    ):
+        definition = (
+            {baseline_key: {"ConstraintsResource": self.CONSTRAINTS}}
+            if baseline_key
+            else {}
+        )
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[
+                self._schedule("dq", "DataQuality"),
+                self._schedule("mq", kind),
+                self._schedule("ok", kind),
+            ],
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._named("bare-def", kind),
+                "ok": self._named("good-def", kind),
+            },
+            job_definitions={
+                "bare-def": definition,
+                "good-def": {
+                    f"{kind}BaselineConfig": {"ConstraintsResource": self.CONSTRAINTS}
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "bare-def" in rows[0]["Finding_Details"]
+        assert "good-def" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
         "kind", ["ModelQuality", "ModelBias", "ModelExplainability"]
     )
     @patch("sagemaker_app.boto3.client")
-    def test_other_named_definitions_are_not_read(self, mock_client, kind):
+    def test_unread_other_definition_is_named_and_withholds_the_pass(
+        self, mock_client, kind
+    ):
         rows = self._baseline_rows(
             mock_client,
+            schedules=[self._schedule("dq", "DataQuality"), self._schedule("mq", kind)],
             details={
-                "dq": self._inline(None),
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
                 "mq": self._named("other-def", kind),
             },
+            job_definitions={"other-def": "AccessDeniedException"},
         )
-        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
-        assert "'dq'" in rows[0]["Finding_Details"]
-        assert "other-def" in rows[1]["Finding_Details"]
-        assert kind in rows[1]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            f"sagemaker:Describe{kind}JobDefinition other-def"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unread_definition_does_not_hide_a_bare_one(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[
+                self._schedule("mq", "ModelQuality"),
+                self._schedule("mb", "ModelBias"),
+            ],
+            details={
+                "mq": self._named("mq-def", "ModelQuality"),
+                "mb": self._named("mb-def", "ModelBias"),
+            },
+            job_definitions={
+                "mq-def": "AccessDeniedException",
+                "mb-def": {"ModelBiasBaselineConfig": {}},
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A"]
 
     @patch("sagemaker_app.boto3.client")
     def test_baselining_job_without_constraints_file_is_not_a_pass(self, mock_client):

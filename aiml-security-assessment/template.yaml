@@ -734,6 +734,18 @@ Resources:
             Action:
               - organizations:ListAWSServiceAccessForOrganization # SM-35
             Resource: '*'
+          - Sid: MonitoringJobDefinitionRead
+            # SM-23 reads the baseline constraints file each named ModelQuality,
+            # ModelBias and ModelExplainability job definition names.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeModelQualityJobDefinition # SM-23
+              - sagemaker:DescribeModelBiasJobDefinition # SM-23
+              - sagemaker:DescribeModelExplainabilityJobDefinition # SM-23
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-quality-job-definition/*'
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-bias-job-definition/*'
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-explainability-job-definition/*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

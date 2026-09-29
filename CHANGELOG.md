@@ -316,13 +316,14 @@ section.
 
 - `SM-23` model drift detection adds a `Model Monitor Baseline Constraints`
   row. Each Scheduled monitoring schedule on an InService endpoint must name a
-  baseline `ConstraintsResource`, read from its inline job definition or, for
-  a DataQuality schedule, from `DescribeDataQualityJobDefinition`. A schedule
-  with no constraints file fails, because its reports have nothing to be
-  validated against. A ModelQuality, ModelBias, or ModelExplainability
-  schedule that names a job definition is `N/A`, since only the DataQuality
-  describe is granted, and so is one that names a baselining job but no
-  constraints file.
+  baseline `ConstraintsResource`, read from its inline job definition or from
+  the named job definition's describe for its monitoring type
+  (`DescribeDataQualityJobDefinition`, `DescribeModelQualityJobDefinition`,
+  `DescribeModelBiasJobDefinition` or
+  `DescribeModelExplainabilityJobDefinition`). A schedule with no constraints
+  file fails, because its reports have nothing to be validated against. A job
+  definition that could not be described is `N/A` naming the describe, and so
+  is one that names a baselining job but no constraints file.
 
 - `SM-23` `Model Monitor Violation Alarm` passed row now says that which
   Model Monitor metric each alarm evaluates, and whether its threshold marks
@@ -344,40 +345,6 @@ section.
   `region` filter that matches the rule's own account or Region, read from
   the rule ARN, no longer narrows, because every Registry event the check
   judges carries those values.
-- `SM-38` runtime monitoring coverage adds a `GuardDuty EKS Audit Log
-  Monitoring` row in each Region that has an EKS cluster. It passes only when
-  the detector is `ENABLED` with its `EKS_AUDIT_LOGS` feature `ENABLED`, and
-  it is judged whether or not Runtime Monitoring is on. The feature used to go
-  unread. A Region whose EKS clusters could not be listed gets an `N/A` row.
-
-- `SM-09` execution role privilege also judges each Studio domain's
-  `DefaultSpaceSettings.ExecutionRole`, the default execution role for spaces,
-  beside the domain's default user role and each user profile's role. A
-  broad grant on the space role used to go unread.
-
-- `SM-22` deployed model registration also judges the model each batch
-  transform job ran, read from `DescribeTransformJob`, beside the models
-  serving on endpoints. An unregistered or unapproved model used only by a
-  transform job used to go unread, and the row said so. A transform job that
-  could not be listed or described now leaves the row `N/A`, and an account
-  with transform jobs but no endpoint now gets the row.
-
-- `SM-23` model drift detection adds a `Model Monitor Baseline Constraints`
-  row. Each Scheduled monitoring schedule on an InService endpoint must name a
-  baseline `ConstraintsResource`, read from its inline job definition or, for
-  a DataQuality schedule, from `DescribeDataQualityJobDefinition`. A schedule
-  with no constraints file fails, because its reports have nothing to be
-  validated against. A ModelQuality, ModelBias, or ModelExplainability
-  schedule that names a job definition is `N/A`, since only the DataQuality
-  describe is granted, and so is one that names a baselining job but no
-  constraints file.
-
-- `SM-11` endpoint model network path also judges the model each inference
-  component names, from `Specification` and every `Specifications` entry,
-  beside the endpoint config's own `EnableNetworkIsolation` and
-  `VpcConfig`. A component model with isolation off or no `VpcConfig` used
-  to pass behind a compliant endpoint config, and a component that could not
-  be listed or described now leaves its endpoint `N/A`.
 
 - `SM-35` security service delegated administrator also reads
   `config-multiaccountsetup.amazonaws.com`, the principal AWS Config rules
@@ -1347,7 +1314,12 @@ through its `Policies` list, for reads that do not fit that function's
 6144-character managed policy limit and holds
 `organizations:ListAWSServiceAccessForOrganization` on `*` (`SM-35`), which
 has no resource type and moves out of the inline
-`OrganizationsInventoryPermissions` statement. It is read-only. The
+`OrganizationsInventoryPermissions` statement, and
+`sagemaker:DescribeModelQualityJobDefinition`,
+`sagemaker:DescribeModelBiasJobDefinition` and
+`sagemaker:DescribeModelExplainabilityJobDefinition` on the account's
+`model-quality-job-definition/*`, `model-bias-job-definition/*` and
+`model-explainability-job-definition/*` ARNs (`SM-23`). All are read-only. The
 deployment role permissions added for `BedrockAssessmentReadsPolicy` cover
 this policy too.
 

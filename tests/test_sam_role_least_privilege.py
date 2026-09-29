@@ -281,6 +281,9 @@ _EXPECTED_ACTIONS = {
     },
     "SageMakerAssessmentReadsPolicy": {
         "organizations:ListAWSServiceAccessForOrganization",
+        "sagemaker:DescribeModelBiasJobDefinition",
+        "sagemaker:DescribeModelExplainabilityJobDefinition",
+        "sagemaker:DescribeModelQualityJobDefinition",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -794,8 +797,25 @@ def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(templat
     assert not _references(data.get("Outputs", {}), "BedrockAssessmentReadsPolicy")
 
 
+_SAGEMAKER_MONITORING_JOB_DEFINITIONS = json.dumps(
+    [
+        {
+            "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:"
+            f"{kind}-job-definition/*"
+        }
+        for kind in ("model-quality", "model-bias", "model-explainability")
+    ]
+)
 _SAGEMAKER_MANAGED_GRANTS = [
     ("Allow", "organizations:ListAWSServiceAccessForOrganization", '"*"'),
+    *(
+        ("Allow", action, _SAGEMAKER_MONITORING_JOB_DEFINITIONS)
+        for action in (
+            "sagemaker:DescribeModelQualityJobDefinition",
+            "sagemaker:DescribeModelBiasJobDefinition",
+            "sagemaker:DescribeModelExplainabilityJobDefinition",
+        )
+    ),
 ]
 
 

@@ -8687,6 +8687,15 @@ def _schedule_cadence(expression: str) -> timedelta:
     return timedelta(days=1)
 
 
+# The describe that returns each monitoring type's {type}BaselineConfig.
+MONITORING_JOB_DEFINITION_DESCRIBES = {
+    "DataQuality": "describe_data_quality_job_definition",
+    "ModelQuality": "describe_model_quality_job_definition",
+    "ModelBias": "describe_model_bias_job_definition",
+    "ModelExplainability": "describe_model_explainability_job_definition",
+}
+
+
 def _schedule_baseline_constraints(
     sagemaker_client: Any, name: str, detail: Dict[str, Any]
 ) -> tuple:
@@ -8694,9 +8703,8 @@ def _schedule_baseline_constraints(
     Where a described monitoring schedule's baseline constraints file is.
 
     Returns ("baselined", uri), ("missing", text) when the job definition
-    names no constraints file, or ("unread", text) when that was not read. Only the DataQuality job definition describe is granted, so a
-    schedule naming a ModelQuality, ModelBias, or ModelExplainability
-    definition is unread.
+    names no constraints file, or ("unread", text) when that was not read.
+    A named job definition is read with the describe of its monitoring type.
     """
     config = detail.get("MonitoringScheduleConfig") or {}
     if "MonitoringJobDefinition" in config:
@@ -8707,22 +8715,22 @@ def _schedule_baseline_constraints(
     elif config.get("MonitoringJobDefinitionName"):
         definition = config["MonitoringJobDefinitionName"]
         kind = config.get("MonitoringType") or detail.get("MonitoringType")
-        if kind != "DataQuality":
+        if kind not in MONITORING_JOB_DEFINITION_DESCRIBES:
             return "unread", (
                 f"schedule '{name}': its {kind or 'untyped'} job definition "
-                f"'{definition}' was not read (only "
-                "sagemaker:DescribeDataQualityJobDefinition is granted)"
+                f"'{definition}' was not read: no describe is known for that type"
             )
+        method = MONITORING_JOB_DEFINITION_DESCRIBES[kind]
         try:
             baseline = (
-                sagemaker_client.describe_data_quality_job_definition(
-                    JobDefinitionName=definition
-                ).get("DataQualityBaselineConfig")
+                getattr(sagemaker_client, method)(JobDefinitionName=definition).get(
+                    f"{kind}BaselineConfig"
+                )
                 or {}
             )
         except Exception as error:
             return "unread", (
-                f"sagemaker:DescribeDataQualityJobDefinition {definition} of "
+                f"sagemaker:Describe{kind}JobDefinition {definition} of "
                 f"schedule '{name}' ({get_assessment_error_label(error)})"
             )
         where = f"its job definition '{definition}'"
