@@ -9239,6 +9239,32 @@ class TestBR42ModelAllowList:
         )
         assert not [f for f in findings if f["Status"] == "Passed"]
 
+    def test_br42_unread_training_jobs_hold_back_a_scoped_invoke_pass(self):
+        training = {
+            "buckets": {},
+            "errors": [
+                "us-east-1 SageMaker training job 'sm2' was not read with "
+                "sagemaker:DescribeTrainingJob (ThrottlingException)"
+            ],
+            "truncated": [],
+            "regions": ["us-east-1"],
+        }
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ScopedRole": [
+                        ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                    ]
+                }
+            ),
+            training_data=training,
+        )
+
+        assert "Passed" not in [f["Status"] for f in findings]
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "ScopedRole" in details
+        assert "SageMaker training job 'sm2'" in details
+
     def test_br42_principal_error_turns_the_passed_row_into_na(self):
         cache = _identity_cache(
             roles={
@@ -9302,6 +9328,37 @@ class TestBR42ModelAllowList:
         ]
         assert result["regions"] == ["us-east-1", "us-west-2"]
 
+    def test_br42_training_data_buckets_keep_sagemaker_channels_and_errors(self):
+        # _ai_data_path_buckets labels a SageMaker input channel "the training
+        # data channel '<name>' of SageMaker training job '<job>'".
+        inventory = {
+            "buckets": {
+                "sm-train": [
+                    "the training data channel 'train' of SageMaker training job 'sm1'"
+                ],
+                "sm-out": ["the output of SageMaker training job 'sm1'"],
+            },
+            "errors": [
+                "SageMaker training jobs were not read with "
+                "sagemaker:ListTrainingJobs (AccessDeniedException)",
+                "SageMaker training job 'sm2' was not read with "
+                "sagemaker:DescribeTrainingJob (ThrottlingException)",
+                "3 older SageMaker training job(s) past the newest 200 were not "
+                "read with sagemaker:DescribeTrainingJob",
+                "knowledge base data sources: AccessDeniedException",
+            ],
+            "truncated": [],
+        }
+        with (
+            patch.object(bedrock_app, "_assessed_regions", return_value=["us-east-1"]),
+            patch.object(bedrock_app, "_ai_data_path_buckets", return_value=inventory),
+        ):
+            result = bedrock_app._training_data_buckets()
+
+        assert set(result["buckets"]) == {"sm-train"}
+        assert len(result["errors"]) == 3
+        assert all("SageMaker" in error for error in result["errors"])
+
     def test_br42_organization_row_carries_the_br42_check_id(self):
         inventory = {
             "items": [
@@ -9318,7 +9375,17 @@ class TestBR42ModelAllowList:
                                         "bedrock:InvokeModelWithResponseStream",
                                     ],
                                     "NotResource": [self.MODEL_ARN],
-                                }
+                                },
+                                {
+                                    "Effect": "Deny",
+                                    "Action": "bedrock-mantle:CreateInference",
+                                    "Resource": "*",
+                                    "Condition": {
+                                        "StringNotEquals": {
+                                            "bedrock-mantle:Model": "openai.gpt-oss-120b"
+                                        }
+                                    },
+                                },
                             ]
                         }
                     ),
@@ -9363,6 +9430,7 @@ class TestBR43RegionInvocationControl:
         "bedrock:InvokeFlow",
         "bedrock:RetrieveAndGenerate",
         "bedrock-agentcore:InvokeAgentRuntime",
+        "bedrock-mantle:CreateInference",
     ]
 
     @staticmethod
@@ -10018,7 +10086,10 @@ class TestBR43RegionInvocationControl:
                         self._region_scp(
                             "StringNotEquals",
                             ["us-east-1"],
-                            action="bedrock-agentcore:InvokeAgentRuntime",
+                            action=[
+                                "bedrock-agentcore:InvokeAgentRuntime",
+                                "bedrock-mantle:CreateInference",
+                            ],
                         ),
                     ),
                 ]
@@ -10049,6 +10120,35 @@ class TestBR43RegionInvocationControl:
             in findings[0]["Finding_Details"]
         )
         assert "bedrock-agentcore:invokeagentruntime" in findings[0]["Resolution"]
+
+    def test_br43_allow_list_missing_mantle_inference_fails(self):
+        # The bedrock-mantle endpoint sends prompts to a model through its own
+        # action, so an allow-list over the bedrock and AgentCore actions alone
+        # leaves it free to run in any Region.
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "NoMantle",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1", "unspecified"],
+                            action=[
+                                a
+                                for a in self.ALL_REGION_ACTIONS
+                                if not a.startswith("bedrock-mantle:")
+                            ],
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "no credited allow-list covers bedrock-mantle:createinference"
+            in findings[0]["Finding_Details"]
+        )
 
     def _exempting(self, *principals):
         return self._statement(
@@ -11974,6 +12074,33 @@ class TestBR45ApiKeyGovernance:
         )
 
         assert [f["Status"] for f in prevention] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "cap_operator", ["NumericGreaterThan", "NumericGreaterThanIfExists"]
+    )
+    def test_br45_null_test_and_cap_in_one_statement_are_not_credited(
+        self, cap_operator
+    ):
+        # Conditions in one statement are ANDed. Null true holds only when the
+        # key is absent, and then the plain cap is false, so the plain form never
+        # matches. The IfExists form matches only a key with no expiry, so it
+        # never denies a long lifetime.
+        prevention = self._prevention(
+            self._scp_items(
+                self._deny(
+                    "iam:CreateServiceSpecificCredential",
+                    {
+                        cap_operator: {"iam:ServiceSpecificCredentialAgeDays": "30"},
+                        "Null": {"iam:ServiceSpecificCredentialAgeDays": "true"},
+                    },
+                    sid="Combined",
+                ),
+                *self._token_denies(),
+            )
+        )
+
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert "in the same statement" in prevention[0]["Finding_Details"]
 
     def test_br45_age_cap_value_operator_and_scope_are_judged(self):
         cases = {
@@ -18060,10 +18187,11 @@ class TestBR32CloudWatchAlarms:
             if f["Finding"] == "Guardrail Intervention Monitoring Signal"
         ]
         assert len(signal) == 1
-        assert signal[0]["Status"] == "Passed"
+        assert signal[0]["Status"] == "Failed"
         assert (
-            "CloudWatch alarm(s) guardrail-intervened on AWS/Bedrock/Guardrails "
-            "InvocationsIntervened" in signal[0]["Finding_Details"]
+            "alarm guardrail-intervened names no dimension, and "
+            "AWS/Bedrock/Guardrails publishes InvocationsIntervened only under a "
+            "dimension" in signal[0]["Finding_Details"]
         )
         for finding in findings:
             assert_finding_schema(finding)
@@ -18373,12 +18501,21 @@ class TestBR32ActingIntervention:
         _, signal = self._run(
             [
                 _intervened_alarm("muted", actions_enabled=False),
-                _intervened_alarm("paged"),
+                _intervened_alarm(
+                    "paged",
+                    Dimensions=[
+                        {"Name": "GuardrailArn", "Value": "arn:g"},
+                        {"Name": "GuardrailVersion", "Value": "1"},
+                    ],
+                ),
                 _intervened_alarm("volume", metric="Invocations"),
             ]
         )
-        assert signal["Status"] == "Passed"
-        assert "CloudWatch alarm(s) paged on" in signal["Finding_Details"]
+        assert signal["Status"] == "N/A"
+        assert (
+            "alarm paged counts only GuardrailArn arn:g, GuardrailVersion 1"
+            in signal["Finding_Details"]
+        )
         assert (
             "muted on InvocationsIntervened reach no action"
             in signal["Finding_Details"]
@@ -18387,7 +18524,16 @@ class TestBR32ActingIntervention:
 
     def test_acting_composite_alarm_carries_a_silent_metric_alarm(self):
         _, signal = self._run(
-            [_intervened_alarm("child", actions=False)],
+            [
+                _intervened_alarm(
+                    "child",
+                    actions=False,
+                    Dimensions=[
+                        {"Name": "GuardrailArn", "Value": "arn:g"},
+                        {"Name": "GuardrailVersion", "Value": "1"},
+                    ],
+                )
+            ],
             composites=[
                 {
                     "AlarmName": "parent",
@@ -18397,8 +18543,11 @@ class TestBR32ActingIntervention:
                 }
             ],
         )
-        assert signal["Status"] == "Passed"
-        assert "CloudWatch alarm(s) child on" in signal["Finding_Details"]
+        assert signal["Status"] == "N/A"
+        assert (
+            "alarm child counts only GuardrailArn arn:g, GuardrailVersion 1"
+            in signal["Finding_Details"]
+        )
 
     def test_negated_or_silent_composite_does_not_carry_the_alarm(self):
         _, signal = self._run(
@@ -18485,6 +18634,64 @@ class TestBR32ActingIntervention:
             in signal["Finding_Details"]
         )
 
+    def test_an_alarm_with_no_dimension_is_not_credited(self):
+        # AWS/Bedrock/Guardrails publishes InvocationsIntervened only under the
+        # dimension sets in monitoring-guardrails-cw-metrics, so an alarm that
+        # names none evaluates a series that receives no datapoint.
+        for apply_called in (False, True):
+            self.apply_called = apply_called
+            _, signal = self._run([ACTING_RUNTIME_ALARM, _intervened_alarm("all")])
+            assert signal["Status"] == "Failed"
+            assert (
+                "alarm all names no dimension, and AWS/Bedrock/Guardrails publishes "
+                "InvocationsIntervened only under a dimension"
+                in signal["Finding_Details"]
+            )
+
+    @pytest.mark.parametrize(
+        "pattern,reason",
+        [
+            (
+                '{ $.["amazon-bedrock-guardrailAction"] = "intervened" }',
+                "names intervened in neither case the log carries",
+            ),
+            (
+                '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" '
+                '&& $.modelId = "anthropic.claude-v2" }',
+                "ANDs the intervention test with another test",
+            ),
+            ("INTERVENED claude", "also requires the term claude"),
+            ("?INTERVENED REQUEST", "also requires the term REQUEST"),
+        ],
+    )
+    def test_a_pattern_that_selects_only_some_interventions_is_not_credited(
+        self, pattern, reason
+    ):
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[_intervened_filter("Narrow", pattern)],
+        )
+        assert signal["Status"] == "Failed"
+        assert f"metric filter Narrow {reason}" in signal["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            '{ $.output.outputBodyJson.stopReason = "guardrail_intervened" }',
+            "?INTERVENED ?guardrail_intervened",
+            '"amazon-bedrock-guardrailAction" INTERVENED',
+            '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" || '
+            '$.stopReason = "guardrail_intervened" }',
+        ],
+    )
+    def test_a_pattern_that_selects_every_intervention_is_credited(self, pattern):
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[_intervened_filter("Wide", pattern)],
+        )
+        assert signal["Status"] == "Passed"
+        assert "Wide (alarm intervened-spike)" in signal["Finding_Details"]
+
     def test_one_alarmed_filter_among_unalarmed_ones_passes(self):
         _, signal = self._run(
             [INTERVENED_FILTER_ALARM],
@@ -18540,11 +18747,20 @@ class TestBR32ActingIntervention:
         _, signal = self._run(
             [
                 _intervened_alarm("late", Threshold=50.0),
-                _intervened_alarm("paged"),
+                _intervened_alarm(
+                    "paged",
+                    Dimensions=[
+                        {"Name": "GuardrailArn", "Value": "arn:g"},
+                        {"Name": "GuardrailVersion", "Value": "1"},
+                    ],
+                ),
             ]
         )
-        assert signal["Status"] == "Passed"
-        assert "CloudWatch alarm(s) paged on" in signal["Finding_Details"]
+        assert signal["Status"] == "N/A"
+        assert (
+            "alarm paged counts only GuardrailArn arn:g, GuardrailVersion 1"
+            in signal["Finding_Details"]
+        )
         assert (
             "alarm late (GreaterThanOrEqualToThreshold 50)" in signal["Finding_Details"]
         )
@@ -18657,7 +18873,8 @@ class TestBR32ActingIntervention:
     def test_namespace_alarm_passes_when_apply_guardrail_is_called(self):
         self.apply_called = True
         _, signal = self._run([_intervened_alarm("paged")])
-        assert signal["Status"] == "Passed"
+        assert signal["Status"] == "Failed"
+        assert "alarm paged names no dimension" in signal["Finding_Details"]
         assert (
             "ApplyGuardrail calls in this Region's event history"
             in signal["Finding_Details"]
@@ -22081,24 +22298,77 @@ class TestBR48AIServicesOptOut:
         assert "0 policy(ies) apply." in details
         assert "No source policy delegates the value" not in details
 
-    def test_br48_one_locking_policy_among_open_ones_passes_and_names_it(self):
+    def test_br48_a_root_lock_among_open_ones_passes_and_a_lock_below_them_fails(
+        self,
+    ):
+        def run(open_target, lock_target):
+            return self._run(
+                effective_content={
+                    "services": {"default": {"opt_out_policy": "optOut"}}
+                },
+                source_policies=[
+                    {"Id": "p-open", "Name": "ai-open"},
+                    {"Id": "p-lock", "Name": "ai-lock"},
+                ],
+                source_documents={"p-open": self.TWO_OF_THREE, "p-lock": self.LOCKED},
+                policy_targets={"p-open": [open_target], "p-lock": [lock_target]},
+            )
+
+        root = {"TargetId": self.ROOT, "Type": "ROOT"}
+        ou = {"TargetId": self.OU, "Type": "ORGANIZATIONAL_UNIT"}
+
+        findings = run(ou, root)
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert f"'ai-lock' (attached to root {self.ROOT})" in details
+        assert "ai-open" not in details
+
+        # A lock binds only the policies below its attachment point, so the open
+        # policy on the root above it can still add a section that opts back in.
+        findings = run(root, ou)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert f"'ai-lock' (attached to organizational unit {self.OU})" in details
+        assert "is attached below the root" in details
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            {"TargetId": "ou-root-ai", "Type": "ORGANIZATIONAL_UNIT"},
+            {"TargetId": "123456789012", "Type": "ACCOUNT"},
+        ],
+        ids=["ou", "account"],
+    )
+    def test_br48_a_lock_below_the_root_is_not_credited_alone(self, target):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": self.LOCKED},
+            policy_targets={"p-lock": [target]},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "Medium"
+        assert "is attached below the root" in findings[0]["Finding_Details"]
+
+    def test_br48_a_root_lock_beside_an_unread_policy_is_not_passed(self):
         findings = self._run(
             effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
             source_policies=[
-                {"Id": "p-open", "Name": "ai-open"},
                 {"Id": "p-lock", "Name": "ai-lock"},
+                {"Id": "p-unread", "Name": "ai-unread"},
             ],
-            source_documents={"p-open": self.TWO_OF_THREE, "p-lock": self.LOCKED},
-            policy_targets={
-                "p-open": [{"TargetId": self.ROOT, "Type": "ROOT"}],
-                "p-lock": [{"TargetId": self.OU, "Type": "ORGANIZATIONAL_UNIT"}],
+            source_documents={"p-lock": self.LOCKED},
+            describe_policy_error={
+                "p-unread": _client_error(
+                    "AccessDeniedException", operation="DescribePolicy"
+                )
             },
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
-        details = findings[0]["Finding_Details"]
-        assert f"'ai-lock' (attached to organizational unit {self.OU})" in details
-        assert "ai-open" not in details
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "'ai-lock' (attached to root r-root)" in findings[0]["Finding_Details"]
+        assert "policy 'ai-unread'" in findings[0]["Finding_Details"]
 
     def test_br48_two_of_three_placements_locked_fails_as_aws_example_2(self):
         findings = self._run(
@@ -24648,6 +24918,16 @@ class TestBR43ApprovedModelControl:
         "arn:aws:bedrock:*:*:inference-profile/global.anthropic.claude-opus-5-5",
     ]
 
+    # The bedrock-mantle endpoint names the model only in its own condition key.
+    MANTLE_LIST = {
+        "Effect": "Deny",
+        "Action": "bedrock-mantle:CreateInference",
+        "Resource": "*",
+        "Condition": {
+            "StringNotEquals": {"bedrock-mantle:Model": ["openai.gpt-oss-120b"]}
+        },
+    }
+
     @staticmethod
     def _inventory(*documents, errors=(), list_error=None):
         return {
@@ -24687,7 +24967,8 @@ class TestBR43ApprovedModelControl:
                             "bedrock:InvokeModelWithResponseStream",
                         ],
                         "NotResource": self.MODELS,
-                    }
+                    },
+                    self.MANTLE_LIST,
                 ),
             )
         )
@@ -24708,7 +24989,8 @@ class TestBR43ApprovedModelControl:
                                 "bedrock:InferenceProfileArn": self.MODELS[1:]
                             }
                         },
-                    }
+                    },
+                    self.MANTLE_LIST,
                 )
             )
         )
@@ -24732,6 +25014,72 @@ class TestBR43ApprovedModelControl:
             "none of them covers bedrock:invokemodelwithresponsestream"
             in rows[0]["Finding_Details"].lower()
         )
+
+    def test_br43_model_list_without_a_mantle_list_fails(self):
+        rows = self._run(
+            self._inventory(
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock:InvokeModel*",
+                        "NotResource": self.MODELS,
+                    }
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "none of them covers bedrock-mantle:createinference"
+            in rows[0]["Finding_Details"].lower()
+        )
+
+    @pytest.mark.parametrize(
+        "change, reason",
+        [
+            (
+                {
+                    "Condition": {
+                        "StringNotLike": {"bedrock-mantle:Model": ["openai.*"]}
+                    }
+                },
+                "has a wildcard",
+            ),
+            (
+                {
+                    "Condition": {
+                        "StringNotEquals": {
+                            "bedrock-mantle:Model": ["openai.gpt-oss-120b"],
+                            "aws:PrincipalTag/team": "ml",
+                        }
+                    }
+                },
+                "it also requires",
+            ),
+            (
+                {
+                    "Resource": "arn:aws:bedrock-mantle:us-east-1:111122223333:project/p1"
+                },
+                "does not match every project",
+            ),
+        ],
+        ids=["wildcard-model", "extra-key", "one-project"],
+    )
+    def test_br43_mantle_model_list_is_judged(self, change, reason):
+        rows = self._run(
+            self._inventory(
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock:InvokeModel*",
+                        "NotResource": self.MODELS,
+                    },
+                    {**self.MANTLE_LIST, **change},
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert reason in rows[0]["Finding_Details"]
+        assert "bedrock-mantle:createinference" in rows[0]["Finding_Details"]
 
     def test_br43_wildcard_over_every_model_is_no_list(self):
         rows = self._run(
@@ -24796,7 +25144,8 @@ class TestBR43ApprovedModelControl:
             self._inventory(
                 _policy(narrowed),
                 _policy(
-                    {"Effect": "Deny", "Action": actions, "NotResource": self.MODELS}
+                    {"Effect": "Deny", "Action": actions, "NotResource": self.MODELS},
+                    self.MANTLE_LIST,
                 ),
             )
         )
@@ -25201,18 +25550,20 @@ class TestBR51AIUserConsoleMFA:
             )
         return result, extract_csv_data(result)
 
-    def test_br51_no_identity_center_instance_keeps_passed(self):
+    def test_br51_no_identity_center_instance_in_one_region_is_not_passed(self):
         _, rows = self._run(
             _ai_user_cache(),
             login={"alice": "yes"},
             devices={"alice": [{"SerialNumber": "s"}]},
         )
-        assert [r["Status"] for r in rows] == ["Passed"]
+        assert [r["Status"] for r in rows] == ["N/A"]
         assert ("sso-admin", "eu-west-1") in self.clients
         self.iam.list_instances.assert_called_once_with(MaxResults=100)
         assert (
             "sso:ListInstances in eu-west-1 returned no IAM Identity Center "
-            "instance. An instance homed only in another Region is not listed here."
+            "instance. An instance homed only in another Region is not listed "
+            "here, so this is not reported as Passed: whether people sign in "
+            "through an instance in another Region was not read."
             in rows[0]["Finding_Details"]
         )
 
@@ -25552,7 +25903,7 @@ class TestBR51AIUserConsoleMFA:
             login={"alice": "yes", "bob": "yes"},
             devices={"alice": [{"SerialNumber": "arn:aws:iam::123456789012:mfa/a"}]},
         )
-        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
         assert (
             "IAM user 'bob' has a console password and no MFA"
             in rows[0]["Finding_Details"]
@@ -25569,7 +25920,7 @@ class TestBR51AIUserConsoleMFA:
             login={"alice": "yes"},
             devices={"alice": [{"SerialNumber": "s"}]},
         )
-        assert [r["Status"] for r in rows] == ["Passed"]
+        assert [r["Status"] for r in rows] == ["N/A"]
         assert "1 have no console password (bob)" in rows[0]["Finding_Details"]
 
     def test_br51_every_row_names_the_identity_center_limit(self):
@@ -25594,7 +25945,7 @@ class TestBR51AIUserConsoleMFA:
             login={"alice": "yes"},
             mfa_error=_make_client_error("AccessDenied"),
         )
-        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
         assert "iam:ListMFADevices" in rows[0]["Finding_Details"]
 
     def test_br51_empty_population_is_na(self, empty_permission_cache):
@@ -25627,7 +25978,7 @@ class TestBR51AIUserConsoleMFA:
             "IAM user 'bob' has 1 active access key(s)"
             in (failed[0]["Finding_Details"])
         )
-        passed = [r for r in rows if r["Status"] == "Passed"]
+        passed = [r for r in rows if r["Status"] == "N/A"]
         assert "held to MFA by a Deny (alice" in passed[0]["Finding_Details"]
 
     def test_br51_mfa_device_does_not_cover_an_access_key(self):
@@ -25638,7 +25989,7 @@ class TestBR51AIUserConsoleMFA:
             keys={"alice": [self.KEY]},
         )
 
-        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
         assert "IAM user 'alice'" in rows[0]["Finding_Details"]
         assert "even though the user has an MFA device" in rows[0]["Finding_Details"]
         assert (
@@ -25674,8 +26025,70 @@ class TestBR51AIUserConsoleMFA:
             cache["user_permissions"][user]["attached_policies"].append(policy)
         _, rows = self._run(cache, keys={"alice": [self.KEY], "bob": [self.KEY]})
 
-        assert [r["Status"] for r in rows] == ["Passed"]
+        assert [r["Status"] for r in rows] == ["N/A"]
         assert "2 user(s) are held to MFA by a Deny" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("operator,value", [("Null", "true"), ("Bool", "false")])
+    def test_br51_a_deny_that_skips_console_sessions_does_not_cover_a_password(
+        self, operator, value
+    ):
+        # Null true fires only when the key is absent, which is the access key
+        # case; a console session carries the key as false.
+        cache = _ai_user_cache()
+        for user in ("alice", "bob"):
+            cache["user_permissions"][user]["attached_policies"].append(
+                self._mfa_deny(operator=operator, value=value)
+            )
+        _, rows = self._run(
+            cache,
+            login={"alice": "yes", "bob": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "IAM user 'bob' has a console password and no MFA device"
+            in failed[0]["Finding_Details"]
+        )
+
+    def test_br51_a_null_true_deny_covers_access_keys_only(self):
+        cache = _ai_user_cache()
+        for user in ("alice", "bob"):
+            cache["user_permissions"][user]["attached_policies"].append(
+                self._mfa_deny(operator="Null", value="true")
+            )
+        _, rows = self._run(
+            cache,
+            login={"bob": "yes"},
+            keys={"alice": [self.KEY], "bob": [self.KEY]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert (
+            "IAM user 'bob' has a console password and no MFA device"
+            in rows[0]["Finding_Details"]
+        )
+        assert "active access key" not in rows[0]["Finding_Details"]
+        assert (
+            "1 user(s) are held to MFA by a Deny (alice (attached policy "
+            "'RequireMfa', which holds its access keys to MFA))"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_br51_a_null_and_bool_if_exists_pair_in_one_statement_is_key_grade(self):
+        # The two tests are ANDed, so the statement fires only when the key is
+        # absent, which leaves a console session without MFA allowed.
+        cache = _ai_user_cache()
+        cache["user_permissions"]["bob"]["attached_policies"].append(
+            self._mfa_deny(extra={"Null": {"aws:MultiFactorAuthPresent": "true"}})
+        )
+        _, rows = self._run(cache, login={"bob": "yes"}, keys={"bob": [self.KEY]})
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "IAM user 'bob' has a console password and no MFA device"
+            in failed[0]["Finding_Details"]
+        )
+        assert "active access key" not in failed[0]["Finding_Details"]
 
     def test_br51_role_trust_policy_is_judged(self):
         cache = {"role_permissions": {}, "user_permissions": {}}
@@ -25738,9 +26151,10 @@ class TestBR51AIUserConsoleMFA:
             "IfExistsRole",
             "OpenRole",
         ]
-        unread = [r for r in rows if r["Status"] == "N/A"]
+        passed = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert [r["Status"] for r in passed] == ["N/A"]
+        unread = [r for r in rows if r["Status"] == "N/A" and r not in passed]
         assert len(unread) == 1 and "'Unread'" in unread[0]["Finding_Details"]
-        passed = [r for r in rows if r["Status"] == "Passed"]
         assert "2 of the 5 in-scope IAM role(s)" in passed[0]["Finding_Details"]
         assert "ReaderRole" not in json.dumps(rows)
 
@@ -29263,7 +29677,7 @@ class TestBR04RetentionDepth:
             },
             replication={"logs": self._replicates("replica")},
         )
-        assert sorted(r["Status"] for r in rows) == ["N/A", "N/A", "Passed"]
+        assert sorted(r["Status"] for r in rows) == ["N/A", "N/A"]
         na = [r for r in rows if r["Status"] == "N/A"]
         assert any("'replica':" in r["Finding_Details"] for r in na)
 
@@ -29330,6 +29744,28 @@ class TestBR04RetentionDepth:
         assert "HeadObject" in na["Finding_Details"]
         assert "s3:GetObject" in na["Finding_Details"]
         assert "action named above" in na["Resolution"]
+
+    def test_a_replicated_or_unread_replication_bucket_is_not_passed(self):
+        # The source bucket's own expiry is held back for objects whose
+        # replication status is unread, so it must not be named as retained.
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+        )
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "'replica' lifecycle" in passed[0]["Finding_Details"]
+        assert "S3 bucket 'logs' lifecycle" not in passed[0]["Finding_Details"]
+
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            replication={
+                "logs": self._not_found("AccessDenied", "GetBucketReplication")
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
 
     def test_a_bucket_without_replication_adds_no_replication_gap(self):
         rows, _ = self._rows(
@@ -30262,13 +30698,20 @@ class TestBR11ValueDepth:
         {"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "Op"
     )
 
-    def _run(self, models, *, jobs=None, buckets=None):
+    def _run(self, models, *, jobs=None, buckets=None, job_list=None):
         """`models` is {name: GetCustomModel body or Exception}; `jobs` is
         {jobArn: body or Exception}; `buckets` is {bucket: rule dict, None for
-        no configuration, or Exception}."""
+        no configuration, or Exception}; `job_list` is the
+        ListModelCustomizationJobs summaries or an Exception."""
         jobs = jobs or {}
         buckets = buckets or {}
         bedrock = MagicMock()
+        if isinstance(job_list, Exception):
+            bedrock.list_model_customization_jobs.side_effect = job_list
+        elif job_list is not None:
+            bedrock.list_model_customization_jobs.return_value = {
+                "modelCustomizationJobSummaries": job_list
+            }
         paginator = MagicMock()
         bedrock.get_paginator.return_value = paginator
         paginator.paginate.return_value = [
@@ -30401,6 +30844,86 @@ class TestBR11ValueDepth:
         assert len(na) == 1 and "'unread'" in na[0]["Finding_Details"]
         passed = self._rows(findings, self.MODEL_PASS, "Passed")
         assert "1 of 4 custom model(s)" in passed[0]["Finding_Details"]
+
+    def test_an_unread_job_does_not_skip_the_model_data_buckets(self):
+        _, findings = self._run(
+            {
+                "m": {
+                    "jobArn": "arn:job:m",
+                    "trainingDataConfig": {"s3Uri": "s3://plain/train.jsonl"},
+                },
+                "n": self._data_model("n", "good"),
+            },
+            jobs={"arn:job:m": self.DENIED},
+            buckets={
+                "plain": {"SSEAlgorithm": "AES256"},
+                "good": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": self.CMK},
+            },
+        )
+        failed = self._rows(findings, self.DATA_ROW, "Failed")
+        assert len(failed) == 1
+        assert "S3 bucket 'plain' uses AES256" in failed[0]["Finding_Details"]
+
+    def test_a_job_that_made_no_model_has_its_buckets_judged(self):
+        # ListCustomModels returns only models that were created; a failed or
+        # stopped job leaves its training data in the bucket all the same.
+        for models in ({}, {"n": self._data_model("n", "good")}):
+            _, findings = self._run(
+                models,
+                job_list=[
+                    {"jobArn": "arn:job:f", "jobName": "f", "status": "Failed"},
+                    {"jobArn": "arn:job:s", "jobName": "s", "status": "Stopped"},
+                ],
+                jobs={
+                    "arn:job:f": {
+                        "trainingDataConfig": {"s3Uri": "s3://orphan/t.jsonl"},
+                        "outputDataConfig": {"s3Uri": "s3://good/o/"},
+                    },
+                    "arn:job:s": {
+                        "trainingDataConfig": {"s3Uri": "s3://good/t.jsonl"},
+                    },
+                },
+                buckets={
+                    "orphan": {"SSEAlgorithm": "AES256"},
+                    "good": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": self.CMK},
+                },
+            )
+            failed = self._rows(findings, self.DATA_ROW, "Failed")
+            assert len(failed) == 1
+            assert (
+                "S3 bucket 'orphan' uses AES256 instead of SSE-KMS with a "
+                "customer managed key, and it holds the training data of "
+                "customization job 'f'." in failed[0]["Finding_Details"]
+            )
+            passed = self._rows(findings, self.DATA_ROW, "Passed")
+            assert "1 of 2 custom model data bucket(s)" in passed[0]["Finding_Details"]
+            assert "customization job 's'" not in failed[0]["Finding_Details"]
+
+    def test_an_unread_job_population_holds_back_the_data_pass(self):
+        for job_list, jobs, unread in (
+            (self.DENIED, {}, "model customization jobs"),
+            (
+                [{"jobArn": "arn:job:x", "jobName": "x"}],
+                {"arn:job:x": self.DENIED},
+                "customization job 'x'",
+            ),
+        ):
+            _, findings = self._run(
+                {"n": self._data_model("n", "good")},
+                job_list=job_list,
+                jobs=jobs,
+                buckets={
+                    "good": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": self.CMK}
+                },
+            )
+            assert not self._rows(findings, self.DATA_ROW, "Passed")
+            held = self._rows(findings, self.DATA_ROW, "N/A")
+            assert len(held) == 1
+            assert "1 of 1 custom model data bucket(s)" in held[0]["Finding_Details"]
+            assert (
+                "This is not reported as Passed because these customization job "
+                f"reads failed: {unread}" in held[0]["Finding_Details"]
+            )
 
     def test_model_with_no_key_anywhere_fails(self):
         _, findings = self._run(
