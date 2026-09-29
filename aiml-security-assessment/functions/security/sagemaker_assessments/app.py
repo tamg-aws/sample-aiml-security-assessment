@@ -11966,9 +11966,9 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
 
     "enforced": it fires when the key is absent or holds a non-compliant value.
     "presence": it fires when the key is absent but admits a non-compliant
-    value: a Null test, a negated Like on a wildcard value, or ForAllValues on a
-    multivalued key, which admits a request that mixes an approved value with
-    an unapproved one. "value": it fires only for one named value whose
+    value: a Null test, a negated Like or Arn operator on a wildcard value, or
+    ForAllValues on a multivalued key, which admits a request that mixes an
+    approved value with an unapproved one. "value": it fires only for one named value whose
     compliance this check does not judge. "absent-open": it fires for a
     non-compliant value but not when the request omits the key. A "presence"
     and an "absent-open" Deny together enforce the key. "conjunctive": the key
@@ -12014,9 +12014,12 @@ def _deny_pair_enforces(strengths: set) -> bool:
 
 
 def _like_values_unbounded(base: str, values: List[str]) -> bool:
-    """Return whether a Like operator's values hold a wildcard, which admits
-    values beyond any approved list."""
-    return "like" in base and any("*" in v or "?" in v for v in values)
+    """Return whether a Like or Arn operator's values hold a wildcard, which
+    admits values beyond any approved list. ArnEquals and ArnNotEquals match
+    wildcards exactly as ArnLike and ArnNotLike do."""
+    return ("like" in base or base.startswith("arn")) and any(
+        "*" in v or "?" in v for v in values
+    )
 
 
 def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
@@ -12025,8 +12028,8 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
 
     IfExists and negated operators match a request that omits the key, so
     neither enforces it. ForAllValues does too, unless the statement also holds
-    a Null false test on the same key. A Null test and a Like on a wildcard value
-    require only that the key is present. ForAnyValue on a multivalued key
+    a Null false test on the same key. A Null test and a Like or Arn operator
+    on a wildcard value require only that the key is present. ForAnyValue on a multivalued key
     admits a request that mixes an approved value with an unapproved one, and
     IAM does not define a multivalued key under no set operator.
     """

@@ -14269,6 +14269,48 @@ class TestSM34ValuePinning:
                 in (row["Finding_Details"])
             )
 
+    @pytest.mark.parametrize(
+        "operator", ["ArnNotEquals", "ArnNotEqualsIfExists", "ArnNotLike"]
+    )
+    def test_a_wildcard_key_arn_under_any_arn_operator_does_not_pin_it(self, operator):
+        # ArnEquals and ArnNotEquals match a wildcard exactly as ArnLike does,
+        # so a key/* value admits every key in the account.
+        wildcard = _scp_deny(
+            ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+            operator,
+            "sagemaker:VolumeKmsKeyArn",
+            ["arn:aws:kms:us-east-1:123456789012:key/*"],
+        )
+        row = self._rows([wildcard] + SCP_ENCRYPTION_DENIES[1:])["encryption"]
+        assert row["Status"] == "Failed"
+        assert (
+            "CreateTrainingJob on sagemaker:VolumeKmsKeyArn" in (row["Finding_Details"])
+        )
+
+    def test_a_literal_key_arn_under_arn_not_equals_still_pins_it(self):
+        row = self._rows(SCP_ENCRYPTION_DENIES)["encryption"]
+        assert row["Status"] == "Passed"
+
+    @pytest.mark.parametrize("wildcard_first", [True, False])
+    def test_an_allow_with_a_wildcard_arn_equals_key_does_not_guard(
+        self, wildcard_first
+    ):
+        loose = json.loads(json.dumps(GUARDED_CREATE_ALLOWS))
+        loose[0]["Condition"]["ArnEquals"]["sagemaker:VolumeKmsKeyArn"] = (
+            "arn:aws:kms:*:*:key/?*"
+        )
+        roles = [("Builder", GUARDED_CREATE_ALLOWS), ("Loose", loose)]
+        if wildcard_first:
+            roles.reverse()
+        rows = self._sm34._by_category(
+            self._sm34._run(self._sm34._inventory(), cache=_creation_cache(dict(roles)))
+        )
+        encryption = rows["encryption"]
+        assert encryption["Status"] == "Failed"
+        assert "Role 'Loose'" in encryption["Finding_Details"]
+        assert "Role 'Builder'" not in encryption["Finding_Details"]
+        assert rows["approved network"]["Status"] == "Passed"
+
     def test_the_model_and_transform_job_actions_are_guarded(self):
         three_actions = [
             "sagemaker:CreateTrainingJob",
@@ -14602,6 +14644,28 @@ class TestSM42BatchCreationGuardrails:
         assert rows["approved network"]["Status"] == "Passed"
         assert "'ModelGuard'" in rows["approved network"]["Finding_Details"]
         assert rows["no direct internet access"]["Status"] == "Passed"
+
+    def test_a_wildcard_arn_not_equals_key_leaves_the_batch_path_failed(self):
+        wildcard = _scp_deny(
+            "sagemaker:CreateTransformJob",
+            "ArnNotEquals",
+            "sagemaker:OutputKmsKeyArn",
+            ["arn:aws:kms:us-east-1:123456789012:key/*"],
+        )
+        inventory = self._policies(
+            ("Guard", BATCH_SCP_DENIES[:1] + [wildcard] + BATCH_SCP_DENIES[2:])
+        )
+        encryption = self._sm34._by_category(self._run(inventory))["encryption"]
+        assert encryption["Status"] == "Failed"
+        assert "1 of 2 encryption requirements" in encryption["Finding_Details"]
+        assert (
+            "CreateTransformJob on sagemaker:OutputKmsKeyArn"
+            in (encryption["Finding_Details"])
+        )
+        assert (
+            "CreateTransformJob on sagemaker:VolumeKmsKeyArn"
+            not in (encryption["Finding_Details"])
+        )
 
     def test_a_guard_on_training_only_leaves_the_batch_path_failed(self):
         training_only = [

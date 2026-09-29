@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-34` and `SM-42` no longer credit an `ArnEquals` or `ArnNotEquals`
+  condition whose KMS key ARN holds a `*` or `?`. Those operators match
+  wildcards as `ArnLike` does, so `arn:aws:kms:*:*:key/*` admits every key.
+  Such an Allow no longer guards creation, and such a Deny only requires the
+  key to be present, which is how a wildcard under `ArnLike` or `ArnNotLike`
+  was already read.
+
 - `BR-10` counts a guardrail direction only from a content filter with
   strength `LOW`, `MEDIUM` or `HIGH` and action `BLOCK`, where any configured
   element used to count. An identity that names no guardrail passes when a
