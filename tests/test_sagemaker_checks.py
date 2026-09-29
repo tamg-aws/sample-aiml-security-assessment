@@ -514,6 +514,40 @@ class TestSM04SecurityHubRouting:
         assert row["Status"] == "Failed"
         assert "none has a target" in row["Finding_Details"]
 
+    @pytest.mark.parametrize(
+        "detail_type",
+        [["AWS API Call via CloudTrail"], "AWS API Call via CloudTrail", []],
+    )
+    @pytest.mark.parametrize("wrong_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_rule_on_another_detail_type_does_not_route_findings(
+        self, mock_client, detail_type, wrong_first
+    ):
+        wrong = json.dumps({"source": ["aws.guardduty"], "detail-type": detail_type})
+        rules = [self._rule("api", wrong), self._rule("gd")]
+        if not wrong_first:
+            rules.reverse()
+        row = self._eventbridge(mock_client, rules, targets={"api": [{"Id": "sns"}]})
+        assert row["Status"] == "Failed"
+        assert "none has a target" in row["Finding_Details"]
+        assert "GuardDuty Finding" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            '{"source": ["aws.guardduty"]}',
+            '{"source": "aws.guardduty", "detail-type": "GuardDuty Finding"}',
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_rule_admitting_the_finding_detail_type_passes(
+        self, mock_client, pattern
+    ):
+        row = self._eventbridge(
+            mock_client, [self._rule("gd", pattern)], targets={"gd": [{"Id": "sns"}]}
+        )
+        assert row["Status"] == "Passed"
+
     @patch("sagemaker_app.boto3.client")
     def test_list_rules_failure_is_incomplete(self, mock_client):
         row = self._eventbridge(

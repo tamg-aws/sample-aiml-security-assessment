@@ -1045,8 +1045,14 @@ GUARDDUTY_EVENTBRIDGE_REFERENCE = (
 )
 
 
+GUARDDUTY_FINDING_DETAIL_TYPE = "GuardDuty Finding"
+
+
 def _rule_matches_guardduty(rule: Dict[str, Any]) -> bool:
-    """True for an ENABLED rule whose pattern names the aws.guardduty source."""
+    """
+    True for an ENABLED rule whose pattern names the aws.guardduty source and
+    either sets no detail-type or lists the GuardDuty Finding detail-type.
+    """
     if rule.get("State") != "ENABLED":
         return False
     try:
@@ -1056,7 +1062,16 @@ def _rule_matches_guardduty(rule: Dict[str, Any]) -> bool:
     sources = pattern.get("source") if isinstance(pattern, dict) else None
     if isinstance(sources, str):
         sources = [sources]
-    return isinstance(sources, list) and "aws.guardduty" in sources
+    if not isinstance(sources, list) or "aws.guardduty" not in sources:
+        return False
+    if "detail-type" not in pattern:
+        return True
+    detail_types = pattern["detail-type"]
+    if isinstance(detail_types, str):
+        detail_types = [detail_types]
+    return (
+        isinstance(detail_types, list) and GUARDDUTY_FINDING_DETAIL_TYPE in detail_types
+    )
 
 
 def _guardduty_eventbridge_routing_finding(region: str) -> Dict[str, Any]:
@@ -1121,9 +1136,10 @@ def _guardduty_eventbridge_routing_finding(region: str) -> Dict[str, Any]:
         )
     return _row(
         f"Of {len(rules)} EventBridge rule(s) on the default event bus, "
-        f"{len(matching)} ENABLED rule(s) name the source aws.guardduty and none "
+        f"{len(matching)} ENABLED rule(s) match GuardDuty findings and none "
         "has a target, so no GuardDuty finding raises an alert. Only a rule whose "
-        "pattern lists aws.guardduty under source is credited.",
+        "pattern lists aws.guardduty under source, and sets no detail-type or "
+        f"lists {GUARDDUTY_FINDING_DETAIL_TYPE} under it, is credited.",
         "Create an ENABLED EventBridge rule with the pattern "
         '{"source": ["aws.guardduty"]} and an alerting target such as an SNS topic.',
         "Medium",

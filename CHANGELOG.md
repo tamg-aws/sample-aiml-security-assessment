@@ -261,6 +261,11 @@ section.
 
 ### Fixed
 
+- `SM-04` credits an EventBridge rule on `aws.guardduty` only when its
+  pattern sets no `detail-type` or lists `GuardDuty Finding`. A rule on
+  another detail-type, such as `AWS API Call via CloudTrail`, used to pass
+  as routing findings to alerting.
+
 - `SM-09` no longer credits an `aws:SourceIp` condition on the presigned
   notebook and domain URL actions when its ranges together cover every IPv4
   or every IPv6 address, such as `0.0.0.0/0` or `::/0`. A `NotIpAddress`
