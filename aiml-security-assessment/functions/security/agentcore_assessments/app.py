@@ -17793,12 +17793,13 @@ def _resource_names_one_workload_identity(resource: str) -> bool:
 
     A workload identity's ARN nests under its directory's, so the directory ARN
     ends at `workload-identity-directory/<name>` and never carries this segment:
-    `workload-identity-directory/` does not contain `workload-identity/`.
+    `workload-identity-directory/` does not contain `workload-identity/`. A `?`
+    matches any one character, so it widens the name as `*` does.
     """
     _, separator, identity_name = resource.partition(WORKLOAD_IDENTITY_ARN_SEGMENT)
     if not separator:
         return False
-    return bool(identity_name) and "*" not in identity_name
+    return bool(identity_name) and not any(c in identity_name for c in "*?")
 
 
 def _token_issuance_scope_verdict(statement: Dict[str, Any]) -> str:
@@ -17809,13 +17810,17 @@ def _token_issuance_scope_verdict(statement: Dict[str, Any]) -> str:
     directory ARN in the list is not the widening. A trailing wildcard is: it
     reaches every identity, vault or provider under that prefix. So is a
     wildcard in the partition, service, region or account segment, which
-    reaches the same name in every region or account, and a NotResource.
+    reaches the same name in every region or account, and a NotResource. So is a
+    `*` or `?` inside a workload identity name, which reaches every identity the
+    pattern matches however many exact names sit beside it.
     """
     if "NotResource" in statement:
         return "unbounded"
     resources = _statement_resources(statement)
     if any(
-        resource.endswith(("*", "?")) or _arn_pattern_is_unbounded(resource)
+        resource.endswith(("*", "?"))
+        or _arn_pattern_is_unbounded(resource)
+        or any(c in resource.partition(WORKLOAD_IDENTITY_ARN_SEGMENT)[2] for c in "*?")
         for resource in resources
     ):
         return "unbounded"

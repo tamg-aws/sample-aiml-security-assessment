@@ -15263,6 +15263,50 @@ class TestAC33TokenIssuanceScope:
         )
         assert [f["Status"] for f in findings] == ["Failed"]
 
+    @pytest.mark.parametrize("runs_as", ["agent-role", "other-role"])
+    @pytest.mark.parametrize("name", ["prod-?-agent", "agent-?b", "prod-*-agent"])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_single_character_wildcard_in_the_name_is_not_a_named_identity(
+        self, mock_ac, name, runs_as
+    ):
+        # `?` matches any one character in an IAM resource ARN, so prod-?-agent
+        # reaches prod-a-agent and prod-b-agent. Neither ends in `?`, so the
+        # trailing-wildcard test does not catch it. Like prod-*-agent it reaches
+        # every identity it matches, the trailing-wildcard leg, whether or not
+        # the principal runs a resource.
+        _ac33_runs_as(mock_ac, runtimes={runs_as: _IDENTITY_ARN})
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessToken"],
+                resource=[_DIRECTORY_ARN, f"{_DIRECTORY_ARN}/workload-identity/{name}"],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+        assert "wildcard resource" in findings[0]["Finding_Details"]
+        assert not agentcore_app._resource_names_one_workload_identity(
+            f"{_DIRECTORY_ARN}/workload-identity/{name}"
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_named_identity_beside_a_single_character_wildcard_is_read_per_element(
+        self, mock_ac
+    ):
+        # One exact identity in the list must not stand in for the other element.
+        _ac33_runs_as(mock_ac, runtimes={"agent-role": _IDENTITY_ARN})
+        wildcard = f"{_DIRECTORY_ARN}/workload-identity/prod-?-agent"
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessToken"],
+                resource=[_DIRECTORY_ARN, _IDENTITY_ARN, wildcard],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+        assert "wildcard resource" in findings[0]["Finding_Details"]
+        assert agentcore_app._resource_names_one_workload_identity(_IDENTITY_ARN)
+        assert not agentcore_app._resource_names_one_workload_identity(wildcard)
+
     def test_a_region_wildcard_reaches_the_name_in_every_region(self):
         # Stricter than before: this asserted Passed, reading a region wildcard
         # as leaving the identity named. It reaches the same identity name in
