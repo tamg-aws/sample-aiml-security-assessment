@@ -12878,23 +12878,90 @@ def check_agentcore_memory_record_access_scope(
     return findings
 
 
-def _gateway_rate_limit_is_bounded(rate_limit: Dict[str, Any]) -> bool:
+def _gateway_rate_limit_caller_keys(rate_limit: Dict[str, Any]) -> List[str]:
+    """Return the dimension keys of a limit that name the caller."""
+    return [
+        str(key)
+        for key in rate_limit.get("dimensionKeys") or []
+        if str(key).startswith("$.context.")
+    ]
+
+
+def _gateway_rate_limit_named_entries(rate_limit: Dict[str, Any]) -> List[str]:
+    """Return one `key=value` list per rated entry that names a caller value.
+
+    An entry's `dimensions` map selects the requests its rate applies to, and a
+    value is either exact or `*`. A caller dimension with an exact value bounds
+    that one caller, so only a rated entry with `*` on every caller dimension
+    bounds every caller. Returns empty when such an entry exists.
+    """
+    caller_keys = _gateway_rate_limit_caller_keys(rate_limit)
+    named: List[str] = []
+    for entry in rate_limit.get("entries") or []:
+        if not isinstance(entry, dict) or not any(
+            entry.get(key) for key in GATEWAY_RATE_LIMIT_VALUE_KEYS
+        ):
+            continue
+        values = entry.get("dimensions")
+        values = values if isinstance(values, dict) else {}
+        exact = [
+            f"{key}={values.get(key, '(absent)')}"
+            for key in caller_keys
+            if values.get(key) != "*"
+        ]
+        if not exact:
+            return []
+        named.append(", ".join(exact))
+    return named
+
+
+def _gateway_rate_limit_unsupplied_dimensions(
+    rate_limit: Dict[str, Any], authorizer_type: Any
+) -> List[str]:
+    """Return the caller dimension keys the gateway's authorizer supplies no
+    value for.
+
+    $.context.iam.* is the SigV4 caller, which only AWS_IAM and
+    AUTHENTICATE_ONLY gateways authenticate, and $.context.jwt.* is a claim of
+    the bearer token only a CUSTOM_JWT gateway reads. A gateway that reported
+    no authorizer type is not judged here.
+    """
+    if not authorizer_type:
+        return []
+    supplied = []
+    if authorizer_type in GATEWAY_AUTHORIZER_SIGV4_VALUES:
+        supplied.append("$.context.iam.")
+    if authorizer_type == GATEWAY_AUTHORIZER_JWT_VALUE:
+        supplied.append("$.context.jwt.")
+    return [
+        key
+        for key in _gateway_rate_limit_caller_keys(rate_limit)
+        if not key.startswith(tuple(supplied))
+    ]
+
+
+def _gateway_rate_limit_is_bounded(
+    rate_limit: Dict[str, Any], authorizer_type: Any = None
+) -> bool:
     """Return whether an active rate limit bounds a throughput value.
 
     `dimensions` is the only required member of a limit entry, so a limit can be
     ACTIVE, name a dimension, and bound nothing. Only `requests`, `tokens` or
     `connections` carries a rate, and a limit still CREATING or DELETING is not
-    in force.
+    in force. A rated entry must also reach every caller, and each caller
+    dimension must be one the gateway's authorizer gives a value.
     """
     if rate_limit.get("status") != "ACTIVE":
         return False
     if _gateway_rate_limit_per_token_dimensions(rate_limit):
         return False
+    if _gateway_rate_limit_unsupplied_dimensions(rate_limit, authorizer_type):
+        return False
     for entry in rate_limit.get("entries") or []:
         if not isinstance(entry, dict):
             continue
         if any(entry.get(key) for key in GATEWAY_RATE_LIMIT_VALUE_KEYS):
-            return True
+            return not _gateway_rate_limit_named_entries(rate_limit)
     return False
 
 
@@ -12981,6 +13048,7 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
         gateway_id = gateway.get("gatewayId", "unknown")
         gateway_name = gateway.get("name", gateway_id)
         label = f"Gateway '{gateway_name}' ({gateway_id})"
+        authorizer_type = gateway.get("authorizerType")
 
         try:
             rate_limits = _agentcore_list_all(
@@ -13011,7 +13079,7 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
         bounded = [
             rate_limit
             for rate_limit in rate_limits
-            if _gateway_rate_limit_is_bounded(rate_limit)
+            if _gateway_rate_limit_is_bounded(rate_limit, authorizer_type)
         ]
         if bounded:
             findings.append(
@@ -13051,6 +13119,37 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
                 if per_token
                 else ""
             )
+            unsupplied = [
+                f"'{rate_limit.get('rateLimitId', 'unknown')}' is keyed on "
+                + ", ".join(
+                    _gateway_rate_limit_unsupplied_dimensions(
+                        rate_limit, authorizer_type
+                    )
+                )
+                for rate_limit in rate_limits
+                if _gateway_rate_limit_unsupplied_dimensions(
+                    rate_limit, authorizer_type
+                )
+            ]
+            if unsupplied:
+                per_token_note += (
+                    f" Limit {'; '.join(unsupplied)}, for which the gateway's "
+                    f"authorizerType {authorizer_type} supplies no value, so the "
+                    "limit is not known to count its callers."
+                )
+            named = [
+                f"'{rate_limit.get('rateLimitId', 'unknown')}' has entries only "
+                "for named values ("
+                + "; ".join(_gateway_rate_limit_named_entries(rate_limit))
+                + ")"
+                for rate_limit in rate_limits
+                if _gateway_rate_limit_named_entries(rate_limit)
+            ]
+            if named:
+                per_token_note += (
+                    f" Limit {'; '.join(named)}, so a caller outside them has no "
+                    "ceiling."
+                )
             findings.append(
                 create_finding(
                     check_id="AC-24",

@@ -10937,7 +10937,12 @@ class TestAC24GatewayRateLimiting:
                         "rateLimitId": "rl-1",
                         "status": "ACTIVE",
                         "dimensionKeys": ["$.context.iam.principal"],
-                        "entries": [{"requests": [{"rate": 100, "period": "MINUTE"}]}],
+                        "entries": [
+                            {
+                                "dimensions": {"$.context.iam.principal": "*"},
+                                "requests": [{"rate": 100, "period": "MINUTE"}],
+                            }
+                        ],
                     }
                 ]
             }
@@ -35652,8 +35657,169 @@ def _keyed_rate_limit(rate_limit_id, *dimension_keys):
         "rateLimitId": rate_limit_id,
         "status": "ACTIVE",
         "dimensionKeys": list(dimension_keys),
-        "entries": [{"requests": [{"rate": 100, "period": "minute"}]}],
+        "entries": [
+            {
+                "dimensions": {key: "*" for key in dimension_keys},
+                "requests": [{"rate": 100, "period": "minute"}],
+            }
+        ],
     }
+
+
+class TestAC24EntryValuesAndAuthorizer:
+    """AC-24 reads each entry's dimension values and the gateway's authorizer."""
+
+    @staticmethod
+    def _limit(rate_limit_id, keys, *entries):
+        return {
+            "rateLimitId": rate_limit_id,
+            "status": "ACTIVE",
+            "dimensionKeys": list(keys),
+            "entries": [
+                {
+                    "dimensions": dict(values),
+                    "requests": [{"rate": 100, "period": "minute"}],
+                }
+                for values in entries
+            ],
+        }
+
+    def _run(self, mock_ac, limits_by_gateway, authorizers):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": g, "name": g, "authorizerType": authorizers[g]}
+                for g in limits_by_gateway
+            ]
+        }
+        mock_ac.list_gateway_rate_limits.side_effect = (
+            lambda gatewayIdentifier, **kwargs: {
+                "rateLimits": limits_by_gateway[gatewayIdentifier]
+            }
+        )
+        return agentcore_app.check_agentcore_gateway_rate_limiting()
+
+    _PRINCIPAL = "$.context.iam.principal"
+    _SUB = "$.context.jwt.sub"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_entry_naming_one_caller_bounds_no_other(self, mock_ac):
+        role = "arn:aws:iam::123456789012:role/app"
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-all": [
+                    self._limit("rl-all", [self._PRINCIPAL], {self._PRINCIPAL: "*"})
+                ],
+                "gw-one": [
+                    self._limit(
+                        "rl-one",
+                        [self._PRINCIPAL],
+                        {self._PRINCIPAL: role},
+                        {self._PRINCIPAL: role + "2"},
+                    )
+                ],
+            },
+            {"gw-all": "AWS_IAM", "gw-one": "AWS_IAM"},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert findings[1]["Finding"].endswith("Ineffective")
+        details = findings[1]["Finding_Details"]
+        assert "'rl-one' has entries only for named values" in details
+        assert f"{self._PRINCIPAL}={role}" in details
+        assert f"{self._PRINCIPAL}={role}2" in details
+        assert "has no ceiling" in details
+        assert_finding_schema(findings[1])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_named_target_with_a_caller_wildcard_bounds_callers(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-t": [
+                    self._limit(
+                        "rl-t",
+                        ["targetName", self._PRINCIPAL],
+                        {"targetName": "orders", self._PRINCIPAL: "*"},
+                    )
+                ]
+            },
+            {"gw-t": "AWS_IAM"},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_catch_all_entry_beside_named_ones_bounds_every_caller(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-mix": [
+                    self._limit(
+                        "rl-mix",
+                        [self._SUB],
+                        {self._SUB: "vip-user"},
+                        {self._SUB: "*"},
+                    )
+                ]
+            },
+            {"gw-mix": "CUSTOM_JWT"},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "key,authorizer",
+        [
+            ("$.context.iam.principal", "CUSTOM_JWT"),
+            ("$.context.iam.sourceIdentity", "NONE"),
+            ("$.context.jwt.sub", "AWS_IAM"),
+            ("$.context.jwt.client_id", "AUTHENTICATE_ONLY"),
+            ("$.context.jwt.sub", "NONE"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_caller_key_the_authorizer_does_not_supply_is_ineffective(
+        self, mock_ac, key, authorizer
+    ):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-ok": [
+                    self._limit("rl-ok", [self._PRINCIPAL], {self._PRINCIPAL: "*"})
+                ],
+                "gw-bad": [self._limit("rl-bad", [key], {key: "*"})],
+            },
+            {"gw-ok": "AWS_IAM", "gw-bad": authorizer},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        details = findings[1]["Finding_Details"]
+        assert f"'rl-bad' is keyed on {key}" in details
+        assert f"authorizerType {authorizer}" in details
+        assert "supplies no value" in details
+
+    @pytest.mark.parametrize(
+        "key,authorizer",
+        [
+            ("$.context.iam.principal", "AWS_IAM"),
+            ("$.context.iam.principal", "AUTHENTICATE_ONLY"),
+            ("$.context.jwt.sub", "CUSTOM_JWT"),
+            ("targetName", "NONE"),
+            ("$.context.jwt.sub", None),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_caller_key_the_authorizer_supplies_passes(
+        self, mock_ac, key, authorizer
+    ):
+        findings = self._run(
+            mock_ac,
+            {"gw": [self._limit("rl", [key], {key: "*"})]},
+            {"gw": authorizer},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
 
 
 class TestAC24RateLimitDimension:
