@@ -24876,6 +24876,132 @@ class TestAC46SessionMonitoring:
         mock_logs.describe_delivery_sources.assert_called_once()
 
 
+_CAPACITY_PROVIDER_ARN = (
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:capacity-provider/cp-1"
+)
+
+
+def _capacity_runtime(runtime_id="rt-1", arn=_CAPACITY_PROVIDER_ARN):
+    summary, detail = _bounded_runtime(runtime_id)
+    detail["capacityProviderConfiguration"] = {"capacityProviderArn": arn}
+    return summary, detail
+
+
+def _capacity_provider(*instance_types):
+    return {
+        "capacityProviderId": "cp-1",
+        "capacityProviderArn": _CAPACITY_PROVIDER_ARN,
+        "name": "agents",
+        "status": "READY",
+        "computeConfiguration": {
+            "ec2Configuration": {
+                "launchTemplateSource": {
+                    "launchParameters": {
+                        "operatingSystem": "LINUX_ARM64",
+                        "instanceRequirements": {
+                            "allowedInstanceTypes": list(instance_types)
+                        },
+                    }
+                }
+            }
+        },
+    }
+
+
+class TestAC46CapacityProvider:
+    """AC-46: a runtime on a capacity provider is bounded by its instance types."""
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_without_a_capacity_provider_says_so(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "no capacity provider" in findings[0]["Finding_Details"]
+        assert "carries no per-session limit" not in findings[0]["Resolution"]
+        mock_ac.get_capacity_provider.assert_not_called()
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_capacity_provider_names_its_instance_types(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_capacity_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_ac.get_capacity_provider.return_value = _capacity_provider(
+            "m7g.large", "m7g.xlarge"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "capacity provider 'agents' (cp-1)" in details
+        assert "m7g.large, m7g.xlarge" in details
+        mock_ac.get_capacity_provider.assert_called_once_with(capacityProviderId="cp-1")
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_capacity_provider_withholds_passed(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_capacity_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_ac.get_capacity_provider.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert _CAPACITY_PROVIDER_ARN in findings[0]["Finding_Details"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetCapacityProvider" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_capacity_provider_does_not_hide_a_failure(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        summary, detail = _capacity_runtime()
+        detail["lifecycleConfiguration"]["maxLifetime"] = (
+            agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS
+        )
+        _wire_runtimes(mock_ac, [(summary, detail)])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_ac.get_capacity_provider.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Not read:" in findings[0]["Finding_Details"]
+        assert _CAPACITY_PROVIDER_ARN in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_shared_capacity_provider_is_read_once(self, mock_ac, mock_logs, mock_cw):
+        _wire_runtimes(mock_ac, [_capacity_runtime("rt-1"), _capacity_runtime("rt-2")])
+        _wire_session_monitoring(mock_logs, mock_cw, delivered_ids=("rt-1", "rt-2"))
+        mock_ac.get_capacity_provider.return_value = _capacity_provider("m7g.large")
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+        mock_ac.get_capacity_provider.assert_called_once_with(capacityProviderId="cp-1")
+
+
 class TestAC47RuntimeInvocationPath:
     """AC-47: which callers and which network paths reach a runtime."""
 

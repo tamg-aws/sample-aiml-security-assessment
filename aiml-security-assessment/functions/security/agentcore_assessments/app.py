@@ -25763,6 +25763,7 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
         except Exception as error:
             alarm_error = _assessment_error_label(error)
 
+    capacity_providers: Dict[str, Any] = {}
     findings = []
     for runtime in runtimes:
         runtime_id = runtime.get("agentRuntimeId", "unknown")
@@ -25851,6 +25852,62 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
                 "single task in this workload legitimately runs, or record why a "
                 "session has to outlive 8 hours."
             )
+
+        # A runtime on a capacity provider runs on instances whose types the
+        # provider allows, not on the service's own allocation.
+        capacity_arn = (detail.get("capacityProviderConfiguration") or {}).get(
+            "capacityProviderArn"
+        )
+        compute_note = (
+            "It names no capacity provider, so it runs on AgentCore's own compute "
+            "and each session's hardware allocation is the service's, which this "
+            "check does not read."
+        )
+        if capacity_arn:
+            if capacity_arn not in capacity_providers:
+                try:
+                    capacity_providers[capacity_arn] = (
+                        agentcore_client.get_capacity_provider(
+                            capacityProviderId=capacity_arn.rsplit("/", 1)[-1]
+                        )
+                    )
+                except Exception as error:
+                    capacity_providers[capacity_arn] = error
+            provider = capacity_providers[capacity_arn]
+            if isinstance(provider, Exception):
+                unread.append(
+                    f"its capacity provider {capacity_arn} "
+                    f"({_assessment_error_label(provider)})"
+                )
+                retries.append(
+                    "Grant bedrock-agentcore:GetCapacityProvider on the capacity "
+                    "provider and retry."
+                )
+            else:
+                node = provider
+                for key in (
+                    "computeConfiguration",
+                    "ec2Configuration",
+                    "launchTemplateSource",
+                    "launchParameters",
+                    "instanceRequirements",
+                ):
+                    node = node.get(key) or {}
+                instance_types = node.get("allowedInstanceTypes") or []
+                provider_id = provider.get("capacityProviderId") or capacity_arn
+                provider_label = (
+                    f"'{provider.get('name') or provider_id}' ({provider_id})"
+                )
+                allowed = (
+                    f"allows instance types {', '.join(instance_types)}"
+                    if instance_types
+                    else "reported no allowed instance types"
+                )
+                compute_note = (
+                    f"It runs on capacity provider {provider_label}, which "
+                    f"{allowed}. Those types set the hardware its sessions run "
+                    "on, and their size is not judged."
+                )
 
         usage_note = ""
         if delivery_error:
@@ -25965,13 +26022,14 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
                         f"{AGENTCORE_SESSION_ALARM_LABEL}. GetAgentRuntime reports "
                         "900 and 28800 seconds for a runtime that sets neither "
                         "lifecycle field, so whether these values were chosen is "
-                        "not readable."
+                        f"not readable. {compute_note}"
                     ),
                     resolution=(
                         "No action required for this check. Confirm these values "
-                        "are the longest a single task should run, and that memory "
-                        "and spend are bounded outside AgentCore: the control plane "
-                        "carries no per-session limit for either."
+                        "are the longest a single task should run, that the "
+                        "compute one session gets fits its memory needs, and that "
+                        f"spend is alerted on, which the {AGENTCORE_COST_ANOMALY_FINDING} "
+                        "row of this check judges."
                     ),
                     reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,

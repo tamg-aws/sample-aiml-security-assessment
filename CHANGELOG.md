@@ -298,6 +298,14 @@ section.
 
 ### Fixed
 
+- `AC-46` reads the capacity provider a runtime names. Its `Passed`
+  resolution said the control plane carries no per-session memory limit, which
+  is not true of a runtime on a capacity provider: its sessions run on the
+  instance types the provider allows. The row now reads each provider once with
+  `bedrock-agentcore:GetCapacityProvider` and names its allowed instance types,
+  or says the runtime names no capacity provider. A provider that cannot be read
+  is `N/A`, so a runtime that passed can now read `N/A`.
+
 - `AC-07` reads each memory's resource-based policy. It called
   `GetResourcePolicy` for runtimes and gateways only, so a memory whose policy
   let any principal read its records passed on its namespaces alone. A new
@@ -1325,16 +1333,17 @@ section.
 be updated for `AC-48` and `AC-26` to compare Regions. Until it is, the function
 receives no `TargetRegions` and compares each Region on its own, as before.
 
-**AgentCore role grants.** The AgentCore assessment role gains seven
+**AgentCore role grants.** The AgentCore assessment role gains eight
 read-only grants: `events:ListTargetsByRule` on `rule/*`,
 `logs:DescribeMetricFilters` on `log-group:*`, `ce:GetAnomalyMonitors` on
-`anomalymonitor/*` and `network-firewall:DescribeFirewallPolicy` on
-`firewall-policy/*` in this account, and `ec2:DescribeNatGateways`,
+`anomalymonitor/*`, `network-firewall:DescribeFirewallPolicy` on
+`firewall-policy/*` and `bedrock-agentcore:GetCapacityProvider` on
+`capacity-provider/*` in this account, and `ec2:DescribeNatGateways`,
 `bedrock:GetModelInvocationLoggingConfiguration` and
 `bedrock-agentcore:ListAgentRuntimeVersions` on `'*'`, which have no resource
 type. Its fifteen unconditioned `Resource: '*'` statements are folded into one,
 `AgentCoreReadsWithoutResourceType`, with the same set of granted actions, so
-the role renders to 8,548 inline-policy characters in `aws-us-gov`, below the
+the role renders to 8,658 inline-policy characters in `aws-us-gov`, below the
 9,000-character project budget.
 
 **Deployment-stack update and CodeBuild run required.** The

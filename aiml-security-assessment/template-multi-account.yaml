@@ -1405,6 +1405,9 @@ Resources:
                 # payment-manager and harness resource types for these.
                 - bedrock-agentcore:GetPaymentManager
                 - bedrock-agentcore:GetHarness
+                # AC-46 reads the capacity provider a runtime names. The service
+                # authorization reference lists the capacity-provider type.
+                - bedrock-agentcore:GetCapacityProvider
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -1417,6 +1420,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:online-evaluation-config/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:capacity-provider/*'
             # AC-18 counts workload identities and credential providers to decide
             # which identity data-event types are in use, and AC-14 reads the
             # token vault each provider ARN names. The service authorization
