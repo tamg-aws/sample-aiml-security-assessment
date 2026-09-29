@@ -1278,9 +1278,11 @@ AI_SUBJECT_ROWS = [
         "override or task definition role, ENI subnet), for every model behind a "
         "SageMaker endpoint (production and shadow variants and inference "
         "components, with the model's execution role and VPC), and for EKS pod "
-        "identity associations (the cluster's VPC and the association's role). A pod "
-        "that takes its role through IAM roles for service accounts is not read, "
-        "since that binding is held by the Kubernetes API",
+        "identity associations (the cluster's VPC and the association's role). Partial, "
+        "ceiling reached for IAM roles for service accounts (IRSA): a pod that takes "
+        "its role through IRSA is not read, because which service account a pod runs "
+        "as, and the role annotation on it, are held by the Kubernetes API, which "
+        "no AWS API returns",
         [],
         5,
     ),

@@ -261,6 +261,14 @@ section.
 
 ### Fixed
 
+- `BR-46` judges the AI source buckets by completed Amazon Comprehend PII
+  detection jobs when Macie is not enabled in the Region. A source that no
+  completed job read in full fails, and a source a job read is `N/A`, because
+  a one-time job does not reach later objects. This reverses the dedup in
+  601bb18, which reported every source `N/A` and left the Macie-off case to
+  `FS-44`. `FS-44` still reports the account-level Macie state, but it names
+  no source bucket, so with Macie off a knowledge base fed from buckets that
+  nothing classifies had no failing row. `BR-46` now overrides that dedup.
 - `BR-51` reads the AWS managed policies attached to each IAM Identity Center
   permission set, and fails a permission set whose inline or AWS managed
   policies grant an AI write unless one of its policies carries the
