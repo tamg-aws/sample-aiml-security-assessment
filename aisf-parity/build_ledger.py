@@ -109,14 +109,16 @@ AI_SUBJECT_ROWS = [
         "node that retrieves from the knowledge base, at DRAFT and at each "
         "alias-routed version, with ListAgentKnowledgeBases and the flow definition. "
         "It fails a knowledge base that ingests a source with no transformation step "
-        "and is reached through no guardrail whose PROMPT_ATTACK input filter blocks "
-        "at HIGH strength, or through an agent or node with no such guardrail, and it "
-        "never passes one. An account-enforced configuration is credited only when "
-        "it applies to every model and every message, without SELECTIVE guarding or "
-        "inputTags HONOR. The ceiling: a transformation Lambda's logic is opaque, "
-        "KnowledgeBase has no guardrailConfiguration member, and a direct "
-        "RetrieveAndGenerate caller supplies guardrailId per request, so no read can "
-        "show that retrieved chunks are screened",
+        "and is reached through any agent version or flow node, because managed "
+        "retrieval cannot wrap retrieved chunks in guardContent tags, so an agent or "
+        "flow guardrail's PROMPT_ATTACK filter does not evaluate them. It never passes "
+        "one. An account-enforced configuration whose PROMPT_ATTACK input filter "
+        "blocks at HIGH strength is credited only when it applies to every model and "
+        "every message, without SELECTIVE guarding or inputTags HONOR. The ceiling: a "
+        "transformation Lambda's logic is opaque, the bedrock-agent KnowledgeBase "
+        "shape has no guardrail member, and guardrailConfiguration is a "
+        "GenerationConfiguration request member of RetrieveAndGenerate, so no read "
+        "can show that retrieved chunks are screened",
         [],
         3,
     ),
@@ -129,15 +131,18 @@ AI_SUBJECT_ROWS = [
         "partial, ceiling reached. BR-26 fails a knowledge base that ingests a source "
         "with no POST_CHUNKING transformation step and no completed Comprehend "
         "ONLY_REDACTION job whose output location holds everything the source "
-        "ingests, and that is reached through no agent version or flow node whose "
-        "guardrail sets a PII entity type to BLOCK or ANONYMIZE, or through one that "
-        "sets none. It never passes one. An account-enforced configuration is "
+        "ingests, whose PiiEntityTypes names ALL, and that ended before the source's "
+        "latest ingestion job started, and that is reached through no agent version "
+        "or flow node whose guardrail blocks or masks AWS_ACCESS_KEY, AWS_SECRET_KEY "
+        "and PASSWORD on both sides with a custom regex on the output, or through one "
+        "whose guardrail does not. It never passes one. An account-enforced configuration is "
         "credited only when it applies to every model and every message, without "
         "SELECTIVE guarding or inputTags HONOR. comprehend:ListPiiEntitiesDetectionJobs has "
         "no resource type and is granted on *, and a failed read leaves an S3 "
         "source not judged. The ceiling: a transformation Lambda's logic and a Glue job's "
-        "effect are not recorded, and a direct RetrieveAndGenerate caller supplies "
-        "guardrailId per request",
+        "effect are not recorded, and guardrailConfiguration is a "
+        "GenerationConfiguration request member of RetrieveAndGenerate, absent from "
+        "the bedrock-agent KnowledgeBase shape",
         [],
         3,
     ),

@@ -5055,7 +5055,10 @@ def _br10_cache(roles=None, users=None, errors=None):
 # inputEnabled or inputAction fields.
 _BOTH_DIRECTIONS = {
     "contentPolicy": {
-        "filters": [{"type": "HATE", "inputStrength": "HIGH", "outputStrength": "HIGH"}]
+        "filters": [
+            {"type": category, "inputStrength": "HIGH", "outputStrength": "HIGH"}
+            for category in ("HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE")
+        ]
     }
 }
 
@@ -5274,7 +5277,10 @@ class TestBR10GuardrailBinding:
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
-        assert "version 1 evaluates no output" in findings[0]["Finding_Details"]
+        assert (
+            "version 1 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the output"
+            in findings[0]["Finding_Details"]
+        )
         assert "role 'BoundRole'" in findings[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
@@ -5288,7 +5294,7 @@ class TestBR10GuardrailBinding:
                         "piiEntities": [{"type": "EMAIL", "action": "BLOCK"}]
                     },
                 },
-                "input and no output",
+                "HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input",
             ),
             (
                 {
@@ -5302,7 +5308,7 @@ class TestBR10GuardrailBinding:
                         ]
                     }
                 },
-                "output",
+                "HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the output",
             ),
             (
                 {
@@ -5317,7 +5323,7 @@ class TestBR10GuardrailBinding:
                         ]
                     }
                 },
-                "input",
+                "HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input",
             ),
         ],
     )
@@ -5332,12 +5338,9 @@ class TestBR10GuardrailBinding:
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
-        assert (
-            f"version 1 evaluates no {skipped} with a blocking content filter"
-            in findings[0]["Finding_Details"]
-        )
+        assert f"version 1 does not block {skipped}" in findings[0]["Finding_Details"]
 
-    def test_two_filters_one_per_direction_cover_both(self):
+    def test_prompt_attack_and_one_category_block_neither_side(self):
         guardrail = {
             "contentPolicy": {
                 "filters": [
@@ -5362,8 +5365,119 @@ class TestBR10GuardrailBinding:
             guardrail=guardrail,
         )
 
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert (
+            "version 1 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
+            in details
+        )
+        assert (
+            "version 1 does not block HATE, MISCONDUCT, SEXUAL, VIOLENCE on the output"
+            in details
+        )
+
+    def test_every_content_safety_category_on_both_sides_passes(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail={
+                "contentPolicy": {
+                    "filters": [
+                        {
+                            "type": category,
+                            "inputStrength": "LOW",
+                            "outputStrength": "MEDIUM",
+                        }
+                        for category in (
+                            "VIOLENCE",
+                            "SEXUAL",
+                            "MISCONDUCT",
+                            "INSULTS",
+                            "HATE",
+                        )
+                    ]
+                }
+            },
+        )
+
         assert [f["Status"] for f in findings] == ["Passed"]
-        assert "blocking content filter to both" in findings[0]["Finding_Details"]
+        assert (
+            "blocks HATE, INSULTS, MISCONDUCT, SEXUAL and VIOLENCE content on both input and output"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_one_category_missing_on_one_side_fails(self):
+        filters = [
+            {"type": category, "inputStrength": "HIGH", "outputStrength": "HIGH"}
+            for category in ("HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE")
+        ]
+        filters[3]["outputStrength"] = "NONE"
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail={"contentPolicy": {"filters": filters}},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "version 1 does not block SEXUAL on the output" in details
+        assert "version 1 does not block" not in details.replace(
+            "version 1 does not block SEXUAL on the output", ""
+        )
+
+    def test_one_weak_version_fails_the_binding_among_full_ones(self):
+        full = {
+            "contentPolicy": {
+                "filters": [
+                    {
+                        "type": category,
+                        "inputStrength": "HIGH",
+                        "outputStrength": "HIGH",
+                    }
+                    for category in (
+                        "HATE",
+                        "INSULTS",
+                        "MISCONDUCT",
+                        "SEXUAL",
+                        "VIOLENCE",
+                    )
+                ]
+            }
+        }
+        weak = {
+            "contentPolicy": {
+                "filters": [
+                    {
+                        "type": "PROMPT_ATTACK",
+                        "inputStrength": "HIGH",
+                        "outputStrength": "NONE",
+                    },
+                    {"type": "HATE", "inputStrength": "LOW", "outputStrength": "LOW"},
+                ]
+            }
+        }
+        client = MagicMock()
+        client.list_guardrails.return_value = {
+            "guardrails": [{"version": "1"}, {"version": "2"}]
+        }
+        client.get_guardrail.side_effect = lambda **kwargs: (
+            weak if kwargs["guardrailVersion"] == "2" else full
+        )
+        findings, _ = self._run(
+            _br10_cache(roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN))}),
+            client=client,
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert (
+            "version 2 does not block INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
+            in details
+        )
+        assert "version 1 does not block" not in details
+        assert "version DRAFT does not block" not in details
 
     def test_a_central_mechanism_binds_an_unbound_identity(self):
         central = {
@@ -5409,7 +5523,10 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "named by the effective policy Y" in findings[0]["Finding_Details"]
-        assert "version 4 evaluates no output" in findings[0]["Finding_Details"]
+        assert (
+            "version 4 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the output"
+            in findings[0]["Finding_Details"]
+        )
 
     def test_an_unread_central_source_keeps_the_identity_failed(self):
         central = {"mechanisms": [], "unread": ["the effective Bedrock policy (x)"]}
@@ -5442,7 +5559,10 @@ class TestBR10GuardrailBinding:
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
-        assert "version 2 evaluates no input" in findings[0]["Finding_Details"]
+        assert (
+            "version 2 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
+            in findings[0]["Finding_Details"]
+        )
 
     def test_an_unversioned_value_reads_every_version(self):
         client = MagicMock()
@@ -5473,7 +5593,10 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
-        assert "version 2 evaluates no input" in details
+        assert (
+            "version 2 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
+            in details
+        )
         assert "role 'OpenVersionRole'" in details
         assert "PinnedRole" not in details
         read = sorted(
@@ -7776,6 +7899,69 @@ class TestBR41CentralGuardrailEnforcement:
             if f["Status"] == "Failed"
         )
 
+    @staticmethod
+    def _share(principal, condition=None):
+        statement = {
+            "Effect": "Allow",
+            "Principal": {"AWS": principal},
+            "Action": "bedrock:ApplyGuardrail",
+            "Resource": "*",
+        }
+        if condition:
+            statement["Condition"] = condition
+        return statement
+
+    def _share_rows(self, *statements):
+        _, findings = self._run(
+            effective=self._effective_policy_document(self.GUARDRAIL_ARN, "3"),
+            share_policy={"Version": "2012-10-17", "Statement": list(statements)},
+        )
+        return findings, [
+            f
+            for f in findings
+            if f["Finding"] == "Central Guardrail Cross-Account Share"
+        ]
+
+    def test_br41_share_to_named_accounts_without_an_org_key_fails(self):
+        findings, share = self._share_rows(
+            self._share("arn:aws:iam::111122223333:root"),
+            self._share("arn:aws:iam::444455556666:root"),
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert [f["Status"] for f in share] == ["Failed"]
+        details = share[0]["Finding_Details"]
+        assert "arn:aws:iam::111122223333:root" in details
+        assert (
+            "with no aws:PrincipalOrgID or aws:PrincipalOrgPaths condition" in details
+        )
+        assert "that it does not name cannot apply the guardrail" in details
+
+    def test_br41_negated_org_key_beside_a_named_share_fails(self):
+        findings, share = self._share_rows(
+            self._share("arn:aws:iam::111122223333:root"),
+            self._share(
+                "arn:aws:iam::444455556666:root",
+                {"StringNotEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}},
+            ),
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert [f["Status"] for f in share] == ["Failed"]
+
+    def test_br41_org_scoped_share_passes_beside_a_named_share(self):
+        findings, share = self._share_rows(
+            self._share("arn:aws:iam::111122223333:root"),
+            self._share("*", {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}),
+        )
+
+        # A passing share is folded into the enforcement row.
+        assert share == []
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "scoped by aws:PrincipalOrgID o-a1b2c3d4e5" in details
+        assert "111122223333" not in details
+
     def test_br41_share_of_a_guardrail_owned_elsewhere_is_not_read(self):
         foreign = "arn:aws:bedrock:us-east-1:999988887777:guardrail/central0001"
         _, bedrock_client, findings = self._run_clients(
@@ -8852,12 +9038,30 @@ class TestBR42ModelAllowList:
                     "Bool": {"aws:ViaAWSService": "false"},
                 },
             },
+            {
+                "Resource": "arn:aws:bedrock:*::foundation-model/amazon.titan-text-lite-v1",
+                "Condition": {
+                    "ArnNotLike": {
+                        "bedrock:ModelArn": "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
+                    }
+                },
+            },
+            {
+                "Resource": "*",
+                "Condition": {
+                    "StringNotEquals": {
+                        "aws:PrincipalTag/model": "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
+                    }
+                },
+            },
         ],
         ids=[
             "other-key",
             "match-all-beside-named",
             "id-wildcard",
             "condition-other-key",
+            "condition-resource-names-one-model",
+            "condition-on-a-non-model-key",
         ],
     )
     def test_br42_an_identity_deny_list_that_is_narrowed_does_not_scope_the_grant(
@@ -8882,6 +9086,40 @@ class TestBR42ModelAllowList:
         assert len(failed) == 1
         assert "Role 'NarrowedDenyRole'" in failed[0]["Finding_Details"]
         assert "ExactDenyRole" in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "Passed"
+        )
+
+    def test_br42_condition_deny_list_scopes_only_with_every_model_as_resource(self):
+        # MDL-01: the same ArnNotLike list credits only when its Resource
+        # matches every model.
+        def condition_deny(resource):
+            return self._deny_list_document(
+                {
+                    "Resource": resource,
+                    "Condition": {"ArnNotLike": {"bedrock:ModelArn": self.MODEL_ARN}},
+                }
+            )
+
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "WholeRole": [("Whole", condition_deny("*"))],
+                    "OneRole": [
+                        (
+                            "One",
+                            condition_deny(
+                                "arn:aws:bedrock:*::foundation-model/amazon.titan-text-lite-v1"
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'OneRole'" in failed[0]["Finding_Details"]
+        assert "WholeRole" not in failed[0]["Finding_Details"]
+        assert "WholeRole" in " ".join(
             f["Finding_Details"] for f in findings if f["Status"] == "Passed"
         )
 
@@ -9168,6 +9406,19 @@ class TestBR43RegionInvocationControl:
             },
         ],
     }
+    # The default profile routes only inside us-east-1, so an allow-list naming
+    # that Region covers its destinations.
+    IN_REGION_PROFILE = {
+        "inferenceProfileId": "us.amazon.nova-lite-v1:0",
+        "inferenceProfileName": "US Nova Lite",
+        "type": "SYSTEM_DEFINED",
+        "status": "ACTIVE",
+        "models": [
+            {
+                "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0"
+            }
+        ],
+    }
     UNBOUNDED_PROFILE = {
         "inferenceProfileId": "global.cohere.embed-v4:0",
         "inferenceProfileName": "Global Cohere Embed v4",
@@ -9211,7 +9462,9 @@ class TestBR43RegionInvocationControl:
                 else [
                     {
                         "inferenceProfileSummaries": list(
-                            profiles if profiles is not None else [self.BOUNDED_PROFILE]
+                            profiles
+                            if profiles is not None
+                            else [self.IN_REGION_PROFILE]
                         )
                     }
                 ]
@@ -9375,7 +9628,7 @@ class TestBR43RegionInvocationControl:
         sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
         bedrock_client = MagicMock()
         bedrock_client.get_paginator.return_value.paginate.return_value = [
-            {"inferenceProfileSummaries": [self.BOUNDED_PROFILE]}
+            {"inferenceProfileSummaries": [self.IN_REGION_PROFILE]}
         ]
 
         with patch(
@@ -9434,7 +9687,7 @@ class TestBR43RegionInvocationControl:
                     )
                 ]
             ),
-            profiles=[self.BOUNDED_PROFILE, self.UNBOUNDED_PROFILE],
+            profiles=[self.IN_REGION_PROFILE, self.UNBOUNDED_PROFILE],
         )
 
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -10028,6 +10281,31 @@ class TestBR43RegionInvocationControl:
         )
         assert "a request routed to a blocked destination Region fails" in detail
 
+    def test_br43_allow_list_missing_a_profile_destination_fails(self):
+        # MDL-03: the allowed set must include every destination Region of a
+        # cross-Region profile, so the same allow-list fails beside a profile
+        # routing to us-west-2 and passes beside one that stays in us-east-1.
+        inventory = self._inventory(
+            [
+                (
+                    "EastOnly",
+                    self._region_scp("StringNotEquals", ["us-east-1", "unspecified"]),
+                )
+            ]
+        )
+        outside = self._run(
+            inventory, profiles=[self.IN_REGION_PROFILE, self.BOUNDED_PROFILE]
+        )
+        inside = self._run(inventory, profiles=[self.IN_REGION_PROFILE])
+
+        assert [f["Status"] for f in outside] == ["Failed"]
+        assert (
+            "does not include every destination Region"
+            in (outside[0]["Finding_Details"])
+        )
+        assert "Add us-west-2 to the Region allow-list" in outside[0]["Resolution"]
+        assert [f["Status"] for f in inside] == ["Passed"]
+
     def test_br43_geographic_destinations_inside_the_allow_list_are_not_named(self):
         findings = self._run(
             self._inventory(
@@ -10586,6 +10864,22 @@ class TestBR44MarketplaceModelControl:
         # ForAnyValue form must still read as a Deny allow-list. An Allow with
         # ForAllValues: is true when the key is absent, so without a Null false
         # test it does not bind and the role is reported.
+        qualified_deny = {
+            "Effect": "Deny",
+            "Action": "aws-marketplace:Subscribe",
+            "Resource": "*",
+            "Condition": {
+                "ForAnyValue:StringNotEquals": {
+                    "aws-marketplace:ProductId": [self.PRODUCT_ID]
+                }
+            },
+        }
+        no_product_deny = {
+            "Effect": "Deny",
+            "Action": "aws-marketplace:Subscribe",
+            "Resource": "*",
+            "Condition": {"Null": {"aws-marketplace:ProductId": "true"}},
+        }
         findings = self._run(
             _identity_cache(
                 roles={
@@ -10608,19 +10902,22 @@ class TestBR44MarketplaceModelControl:
                             "QualifiedDeny",
                             {
                                 "Version": "2012-10-17",
+                                "Statement": [qualified_deny, no_product_deny],
+                            },
+                        )
+                    ],
+                    "LoneDenyRole": [
+                        (
+                            "LoneDeny",
+                            {
+                                "Version": "2012-10-17",
                                 "Statement": [
                                     {
-                                        "Effect": "Deny",
+                                        "Effect": "Allow",
                                         "Action": "aws-marketplace:Subscribe",
                                         "Resource": "*",
-                                        "Condition": {
-                                            "ForAnyValue:StringNotEquals": {
-                                                "aws-marketplace:ProductId": [
-                                                    self.PRODUCT_ID
-                                                ]
-                                            }
-                                        },
-                                    }
+                                    },
+                                    qualified_deny,
                                 ],
                             },
                         )
@@ -10629,12 +10926,28 @@ class TestBR44MarketplaceModelControl:
             )
         )
 
-        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
-        assert "QualifiedAllowRole" in findings[0]["Finding_Details"]
-        assert "forallvalues:stringequals" in findings[0]["Finding_Details"]
-        assert "key is absent" in findings[0]["Finding_Details"]
-        assert "QualifiedDenyRole" in findings[1]["Finding_Details"]
-        assert "foranyvalue:stringnotequals" in findings[1]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Passed"]
+        by_role = {
+            role: f["Finding_Details"]
+            for f in findings
+            for role in ("QualifiedAllowRole", "LoneDenyRole", "QualifiedDenyRole")
+            if f"'{role}'" in f["Finding_Details"]
+        }
+        allow_row = next(
+            f for f in findings if "'QualifiedAllowRole'" in f["Finding_Details"]
+        )
+        assert allow_row["Status"] == "Failed"
+        assert "forallvalues:stringequals" in by_role["QualifiedAllowRole"]
+        assert "key is absent" in by_role["QualifiedAllowRole"]
+        # MDL-04: the same ForAnyValue Deny without a Null true Deny fails open.
+        lone_row = next(f for f in findings if "'LoneDenyRole'" in f["Finding_Details"])
+        assert lone_row["Status"] == "Failed"
+        assert "no Deny with a Null true test on it" in by_role["LoneDenyRole"]
+        assert "QualifiedDenyRole" not in lone_row["Finding_Details"]
+        assert "QualifiedDenyRole" not in allow_row["Finding_Details"]
+        assert findings[2]["Status"] == "Passed"
+        assert "QualifiedDenyRole" in findings[2]["Finding_Details"]
+        assert "foranyvalue:stringnotequals" in findings[2]["Finding_Details"]
 
     def test_br44_resolution_names_the_multi_value_qualifier(self):
         findings = self._run(
@@ -10660,14 +10973,14 @@ class TestBR44MarketplaceModelControl:
             {operator: {"aws-marketplace:ProductId": value or self.PRODUCT_ID}},
         )
 
-    def _scp(self, statement):
+    def _scp(self, *statements):
         return {
             "items": [
                 {
                     "name": "MarketplaceGuard",
                     "id": "p-mkt",
                     "content": json.dumps(
-                        {"Version": "2012-10-17", "Statement": [statement]}
+                        {"Version": "2012-10-17", "Statement": list(statements)}
                     ),
                     "attached_to": ["r-root"],
                 }
@@ -10685,6 +10998,14 @@ class TestBR44MarketplaceModelControl:
                 "aws-marketplace:ProductId": ["prod-abcdefghijklm"]
             }
         },
+    }
+    # ForAnyValue:StringNotEquals is false when the product key is absent, so
+    # the allow-list binds only beside a Deny on requests that carry none.
+    SCP_NO_PRODUCT_DENY = {
+        "Effect": "Deny",
+        "Action": ["aws-marketplace:Subscribe", "aws-marketplace:Unsubscribe"],
+        "Resource": "*",
+        "Condition": {"Null": {"aws-marketplace:ProductId": "true"}},
     }
 
     def test_br44_unscoped_unsubscribe_fails(self):
@@ -10842,7 +11163,9 @@ class TestBR44MarketplaceModelControl:
         )
         findings = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_model_control(
-                cache, region="Global", scp_inventory=self._scp(self.SCP_ALLOW_LIST)
+                cache,
+                region="Global",
+                scp_inventory=self._scp(self.SCP_ALLOW_LIST, self.SCP_NO_PRODUCT_DENY),
             )
         )
 
@@ -10850,6 +11173,22 @@ class TestBR44MarketplaceModelControl:
         details = findings[0]["Finding_Details"]
         assert "policy 'MarketplaceGuard'" in details
         assert "role 'OpenA'" in details and "role 'OpenB'" in details
+
+    def test_br44_scp_for_any_value_deny_alone_fails_open(self):
+        # MDL-04: with no Deny on an absent product key, a request carrying no
+        # aws-marketplace:ProductId is not denied.
+        cache = _identity_cache(
+            roles={"OpenA": [("Open", _allow("aws-marketplace:Subscribe", "*"))]}
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                cache, region="Global", scp_inventory=self._scp(self.SCP_ALLOW_LIST)
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Role 'OpenA'" in findings[0]["Finding_Details"]
+        assert "MarketplaceGuard" not in findings[0]["Finding_Details"]
 
     def test_br44_scp_is_not_credited_in_the_management_account(self):
         inventory = self._scp(self.SCP_ALLOW_LIST)
@@ -15337,10 +15676,32 @@ class TestKnowledgeBaseScreening:
             "regexes": [{"name": "k", "pattern": "k", "action": "BLOCK"}]
         }
     }
+    MASKS_CREDENTIALS = {
+        "sensitiveInformationPolicy": {
+            "piiEntities": [
+                {"type": t, "inputAction": "BLOCK", "outputAction": "ANONYMIZE"}
+                for t in ("AWS_ACCESS_KEY", "AWS_SECRET_KEY", "PASSWORD", "EMAIL")
+            ],
+            "regexes": [{"name": "k", "pattern": "k", "outputAction": "BLOCK"}],
+        }
+    }
+    REDACT_ALL = {
+        "JobName": "redact-docs",
+        "JobStatus": "COMPLETED",
+        "Mode": "ONLY_REDACTION",
+        "OutputDataConfig": {"S3Uri": "s3://docs/redacted/"},
+        "RedactionConfig": {
+            "PiiEntityTypes": ["ALL"],
+            "MaskMode": "REPLACE_WITH_PII_ENTITY_TYPE",
+        },
+        "EndTime": "2026-09-01T00:00:00Z",
+    }
 
     @staticmethod
-    def _source(name, kind="S3", lambdas=(), bucket="docs", prefixes=()):
+    def _source(name, kind="S3", lambdas=(), bucket="docs", prefixes=(), kb="kb"):
         return {
+            "knowledge_base_id": kb,
+            "data_source_id": name,
             "label": f"data source '{name}'",
             "type": kind,
             "transformations": list(lambdas),
@@ -15398,9 +15759,18 @@ class TestKnowledgeBaseScreening:
             if f["Finding"] == "Knowledge Base Ingestion Prompt Attack Screening"
         ]
 
-    def _br26(self, inventory, jobs=None, jobs_error=None):
+    def _br26(self, inventory, jobs=None, jobs_error=None, ingestions=None):
         client = MagicMock()
         client.list_guardrails.return_value = {"guardrails": []}
+        ingestions = ingestions or {}
+
+        def list_ingestion_jobs(knowledgeBaseId, dataSourceId, **_):
+            started = ingestions.get(dataSourceId, [])
+            if isinstance(started, Exception):
+                raise started
+            return {"ingestionJobSummaries": [{"startedAt": t} for t in started]}
+
+        client.list_ingestion_jobs.side_effect = list_ingestion_jobs
         if jobs_error:
             client.list_pii_entities_detection_jobs.side_effect = jobs_error
         else:
@@ -15467,7 +15837,7 @@ class TestKnowledgeBaseScreening:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "flow 'f' 1 node 'n' retrieves from it" in rows[0]["Finding_Details"]
 
-    def test_br34_one_screened_front_does_not_clear_an_open_one(self):
+    def test_br34_a_guarded_front_fails_beside_a_bare_one(self):
         rows = self._br34(
             self._inventory(
                 [
@@ -15485,18 +15855,46 @@ class TestKnowledgeBaseScreening:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "agent 'bare' DRAFT" in rows[0]["Finding_Details"]
-        assert "agent 'guarded' 2" not in rows[0]["Finding_Details"]
+        assert "agent 'guarded' 2" in rows[0]["Finding_Details"]
+        assert "cannot wrap the retrieved chunks" in rows[0]["Finding_Details"]
 
-    def test_br34_screened_fronts_are_not_failed_and_never_pass(self):
+    def test_br34_a_prompt_attack_front_does_not_screen_retrieved_chunks(self):
+        # KB-05: managed retrieval builds the prompt itself and cannot tag the
+        # retrieved chunks, so an agent guardrail's PROMPT_ATTACK filter never
+        # evaluates them.
         rows = self._br34(
             self._inventory(
                 [self._kb("kb", [self._source("raw")], [self._front("agent 'g' 2")])],
                 {("gr-1", "1"): self.PROMPT_ATTACK},
             )
         )
-        assert [r["Status"] for r in rows] == ["N/A"]
-        assert "is not failed: agent 'g' 2" in rows[0]["Finding_Details"]
-        assert rows[0]["Severity"] == "Informational"
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "agent 'g' 2 retrieves from it through managed retrieval" in details
+        assert "is not failed" not in details
+        assert rows[0]["Severity"] == "High"
+
+    def test_br34_a_transformed_kb_is_not_failed_beside_a_front_only_one(self):
+        rows = self._br34(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb-lambda",
+                        [self._source("clean", lambdas=["scrub"])],
+                        [self._front("agent 'g' 2")],
+                    ),
+                    self._kb(
+                        "kb-front",
+                        [self._source("raw")],
+                        [self._front("agent 'g' 2")],
+                    ),
+                ],
+                {("gr-1", "1"): self.PROMPT_ATTACK},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert "knowledge base 'kb-front'" in rows[0]["Finding_Details"]
+        assert "runs POST_CHUNKING Lambda scrub" in rows[1]["Finding_Details"]
 
     def test_br34_no_front_fails_only_when_every_agent_and_flow_was_read(self):
         kb = self._kb("kb", [self._source("raw", kind="WEB")])
@@ -15518,15 +15916,17 @@ class TestKnowledgeBaseScreening:
             in unread[0]["Finding_Details"]
         )
 
-    def test_br34_unread_front_guardrail_is_na(self):
+    def test_br34_an_unread_front_guardrail_does_not_hold_back_the_failure(self):
+        # No front guardrail can screen retrieved chunks, so reading it would
+        # not change the verdict.
         rows = self._br34(
             self._inventory(
                 [self._kb("kb", [self._source("raw")], [self._front("agent 'g' 2")])],
                 {("gr-1", "1"): None},
             )
         )
-        assert [r["Status"] for r in rows] == ["N/A"]
-        assert "the guardrail of agent 'g' 2 was not read" in rows[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "was not read" not in rows[0]["Finding_Details"]
 
     def test_br34_account_enforced_guardrail_credit_and_unread(self):
         kb = self._kb(
@@ -15688,23 +16088,49 @@ class TestKnowledgeBaseScreening:
                         [self._front("agent 'r' 1", guardrail="gr-r")],
                     ),
                 ],
-                {("gr-1", "1"): self.MASKS_PII, ("gr-r", "1"): self.REGEX_ONLY},
+                {
+                    ("gr-1", "1"): self.MASKS_CREDENTIALS,
+                    ("gr-r", "1"): self.REGEX_ONLY,
+                },
             )
         )
         assert [r["Status"] for r in rows] == ["N/A", "Failed"]
         assert "is not failed: agent 'm' 1" in rows[0]["Finding_Details"]
         assert (
-            "agent 'r' 1 retrieves from it with no guardrail that blocks or masks a PII entity type"
-            in rows[1]["Finding_Details"]
+            "agent 'r' 1 retrieves from it with no guardrail that blocks or masks "
+            "AWS_ACCESS_KEY, AWS_SECRET_KEY and PASSWORD" in rows[1]["Finding_Details"]
         )
 
+    def test_br26_one_masked_pii_entity_on_a_front_is_not_credited(self):
+        # KB-08: EMAIL masked on the output alone leaves credentials and the
+        # input side open.
+        rows = self._br26(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb-full",
+                        [self._source("raw", kind="WEB")],
+                        [self._front("agent 'f' 1", guardrail="gr-f")],
+                    ),
+                    self._kb(
+                        "kb-one",
+                        [self._source("raw", kind="WEB")],
+                        [self._front("agent 'o' 1")],
+                    ),
+                ],
+                {
+                    ("gr-1", "1"): self.MASKS_PII,
+                    ("gr-f", "1"): self.MASKS_CREDENTIALS,
+                },
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "is not failed: agent 'f' 1" in rows[0]["Finding_Details"]
+        assert "knowledge base 'kb-one'" in rows[1]["Finding_Details"]
+        assert "agent 'o' 1 retrieves from it" in rows[1]["Finding_Details"]
+
     def test_br26_comprehend_redaction_output_credits_only_the_matching_source(self):
-        job = {
-            "JobName": "redact-docs",
-            "JobStatus": "COMPLETED",
-            "Mode": "ONLY_REDACTION",
-            "OutputDataConfig": {"S3Uri": "s3://docs/redacted/"},
-        }
+        job = self.REDACT_ALL
         offsets = dict(
             job,
             JobName="offsets",
@@ -15719,13 +16145,90 @@ class TestKnowledgeBaseScreening:
                 ]
             ),
             jobs=[job, offsets],
+            ingestions={"in": ["2026-09-02T00:00:00Z"]},
         )
         assert [r["Status"] for r in rows] == ["N/A", "Failed"]
         assert (
             "Comprehend PII redaction job 'redact-docs' (s3://docs/redacted/)"
             in rows[0]["Finding_Details"]
         )
+        assert (
+            "redacts ALL PII entity types with MaskMode REPLACE_WITH_PII_ENTITY_TYPE "
+            "and completed before the latest ingestion job started"
+            in rows[0]["Finding_Details"]
+        )
         assert "data source 'whole' (S3)" in rows[1]["Finding_Details"]
+
+    def test_br26_redaction_job_naming_some_entity_types_is_not_credited(self):
+        # KB-08: a job that redacts only NAME leaves every other entity type
+        # in the ingested text.
+        partial = dict(
+            self.REDACT_ALL,
+            JobName="names-only",
+            OutputDataConfig={"S3Uri": "s3://docs/names/"},
+            RedactionConfig={"PiiEntityTypes": ["NAME"], "MaskMode": "MASK"},
+        )
+        rows = self._br26(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb-all", [self._source("a", prefixes=["redacted/"], kb="A")]
+                    ),
+                    self._kb(
+                        "kb-names", [self._source("n", prefixes=["names/"], kb="N")]
+                    ),
+                ]
+            ),
+            jobs=[self.REDACT_ALL, partial],
+            ingestions={"a": ["2026-09-02T00:00:00Z"], "n": ["2026-09-02T00:00:00Z"]},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "'redact-docs'" in rows[0]["Finding_Details"]
+        assert "knowledge base 'kb-names'" in rows[1]["Finding_Details"]
+        assert "names-only" not in rows[1]["Finding_Details"]
+
+    def test_br26_ingestion_before_the_redaction_job_ended_is_not_credited(self):
+        # KB-08: the latest ingestion started before the job completed, so
+        # the index was not built from its output.
+        rows = self._br26(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb-after", [self._source("a", prefixes=["redacted/"], kb="A")]
+                    ),
+                    self._kb(
+                        "kb-before", [self._source("b", prefixes=["redacted/"], kb="B")]
+                    ),
+                    self._kb(
+                        "kb-never", [self._source("c", prefixes=["redacted/"], kb="C")]
+                    ),
+                ]
+            ),
+            jobs=[self.REDACT_ALL],
+            ingestions={
+                "a": ["2026-08-01T00:00:00Z", "2026-09-03T00:00:00Z"],
+                "b": ["2026-08-31T00:00:00Z", "2026-08-01T00:00:00Z"],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed", "N/A"]
+        assert "before the latest ingestion job started" in rows[0]["Finding_Details"]
+        assert "knowledge base 'kb-before'" in rows[1]["Finding_Details"]
+        assert (
+            "with no ingestion job recorded for the source"
+            in rows[2]["Finding_Details"]
+        )
+
+    def test_br26_unread_ingestion_jobs_hold_back_the_failure(self):
+        rows = self._br26(
+            self._inventory(
+                [self._kb("kb", [self._source("a", prefixes=["redacted/"])])]
+            ),
+            jobs=[self.REDACT_ALL],
+            ingestions={"a": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "bedrock:ListIngestionJobs" in rows[0]["Finding_Details"]
+        assert "is not failed" not in rows[0]["Finding_Details"]
 
     def test_br26_unread_comprehend_jobs_block_only_s3_sources(self):
         rows = self._br26(
@@ -16891,6 +17394,119 @@ class TestGuardrailConditionPins:
         )
         assert [row["Status"] for row in rows] == ["Failed"]
         assert "condition on role 'Pinned'" in rows[0]["Finding_Details"]
+
+
+class TestDeployedGuardrailEnforcedNarrowings:
+    """A narrowed account-enforced configuration does not credit its guardrail."""
+
+    REGION = "us-east-1"
+    ARN = "arn:aws:bedrock:us-east-1:123456789012:guardrail/"
+
+    def _inventory(self, configs):
+        agent_client = MagicMock()
+        agent_client.list_agents.return_value = {"agentSummaries": []}
+        agent_client.list_flows.return_value = {"flowSummaries": []}
+        bedrock_client = MagicMock()
+        bedrock_client.list_enforced_guardrails_configuration.return_value = {
+            "guardrailsConfig": configs
+        }
+        bedrock_client.get_guardrail.side_effect = lambda **kwargs: {
+            "guardrail": dict(kwargs)
+        }
+        clients = {"bedrock-agent": agent_client, "bedrock": bedrock_client}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **_: clients[service],
+        ):
+            return bedrock_app.get_guardrail_attachment_inventory(self.REGION)
+
+    def _config(self, config_id, guardrail, **extra):
+        return {
+            "configId": config_id,
+            "guardrailArn": self.ARN + guardrail,
+            "guardrailVersion": "1",
+            **extra,
+        }
+
+    def _rows(self, configs):
+        return bedrock_app._deployed_guardrail_findings(
+            "BR-34",
+            "Deployed",
+            bedrock_app.GUARDRAIL_IAM_REFERENCE,
+            self.REGION,
+            self._inventory(configs),
+            lambda detail: ("Passed", "filter set"),
+            "fix",
+            "High",
+        )
+
+    def test_selective_messages_guarding_is_not_credited(self):
+        rows = self._rows(
+            [
+                self._config(
+                    "c-1", "gr-a", selectiveContentGuarding={"messages": "SELECTIVE"}
+                )
+            ]
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "account-enforced configuration c-1 applies it only in part" in details
+        assert "messages content is guarded SELECTIVE" in details
+        assert "pass:" not in details
+
+    def test_one_honor_config_fails_beside_a_comprehensive_one(self):
+        rows = self._rows(
+            [
+                self._config("c-full", "gr-a"),
+                self._config("c-tags", "gr-b", inputTags="HONOR"),
+            ]
+        )
+
+        assert sorted(row["Status"] for row in rows) == ["Failed", "Passed"]
+        failed = next(row for row in rows if row["Status"] == "Failed")
+        passed = next(row for row in rows if row["Status"] == "Passed")
+        assert "account-enforced configuration c-tags" in failed["Finding_Details"]
+        assert "inputTags is HONOR" in failed["Finding_Details"]
+        assert "gr-a version 1" in passed["Finding_Details"]
+        assert "gr-b" not in passed["Finding_Details"]
+
+    def test_a_narrowed_surface_is_dropped_from_a_shared_version(self):
+        rows = self._rows(
+            [
+                self._config("c-full", "gr-a"),
+                self._config(
+                    "c-part",
+                    "gr-a",
+                    modelEnforcement={"includedModels": ["model-x"]},
+                ),
+            ]
+        )
+
+        assert sorted(row["Status"] for row in rows) == ["Failed", "Passed"]
+        passed = next(row for row in rows if row["Status"] == "Passed")
+        assert (
+            "applied by account-enforced configuration c-full)"
+            in (passed["Finding_Details"])
+        )
+        assert "c-part" not in passed["Finding_Details"]
+        failed = next(row for row in rows if row["Status"] == "Failed")
+        assert "includedModels does not name ALL" in failed["Finding_Details"]
+
+    def test_a_narrowed_config_on_a_failing_guardrail_fails_once(self):
+        rows = bedrock_app._deployed_guardrail_findings(
+            "BR-26",
+            "Deployed",
+            bedrock_app.GUARDRAIL_IAM_REFERENCE,
+            self.REGION,
+            self._inventory([self._config("c-1", "gr-a", inputTags="HONOR")]),
+            lambda detail: ("Failed", "no filter"),
+            "fix",
+            "High",
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "fails: no filter" in rows[0]["Finding_Details"]
 
 
 # ===================================================================
@@ -19286,7 +19902,7 @@ class TestProposedBedrockChecks:
                 "inputModalities": ["TEXT", "IMAGE"],
                 "outputModalities": ["TEXT", "IMAGE"],
             }
-            for filter_type in ("HATE", "INSULTS", "SEXUAL", "VIOLENCE")
+            for filter_type in ("HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE")
         ]
         result = bedrock_app.check_bedrock_guardrail_image_content_filters(
             region="us-east-1",
@@ -19303,7 +19919,7 @@ class TestProposedBedrockChecks:
                 "inputModalities": ["TEXT", "IMAGE"],
                 "outputModalities": ["TEXT", "IMAGE"],
             }
-            for filter_type in ("HATE", "INSULTS", "SEXUAL", "VIOLENCE")
+            for filter_type in ("HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE")
         ]
         filters.append(
             {
