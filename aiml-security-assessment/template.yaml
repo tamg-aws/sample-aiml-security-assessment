@@ -300,6 +300,10 @@ Resources:
               - aoss:ListAccessPolicies # BR-20
               - aoss:GetAccessPolicy # BR-20
               - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
+              - sagemaker:ListInferenceComponents # BR-02
+              - eks:ListClusters # BR-02
+              - sagemaker:ListDomains # BR-53
+              - bedrock-agentcore:ListCodeInterpreters # BR-53
             Resource: '*'
           - Sid: CloudTrailEventDataStoreRead
             # BR-06 reads each event data store's Status and
@@ -322,6 +326,125 @@ Resources:
             Action:
               - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
             Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
+          - Sid: AccountListRegions
+            # BR-51 lists the Regions enabled for this account and sweeps each
+            # for an IAM Identity Center instance.
+            Effect: Allow
+            Action:
+              - account:ListRegions # BR-51
+            Resource: !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
+          - Sid: EventBridgeRuleTargetList
+            # BR-33 names the targets of each default-bus rule that matches
+            # Inspector findings.
+            Effect: Allow
+            Action:
+              - events:ListTargetsByRule # BR-33
+            Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
+          - Sid: SageMakerEndpointRead
+            # BR-02 reads the configuration behind each SageMaker endpoint.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeEndpoint # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint/*'
+          - Sid: SageMakerEndpointConfigRead
+            # BR-02 reads the variants, execution role and VPC of each
+            # endpoint configuration.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeEndpointConfig # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint-config/*'
+          - Sid: SageMakerModelRead
+            # BR-02 reads the execution role and VPC of each endpoint model.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeModel # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model/*'
+          - Sid: SageMakerInferenceComponentRead
+            # BR-02 reads the model behind each inference component.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeInferenceComponent # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:inference-component/*'
+          - Sid: EKSClusterRead
+            # BR-02 reads each cluster's VPC and lists its pod identity
+            # associations.
+            Effect: Allow
+            Action:
+              - eks:DescribeCluster # BR-02
+              - eks:ListPodIdentityAssociations # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+          - Sid: EKSPodIdentityAssociationRead
+            # BR-02 reads the role each pod identity association gives.
+            Effect: Allow
+            Action:
+              - eks:DescribePodIdentityAssociation # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:podidentityassociation/*/*'
+          - Sid: ECSTaskRead
+            # BR-02 reads the task role and subnets of each task started
+            # outside a service.
+            Effect: Allow
+            Action:
+              - ecs:DescribeTasks # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/*'
+          - Sid: ECSTaskList
+            # BR-02 lists the tasks in each cluster. The service authorization
+            # reference gives ListTasks the container-instance resource type,
+            # which a listing by cluster does not name, so the grant takes '*'
+            # scoped by the ecs:cluster key, as the ECS developer guide's
+            # ListTasks example does.
+            Effect: Allow
+            Action:
+              - ecs:ListTasks # BR-02
+            Resource: '*'
+            Condition:
+              ArnLike:
+                ecs:cluster: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/*'
+          - Sid: SSOPermissionSetPolicyList
+            # BR-51 lists the AWS managed and customer managed policies of each
+            # permission set. The service authorization reference gives both
+            # actions the Instance and PermissionSet resource types.
+            Effect: Allow
+            Action:
+              - sso:ListManagedPoliciesInPermissionSet # BR-51
+              - sso:ListCustomerManagedPolicyReferencesInPermissionSet # BR-51
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
+              - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
+          - Sid: AWSManagedPolicyRead
+            # BR-51 reads the default version of each AWS managed policy
+            # attached to a permission set. Only AWS managed policies, which
+            # live under the aws account segment, are read.
+            Effect: Allow
+            Action:
+              - iam:GetPolicy # BR-51
+              - iam:GetPolicyVersion # BR-51
+            Resource: !Sub 'arn:${AWS::Partition}:iam::aws:policy/*'
+          - Sid: BedrockMantleProjectList
+            # BR-37 lists every bedrock-mantle project to read its data_retention
+            # mode. The service authorization reference gives ListProjects the
+            # project resource type.
+            Effect: Allow
+            Action:
+              - bedrock-mantle:ListProjects # BR-37
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-mantle:*:${AWS::AccountId}:project/*'
+          - Sid: BedrockMantleAccountRetentionRead
+            # BR-37 reads the bedrock-mantle account data-retention mode that a
+            # project set to inherit takes. The service authorization reference
+            # lists no resource type for GetAccountDataRetention, so the
+            # resource must be '*'.
+            Effect: Allow
+            Action:
+              - bedrock-mantle:GetAccountDataRetention # BR-37
+            Resource: '*'
+          - Sid: IAMAccountSummaryRead
+            # BR-50 reads AccountAccessKeysPresent to learn whether the root
+            # user has an access key. The service authorization reference lists
+            # no resource type for GetAccountSummary, so the resource must be
+            # '*'.
+            Effect: Allow
+            Action:
+              - iam:GetAccountSummary # BR-50
+            Resource: '*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -397,7 +520,7 @@ Resources:
                 - bedrock-agentcore:ListMemories # BR-53
                 - bedrock-agentcore:ListGateways # BR-53
                 - bedrock-agentcore:ListBrowsers # BR-42, BR-47, BR-52, BR-53
-                - sagemaker:ListEndpoints # BR-53
+                - sagemaker:ListEndpoints # BR-02, BR-53
                 - sagemaker:ListModels # BR-53
                 - sagemaker:ListNotebookInstances # BR-02, BR-53
                 # Former Sid KMSKeyInventory.

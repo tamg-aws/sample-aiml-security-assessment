@@ -142,12 +142,34 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockAssessmentReadsPolicy": {
+        "account:ListRegions",
         "aoss:GetAccessPolicy",
         "aoss:ListAccessPolicies",
+        "bedrock-agentcore:ListCodeInterpreters",
+        "bedrock-mantle:GetAccountDataRetention",
+        "bedrock-mantle:ListProjects",
         "bedrock:ListIngestionJobs",
         "cloudtrail:GetEventDataStore",
+        "ecs:DescribeTasks",
+        "ecs:ListTasks",
+        "eks:DescribeCluster",
+        "eks:DescribePodIdentityAssociation",
+        "eks:ListClusters",
+        "eks:ListPodIdentityAssociations",
+        "events:ListTargetsByRule",
+        "iam:GetAccountSummary",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "sagemaker:DescribeEndpoint",
+        "sagemaker:DescribeEndpointConfig",
+        "sagemaker:DescribeInferenceComponent",
+        "sagemaker:DescribeModel",
         "sagemaker:DescribeTrainingJob",
+        "sagemaker:ListDomains",
+        "sagemaker:ListInferenceComponents",
         "sagemaker:ListTrainingJobs",
+        "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
+        "sso:ListManagedPoliciesInPermissionSet",
     },
     "BedrockSecurityAssessmentFunction": {
         "aoss:BatchGetCollection",
@@ -727,13 +749,65 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
         for action in statement["Action"]
     )
     assert all(
-        set(s) <= {"Sid", "Effect", "Action", "Resource"} for s in document["Statement"]
+        set(s) <= {"Sid", "Effect", "Action", "Resource"}
+        for s in document["Statement"]
+        if s["Sid"] != "ECSTaskList"
     )
+    conditioned = [s for s in document["Statement"] if "Condition" in s]
+    assert [(s["Sid"], s["Condition"]) for s in conditioned] == [
+        (
+            "ECSTaskList",
+            {
+                "ArnLike": {
+                    "ecs:cluster": {
+                        "Fn::Sub": "arn:${AWS::Partition}:ecs:*:"
+                        "${AWS::AccountId}:cluster/*"
+                    }
+                }
+            },
+        )
+    ]
+    assert set(conditioned[0]) == {"Sid", "Effect", "Action", "Resource", "Condition"}
+
+    def scoped(action, suffix):
+        return (
+            "Allow",
+            action,
+            json.dumps({"Fn::Sub": "arn:${AWS::Partition}:" + suffix}, sort_keys=True),
+        )
+
     assert grants == sorted(
         [
             ("Allow", "aoss:ListAccessPolicies", '"*"'),
             ("Allow", "aoss:GetAccessPolicy", '"*"'),
             ("Allow", "sagemaker:ListTrainingJobs", '"*"'),
+            ("Allow", "sagemaker:ListInferenceComponents", '"*"'),
+            ("Allow", "eks:ListClusters", '"*"'),
+            ("Allow", "sagemaker:ListDomains", '"*"'),
+            ("Allow", "bedrock-agentcore:ListCodeInterpreters", '"*"'),
+            ("Allow", "ecs:ListTasks", '"*"'),
+            scoped(
+                "sagemaker:DescribeEndpoint",
+                "sagemaker:*:${AWS::AccountId}:endpoint/*",
+            ),
+            scoped(
+                "sagemaker:DescribeEndpointConfig",
+                "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
+            ),
+            scoped("sagemaker:DescribeModel", "sagemaker:*:${AWS::AccountId}:model/*"),
+            scoped(
+                "sagemaker:DescribeInferenceComponent",
+                "sagemaker:*:${AWS::AccountId}:inference-component/*",
+            ),
+            scoped("eks:DescribeCluster", "eks:*:${AWS::AccountId}:cluster/*"),
+            scoped(
+                "eks:ListPodIdentityAssociations", "eks:*:${AWS::AccountId}:cluster/*"
+            ),
+            scoped(
+                "eks:DescribePodIdentityAssociation",
+                "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
+            ),
+            scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
             (
                 "Allow",
                 "cloudtrail:GetEventDataStore",
@@ -763,6 +837,52 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                         "${AWS::AccountId}:training-job/*"
                     }
                 ),
+            ),
+            (
+                "Allow",
+                "account:ListRegions",
+                json.dumps(
+                    {
+                        "Fn::Sub": "arn:${AWS::Partition}:account::"
+                        "${AWS::AccountId}:account"
+                    }
+                ),
+            ),
+            (
+                "Allow",
+                "events:ListTargetsByRule",
+                json.dumps(
+                    {
+                        "Fn::Sub": "arn:${AWS::Partition}:events:*:"
+                        "${AWS::AccountId}:rule/*"
+                    }
+                ),
+            ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": "arn:${AWS::Partition}:sso:::instance/*"},
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sso:::permissionSet/*/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in (
+                    "sso:ListManagedPoliciesInPermissionSet",
+                    "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
+                )
+            ),
+            scoped("iam:GetPolicy", "iam::aws:policy/*"),
+            scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
+            ("Allow", "bedrock-mantle:GetAccountDataRetention", '"*"'),
+            ("Allow", "iam:GetAccountSummary", '"*"'),
+            scoped(
+                "bedrock-mantle:ListProjects",
+                "bedrock-mantle:*:${AWS::AccountId}:project/*",
             ),
         ]
     )
@@ -1702,6 +1822,43 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockAssessmentReadsPolicy", "CloudTrailEventDataStoreRead"): (
             "cloudtrail:GetEventDataStore",
             "cloudtrail:*:${AWS::AccountId}:eventdatastore/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "AccountListRegions"): (
+            "account:ListRegions",
+            "account::${AWS::AccountId}:account",
+        ),
+        ("BedrockAssessmentReadsPolicy", "EventBridgeRuleTargetList"): (
+            "events:ListTargetsByRule",
+            "events:*:${AWS::AccountId}:rule/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointRead"): (
+            "sagemaker:DescribeEndpoint",
+            "sagemaker:*:${AWS::AccountId}:endpoint/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointConfigRead"): (
+            "sagemaker:DescribeEndpointConfig",
+            "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "SageMakerModelRead"): (
+            "sagemaker:DescribeModel",
+            "sagemaker:*:${AWS::AccountId}:model/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "SageMakerInferenceComponentRead"): (
+            "sagemaker:DescribeInferenceComponent",
+            "sagemaker:*:${AWS::AccountId}:inference-component/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "EKSClusterRead"): (
+            "eks:DescribeCluster",
+            "eks:ListPodIdentityAssociations",
+            "eks:*:${AWS::AccountId}:cluster/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "EKSPodIdentityAssociationRead"): (
+            "eks:DescribePodIdentityAssociation",
+            "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
+        ),
+        ("BedrockAssessmentReadsPolicy", "ECSTaskRead"): (
+            "ecs:DescribeTasks",
+            "ecs:*:${AWS::AccountId}:task/*",
         ),
         ("BedrockSecurityAssessmentFunction", "SSOPermissionSetRead"): (
             "sso:GetInlinePolicyForPermissionSet",

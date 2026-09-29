@@ -12,6 +12,43 @@ section.
 
 ### Added
 
+- `BR-50` adds a `Root User Access Key` row. It reads
+  `iam:GetAccountSummary` and fails when `AccountAccessKeysPresent` is `1`,
+  because a root access key signs any request, AI services included, and
+  BR-50 read IAM users only. The summary does not say whether the key is
+  active, and the row says so. The row runs on the primary Region even when
+  the permissions cache is unavailable.
+
+- `BR-37` reads the `bedrock-mantle` data-retention scopes. It signs GET
+  requests to `https://bedrock-mantle.<region>.api.aws` with SigV4 under the
+  `bedrock-mantle` signing name, reads the mantle account mode
+  (`/v1/data_retention`) and every page of projects
+  (`/v1/organization/projects`), and adds one `Bedrock Mantle Project Data
+  Retention` row per project. A project's effective mode is its own value
+  unless it is `inherit`, then the mantle account value unless that is
+  `inherit`, and otherwise each model's default. Only `none` passes, and a
+  model default fails. A project that inherits takes the mantle account
+  mode, which is a separate setting from `bedrock:GetAccountDataRetention`:
+  in one account read on 2026-09-29 the control plane returned `none` and
+  mantle returned `aws_review`, so `BR-37` passed while the default project
+  ran at `aws_review`. The control-plane row names both values and says when
+  they differ. An unread project list, a failed connection or TLS error, or
+  an unread account mode under an inheriting project is `N/A`, never
+  `Passed`. The ceiling sentence that said these scopes could not be read is
+  gone.
+
+- `BR-06` adds a `Bedrock Mantle Data Event Logging` row. Inference on the
+  `bedrock-mantle` endpoint (`CreateInference`) is a CloudTrail data event, so
+  a trail that selects only the `AWS::Bedrock::*` types recorded none of it,
+  and the inference row's `Passed` text said so without failing. The row
+  needs all six `AWS::BedrockMantle::*` resource types on a logging
+  multi-region trail or an enabled event data store, and a selector copied
+  from AWS's example, which names `Project`, `CustomizedModel` and
+  `Reservation`, fails naming `Environment`, `Runtime` and `Skill`. A
+  deployment whose trails selected only the Bedrock types gains a `Failed`
+  row. No new IAM grant: the row reads the trail and store selectors BR-06
+  already reads.
+
 - Added `AC-53` Inter-Agent Anomaly Alarms, growing the catalog from 276 to
   277 checks (162 core). It covers AISF `AIR-FND-DET-10`, which the ledger
   had marked `not_implementable`. Application Signals publishes an `Error`,
@@ -338,6 +375,42 @@ section.
   to pass behind a compliant endpoint config, and a component that could not
   be listed or described now leaves its endpoint `N/A`.
 
+- `BR-37` fails a control-plane mode of `aws_review`. It fell to the
+  unknown-mode branch and read `N/A`, although `aws_review` sits above
+  `default` on AWS's scale and `default` already failed. This is a verdict
+  change from `N/A` to `Failed`, at the incumbent `High` severity.
+
+- `BR-46` judges the AI source buckets by completed Amazon Comprehend PII
+  detection jobs when Macie is not enabled in the Region. A source that no
+  completed job read in full fails, and a source a job read is `N/A`, because
+  a one-time job does not reach later objects. This reverses the dedup in
+  601bb18, which reported every source `N/A` and left the Macie-off case to
+  `FS-44`. `FS-44` still reports the account-level Macie state, but it names
+  no source bucket, so with Macie off a knowledge base fed from buckets that
+  nothing classifies had no failing row. `BR-46` now overrides that dedup.
+- `BR-51` reads the AWS managed policies attached to each IAM Identity Center
+  permission set, and fails a permission set whose inline or AWS managed
+  policies grant an AI write unless one of its policies carries the
+  `aws:PrincipalTag` Deny over every AI service granted. It had read only the
+  inline policy, so a permission set that granted `bedrock:*` through
+  `AmazonBedrockFullAccess` was never named. A permission set whose AWS managed
+  policy cannot be read keeps the row `N/A`. Customer managed policy
+  references are named and not read, because each resolves to a policy of that
+  name in every account the permission set is provisioned to, and a permission
+  set that has one is not judged.
+- `BR-32` `Passed` rows name, as an UNVERIFIED open edge, whether guardrail
+  metrics for a guardrail that another account owns, or that the
+  organization enforces, are emitted in this account.
+- `BR-10` needs, on the input and on the output of each guardrail version
+  that may be named, at least one `HATE`, `INSULTS`, `MISCONDUCT`, `SEXUAL`
+  or `VIOLENCE` content filter that blocks at `LOW` or above. It had required
+  all five on both sides, which the control text for `AIR-BDR-GRD-01` does
+  not ask for. `PROMPT_ATTACK` still counts for neither side, because it
+  screens user inputs for malicious intent. The `Passed` row names the
+  categories found on each side and says strength above `LOW` is not judged.
+- `BR-02` no longer calls `ecs:ListTasks` without a cluster when
+  `ecs:ListClusters` is denied. The grant admits only a named cluster, so that
+  call would be denied; the row now says no standalone task was listed.
 - `AR-10` credited a rule filtered on `region`, `time`, `id` or any other
   top-level field beyond `source`, `detail-type`, `detail`, `resources` and
   `account` as routing every approval transition. Every such field now
@@ -1331,6 +1404,36 @@ has no resource type and moves out of the inline
 segment open, because a list can be shared through AWS RAM from another
 account (`SM-39`). All are read-only. The deployment role permissions added
 for `BedrockAssessmentReadsPolicy` cover this policy too.
+`BedrockAssessmentReadsPolicy` gains, in both SAM templates:
+`account:ListRegions` on the account ARN (`BR-51`),
+`events:ListTargetsByRule` on the account's `rule/*` ARNs (`BR-33`),
+`sagemaker:DescribeEndpoint`, `sagemaker:DescribeEndpointConfig`,
+`sagemaker:DescribeModel` and `sagemaker:DescribeInferenceComponent` on the
+account's `endpoint/*`, `endpoint-config/*`, `model/*` and
+`inference-component/*` ARNs, `eks:DescribeCluster` and
+`eks:ListPodIdentityAssociations` on `cluster/*`,
+`eks:DescribePodIdentityAssociation` on `podidentityassociation/*/*` and
+`ecs:DescribeTasks` on `task/*` (`BR-02`). It gains on `*`, because none has
+a resource type in the IAM service authorization reference,
+`sagemaker:ListInferenceComponents` and `eks:ListClusters` (`BR-02`), and
+`sagemaker:ListDomains` and `bedrock-agentcore:ListCodeInterpreters`
+(`BR-53`). `ecs:ListTasks` (`BR-02`) is granted on `*` only under an
+`ArnLike` `ecs:cluster` condition on the account's `cluster/*` ARNs. The two
+AWS sources disagree here: the service authorization reference gives
+`ListTasks` the `container-instance` resource type, which a listing by
+cluster does not name, while the Amazon ECS developer guide's `ListTasks`
+example grants `*` under the `ecs:cluster` key. The grant follows the
+developer guide. For `BR-51` it gains `sso:ListManagedPoliciesInPermissionSet`
+and `sso:ListCustomerManagedPolicyReferencesInPermissionSet` on the
+`instance/*` and `permissionSet/*/*` ARNs, and `iam:GetPolicy` and
+`iam:GetPolicyVersion` on `arn:${AWS::Partition}:iam::aws:policy/*`, so only
+AWS managed policy documents are readable. For `BR-37` it gains
+`bedrock-mantle:ListProjects` on the account's `project/*` ARNs and
+`bedrock-mantle:GetAccountDataRetention` on `*`, which has no resource type
+in the IAM service authorization reference. For `BR-50` it gains
+`iam:GetAccountSummary` on `*`, which also has no resource type there. All
+are read-only, and the same CodeBuild run applies them. The Bedrock function
+now also makes HTTPS calls to `bedrock-mantle.<region>.api.aws`.
 
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a
