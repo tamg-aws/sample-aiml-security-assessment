@@ -1274,10 +1274,13 @@ AI_SUBJECT_ROWS = [
         "instances, ECS services (every cluster, awsvpc subnets, task definition role) "
         "and SageMaker notebook instances, failing a notebook with no subnet, and for "
         "each VPC-mode AgentCore runtime version, including the versions its endpoints "
-        "serve. Not read for want of a grant: SageMaker endpoints "
-        "(sagemaker:DescribeEndpoint, DescribeEndpointConfig, DescribeModel), EKS "
-        "clusters (eks:ListClusters, DescribeCluster, ListPodIdentityAssociations) and "
-        "ECS tasks started outside a service (ecs:ListTasks, DescribeTasks)",
+        "serve. It does the same for ECS tasks started outside a service (task role "
+        "override or task definition role, ENI subnet), for every model behind a "
+        "SageMaker endpoint (production and shadow variants and inference "
+        "components, with the model's execution role and VPC), and for EKS pod "
+        "identity associations (the cluster's VPC and the association's role). A pod "
+        "that takes its role through IAM roles for service accounts is not read, "
+        "since that binding is held by the Kubernetes API",
         [],
         5,
     ),

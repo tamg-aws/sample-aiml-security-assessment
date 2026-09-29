@@ -2554,16 +2554,14 @@ def _granted_bedrock_surfaces(
 WORKLOAD_CONNECTIVITY_FINDING = "Bedrock Workload Private Connectivity"
 
 WORKLOAD_CONNECTIVITY_CEILING = (
-    "Lambda functions, EC2 instances, ECS services, SageMaker notebook "
-    "instances and VPC-mode AgentCore runtime versions are read. A PUBLIC-mode "
-    "AgentCore runtime is judged by AC-01. SageMaker endpoints are not read "
-    "because sagemaker:DescribeEndpoint, sagemaker:DescribeEndpointConfig and "
-    "sagemaker:DescribeModel are not granted to this assessment. EKS clusters "
-    "are not read because eks:ListClusters, eks:DescribeCluster and "
-    "eks:ListPodIdentityAssociations are not granted. An ECS task started "
-    "outside a service is not listed because ecs:ListTasks and "
-    "ecs:DescribeTasks are not granted. Endpoints reached from another VPC "
-    "through a shared private hosted zone are not read."
+    "Lambda functions, EC2 instances, ECS services and standalone tasks, "
+    "SageMaker notebook instances and endpoints, EKS pod identity associations "
+    "and VPC-mode AgentCore runtime versions are read. A PUBLIC-mode AgentCore "
+    "runtime is judged by AC-01. An EKS pod that takes a role through IAM roles "
+    "for service accounts is not read, because that binding is a service "
+    "account annotation held by the Kubernetes API, which this assessment does "
+    "not call. Endpoints reached from another VPC through a shared private "
+    "hosted zone are not read."
 )
 
 
@@ -2583,8 +2581,10 @@ def _subnet_vpcs(
 
 def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
     """
-    Add every ECS service in every cluster, with the VPC of its awsvpc subnets
-    and the task role of its task definition, to ``inventory``.
+    Add every ECS service in every cluster, and every task started outside a
+    service, with the VPC of its awsvpc subnets and its task role, to
+    ``inventory``. A task's overridden task role is read before the one in its
+    task definition.
     """
     ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
     ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
@@ -2599,6 +2599,58 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
         clusters = [None]
     subnet_cache: Dict[str, Optional[str]] = {}
     task_roles: Dict[str, Any] = {}
+
+    def record(kind, name, task_definition, override_role, subnets, runs_on):
+        label = f"{kind} '{name}'"
+        if override_role:
+            task_role = override_role
+        else:
+            if task_definition and task_definition not in task_roles:
+                try:
+                    task_roles[task_definition] = (
+                        ecs_client.describe_task_definition(
+                            taskDefinition=task_definition
+                        )
+                        .get("taskDefinition", {})
+                        .get("taskRoleArn")
+                    )
+                except (ClientError, BotoCoreError) as error:
+                    task_roles[task_definition] = error
+            task_role = task_roles.get(task_definition)
+            if not task_definition or isinstance(task_role, Exception):
+                inventory["errors"].append(
+                    f"{label} has a task role that was not read with "
+                    "ecs:DescribeTaskDefinition ({})".format(
+                        get_assessment_error_label(task_role)
+                        if isinstance(task_role, Exception)
+                        else "no task definition returned"
+                    )
+                )
+                return
+        if not subnets:
+            inventory["errors"].append(
+                f"{label} uses no awsvpc subnets, so the VPC of the "
+                f"{runs_on} was not read"
+            )
+            return
+        try:
+            vpcs = _subnet_vpcs(ec2_client, subnets, subnet_cache)
+        except (ClientError, BotoCoreError) as error:
+            inventory["errors"].append(
+                f"the subnets of {label} were not read with "
+                f"ec2:DescribeSubnets ({get_assessment_error_label(error)})"
+            )
+            return
+        role = str(task_role or "").rsplit("/", 1)[-1] or None
+        for vpc_id in sorted({vpc for vpc in vpcs.values() if vpc}):
+            inventory["workloads"].append(
+                {"kind": kind, "name": name, "vpc_id": vpc_id, "role": role}
+            )
+        if not any(vpcs.values()):
+            inventory["errors"].append(
+                f"the subnets of {label} were not returned by ec2:DescribeSubnets"
+            )
+
     for cluster in clusters:
         cluster_kwargs = {"cluster": cluster} if cluster else {}
         cluster_label = cluster or "the default cluster"
@@ -2611,7 +2663,7 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                 f"ECS services in {cluster_label} were not listed with "
                 f"ecs:ListServices ({get_assessment_error_label(error)})"
             )
-            continue
+            service_arns = []
         for start in range(0, len(service_arns), 10):
             batch = service_arns[start : start + 10]
             try:
@@ -2636,67 +2688,64 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                     )
                 )
             for service in services:
-                label = "ECS service '{}'".format(
-                    service.get("serviceName") or service.get("serviceArn")
+                record(
+                    "ECS service",
+                    service.get("serviceName") or service.get("serviceArn"),
+                    service.get("taskDefinition"),
+                    None,
+                    (
+                        (service.get("networkConfiguration") or {}).get(
+                            "awsvpcConfiguration"
+                        )
+                        or {}
+                    ).get("subnets")
+                    or [],
+                    "container instances its tasks run on",
                 )
-                task_definition = service.get("taskDefinition")
-                if task_definition and task_definition not in task_roles:
-                    try:
-                        task_roles[task_definition] = (
-                            ecs_client.describe_task_definition(
-                                taskDefinition=task_definition
-                            )
-                            .get("taskDefinition", {})
-                            .get("taskRoleArn")
-                        )
-                    except (ClientError, BotoCoreError) as error:
-                        task_roles[task_definition] = error
-                task_role = task_roles.get(task_definition)
-                if not task_definition or isinstance(task_role, Exception):
-                    inventory["errors"].append(
-                        f"{label} has a task role that was not read with "
-                        "ecs:DescribeTaskDefinition ({})".format(
-                            get_assessment_error_label(task_role)
-                            if isinstance(task_role, Exception)
-                            else "no task definition returned"
-                        )
+        try:
+            task_arns = _list_all_items(
+                ecs_client, "list_tasks", "taskArns", **cluster_kwargs
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"ECS tasks in {cluster_label} were not listed with "
+                f"ecs:ListTasks ({get_assessment_error_label(error)})"
+            )
+            continue
+        for start in range(0, len(task_arns), 100):
+            batch = task_arns[start : start + 100]
+            try:
+                described = ecs_client.describe_tasks(tasks=batch, **cluster_kwargs)
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    "ECS task(s) {} were not described with ecs:DescribeTasks "
+                    "({})".format(", ".join(batch), get_assessment_error_label(error))
+                )
+                continue
+            for failure in described.get("failures") or []:
+                inventory["errors"].append(
+                    "ECS task {} was not described with ecs:DescribeTasks ({})".format(
+                        failure.get("arn") or "unnamed",
+                        failure.get("reason") or "no reason returned",
                     )
+                )
+            for task in described.get("tasks", []):
+                if str(task.get("group") or "").startswith("service:"):
                     continue
-                subnets = (
-                    (service.get("networkConfiguration") or {}).get(
-                        "awsvpcConfiguration"
-                    )
-                    or {}
-                ).get("subnets") or []
-                if not subnets:
-                    inventory["errors"].append(
-                        f"{label} uses no awsvpc subnets, so the VPC of the "
-                        "container instances its tasks run on was not read"
-                    )
-                    continue
-                try:
-                    vpcs = _subnet_vpcs(ec2_client, subnets, subnet_cache)
-                except (ClientError, BotoCoreError) as error:
-                    inventory["errors"].append(
-                        f"the subnets of {label} were not read with "
-                        f"ec2:DescribeSubnets ({get_assessment_error_label(error)})"
-                    )
-                    continue
-                role = str(task_role or "").rsplit("/", 1)[-1] or None
-                for vpc_id in sorted({vpc for vpc in vpcs.values() if vpc}):
-                    inventory["workloads"].append(
-                        {
-                            "kind": "ECS service",
-                            "name": service.get("serviceName") or "unnamed",
-                            "vpc_id": vpc_id,
-                            "role": role,
-                        }
-                    )
-                if not any(vpcs.values()):
-                    inventory["errors"].append(
-                        f"the subnets of {label} were not returned by "
-                        "ec2:DescribeSubnets"
-                    )
+                record(
+                    "ECS task",
+                    str(task.get("taskArn") or "unnamed").split(":task/", 1)[-1],
+                    task.get("taskDefinitionArn"),
+                    (task.get("overrides") or {}).get("taskRoleArn"),
+                    [
+                        detail.get("value")
+                        for attachment in task.get("attachments") or []
+                        if attachment.get("type") == "ElasticNetworkInterface"
+                        for detail in attachment.get("details") or []
+                        if detail.get("name") == "subnetId" and detail.get("value")
+                    ],
+                    "container instance it runs on",
+                )
 
 
 def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
@@ -2761,6 +2810,232 @@ def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
                 "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
             }
         )
+
+
+def _sagemaker_endpoint_workloads(region: str, inventory: Dict[str, Any]) -> None:
+    """
+    Add every SageMaker endpoint model, with the VPC of its subnets and its
+    execution role, to ``inventory``. A model is reached through a production
+    or shadow variant, or through an inference component, which runs in the
+    endpoint configuration's VPC when the model names none. An endpoint
+    configuration with its own execution role is added as well.
+    """
+    sagemaker_client = boto3.client(
+        "sagemaker", config=boto3_config, region_name=region
+    )
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    try:
+        endpoints = _list_all_items(
+            sagemaker_client,
+            "list_endpoints",
+            "Endpoints",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        inventory["errors"].append(
+            "SageMaker endpoints were not listed with sagemaker:ListEndpoints "
+            f"({get_assessment_error_label(error)})"
+        )
+        return
+    subnet_cache: Dict[str, Optional[str]] = {}
+
+    def record(name, label, role_arn, subnets):
+        vpc_id = None
+        if subnets:
+            try:
+                vpcs = _subnet_vpcs(ec2_client, subnets, subnet_cache)
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"the subnets of {label} were not read with "
+                    f"ec2:DescribeSubnets ({get_assessment_error_label(error)})"
+                )
+                return
+            missing = sorted(subnet for subnet, vpc in vpcs.items() if not vpc)
+            if missing:
+                inventory["errors"].append(
+                    "subnet(s) {} of {} were not returned by ec2:DescribeSubnets".format(
+                        ", ".join(missing), label
+                    )
+                )
+                return
+            vpc_id = sorted(set(vpcs.values()))[0]
+        role_arn = str(role_arn or "")
+        inventory["workloads"].append(
+            {
+                "kind": "SageMaker endpoint",
+                "name": name,
+                "vpc_id": vpc_id,
+                "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+            }
+        )
+
+    for endpoint in endpoints:
+        name = endpoint.get("EndpointName") or "unnamed"
+        label = f"SageMaker endpoint '{name}'"
+        try:
+            config_name = sagemaker_client.describe_endpoint(EndpointName=name).get(
+                "EndpointConfigName"
+            )
+        except (ClientError, BotoCoreError) as error:
+            inventory["errors"].append(
+                f"{label} was not read with sagemaker:DescribeEndpoint "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        try:
+            config = sagemaker_client.describe_endpoint_config(
+                EndpointConfigName=config_name
+            )
+        except (ClientError, BotoCoreError) as error:
+            inventory["errors"].append(
+                f"the configuration of {label} was not read with "
+                "sagemaker:DescribeEndpointConfig "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        config_subnets = (config.get("VpcConfig") or {}).get("Subnets") or []
+        if config.get("ExecutionRoleArn"):
+            record(name, label, config["ExecutionRoleArn"], config_subnets)
+        variants = list(config.get("ProductionVariants") or []) + list(
+            config.get("ShadowProductionVariants") or []
+        )
+        model_names = [v["ModelName"] for v in variants if v.get("ModelName")]
+        component_models: List[str] = []
+        if any(not variant.get("ModelName") for variant in variants):
+            try:
+                for component in _list_all_items(
+                    sagemaker_client,
+                    "list_inference_components",
+                    "InferenceComponents",
+                    max_results_param="MaxResults",
+                    token_param="NextToken",
+                    token_response_keys=("NextToken",),
+                    EndpointNameEquals=name,
+                ):
+                    component_name = component.get("InferenceComponentName")
+                    specification = (
+                        sagemaker_client.describe_inference_component(
+                            InferenceComponentName=component_name
+                        ).get("Specification")
+                        or {}
+                    )
+                    if specification.get("ModelName"):
+                        component_models.append(specification["ModelName"])
+            except (ClientError, BotoCoreError, TypeError) as error:
+                inventory["errors"].append(
+                    f"the inference components of {label} were not read with "
+                    "sagemaker:ListInferenceComponents and "
+                    "sagemaker:DescribeInferenceComponent "
+                    f"({get_assessment_error_label(error)})"
+                )
+        for model_name in dict.fromkeys(model_names + component_models):
+            model_label = f"model {model_name} of {label}"
+            try:
+                model = sagemaker_client.describe_model(ModelName=model_name)
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"{model_label} was not read with sagemaker:DescribeModel "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            subnets = (model.get("VpcConfig") or {}).get("Subnets") or []
+            if not subnets and model_name not in model_names:
+                subnets = config_subnets
+            record(
+                f"{name} model {model_name}",
+                model_label,
+                model.get("ExecutionRoleArn"),
+                subnets,
+            )
+
+
+def _eks_pod_identity_workloads(region: str, inventory: Dict[str, Any]) -> None:
+    """
+    Add every EKS pod identity association, with its cluster's VPC and the
+    role its pods receive, to ``inventory``.
+    """
+    eks_client = boto3.client("eks", config=boto3_config, region_name=region)
+    try:
+        clusters = _list_all_items(eks_client, "list_clusters", "clusters")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        inventory["errors"].append(
+            "EKS clusters were not listed with eks:ListClusters "
+            f"({get_assessment_error_label(error)})"
+        )
+        return
+    for cluster in clusters:
+        label = f"EKS cluster '{cluster}'"
+        try:
+            vpc_id = (
+                (eks_client.describe_cluster(name=cluster).get("cluster") or {}).get(
+                    "resourcesVpcConfig"
+                )
+                or {}
+            ).get("vpcId")
+        except (ClientError, BotoCoreError) as error:
+            inventory["errors"].append(
+                f"{label} was not read with eks:DescribeCluster "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        try:
+            associations = _list_all_items(
+                eks_client,
+                "list_pod_identity_associations",
+                "associations",
+                clusterName=cluster,
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"the pod identity associations of {label} were not listed with "
+                f"eks:ListPodIdentityAssociations ({get_assessment_error_label(error)})"
+            )
+            continue
+        for association in associations:
+            name = "{} {}/{}".format(
+                cluster,
+                association.get("namespace") or "unnamed",
+                association.get("serviceAccount") or "unnamed",
+            )
+            association_label = f"EKS pod identity association '{name}'"
+            try:
+                detail = (
+                    eks_client.describe_pod_identity_association(
+                        clusterName=cluster,
+                        associationId=association.get("associationId"),
+                    ).get("association")
+                    or {}
+                )
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"{association_label} was not read with "
+                    "eks:DescribePodIdentityAssociation "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            if detail.get("targetRoleArn"):
+                inventory["errors"].append(
+                    f"{association_label} gives its pods target role "
+                    f"{detail['targetRoleArn']}, whose grants the IAM cache of "
+                    "this account does not hold"
+                )
+                continue
+            if not vpc_id:
+                inventory["errors"].append(
+                    f"{label} returned no vpcId from eks:DescribeCluster"
+                )
+                break
+            role_arn = str(detail.get("roleArn") or "")
+            inventory["workloads"].append(
+                {
+                    "kind": "EKS pod identity association",
+                    "name": name,
+                    "vpc_id": vpc_id,
+                    "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                }
+            )
 
 
 def _agentcore_runtime_workloads(region: str, inventory: Dict[str, Any]) -> None:
@@ -2863,7 +3138,8 @@ def _agentcore_runtime_workloads(region: str, inventory: Dict[str, Any]) -> None
 
 def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     """
-    List Lambda functions, ECS services, SageMaker notebook instances,
+    List Lambda functions, ECS services and standalone tasks, SageMaker
+    notebook instances and endpoint models, EKS pod identity associations,
     VPC-mode AgentCore runtime versions and EC2 instances with the VPC and
     role each runs as.
 
@@ -2894,6 +3170,8 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
 
     _ecs_service_workloads(region, inventory)
     _notebook_workloads(region, inventory)
+    _sagemaker_endpoint_workloads(region, inventory)
+    _eks_pod_identity_workloads(region, inventory)
     _agentcore_runtime_workloads(region, inventory)
 
     try:

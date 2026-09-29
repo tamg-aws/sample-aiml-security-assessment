@@ -907,9 +907,17 @@ def _empty_ecs_and_sagemaker():
     ecs.list_clusters.return_value = {"clusterArns": []}
     sagemaker = MagicMock()
     sagemaker.list_notebook_instances.return_value = {"NotebookInstances": []}
+    sagemaker.list_endpoints.return_value = {"Endpoints": []}
+    eks = MagicMock()
+    eks.list_clusters.return_value = {"clusters": []}
     agentcore = MagicMock()
     agentcore.list_agent_runtimes.return_value = {"agentRuntimes": []}
-    return {"ecs": ecs, "sagemaker": sagemaker, "bedrock-agentcore-control": agentcore}
+    return {
+        "ecs": ecs,
+        "sagemaker": sagemaker,
+        "eks": eks,
+        "bedrock-agentcore-control": agentcore,
+    }
 
 
 class TestBR02WorkloadConnectivity:
@@ -1115,21 +1123,16 @@ class TestBR02WorkloadConnectivity:
 
         detail = rows[0]["Finding_Details"]
         assert (
-            "Lambda functions, EC2 instances, ECS services, SageMaker notebook "
-            "instances and VPC-mode AgentCore runtime versions are read." in detail
+            "Lambda functions, EC2 instances, ECS services and standalone tasks, "
+            "SageMaker notebook instances and endpoints, EKS pod identity "
+            "associations and VPC-mode AgentCore runtime versions are read." in detail
         )
-        for action in (
-            "sagemaker:DescribeEndpoint",
-            "sagemaker:DescribeEndpointConfig",
-            "sagemaker:DescribeModel",
-            "eks:ListClusters",
-            "eks:DescribeCluster",
-            "eks:ListPodIdentityAssociations",
-            "ecs:ListTasks",
-            "ecs:DescribeTasks",
-        ):
-            assert action in detail
-        assert "are not granted to this assessment" in detail
+        assert (
+            "An EKS pod that takes a role through IAM roles for service accounts "
+            "is not read, because that binding is a service account annotation "
+            "held by the Kubernetes API, which this assessment does not call." in detail
+        )
+        assert "not granted" not in detail
         assert "ceiling" not in detail.lower()
         for action in (
             "ecs:ListServices",
@@ -1364,10 +1367,20 @@ class TestBR02WorkloadConnectivity:
         runtimes=None,
         runtime_details=None,
         runtime_endpoints=None,
+        tasks=None,
+        endpoints=None,
+        endpoint_configs=None,
+        inference_components=None,
+        models=None,
+        eks_clusters=None,
     ):
         """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired.
 
         `describe_failures` names services DescribeServices returns as failures.
+        `tasks` maps a cluster to the tasks ListTasks returns, `endpoint_configs`
+        an endpoint name to its DescribeEndpointConfig response,
+        `inference_components` an endpoint to (component, model) pairs, and
+        `eks_clusters` a cluster name to its vpcId and pod identity associations.
         """
         lambda_client = MagicMock()
         lambda_client.get_paginator.return_value.paginate.return_value = [
@@ -1443,6 +1456,25 @@ class TestBR02WorkloadConnectivity:
             return {"taskDefinition": {"taskRoleArn": outcome}}
 
         ecs.describe_task_definition.side_effect = describe_task_definition
+        tasks = tasks or {}
+
+        def list_tasks(**kwargs):
+            outcome = tasks.get(kwargs.get("cluster"), [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"taskArns": [task["taskArn"] for task in outcome]}
+
+        def describe_tasks(**kwargs):
+            by_arn = {
+                task["taskArn"]: task
+                for listed in tasks.values()
+                if isinstance(listed, list)
+                for task in listed
+            }
+            return {"tasks": [by_arn[arn] for arn in kwargs["tasks"]], "failures": []}
+
+        ecs.list_tasks.side_effect = list_tasks
+        ecs.describe_tasks.side_effect = describe_tasks
         sagemaker = MagicMock()
         if isinstance(notebooks, Exception):
             sagemaker.list_notebook_instances.side_effect = notebooks
@@ -1459,6 +1491,90 @@ class TestBR02WorkloadConnectivity:
             return outcome
 
         sagemaker.describe_notebook_instance.side_effect = describe_notebook
+        if isinstance(endpoints, Exception):
+            sagemaker.list_endpoints.side_effect = endpoints
+        else:
+            sagemaker.list_endpoints.return_value = {
+                "Endpoints": [{"EndpointName": name} for name in endpoints or []]
+            }
+        endpoint_configs = endpoint_configs or {}
+        sagemaker.describe_endpoint.side_effect = lambda EndpointName: {
+            "EndpointName": EndpointName,
+            "EndpointConfigName": f"{EndpointName}-config",
+        }
+
+        def describe_endpoint_config(EndpointConfigName):
+            outcome = endpoint_configs[EndpointConfigName[: -len("-config")]]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        sagemaker.describe_endpoint_config.side_effect = describe_endpoint_config
+        inference_components = inference_components or {}
+        sagemaker.list_inference_components.side_effect = lambda **kwargs: {
+            "InferenceComponents": [
+                {"InferenceComponentName": component}
+                for component, _ in inference_components.get(
+                    kwargs["EndpointNameEquals"], []
+                )
+            ]
+        }
+        component_models = {
+            component: model
+            for pairs in inference_components.values()
+            for component, model in pairs
+        }
+        sagemaker.describe_inference_component.side_effect = (
+            lambda InferenceComponentName: {
+                "Specification": {"ModelName": component_models[InferenceComponentName]}
+            }
+        )
+        models = models or {}
+
+        def describe_model(ModelName):
+            outcome = models[ModelName]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        sagemaker.describe_model.side_effect = describe_model
+        eks = MagicMock()
+        eks_clusters = eks_clusters if eks_clusters is not None else {}
+        if isinstance(eks_clusters, Exception):
+            eks.list_clusters.side_effect = eks_clusters
+        else:
+            eks.list_clusters.return_value = {"clusters": list(eks_clusters)}
+
+        def describe_cluster(name):
+            outcome = eks_clusters[name]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {
+                "cluster": {
+                    "name": name,
+                    "resourcesVpcConfig": {"vpcId": outcome["vpc"]},
+                }
+            }
+
+        eks.describe_cluster.side_effect = describe_cluster
+        eks.list_pod_identity_associations.side_effect = lambda **kwargs: {
+            "associations": [
+                {
+                    key: association[key]
+                    for key in ("associationId", "namespace", "serviceAccount")
+                }
+                for association in eks_clusters[kwargs["clusterName"]]["associations"]
+            ]
+        }
+        eks.describe_pod_identity_association.side_effect = (
+            lambda clusterName, associationId: {
+                "association": next(
+                    association
+                    for association in eks_clusters[clusterName]["associations"]
+                    if association["associationId"] == associationId
+                )
+            }
+        )
         agentcore = MagicMock()
         if isinstance(runtimes, Exception):
             agentcore.list_agent_runtimes.side_effect = runtimes
@@ -1480,6 +1596,7 @@ class TestBR02WorkloadConnectivity:
             "iam": MagicMock(),
             "ecs": ecs,
             "sagemaker": sagemaker,
+            "eks": eks,
             "bedrock-agentcore-control": agentcore,
         }
         with patch(
@@ -1488,6 +1605,7 @@ class TestBR02WorkloadConnectivity:
         ):
             inventory = bedrock_app.get_bedrock_vpc_workload_inventory(self.REGION)
         self.ecs, self.sagemaker, self.subnet_calls = ecs, sagemaker, subnet_calls
+        self.eks = eks
         return inventory
 
     @staticmethod
@@ -1577,6 +1695,243 @@ class TestBR02WorkloadConnectivity:
 
         assert len(inventory["errors"]) == 1
         assert "bedrock-agentcore:ListAgentRuntimes" in inventory["errors"][0]
+
+    @staticmethod
+    def _task(
+        task_id, group, task_definition="td-batch:1", role=None, subnet="subnet-1"
+    ):
+        task = {
+            "taskArn": f"arn:aws:ecs:us-east-1:123456789012:task/a/{task_id}",
+            "group": group,
+            "taskDefinitionArn": task_definition,
+            "attachments": [],
+        }
+        if role:
+            task["overrides"] = {
+                "taskRoleArn": f"arn:aws:iam::123456789012:role/{role}"
+            }
+        if subnet:
+            task["attachments"] = [
+                {
+                    "type": "ElasticNetworkInterface",
+                    "details": [
+                        {"name": "networkInterfaceId", "value": "eni-1"},
+                        {"name": "subnetId", "value": subnet},
+                    ],
+                }
+            ]
+        return task
+
+    def test_br02_standalone_ecs_tasks_carry_their_role_and_vpc(self):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A, self.CLUSTER_B],
+            tasks={
+                self.CLUSTER_A: [
+                    self._task("svc", "service:api", role="ServiceTask"),
+                    self._task("t1", "family:batch", subnet="subnet-2"),
+                    self._task("t2", "family:other", "td-other:1", role="Override"),
+                ],
+                self.CLUSTER_B: [self._task("t3", "family:batch", subnet=None)],
+            },
+            task_roles={
+                "td-batch:1": "arn:aws:iam::123456789012:role/BatchTask",
+                "td-other:1": _make_client_error("AccessDeniedException"),
+            },
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+        )
+
+        assert self._names(inventory) == [
+            ("ECS task", "a/t1", "vpc-2", "BatchTask"),
+            ("ECS task", "a/t2", "vpc-1", "Override"),
+        ]
+        assert inventory["errors"] == [
+            "ECS task 'a/t3' uses no awsvpc subnets, so the VPC of the container "
+            "instance it runs on was not read"
+        ]
+        assert [c.kwargs for c in self.ecs.list_tasks.call_args_list] == [
+            {"cluster": self.CLUSTER_A, "maxResults": 100},
+            {"cluster": self.CLUSTER_B, "maxResults": 100},
+        ]
+
+    def test_br02_unlisted_tasks_name_their_cluster_and_tasks_go_100_at_a_time(
+        self,
+    ):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A, self.CLUSTER_B],
+            tasks={
+                self.CLUSTER_A: [
+                    self._task(f"t{i:03d}", "family:batch") for i in range(101)
+                ],
+                self.CLUSTER_B: _make_client_error("AccessDeniedException"),
+            },
+            task_roles={"td-batch:1": "arn:aws:iam::123456789012:role/BatchTask"},
+        )
+
+        assert len(self._names(inventory)) == 101
+        assert inventory["errors"] == [
+            f"ECS tasks in {self.CLUSTER_B} were not listed with ecs:ListTasks "
+            "(AccessDeniedException)"
+        ]
+        assert [
+            len(c.kwargs["tasks"]) for c in self.ecs.describe_tasks.call_args_list
+        ] == [100, 1]
+
+    @staticmethod
+    def _role_arn(name):
+        return f"arn:aws:iam::123456789012:role/{name}"
+
+    def test_br02_sagemaker_endpoints_carry_the_role_and_vpc_of_each_model(self):
+        inventory = self._inventory(
+            endpoints=["classic", "shared"],
+            endpoint_configs={
+                "classic": {
+                    "ProductionVariants": [
+                        {"VariantName": "a", "ModelName": "m-a"},
+                        {"VariantName": "b", "ModelName": "m-b"},
+                    ],
+                    "ShadowProductionVariants": [
+                        {"VariantName": "s", "ModelName": "m-s"}
+                    ],
+                },
+                "shared": {
+                    "ProductionVariants": [{"VariantName": "ic"}],
+                    "ExecutionRoleArn": self._role_arn("EndpointRole"),
+                    "VpcConfig": {"Subnets": ["subnet-2"]},
+                },
+            },
+            inference_components={"shared": [("ic-1", "m-c"), ("ic-2", "m-d")]},
+            models={
+                "m-a": {
+                    "ExecutionRoleArn": self._role_arn("RoleA"),
+                    "VpcConfig": {"Subnets": ["subnet-1"]},
+                },
+                "m-b": {"ExecutionRoleArn": self._role_arn("RoleB")},
+                "m-s": {
+                    "ExecutionRoleArn": self._role_arn("RoleS"),
+                    "VpcConfig": {"Subnets": ["subnet-2"]},
+                },
+                "m-c": {"ExecutionRoleArn": self._role_arn("RoleC")},
+                "m-d": {
+                    "ExecutionRoleArn": self._role_arn("RoleD"),
+                    "VpcConfig": {"Subnets": ["subnet-1"]},
+                },
+            },
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+        )
+
+        assert inventory["errors"] == []
+        assert self._names(inventory) == [
+            ("SageMaker endpoint", "classic model m-a", "vpc-1", "RoleA"),
+            ("SageMaker endpoint", "classic model m-b", None, "RoleB"),
+            ("SageMaker endpoint", "classic model m-s", "vpc-2", "RoleS"),
+            ("SageMaker endpoint", "shared", "vpc-2", "EndpointRole"),
+            ("SageMaker endpoint", "shared model m-c", "vpc-2", "RoleC"),
+            ("SageMaker endpoint", "shared model m-d", "vpc-1", "RoleD"),
+        ]
+        self.sagemaker.list_inference_components.assert_called_once_with(
+            EndpointNameEquals="shared", MaxResults=100
+        )
+
+    def test_br02_an_unread_endpoint_or_model_is_named(self):
+        inventory = self._inventory(
+            endpoints=["one", "two"],
+            endpoint_configs={
+                "one": _make_client_error("AccessDeniedException"),
+                "two": {
+                    "ProductionVariants": [
+                        {"VariantName": "a", "ModelName": "m-x"},
+                        {"VariantName": "b", "ModelName": "m-y"},
+                    ]
+                },
+            },
+            models={
+                "m-x": _make_client_error("AccessDeniedException"),
+                "m-y": {"ExecutionRoleArn": self._role_arn("RoleY")},
+            },
+        )
+
+        assert self._names(inventory) == [
+            ("SageMaker endpoint", "two model m-y", None, "RoleY")
+        ]
+        assert inventory["errors"] == [
+            "the configuration of SageMaker endpoint 'one' was not read with "
+            "sagemaker:DescribeEndpointConfig (AccessDeniedException)",
+            "model m-x of SageMaker endpoint 'two' was not read with "
+            "sagemaker:DescribeModel (AccessDeniedException)",
+        ]
+
+    def test_br02_unlisted_sagemaker_endpoints_are_named(self):
+        inventory = self._inventory(
+            endpoints=_make_client_error("AccessDeniedException")
+        )
+
+        assert inventory["errors"] == [
+            "SageMaker endpoints were not listed with sagemaker:ListEndpoints "
+            "(AccessDeniedException)"
+        ]
+
+    def test_br02_eks_pod_identity_associations_carry_their_role_and_vpc(self):
+        inventory = self._inventory(
+            eks_clusters={
+                "prod": {
+                    "vpc": "vpc-1",
+                    "associations": [
+                        {
+                            "associationId": "a-1",
+                            "namespace": "ml",
+                            "serviceAccount": "infer",
+                            "roleArn": self._role_arn("InferRole"),
+                        },
+                        {
+                            "associationId": "a-2",
+                            "namespace": "ml",
+                            "serviceAccount": "batch",
+                            "roleArn": self._role_arn("BatchRole"),
+                        },
+                    ],
+                },
+                "cross": {
+                    "vpc": "vpc-2",
+                    "associations": [
+                        {
+                            "associationId": "a-3",
+                            "namespace": "x",
+                            "serviceAccount": "y",
+                            "roleArn": self._role_arn("LocalHop"),
+                            "targetRoleArn": "arn:aws:iam::999999999999:role/Remote",
+                        }
+                    ],
+                },
+                "hidden": _make_client_error("AccessDeniedException"),
+            },
+        )
+
+        assert self._names(inventory) == [
+            ("EKS pod identity association", "prod ml/infer", "vpc-1", "InferRole"),
+            ("EKS pod identity association", "prod ml/batch", "vpc-1", "BatchRole"),
+        ]
+        assert inventory["errors"] == [
+            "EKS pod identity association 'cross x/y' gives its pods target role "
+            "arn:aws:iam::999999999999:role/Remote, whose grants the IAM cache of "
+            "this account does not hold",
+            "EKS cluster 'hidden' was not read with eks:DescribeCluster "
+            "(AccessDeniedException)",
+        ]
+        assert [
+            c.kwargs for c in self.eks.list_pod_identity_associations.call_args_list
+        ] == [
+            {"clusterName": "prod", "maxResults": 100},
+            {"clusterName": "cross", "maxResults": 100},
+        ]
+
+    def test_br02_unlisted_eks_clusters_are_named(self):
+        inventory = self._inventory(
+            eks_clusters=_make_client_error("AccessDeniedException")
+        )
+
+        assert inventory["errors"] == [
+            "EKS clusters were not listed with eks:ListClusters (AccessDeniedException)"
+        ]
 
     def test_br02_ecs_services_in_every_cluster_carry_their_task_role_and_vpc(
         self,

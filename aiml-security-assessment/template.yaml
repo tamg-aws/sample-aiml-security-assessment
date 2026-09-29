@@ -300,6 +300,8 @@ Resources:
               - aoss:ListAccessPolicies # BR-20
               - aoss:GetAccessPolicy # BR-20
               - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
+              - sagemaker:ListInferenceComponents # BR-02
+              - eks:ListClusters # BR-02
             Resource: '*'
           - Sid: CloudTrailEventDataStoreRead
             # BR-06 reads each event data store's Status and
@@ -336,6 +338,65 @@ Resources:
             Action:
               - events:ListTargetsByRule # BR-33
             Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
+          - Sid: SageMakerEndpointRead
+            # BR-02 reads the configuration behind each SageMaker endpoint.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeEndpoint # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint/*'
+          - Sid: SageMakerEndpointConfigRead
+            # BR-02 reads the variants, execution role and VPC of each
+            # endpoint configuration.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeEndpointConfig # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint-config/*'
+          - Sid: SageMakerModelRead
+            # BR-02 reads the execution role and VPC of each endpoint model.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeModel # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model/*'
+          - Sid: SageMakerInferenceComponentRead
+            # BR-02 reads the model behind each inference component.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeInferenceComponent # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:inference-component/*'
+          - Sid: EKSClusterRead
+            # BR-02 reads each cluster's VPC and lists its pod identity
+            # associations.
+            Effect: Allow
+            Action:
+              - eks:DescribeCluster # BR-02
+              - eks:ListPodIdentityAssociations # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+          - Sid: EKSPodIdentityAssociationRead
+            # BR-02 reads the role each pod identity association gives.
+            Effect: Allow
+            Action:
+              - eks:DescribePodIdentityAssociation # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:podidentityassociation/*/*'
+          - Sid: ECSTaskRead
+            # BR-02 reads the task role and subnets of each task started
+            # outside a service.
+            Effect: Allow
+            Action:
+              - ecs:DescribeTasks # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/*'
+          - Sid: ECSTaskList
+            # BR-02 lists the tasks in each cluster. The service authorization
+            # reference gives ListTasks the container-instance resource type,
+            # which a listing by cluster does not name, so the grant takes '*'
+            # scoped by the ecs:cluster key, as the ECS developer guide's
+            # ListTasks example does.
+            Effect: Allow
+            Action:
+              - ecs:ListTasks # BR-02
+            Resource: '*'
+            Condition:
+              ArnLike:
+                ecs:cluster: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -411,7 +472,7 @@ Resources:
                 - bedrock-agentcore:ListMemories # BR-53
                 - bedrock-agentcore:ListGateways # BR-53
                 - bedrock-agentcore:ListBrowsers # BR-42, BR-47, BR-52, BR-53
-                - sagemaker:ListEndpoints # BR-53
+                - sagemaker:ListEndpoints # BR-02, BR-53
                 - sagemaker:ListModels # BR-53
                 - sagemaker:ListNotebookInstances # BR-02, BR-53
                 # Former Sid KMSKeyInventory.
