@@ -1277,7 +1277,8 @@ def _statement_has_resource_tag_condition(statement: Dict[str, Any]) -> bool:
     Return whether a statement narrows its resources by tag.
 
     An IfExists or ForAllValues operator passes a resource that lacks the tag,
-    and a negated operator passes every resource without the named value, so
+    a negated operator passes every resource without the named value, and a
+    Like value made only of wildcards, such as "*", matches every value, so
     none of them narrows the grant.
     """
     condition = statement.get("Condition", {})
@@ -1294,9 +1295,15 @@ def _statement_has_resource_tag_condition(statement: Dict[str, Any]) -> bool:
             or "not" in normalized
         ):
             continue
-        for key in condition_keys:
-            if str(key).lower().startswith("aws:resourcetag/"):
-                return True
+        for key, values in condition_keys.items():
+            if not str(key).lower().startswith("aws:resourcetag/"):
+                continue
+            if "like" in normalized and any(
+                "*" in str(value) and not str(value).strip("*?")
+                for value in _policy_values(values)
+            ):
+                continue
+            return True
     return False
 
 
@@ -1419,7 +1426,9 @@ def _endpoint_invocation_scoping_findings(
                     f"{entry['label']} can invoke any SageMaker endpoint in the "
                     f"account: policy '{entry['policy']}' allows endpoint "
                     f"invocation on resource '{entry['resource']}' with no "
-                    "endpoint ARN and no aws:ResourceTag condition."
+                    "endpoint ARN and no aws:ResourceTag condition that narrows "
+                    "it: a Like value made only of wildcards matches every tag "
+                    "value."
                     f"{boundary_text} {SCP_NOT_EVALUATED_NOTE}"
                 ),
                 resolution=ENDPOINT_INVOCATION_SCOPING_RESOLUTION,

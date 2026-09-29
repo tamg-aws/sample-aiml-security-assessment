@@ -10136,6 +10136,55 @@ class TestSM02EndpointInvocationScopingFullGrade:
         )
         assert [r["Status"] for r in rows] == ["Passed"]
 
+    @pytest.mark.parametrize("value", ["*", "?*", ["fraud", "*"]])
+    def test_a_like_tag_condition_that_matches_any_value_does_not_scope(self, value):
+        policy = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": value}},
+        )
+        cache = _v2_cache({"TagRole": [("Inv", policy)]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_a_like_tag_condition_on_a_value_prefix_scopes(self):
+        policy = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": "fraud-*"}},
+        )
+        cache = _v2_cache({"TagRole": [("Inv", policy)]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize("any_value_first", [True, False])
+    def test_only_the_role_whose_tag_matches_any_value_fails(self, any_value_first):
+        scoped = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": "fraud-*"}},
+        )
+        open_tag = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringLike": {"aws:ResourceTag/team": "*"}},
+        )
+        roles = [("ScopedRole", [("Inv", scoped)]), ("AnyTagRole", [("Inv", open_tag)])]
+        if any_value_first:
+            roles.reverse()
+        rows = _by_finding(
+            _sm02_rows(_v2_cache(dict(roles))),
+            sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING,
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "AnyTagRole" in failed[0]["Finding_Details"]
+        assert "ScopedRole" not in failed[0]["Finding_Details"]
+
     def test_boundary_on_named_endpoint_scopes_a_wildcard_grant(self):
         boundary = _identity_policy(
             "sagemaker:InvokeEndpoint",
@@ -10979,6 +11028,51 @@ class TestSM02RuntimeVpcEndpointPolicy:
         )
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "vpce-1" in rows[0]["Finding_Details"]
+
+    @staticmethod
+    def _tag_policy(value):
+        return json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "sagemaker:InvokeEndpoint",
+                        "Resource": "*",
+                        "Condition": {"StringLike": {"aws:ResourceTag/team": value}},
+                    }
+                ]
+            }
+        )
+
+    @pytest.mark.parametrize("any_tag_first", [True, False])
+    def test_a_tag_condition_matching_any_value_fails_only_its_endpoint(
+        self, any_tag_first
+    ):
+        vpces = [
+            dict(
+                _PRIVATE_RUNTIME_VPCE,
+                VpcEndpointId="vpce-prefix",
+                PolicyDocument=self._tag_policy("fraud-*"),
+            ),
+            dict(
+                _PRIVATE_RUNTIME_VPCE,
+                VpcEndpointId="vpce-anytag",
+                PolicyDocument=self._tag_policy("*"),
+            ),
+        ]
+        if any_tag_first:
+            vpces.reverse()
+        rows = self._run(vpces)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "vpce-anytag" in rows[0]["Finding_Details"]
+        assert "vpce-prefix" not in rows[0]["Finding_Details"]
+
+    def test_a_tag_condition_on_a_value_prefix_passes(self):
+        rows = self._run(
+            [dict(_PRIVATE_RUNTIME_VPCE, PolicyDocument=self._tag_policy("fraud-*"))]
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
 
     def test_unparsable_policy_blocks_the_pass(self):
         rows = self._run(

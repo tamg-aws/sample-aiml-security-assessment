@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-02` no longer counts an `aws:ResourceTag` condition as scoping an
+  endpoint invocation grant when a `Like` operator's value is made only of
+  wildcards, such as `*` or `?*`, because that value matches every tag value.
+  This applies to identity policies and to the `sagemaker.runtime` VPC
+  endpoint policy. A `Like` value with a fixed part, such as `fraud-*`, still
+  scopes the grant.
+
 - `SM-34` and `SM-42` no longer credit an `ArnEquals` or `ArnNotEquals`
   condition whose KMS key ARN holds a `*` or `?`. Those operators match
   wildcards as `ArnLike` does, so `arn:aws:kms:*:*:key/*` admits every key.
