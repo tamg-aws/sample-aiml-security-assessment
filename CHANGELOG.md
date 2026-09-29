@@ -1340,6 +1340,17 @@ in the IAM service authorization reference. All six are read-only. Each
 stack creates one more customer managed policy, named with the stack name as
 its prefix.
 
+Both SAM templates add `SageMakerAssessmentReadsPolicy`, an
+`AWS::IAM::ManagedPolicy` attached only to the SageMaker assessment function
+through its `Policies` list, for reads that do not fit that function's
+9000-character inline budget. It renders to under 5500 of IAM's
+6144-character managed policy limit and holds
+`organizations:ListAWSServiceAccessForOrganization` on `*` (`SM-35`), which
+has no resource type and moves out of the inline
+`OrganizationsInventoryPermissions` statement. It is read-only. The
+deployment role permissions added for `BedrockAssessmentReadsPolicy` cover
+this policy too.
+
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a
 managed policy, so an assessment deploy from this version on an old deployment

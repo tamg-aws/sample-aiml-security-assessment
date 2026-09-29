@@ -279,6 +279,9 @@ _EXPECTED_ACTIONS = {
         "sso:ListPermissionSets",
         "tag:GetResources",
     },
+    "SageMakerAssessmentReadsPolicy": {
+        "organizations:ListAWSServiceAccessForOrganization",
+    },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
         "config:DescribeComplianceByConfigRule",
@@ -302,7 +305,6 @@ _EXPECTED_ACTIONS = {
         "iot:ListTargetsForPolicy",
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
-        "organizations:ListAWSServiceAccessForOrganization",
         "organizations:ListDelegatedAdministrators",
         "organizations:ListParents",
         "organizations:ListPolicies",
@@ -773,7 +775,7 @@ def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(templat
         for logical_id, resource in data["Resources"].items()
         if resource.get("Type") == "AWS::IAM::ManagedPolicy"
     }
-    assert managed == {"BedrockAssessmentReadsPolicy"}
+    assert managed == {"BedrockAssessmentReadsPolicy", "SageMakerAssessmentReadsPolicy"}
     properties = data["Resources"]["BedrockAssessmentReadsPolicy"]["Properties"]
     assert not {"Roles", "Users", "Groups"} & set(properties)
 
@@ -790,6 +792,80 @@ def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(templat
     references = [p for p in policies if _references(p, "BedrockAssessmentReadsPolicy")]
     assert references == [{"Fn::Ref": "BedrockAssessmentReadsPolicy"}]
     assert not _references(data.get("Outputs", {}), "BedrockAssessmentReadsPolicy")
+
+
+_SAGEMAKER_MANAGED_GRANTS = [
+    ("Allow", "organizations:ListAWSServiceAccessForOrganization", '"*"'),
+]
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+@pytest.mark.parametrize("partition", ["aws", "aws-us-gov"])
+def test_sagemaker_managed_policy_renders_within_its_budget(template, partition):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    document = data["Resources"]["SageMakerAssessmentReadsPolicy"]["Properties"][
+        "PolicyDocument"
+    ]
+    rendered = json.dumps(
+        _render_policy_intrinsics(document, partition), separators=(",", ":")
+    )
+    assert len(rendered) <= _MANAGED_POLICY_BUDGET, (
+        f"{os.path.basename(template)} SageMakerAssessmentReadsPolicy renders to "
+        f"{len(rendered):,} characters in {partition}; keep it below the "
+        f"{_MANAGED_POLICY_BUDGET:,}-character project budget and never exceed "
+        f"IAM's {_MANAGED_POLICY_LIMIT:,}-character managed policy limit."
+    )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_sagemaker_managed_policy_holds_exactly_the_approved_grants(template):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    resource = data["Resources"]["SageMakerAssessmentReadsPolicy"]
+    assert resource["Type"] == "AWS::IAM::ManagedPolicy"
+    document = resource["Properties"]["PolicyDocument"]
+    assert all(
+        set(s) <= {"Sid", "Effect", "Action", "Resource"} for s in document["Statement"]
+    )
+    grants = sorted(
+        (
+            statement["Effect"],
+            action,
+            json.dumps(statement["Resource"], sort_keys=True),
+        )
+        for statement in document["Statement"]
+        for action in statement["Action"]
+    )
+    assert grants == sorted(_SAGEMAKER_MANAGED_GRANTS)
+    inline = _actions(template, "SagemakerSecurityAssessmentFunction")
+    assert not {action for _, action, _ in grants} & inline
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_sagemaker_managed_policy_is_attached_only_to_the_sagemaker_function(template):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    properties = data["Resources"]["SageMakerAssessmentReadsPolicy"]["Properties"]
+    assert not {"Roles", "Users", "Groups"} & set(properties)
+    referencing = {
+        logical_id
+        for logical_id, resource in data["Resources"].items()
+        if logical_id != "SageMakerAssessmentReadsPolicy"
+        and _references(resource, "SageMakerAssessmentReadsPolicy")
+    }
+    assert referencing == {"SagemakerSecurityAssessmentFunction"}
+    policies = data["Resources"]["SagemakerSecurityAssessmentFunction"]["Properties"][
+        "Policies"
+    ]
+    references = [
+        p for p in policies if _references(p, "SageMakerAssessmentReadsPolicy")
+    ]
+    assert references == [{"Fn::Ref": "SageMakerAssessmentReadsPolicy"}]
+    assert not _references(data.get("Outputs", {}), "SageMakerAssessmentReadsPolicy")
 
 
 _ARTIFACT_PREFIXES = {
@@ -1104,10 +1180,7 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
     for sid, actions in (
         (
             "OrganizationsInventoryPermissions",
-            (
-                "organizations:ListDelegatedAdministrators",
-                "organizations:ListAWSServiceAccessForOrganization",
-            ),
+            ("organizations:ListDelegatedAdministrators",),
         ),
         (
             "AccountInventoryWithoutResourceType",

@@ -718,6 +718,23 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
                 - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
         - !Ref BedrockAssessmentReadsPolicy
+  SageMakerAssessmentReadsPolicy:
+    # Reads that do not fit the SageMaker function's 9000-byte inline policy
+    # budget. Attached only to SagemakerSecurityAssessmentFunction through its
+    # Policies list. A managed policy document is limited to 6144 characters.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read-only grants for the SageMaker security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManagedReadsOnWildcard
+            # None of these actions has a resource type in the service
+            # authorization reference.
+            Effect: Allow
+            Action:
+              - organizations:ListAWSServiceAccessForOrganization # SM-35
+            Resource: '*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -874,13 +891,13 @@ Resources:
                 - config:DescribeConformancePackCompliance # SM-32
               Resource: !Sub 'arn:${AWS::Partition}:config:*:${AWS::AccountId}:conformance-pack/*/*'
             - Sid: OrganizationsInventoryPermissions
-              # None of these four Organizations actions has a resource type in IAM.
+              # None of these three Organizations actions has a resource type in IAM.
+              # ListAWSServiceAccessForOrganization is in SageMakerAssessmentReadsPolicy.
               Effect: Allow
               Action:
                 - organizations:DescribeOrganization # SM-34, SM-35
                 - organizations:ListPolicies # SM-34
                 - organizations:ListDelegatedAdministrators # SM-35
-                - organizations:ListAWSServiceAccessForOrganization # SM-35
               Resource: '*'
             - Sid: EC2SubnetExposureInventory
               # SM-10, SM-11, SM-28 and SM-33 resolve whether a subnet routes to an
@@ -1083,6 +1100,7 @@ Resources:
               Action:
                 - kms:DescribeKey # SM-03, SM-11, SM-18, SM-27
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+        - !Ref SageMakerAssessmentReadsPolicy
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
