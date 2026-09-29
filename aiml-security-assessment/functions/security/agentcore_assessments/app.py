@@ -14214,9 +14214,12 @@ def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -
     return False
 
 
-def _source_arn_names_resource_type(value: str, account_id: str) -> bool:
+def _source_arn_names_resource_type(
+    value: str, account_id: str, resource_types: Optional[Tuple[str, ...]] = None
+) -> bool:
     """Return whether an aws:SourceArn value names `account_id` and fixes every
-    segment up to the resource type.
+    segment up to the resource type, and, when `resource_types` is given, names
+    an AgentCore resource of one of those types.
 
     `arn:aws:bedrock-agentcore:*:111122223333:*` names the account yet matches
     every AgentCore resource in every Region, so it scopes no more than
@@ -14230,10 +14233,16 @@ def _source_arn_names_resource_type(value: str, account_id: str) -> bool:
     if any("*" in part or "?" in part for part in parts[1:4]):
         return False
     resource_type = re.split(r"[/:]", parts[5], maxsplit=1)[0]
+    if resource_types is not None:
+        return parts[2] == "bedrock-agentcore" and resource_type in resource_types
     return bool(resource_type) and "*" not in resource_type and "?" not in resource_type
 
 
-def _statement_scopes_source_arn(statement: Dict[str, Any], account_id: str) -> bool:
+def _statement_scopes_source_arn(
+    statement: Dict[str, Any],
+    account_id: str,
+    resource_types: Optional[Tuple[str, ...]] = None,
+) -> bool:
     """Return whether the statement carries an aws:SourceArn entry whose every
     value names this account, a Region and a resource type with no wildcard.
 
@@ -14257,7 +14266,9 @@ def _statement_scopes_source_arn(statement: Dict[str, Any], account_id: str) -> 
                 values
                 and str(key).strip().lower() == "aws:sourcearn"
                 and all(
-                    _source_arn_names_resource_type(value.strip(), account_id)
+                    _source_arn_names_resource_type(
+                        value.strip(), account_id, resource_types
+                    )
                     for value in values
                 )
             ):
@@ -14266,10 +14277,13 @@ def _statement_scopes_source_arn(statement: Dict[str, Any], account_id: str) -> 
 
 
 def _statements_without_scoped_source_arn(
-    statements: List[Dict[str, Any]], account_id: str
+    statements: List[Dict[str, Any]],
+    account_id: str,
+    resource_types: Optional[Tuple[str, ...]] = None,
 ) -> List[Dict[str, Any]]:
     """Return the Allow statements trusting a service or `*` whose aws:SourceArn
-    is absent or open across Regions or resource types."""
+    is absent, open across Regions or resource types, or, when `resource_types`
+    is given, names a resource of another type."""
     return [
         statement
         for statement in statements
@@ -14277,7 +14291,7 @@ def _statements_without_scoped_source_arn(
             principal == "*" or principal.endswith(".amazonaws.com")
             for principal in _statement_principals(statement)
         )
-        and not _statement_scopes_source_arn(statement, account_id)
+        and not _statement_scopes_source_arn(statement, account_id, resource_types)
     ]
 
 
@@ -22651,6 +22665,11 @@ def check_agentcore_evaluation_pass_role_scope(
     return findings
 
 
+# The resource types the devguide's evaluation execution role trust policy names
+# in aws:SourceArn.
+EVALUATION_SOURCE_ARN_RESOURCE_TYPES = ("evaluator", "online-evaluation-config")
+
+
 def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
     """AC-43: Judge each evaluation execution role's trust for a deputy guard.
 
@@ -22793,7 +22812,9 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
             )
             continue
 
-        unscoped = _statements_without_scoped_source_arn(statements, account_id)
+        unscoped = _statements_without_scoped_source_arn(
+            statements, account_id, EVALUATION_SOURCE_ARN_RESOURCE_TYPES
+        )
         if unscoped:
             findings.append(
                 create_finding(
@@ -22805,9 +22826,11 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
                         "service principal or every principal whose guard names "
                         f"account {account_id} but carries no aws:SourceArn "
                         "condition whose every value names that account, a Region "
-                        "and a resource type with no wildcard. The service can "
-                        "assume the role for any AgentCore resource in the "
-                        "account, in any Region, not only for an evaluation."
+                        "and a resource type with no wildcard, and names an "
+                        "evaluator or online-evaluation-config resource. The "
+                        "service can assume the role for another AgentCore "
+                        "resource in the account, or in another Region, not only "
+                        "for an evaluation."
                     ),
                     resolution=(
                         "Add an ArnLike aws:SourceArn condition naming "
@@ -22829,15 +22852,11 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} runs as {role_name}, whose {len(statements)} Allow "
                         "statement(s) each carry an aws:SourceArn condition whose "
-                        f"every value names account {account_id}, a Region and a "
-                        "resource type with no wildcard, or name no service or "
-                        "wildcard principal."
+                        f"every value names account {account_id}, a Region and "
+                        "an evaluator or online-evaluation-config resource, or "
+                        "name no service or wildcard principal."
                     ),
-                    resolution=(
-                        "No action required. Confirm the aws:SourceArn pattern names "
-                        "this account's evaluator and online-evaluation-config "
-                        "resources rather than other AgentCore resource types."
-                    ),
+                    resolution="No action required.",
                     reference=CONFUSED_DEPUTY_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.PASSED,

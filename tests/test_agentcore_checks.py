@@ -29432,6 +29432,105 @@ class TestAC43EvaluationRoleTrustByValue:
         assert "Eval-oec-0" in passed[0]["Finding_Details"]
 
 
+class TestAC43SourceArnResourceType:
+    """AC-43 requires aws:SourceArn to name an evaluation resource type."""
+
+    _PREFIX = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}"
+
+    def _run(self, mock_ac, mock_iam, source_arns):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": [
+                {
+                    "onlineEvaluationConfigId": f"oec-{i}",
+                    "onlineEvaluationConfigName": f"oec-{i}",
+                }
+                for i in range(len(source_arns))
+            ]
+        }
+        mock_ac.get_online_evaluation_config.side_effect = lambda **kwargs: {
+            "onlineEvaluationConfigId": kwargs["onlineEvaluationConfigId"],
+            "evaluationExecutionRoleArn": (
+                f"arn:aws:iam::{_ACCOUNT}:role/Eval-{kwargs['onlineEvaluationConfigId']}"
+            ),
+        }
+        documents = {
+            f"Eval-oec-{i}": _service_trust(
+                {
+                    "StringEquals": {"aws:SourceAccount": _ACCOUNT},
+                    "ArnLike": {"aws:SourceArn": value},
+                }
+            )
+            for i, value in enumerate(source_arns)
+        }
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": documents[RoleName]}
+        }
+        return agentcore_app.check_agentcore_evaluation_role_trust()
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/*",
+            f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:runtime/*",
+            [
+                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:evaluator/*",
+                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/*",
+            ],
+            f"arn:aws:bedrock:us-east-1:{_ACCOUNT}:evaluator/*",
+        ],
+        ids=["gateway", "runtime", "evaluator-and-gateway", "other-service"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_arn_on_another_resource_type_fails_only_that_role(
+        self, mock_ac, mock_iam, other
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            [
+                [
+                    f"{self._PREFIX}:evaluator/*",
+                    f"{self._PREFIX}:online-evaluation-config/*",
+                ],
+                other,
+            ],
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "Eval-oec-1" in failed[0]["Finding_Details"]
+        assert failed[0]["Finding"] == (
+            "AgentCore Evaluation Role Trust Source ARN Not Scoped"
+        )
+        assert (
+            "an evaluator or online-evaluation-config resource"
+            in failed[0]["Finding_Details"]
+        )
+        assert len(passed) == 1
+        assert "Eval-oec-0" in passed[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:online-evaluation-config/oec-1",
+            f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:evaluator/*",
+        ],
+        ids=["one-config", "evaluators"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_evaluation_resource_type_passes(self, mock_ac, mock_iam, value):
+        findings = self._run(mock_ac, mock_iam, [value])
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "an evaluator or online-evaluation-config resource"
+            in findings[0]["Finding_Details"]
+        )
+
+
 class TestAC48WidenedPopulation:
     """AC-48 reads memory, payment manager and harness roles, and judges a
     condition on an account-root principal by what it names."""
