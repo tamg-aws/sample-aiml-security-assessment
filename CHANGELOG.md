@@ -261,6 +261,15 @@ section.
 
 ### Fixed
 
+- `SM-26` GuardDuty AI Protection adds a `GuardDuty AI Protection
+  Organization Auto-Enable` row for an `ENABLED` detector. It reads
+  `guardduty:DescribeOrganizationConfiguration` (newly granted to the
+  SageMaker function on `*`, because the action has no resource type) and
+  passes only when `AutoEnableOrganizationMembers` and the `AI_PROTECTION`
+  feature's `AutoEnable` are both `ALL`. Outside the GuardDuty delegated
+  administrator the read fails and the row is `N/A`. Whether AI Protection
+  reached every member account used to go unread.
+
 - `SM-38` runtime monitoring coverage compares every running EC2 instance
   (`ec2:DescribeInstances`, newly granted to the SageMaker function on `*`
   because the action has no resource type) with the EC2 instances in

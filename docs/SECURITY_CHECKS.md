@@ -265,7 +265,7 @@ investigation and remediation.
 ### SM-26: GuardDuty AI Protection
 
 - **Severity:** High
-- **Description:** Reuses the regional GuardDuty detector inventory and verifies the detector `Status` and its `AI_PROTECTION` feature are both `ENABLED`. A detector with status `DISABLED` fails whatever its feature status, and a Region with no detector fails, because neither produces AI Protection findings.
+- **Description:** Reuses the regional GuardDuty detector inventory and verifies the detector `Status` and its `AI_PROTECTION` feature are both `ENABLED`. A detector with status `DISABLED` fails whatever its feature status, and a Region with no detector fails, because neither produces AI Protection findings. For an `ENABLED` detector, a second row, `GuardDuty AI Protection Organization Auto-Enable`, reads `DescribeOrganizationConfiguration` (every page) and passes only when `AutoEnableOrganizationMembers` is `ALL` and the `AI_PROTECTION` feature's `AutoEnable` is `ALL`. `NEW`, `NONE` or a missing entry fails. A failed read is `N/A`, because only the GuardDuty delegated administrator can call the API. Each member account's own detector is not read.
 
 ### SM-27: HyperPod EBS CMK Encryption
 

@@ -1147,6 +1147,89 @@ def _guardduty_eventbridge_routing_finding(region: str) -> Dict[str, Any]:
     )
 
 
+GUARDDUTY_ORG_AUTO_ENABLE_FINDING = "GuardDuty AI Protection Organization Auto-Enable"
+
+
+def _guardduty_org_auto_enable_finding(region: str, detector_id: str) -> Dict[str, Any]:
+    """GuardDuty and its AI_PROTECTION plan auto-enabled for ALL member accounts."""
+    reference = "https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html"
+    try:
+        client = boto3.client("guardduty", config=boto3_config, region_name=region)
+        response = client.describe_organization_configuration(DetectorId=detector_id)
+        features = list(response.get("Features") or [])
+        token = response.get("NextToken")
+        while isinstance(token, str) and token:
+            page = client.describe_organization_configuration(
+                DetectorId=detector_id, NextToken=token
+            )
+            features.extend(page.get("Features") or [])
+            token = page.get("NextToken")
+    except Exception as error:
+        return create_finding(
+            check_id="SM-26",
+            finding_name=GUARDDUTY_ORG_AUTO_ENABLE_FINDING,
+            finding_details=(
+                "guardduty:DescribeOrganizationConfiguration failed "
+                f"({get_assessment_error_label(error)}). Only the GuardDuty "
+                "delegated administrator account can read whether GuardDuty and "
+                "AI Protection are auto-enabled for member accounts, so this leg "
+                "is judged when the assessment runs there."
+            ),
+            resolution=(
+                "Run the assessment in the GuardDuty delegated administrator "
+                "account to judge organization auto-enable."
+            ),
+            reference=reference,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+    members = response.get("AutoEnableOrganizationMembers")
+    ai_protection = next(
+        (
+            feature.get("AutoEnable")
+            for feature in features
+            if feature.get("Name") == "AI_PROTECTION"
+        ),
+        None,
+    )
+    if members == "ALL" and ai_protection == "ALL":
+        return create_finding(
+            check_id="SM-26",
+            finding_name=GUARDDUTY_ORG_AUTO_ENABLE_FINDING,
+            finding_details=(
+                "The organization configuration auto-enables GuardDuty "
+                "(AutoEnableOrganizationMembers ALL) and the AI_PROTECTION feature "
+                "(AutoEnable ALL) for every existing and new member account. Each "
+                "member's own detector is not read."
+            ),
+            resolution="No action required",
+            reference=reference,
+            severity="High",
+            status="Passed",
+            region=region,
+        )
+    return create_finding(
+        check_id="SM-26",
+        finding_name=GUARDDUTY_ORG_AUTO_ENABLE_FINDING,
+        finding_details=(
+            f"AutoEnableOrganizationMembers is {members or 'not returned'} and the "
+            f"AI_PROTECTION feature AutoEnable is {ai_protection or 'not returned'}. "
+            "Both must be ALL: NEW enables only accounts that join later, and NONE "
+            "enables none, so a member account can host AI workloads without AI "
+            "Protection."
+        ),
+        resolution=(
+            "From the GuardDuty delegated administrator, set auto-enable to ALL for "
+            "the organization and for the AI Protection plan."
+        ),
+        reference=reference,
+        severity="High",
+        status="Failed",
+        region=region,
+    )
+
+
 def check_guardduty_ai_protection(
     region: str = "", detector_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
@@ -1216,6 +1299,9 @@ def check_guardduty_ai_protection(
                 status="Passed" if enabled else "Failed",
                 region=region,
             )
+        )
+        findings["csv_data"].append(
+            _guardduty_org_auto_enable_finding(region, inventory["detector_id"])
         )
     except Exception as error:
         findings["csv_data"].append(

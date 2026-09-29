@@ -832,9 +832,12 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:inference-component/*'
         - Statement:
             - Sid: GuardDutyInventoryPermissions
+              # SM-26 reads organization auto-enable from the delegated
+              # administrator. Neither action has a resource type in IAM.
               Effect: Allow
               Action:
                 - guardduty:ListDetectors
+                - guardduty:DescribeOrganizationConfiguration # SM-26
               Resource: '*'
             - Sid: GuardDutyDetectorRead
               Effect: Allow

@@ -294,6 +294,7 @@ _EXPECTED_ACTIONS = {
         "guardduty:GetDetector",
         "guardduty:ListCoverage",
         "guardduty:ListDetectors",
+        "guardduty:DescribeOrganizationConfiguration",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetServiceLastAccessedDetails",
         "iot:GetPolicy",
@@ -1119,6 +1120,10 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
                 "ec2:DescribeSecurityGroups",
                 "ec2:DescribeInstances",
             ),
+        ),
+        (
+            "GuardDutyInventoryPermissions",
+            ("guardduty:ListDetectors", "guardduty:DescribeOrganizationConfiguration"),
         ),
         ("ConformancePackInventory", ("config:DescribeConformancePacks",)),
         (

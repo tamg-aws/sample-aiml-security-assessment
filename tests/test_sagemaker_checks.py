@@ -575,7 +575,10 @@ class TestSM04SecurityHubRouting:
 class TestProposedSageMakerChecks:
     """SM-26 through SM-30 proposal checks (SM-29 remains reserved/deferred)."""
 
-    def test_sm26_ai_protection_enabled_passes(self):
+    # SM-26 reads the organization auto-enable configuration once the detector
+    # is ENABLED, so boto3 is patched here to keep these tests off the network.
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_ai_protection_enabled_passes(self, mock_client):
         inventory = {
             "detector_id": "detector-1",
             "detail": {
@@ -590,7 +593,8 @@ class TestProposedSageMakerChecks:
         assert finding["Check_ID"] == "SM-26"
         assert finding["Status"] == "Passed"
 
-    def test_sm26_ai_protection_disabled_fails(self):
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_ai_protection_disabled_fails(self, mock_client):
         inventory = {
             "detector_id": "detector-1",
             "detail": {"Status": "ENABLED", "Features": []},
@@ -618,6 +622,105 @@ class TestProposedSageMakerChecks:
         assert "detector-1" in finding["Finding_Details"]
         assert "DISABLED" in finding["Finding_Details"]
         assert "AI Protection is enabled" not in finding["Finding_Details"]
+
+    ENABLED_INVENTORY = {
+        "detector_id": "detector-1",
+        "detail": {
+            "Status": "ENABLED",
+            "Features": [{"Name": "AI_PROTECTION", "Status": "ENABLED"}],
+        },
+        "error": None,
+    }
+
+    def _org_rows(self, mock_client, pages=None, error=None, inventory=None):
+        client = mock_client.return_value
+        if error is not None:
+            client.describe_organization_configuration.side_effect = error
+        else:
+            client.describe_organization_configuration.side_effect = list(pages)
+        rows = extract_csv_data(
+            sagemaker_app.check_guardduty_ai_protection(
+                "us-east-1", inventory or self.ENABLED_INVENTORY
+            )
+        )
+        return [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.GUARDDUTY_ORG_AUTO_ENABLE_FINDING
+        ]
+
+    @staticmethod
+    def _org_page(members="ALL", ai="ALL", token=None, others=("S3_DATA_EVENTS",)):
+        features = [{"Name": name, "AutoEnable": "NONE"} for name in others]
+        if ai is not None:
+            features.append({"Name": "AI_PROTECTION", "AutoEnable": ai})
+        page = {"AutoEnableOrganizationMembers": members, "Features": features}
+        if token:
+            page["NextToken"] = token
+        return page
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_auto_enable_all_passes(self, mock_client):
+        rows = self._org_rows(mock_client, [self._org_page()])
+        assert [r["Status"] for r in rows] == ["Passed"]
+        mock_client.return_value.describe_organization_configuration.assert_called_once_with(
+            DetectorId="detector-1"
+        )
+
+    @pytest.mark.parametrize(
+        "members,ai",
+        [("ALL", "NEW"), ("ALL", "NONE"), ("NEW", "ALL"), ("NONE", "ALL")],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_auto_enable_short_of_all_fails(self, mock_client, members, ai):
+        rows = self._org_rows(mock_client, [self._org_page(members=members, ai=ai)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"AutoEnableOrganizationMembers is {members}" in rows[0]["Finding_Details"]
+        )
+        assert f"AI_PROTECTION feature AutoEnable is {ai}" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_without_an_ai_protection_entry_fails(self, mock_client):
+        rows = self._org_rows(mock_client, [self._org_page(ai=None)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "AutoEnable is not returned" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_ai_protection_on_a_later_page_is_read(self, mock_client):
+        rows = self._org_rows(
+            mock_client,
+            [
+                self._org_page(ai=None, token="t1"),
+                self._org_page(ai="ALL", others=("EKS_AUDIT_LOGS",)),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            mock_client.return_value.describe_organization_configuration.call_args_list[
+                1
+            ].kwargs
+            == {"DetectorId": "detector-1", "NextToken": "t1"}
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_read_error_is_na_naming_the_delegated_admin(self, mock_client):
+        rows = self._org_rows(
+            mock_client, error=_make_client_error("BadRequestException")
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "DescribeOrganizationConfiguration" in rows[0]["Finding_Details"]
+        assert "delegated administrator" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm26_org_leg_is_not_read_for_a_suspended_detector(self, mock_client):
+        inventory = {
+            "detector_id": "detector-1",
+            "detail": {"Status": "DISABLED", "Features": []},
+            "error": None,
+        }
+        assert self._org_rows(mock_client, [], inventory=inventory) == []
+        mock_client.return_value.describe_organization_configuration.assert_not_called()
 
     def test_sm26_no_detector_fails(self):
         finding = extract_csv_data(
