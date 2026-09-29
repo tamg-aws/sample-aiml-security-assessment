@@ -1801,6 +1801,76 @@ class TestSM14ContainerRepository:
         assert_could_not_assess_finding(findings[0])
 
 
+def _sm14_rows(models, pages=None):
+    """Run SM-14 over {model name: DescribeModel response or exception}."""
+
+    def describe_model(ModelName):
+        value = models[ModelName]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    listing = {"list_models": [{"Models": [{"ModelName": n} for n in models]}]}
+    listing.update(pages or {})
+    sm = _pages_client(listing, describe_model=MagicMock(side_effect=describe_model))
+    with patch("sagemaker_app.boto3.client", return_value=sm):
+        return extract_csv_data(
+            sagemaker_app.check_sagemaker_model_container_repository("us-east-1")
+        )
+
+
+def _sm14_model(mode):
+    return {
+        "PrimaryContainer": {
+            "Image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/m:1",
+            "ImageConfig": {"RepositoryAccessMode": mode},
+        }
+    }
+
+
+class TestSM14UnreadModels:
+    """EP-03: a model whose description failed is not counted as passing."""
+
+    def test_every_model_in_vpc_mode_passes(self):
+        rows = _sm14_rows({"a": _sm14_model("Vpc"), "b": _sm14_model("Vpc")})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 2 models" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("broken_first", [True, False])
+    def test_a_failed_describe_withholds_passed_and_is_named(self, broken_first):
+        models = [
+            ("good", _sm14_model("Vpc")),
+            ("broken", _make_client_error("AccessDeniedException")),
+        ]
+        if broken_first:
+            models.reverse()
+        rows = _sm14_rows(dict(models))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sagemaker:DescribeModel broken" in rows[0]["Finding_Details"]
+        assert "AccessDenied" in rows[0]["Finding_Details"]
+
+    def test_a_failed_describe_beside_a_platform_model_keeps_both_rows(self):
+        rows = _sm14_rows(
+            {
+                "open": _sm14_model("Platform"),
+                "broken": _make_client_error("ThrottlingException"),
+            }
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A"]
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert "'open'" in failed[0]["Finding_Details"]
+        unread = [r for r in rows if r["Status"] == "N/A"]
+        assert "sagemaker:DescribeModel broken" in unread[0]["Finding_Details"]
+
+    def test_a_failed_list_is_not_reported_as_no_models(self):
+        rows = _sm14_rows(
+            {}, pages={"list_models": _make_client_error("AccessDeniedException")}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sagemaker:ListModels" in rows[0]["Finding_Details"]
+        assert "No models found" not in rows[0]["Finding_Details"]
+
+
 # ===================================================================
 # SM-15: check_sagemaker_feature_store_encryption
 # ===================================================================

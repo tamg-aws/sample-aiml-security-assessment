@@ -6303,6 +6303,7 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
 
         models_platform_mode = []
         models_vpc_mode = []
+        unread = []
 
         try:
             paginator = sagemaker_client.get_paginator("list_models")
@@ -6364,9 +6365,14 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                             logger.warning(
                                 f"Error describing model {model_name}: {str(e)}"
                             )
+                            unread.append(
+                                f"sagemaker:DescribeModel {model_name} "
+                                f"({get_assessment_error_label(e)})"
+                            )
 
         except Exception as e:
             logger.error(f"Error listing models: {str(e)}")
+            unread.append(f"sagemaker:ListModels ({get_assessment_error_label(e)})")
 
         if models_platform_mode:
             # Limit findings
@@ -6397,7 +6403,7 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                         region=region,
                     )
                 )
-        else:
+        elif not unread:
             if models_vpc_mode:
                 # Models exist and all use VPC repository access - Passed
                 findings["csv_data"].append(
@@ -6426,6 +6432,19 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                         region=region,
                     )
                 )
+
+        if unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-14",
+                    "SageMaker Model Repository Access Check",
+                    unread,
+                    f"{len(models_vpc_mode)} model(s) have a primary container "
+                    "with VPC repository access.",
+                    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-container-repositories.html",
+                    region,
+                )
+            )
 
         return findings
 

@@ -261,6 +261,11 @@ section.
 
 ### Fixed
 
+- `SM-14` names a model whose `DescribeModel` call failed, or a failed
+  `ListModels`, in an `N/A` Incomplete row and withholds `Passed`. Such a
+  model used to be logged and dropped, so the rest could pass, and a failed
+  list read as no models found.
+
 - `SM-03` reads the `KeyState` that `kms:DescribeKey` returns beside
   `KeyManager`. A notebook, domain, training job output or volume, training
   file system, or training data bucket whose customer managed key has a
