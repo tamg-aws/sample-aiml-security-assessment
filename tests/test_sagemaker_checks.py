@@ -6749,6 +6749,9 @@ class TestSM35SecurityServiceDelegatedAdmin:
                         ]
                     }
                 ],
+                "config-multiaccountsetup.amazonaws.com": [
+                    {"DelegatedAdministrators": [active]}
+                ],
                 # The active admin arrives on the second page.
                 "access-analyzer.amazonaws.com": [
                     {"DelegatedAdministrators": []},
@@ -6779,11 +6782,13 @@ class TestSM35SecurityServiceDelegatedAdmin:
             "Passed",
             "Passed",
             "Passed",
+            "Passed",
             "Failed",
             "Passed",
             "Failed",
             "Failed",
         ]
+        assert "config-multiaccountsetup.amazonaws.com" in rows[5]["Finding_Details"]
         assert all(r["Check_ID"] == "SM-35" for r in rows)
         assert all(
             "Services checked (fixed list): Amazon GuardDuty" in r["Finding_Details"]
@@ -6813,7 +6818,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
             }
         )
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert [r["Status"] for r in rows] == ["Passed"] * 12
+        assert [r["Status"] for r in rows] == ["Passed"] * 13
         assert self.MANAGEMENT not in rows[0]["Finding_Details"].split(".")[0]
         assert (
             f"one non-management account {self.SECURITY}"
@@ -6831,7 +6836,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
         pages["guardduty.amazonaws.com"] = _make_client_error("TooManyRequests")
         mock_client.return_value = self._client(pages)
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert len(rows) == 12
+        assert len(rows) == 13
         assert_could_not_assess_finding(rows[0])
         assert "readable only from" not in rows[0]["Finding_Details"]
         assert rows[1]["Status"] == "Failed"
@@ -6898,6 +6903,45 @@ class TestSM35DelegatedAdminConsolidation:
     def test_acc09_services_are_checked(self, service):
         assert service in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
 
+    def test_config_multi_account_setup_is_a_checked_service(self):
+        # Config rules and conformance packs are delegated through their own
+        # principal, apart from the aggregator's config.amazonaws.com.
+        assert (
+            "AWS Config multi-account setup",
+            "config-multiaccountsetup.amazonaws.com",
+        ) in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+
+    @pytest.mark.parametrize(
+        "management, dedicated",
+        [
+            ("config-multiaccountsetup.amazonaws.com", "config.amazonaws.com"),
+            ("config.amazonaws.com", "config-multiaccountsetup.amazonaws.com"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_each_config_principal_is_judged_on_its_own_administrator(
+        self, mock_client, management, dedicated
+    ):
+        rows = self._rows(
+            mock_client,
+            {
+                management: [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ]
+            },
+        )
+        by_principal = {
+            principal: [r for r in rows if f"({principal})" in r["Finding_Details"]]
+            for principal in (management, dedicated)
+        }
+        assert [r["Status"] for r in by_principal[management]] == ["Failed"]
+        assert [r["Status"] for r in by_principal[dedicated]] == ["Passed"]
+        assert rows[-1]["Status"] == "Failed"
+
     @patch("sagemaker_app.boto3.client")
     def test_a_management_administered_audit_manager_fails(self, mock_client):
         rows = self._rows(
@@ -6921,7 +6965,7 @@ class TestSM35DelegatedAdminConsolidation:
     def test_one_shared_administrator_passes(self, mock_client):
         rows = self._rows(mock_client)
         assert rows[-1]["Status"] == "Passed"
-        assert "11 security services" in rows[-1]["Finding_Details"]
+        assert "12 security services" in rows[-1]["Finding_Details"]
         assert "not recorded by any Organizations API" in rows[-1]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
@@ -6939,7 +6983,7 @@ class TestSM35DelegatedAdminConsolidation:
             },
         )
         # Every per-service row passes; only the cross-service row sees the split.
-        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 11
+        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 12
         assert rows[-1]["Status"] == "Failed"
         assert f"account {self.OTHER}: Amazon Inspector" in rows[-1]["Finding_Details"]
 

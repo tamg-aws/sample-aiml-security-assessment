@@ -12877,6 +12877,7 @@ SECURITY_SERVICE_PRINCIPALS = (
     ("Amazon Inspector", "inspector2.amazonaws.com"),
     ("Amazon Macie", "macie.amazonaws.com"),
     ("AWS Config", "config.amazonaws.com"),
+    ("AWS Config multi-account setup", "config-multiaccountsetup.amazonaws.com"),
     ("IAM Access Analyzer", "access-analyzer.amazonaws.com"),
     ("AWS CloudTrail", "cloudtrail.amazonaws.com"),
     ("Amazon Detective", "detective.amazonaws.com"),

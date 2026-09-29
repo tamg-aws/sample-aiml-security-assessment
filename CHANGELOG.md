@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-35` security service delegated administrator also reads
+  `config-multiaccountsetup.amazonaws.com`, the principal AWS Config rules
+  and conformance packs are delegated through, beside
+  `config.amazonaws.com`. A Config rules administrator left on the
+  management account, or on a second account, used to go unread, so the
+  consolidation row could pass.
+
 - `SM-37` endpoint network alerting no longer passes on an alarm that can
   never fire. An alarm is credited only when it reads the dimension names
   and unit its metric filter publishes, and, when the filter publishes

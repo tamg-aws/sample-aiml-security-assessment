@@ -1580,9 +1580,12 @@ FOUNDATION_ROWS = [
         "sagemaker_assessments",
         ["SM-35"],
         "SM-35 reads the management account id from DescribeOrganization and "
-        "calls ListDelegatedAdministrators for each of a fixed list of six service "
-        "principals: GuardDuty, Security Hub, Inspector, Macie, Config and IAM "
-        "Access Analyzer, which the finding states. One row per service passes "
+        "calls ListDelegatedAdministrators for each of a fixed list of 12 service "
+        "principals: GuardDuty, Security Hub, Inspector, Macie, Config "
+        "(config.amazonaws.com), Config multi-account setup "
+        "(config-multiaccountsetup.amazonaws.com), IAM Access Analyzer, "
+        "CloudTrail, Detective, Security Lake, Firewall Manager and Audit "
+        "Manager, which the finding states. One row per service passes "
         "when an ACTIVE delegated administrator is not the management account, "
         "and fails when there is none or it is the management account. A member "
         "account that cannot call the API is Not Applicable with the reason",

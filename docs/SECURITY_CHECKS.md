@@ -307,7 +307,7 @@ investigation and remediation.
 ### SM-35: Security Service Delegated Administrator
 
 - **Severity:** High
-- **Description:** Emits one row per security service from a fixed list (Amazon GuardDuty, AWS Security Hub, Amazon Inspector, Amazon Macie, AWS Config, IAM Access Analyzer), each row naming the list. A service passes when an `ACTIVE` delegated administrator other than the organization management account is registered, and fails when none is registered or the only active one is the management account. `ListDelegatedAdministrators` is readable only from the management account or a delegated administrator account, so an access denial for one service is `N/A` for that service alone. An account outside AWS Organizations produces one `N/A` row. Runs once, on the primary region, tagged `Global`.
+- **Description:** Emits one row per security service principal from a fixed list (Amazon GuardDuty, AWS Security Hub, Amazon Inspector, Amazon Macie, AWS Config through `config.amazonaws.com`, AWS Config multi-account setup through `config-multiaccountsetup.amazonaws.com`, IAM Access Analyzer, AWS CloudTrail, Amazon Detective, Amazon Security Lake, AWS Firewall Manager, AWS Audit Manager), each row naming the list. A service passes when an `ACTIVE` delegated administrator other than the organization management account is registered, and fails when none is registered or the only active one is the management account. `ListDelegatedAdministrators` is readable only from the management account or a delegated administrator account, so an access denial for one service is `N/A` for that service alone. An account outside AWS Organizations produces one `N/A` row. Runs once, on the primary region, tagged `Global`.
 
 ### SM-36: Security Hub AI Security Standard
 
