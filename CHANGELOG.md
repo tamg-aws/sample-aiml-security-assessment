@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-11` endpoint model network path also judges the model each inference
+  component names, from `Specification` and every `Specifications` entry,
+  beside the endpoint config's own `EnableNetworkIsolation` and
+  `VpcConfig`. A component model with isolation off or no `VpcConfig` used
+  to pass behind a compliant endpoint config, and a component that could not
+  be listed or described now leaves its endpoint `N/A`.
+
 - `AR-10` credited a rule filtered on `region`, `time`, `id` or any other
   top-level field beyond `source`, `detail-type`, `detail`, `resources` and
   `account` as routing every approval transition. Every such field now

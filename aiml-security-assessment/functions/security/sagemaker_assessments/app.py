@@ -5153,39 +5153,103 @@ def _endpoint_hosting_inventory(sagemaker_client) -> Dict[str, Any]:
     return {"endpoints": endpoints, "unread": unread}
 
 
+def _inference_component_models(
+    sagemaker_client, inventory: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    The models each inference component on an endpoint names.
+
+    Returns {endpoint name: ([(component, model), ...], [unread, ...])}. A
+    component that names a Container and no model, or an adapter loaded by a
+    base component, contributes no model.
+    """
+    components = {}
+    for endpoint in inventory["endpoints"]:
+        if not endpoint["component_variants"]:
+            continue
+        name = endpoint["name"]
+        served, unread = [], []
+        try:
+            for page in sagemaker_client.get_paginator(
+                "list_inference_components"
+            ).paginate(EndpointNameEquals=name):
+                for summary in page.get("InferenceComponents", []):
+                    component = summary.get("InferenceComponentName")
+                    if summary.get("EndpointName") != name or not component:
+                        continue
+                    try:
+                        described = sagemaker_client.describe_inference_component(
+                            InferenceComponentName=component
+                        )
+                    except Exception as error:
+                        unread.append(
+                            f"inference component '{component}' on endpoint "
+                            f"'{name}' ({get_assessment_error_label(error)})"
+                        )
+                        continue
+                    specifications = [described.get("Specification") or {}] + list(
+                        described.get("Specifications") or []
+                    )
+                    served.extend(
+                        (component, spec["ModelName"])
+                        for spec in specifications
+                        if spec.get("ModelName")
+                    )
+        except Exception as error:
+            unread.append(
+                f"inference components of endpoint '{name}' "
+                f"({get_assessment_error_label(error)})"
+            )
+        components[name] = (served, unread)
+    return components
+
+
 def _endpoint_model_network_findings(
     inventory: Dict[str, Any],
     model_settings: Dict[str, Dict[str, Any]],
     unread_models: Dict[str, str],
     region: str,
+    component_models: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     AIR-SGM-EP-01 and EP-03: judge network isolation and VpcConfig on the
     models an endpoint actually serves, not on the model inventory at large.
 
-    A model the endpoint names but the scan could not describe, or one deleted
-    after the endpoint was created, leaves that endpoint unread.
+    An endpoint that hosts inference components is judged on the endpoint
+    config's own settings and on the model each component names. A model the
+    endpoint names but the scan could not describe, one deleted after the
+    endpoint was created, or components that could not be read, leave that
+    endpoint unread.
     """
     emitted = []
     unread = list(inventory["unread"])
     compliant = []
+    component_models = component_models or {}
     for endpoint in inventory["endpoints"]:
         gaps = []
         endpoint_unread = False
-        for model_name in endpoint["models"]:
+        served = [(None, model_name) for model_name in endpoint["models"]]
+        components, components_unread = component_models.get(endpoint["name"], ([], []))
+        served.extend(components)
+        if components_unread:
+            unread.extend(components_unread)
+            endpoint_unread = True
+        for component, model_name in served:
+            label = f"model '{model_name}'" + (
+                f" of inference component '{component}'" if component else ""
+            )
             settings = model_settings.get(model_name)
             if settings is None:
                 reason = unread_models.get(model_name, "not in the model inventory")
                 unread.append(
-                    f"model '{model_name}' behind endpoint '{endpoint['name']}' "
-                    f"({reason})"
+                    f"{label} behind endpoint '{endpoint['name']}' ({reason})"
                 )
                 endpoint_unread = True
                 continue
             if not settings["isolation"]:
-                gaps.append(f"model '{model_name}' has EnableNetworkIsolation off")
+                gaps.append(f"{label} has EnableNetworkIsolation off")
             if not settings["subnets"]:
-                gaps.append(f"model '{model_name}' has no VpcConfig")
+                gaps.append(f"{label} has no VpcConfig")
         if endpoint["component_variants"]:
             config = endpoint["config"]
             vpc_config = config.get("VpcConfig")
@@ -6017,7 +6081,11 @@ def check_sagemaker_model_network_isolation(
 
         findings["csv_data"].extend(
             _endpoint_model_network_findings(
-                inventory, model_settings, unread_models, region
+                inventory,
+                model_settings,
+                unread_models,
+                region,
+                _inference_component_models(sagemaker_client, inventory),
             )
         )
         findings["csv_data"].extend(_endpoint_config_kms_findings(inventory, region))
