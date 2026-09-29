@@ -24997,6 +24997,156 @@ def _customer_policy(name, *statements):
     }
 
 
+class TestBR39JobVpc:
+    """BR-39 / AIR-FND-NET-01: customization and batch jobs must run in a private VPC."""
+
+    net = TestBR39MarketplaceSubnetPrivacy
+
+    @staticmethod
+    def _bedrock(customization=(), batch=(), list_error=None, get_errors=()):
+        client = MagicMock()
+        details = {job["jobName"]: job for job in customization}
+        if list_error is not None:
+            client.list_model_customization_jobs.side_effect = list_error
+            client.list_model_invocation_jobs.side_effect = list_error
+        else:
+            client.list_model_customization_jobs.return_value = {
+                "modelCustomizationJobSummaries": [
+                    {"jobName": name, "jobArn": f"arn:job/{name}"} for name in details
+                ]
+            }
+            client.list_model_invocation_jobs.return_value = {
+                "invocationJobSummaries": list(batch)
+            }
+
+        def get_job(jobIdentifier):
+            name = jobIdentifier.rsplit("/", 1)[-1]
+            if name in get_errors:
+                raise _make_client_error("AccessDeniedException")
+            return details[name]
+
+        client.get_model_customization_job.side_effect = get_job
+        return client
+
+    @staticmethod
+    def _job(name, subnets=None):
+        job = {"jobName": name, "jobArn": f"arn:job/{name}"}
+        if subnets is not None:
+            job["vpcConfig"] = {
+                "subnetIds": list(subnets),
+                "securityGroupIds": ["sg-1"],
+            }
+        return job
+
+    def _run(self, bedrock, ec2=None):
+        return extract_csv_data(
+            bedrock_app.check_bedrock_job_vpc(
+                "us-east-1",
+                bedrock_client=bedrock,
+                ec2_client=ec2
+                or self.net._ec2(
+                    [
+                        self.net._subnet("subnet-private"),
+                        self.net._subnet("subnet-public"),
+                    ],
+                    [self.net._PRIVATE_TABLE, self.net._PUBLIC_TABLE],
+                ),
+            )
+        )
+
+    def test_br39_jobs_are_judged_by_vpc_and_route(self):
+        rows = self._run(
+            self._bedrock(
+                customization=[
+                    self._job("tune-private", ["subnet-private"]),
+                    self._job("tune-open"),
+                ],
+                batch=[
+                    self._job("batch-public", ["subnet-public"]),
+                    self._job("batch-private", ["subnet-private"]),
+                ],
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "2 of 4" in detail
+        assert "customization job 'tune-open' has no vpcConfig" in detail
+        assert "batch inference job 'batch-public'" in detail
+        assert "igw-1" in detail
+        assert "tune-private" not in detail and "batch-private" not in detail
+        assert rows[0]["Finding"] == bedrock_app.BEDROCK_JOB_VPC_FINDING
+
+    def test_br39_private_jobs_pass(self):
+        rows = self._run(
+            self._bedrock(
+                customization=[self._job("tune-private", ["subnet-private"])],
+                batch=[self._job("batch-private", ["subnet-private"])],
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "2 Bedrock job(s)" in rows[0]["Finding_Details"]
+
+    def test_br39_empty_subnet_list_is_outside_a_vpc(self):
+        rows = self._run(self._bedrock(batch=[self._job("batch-empty", [])]))
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "batch inference job 'batch-empty' has no vpcConfig"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "bedrock_kwargs, ec2, phrase",
+        [
+            (
+                {"get_errors": ("tune-hidden",)},
+                None,
+                "bedrock:GetModelCustomizationJob",
+            ),
+            (
+                {"list_error": _make_client_error("AccessDeniedException")},
+                None,
+                "bedrock:ListModelInvocationJobs",
+            ),
+            (
+                {},
+                TestBR39MarketplaceSubnetPrivacy._ec2(
+                    [{"SubnetId": "subnet-private", "VpcId": "vpc-1"}],
+                    tables_error=_make_client_error("UnauthorizedOperation"),
+                ),
+                "UnauthorizedOperation",
+            ),
+        ],
+    )
+    def test_br39_unread_job_leg_is_not_a_pass(self, bedrock_kwargs, ec2, phrase):
+        rows = self._run(
+            self._bedrock(
+                customization=[
+                    self._job("tune-private", ["subnet-private"]),
+                    self._job("tune-hidden", ["subnet-private"]),
+                ],
+                **bedrock_kwargs,
+            ),
+            ec2,
+        )
+
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(
+            phrase in row["Finding_Details"] for row in rows if row["Status"] == "N/A"
+        )
+
+    def test_br39_no_jobs_is_na(self):
+        rows = self._run(self._bedrock())
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "No model customization or batch inference jobs"
+            in (rows[0]["Finding_Details"])
+        )
+
+
 class TestBR01WildcardActionGrant:
     """BR-01: customer-written bedrock:* and NotAction grants."""
 

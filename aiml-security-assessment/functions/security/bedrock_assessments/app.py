@@ -18982,6 +18982,185 @@ def check_bedrock_marketplace_endpoint_vpc(
     return findings
 
 
+BEDROCK_JOB_VPC_FINDING = "Bedrock Job VPC Configuration"
+
+
+def check_bedrock_job_vpc(
+    region: str = "", bedrock_client: Any = None, ec2_client: Any = None
+) -> Dict[str, Any]:
+    """
+    BR-39: Require a private VPC on every model customization and batch
+    inference job. A job with no vpcConfig runs outside the customer's VPC, and
+    one whose subnet routes to an internet gateway has a path off it. Every job
+    is judged whatever its status, as SM-33 judges training jobs.
+    """
+    findings = {"csv_data": []}
+    reference = (
+        "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_VpcConfig.html"
+    )
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-39",
+            finding_name=BEDROCK_JOB_VPC_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=reference,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    client = bedrock_client or boto3.client(
+        "bedrock", config=boto3_config, region_name=region
+    )
+    jobs = []
+    unread = []
+    try:
+        summaries = _list_all_items(
+            client, "list_model_customization_jobs", "modelCustomizationJobSummaries"
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        summaries = []
+        unread.append(
+            "model customization jobs were not listed with "
+            f"bedrock:ListModelCustomizationJobs ({get_assessment_error_label(error)})"
+        )
+    for summary in summaries:
+        name = summary.get("jobName") or summary.get("jobArn") or "unnamed"
+        try:
+            detail = client.get_model_customization_job(
+                jobIdentifier=summary.get("jobArn") or name
+            )
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"customization job '{name}' was not read with "
+                f"bedrock:GetModelCustomizationJob ({get_assessment_error_label(error)})"
+            )
+            continue
+        jobs.append(
+            (
+                f"customization job '{name}'",
+                (detail.get("vpcConfig") or {}).get("subnetIds") or [],
+            )
+        )
+    try:
+        batch_jobs = _list_all_items(
+            client, "list_model_invocation_jobs", "invocationJobSummaries"
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        batch_jobs = []
+        unread.append(
+            "batch inference jobs were not listed with "
+            f"bedrock:ListModelInvocationJobs ({get_assessment_error_label(error)})"
+        )
+    for job in batch_jobs:
+        jobs.append(
+            (
+                "batch inference job '{}'".format(
+                    job.get("jobName") or job.get("jobArn") or "unnamed"
+                ),
+                (job.get("vpcConfig") or {}).get("subnetIds") or [],
+            )
+        )
+
+    all_subnets = sorted({subnet for _, subnets in jobs for subnet in subnets})
+    privacy = (
+        _subnet_route_privacy(region, all_subnets, ec2_client)
+        if all_subnets
+        else {"public": {}, "private": [], "unresolved": {}, "error": ""}
+    )
+    failed = []
+    passed = 0
+    for label, subnets in jobs:
+        if not subnets:
+            failed.append(f"{label} has no vpcConfig, so it runs outside a VPC")
+            continue
+        if privacy["error"]:
+            unread.append(
+                f"the subnets of {label} were not resolved to a route table "
+                f"({privacy['error']})"
+            )
+            continue
+        public = [
+            f"{subnet} ({privacy['public'][subnet]})"
+            for subnet in subnets
+            if subnet in privacy["public"]
+        ]
+        if public:
+            failed.append(
+                "{} uses subnet(s) that route to an internet gateway: {}".format(
+                    label, "; ".join(public[:5])
+                )
+            )
+            continue
+        unresolved = [
+            f"{subnet} ({privacy['unresolved'].get(subnet, 'not resolved')})"
+            for subnet in subnets
+            if subnet not in privacy["private"]
+        ]
+        if unresolved:
+            unread.append(
+                "the subnet(s) of {} were not resolved: {}".format(
+                    label, "; ".join(unresolved[:5])
+                )
+            )
+            continue
+        passed += 1
+
+    if failed:
+        findings["csv_data"].append(
+            row(
+                "{} of {} Bedrock job(s) do not run in a private VPC: {}.".format(
+                    len(failed), len(jobs), "; ".join(failed[:10])
+                ),
+                "Run each model customization and batch inference job with a "
+                "vpcConfig on subnets whose route tables carry no internet gateway "
+                "route.",
+                "High",
+                "Failed",
+            )
+        )
+    elif passed:
+        findings["csv_data"].append(
+            row(
+                "All {} Bedrock job(s) read run in a VPC whose subnets route to no "
+                "internet gateway.{}".format(
+                    passed,
+                    " This is not reported as Passed because part of the job "
+                    "population was not read."
+                    if unread
+                    else "",
+                ),
+                "No action required",
+                "High",
+                "N/A" if unread else "Passed",
+            )
+        )
+    if unread:
+        findings["csv_data"].append(
+            row(
+                "{} part(s) of the Bedrock job population were not read: {}.".format(
+                    len(unread), "; ".join(unread[:10])
+                ),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    if not findings["csv_data"]:
+        findings["csv_data"].append(
+            row(
+                "No model customization or batch inference jobs found in "
+                f"{region or 'this Region'}.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+    return findings
+
+
 def check_bedrock_marketplace_endpoint_cmk(
     region: str = "",
     endpoint_inventory: Dict[str, Any] = None,
@@ -31076,6 +31255,9 @@ def lambda_handler(event, context):
                 region=region, endpoint_inventory=marketplace_endpoint_inventory
             )
         )
+
+        logger.info("Running Bedrock job VPC check (BR-39)")
+        all_findings.append(check_bedrock_job_vpc(region=region))
 
         logger.info("Running Marketplace endpoint CMK check (BR-40)")
         all_findings.append(

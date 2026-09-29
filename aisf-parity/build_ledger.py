@@ -1242,7 +1242,9 @@ AI_SUBJECT_ROWS = [
         "runtime reporting requireServiceS3Endpoint true; SM-10 also reads every Studio "
         "domain's AppNetworkAccessType and SubnetIds; SM-33 also reads every processing "
         "job's NetworkConfig and every training job with no item cap; BR-39 resolves "
-        "every subnet. Ceiling: Lambda GetFunctionConfiguration and ECS DescribeServices "
+        "every subnet, and also fails every Bedrock model customization job and batch "
+        "inference job whose vpcConfig is absent or names a subnet routed to an igw- "
+        "gateway. Ceiling: Lambda GetFunctionConfiguration and ECS DescribeServices "
         "return no field that marks a function or service as AI inference, so general "
         "Lambda and ECS compute is not in the population",
         [],
