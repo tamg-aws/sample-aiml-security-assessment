@@ -261,6 +261,12 @@ section.
 
 ### Fixed
 
+- `SM-38` runtime monitoring coverage adds a `GuardDuty EKS Audit Log
+  Monitoring` row in each Region that has an EKS cluster. It passes only when
+  the detector is `ENABLED` with its `EKS_AUDIT_LOGS` feature `ENABLED`, and
+  it is judged whether or not Runtime Monitoring is on. The feature used to go
+  unread. A Region whose EKS clusters could not be listed gets an `N/A` row.
+
 - `SM-09` execution role privilege also judges each Studio domain's
   `DefaultSpaceSettings.ExecutionRole`, the default execution role for spaces,
   beside the domain's default user role and each user profile's role. A
