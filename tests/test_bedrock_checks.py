@@ -28271,6 +28271,8 @@ class TestBR53OwnerTagSweep:
         "list_gateways": "items",
         "list_browsers": "browserSummaries",
         "list_training_jobs": "TrainingJobSummaries",
+        "list_domains": "Domains",
+        "list_code_interpreters": "codeInterpreterSummaries",
     }
 
     def _run(self, pages, errors=None, runtimes=None, lists=None):
@@ -28362,10 +28364,12 @@ class TestBR53OwnerTagSweep:
         assert "a resource never tagged is not listed" in details
         assert "APIReference/API_GetResources.html)." in details
         assert (
-            "the Bedrock assessment role is not granted sagemaker:ListDomains or "
-            "bedrock-agentcore:ListCodeInterpreters, so those two types are held "
-            "back by a missing grant, not a ceiling." in details
+            "SageMaker and AgentCore resource types other than endpoints, models, "
+            "notebook instances, training jobs, domains, agent runtimes, memories, "
+            "gateways, custom browsers and custom code interpreters are read only "
+            "through GetResources" in details
         )
+        assert "not granted" not in details
         assert "ceiling reached" not in details
         assert "bedrock-agentcore:ListAgentRuntimes" in details
 
@@ -28475,6 +28479,10 @@ class TestBR53OwnerTagSweep:
     AC_GW_TAGGED = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-a"
     AC_BROWSER = "arn:aws:bedrock-agentcore:us-east-1:123456789012:browser-custom/br-1"
     AC_MEMORY = "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-1"
+    SM_DOMAIN = "arn:aws:sagemaker:us-east-1:123456789012:domain/d-never"
+    AC_INTERPRETER = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:code-interpreter-custom/ci-1"
+    )
 
     def _owned(self, arn):
         return {"ResourceARN": arn, "Tags": [{"Key": "Owner", "Value": "ml"}]}
@@ -28519,6 +28527,8 @@ class TestBR53OwnerTagSweep:
                 "list_memories": [{"arn": self.AC_MEMORY}],
                 "list_browsers": [{"browserArn": self.AC_BROWSER}],
                 "list_training_jobs": [{"TrainingJobArn": self.SM_TRAINING}],
+                "list_domains": [{"DomainArn": self.SM_DOMAIN}],
+                "list_code_interpreters": [{"codeInterpreterArn": self.AC_INTERPRETER}],
             },
         )
         failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
@@ -28530,6 +28540,8 @@ class TestBR53OwnerTagSweep:
             self.AC_MEMORY: "bedrock-agentcore:ListMemories",
             self.AC_BROWSER: "bedrock-agentcore:ListBrowsers",
             self.SM_TRAINING: "sagemaker:ListTrainingJobs",
+            self.SM_DOMAIN: "sagemaker:ListDomains",
+            self.AC_INTERPRETER: "bedrock-agentcore:ListCodeInterpreters",
         }
         assert len(failed) == len(named)
         for resource, action in named.items():
@@ -28552,6 +28564,10 @@ class TestBR53OwnerTagSweep:
         assert "ceiling reached" not in summary
         assert "bedrock-agentcore:ListCodeInterpreters" in summary
         tagging.list_browsers.assert_called_once_with(maxResults=100, type="CUSTOM")
+        tagging.list_code_interpreters.assert_called_once_with(
+            maxResults=100, type="CUSTOM"
+        )
+        tagging.list_domains.assert_called_once_with(MaxResults=100)
         tagging.list_training_jobs.assert_called_once_with(MaxResults=100)
         tagging.list_endpoints.assert_called_once_with(MaxResults=100)
 

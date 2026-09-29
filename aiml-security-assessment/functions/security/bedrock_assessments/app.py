@@ -27799,6 +27799,17 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         {},
     ),
     (
+        "sagemaker",
+        "SageMaker",
+        "domain",
+        "sagemaker",
+        "list_domains",
+        "Domains",
+        "DomainArn",
+        "sagemaker:ListDomains",
+        {},
+    ),
+    (
         "bedrock-agentcore",
         "AgentCore",
         "agent runtime",
@@ -27842,20 +27853,29 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         "bedrock-agentcore:ListBrowsers",
         {"type": "CUSTOM"},
     ),
+    (
+        "bedrock-agentcore",
+        "AgentCore",
+        "custom code interpreter",
+        "bedrock-agentcore-control",
+        "list_code_interpreters",
+        "codeInterpreterSummaries",
+        "codeInterpreterArn",
+        "bedrock-agentcore:ListCodeInterpreters",
+        {"type": "CUSTOM"},
+    ),
 )
 
 # Resource types the list reads above do not enumerate, so one never tagged is
 # still invisible to this check.
 RESOURCE_OWNER_SWEEP_GAP = (
     "SageMaker and AgentCore resource types other than endpoints, models, "
-    "notebook instances, training jobs, agent runtimes, memories, gateways and "
-    "custom browsers are read only through GetResources, which returns only "
-    "resources that are or were tagged, so a resource never tagged is not listed "
+    "notebook instances, training jobs, domains, agent runtimes, memories, "
+    "gateways, custom browsers and custom code interpreters are read only "
+    "through GetResources, which returns only resources that are or were "
+    "tagged, so a resource never tagged is not listed "
     "(https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/"
-    "API_GetResources.html). SageMaker domains and AgentCore code interpreters "
-    "have list APIs, but the Bedrock assessment role is not granted "
-    "sagemaker:ListDomains or bedrock-agentcore:ListCodeInterpreters, so those "
-    "two types are held back by a missing grant, not a ceiling."
+    "API_GetResources.html)."
 )
 
 

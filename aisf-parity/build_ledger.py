@@ -1724,13 +1724,10 @@ FOUNDATION_ROWS = [
         "omits the resources that most need an owner. SageMaker and AgentCore "
         "resources are read through a ResourceTypeFilters sweep: each returned "
         "resource without an owner tag fails, and the sweep never passes. SageMaker "
-        "endpoints, models, notebook instances and training jobs, and agent "
-        "runtimes, memories, gateways and custom browsers, listed by their SageMaker "
-        "and AgentCore list APIs and absent from the sweep, fail as never tagged. "
-        "SageMaker domains and AgentCore code interpreters have list APIs, but "
-        "sagemaker:ListDomains and bedrock-agentcore:ListCodeInterpreters are not "
-        "granted to the Bedrock role, so a never-tagged one is not seen; that is a "
-        "missing grant, not a ceiling",
+        "endpoints, models, notebook instances, training jobs and domains, and agent "
+        "runtimes, memories, gateways, custom browsers and custom code interpreters, "
+        "listed by their SageMaker and AgentCore list APIs and absent from the "
+        "sweep, fail as never tagged",
         [],
         6,
     ),

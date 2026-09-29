@@ -303,6 +303,8 @@ Resources:
               - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
               - sagemaker:ListInferenceComponents # BR-02
               - eks:ListClusters # BR-02
+              - sagemaker:ListDomains # BR-53
+              - bedrock-agentcore:ListCodeInterpreters # BR-53
             Resource: '*'
           - Sid: CloudTrailEventDataStoreRead
             # BR-06 reads each event data store's Status and
