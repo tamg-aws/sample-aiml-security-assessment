@@ -15810,9 +15810,13 @@ WORKLOAD_SEGMENTATION_REFERENCE = (
     "https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/"
     "security-network.html"
 )
-# A CIDR wider than a /24 (IPv6 /64) is not read as a declared dependency.
-BROAD_IPV4_PREFIX = 23
-BROAD_IPV6_PREFIX = 63
+# AIR-SLF-RT-05 asks for security groups that reference each other in place of
+# broad CIDR allowances and names no width. A CIDR of /16 (IPv6 /48) or wider
+# fails; one wider than a /24 (IPv6 /64) but narrower than that is not judged.
+BROAD_IPV4_PREFIX = 16
+BROAD_IPV6_PREFIX = 48
+UNJUDGED_IPV4_PREFIX = 23
+UNJUDGED_IPV6_PREFIX = 63
 
 
 def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
@@ -15838,24 +15842,25 @@ def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
         return entry.group(1) if entry else None
 
 
-def _broad_rule_targets(permission: Dict[str, Any]) -> List[str]:
-    """CIDRs in one rule wider than BROAD_IPV4_PREFIX or BROAD_IPV6_PREFIX."""
-    broad = []
-    for entry in permission.get("IpRanges") or []:
-        cidr = entry.get("CidrIp") or ""
-        try:
-            if ipaddress.ip_network(cidr, strict=False).prefixlen <= BROAD_IPV4_PREFIX:
+def _broad_rule_targets(permission: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """(broad, unjudged) CIDRs in one rule, split at the BROAD_ and UNJUDGED_ bounds."""
+    broad, unjudged = [], []
+    for key, field, broad_prefix, unjudged_prefix, family in (
+        ("IpRanges", "CidrIp", BROAD_IPV4_PREFIX, UNJUDGED_IPV4_PREFIX, "IPv4"),
+        ("Ipv6Ranges", "CidrIpv6", BROAD_IPV6_PREFIX, UNJUDGED_IPV6_PREFIX, "IPv6"),
+    ):
+        for entry in permission.get(key) or []:
+            cidr = entry.get(field) or ""
+            try:
+                prefixlen = ipaddress.ip_network(cidr, strict=False).prefixlen
+            except ValueError:
+                broad.append(cidr or f"an unparsed {family} range")
+                continue
+            if prefixlen <= broad_prefix:
                 broad.append(cidr)
-        except ValueError:
-            broad.append(cidr or "an unparsed IPv4 range")
-    for entry in permission.get("Ipv6Ranges") or []:
-        cidr = entry.get("CidrIpv6") or ""
-        try:
-            if ipaddress.ip_network(cidr, strict=False).prefixlen <= BROAD_IPV6_PREFIX:
-                broad.append(cidr)
-        except ValueError:
-            broad.append(cidr or "an unparsed IPv6 range")
-    return broad
+            elif prefixlen <= unjudged_prefix:
+                unjudged.append(cidr)
+    return broad, unjudged
 
 
 def _rule_ports(permission: Dict[str, Any]) -> str:
@@ -15878,16 +15883,22 @@ def _security_group_permissions(group: Dict[str, Any], check_ingress: bool):
 
 
 def _security_group_problems(
-    group: Dict[str, Any], check_ingress: bool, referenced: Dict[str, Any]
+    group: Dict[str, Any],
+    check_ingress: bool,
+    referenced: Dict[str, Any],
+    unjudged: List[str],
 ) -> List[str]:
+    """Rule problems of one group; rules to an unjudged CIDR go to unjudged."""
     problems = []
     for direction, preposition, permission in _security_group_permissions(
         group, check_ingress
     ):
         rule = f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)}"
-        broad = _broad_rule_targets(permission)
+        broad, between = _broad_rule_targets(permission)
         if broad:
             problems.append(f"{rule} {preposition} {', '.join(broad[:3])}")
+        if between:
+            unjudged.append(f"{rule} {preposition} {', '.join(between[:3])}")
         for pair in permission.get("UserIdGroupPairs") or []:
             target = referenced.get(pair.get("GroupId")) or {}
             if target.get("GroupName") == "default":
@@ -16155,6 +16166,7 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
         for group in workload["groups"]:
             users.setdefault(group, []).append(workload["label"])
     problems = []
+    unjudged = []
     outside_vpc = []
     for workload in workloads:
         if not workload["awsvpc"]:
@@ -16179,11 +16191,13 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 if group not in groups:
                     unread.append(f"security group {group}")
                     continue
+                between = []
                 found.extend(
                     _security_group_problems(
-                        groups[group], workload["ingress"], referenced
+                        groups[group], workload["ingress"], referenced, between
                     )
                 )
+                unjudged.extend(f"{workload['label']}: {rule}" for rule in between)
         if found:
             problems.append(f"{workload['label']}: {'; '.join(found[:4])}")
     if outside_vpc:
@@ -16232,6 +16246,37 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 region=region,
             )
         )
+    if unjudged:
+        shown = "; ".join(unjudged[:10])
+        if len(unjudged) > 10:
+            shown += f"; and {len(unjudged) - 10} more"
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=f"{WORKLOAD_SEGMENTATION_FINDING} CIDR Width Not Judged",
+                finding_details=(
+                    f"{len(unjudged)} rule(s) name a CIDR narrower than "
+                    f"/{BROAD_IPV4_PREFIX} (IPv6 /{BROAD_IPV6_PREFIX}) and wider "
+                    f"than /{UNJUDGED_IPV4_PREFIX + 1} "
+                    f"(IPv6 /{UNJUDGED_IPV6_PREFIX + 1}): {shown}. AIR-SLF-RT-05 "
+                    "asks for security groups that reference each other in place "
+                    "of broad CIDR allowances and names no width, so this check "
+                    f"fails /{BROAD_IPV4_PREFIX} (IPv6 /{BROAD_IPV6_PREFIX}) or "
+                    f"wider, passes /{UNJUDGED_IPV4_PREFIX + 1} "
+                    f"(IPv6 /{UNJUDGED_IPV6_PREFIX + 1}) or narrower, and does not "
+                    "judge the ranges between."
+                ),
+                resolution=(
+                    "Replace each CIDR named with a rule that references the "
+                    "dependency's security group, or confirm the range holds only "
+                    "the workload's declared dependencies."
+                ),
+                reference=WORKLOAD_SEGMENTATION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
     if unread:
         rows.append(
             _unread_resources_finding(
@@ -16243,7 +16288,7 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 region,
             )
         )
-    elif not problems:
+    elif not problems and not unjudged:
         rows.append(
             create_finding(
                 check_id="SM-39",
@@ -16251,9 +16296,10 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 finding_details=(
                     f"All {len(workloads)} ECS service(s) and Lambda function(s) run "
                     "in their own security groups with no rule to or from the VPC "
-                    f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
-                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider, and none that names a "
-                    "prefix list. Standalone EC2 instances are not read."
+                    "default security group or a CIDR wider than "
+                    f"/{UNJUDGED_IPV4_PREFIX + 1} (IPv6 /{UNJUDGED_IPV6_PREFIX + 1}), "
+                    "and none that names a prefix list. Standalone EC2 instances "
+                    "are not read."
                     if workloads
                     else "No ECS services or Lambda functions found in this region."
                 ),

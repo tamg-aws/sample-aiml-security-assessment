@@ -10105,19 +10105,14 @@ class TestSM39WorkloadSegmentation:
         assert "allows ingress tcp 443 from 10.0.0.0/16" in details
         assert "10.0.12.0/24" not in details
 
-    @pytest.mark.parametrize(
-        ("cidr", "v6"),
-        [("10.0.0.0/17", False), ("10.0.0.0/23", False), ("2001:db8::/56", True)],
-    )
-    @pytest.mark.parametrize("wide_first", [True, False])
-    def test_a_cidr_wider_than_a_24_fails_only_its_workload(self, cidr, v6, wide_first):
+    def _wide_and_narrow(self, cidr, v6, wide_first):
         services = [
             self._service("wide", ["sg-w"]),
             self._service("narrow", ["sg-n"]),
         ]
         if not wide_first:
             services.reverse()
-        seg = self._seg(
+        return self._seg(
             self._run(
                 services={"agents": services},
                 groups=[
@@ -10132,10 +10127,101 @@ class TestSM39WorkloadSegmentation:
                 ],
             )
         )
+
+    @pytest.mark.parametrize(
+        ("cidr", "v6"),
+        [("10.0.0.0/16", False), ("10.0.0.0/8", False), ("2001:db8::/48", True)],
+    )
+    @pytest.mark.parametrize("wide_first", [True, False])
+    def test_a_cidr_of_16_or_wider_fails_only_its_workload(self, cidr, v6, wide_first):
+        seg = self._wide_and_narrow(cidr, v6, wide_first)
         assert [r["Status"] for r in seg] == ["Failed"]
         details = seg[0]["Finding_Details"]
         assert f"sg-w allows egress tcp 443 to {cidr}" in details
+        assert "a CIDR of /16 (IPv6 /48) or wider" in details
         assert "narrow" not in details
+
+    @pytest.mark.parametrize(
+        ("cidr", "v6"),
+        [
+            ("10.0.0.0/17", False),
+            ("10.0.0.0/23", False),
+            ("2001:db8::/49", True),
+            ("2001:db8::/63", True),
+        ],
+    )
+    @pytest.mark.parametrize("wide_first", [True, False])
+    def test_a_cidr_between_16_and_24_is_not_judged_and_withholds_the_pass(
+        self, cidr, v6, wide_first
+    ):
+        # AIR-SLF-RT-05 names no CIDR width, so neither verdict is claimed.
+        seg = self._wide_and_narrow(cidr, v6, wide_first)
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert seg[0]["Finding"] == (
+            f"{sagemaker_app.WORKLOAD_SEGMENTATION_FINDING} CIDR Width Not Judged"
+        )
+        details = seg[0]["Finding_Details"]
+        assert f"ECS service wide in agents: sg-w allows egress tcp 443 to {cidr}" in (
+            details
+        )
+        assert "narrower than /16 (IPv6 /48) and wider than /24 (IPv6 /64)" in details
+        assert "AIR-SLF-RT-05" in details
+        assert "names no width" in details
+        assert "narrow in agents" not in details
+
+    def test_each_workload_with_an_unjudged_cidr_is_named(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("one", ["sg-a"]),
+                    self._function("two", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._open("10.0.0.0/20", "tcp", 443)]),
+                    self._sg("sg-b", egress=[self._open("10.1.0.0/22", "tcp", 443)]),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        details = seg[0]["Finding_Details"]
+        assert details.startswith("2 rule(s)")
+        assert "Lambda function one: sg-a allows egress tcp 443 to 10.0.0.0/20" in (
+            details
+        )
+        assert "Lambda function two: sg-b allows egress tcp 443 to 10.1.0.0/22" in (
+            details
+        )
+
+    def test_a_broad_cidr_fails_beside_an_unjudged_one(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("broad", ["sg-a"]),
+                    self._function("between", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg("sg-a", egress=[self._open("10.0.0.0/16", "tcp", 443)]),
+                    self._sg("sg-b", egress=[self._open("10.1.0.0/20", "tcp", 443)]),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed", "N/A"]
+        assert "Lambda function broad:" in seg[0]["Finding_Details"]
+        assert "between" not in seg[0]["Finding_Details"]
+        assert "Lambda function between:" in seg[1]["Finding_Details"]
+        assert "Lambda function broad" not in seg[1]["Finding_Details"]
+
+    def test_the_passed_row_names_the_24_bound(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[
+                    self._sg("sg-a", egress=[self._open("10.0.12.0/24", "tcp", 443)])
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+        assert "a CIDR wider than /24 (IPv6 /64)" in seg[0]["Finding_Details"]
 
     def test_a_prefix_list_rule_withholds_the_pass(self):
         seg = self._seg(
