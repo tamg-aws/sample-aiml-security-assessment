@@ -11158,8 +11158,15 @@ class TestAC27GatewayPolicyConditions:
 
         mock_ac.get_resource_policy.side_effect = get_resource_policy
 
+        # gateway/* in _GUARDED_TRUST also admits gw-open, which runs with
+        # OpenRole, so the guarded role names its own gateway here.
+        guarded = json.loads(json.dumps(_GUARDED_TRUST))
+        guarded["Statement"][0]["Condition"]["ArnLike"]["aws:SourceArn"] = (
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-guarded"
+        )
+
         def get_role(RoleName):
-            document = _GUARDED_TRUST if RoleName == "GuardedRole" else _UNGUARDED_TRUST
+            document = guarded if RoleName == "GuardedRole" else _UNGUARDED_TRUST
             return {"Role": {"AssumeRolePolicyDocument": document}}
 
         mock_iam.get_role.side_effect = get_role
@@ -29398,7 +29405,7 @@ class TestAC27GatewayRoleTrustByValue:
                         "StringEquals": {"aws:SourceAccount": _ACCOUNT},
                         "ArnLike": {
                             "aws:SourceArn": (
-                                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/*"
+                                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/gw-0"
                             )
                         },
                     }
@@ -29465,7 +29472,7 @@ class TestAC27GatewayRoleTrustByValue:
                     {
                         "ArnLike": {
                             "aws:SourceArn": (
-                                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/*"
+                                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/gw-0"
                             )
                         }
                     }
@@ -29503,6 +29510,241 @@ class TestAC27GatewayRoleTrustByValue:
         ]
         assert len(passed) == 1
         assert "(gw-0)" in passed[0]["Finding_Details"]
+
+
+class TestAC27RoleTrustSourceArnNamesTheGateway:
+    """AC-27 reads the role trust's aws:SourceArn against the gateways it holds."""
+
+    _GW = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/"
+
+    def _run(self, mock_ac, mock_iam, gateway_roles, documents, unread=()):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": g} for g in gateway_roles]
+        }
+
+        def get_gateway(gatewayIdentifier):
+            if gatewayIdentifier in unread:
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException"}}, "GetGateway"
+                )
+            return {
+                "gatewayArn": self._GW + gatewayIdentifier,
+                "roleArn": (
+                    f"arn:aws:iam::{_ACCOUNT}:role/{gateway_roles[gatewayIdentifier]}"
+                ),
+            }
+
+        mock_ac.get_gateway.side_effect = get_gateway
+        mock_ac.get_resource_policy.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException"}}, "GetResourcePolicy"
+        )
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": documents[RoleName]}
+        }
+        return agentcore_app.check_agentcore_gateway_policy_conditions()
+
+    @staticmethod
+    def _arn_trust(value, operator="ArnLike"):
+        return _service_trust(
+            {
+                "StringEquals": {"aws:SourceAccount": _ACCOUNT},
+                operator: {"aws:SourceArn": value},
+            }
+        )
+
+    @staticmethod
+    def _named(findings, name):
+        return [f for f in findings if f["Finding"] == name]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            f"arn:aws:lambda:us-east-1:{_ACCOUNT}:function:router",
+            f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:runtime/*",
+        ],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_arn_naming_another_resource_type_is_not_scoped(
+        self, mock_ac, mock_iam, value
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-b": "RoleB"},
+            {
+                "RoleA": self._arn_trust(self._GW + "gw-a"),
+                "RoleB": self._arn_trust(value),
+            },
+        )
+
+        unscoped = self._named(
+            findings, "AgentCore Gateway Role Trust Source ARN Not Scoped"
+        )
+        assert len(unscoped) == 1
+        assert unscoped[0]["Status"] == "Failed"
+        assert "(gw-b)" in unscoped[0]["Finding_Details"]
+        assert "a gateway resource" in unscoped[0]["Finding_Details"]
+        assert_finding_schema(unscoped[0])
+        passed = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert [p["Status"] for p in passed] == ["Passed"]
+        assert "(gw-a)" in passed[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_wildcard_reaching_a_gateway_on_another_role_fails(
+        self, mock_ac, mock_iam
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-b": "RoleB", "gw-c": "RoleC"},
+            {
+                "RoleA": self._arn_trust(self._GW + "gw-a"),
+                "RoleB": self._arn_trust(self._GW + "*"),
+                "RoleC": self._arn_trust(self._GW + "gw-c"),
+            },
+        )
+
+        reach = self._named(
+            findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+        )
+        assert len(reach) == 1
+        assert reach[0]["Status"] == "Failed"
+        assert reach[0]["Severity"] == "Medium"
+        details = reach[0]["Finding_Details"]
+        assert "(gw-b)" in details
+        assert "gw-a (role RoleA)" in details
+        assert "gw-c (role RoleC)" in details
+        assert_finding_schema(reach[0])
+        passed = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert sorted(p["Finding_Details"][:14] for p in passed) == [
+            "Gateway 'gw-a'",
+            "Gateway 'gw-c'",
+        ]
+
+    @pytest.mark.parametrize(
+        "operator,value",
+        [
+            (
+                "StringLike",
+                "arn:aws:bedrock-agentcore:us-east-1:" + _ACCOUNT + ":gateway/gw-?",
+            ),
+            (
+                "ArnEquals",
+                "arn:aws:bedrock-agentcore:us-east-1:" + _ACCOUNT + ":gateway/*",
+            ),
+        ],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_like_operator_is_matched_as_a_pattern(
+        self, mock_ac, mock_iam, operator, value
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-b": "RoleB"},
+            {
+                "RoleA": self._arn_trust(self._GW + "gw-a"),
+                "RoleB": self._arn_trust(value, operator=operator),
+            },
+        )
+
+        reach = self._named(
+            findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+        )
+        assert len(reach) == 1
+        assert "(gw-b)" in reach[0]["Finding_Details"]
+        assert "gw-a (role RoleA)" in reach[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_string_equals_value_is_not_read_as_a_pattern(self, mock_ac, mock_iam):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-b": "RoleB"},
+            {
+                "RoleA": self._arn_trust(self._GW + "gw-a"),
+                "RoleB": self._arn_trust(self._GW + "gw-?", operator="StringEquals"),
+            },
+        )
+
+        assert not self._named(
+            findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_negated_source_arn_that_excludes_the_other_gateway_passes(
+        self, mock_ac, mock_iam
+    ):
+        trust = _service_trust(
+            {
+                "StringEquals": {"aws:SourceAccount": _ACCOUNT},
+                "ArnLike": {"aws:SourceArn": self._GW + "*"},
+                "ArnNotLike": {"aws:SourceArn": self._GW + "gw-a"},
+            }
+        )
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-b": "RoleB"},
+            {"RoleA": self._arn_trust(self._GW + "gw-a"), "RoleB": trust},
+        )
+
+        assert not self._named(
+            findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+        )
+        assert (
+            len(
+                self._named(
+                    findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+                )
+            )
+            == 2
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_over_gateways_sharing_the_role_passes(self, mock_ac, mock_iam):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "Shared", "gw-b": "Shared"},
+            {"Shared": self._arn_trust(self._GW + "*")},
+        )
+
+        passed = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert [p["Status"] for p in passed] == ["Passed", "Passed"]
+        assert "no other gateway in this Region" in passed[0]["Finding_Details"]
+        assert not self._named(
+            findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_gateway_is_named_in_the_passed_text(self, mock_ac, mock_iam):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-b": "RoleB"},
+            {"RoleA": self._arn_trust(self._GW + "*")},
+            unread=("gw-b",),
+        )
+
+        passed = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert len(passed) == 1
+        assert "1 gateway(s) could not be read" in passed[0]["Finding_Details"]
 
 
 class TestAC43EvaluationRoleTrustByValue:

@@ -14276,6 +14276,75 @@ def _statement_scopes_source_arn(
     return False
 
 
+SOURCE_ARN_NEGATED_OPERATORS = {
+    "stringnotequals",
+    "stringnotequalsignorecase",
+    "stringnotlike",
+    "arnnotequals",
+    "arnnotlike",
+}
+
+
+def _source_arn_value_matches(operator: str, pattern: str, arn: str) -> bool:
+    """Return whether one aws:SourceArn condition value matches `arn`.
+
+    ArnEquals and ArnLike both read `*` and `?` as wildcards and match each of
+    the six colon-separated ARN parts on its own. The String operators match the
+    whole string, with wildcards only in the Like form.
+    """
+    if operator in SOURCE_ARN_NEGATED_OPERATORS:
+        operator = operator.replace("not", "", 1)
+    if operator.startswith("arn"):
+        pattern_parts, arn_parts = pattern.split(":", 5), arn.split(":", 5)
+        return len(pattern_parts) == len(arn_parts) == 6 and all(
+            _condition_string_matches(part, value, like=True, ignore_case=False)
+            for part, value in zip(pattern_parts, arn_parts)
+        )
+    return _condition_string_matches(
+        pattern,
+        arn,
+        like=operator == "stringlike",
+        ignore_case=operator.endswith("ignorecase"),
+    )
+
+
+def _statement_source_arn_admits(statement: Dict[str, Any], arn: str) -> bool:
+    """Return whether every aws:SourceArn condition in the statement lets `arn`
+    through.
+
+    Condition entries are ANDed and the values of one entry are ORed, so a
+    positive entry needs one value that matches and a negated entry needs none.
+    A statement with no positive aws:SourceArn entry admits nothing here: it is
+    judged by the scoping test before this is asked.
+    """
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return False
+    positive = False
+    for operator, entries in conditions.items():
+        if not isinstance(entries, dict):
+            continue
+        name = str(operator).strip().lower()
+        if name.startswith("foranyvalue:"):
+            name = name[len("foranyvalue:") :]
+        if name.endswith("ifexists"):
+            name = name[: -len("ifexists")]
+        negated = name in SOURCE_ARN_NEGATED_OPERATORS
+        if not negated and name not in CONFUSED_DEPUTY_GUARD_OPERATORS:
+            continue
+        for key, raw in entries.items():
+            if str(key).strip().lower() != "aws:sourcearn":
+                continue
+            matched = any(
+                _source_arn_value_matches(name, value.strip(), arn)
+                for value in _condition_values(raw)
+            )
+            if matched == negated:
+                return False
+            positive = positive or not negated
+    return positive
+
+
 def _statements_without_scoped_source_arn(
     statements: List[Dict[str, Any]],
     account_id: str,
@@ -14369,6 +14438,7 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
 
     findings = []
     trust_cache: Dict[str, Any] = {}
+    held: List[Tuple[str, str, Dict[str, Any]]] = []
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId", "unknown")
         gateway_name = gateway.get("name", gateway_id)
@@ -14391,12 +14461,25 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
                 )
             )
             continue
+        held.append((gateway_id, label, detail))
 
+    unread = len(gateways) - len(held)
+    for gateway_id, label, detail in held:
+        role_arn = detail.get("roleArn")
+        others = [
+            (other_id, str(other.get("gatewayArn")), str(other.get("roleArn")))
+            for other_id, _, other in held
+            if other_id != gateway_id
+            and other.get("gatewayArn")
+            and other.get("roleArn") != role_arn
+        ]
         findings.extend(
             _gateway_resource_policy_findings(label, detail.get("gatewayArn"))
         )
         findings.extend(
-            _gateway_role_trust_findings(label, detail.get("roleArn"), trust_cache)
+            _gateway_role_trust_findings(
+                label, role_arn, trust_cache, others=others, unread=unread
+            )
         )
 
     return findings
@@ -14606,13 +14689,23 @@ def _gateway_resource_policy_findings(
 
 
 def _gateway_role_trust_findings(
-    label: str, role_arn: Any, trust_cache: Dict[str, Any]
+    label: str,
+    role_arn: Any,
+    trust_cache: Dict[str, Any],
+    others: Iterable[Tuple[str, str, str]] = (),
+    unread: int = 0,
 ) -> List[Dict[str, Any]]:
     """Judge one gateway execution role's trust policy for a confused-deputy guard.
 
     The permission cache stores attached and inline policies only, so the trust
     policy is read from IAM here. Roles are cached per invocation because several
     gateways in one account share one execution role.
+
+    `others` holds (id, gatewayArn, roleArn) for every other gateway read in this
+    Region that runs with a different role. An aws:SourceArn that names a
+    gateway resource can still be a pattern, such as gateway/*, that admits
+    those gateways too; each held ARN is matched against it by value. `unread`
+    counts the gateways GetGateway could not read, whose ARNs were not compared.
     """
     if not role_arn:
         return [
@@ -14722,7 +14815,9 @@ def _gateway_role_trust_findings(
             )
         ]
 
-    unscoped = _statements_without_scoped_source_arn(statements, account_id)
+    unscoped = _statements_without_scoped_source_arn(
+        statements, account_id, resource_types=("gateway",)
+    )
     if unscoped:
         return findings + [
             create_finding(
@@ -14735,9 +14830,10 @@ def _gateway_role_trust_findings(
                     "guard names account "
                     f"{account_id} but carries no aws:SourceArn condition whose "
                     "every value names that account, a Region and a resource "
-                    "type with no wildcard. The service can assume the role for "
-                    "any AgentCore resource in the account, in any Region, not "
-                    "only for this gateway."
+                    "type with no wildcard, and names a gateway resource. The "
+                    "service can assume the role for any AgentCore resource in "
+                    "the account, in any Region, or for a resource that is not a "
+                    "gateway, not only for this gateway."
                 ),
                 resolution=(
                     "Add an ArnLike aws:SourceArn condition naming this gateway's "
@@ -14751,6 +14847,54 @@ def _gateway_role_trust_findings(
             )
         ]
 
+    service_statements = [
+        statement
+        for statement in statements
+        if any(
+            principal == "*" or principal.endswith(".amazonaws.com")
+            for principal in _statement_principals(statement)
+        )
+    ]
+    reached = [
+        f"{other_id} (role {str(other_role).rsplit('/', 1)[-1]})"
+        for other_id, other_arn, other_role in others
+        if any(
+            _statement_source_arn_admits(statement, other_arn)
+            for statement in service_statements
+        )
+    ]
+    if reached:
+        return findings + [
+            create_finding(
+                check_id="AC-27",
+                finding_name=(
+                    "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+                ),
+                finding_details=(
+                    f"{label} uses execution role {role_name}, whose trust policy "
+                    "aws:SourceArn also admits "
+                    f"{len(reached)} other gateway(s) in this Region that run "
+                    f"with another role: {', '.join(reached)}. If one of them is "
+                    "pointed at this role, the service assumes it for that "
+                    "gateway with no trust policy change."
+                ),
+                resolution=(
+                    "Name this gateway's ARN, or the ARNs of only the gateways "
+                    "that use this role, in the trust policy's aws:SourceArn "
+                    "condition."
+                ),
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+
+    unread_note = (
+        f" {unread} gateway(s) could not be read, so their ARNs were not "
+        "compared with the pattern."
+        if unread
+        else ""
+    )
     return findings + [
         create_finding(
             check_id="AC-27",
@@ -14759,12 +14903,14 @@ def _gateway_role_trust_findings(
                 f"{label} uses execution role {role_name}, whose "
                 f"{len(statements)} Allow statement(s) each carry an "
                 "aws:SourceArn condition whose every value names account "
-                f"{account_id}, a Region and a resource type with no wildcard, "
-                "or name no service or wildcard principal."
+                f"{account_id}, a Region and a gateway resource with no "
+                "wildcard, or name no service or wildcard principal. The "
+                "aws:SourceArn admits no other gateway in this Region that runs "
+                f"with another role.{unread_note}"
             ),
             resolution=(
-                "No action required. Confirm the aws:SourceArn pattern names this "
-                "gateway rather than every gateway in the account."
+                "No action required. A gateway created later is not compared; "
+                "name this gateway's ARN in aws:SourceArn to exclude it."
             ),
             reference=CONFUSED_DEPUTY_REFERENCE_URL,
             severity=SeverityEnum.HIGH,
