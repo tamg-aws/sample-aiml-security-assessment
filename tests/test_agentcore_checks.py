@@ -26177,7 +26177,9 @@ class TestAG39GatewayWafRuleCoverage:
         self, mock_ac, mock_waf, action
     ):
         # Two SQL injection rules, the first not Block: only the second may be
-        # credited, and the evidence names it.
+        # credited, and the evidence names it. An Allow ends evaluation for the
+        # SQL injection requests it matches, so the blocking rule after it never
+        # sees them and is not credited either.
         findings = self._ag39(
             mock_ac,
             mock_waf,
@@ -26191,6 +26193,21 @@ class TestAG39GatewayWafRuleCoverage:
             ),
         )
 
+        if action == "Allow":
+            details = findings[0]["Finding_Details"]
+            assert findings[0]["Status"] == "Failed"
+            # Every filter after the Allow loses credit: its statement is not
+            # judged for which requests it matches.
+            assert "missing 3 of the five" in details
+            assert (
+                "SQL injection inspection, cross-site scripting inspection, "
+                "a rate-based rule" in details.split("It applies")[0]
+            )
+            assert (
+                "SQL injection inspection in rule 'sqli-block' runs after rule "
+                "'sqli-soft'" in details
+            )
+            return
         assert findings[0]["Status"] == "Passed"
         assert "rule 'sqli-block'" in findings[0]["Finding_Details"]
         assert "rule 'sqli-soft'" not in findings[0]["Finding_Details"]
@@ -38791,3 +38808,249 @@ class TestAC49FirewallBypasses:
         assert rows["egress"]["Status"] == "N/A"
         assert rows["threat"]["Status"] == "N/A"
         assert "$PARTNERS" in rows["egress"]["Finding_Details"]
+
+
+def _allow_every_path_rule(priority=0):
+    return {
+        "Name": "allow-root",
+        "Priority": priority,
+        "Action": {"Allow": {}},
+        "Statement": {
+            "ByteMatchStatement": {
+                "FieldToMatch": {"UriPath": {}},
+                "PositionalConstraint": "STARTS_WITH",
+                "SearchString": "/",
+                "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+            }
+        },
+    }
+
+
+def _prioritized(*rules):
+    return [{**rule, "Priority": index + 1} for index, rule in enumerate(rules)]
+
+
+class TestWafRuleOrderAndScope:
+    """AG-39 and AC-51 read rules in Priority order, stop crediting filters that
+    run after a terminating Allow, credit no match statement that only scopes a
+    rate rule, and read the Firewall Manager groups around the ACL's rules."""
+
+    _base = TestAG39GatewayWafRuleCoverage()
+
+    def _filters(self):
+        return _prioritized(
+            _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+            _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+            _rate_rule(),
+        )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_that_runs_first_fails_the_filters_behind_it(
+        self, mock_ac, mock_waf
+    ):
+        # Listed last, run first: Priority decides, not the list position.
+        rules = self._filters() + [_allow_every_path_rule(priority=0)]
+        findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "missing 3 of the five" in details
+        assert "rule 'allow-root'" in details
+        assert "Allow" in details
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_that_runs_last_leaves_the_filters_credited(
+        self, mock_ac, mock_waf
+    ):
+        # Listed first, run last.
+        rules = [_allow_every_path_rule(priority=99)] + self._filters()
+        findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_filters_after_the_allow_lose_credit(self, mock_ac, mock_waf):
+        sqli, common, rate = self._filters()
+        rules = [sqli, {**_allow_every_path_rule(), "Priority": 2}, common, rate]
+        rules[2] = {**common, "Priority": 3}
+        rules[3] = {**rate, "Priority": 4}
+        findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
+
+        details = findings[0]["Finding_Details"]
+        assert findings[0]["Status"] == "Failed"
+        assert "missing 2 of the five" in details
+        assert "cross-site scripting inspection, a rate-based rule" in details
+        assert "SQL injection inspection from" in details
+
+    @pytest.mark.parametrize(
+        "allow_priority, status", [(2, "Failed"), (99, "Passed")], ids=["first", "last"]
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_no_match_body_rule_behind_an_allow_is_not_credited(
+        self, mock_ac, mock_waf, allow_priority, status
+    ):
+        rules = [
+            {**_managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"), "Priority": 1},
+            {
+                **_inspecting_rule(
+                    "xss-body", "XssMatchStatement", oversize="NO_MATCH"
+                ),
+                "Priority": 3,
+            },
+            {**_rate_rule(), "Priority": 0},
+            {**_body_size_rule(), "Priority": 4},
+            _allow_every_path_rule(priority=allow_priority),
+        ]
+        findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
+
+        assert [f["Status"] for f in findings] == [status]
+        if status == "Failed":
+            details = findings[0]["Finding_Details"]
+            assert "missing 1 of the five" in details
+            assert (
+                "cross-site scripting inspection in rule 'xss-body' runs after "
+                "rule 'allow-root'" in details
+            )
+
+    @pytest.mark.parametrize("scoped", [True, False], ids=["scope-down", "own-rules"])
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rate_rule_scope_down_is_not_inspection(self, mock_ac, mock_waf, scoped):
+        sqli = _inspecting_rule("sqli", "SqliMatchStatement")["Statement"]
+        xss = _inspecting_rule("xss", "XssMatchStatement")["Statement"]
+        if scoped:
+            rules = _prioritized(
+                _rate_rule(
+                    Statement={
+                        "RateBasedStatement": {
+                            "Limit": 2000,
+                            "AggregateKeyType": "IP",
+                            "ScopeDownStatement": {
+                                "OrStatement": {"Statements": [sqli, xss]}
+                            },
+                        }
+                    }
+                )
+            )
+        else:
+            rules = _prioritized(
+                _rate_rule(),
+                _inspecting_rule("sqli", "SqliMatchStatement"),
+                _inspecting_rule("xss", "XssMatchStatement"),
+            )
+        findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
+
+        if scoped:
+            assert findings[0]["Status"] == "Failed"
+            assert "missing 2 of the five" in findings[0]["Finding_Details"]
+        else:
+            assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ag39_reads_firewall_manager_groups(self, mock_ac, mock_waf):
+        def fms(name, group):
+            return {
+                "Name": name,
+                "Priority": 1,
+                "OverrideAction": {"None": {}},
+                "FirewallManagerStatement": {
+                    "ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": group}
+                },
+            }
+
+        acl = self._base._acl(
+            rules=_prioritized(_rate_rule()),
+            PreProcessFirewallManagerRuleGroups=[
+                fms("fms-sqli", "AWSManagedRulesSQLiRuleSet"),
+                fms("fms-common", "AWSManagedRulesCommonRuleSet"),
+            ],
+        )
+        findings = self._base._ag39(mock_ac, mock_waf, acl)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "fms-sqli" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_pre_process_groups_run_before_the_acls_own_allow(self, mock_ac, mock_waf):
+        def fms(name, group):
+            return {
+                "Name": name,
+                "Priority": 1,
+                "OverrideAction": {"None": {}},
+                "FirewallManagerStatement": {
+                    "ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": group}
+                },
+            }
+
+        acl = self._base._acl(
+            rules=[_allow_every_path_rule(priority=0), {**_rate_rule(), "Priority": 5}],
+            PreProcessFirewallManagerRuleGroups=[
+                fms("fms-sqli", "AWSManagedRulesSQLiRuleSet"),
+                fms("fms-common", "AWSManagedRulesCommonRuleSet"),
+            ],
+        )
+        findings = self._base._ag39(mock_ac, mock_waf, acl)
+
+        details = findings[0]["Finding_Details"]
+        assert findings[0]["Status"] == "Failed"
+        assert "missing 1 of the five" in details
+        assert "a rate-based rule" in details.split("It applies")[0]
+
+    @pytest.mark.parametrize(
+        "allow_priority, status", [(0, "Failed"), (99, "Passed")], ids=["first", "last"]
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac51_credits_no_group_behind_an_allow(
+        self, mock_ac, mock_waf, allow_priority, status
+    ):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
+            {
+                "acl": {
+                    "Name": "acl",
+                    "Rules": _prioritized(_anti_ddos_rule(), _rate_rule())
+                    + [_allow_every_path_rule(priority=allow_priority)],
+                }
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [f["Status"] for f in findings] == [status]
+        if status == "Failed":
+            assert "rule 'allow-root'" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac51_names_a_rate_rule_behind_an_allow(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
+            {
+                "acl": {
+                    "Name": "acl",
+                    "Rules": [
+                        {**_anti_ddos_rule(), "Priority": 1},
+                        _allow_every_path_rule(priority=2),
+                        {**_rate_rule(), "Priority": 3},
+                    ],
+                }
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "rule 'rate'" in details
+        assert "rule 'allow-root'" in details

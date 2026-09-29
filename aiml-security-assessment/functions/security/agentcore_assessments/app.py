@@ -26933,12 +26933,13 @@ WAF_ANTI_DDOS_DEFAULT_CHALLENGE_SENSITIVITY = "HIGH"
 def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
     """Return one node per statement in a rule's statement tree.
 
-    AndStatement and OrStatement nest a list of statements, and a rate-based or
-    managed-rule-group statement nests the scope-down statement that decides
-    which requests it applies to, so a match statement inside any of them is
-    still inspecting requests. NotStatement is not descended into: it matches
-    everything its child does not, so a SQL injection match inside one is not
-    SQL injection coverage.
+    AndStatement and OrStatement nest a list of statements, so a match
+    statement inside either is still inspecting requests. A rate-based or
+    managed-rule-group statement's ScopeDownStatement is not descended into: it
+    only picks the requests the outer statement counts or inspects, so a SQL
+    injection match there blocks nothing on its own. NotStatement is not
+    descended into either: it matches everything its child does not, so a SQL
+    injection match inside one is not SQL injection coverage.
     """
     if not isinstance(statement, dict):
         return []
@@ -26949,10 +26950,6 @@ def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
         if isinstance(nested, dict):
             for child in nested.get("Statements") or []:
                 nodes.extend(_waf_statement_nodes(child))
-    for key in ("RateBasedStatement", "ManagedRuleGroupStatement"):
-        nested = statement.get(key)
-        if isinstance(nested, dict):
-            nodes.extend(_waf_statement_nodes(nested.get("ScopeDownStatement")))
     return nodes
 
 
@@ -26982,7 +26979,11 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
     Only a rule whose action is Block filters: Allow lets the matching request
     through, Count observes it, and Captcha and Challenge let through a request
     that carries a valid token. A rule group whose OverrideAction is Count
-    blocks nothing. Inside an AWS managed rule group, a rule overridden to any
+    blocks nothing. Rules are read in the order given, which
+    _web_acl_with_firewall_manager_rules sorts by Priority, and an Allow rule
+    ends evaluation for the requests it matches, so a filter in a later rule is
+    listed under shadowed and not credited: the statement of the Allow is not
+    judged for how many requests it matches. Inside an AWS managed rule group, a rule overridden to any
     action but Block, or excluded, does not block, so a group is not credited
     with SQL injection or cross-site scripting inspection when a rule that
     provides it is overridden. The group's rule list is not read, so a group
@@ -27014,8 +27015,28 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
         "anti_ddos_overridden": [],
         "anti_ddos_config": None,
         "weakened": [],
+        "shadowed": [],
         "evidence": {},
     }
+    allowed_by: List[str] = []
+    labels = {
+        "sqli": "SQL injection inspection",
+        "xss": "cross-site scripting inspection",
+    }
+
+    def credit(kind: str, evidence: str, what: str) -> bool:
+        """Credit a filter unless an earlier Allow rule lets requests past it."""
+        if allowed_by:
+            coverage["shadowed"].append(
+                f"{what} in {evidence} runs after {', '.join(allowed_by)}, whose "
+                "Allow action lets a request it matches through uninspected"
+            )
+            return False
+        if not coverage[kind]:
+            coverage[kind] = True
+            coverage["evidence"][kind] = evidence
+        return True
+
     # Match statements that credit a filter only once a rule blocks the
     # oversized body they decline to match.
     no_match_pending: List[Tuple[str, str]] = []
@@ -27072,15 +27093,16 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                 if weakness:
                     coverage["weakened"].extend(weakness)
                 elif oversize == "NO_MATCH":
-                    no_match_pending.append((kind, f"rule '{rule_name}'"))
-                elif not coverage[kind]:
-                    coverage[kind] = True
-                    coverage["evidence"][kind] = f"rule '{rule_name}'"
+                    if not allowed_by:
+                        no_match_pending.append((kind, f"rule '{rule_name}'"))
+                    else:
+                        credit(kind, f"rule '{rule_name}'", labels[kind])
+                else:
+                    credit(kind, f"rule '{rule_name}'", labels[kind])
             if blocks and _waf_blocks_oversized_body(node):
                 body_size_rule = True
-            if blocks and "RateBasedStatement" in node and not coverage["rate"]:
-                coverage["rate"] = True
-                coverage["evidence"]["rate"] = f"rule '{rule_name}'"
+            if blocks and "RateBasedStatement" in node:
+                credit("rate", f"rule '{rule_name}'", "a rate-based rule")
 
             referenced = node.get("RuleGroupReferenceStatement")
             if isinstance(referenced, dict):
@@ -27117,9 +27139,9 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                         f"{member} of {name} in rule '{rule_name}' is set to {action}"
                         for member, action in disabled
                     )
-                elif not coverage["anti_ddos"]:
-                    coverage["anti_ddos"] = True
-                    coverage["evidence"]["anti_ddos"] = f"rule '{rule_name}'"
+                elif not coverage["anti_ddos"] and credit(
+                    "anti_ddos", f"rule '{rule_name}'", WAF_ANTI_DDOS_RULE_GROUP
+                ):
                     coverage["anti_ddos_config"] = next(
                         (
                             config[WAF_ANTI_DDOS_RULE_GROUP]
@@ -27140,9 +27162,7 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 else:
                     provides = True
-                    if not coverage["sqli"]:
-                        coverage["sqli"] = True
-                        coverage["evidence"]["sqli"] = f"{name} in rule '{rule_name}'"
+                    credit("sqli", f"{name} in rule '{rule_name}'", labels["sqli"])
             if WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN in lowered:
                 xss_overridden = [
                     (member, action)
@@ -27156,15 +27176,16 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 else:
                     provides = True
-                    if not coverage["xss"]:
-                        coverage["xss"] = True
-                        coverage["evidence"]["xss"] = f"{name} in rule '{rule_name}'"
+                    credit("xss", f"{name} in rule '{rule_name}'", labels["xss"])
 
             if (provides or not non_blocking) and not coverage["block"]:
                 coverage["block"] = True
                 coverage["evidence"]["block"] = (
                     f"the blocking rules of {name} in rule '{rule_name}'"
                 )
+
+        if "Allow" in (rule.get("Action") or {}):
+            allowed_by.append(f"rule '{rule_name}'")
 
     for kind, evidence in no_match_pending:
         if not body_size_rule:
@@ -27227,8 +27248,13 @@ def _gateway_waf_rule_findings(
     WAF cannot be evaluated: FAIL_OPEN lets the request through, so the ACL
     filters nothing while AWS WAF is unreachable or times out. The API states no
     default for an absent failureMode, so an unset value is not judged.
+
+    Rules are read in the order AWS WAF runs them: the Firewall Manager groups
+    that run before the ACL's rules, the rules by Priority, then the groups that
+    run after. A filter in a rule after an Allow rule is not credited, because
+    the Allow ends evaluation for the requests it matches.
     """
-    coverage = _waf_rule_coverage(web_acl)
+    coverage = _waf_rule_coverage(_web_acl_with_firewall_manager_rules(web_acl))
     body_limit = _waf_body_inspection_limit(web_acl)
     body_filters = bool(body_limit) and body_limit != WAF_DEFAULT_BODY_INSPECTION_LIMIT
     acl_name = web_acl.get("Name") or web_acl_arn
@@ -27259,15 +27285,24 @@ def _gateway_waf_rule_findings(
         if present
     )
     overridden = (
-        " Not credited because the rule is overridden or excluded: "
-        f"{'; '.join(coverage['overridden'])}."
-        if coverage["overridden"]
-        else ""
-    ) + (
-        " Not credited because the match statement does not inspect the whole "
-        f"request: {'; '.join(coverage['weakened'])}."
-        if coverage["weakened"]
-        else ""
+        (
+            " Not credited because the rule is overridden or excluded: "
+            f"{'; '.join(coverage['overridden'])}."
+            if coverage["overridden"]
+            else ""
+        )
+        + (
+            " Not credited because the match statement does not inspect the whole "
+            f"request: {'; '.join(coverage['weakened'])}."
+            if coverage["weakened"]
+            else ""
+        )
+        + (
+            " Not credited because an earlier rule ends evaluation first: "
+            f"{'; '.join(coverage['shadowed'])}."
+            if coverage["shadowed"]
+            else ""
+        )
     )
     fails_open = (
         " The gateway's wafConfiguration failureMode is FAIL_OPEN, so the gateway "
@@ -27422,18 +27457,28 @@ def _web_acl_with_firewall_manager_rules(web_acl: Dict[str, Any]) -> Dict[str, A
     Firewall Manager adds rule groups that run before and after the ACL's own
     rules and keeps them out of Rules. Each carries its managed rule group in
     FirewallManagerStatement, so it reads as a rule whose statement is that.
+    AWS WAF runs each of the three lists in Priority order, so each is sorted
+    by Priority, and the order among them is pre-process, Rules, post-process.
     """
+
+    def by_priority(rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(rules, key=lambda rule: rule.get("Priority") or 0)
+
     merged = dict(web_acl)
     merged["Rules"] = (
-        [
-            {**group, "Statement": group.get("FirewallManagerStatement")}
-            for group in web_acl.get("PreProcessFirewallManagerRuleGroups") or []
-        ]
-        + list(web_acl.get("Rules") or [])
-        + [
-            {**group, "Statement": group.get("FirewallManagerStatement")}
-            for group in web_acl.get("PostProcessFirewallManagerRuleGroups") or []
-        ]
+        by_priority(
+            [
+                {**group, "Statement": group.get("FirewallManagerStatement")}
+                for group in web_acl.get("PreProcessFirewallManagerRuleGroups") or []
+            ]
+        )
+        + by_priority(list(web_acl.get("Rules") or []))
+        + by_priority(
+            [
+                {**group, "Statement": group.get("FirewallManagerStatement")}
+                for group in web_acl.get("PostProcessFirewallManagerRuleGroups") or []
+            ]
+        )
     )
     return merged
 
@@ -27500,7 +27545,9 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
 
     The group is paired with a rate-based rule whose action is Block, which caps
     the request rate per caller and so the inference spend a flood runs up. The
-    rule's limit and scope-down statement are not judged. A web ACL with no such
+    rule's limit and scope-down statement are not judged. Neither the group nor
+    the rule is credited when it runs after an Allow rule, which ends
+    evaluation for the requests it matches. A web ACL with no such
     rule among the rules this check reads, and a rule group whose rules live in
     another resource, is not judged on that leg.
     """
@@ -27625,6 +27672,12 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             " It applies no rate-based rule whose action is Block, so no rule "
             "caps the request rate of a single caller."
         )
+        shadowed = (
+            " Not credited because an earlier rule ends evaluation first: "
+            f"{'; '.join(coverage['shadowed'])}."
+            if coverage["shadowed"]
+            else ""
+        )
         opaque_rate = (
             " It applies no rate-based rule whose action is Block in the rules "
             f"this check reads, and delegates to {len(coverage['opaque'])} rule "
@@ -27665,7 +27718,7 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             else:
                 findings.append(
                     finding(
-                        f"{runs}{no_rate} A flood from one caller runs up inference "
+                        f"{runs}{no_rate}{shadowed} A flood from one caller runs up inference "
                         "spend below the level the Anti-DDoS group treats as an "
                         "event.",
                         rate_resolution,
@@ -27686,6 +27739,7 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
                 f"{label} is associated with web ACL {acl_name}, which does not "
                 f"run {WAF_ANTI_DDOS_RULE_GROUP}, so a request flood spread across "
                 f"many clients reaches the gateway unmitigated.{not_credited}"
+                f"{shadowed}"
                 f"{'' if coverage['rate'] or coverage['opaque'] else no_rate}",
                 f"Add the AWS managed rule group {WAF_ANTI_DDOS_RULE_GROUP} to the "
                 "web ACL with no Count override on the group and no rule inside it "
