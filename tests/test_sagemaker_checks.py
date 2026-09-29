@@ -13850,6 +13850,64 @@ class TestSM09NotebookAccessGuardrails:
         rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [conjunctive])
         assert [r["Status"] for r in rows] == ["N/A"]
 
+    @staticmethod
+    def _ip_deny(ranges):
+        return _scp_deny(
+            [
+                "sagemaker:CreatePresignedNotebookInstanceUrl",
+                "sagemaker:CreatePresignedDomainUrl",
+            ],
+            "NotIpAddress",
+            "aws:SourceIp",
+            ranges,
+        )
+
+    @pytest.mark.parametrize(
+        "ranges",
+        [
+            ["0.0.0.0/0"],
+            ["203.0.113.0/24", "0.0.0.0/0"],
+            ["0.0.0.0/1", "128.0.0.0/1"],
+            ["203.0.113.0/24", "::/0"],
+        ],
+    )
+    def test_an_ip_deny_that_admits_every_address_does_not_hold(self, ranges):
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [self._ip_deny(ranges)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Role 'Admin'" in rows[0]["Finding_Details"]
+
+    def test_an_ip_deny_on_bounded_v4_and_v6_ranges_holds(self):
+        deny = self._ip_deny(["203.0.113.0/24", "2001:db8::/32"])
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [deny])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        ("ranges", "expected"),
+        [
+            ("0.0.0.0/0", "Failed"),
+            (["::/0", "203.0.113.0/24"], "Failed"),
+            ("203.0.113.0/24", "Passed"),
+        ],
+    )
+    def test_an_ip_allow_is_judged_on_its_ranges(self, ranges, expected):
+        cache = _creation_cache(
+            {
+                "DataScientist": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "sagemaker:CreatePresignedNotebookInstanceUrl",
+                            "sagemaker:CreatePresignedDomainUrl",
+                        ],
+                        "Resource": "*",
+                        "Condition": {"IpAddress": {"aws:SourceIp": ranges}},
+                    }
+                ]
+            }
+        )
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1], cache=cache)
+        assert [r["Status"] for r in rows] == [expected]
+
     def test_source_vpce_deny_on_profile_arns_passes(self):
         vpce = _scp_deny(
             [

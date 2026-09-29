@@ -261,6 +261,12 @@ section.
 
 ### Fixed
 
+- `SM-09` no longer credits an `aws:SourceIp` condition on the presigned
+  notebook and domain URL actions when its ranges together cover every IPv4
+  or every IPv6 address, such as `0.0.0.0/0` or `::/0`. A `NotIpAddress`
+  `Deny` on such values fires only when the key is absent, and an
+  `IpAddress` `Allow` on them admits any caller.
+
 - `SM-39` workload segmentation fails a security group rule to or from a
   CIDR wider than a /24 (IPv6 /64), where only /16 (IPv6 /48) or wider
   failed, and a rule that references the VPC's default security group. A

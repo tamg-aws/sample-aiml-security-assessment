@@ -12066,7 +12066,8 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
 
     "enforced": it fires when the key is absent or holds a non-compliant value.
     "presence": it fires when the key is absent but admits a non-compliant
-    value: a Null test, a negated Like or Arn operator on a wildcard value, or
+    value: a Null test, a negated Like or Arn operator on a wildcard value, a
+    NotIpAddress on aws:SourceIp values that cover every address, or
     ForAllValues on a multivalued key, which admits a request that mixes an
     approved value with an unapproved one. "value": it fires only for one named value whose
     compliance this check does not judge. "absent-open": it fires for a
@@ -12092,7 +12093,9 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
             return "undefined-operator"
         # A negated operator is true for an absent key, except under
         # ForAnyValue, which is false over an empty set.
-        if _like_values_unbounded(base, values):
+        if _like_values_unbounded(base, values) or _source_ip_values_unbounded(
+            key, values
+        ):
             return "value" if prefix == "foranyvalue" else "presence"
         if prefix == "foranyvalue":
             return "absent-open"
@@ -12122,14 +12125,35 @@ def _like_values_unbounded(base: str, values: List[str]) -> bool:
     )
 
 
+def _source_ip_values_unbounded(key: str, values: List[str]) -> bool:
+    """Return whether aws:SourceIp values together cover every IPv4 or every
+    IPv6 address, as 0.0.0.0/0 or ::/0 do, so they approve no range."""
+    if key != "aws:sourceip":
+        return False
+    networks = {4: [], 6: []}
+    for value in values:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            continue
+        networks[network.version].append(network)
+    return any(
+        [str(n) for n in ipaddress.collapse_addresses(found)]
+        == [("0.0.0.0/0" if version == 4 else "::/0")]
+        for version, found in networks.items()
+        if found
+    )
+
+
 def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
     """
     Return whether an Allow grants only requests that carry a compliant key.
 
     IfExists and negated operators match a request that omits the key, so
     neither enforces it. ForAllValues does too, unless the statement also holds
-    a Null false test on the same key. A Null test and a Like or Arn operator
-    on a wildcard value require only that the key is present. ForAnyValue on a multivalued key
+    a Null false test on the same key. A Null test, a Like or Arn operator
+    on a wildcard value, and aws:SourceIp values that cover every address
+    require only that the key is present. ForAnyValue on a multivalued key
     admits a request that mixes an approved value with an unapproved one, and
     IAM does not define a multivalued key under no set operator.
     """
@@ -12145,7 +12169,11 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
         prefix, base, if_exists = _condition_operator_parts(operator)
         if if_exists or "not" in base:
             continue
-        if base == "null" or _like_values_unbounded(base, values):
+        if (
+            base == "null"
+            or _like_values_unbounded(base, values)
+            or _source_ip_values_unbounded(key, values)
+        ):
             continue
         if prefix == "forallvalues" and key not in required:
             continue
