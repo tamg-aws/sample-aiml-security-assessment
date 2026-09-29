@@ -4164,9 +4164,16 @@ class TestSM23MonitorReportAndAlarm:
 
     @staticmethod
     def _client(
-        mock_client, schedules, details, alarms=(), errors=None, endpoints=("ep",)
+        mock_client,
+        schedules,
+        details,
+        alarms=(),
+        errors=None,
+        endpoints=("ep",),
+        job_definitions=None,
     ):
         errors = errors or {}
+        job_definitions = job_definitions or {}
         mock_sm = MagicMock()
         mock_client.return_value = mock_sm
 
@@ -4200,6 +4207,14 @@ class TestSM23MonitorReportAndAlarm:
             return details[MonitoringScheduleName]
 
         mock_sm.describe_monitoring_schedule.side_effect = describe
+
+        def describe_definition(JobDefinitionName):
+            value = job_definitions[JobDefinitionName]
+            if isinstance(value, str):
+                raise _make_client_error(value, "DescribeDataQualityJobDefinition")
+            return value
+
+        mock_sm.describe_data_quality_job_definition.side_effect = describe_definition
         return mock_sm
 
     @staticmethod
@@ -4404,6 +4419,168 @@ class TestSM23MonitorReportAndAlarm:
             sagemaker_app.check_model_drift_detection(region="us-east-1")
         )
         assert "Passed" not in [r["Status"] for r in rows]
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    CONSTRAINTS = {"S3Uri": "s3://baselines/constraints.json"}
+
+    def _inline(self, baseline):
+        detail = self._detail(1)
+        definition = {} if baseline is None else {"BaselineConfig": baseline}
+        detail["MonitoringScheduleConfig"]["MonitoringJobDefinition"] = definition
+        return detail
+
+    def _named(self, name, kind):
+        detail = self._detail(1)
+        detail["MonitoringScheduleConfig"].update(
+            {"MonitoringJobDefinitionName": name, "MonitoringType": kind}
+        )
+        return detail
+
+    def _baseline_rows(self, mock_client, **kwargs):
+        return self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_BASELINE_FINDING,
+            schedules=kwargs.pop("schedules", self._two()),
+            **kwargs,
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_inline_constraints_on_every_schedule_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "baseline",
+        [
+            None,
+            {},
+            {"StatisticsResource": {"S3Uri": "s3://b/s.json"}},
+            {"ConstraintsResource": {"S3Uri": ""}},
+        ],
+    )
+    @pytest.mark.parametrize("bare", ["dq", "mq"])
+    @patch("sagemaker_app.boto3.client")
+    def test_one_schedule_without_constraints_fails_only_itself(
+        self, mock_client, bare, baseline
+    ):
+        details = {
+            name: self._inline({"ConstraintsResource": self.CONSTRAINTS})
+            for name in ("dq", "mq")
+        }
+        details[bare] = self._inline(baseline)
+        rows = self._baseline_rows(mock_client, details=details)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        other = "mq" if bare == "dq" else "dq"
+        assert f"'{bare}'" in rows[0]["Finding_Details"]
+        assert f"'{other}'" not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_schedule_without_constraints_gets_a_row(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={"dq": self._inline(None), "mq": self._inline({})},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "'mq'" in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_named_data_quality_definition_is_read(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[self._schedule("dq", "DataQuality")],
+            details={"dq": self._named("dq-def", "DataQuality")},
+            job_definitions={
+                "dq-def": {
+                    "DataQualityBaselineConfig": {
+                        "ConstraintsResource": self.CONSTRAINTS
+                    }
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_named_data_quality_definition_without_constraints_fails(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._named("dq-def", "DataQuality"),
+                "mq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+            },
+            job_definitions={"dq-def": {"DataQualityBaselineConfig": {}}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "dq-def" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_data_quality_definition_withholds_the_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._named("dq-def", "DataQuality"),
+                "mq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+            },
+            job_definitions={"dq-def": "AccessDeniedException"},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "dq-def" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kind", ["ModelQuality", "ModelBias", "ModelExplainability"]
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_other_named_definitions_are_not_read(self, mock_client, kind):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline(None),
+                "mq": self._named("other-def", kind),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "other-def" in rows[1]["Finding_Details"]
+        assert kind in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_baselining_job_without_constraints_file_is_not_a_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._inline({"BaseliningJobName": "baseline-job"}),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "baseline-job" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_schedule_naming_no_definition_is_not_a_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._detail(1),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_undescribed_schedule_withholds_the_baseline_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={},
+            errors={"describe_monitoring_schedule": "AccessDeniedException"},
+        )
         assert [r["Status"] for r in rows] == ["N/A"]
 
 

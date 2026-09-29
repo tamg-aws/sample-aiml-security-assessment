@@ -261,6 +261,16 @@ section.
 
 ### Fixed
 
+- `SM-23` model drift detection adds a `Model Monitor Baseline Constraints`
+  row. Each Scheduled monitoring schedule on an InService endpoint must name a
+  baseline `ConstraintsResource`, read from its inline job definition or, for
+  a DataQuality schedule, from `DescribeDataQualityJobDefinition`. A schedule
+  with no constraints file fails, because its reports have nothing to be
+  validated against. A ModelQuality, ModelBias, or ModelExplainability
+  schedule that names a job definition is `N/A`, since only the DataQuality
+  describe is granted, and so is one that names a baselining job but no
+  constraints file.
+
 - `SM-11` endpoint model network path also judges the model each inference
   component names, from `Specification` and every `Specifications` entry,
   beside the endpoint config's own `EnableNetworkIsolation` and
