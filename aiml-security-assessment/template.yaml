@@ -436,6 +436,15 @@ Resources:
             Action:
               - bedrock-mantle:GetAccountDataRetention # BR-37
             Resource: '*'
+          - Sid: IAMAccountSummaryRead
+            # BR-50 reads AccountAccessKeysPresent to learn whether the root
+            # user has an access key. The service authorization reference lists
+            # no resource type for GetAccountSummary, so the resource must be
+            # '*'.
+            Effect: Allow
+            Action:
+              - iam:GetAccountSummary # BR-50
+            Resource: '*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

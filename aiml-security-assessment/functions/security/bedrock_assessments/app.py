@@ -24489,6 +24489,85 @@ def check_bedrock_ai_user_access_keys(
         }
 
 
+ROOT_ACCESS_KEY_FINDING = "Root User Access Key"
+
+ROOT_ACCESS_KEY_REFERENCE = (
+    "https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountSummary.html"
+)
+
+
+def check_root_user_access_key(region: str = "") -> Dict[str, Any]:
+    """
+    BR-50 root leg: a root user access key signs any request, AI services
+    included. iam:GetAccountSummary reports AccountAccessKeysPresent as 1 when
+    the root user has an access key and 0 otherwise.
+    """
+    findings = {"check_name": ROOT_ACCESS_KEY_FINDING, "csv_data": []}
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-50",
+            finding_name=ROOT_ACCESS_KEY_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=ROOT_ACCESS_KEY_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        iam_client = boto3.client("iam", config=boto3_config)
+        summary = iam_client.get_account_summary().get("SummaryMap") or {}
+    except (ClientError, BotoCoreError) as error:
+        findings["csv_data"].append(
+            row(
+                "The root user's access keys could not be read: "
+                f"{describe_api_error(error, 'iam:GetAccountSummary', region)}.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+    present = summary.get("AccountAccessKeysPresent")
+    if present == 1:
+        findings["csv_data"].append(
+            row(
+                "iam:GetAccountSummary reports AccountAccessKeysPresent is 1: the "
+                "root user has an access key, and whether that key is active is not "
+                "returned. A root access key signs any request, Bedrock, "
+                "bedrock-mantle, SageMaker AI and AgentCore included.",
+                "Delete the root user's access keys and use an IAM role or IAM "
+                "Identity Center for programmatic access.",
+                "High",
+                "Failed",
+            )
+        )
+    elif present == 0:
+        findings["csv_data"].append(
+            row(
+                "iam:GetAccountSummary reports AccountAccessKeysPresent is 0: the "
+                "root user has no access key.",
+                "No action required",
+                "High",
+                "Passed",
+            )
+        )
+    else:
+        findings["csv_data"].append(
+            row(
+                "iam:GetAccountSummary returned no AccountAccessKeysPresent value "
+                f"of 0 or 1 (got {present!r}), so the root user's access keys were "
+                "not judged.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    return findings
+
+
 AI_USER_MFA_FINDING = "AI User Console MFA"
 
 AI_USER_MFA_REFERENCE = (
@@ -31843,6 +31922,10 @@ def lambda_handler(event, context):
                         identity_center_region=region,
                     )
                 )
+
+            # The root leg of BR-50 reads iam:GetAccountSummary, not the cache.
+            logger.info("Running root user access key check (BR-50)")
+            all_findings.append(check_root_user_access_key(region=GLOBAL_REGION_LABEL))
 
             # logger.info("Running global stale Bedrock access check (BR-14)")
             # all_findings.append(

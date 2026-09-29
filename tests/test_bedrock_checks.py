@@ -7557,10 +7557,11 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_marketplace_model_control",  # BR-44
         "check_bedrock_api_key_governance",  # BR-45
         "check_bedrock_ai_user_access_keys",  # BR-50
+        "check_root_user_access_key",  # BR-50 root leg
         "check_bedrock_ai_user_console_mfa",  # BR-51
     )
 
-    def _run_handler_with_check_spies(self, event):
+    def _run_handler_with_check_spies(self, event, cache=None):
         """Drive the handler down the full regional path with every check function
         replaced by a spy that records the region it was called with. The probe
         raises ValidationException (service reachable) so all regional checks run.
@@ -7607,6 +7608,7 @@ class TestBedrockHandlerMultiRegion:
             "check_bedrock_marketplace_model_control",  # BR-44 (global)
             "check_bedrock_api_key_governance",  # BR-45 (global)
             "check_bedrock_ai_user_access_keys",  # BR-50 (global)
+            "check_root_user_access_key",  # BR-50 root leg (global)
             "check_bedrock_ai_user_console_mfa",  # BR-51 (global)
             "check_bedrock_knowledge_base_source_classification",  # BR-46
             "check_bedrock_guardrail_tier",
@@ -7630,7 +7632,9 @@ class TestBedrockHandlerMultiRegion:
                 patch.object(
                     bedrock_app,
                     "get_permissions_cache",
-                    return_value={"role_permissions": {}, "user_permissions": {}},
+                    return_value=cache
+                    if cache is not None
+                    else {"role_permissions": {}, "user_permissions": {}},
                 )
             )
             stack.enter_context(
@@ -7691,6 +7695,16 @@ class TestBedrockHandlerMultiRegion:
             recorded.get("check_bedrock_knowledge_base_source_classification")
             == "us-east-1"
         )
+
+    def test_the_root_key_leg_runs_without_the_permissions_cache(self):
+        # The root leg reads iam:GetAccountSummary, so an unavailable cache
+        # must not drop it along with the cache-backed BR-50 user leg.
+        resp, recorded = self._run_handler_with_check_spies(
+            _bedrock_event(region="us-east-1", region_index=0), cache={}
+        )
+        assert resp["statusCode"] == 200
+        assert "check_bedrock_ai_user_access_keys" not in recorded
+        assert recorded.get("check_root_user_access_key") == "Global"
 
 
 # ===================================================================
@@ -34316,3 +34330,54 @@ class TestMantleGet:
                 bedrock_app._mantle_get("us-east-1", "/v1/data_retention")
         assert raised.value.label == "NoCredentialsError"
         urlopen.assert_not_called()
+
+
+class TestBR50RootAccessKey:
+    """BR-50 root leg: iam:GetAccountSummary AccountAccessKeysPresent."""
+
+    @staticmethod
+    def _run(summary=None, error=None):
+        iam = MagicMock()
+        if error is not None:
+            iam.get_account_summary.side_effect = error
+        else:
+            iam.get_account_summary.return_value = {"SummaryMap": summary}
+        with patch("bedrock_app.boto3.client", return_value=iam) as client:
+            rows = extract_csv_data(
+                bedrock_app.check_root_user_access_key(region="Global")
+            )
+        assert client.call_args.args[0] == "iam"
+        return rows
+
+    def test_a_root_access_key_fails(self):
+        [row] = self._run({"AccountAccessKeysPresent": 1, "Users": 3})
+        assert row["Check_ID"] == "BR-50"
+        assert row["Finding"] == "Root User Access Key"
+        assert row["Status"] == "Failed"
+        assert row["Severity"] == "High"
+        assert "AccountAccessKeysPresent is 1" in row["Finding_Details"]
+        assert "whether that key is active is not returned" in row["Finding_Details"]
+
+    def test_no_root_access_key_passes(self):
+        [row] = self._run({"AccountAccessKeysPresent": 0})
+        assert row["Status"] == "Passed"
+        assert "AccountAccessKeysPresent is 0" in row["Finding_Details"]
+
+    def test_a_missing_or_unexpected_value_is_na(self):
+        for summary in ({"Users": 3}, {"AccountAccessKeysPresent": 2}, {}, None):
+            [row] = self._run(summary)
+            assert row["Status"] == "N/A", summary
+            assert "AccountAccessKeysPresent" in row["Finding_Details"]
+
+    def test_a_denied_summary_is_na_naming_the_action(self):
+        [row] = self._run(error=_make_client_error("AccessDenied"))
+        assert row["Status"] == "N/A"
+        assert "iam:GetAccountSummary" in row["Finding_Details"]
+
+    def test_rows_pass_the_schema(self):
+        for summary in (
+            {"AccountAccessKeysPresent": 1},
+            {"AccountAccessKeysPresent": 0},
+        ):
+            for finding in self._run(summary):
+                assert_finding_schema(finding)

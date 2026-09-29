@@ -1561,7 +1561,8 @@ FOUNDATION_ROWS = [
         "attached, inline or group policies grant any bedrock:, sagemaker:, "
         "bedrock-agentcore: or bedrock-mantle: action, reads included, and whose permissions boundary "
         "allows one too, fails each Active key and reports its age from CreateDate. "
-        "Inactive keys do not count",
+        "Inactive keys do not count. A separate BR-50 row reads iam:GetAccountSummary "
+        "and fails when AccountAccessKeysPresent is 1, a root user access key",
         [],
         6,
     ),

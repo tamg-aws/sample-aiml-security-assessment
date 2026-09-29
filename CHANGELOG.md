@@ -12,6 +12,13 @@ section.
 
 ### Added
 
+- `BR-50` adds a `Root User Access Key` row. It reads
+  `iam:GetAccountSummary` and fails when `AccountAccessKeysPresent` is `1`,
+  because a root access key signs any request, AI services included, and
+  BR-50 read IAM users only. The summary does not say whether the key is
+  active, and the row says so. The row runs on the primary Region even when
+  the permissions cache is unavailable.
+
 - `BR-37` reads the `bedrock-mantle` data-retention scopes. It signs GET
   requests to `https://bedrock-mantle.<region>.api.aws` with SigV4 under the
   `bedrock-mantle` signing name, reads the mantle account mode
@@ -1230,9 +1237,10 @@ and `sso:ListCustomerManagedPolicyReferencesInPermissionSet` on the
 AWS managed policy documents are readable. For `BR-37` it gains
 `bedrock-mantle:ListProjects` on the account's `project/*` ARNs and
 `bedrock-mantle:GetAccountDataRetention` on `*`, which has no resource type
-in the IAM service authorization reference. All are read-only, and the same
-CodeBuild run applies them. The Bedrock function now also makes HTTPS calls
-to `bedrock-mantle.<region>.api.aws`.
+in the IAM service authorization reference. For `BR-50` it gains
+`iam:GetAccountSummary` on `*`, which also has no resource type there. All
+are read-only, and the same CodeBuild run applies them. The Bedrock function
+now also makes HTTPS calls to `bedrock-mantle.<region>.api.aws`.
 
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a

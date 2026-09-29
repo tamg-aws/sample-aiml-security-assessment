@@ -157,6 +157,7 @@ _EXPECTED_ACTIONS = {
         "eks:ListClusters",
         "eks:ListPodIdentityAssociations",
         "events:ListTargetsByRule",
+        "iam:GetAccountSummary",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
         "sagemaker:DescribeEndpoint",
@@ -866,6 +867,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             scoped("iam:GetPolicy", "iam::aws:policy/*"),
             scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
             ("Allow", "bedrock-mantle:GetAccountDataRetention", '"*"'),
+            ("Allow", "iam:GetAccountSummary", '"*"'),
             scoped(
                 "bedrock-mantle:ListProjects",
                 "bedrock-mantle:*:${AWS::AccountId}:project/*",
