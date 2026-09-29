@@ -3511,9 +3511,11 @@ class TestSM22RegistryLegs:
         components=None,
         ram=None,
         errors=None,
+        transform_jobs=None,
     ):
         errors = errors or {}
         endpoints = endpoints or {}
+        transform_jobs = transform_jobs or {}
         models = models or {}
         components = components or {}
         ram = ram if ram is not None else {"SELF": ["arn:grp"], "OTHER-ACCOUNTS": []}
@@ -3568,6 +3570,14 @@ class TestSM22RegistryLegs:
                             ]
                         }
                     ]
+                if name == "list_transform_jobs":
+                    return [
+                        {
+                            "TransformJobSummaries": [
+                                {"TransformJobName": j} for j in transform_jobs
+                            ]
+                        }
+                    ]
                 return [{}]
 
             pager.paginate.side_effect = paginate
@@ -3592,6 +3602,12 @@ class TestSM22RegistryLegs:
             return models[ModelName]
 
         mock_sm.describe_model.side_effect = describe_model
+
+        def describe_transform_job(TransformJobName):
+            fail("describe_transform_job")
+            return {"ModelName": transform_jobs[TransformJobName]}
+
+        mock_sm.describe_transform_job.side_effect = describe_transform_job
         mock_sm.describe_inference_component.side_effect = (
             lambda InferenceComponentName: {
                 "Specification": {
@@ -3803,6 +3819,101 @@ class TestSM22RegistryLegs:
     def test_no_endpoints_adds_no_deployment_row(self, mock_client):
         self._client(mock_client, {"p1": self._good_package()})
         assert self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING) == []
+
+    REGISTERED = {"PrimaryContainer": {"ModelPackageName": "p1"}}
+    UNREGISTERED = {"PrimaryContainer": {"Image": "img"}}
+
+    @patch("sagemaker_app.boto3.client")
+    def test_registered_endpoint_and_transform_models_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            transform_jobs={"batch-1": "m2"},
+            models={"m1": self.REGISTERED, "m2": self.REGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "1 batch transform job(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("bad", ["batch-1", "batch-2"])
+    @patch("sagemaker_app.boto3.client")
+    def test_one_unregistered_transform_model_fails_only_its_job(
+        self, mock_client, bad
+    ):
+        jobs = {"batch-1": "m1", "batch-2": "m1"}
+        jobs[bad] = "m2"
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            transform_jobs=jobs,
+            models={"m1": self.REGISTERED, "m2": self.UNREGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        good = "batch-2" if bad == "batch-1" else "batch-1"
+        assert "'m2'" in rows[0]["Finding_Details"]
+        assert f"transform job {bad}" in rows[0]["Finding_Details"]
+        assert good not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_transform_model_is_judged_without_any_endpoint(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            transform_jobs={"batch-1": "m2"},
+            models={"m2": self.UNREGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "transform job batch-1" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_model_on_an_endpoint_and_a_job_names_both(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m2"}]},
+            transform_jobs={"batch-1": "m2"},
+            models={"m2": self.UNREGISTERED},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ep/v" in rows[0]["Finding_Details"]
+        assert "transform job batch-1" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_undescribed_transform_job_withholds_the_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            transform_jobs={"batch-1": "m1"},
+            models={"m1": self.REGISTERED},
+            errors={"describe_transform_job": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "batch-1" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("with_endpoint", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_transform_list_denied_withholds_the_pass(self, mock_client, with_endpoint):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints=(
+                {"ep": [{"VariantName": "v", "ModelName": "m1"}]}
+                if with_endpoint
+                else None
+            ),
+            models={"m1": self.REGISTERED},
+            errors={"list_transform_jobs": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "ListTransformJobs" in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_describe_package_denied_withholds_the_aggregate_pass(self, mock_client):
@@ -4164,9 +4275,16 @@ class TestSM23MonitorReportAndAlarm:
 
     @staticmethod
     def _client(
-        mock_client, schedules, details, alarms=(), errors=None, endpoints=("ep",)
+        mock_client,
+        schedules,
+        details,
+        alarms=(),
+        errors=None,
+        endpoints=("ep",),
+        job_definitions=None,
     ):
         errors = errors or {}
+        job_definitions = job_definitions or {}
         mock_sm = MagicMock()
         mock_client.return_value = mock_sm
 
@@ -4200,6 +4318,14 @@ class TestSM23MonitorReportAndAlarm:
             return details[MonitoringScheduleName]
 
         mock_sm.describe_monitoring_schedule.side_effect = describe
+
+        def describe_definition(JobDefinitionName):
+            value = job_definitions[JobDefinitionName]
+            if isinstance(value, str):
+                raise _make_client_error(value, "DescribeDataQualityJobDefinition")
+            return value
+
+        mock_sm.describe_data_quality_job_definition.side_effect = describe_definition
         return mock_sm
 
     @staticmethod
@@ -4404,6 +4530,168 @@ class TestSM23MonitorReportAndAlarm:
             sagemaker_app.check_model_drift_detection(region="us-east-1")
         )
         assert "Passed" not in [r["Status"] for r in rows]
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    CONSTRAINTS = {"S3Uri": "s3://baselines/constraints.json"}
+
+    def _inline(self, baseline):
+        detail = self._detail(1)
+        definition = {} if baseline is None else {"BaselineConfig": baseline}
+        detail["MonitoringScheduleConfig"]["MonitoringJobDefinition"] = definition
+        return detail
+
+    def _named(self, name, kind):
+        detail = self._detail(1)
+        detail["MonitoringScheduleConfig"].update(
+            {"MonitoringJobDefinitionName": name, "MonitoringType": kind}
+        )
+        return detail
+
+    def _baseline_rows(self, mock_client, **kwargs):
+        return self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_BASELINE_FINDING,
+            schedules=kwargs.pop("schedules", self._two()),
+            **kwargs,
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_inline_constraints_on_every_schedule_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "baseline",
+        [
+            None,
+            {},
+            {"StatisticsResource": {"S3Uri": "s3://b/s.json"}},
+            {"ConstraintsResource": {"S3Uri": ""}},
+        ],
+    )
+    @pytest.mark.parametrize("bare", ["dq", "mq"])
+    @patch("sagemaker_app.boto3.client")
+    def test_one_schedule_without_constraints_fails_only_itself(
+        self, mock_client, bare, baseline
+    ):
+        details = {
+            name: self._inline({"ConstraintsResource": self.CONSTRAINTS})
+            for name in ("dq", "mq")
+        }
+        details[bare] = self._inline(baseline)
+        rows = self._baseline_rows(mock_client, details=details)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        other = "mq" if bare == "dq" else "dq"
+        assert f"'{bare}'" in rows[0]["Finding_Details"]
+        assert f"'{other}'" not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_schedule_without_constraints_gets_a_row(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={"dq": self._inline(None), "mq": self._inline({})},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "'mq'" in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_named_data_quality_definition_is_read(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            schedules=[self._schedule("dq", "DataQuality")],
+            details={"dq": self._named("dq-def", "DataQuality")},
+            job_definitions={
+                "dq-def": {
+                    "DataQualityBaselineConfig": {
+                        "ConstraintsResource": self.CONSTRAINTS
+                    }
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_named_data_quality_definition_without_constraints_fails(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._named("dq-def", "DataQuality"),
+                "mq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+            },
+            job_definitions={"dq-def": {"DataQualityBaselineConfig": {}}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "dq-def" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_data_quality_definition_withholds_the_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._named("dq-def", "DataQuality"),
+                "mq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+            },
+            job_definitions={"dq-def": "AccessDeniedException"},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "dq-def" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kind", ["ModelQuality", "ModelBias", "ModelExplainability"]
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_other_named_definitions_are_not_read(self, mock_client, kind):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline(None),
+                "mq": self._named("other-def", kind),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "other-def" in rows[1]["Finding_Details"]
+        assert kind in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_baselining_job_without_constraints_file_is_not_a_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._inline({"BaseliningJobName": "baseline-job"}),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "baseline-job" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_schedule_naming_no_definition_is_not_a_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={
+                "dq": self._inline({"ConstraintsResource": self.CONSTRAINTS}),
+                "mq": self._detail(1),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_undescribed_schedule_withholds_the_baseline_pass(self, mock_client):
+        rows = self._baseline_rows(
+            mock_client,
+            details={},
+            errors={"describe_monitoring_schedule": "AccessDeniedException"},
+        )
         assert [r["Status"] for r in rows] == ["N/A"]
 
 
@@ -8758,6 +9046,66 @@ class TestSM38RuntimeCoverageAndLambdaTier:
     def _named(rows, name):
         return [r for r in rows if r["Finding"].startswith(name)]
 
+    def _audit(self, status, runtime="ENABLED", detector_status="ENABLED"):
+        detector = self._detail(runtime=runtime)
+        detector["detail"]["Status"] = detector_status
+        if status is not None:
+            detector["detail"]["Features"].append(
+                {"Name": "EKS_AUDIT_LOGS", "Status": status}
+            )
+        return detector
+
+    def test_eks_audit_logs_enabled_passes(self):
+        rows = self._run(
+            self._audit("ENABLED"),
+            coverage=[self._eks("a"), self._eks("b")],
+            eks=["a", "b"],
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Passed"]
+        assert "2 EKS cluster(s)" in audit[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["DISABLED", None])
+    def test_eks_audit_logs_off_fails_with_clusters(self, status):
+        rows = self._run(
+            self._audit(status),
+            coverage=[self._eks("a"), self._eks("b")],
+            eks=["a", "b"],
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Failed"]
+        assert "a, b" in audit[0]["Finding_Details"]
+        assert (status or "absent") in audit[0]["Finding_Details"]
+
+    def test_eks_audit_logs_are_judged_when_runtime_monitoring_is_off(self):
+        rows = self._run(self._audit("DISABLED", runtime="DISABLED"), eks=["a"])
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Failed"]
+
+    def test_eks_audit_logs_on_a_disabled_detector_fails(self):
+        rows = self._run(
+            self._audit("ENABLED", detector_status="DISABLED"),
+            coverage=[self._eks("a")],
+            eks=["a"],
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Failed"]
+        assert "detector" in audit[0]["Finding_Details"]
+
+    def test_no_eks_cluster_adds_no_audit_log_row(self):
+        rows = self._run(self._audit("DISABLED"))
+        assert self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING) == []
+
+    @pytest.mark.parametrize("status", ["ENABLED", "DISABLED"])
+    def test_eks_list_denied_withholds_the_audit_log_verdict(self, status):
+        rows = self._run(
+            self._audit(status),
+            errors={"eks": _make_client_error("AccessDeniedException")},
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["N/A"]
+        assert "eks:ListClusters" in audit[0]["Finding_Details"]
+
     def test_healthy_coverage_for_every_cluster_passes(self):
         rows = self._run(
             self._detail(),
@@ -11421,10 +11769,13 @@ def _sm11_rows(
     extra_pages=None,
     permission_cache=None,
     key_managers=None,
+    components=None,
 ):
     """Run SM-11 against models {name: DescribeModel}, endpoints {name: config}.
 
     kms:DescribeKey reports CUSTOMER for any key not in key_managers.
+    components is {name: (endpoint, DescribeInferenceComponent)}, listed on
+    one page.
     """
     endpoints = endpoints or {}
     key_managers = key_managers or {}
@@ -11457,11 +11808,32 @@ def _sm11_rows(
     def describe_endpoint_config(EndpointConfigName):
         return configs[EndpointConfigName]
 
+    components = components or {}
+    if components:
+        # The mock ignores EndpointNameEquals; the check keeps its own.
+        pages["list_inference_components"] = [
+            {
+                "InferenceComponents": [
+                    {"InferenceComponentName": name, "EndpointName": endpoint}
+                    for name, (endpoint, _) in components.items()
+                ]
+            }
+        ]
+
+    def describe_inference_component(InferenceComponentName):
+        value = components[InferenceComponentName][1]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
     sm = _pages_client(
         pages,
         describe_model=MagicMock(side_effect=describe_model),
         describe_endpoint=MagicMock(side_effect=describe_endpoint),
         describe_endpoint_config=MagicMock(side_effect=describe_endpoint_config),
+        describe_inference_component=MagicMock(
+            side_effect=describe_inference_component
+        ),
     )
     ec2_pages = {
         "describe_subnets": [{"Subnets": PRIVATE_SUBNET_FIXTURE[0]}],
@@ -11635,6 +12007,138 @@ class TestSM11EndpointModelNetworkPath:
         rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "inference-component" in rows[0]["Finding_Details"]
+
+    IC_CONFIG = {
+        "ProductionVariants": [{"VariantName": "ic", "InstanceType": "ml.g5"}],
+        "EnableNetworkIsolation": True,
+        "VpcConfig": {"Subnets": ["subnet-private"], "SecurityGroupIds": ["sg-1"]},
+    }
+
+    def _component(self, endpoint, model=None, specifications=None):
+        component = {"EndpointName": endpoint, "VariantName": "ic"}
+        if not model and not specifications:
+            return endpoint, component
+        if model:
+            component["Specification"] = {"ModelName": model}
+        if specifications:
+            component["Specifications"] = [
+                {"InstanceType": "ml.g5", "ModelName": m} for m in specifications
+            ]
+        return endpoint, component
+
+    def _ic_rows(self, models, components):
+        rows, _ = _sm11_rows(
+            models,
+            endpoints={"ep-a": "cfg", "ep-b": "cfg"},
+            configs={"cfg": self.IC_CONFIG},
+            components=components,
+        )
+        return rows
+
+    @pytest.mark.parametrize(
+        "open_model, gap",
+        [
+            (
+                {"EnableNetworkIsolation": False, "VpcConfig": {"Subnets": ["s"]}},
+                "EnableNetworkIsolation off",
+            ),
+            ({"EnableNetworkIsolation": True}, "no VpcConfig"),
+        ],
+    )
+    @pytest.mark.parametrize("open_first", [True, False])
+    def test_an_inference_component_model_fails_only_its_endpoint(
+        self, open_model, gap, open_first
+    ):
+        components = [
+            ("ic-a", self._component("ep-a", "good")),
+            ("ic-b", self._component("ep-b", "open")),
+        ]
+        if open_first:
+            components.reverse()
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL, "open": open_model}, dict(components)
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "Endpoint 'ep-b'" in details
+        assert "ep-a" not in details
+        assert f"model 'open' of inference component 'ic-b' has {gap}" in details
+
+    def test_a_second_specification_model_is_judged(self):
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL, "open": {"EnableNetworkIsolation": False}},
+            {
+                "ic-a": self._component("ep-a", "good"),
+                "ic-b": self._component("ep-b", specifications=["good", "open"]),
+            },
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "model 'open' of inference component 'ic-b'" in (rows[0]["Finding_Details"])
+        )
+
+    def test_inference_components_on_isolated_models_pass(self):
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            {
+                "ic-a": self._component("ep-a", "good"),
+                "ic-b": self._component("ep-b", "good"),
+            },
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 endpoint(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "component_b, named",
+        [
+            (("ep-b", _make_client_error("ThrottlingException")), "ic-b"),
+            (("ep-b", {"Specification": {"ModelName": "gone"}}), "gone"),
+        ],
+    )
+    def test_an_unread_inference_component_model_withholds_the_pass(
+        self, component_b, named
+    ):
+        rows = self._ic_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            {"ic-a": self._component("ep-a", "good"), "ic-b": component_b},
+        )
+        assert not [
+            r
+            for r in _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+            if r["Status"] == "Passed"
+        ]
+        incomplete = _by_finding(
+            rows, f"{sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING} Incomplete"
+        )
+        assert [r["Status"] for r in incomplete] == ["N/A"]
+        assert named in incomplete[0]["Finding_Details"]
+        assert "1 endpoint(s) serve" in incomplete[0]["Finding_Details"]
+
+    def test_an_unlisted_inference_component_withholds_the_pass(self):
+        rows, _ = _sm11_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-a": "cfg-a", "ep-b": "cfg"},
+            configs={"cfg-a": _config(["good"]), "cfg": self.IC_CONFIG},
+            extra_pages={
+                "list_inference_components": _make_client_error("AccessDenied")
+            },
+        )
+        assert not [
+            r
+            for r in _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+            if r["Status"] == "Passed"
+        ]
+        incomplete = _by_finding(
+            rows, f"{sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING} Incomplete"
+        )
+        assert (
+            "inference components of endpoint 'ep-b'"
+            in (incomplete[0]["Finding_Details"])
+        )
+        assert "1 endpoint(s) serve" in incomplete[0]["Finding_Details"]
 
     def test_list_endpoints_error_is_not_no_endpoints(self):
         pages = {"list_endpoints": _make_client_error("AccessDeniedException")}
@@ -14002,6 +14506,54 @@ class TestSM09ExecutionRolePrivilege:
         role_rows = _by_finding(rows, self.ROLE)
         assert [r["Status"] for r in role_rows] == ["Failed"]
         assert "d-1/alice" in role_rows[0]["Finding_Details"]
+
+    WIDE_ROLE = "arn:aws:iam::123456789012:role/wide-role"
+
+    def _space_cache(self):
+        return _environment_cache(
+            {
+                "nb-role": [("scoped", "arn:aws:iam::1:policy/s", [_LEAST_PRIVILEGE])],
+                "wide-role": [
+                    (
+                        "AmazonSageMakerFullAccess",
+                        "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess",
+                        [],
+                    )
+                ],
+            }
+        )
+
+    @pytest.mark.parametrize("wide", ["user", "space"])
+    def test_domain_default_space_role_is_read(self, wide):
+        user_role = self.WIDE_ROLE if wide == "user" else _NB_ROLE
+        space_role = self.WIDE_ROLE if wide == "space" else _NB_ROLE
+        rows = _sm09_rows(
+            notebooks={},
+            domains={
+                "d-1": {
+                    "DefaultUserSettings": {"ExecutionRole": user_role},
+                    "DefaultSpaceSettings": {"ExecutionRole": space_role},
+                }
+            },
+            cache=self._space_cache(),
+        )
+        role_rows = _by_finding(rows, self.ROLE)
+        assert [r["Status"] for r in role_rows] == ["Failed"]
+        details = role_rows[0]["Finding_Details"]
+        assert ("default space" in details) == (wide == "space")
+
+    def test_clean_default_space_role_passes(self):
+        rows = _sm09_rows(
+            notebooks={},
+            domains={
+                "d-1": {
+                    "DefaultUserSettings": {"ExecutionRole": _NB_ROLE},
+                    "DefaultSpaceSettings": {"ExecutionRole": _NB_ROLE},
+                }
+            },
+            cache=self._space_cache(),
+        )
+        assert _statuses_of(rows, self.ROLE) == ["Passed"]
 
     def test_role_missing_from_cache_is_incomplete(self):
         rows = _sm09_rows(cache=_environment_cache({}))

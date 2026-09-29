@@ -4511,6 +4511,13 @@ def check_sagemaker_notebook_root_access(
                 environment_roles.append(
                     (f"Studio domain '{domain_id}' default", default_role)
                 )
+            space_role = (domain_details.get("DefaultSpaceSettings") or {}).get(
+                "ExecutionRole"
+            )
+            if space_role:
+                environment_roles.append(
+                    (f"Studio domain '{domain_id}' default space", space_role)
+                )
             try:
                 profiles = []
                 for page in sagemaker_client.get_paginator(
@@ -5153,39 +5160,103 @@ def _endpoint_hosting_inventory(sagemaker_client) -> Dict[str, Any]:
     return {"endpoints": endpoints, "unread": unread}
 
 
+def _inference_component_models(
+    sagemaker_client, inventory: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    The models each inference component on an endpoint names.
+
+    Returns {endpoint name: ([(component, model), ...], [unread, ...])}. A
+    component that names a Container and no model, or an adapter loaded by a
+    base component, contributes no model.
+    """
+    components = {}
+    for endpoint in inventory["endpoints"]:
+        if not endpoint["component_variants"]:
+            continue
+        name = endpoint["name"]
+        served, unread = [], []
+        try:
+            for page in sagemaker_client.get_paginator(
+                "list_inference_components"
+            ).paginate(EndpointNameEquals=name):
+                for summary in page.get("InferenceComponents", []):
+                    component = summary.get("InferenceComponentName")
+                    if summary.get("EndpointName") != name or not component:
+                        continue
+                    try:
+                        described = sagemaker_client.describe_inference_component(
+                            InferenceComponentName=component
+                        )
+                    except Exception as error:
+                        unread.append(
+                            f"inference component '{component}' on endpoint "
+                            f"'{name}' ({get_assessment_error_label(error)})"
+                        )
+                        continue
+                    specifications = [described.get("Specification") or {}] + list(
+                        described.get("Specifications") or []
+                    )
+                    served.extend(
+                        (component, spec["ModelName"])
+                        for spec in specifications
+                        if spec.get("ModelName")
+                    )
+        except Exception as error:
+            unread.append(
+                f"inference components of endpoint '{name}' "
+                f"({get_assessment_error_label(error)})"
+            )
+        components[name] = (served, unread)
+    return components
+
+
 def _endpoint_model_network_findings(
     inventory: Dict[str, Any],
     model_settings: Dict[str, Dict[str, Any]],
     unread_models: Dict[str, str],
     region: str,
+    component_models: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     AIR-SGM-EP-01 and EP-03: judge network isolation and VpcConfig on the
     models an endpoint actually serves, not on the model inventory at large.
 
-    A model the endpoint names but the scan could not describe, or one deleted
-    after the endpoint was created, leaves that endpoint unread.
+    An endpoint that hosts inference components is judged on the endpoint
+    config's own settings and on the model each component names. A model the
+    endpoint names but the scan could not describe, one deleted after the
+    endpoint was created, or components that could not be read, leave that
+    endpoint unread.
     """
     emitted = []
     unread = list(inventory["unread"])
     compliant = []
+    component_models = component_models or {}
     for endpoint in inventory["endpoints"]:
         gaps = []
         endpoint_unread = False
-        for model_name in endpoint["models"]:
+        served = [(None, model_name) for model_name in endpoint["models"]]
+        components, components_unread = component_models.get(endpoint["name"], ([], []))
+        served.extend(components)
+        if components_unread:
+            unread.extend(components_unread)
+            endpoint_unread = True
+        for component, model_name in served:
+            label = f"model '{model_name}'" + (
+                f" of inference component '{component}'" if component else ""
+            )
             settings = model_settings.get(model_name)
             if settings is None:
                 reason = unread_models.get(model_name, "not in the model inventory")
                 unread.append(
-                    f"model '{model_name}' behind endpoint '{endpoint['name']}' "
-                    f"({reason})"
+                    f"{label} behind endpoint '{endpoint['name']}' ({reason})"
                 )
                 endpoint_unread = True
                 continue
             if not settings["isolation"]:
-                gaps.append(f"model '{model_name}' has EnableNetworkIsolation off")
+                gaps.append(f"{label} has EnableNetworkIsolation off")
             if not settings["subnets"]:
-                gaps.append(f"model '{model_name}' has no VpcConfig")
+                gaps.append(f"{label} has no VpcConfig")
         if endpoint["component_variants"]:
             config = endpoint["config"]
             vpc_config = config.get("VpcConfig")
@@ -6017,7 +6088,11 @@ def check_sagemaker_model_network_isolation(
 
         findings["csv_data"].extend(
             _endpoint_model_network_findings(
-                inventory, model_settings, unread_models, region
+                inventory,
+                model_settings,
+                unread_models,
+                region,
+                _inference_component_models(sagemaker_client, inventory),
             )
         )
         findings["csv_data"].extend(_endpoint_config_kms_findings(inventory, region))
@@ -7988,12 +8063,42 @@ def _endpoint_variant_models(
     return models, endpoints
 
 
+def _transform_job_models(
+    sagemaker_client: Any, models: Dict[str, List[str]], unread: List[str]
+) -> int:
+    """Add the model each batch transform job ran to models; return the job count."""
+    jobs = 0
+    try:
+        for page in sagemaker_client.get_paginator("list_transform_jobs").paginate():
+            for summary in page.get("TransformJobSummaries", []):
+                name = summary.get("TransformJobName")
+                jobs += 1
+                try:
+                    model_name = sagemaker_client.describe_transform_job(
+                        TransformJobName=name
+                    ).get("ModelName")
+                except Exception as error:
+                    unread.append(
+                        f"transform job {name} ({get_assessment_error_label(error)})"
+                    )
+                    continue
+                if not model_name:
+                    unread.append(f"transform job {name} (no ModelName returned)")
+                    continue
+                models.setdefault(model_name, []).append(f"transform job {name}")
+    except Exception as error:
+        unread.append(
+            f"sagemaker:ListTransformJobs ({get_assessment_error_label(error)})"
+        )
+    return jobs
+
+
 def _deployed_model_registration_findings(
     sagemaker_client: Any, region: str
 ) -> List[Dict[str, Any]]:
     """
-    Report whether every model serving on an endpoint was created from an
-    Approved version in a model package group.
+    Report whether every model serving on an endpoint or run by a batch
+    transform job was created from an Approved version in a model package group.
     """
     unread = []
     try:
@@ -8009,7 +8114,8 @@ def _deployed_model_registration_findings(
                 region,
             )
         ]
-    if not endpoints:
+    transform_jobs = _transform_job_models(sagemaker_client, models, unread)
+    if not endpoints and not transform_jobs and not unread:
         return []
     problems = []
     registered = 0
@@ -8098,8 +8204,8 @@ def _deployed_model_registration_findings(
                 "SM-22",
                 DEPLOYED_MODEL_REGISTRATION_FINDING,
                 unread,
-                f"{endpoints} endpoint(s) and {len(models)} serving model(s) were "
-                "found.",
+                f"{endpoints} endpoint(s), {transform_jobs} batch transform job(s), "
+                f"and {len(models)} model(s) they use were found.",
                 DEPLOYED_MODEL_REGISTRATION_REFERENCE,
                 region,
             )
@@ -8111,8 +8217,8 @@ def _deployed_model_registration_findings(
                 finding_name=DEPLOYED_MODEL_REGISTRATION_FINDING,
                 finding_details=(
                     f"All {registered} model(s) serving on the {endpoints} endpoint(s) "
-                    "read were created from an Approved version in a model package "
-                    "group. Batch transform jobs are not part of this population."
+                    f"and run by the {transform_jobs} batch transform job(s) read were "
+                    "created from an Approved version in a model package group."
                 ),
                 resolution="No action required",
                 reference=DEPLOYED_MODEL_REGISTRATION_REFERENCE,
@@ -8410,6 +8516,7 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
 
 MONITOR_REPORT_FINDING = "Model Monitor Recent Report"
 MONITOR_ALARM_FINDING = "Model Monitor Violation Alarm"
+MONITOR_BASELINE_FINDING = "Model Monitor Baseline Constraints"
 MODEL_MONITOR_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor.html"
 )
@@ -8494,18 +8601,76 @@ def _schedule_cadence(expression: str) -> timedelta:
     return timedelta(days=1)
 
 
+def _schedule_baseline_constraints(
+    sagemaker_client: Any, name: str, detail: Dict[str, Any]
+) -> tuple:
+    """
+    Where a described monitoring schedule's baseline constraints file is.
+
+    Returns ("baselined", uri), ("missing", text) when the job definition
+    names no constraints file, or ("unread", text) when that was not read. Only the DataQuality job definition describe is granted, so a
+    schedule naming a ModelQuality, ModelBias, or ModelExplainability
+    definition is unread.
+    """
+    config = detail.get("MonitoringScheduleConfig") or {}
+    if "MonitoringJobDefinition" in config:
+        baseline = (config.get("MonitoringJobDefinition") or {}).get(
+            "BaselineConfig"
+        ) or {}
+        where = "its inline job definition"
+    elif config.get("MonitoringJobDefinitionName"):
+        definition = config["MonitoringJobDefinitionName"]
+        kind = config.get("MonitoringType") or detail.get("MonitoringType")
+        if kind != "DataQuality":
+            return "unread", (
+                f"schedule '{name}': its {kind or 'untyped'} job definition "
+                f"'{definition}' was not read (only "
+                "sagemaker:DescribeDataQualityJobDefinition is granted)"
+            )
+        try:
+            baseline = (
+                sagemaker_client.describe_data_quality_job_definition(
+                    JobDefinitionName=definition
+                ).get("DataQualityBaselineConfig")
+                or {}
+            )
+        except Exception as error:
+            return "unread", (
+                f"sagemaker:DescribeDataQualityJobDefinition {definition} of "
+                f"schedule '{name}' ({get_assessment_error_label(error)})"
+            )
+        where = f"its job definition '{definition}'"
+    else:
+        return "unread", f"schedule '{name}' names no job definition"
+    uri = (baseline.get("ConstraintsResource") or {}).get("S3Uri")
+    if uri:
+        return "baselined", uri
+    if baseline.get("BaseliningJobName"):
+        # Whether monitoring falls back to the baselining job's output for its
+        # constraints is not established, so this is neither pass nor fail.
+        return "unread", (
+            f"schedule '{name}': {where} names baselining job "
+            f"'{baseline['BaseliningJobName']}' but no constraints file"
+        )
+    return "missing", f"schedule '{name}': {where} names no baseline constraints file"
+
+
 def _monitor_report_and_alarm_findings(
     sagemaker_client: Any, schedules: List[Dict[str, Any]], region: str
 ) -> List[Dict[str, Any]]:
     """
-    For each monitoring schedule on an InService endpoint, require a report
-    produced within two cadences and an alarm with an action on its metrics.
+    For each monitoring schedule on an InService endpoint, require a baseline
+    constraints file, a report produced within two cadences, and an alarm with
+    an action on its metrics.
     """
     rows = []
     now = datetime.now(timezone.utc)
     stale = []
     fresh = []
     unread = []
+    unbaselined = []
+    baselined = []
+    baseline_unread = []
     for schedule in schedules:
         name = schedule["name"]
         try:
@@ -8517,7 +8682,15 @@ def _monitor_report_and_alarm_findings(
                 f"sagemaker:DescribeMonitoringSchedule {name} "
                 f"({get_assessment_error_label(error)})"
             )
+            baseline_unread.append(unread[-1])
             continue
+        state, text = _schedule_baseline_constraints(sagemaker_client, name, detail)
+        if state == "baselined":
+            baselined.append(f"{name} ({text})")
+        elif state == "missing":
+            unbaselined.append(text)
+        else:
+            baseline_unread.append(text)
         expression = (
             (detail.get("MonitoringScheduleConfig") or {}).get("ScheduleConfig") or {}
         ).get("ScheduleExpression") or ""
@@ -8548,6 +8721,54 @@ def _monitor_report_and_alarm_findings(
             )
         else:
             fresh.append(f"{name} ({status} at {scheduled.isoformat()})")
+    for problem in unbaselined[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_BASELINE_FINDING,
+                finding_details=(
+                    f"Monitoring {problem}, so its reports have no baseline "
+                    "constraints to be validated against and cannot record a "
+                    "violation."
+                ),
+                resolution=(
+                    "Run a baselining job on the training data and set its "
+                    "constraints.json as the schedule's baseline ConstraintsResource."
+                ),
+                reference=MODEL_MONITOR_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if baselined and not unbaselined and not baseline_unread:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_BASELINE_FINDING,
+                finding_details=(
+                    f"All {len(baselined)} monitoring schedule(s) name a baseline "
+                    f"constraints file: {', '.join(baselined[:5])}."
+                ),
+                resolution="No action required",
+                reference=MODEL_MONITOR_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    if baseline_unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-23",
+                MONITOR_BASELINE_FINDING,
+                baseline_unread,
+                f"{len(baselined) + len(unbaselined)} of {len(schedules)} "
+                "schedule(s) had their baseline read.",
+                MODEL_MONITOR_REFERENCE,
+                region,
+            )
+        )
     for problem in stale[:20]:
         rows.append(
             create_finding(
@@ -14971,6 +15192,81 @@ def _runtime_coverage_findings(
     return rows
 
 
+EKS_AUDIT_LOGS_FINDING = "GuardDuty EKS Audit Log Monitoring"
+EKS_AUDIT_LOGS_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/kubernetes-protection.html"
+)
+
+
+def _eks_audit_log_findings(
+    region: str, detail: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Where EKS clusters exist, the detector must be ENABLED with its
+    EKS_AUDIT_LOGS feature ENABLED. No cluster yields no row.
+    """
+    try:
+        eks_client = boto3.client("eks", config=boto3_config, region_name=region)
+        clusters = []
+        for page in eks_client.get_paginator("list_clusters").paginate():
+            clusters.extend(page.get("clusters", []))
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-38",
+                EKS_AUDIT_LOGS_FINDING,
+                [f"eks:ListClusters ({get_assessment_error_label(error)})"],
+                "whether any EKS cluster needs audit log monitoring is unknown.",
+                EKS_AUDIT_LOGS_REFERENCE,
+                region,
+            )
+        ]
+    if not clusters:
+        return []
+    shown = ", ".join(sorted(clusters)[:10])
+    feature = _guardduty_feature(detail, "EKS_AUDIT_LOGS")
+    state = feature.get("Status") if feature else "absent"
+    if detail.get("Status") != "ENABLED":
+        problem = "the GuardDuty detector is not enabled"
+    elif state != "ENABLED":
+        problem = f"the detector's EKS_AUDIT_LOGS feature is {state}"
+    else:
+        return [
+            create_finding(
+                check_id="SM-38",
+                finding_name=EKS_AUDIT_LOGS_FINDING,
+                finding_details=(
+                    "GuardDuty EKS_AUDIT_LOGS is enabled on the detector for the "
+                    f"{len(clusters)} EKS cluster(s) in this Region: {shown}."
+                ),
+                resolution="No action required",
+                reference=EKS_AUDIT_LOGS_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="SM-38",
+            finding_name=EKS_AUDIT_LOGS_FINDING,
+            finding_details=(
+                f"{len(clusters)} EKS cluster(s) run in this Region ({shown}), but "
+                f"{problem}, so GuardDuty does not analyze their Kubernetes audit "
+                "logs."
+            ),
+            resolution=(
+                "Enable the GuardDuty detector and its EKS Protection "
+                "(EKS_AUDIT_LOGS) feature."
+            ),
+            reference=EKS_AUDIT_LOGS_REFERENCE,
+            severity="High",
+            status="Failed",
+            region=region,
+        )
+    ]
+
+
 def _lambda_runtime_tier_findings(
     region: str, detail: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -15121,7 +15417,8 @@ def check_guardduty_runtime_monitoring_coverage(
 ) -> Dict[str, Any]:
     """
     SM-38: Read Runtime Monitoring coverage per resource against the EKS and ECS
-    cluster population, and the Lambda tier that stands in for a runtime agent.
+    cluster population, EKS audit log monitoring where EKS clusters exist, and
+    the Lambda tier that stands in for a runtime agent.
     A detector with every agent-management option off and no manual agent
     fails here, where the feature flag alone reads as enabled.
     """
@@ -15141,6 +15438,7 @@ def check_guardduty_runtime_monitoring_coverage(
             findings["csv_data"].extend(
                 _runtime_coverage_findings(region, inventory["detector_id"], runtime)
             )
+        findings["csv_data"].extend(_eks_audit_log_findings(region, detail))
         findings["csv_data"].extend(_lambda_runtime_tier_findings(region, detail))
     except Exception as error:
         findings["csv_data"].append(
