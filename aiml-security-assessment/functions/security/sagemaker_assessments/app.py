@@ -13488,12 +13488,40 @@ ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "CompositeAlarm type. Neither history result changes the status: an alarm that "
     "has never entered ALARM still passes, and a history read that fails is "
     "named in the row without holding back Passed. Whether a fired alarm was "
-    "triaged is not recorded by any CloudWatch API."
+    "triaged is not recorded by any CloudWatch API. An alarm is credited only "
+    "when it reads the dimension names and unit the filter publishes, and its "
+    "static threshold is judged only when the filter publishes literal values. "
+    "Pattern terms and field equalities are matched against the tokens of the "
+    "default flow-log format, so a field only a custom log format carries is "
+    "not recognized."
 )
 FLOW_LOG_ALERTING_TRAFFIC_TYPES = ("ALL", "ACCEPT")
 FLOW_LOG_RECORD_TERM = re.compile(
-    r"^(ACCEPT|REJECT|OK|NODATA|SKIPDATA|\d[\d.:]*|(eni|vpc|subnet|i)-[0-9a-f]+)$"
+    r"^(ACCEPT|REJECT|OK|NODATA|SKIPDATA|-|\d[\d.:]*|[0-9a-f]*:[0-9a-f:]*"
+    r"|(eni|vpc|subnet|i)-[0-9a-f]+)$"
 )
+FLOW_LOG_FIELD_CONDITION = re.compile(r"^\s*[\w.-]*\s*(!=|>=|<=|=|>|<)\s*(.*?)\s*$")
+
+
+def _bracketed_pattern_selects_flow_records(pattern: str) -> bool:
+    """
+    Whether a space-delimited pattern's field conditions can hold on a record.
+
+    Only an equality to a literal no flow-log record carries rules a field out;
+    a wildcard value, an OR (||) of conditions and every comparison other than
+    = are taken to hold.
+    """
+    for field in pattern[1 : pattern.rfind("]")].split(","):
+        if "||" in field:
+            continue
+        for condition in field.split("&&"):
+            match = FLOW_LOG_FIELD_CONDITION.match(condition)
+            if not match or match.group(1) != "=":
+                continue
+            value = match.group(2).strip('"')
+            if "*" not in value and not FLOW_LOG_RECORD_TERM.match(value):
+                return False
+    return True
 
 
 def _filter_pattern_selects_flow_records(metric_filter: Dict[str, Any]) -> bool:
@@ -13507,8 +13535,10 @@ def _filter_pattern_selects_flow_records(metric_filter: Dict[str, Any]) -> bool:
     flow-log record carries; exclusion (-) terms never stop a match.
     """
     pattern = (metric_filter.get("filterPattern") or "").strip()
-    if not pattern or pattern.startswith("["):
+    if not pattern:
         return True
+    if pattern.startswith("["):
+        return _bracketed_pattern_selects_flow_records(pattern)
     if pattern.startswith("{"):
         return bool(metric_filter.get("applyOnTransformedLogs"))
     required, optional = [], []
@@ -13609,15 +13639,98 @@ def _alarm_last_fired(
 
 
 def _alarm_metrics(alarm: Dict[str, Any]) -> List[tuple]:
-    """Every (namespace, metric name) a metric alarm evaluates."""
+    """
+    Every (namespace, metric name) a metric alarm evaluates, with the series
+    it reads: its dimension names, its unit, and, for a single-metric alarm,
+    the statistic it compares with its threshold.
+    """
     metrics = []
     if alarm.get("MetricName"):
-        metrics.append((alarm.get("Namespace"), alarm.get("MetricName")))
+        metrics.append(
+            (
+                (alarm.get("Namespace"), alarm.get("MetricName")),
+                {
+                    "dimensions": {
+                        d.get("Name") for d in alarm.get("Dimensions") or []
+                    },
+                    "unit": alarm.get("Unit"),
+                    "statistic": alarm.get("Statistic")
+                    or alarm.get("ExtendedStatistic"),
+                    "operator": alarm.get("ComparisonOperator"),
+                    "threshold": alarm.get("Threshold"),
+                },
+            )
+        )
     for query in alarm.get("Metrics") or []:
-        metric = (query.get("MetricStat") or {}).get("Metric") or {}
+        metric_stat = query.get("MetricStat") or {}
+        metric = metric_stat.get("Metric") or {}
         if metric.get("MetricName"):
-            metrics.append((metric.get("Namespace"), metric.get("MetricName")))
+            metrics.append(
+                (
+                    (metric.get("Namespace"), metric.get("MetricName")),
+                    {
+                        "dimensions": {
+                            d.get("Name") for d in metric.get("Dimensions") or []
+                        },
+                        "unit": metric_stat.get("Unit"),
+                    },
+                )
+            )
     return metrics
+
+
+BOUNDED_ALARM_STATISTIC = re.compile(r"^(Maximum|Minimum|Average|p\d+(\.\d+)?)$")
+
+
+def _alarm_cannot_fire(
+    transformation: Dict[str, Any], series: Dict[str, Any]
+) -> Optional[str]:
+    """
+    Why an alarm on a metric filter's metric can never enter ALARM, or None.
+
+    The alarm reads nothing when its dimension names differ from those the
+    filter publishes, or when it names a unit other than the filter's (None
+    when the filter sets none). When the filter publishes only literal values,
+    a static threshold that no statistic of those values can cross is never
+    breached: no statistic of values at or above zero falls below zero, and a
+    Maximum, Minimum, Average or percentile never exceeds the largest value.
+    """
+    published = set(transformation.get("dimensions") or {})
+    if series["dimensions"] != published:
+        return (
+            f"it reads dimension(s) {', '.join(sorted(series['dimensions'])) or 'none'}"
+            f" and the filter publishes {', '.join(sorted(published)) or 'none'}"
+        )
+    unit = transformation.get("unit") or "None"
+    if series["unit"] and series["unit"] != unit:
+        return f"it reads unit {series['unit']} and the filter publishes unit {unit}"
+    operator, threshold = series.get("operator"), series.get("threshold")
+    if threshold is None:
+        return None
+    values = [transformation.get("metricValue")]
+    if transformation.get("defaultValue") is not None:
+        values.append(transformation["defaultValue"])
+    try:
+        values = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    statistic = series.get("statistic") or ""
+    bounded = BOUNDED_ALARM_STATISTIC.match(statistic) or (
+        statistic == "Sum" and not any(values)
+    )
+    compare = f"{statistic or 'its statistic'} {operator} {threshold:g}"
+    shown = ", ".join(f"{value:g}" for value in values)
+    if min(values) >= 0 and (
+        (operator == "LessThanThreshold" and threshold <= 0)
+        or (operator == "LessThanOrEqualToThreshold" and threshold < 0)
+    ):
+        return f"it compares {compare} and the filter publishes only {shown}"
+    if bounded and (
+        (operator == "GreaterThanThreshold" and threshold >= max(values))
+        or (operator == "GreaterThanOrEqualToThreshold" and threshold > max(values))
+    ):
+        return f"it compares {compare} and the filter publishes only {shown}"
+    return None
 
 
 def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, Any]:
@@ -13626,8 +13739,9 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
 
     An endpoint passes only when each subnet it runs in is covered by an ACTIVE
     VPC or subnet flow log that captures accepted traffic into CloudWatch Logs,
-    and that log group has a metric filter whose metric an alarm with an action
-    evaluates.
+    and that log group has a metric filter whose pattern can match a flow-log
+    record and whose metric an alarm with an action evaluates on the series the
+    filter publishes, with a threshold the published values can cross.
     """
     findings = {"csv_data": []}
 
@@ -13742,7 +13856,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
     unmatched_filters = {}
     for group in sorted({g for groups in alerting_logs.values() for g in groups}):
         try:
-            metrics = set()
+            metrics = {}
             for page in logs_client.get_paginator("describe_metric_filters").paginate(
                 logGroupName=group
             ):
@@ -13758,12 +13872,13 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                     for transformation in (
                         metric_filter.get("metricTransformations") or []
                     ):
-                        metrics.add(
+                        metrics.setdefault(
                             (
                                 transformation.get("metricNamespace"),
                                 transformation.get("metricName"),
-                            )
-                        )
+                            ),
+                            [],
+                        ).append(transformation)
             group_metrics[group] = metrics
         except Exception as error:
             group_errors[group] = get_assessment_error_label(error)
@@ -13792,9 +13907,9 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 )
                 if composite:
                     label += f", actioned through composite alarm '{composite}'"
-                for metric in _alarm_metrics(alarm):
-                    alarmed_metrics.setdefault(
-                        metric, (label, alarm["AlarmName"], composite)
+                for metric, series in _alarm_metrics(alarm):
+                    alarmed_metrics.setdefault(metric, []).append(
+                        (label, alarm["AlarmName"], composite, series)
                     )
         except Exception as error:
             alarm_error = get_assessment_error_label(error)
@@ -13825,6 +13940,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
         uncovered = []
         unalarmed = {}
         alarmed = []
+        dead_alarms = []
         for subnet in subnets:
             covering = alerting_logs.get(subnet, set()) | alerting_logs.get(
                 subnet_vpc.get(subnet), set()
@@ -13832,16 +13948,27 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             if not covering:
                 uncovered.append(subnet)
                 continue
-            hits = [
-                (g, *alarmed_metrics[metric])
-                for g in sorted(covering)
-                for metric in sorted(group_metrics.get(g, set()), key=str)
-                if metric in alarmed_metrics
-            ]
+            hits = []
+            dead = []
+            for g in sorted(covering):
+                for metric in sorted(group_metrics.get(g, {}), key=str):
+                    for transformation in group_metrics[g][metric]:
+                        for label, alarm, composite, series in alarmed_metrics.get(
+                            metric, []
+                        ):
+                            reason = _alarm_cannot_fire(transformation, series)
+                            if reason is None:
+                                hits.append((g, label, alarm, composite))
+                                continue
+                            dead.append(
+                                f"alarm '{alarm}' on {metric[0]}/{metric[1]} can "
+                                f"never fire: {reason}"
+                            )
             if hits:
                 alarmed.append(hits[0])
             else:
                 unalarmed[subnet] = covering
+                dead_alarms.extend(d for d in dead if d not in dead_alarms)
         if uncovered:
             failed.append(
                 f"endpoint '{name}': no ACTIVE flow log capturing accepted traffic "
@@ -13877,6 +14004,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                     if unmatched
                     else ""
                 )
+                + (f" ({'; '.join(dead_alarms)})" if dead_alarms else "")
             )
 
     history = {

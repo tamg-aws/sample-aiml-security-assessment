@@ -8070,6 +8070,342 @@ class TestSM37EndpointFlowLogAlerting:
         assert "2 endpoint(s) have no network anomaly alerting" in details
         assert self.history_calls == []
 
+    def _split_groups(self, a_filters, b_filters, b_alarms=None):
+        """ep-1 on /flow/a, ep-2 on /flow/b, each with its own filters."""
+        return {
+            "flow_logs": [
+                self._flow_log("vpc-1"),
+                self._flow_log("vpc-2", group="/flow/b"),
+            ],
+            "filters": {
+                "/flow/a": [dict(f, logGroupName="/flow/a") for f in a_filters],
+                "/flow/b": [dict(f, logGroupName="/flow/b") for f in b_filters],
+            },
+        }
+
+    def _transform(self, pattern="", name="Egress", **transformation):
+        return {
+            "filterName": f"f-{name}",
+            "filterPattern": pattern,
+            "metricTransformations": [
+                {"metricNamespace": "Flow", "metricName": name, **transformation}
+            ],
+        }
+
+    FLOW_FIELDS = (
+        "[version, account, eni, source, destination, srcport, destport, "
+        "protocol, packets, bytes, start, end, {action}, {status}]"
+    )
+
+    @pytest.mark.parametrize(
+        "action, status",
+        [
+            ('action="DENY"', "status"),
+            ("action=REJECT && action=ERROR", "status"),
+            ("action", "status=FAILED"),
+        ],
+    )
+    @pytest.mark.parametrize("dead_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_bracketed_condition_no_flow_record_carries_fails_only_its_endpoint(
+        self, mock_client, action, status, dead_first
+    ):
+        dead = self._transform(self.FLOW_FIELDS.format(action=action, status=status))
+        other = self._transform("", name="Ingress")
+        b_filters = [dead, other] if dead_first else [other, dead]
+        alarms = [self._alarm(), self._alarm(metric="Egress", AlarmName="egress-2")]
+        rows = self._run(
+            mock_client,
+            alarms=alarms,
+            **self._split_groups([self._transform("REJECT")], b_filters),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert "endpoint 'ep-2'" in details
+        assert "endpoint 'ep-1'" not in details
+        assert "pattern matches no flow-log record" in details
+        assert "'f-Egress'" in details
+
+    @pytest.mark.parametrize(
+        "action, status",
+        [
+            ('action="REJECT"', "status"),
+            ("action=ACCEPT || action=DENY", "status"),
+            ("action=*EJECT", "status"),
+            ("action", "status=-"),
+            ("action", "status=NODATA"),
+            ("action", "status"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_bracketed_condition_a_flow_record_carries_passes(
+        self, mock_client, action, status
+    ):
+        rows = self._run(
+            mock_client,
+            filters={
+                "/flow/a": [
+                    dict(
+                        self._transform(
+                            self.FLOW_FIELDS.format(action=action, status=status)
+                        ),
+                        logGroupName="/flow/a",
+                    )
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_bracketed_ipv6_source_passes(self, mock_client):
+        pattern = (
+            "[version, account, eni, source=fe80::1, destination, srcport, "
+            "destport, protocol, packets, bytes, start, end, action, status]"
+        )
+        rows = self._run(
+            mock_client,
+            filters={
+                "/flow/a": [dict(self._transform(pattern), logGroupName="/flow/a")]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    DEAD_ALARMS = [
+        # The alarm reads a dimension the filter never publishes.
+        ({}, {"Dimensions": [{"Name": "eni", "Value": "eni-1"}]}, "dimension"),
+        # The filter publishes a dimension the alarm does not read.
+        ({"dimensions": {"eni": "$eni"}}, {}, "dimension"),
+        # The alarm reads a unit the filter never publishes.
+        ({}, {"Unit": "Bytes"}, "unit Bytes"),
+        ({"unit": "Count"}, {"Unit": "Bytes"}, "unit Bytes"),
+        # A count can never fall below zero.
+        (
+            {"metricValue": "1"},
+            {
+                "Statistic": "Sum",
+                "ComparisonOperator": "LessThanThreshold",
+                "Threshold": 0.0,
+            },
+            "never",
+        ),
+        (
+            {"metricValue": "1"},
+            {
+                "Statistic": "Sum",
+                "ComparisonOperator": "LessThanOrEqualToThreshold",
+                "Threshold": -1.0,
+            },
+            "never",
+        ),
+        # The largest value the filter publishes is 1.
+        (
+            {"metricValue": "1"},
+            {
+                "Statistic": "Maximum",
+                "ComparisonOperator": "GreaterThanThreshold",
+                "Threshold": 1.0,
+            },
+            "never",
+        ),
+        (
+            {"metricValue": "1", "defaultValue": 0.0},
+            {
+                "ExtendedStatistic": "p99",
+                "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+                "Threshold": 2.0,
+            },
+            "never",
+        ),
+        # A filter that publishes only zeros sums to zero.
+        (
+            {"metricValue": "0"},
+            {
+                "Statistic": "Sum",
+                "ComparisonOperator": "GreaterThanThreshold",
+                "Threshold": 0.0,
+            },
+            "never",
+        ),
+    ]
+
+    @pytest.mark.parametrize("transformation, alarm, reason", DEAD_ALARMS)
+    @patch("sagemaker_app.boto3.client")
+    def test_an_alarm_that_can_never_fire_fails_only_its_endpoint(
+        self, mock_client, transformation, alarm, reason
+    ):
+        # ep-1's group publishes Egress, which the live alarm reads. ep-2's
+        # group publishes Dead, which only the dead alarm reads.
+        alarms = [
+            self._alarm(),
+            self._alarm(metric="Dead", AlarmName="dead", **alarm),
+        ]
+        rows = self._run(
+            mock_client,
+            alarms=alarms,
+            **self._split_groups(
+                [self._transform()], [self._transform(name="Dead", **transformation)]
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert "endpoint 'ep-2'" in details
+        assert "endpoint 'ep-1'" not in details
+        assert "alarm 'dead' on Flow/Dead can never fire" in details
+        assert reason in details.split("alarm 'dead' on Flow/Dead can never fire")[1]
+
+    @pytest.mark.parametrize("transformation, alarm, reason", DEAD_ALARMS)
+    @pytest.mark.parametrize("dead_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_live_alarm_beside_a_dead_one_passes(
+        self, mock_client, transformation, alarm, reason, dead_first
+    ):
+        dead = self._alarm(AlarmName="dead", **alarm)
+        live_overrides = {
+            k: v for k, v in alarm.items() if k not in ("Dimensions", "Unit")
+        }
+        live_overrides.pop("ComparisonOperator", None)
+        live_overrides.pop("Threshold", None)
+        live_overrides.pop("Statistic", None)
+        live_overrides.pop("ExtendedStatistic", None)
+        dims = transformation.get("dimensions")
+        if dims:
+            live_overrides["Dimensions"] = [
+                {"Name": key, "Value": "eni-1"} for key in dims
+            ]
+        live = self._alarm(AlarmName="live", **live_overrides)
+        rows = self._run(
+            mock_client,
+            alarms=[dead, live] if dead_first else [live, dead],
+            filters={
+                "/flow/a": [
+                    dict(self._transform(**transformation), logGroupName="/flow/a")
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "alarm 'live'" in rows[0]["Finding_Details"]
+        assert "alarm 'dead'" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "transformation, alarm",
+        [
+            (
+                {"dimensions": {"eni": "$eni"}},
+                {"Dimensions": [{"Name": "eni", "Value": "eni-1"}]},
+            ),
+            ({}, {"Unit": "None"}),
+            ({"unit": "Count"}, {"Unit": "Count"}),
+            (
+                {"metricValue": "1"},
+                {
+                    "Statistic": "Sum",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 100.0,
+                },
+            ),
+            (
+                {"metricValue": "1"},
+                {
+                    "Statistic": "Maximum",
+                    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+                    "Threshold": 1.0,
+                },
+            ),
+            (
+                {"metricValue": "1", "defaultValue": 5.0},
+                {
+                    "Statistic": "Maximum",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 1.0,
+                },
+            ),
+            (
+                {"metricValue": "0"},
+                {
+                    "Statistic": "SampleCount",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 0.0,
+                },
+            ),
+            (
+                {"metricValue": "$bytes"},
+                {
+                    "Statistic": "Maximum",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "Threshold": 1e9,
+                },
+            ),
+            (
+                {"metricValue": "1"},
+                {
+                    "Statistic": "Sum",
+                    "ComparisonOperator": "LessThanThreshold",
+                    "Threshold": 1.0,
+                },
+            ),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_an_alarm_that_can_fire_passes(self, mock_client, transformation, alarm):
+        rows = self._run(
+            mock_client,
+            alarms=[self._alarm(**alarm)],
+            filters={
+                "/flow/a": [
+                    dict(self._transform(**transformation), logGroupName="/flow/a")
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_dead_alarm_on_an_alarmed_subnet_is_not_named(self, mock_client):
+        # subnet-1's group is alarmed by 'live' beside 'dead'; subnet-2's
+        # group has no filter. Only subnet-2 is named.
+        rows = self._run(
+            mock_client,
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": ["subnet-1", "subnet-2"]},
+            alarms=[
+                self._alarm(AlarmName="dead", Unit="Bytes"),
+                self._alarm(AlarmName="live"),
+            ],
+            flow_logs=[
+                self._flow_log("vpc-1"),
+                self._flow_log("vpc-2", group="/flow/b"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "/flow/b covering subnet-2" in details
+        assert "alarm 'dead'" not in details
+
+    @pytest.mark.parametrize(
+        "stat",
+        [
+            {"Dimensions": [{"Name": "eni", "Value": "eni-1"}]},
+            {"Unit": "Bytes"},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_metric_math_alarm_on_another_series_fails(self, mock_client, stat):
+        band = self._alarm(MetricName=None, Namespace=None)
+        metric = {"Namespace": "Flow", "MetricName": "Egress"}
+        metric_stat = {"Metric": metric}
+        if "Dimensions" in stat:
+            metric["Dimensions"] = stat["Dimensions"]
+        else:
+            metric_stat["Unit"] = stat["Unit"]
+        band["Metrics"] = [
+            {"Id": "m1", "MetricStat": metric_stat},
+            {"Id": "ad1", "Expression": "ANOMALY_DETECTION_BAND(m1, 2)"},
+        ]
+        rows = self._run(mock_client, alarms=[band])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "can never fire" in rows[0]["Finding_Details"]
+
 
 class TestSM37GuardDutyLambdaNetworkLogs:
     """AIR-FND-NET-07: GuardDuty Lambda Protection."""

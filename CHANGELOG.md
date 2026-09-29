@@ -261,6 +261,15 @@ section.
 
 ### Fixed
 
+- `SM-37` endpoint network alerting no longer passes on an alarm that can
+  never fire. An alarm is credited only when it reads the dimension names
+  and unit its metric filter publishes, and, when the filter publishes
+  literal values, only when its static threshold can be crossed: a
+  `LessThanThreshold 0` alarm on a count, or a `Maximum` above the largest
+  value the filter publishes, is named as unable to fire. A space-delimited
+  (bracketed) pattern whose field equality names a value no flow-log record
+  carries, such as `action="DENY"`, now counts as matching no record.
+
 - `SM-04` credits an EventBridge rule on `aws.guardduty` only when its
   pattern sets no `detail-type` or lists `GuardDuty Finding`. A rule on
   another detail-type, such as `AWS API Call via CloudTrail`, used to pass
