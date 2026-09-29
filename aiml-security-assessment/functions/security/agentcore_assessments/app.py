@@ -20095,23 +20095,37 @@ def _guardrail_policy_verdict(effect: str, conditions: str) -> Tuple[str, str]:
     when its condition is true, so a comparison no discrete score satisfies,
     such as greaterThan(decimal("1.0")), never acts; a permit acts regardless of
     the score when every score satisfies it. A call whose categories or data
-    paths are an empty list scores nothing. The policy is inert only when every
-    call is, which holds under any combination of `&&` and `||`; a `!` could
-    invert that, so a condition carrying one is left unread.
+    paths are an empty list scores nothing. The policy is inert when no score
+    changes its decision, read through the `&&` and `||` that join the calls
+    and the when blocks, which are joined by `&&`: a forbid conjunction holding
+    a call that never acts never acts, and a permit disjunction holding a call
+    that always holds always applies. A `!` or an unless block could invert
+    that, so a condition carrying one is left unread.
     """
     flat = re.sub(r"\s+", "", conditions)
     if re.search(r"!(?!=)", flat):
         return "unread", "its guardrail condition is negated"
+    blocks = _cedar_condition_blocks(conditions)
+    if any(
+        keyword == "unless" and "BedrockGuardrails::" in body
+        for keyword, body in blocks
+    ):
+        return "unread", "a guardrail call sits in an unless block, which negates it"
     calls = list(GUARDRAIL_CALL_PATTERN.finditer(flat))
     if not calls or len(calls) != flat.count("BedrockGuardrails::"):
         return "unread", "a guardrail call could not be read"
     inert: List[str] = []
     summaries: List[str] = []
+    # Each call's value when no score can move it: False for a forbid call
+    # that never acts, True for a permit call that always holds, None when the
+    # score decides it.
+    fixed: Dict[str, Optional[bool]] = {}
     for call in calls:
         safeguard, categories, paths, aggregate, operator, threshold = call.groups()
         label = f"{safeguard}({categories or 'no category'})"
         if not categories or not paths:
             inert.append(f"{label} names no category or no data path")
+            fixed[call.group(0)] = effect == "permit"
             continue
         fires = (
             _guardrail_scores_that_fire(operator, threshold)
@@ -20125,19 +20139,71 @@ def _guardrail_policy_verdict(effect: str, conditions: str) -> Tuple[str, str]:
                 f"{label} {operator}({threshold}) holds for every score, so the "
                 "permit applies whatever the guardrail returns"
             )
+            fixed[call.group(0)] = True
         elif effect != "permit" and not fires:
             inert.append(
                 f"{label} {operator}({threshold}) holds for no score the "
                 "guardrail returns, so the policy never acts"
             )
+            fixed[call.group(0)] = False
         else:
             summaries.append(
                 f"{label} on {paths} acts at score "
                 f"{', '.join(f'{score:g}' for score in fires)}"
             )
+            fixed[call.group(0)] = None
     if len(inert) == len(calls):
         return "inert", "; ".join(inert)
+    if not inert:
+        return "scored", "; ".join(summaries)
+    joined = [
+        _guardrail_join_value(re.sub(r"\s+", "", body), fixed)
+        for keyword, body in blocks
+        if keyword == "when"
+    ]
+    if "unread" in joined or not any(
+        keyword == "when" and "BedrockGuardrails::" in body for keyword, body in blocks
+    ):
+        return "unread", "a guardrail call is compared or nested in a way not read"
+    if _guardrail_join(joined, "&&") != "scored":
+        return "inert", (
+            f"{'; '.join(inert)}, and the && and || joining it to "
+            f"{'; '.join(summaries)} mean no score changes the decision"
+        )
     return "scored", "; ".join(summaries + inert)
+
+
+def _guardrail_join(values: List[Any], operator: str) -> Any:
+    """Join the values of guardrail sub-expressions by && or ||.
+
+    A value is True or False when no score changes it, "plain" when only
+    something other than a score decides it, "scored" when a score can, and
+    "unread" when it could not be read.
+    """
+    if "unread" in values:
+        return "unread"
+    absorbing = operator == "||"
+    if absorbing in values:
+        return absorbing
+    remaining = [value for value in values if value is not (not absorbing)]
+    if not remaining:
+        return not absorbing
+    return "scored" if "scored" in remaining else "plain"
+
+
+def _guardrail_join_value(expression: str, fixed: Dict[str, Optional[bool]]) -> Any:
+    """Return the _guardrail_join value of one when-block expression, with
+    every guardrail call read from `fixed` by its whitespace-free text."""
+    expression = _cedar_unwrap_parentheses(expression)
+    for operator, separator in (("||", "|"), ("&&", "&")):
+        parts = [part for part in _cedar_split(expression, separator) if part]
+        if len(parts) > 1:
+            return _guardrail_join(
+                [_guardrail_join_value(part, fixed) for part in parts], operator
+            )
+    if expression in fixed:
+        return "scored" if fixed[expression] is None else fixed[expression]
+    return "unread" if "BedrockGuardrails::" in expression else "plain"
 
 
 def check_agentcore_policy_guardrail_wiring(

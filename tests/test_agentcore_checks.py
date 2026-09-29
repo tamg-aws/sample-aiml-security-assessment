@@ -33548,6 +33548,139 @@ def _trail(name, multi_region=True, home="us-east-1", validation=True):
     }
 
 
+class TestAC37GuardrailConditionStructure:
+    """AC-37 reads how && and || join the guardrail calls: a forbid conjunction
+    holding a call that never fires never acts, and a permit disjunction holding
+    a call that always holds applies whatever the guardrail returns."""
+
+    _base = TestAC37WholePopulation()
+
+    def _dead(self):
+        return self._base._call("greaterThan", "1.0")
+
+    def _always(self):
+        return self._base._call("lessThanOrEqual", "1.0")
+
+    def _good(self):
+        return self._base._GOOD
+
+    def _live_permit(self):
+        return self._base._call("lessThan", "0.4")
+
+    @pytest.mark.parametrize(
+        "effect, call, status",
+        [
+            ("forbid", "{dead} && {good}", "Failed"),
+            ("forbid", "{good} && ({dead})", "Failed"),
+            ("suppressOutput", "{good} && {dead}", "Failed"),
+            ("forbid", "({good} && {dead}) || context.input.flag == true", "Failed"),
+            ("permit", "{always} || {live}", "Failed"),
+            ("forbid", "{dead} || {good}", "Passed"),
+            ("forbid", "({dead} && context.input.flag == true) || {good}", "Passed"),
+            ("permit", "{always} && {live}", "Passed"),
+        ],
+        ids=[
+            "forbid-and-dead-first",
+            "forbid-and-dead-parenthesized",
+            "suppress-and-dead",
+            "forbid-dead-conjunction-or-plain",
+            "permit-or-always",
+            "forbid-or-dead",
+            "forbid-dead-conjunction-or-live",
+            "permit-and-always",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_join_decides_whether_a_score_moves_the_policy(
+        self, mock_ac, effect, call, status
+    ):
+        condition = call.format(
+            dead=self._dead(),
+            good=self._good(),
+            always=self._always(),
+            live=self._live_permit(),
+        )
+        findings = self._base._run(
+            mock_ac, [("joined", _guardrail_policy(effect, condition))]
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        if status == "Failed":
+            assert findings[0]["Finding"] == "AgentCore Policy Guardrail Inert"
+            assert "no score changes the decision" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_dead_call_in_a_second_when_block_makes_the_forbid_inert(self, mock_ac):
+        # Every when block must hold for the policy to act, so the blocks are
+        # joined by &&.
+        statement = _guardrail_policy("forbid", self._good())[:-1] + (
+            f" when {{ {self._dead()} }};"
+        )
+        findings = self._base._run(mock_ac, [("two-blocks", statement)])
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "two-blocks (forbid:" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "join, status", [("&&", "Failed"), ("||", "Passed")], ids=["and", "or"]
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_call_that_scores_nothing_joins_as_one_that_never_acts(
+        self, mock_ac, join, status
+    ):
+        empty = self._base._call(categories="")
+        findings = self._base._run(
+            mock_ac,
+            [("empty", _guardrail_policy("forbid", f"{empty} {join} {self._good()}"))],
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+
+    @pytest.mark.parametrize(
+        "call, status",
+        [("{dead} && ({good}) == true", "N/A"), ("({good}) == true", "Passed")],
+        ids=["beside-a-dead-call", "alone"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_compared_call_beside_a_dead_one_is_left_unread(
+        self, mock_ac, call, status
+    ):
+        # With no dead call the join cannot make the policy inert, so a call
+        # compared with true is read by its own threshold as before.
+        condition = call.format(dead=self._dead(), good=self._good())
+        findings = self._base._run(
+            mock_ac, [("compared", _guardrail_policy("forbid", condition))]
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_guardrail_call_in_an_unless_block_is_left_unread(self, mock_ac):
+        statement = f"forbid(principal, action, resource) unless {{ {self._good()} }};"
+        findings = self._base._run(mock_ac, [("inverted", statement)])
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "inverted (forbid:" in findings[0]["Finding_Details"]
+        assert "unless" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_dead_conjunction_is_named_beside_a_good_policy(self, mock_ac):
+        findings = self._base._run(
+            mock_ac,
+            [
+                ("good", _guardrail_policy("forbid", self._good())),
+                (
+                    "joined",
+                    _guardrail_policy("forbid", f"{self._good()} && {self._dead()}"),
+                ),
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "joined (forbid:" in findings[0]["Finding_Details"]
+        assert "good (" not in findings[0]["Finding_Details"]
+
+
 class TestAC37GrantResourceAndDefaultBand:
     """AC-37 credits only an unconditioned Resource "*" grant and reads the band."""
 
