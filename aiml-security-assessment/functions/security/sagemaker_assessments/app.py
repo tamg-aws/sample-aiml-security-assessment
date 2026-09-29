@@ -1145,11 +1145,31 @@ def check_guardduty_ai_protection(
                 create_finding(
                     check_id="SM-26",
                     finding_name="GuardDuty AI Protection",
-                    finding_details="No GuardDuty detector found; AI Protection cannot be assessed separately.",
+                    finding_details="No GuardDuty detector exists in this region, so GuardDuty AI Protection produces no findings.",
                     resolution="Enable GuardDuty first, then enable the AI Protection feature.",
                     reference="https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html",
-                    severity="Informational",
-                    status="N/A",
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+            return findings
+
+        detector_status = (inventory.get("detail") or {}).get("Status")
+        if detector_status != "ENABLED":
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-26",
+                    finding_name="GuardDuty AI Protection",
+                    finding_details=(
+                        f"GuardDuty detector {inventory['detector_id']} has status "
+                        f"{detector_status}, so it produces no AI Protection "
+                        "findings whatever its AI_PROTECTION feature status."
+                    ),
+                    resolution="Re-enable the GuardDuty detector, then enable the AI Protection feature.",
+                    reference="https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html",
+                    severity="High",
+                    status="Failed",
                     region=region,
                 )
             )

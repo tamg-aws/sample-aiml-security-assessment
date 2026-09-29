@@ -261,6 +261,11 @@ section.
 
 ### Fixed
 
+- `SM-26` reads the GuardDuty detector `Status`. A detector whose status is
+  `DISABLED` now fails even when its `AI_PROTECTION` feature is `ENABLED`,
+  where it used to pass, and a Region with no detector fails where it used to
+  report `N/A`. Neither produces an AI Protection finding.
+
 - `SM-02` no longer counts an `aws:ResourceTag` condition as scoping an
   endpoint invocation grant when a `Like` operator's value is made only of
   wildcards, such as `*` or `?*`, because that value matches every tag value.

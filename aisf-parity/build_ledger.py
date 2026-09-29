@@ -1484,7 +1484,8 @@ FOUNDATION_ROWS = [
         ["SM-26", "SM-04", "SM-36"],
         "SM-04 ('GuardDuty Enabled') and SM-26 ('GuardDuty AI Protection') read "
         "the GuardDuty detector and its AI_PROTECTION feature, which is threat "
-        "detection for the account. SM-36 covers the Security Hub AI security "
+        "detection for the account. SM-26 fails a Region with no detector or a "
+        "detector whose Status is not ENABLED. SM-36 covers the Security Hub AI security "
         "standard the control also asks for: it reads GetEnabledStandards in each "
         "Region and passes when a StandardsArn contains "
         "standards/ai-security-best-practices/v/1.0.0 with StandardsStatus READY "

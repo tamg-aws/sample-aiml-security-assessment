@@ -568,6 +568,33 @@ class TestProposedSageMakerChecks:
         assert finding["Status"] == "Failed"
         assert finding["Severity"] == "High"
 
+    def test_sm26_a_suspended_detector_fails_despite_the_feature(self):
+        inventory = {
+            "detector_id": "detector-1",
+            "detail": {
+                "Status": "DISABLED",
+                "Features": [{"Name": "AI_PROTECTION", "Status": "ENABLED"}],
+            },
+            "error": None,
+        }
+        finding = extract_csv_data(
+            sagemaker_app.check_guardduty_ai_protection("us-east-1", inventory)
+        )[0]
+        assert finding["Status"] == "Failed"
+        assert "detector-1" in finding["Finding_Details"]
+        assert "DISABLED" in finding["Finding_Details"]
+        assert "AI Protection is enabled" not in finding["Finding_Details"]
+
+    def test_sm26_no_detector_fails(self):
+        finding = extract_csv_data(
+            sagemaker_app.check_guardduty_ai_protection(
+                "us-east-1", {"detector_id": None, "detail": None, "error": None}
+            )
+        )[0]
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "High"
+        assert "No GuardDuty detector" in finding["Finding_Details"]
+
     # SM-28 now reads the route tables of the effective VPC subnets, so boto3 is
     # patched here to keep this unit test off the network.
     @patch("sagemaker_app.boto3.client")

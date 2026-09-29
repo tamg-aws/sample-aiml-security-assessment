@@ -265,7 +265,7 @@ investigation and remediation.
 ### SM-26: GuardDuty AI Protection
 
 - **Severity:** High
-- **Description:** Reuses the regional GuardDuty detector inventory and verifies the `AI_PROTECTION` feature is `ENABLED`. No detector is N/A because SM-04 separately reports GuardDuty enablement.
+- **Description:** Reuses the regional GuardDuty detector inventory and verifies the detector `Status` and its `AI_PROTECTION` feature are both `ENABLED`. A detector with status `DISABLED` fails whatever its feature status, and a Region with no detector fails, because neither produces AI Protection findings.
 
 ### SM-27: HyperPod EBS CMK Encryption
 
