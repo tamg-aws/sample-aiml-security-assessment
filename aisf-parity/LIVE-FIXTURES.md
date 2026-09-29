@@ -229,9 +229,9 @@ negligible. The CMK is the only recurring charge in either fixture.
 
 - Guardrail `aisf-fixture-br10-guardrail` (`9mls97oibka9`), version `2`, five content
   filters (`SEXUAL`, `VIOLENCE`, `HATE`, `INSULTS` and `MISCONDUCT`, each at `HIGH`
-  with action `BLOCK` on input and output). BR-10 credits a side only when all five
-  block on it, so version `1`, which carried `HATE` alone, now fails. It is referenced
-  and never invoked.
+  with action `BLOCK` on input and output). BR-10 credits a side that blocks at least
+  one of these five categories at `LOW` or above. The binding names version `2`. It
+  is referenced and never invoked.
 - `aisf-fixture-br10-bound`, trust for `bedrock.amazonaws.com` under an
   `aws:SourceAccount` condition. One inline policy, `br10-guardrail-bound`, allows
   `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on the single
