@@ -78,7 +78,9 @@ AI_SUBJECT_ROWS = [
         ["BR-06"],
         "BR-06 credits Bedrock management and data events from multi-region trails and "
         "from each ENABLED CloudTrail Lake event data store, whose advanced selectors "
-        "it reads with cloudtrail:GetEventDataStore and judges as a trail's. An unread "
+        "it reads with cloudtrail:GetEventDataStore and judges as a trail's. A management "
+        "selector must admit both bedrock.amazonaws.com and bedrock-mantle.amazonaws.com. "
+        "An unread "
         "trail or store keeps a gap N/A. No record is traced end to end",
         [],
         3,
@@ -162,8 +164,9 @@ AI_SUBJECT_ROWS = [
         "version an alias routes to (ListFlowAliases, GetFlowVersion), and fails a node that pins no version suffix,"
         " since an unversioned ARN resolves to the working draft, and a node that defines "
         "its prompt inline, which no version pins. The flow leg runs even with no prompt "
-        "in the Region. A role or user allowed bedrock:UpdatePrompt or "
-        "bedrock:CreatePromptVersion on a Resource with a wildcard fails. A version != DRAFT test "
+        "in the Region. A role or user allowed bedrock:UpdatePrompt, "
+        "bedrock:CreatePromptVersion or bedrock:DeletePrompt on a Resource with a wildcard "
+        "fails, and so does one that holds one of them beside bedrock:RenderPrompt. A version != DRAFT test "
         "on bare ListPrompts or on a GetPrompt with no promptVersion would have failed "
         "every prompt in every account, because both return the draft. Partial, ceiling "
         "reached: a prompt held in application code has no AWS record, and no AWS field "
@@ -1123,8 +1126,9 @@ AI_SUBJECT_ROWS = [
         "flag is Not Applicable. An S3-only configuration is not failed on the "
         "large-payload field, which sits on CloudWatchConfig. BR-12 asserts a "
         "customer-managed key, judged by DescribeKey, on the S3 destination bucket, fails a "
-        "bucket with no default encryption, and reports a CloudWatch-only "
-        "configuration as Not Applicable",
+        "bucket with no default encryption, and judges the CloudWatch Logs group the "
+        "same way: a group with no kmsKeyId, or whose key is not an enabled customer "
+        "managed key, fails. A key that cannot be described is Not Applicable",
         [],
         5,
     ),
@@ -1508,8 +1512,8 @@ FOUNDATION_ROWS = [
         "BR-45 ('Bedrock API Key Inventory') covers the Bedrock API keys, which "
         "are one kind of long-lived credential. BR-50 covers the other, IAM user "
         "access keys: it reads ListAccessKeys for each cached IAM user whose "
-        "attached, inline or group policies grant any bedrock:, sagemaker: or "
-        "bedrock-agentcore: action, reads included, and whose permissions boundary "
+        "attached, inline or group policies grant any bedrock:, sagemaker:, "
+        "bedrock-agentcore: or bedrock-mantle: action, reads included, and whose permissions boundary "
         "allows one too, fails each Active key and reports its age from CreateDate. "
         "Inactive keys do not count",
         [],
@@ -1618,8 +1622,8 @@ FOUNDATION_ROWS = [
         "not clear a bucket. The Bedrock role holds neither "
         "backup:ListRecoveryPointsByResource nor backup:DescribeRecoveryPoint, so "
         "a bucket without the Object Lock stays Failed and its row says whether a "
-        "backup covers it is unknown, naming the action as not granted, partial, "
-        "ceiling reached",
+        "backup covers it is unknown, naming the action as not granted. That is a "
+        "missing grant, not a ceiling: both APIs return the fields the check judges",
         [],
         6,
     ),
@@ -1676,12 +1680,13 @@ FOUNDATION_ROWS = [
         "omits the resources that most need an owner. SageMaker and AgentCore "
         "resources are read through a ResourceTypeFilters sweep: each returned "
         "resource without an owner tag fails, and the sweep never passes. SageMaker "
-        "endpoints, models and notebook instances, and agent runtimes, memories, "
-        "gateways and custom browsers, listed by their SageMaker and AgentCore list "
-        "APIs and absent from the sweep, fail as never tagged. Ceiling: any other "
-        "SageMaker or AgentCore resource type, such as domains, training jobs and "
-        "code interpreters, is read only through the sweep, so one never tagged is "
-        "not seen",
+        "endpoints, models, notebook instances and training jobs, and agent "
+        "runtimes, memories, gateways and custom browsers, listed by their SageMaker "
+        "and AgentCore list APIs and absent from the sweep, fail as never tagged. "
+        "SageMaker domains and AgentCore code interpreters have list APIs, but "
+        "sagemaker:ListDomains and bedrock-agentcore:ListCodeInterpreters are not "
+        "granted to the Bedrock role, so a never-tagged one is not seen; that is a "
+        "missing grant, not a ceiling",
         [],
         6,
     ),

@@ -2900,6 +2900,51 @@ class TestBR06SelectorValues:
     @pytest.mark.parametrize(
         "extra, credited",
         [
+            ({"eventSource": {"Equals": ["bedrock.amazonaws.com"]}}, False),
+            ({"eventSource": {"NotEquals": ["bedrock-mantle.amazonaws.com"]}}, False),
+            (
+                {
+                    "eventSource": {
+                        "Equals": [
+                            "bedrock.amazonaws.com",
+                            "bedrock-mantle.amazonaws.com",
+                        ]
+                    }
+                },
+                True,
+            ),
+        ],
+    )
+    def test_a_management_selector_must_admit_the_mantle_source(self, extra, credited):
+        rows = self._run({"trail": {"advanced": [_management("mgmt", **extra)]}})
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == ("Passed" if credited else "Failed")
+        if not credited:
+            assert "narrows its management selector 'mgmt'" in row["Finding_Details"]
+
+    def test_excluded_mantle_source_is_not_coverage(self):
+        rows = self._run(
+            {
+                "trail": {
+                    "basic": [
+                        {
+                            "IncludeManagementEvents": True,
+                            "ReadWriteType": "All",
+                            "ExcludeManagementEventSources": [
+                                "bedrock-mantle.amazonaws.com"
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Failed"
+        assert "excludes bedrock-mantle.amazonaws.com" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "extra, credited",
+        [
             ({"readOnly": {"Equals": ["false"]}}, False),
             ({"eventSource": {"NotEquals": ["bedrock.amazonaws.com"]}}, False),
             ({"eventSource": {"Equals": ["s3.amazonaws.com"]}}, False),
@@ -2908,7 +2953,11 @@ class TestBR06SelectorValues:
             (
                 {
                     "eventSource": {
-                        "Equals": ["s3.amazonaws.com", "bedrock.amazonaws.com"]
+                        "Equals": [
+                            "s3.amazonaws.com",
+                            "bedrock.amazonaws.com",
+                            "bedrock-mantle.amazonaws.com",
+                        ]
                     }
                 },
                 True,
@@ -4728,6 +4777,62 @@ class TestBR07PromptProductionVersion:
         rows = self._scope_rows(None)
 
         assert [row["Status"] for row in rows] == ["N/A"]
+
+    def test_br07_delete_prompt_on_every_prompt_fails(self):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "scoped": {
+                        "inline_policies": [
+                            self._grant("bedrock:DeletePrompt", self._PROMPT_ARN)
+                        ]
+                    },
+                    "wide": {
+                        "inline_policies": [
+                            self._grant(
+                                "bedrock:DeletePrompt",
+                                "arn:aws:bedrock:us-east-1:123456789012:prompt/*",
+                            )
+                        ]
+                    },
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "role 'wide' (bedrock:deleteprompt on" in rows[0]["Finding_Details"]
+        assert "role 'scoped'" not in rows[0]["Finding_Details"]
+
+    def test_br07_a_role_that_renders_and_changes_prompts_fails(self):
+        cache = {
+            "cache_schema_version": 2,
+            "role_permissions": {
+                "runtime": {
+                    "inline_policies": [
+                        self._grant("bedrock:RenderPrompt", self._PROMPT_ARN)
+                    ]
+                },
+                "editor": {
+                    "inline_policies": [
+                        self._grant("bedrock:UpdatePrompt", self._PROMPT_ARN)
+                    ]
+                },
+            },
+        }
+        assert [row["Status"] for row in self._scope_rows(cache)] == ["Passed"]
+
+        cache["role_permissions"]["runtime"]["inline_policies"].append(
+            self._grant("bedrock:CreatePromptVersion", self._PROMPT_ARN)
+        )
+        rows = self._scope_rows(cache)
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "1 role(s) or user(s) may both render prompts (bedrock:RenderPrompt) "
+            "and change them: role 'runtime'." in rows[0]["Finding_Details"]
+        )
+        assert "role 'editor'" not in rows[0]["Finding_Details"]
 
 
 # ===================================================================
@@ -25240,6 +25345,7 @@ class TestAIWriteUserPopulation:
                                         "bedrock:*",
                                         "sagemaker:*",
                                         "bedrock-agentcore:*",
+                                        "bedrock-mantle:*",
                                     ],
                                     "Resource": "*",
                                 }
@@ -25275,6 +25381,45 @@ class TestAIWriteUserPopulation:
         assert bedrock_app._action_grants_ai_write("*:Put*") == list(
             bedrock_app.AI_WRITE_SERVICES
         )
+
+    def test_population_counts_bedrock_mantle_writes(self):
+        assert bedrock_app._action_grants_ai_write(
+            "bedrock-mantle:CreateInference"
+        ) == ["bedrock-mantle"]
+        assert bedrock_app._action_grants_ai_write("bedrock-mantle:ListProjects") == []
+        assert bedrock_app._action_grants_ai_write(
+            "bedrock-mantle:ListProjects", include_reads=True
+        ) == ["bedrock-mantle"]
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "mantle": _identity(
+                    attached=[
+                        _customer_policy(
+                            "Mantle",
+                            {
+                                "Effect": "Allow",
+                                "Action": "bedrock-mantle:CreateInference",
+                                "Resource": "*",
+                            },
+                        )
+                    ]
+                ),
+                "reader": _identity(
+                    attached=[
+                        _customer_policy(
+                            "MantleRead",
+                            {
+                                "Effect": "Allow",
+                                "Action": "bedrock-mantle:List*",
+                                "Resource": "*",
+                            },
+                        )
+                    ]
+                ),
+            },
+        }
+        assert list(bedrock_app._ai_write_users(cache)["users"]) == ["mantle"]
 
     def test_population_unread_group_policies_are_reported_not_dropped(self):
         cache = {
@@ -26617,7 +26762,7 @@ class TestBR52DataPathObjectLock:
         assert "backup:ListRecoveryPointsByResource" in rows[1]["Finding_Details"]
         assert "b (kb)" in rows[1]["Finding_Details"]
 
-    def test_br52_denied_backup_reads_name_the_missing_grant_and_the_ceiling(self):
+    def test_br52_denied_backup_reads_name_the_missing_grant_not_a_ceiling(self):
         _, rows = self._run(
             {"a": ["kb"], "b": ["kb"]},
             {"a": self.GOVERNED, "b": self.GOVERNED},
@@ -26631,8 +26776,11 @@ class TestBR52DataPathObjectLock:
         assert "Bucket a" in denied
         assert (
             "backup:ListRecoveryPointsByResource is not granted to the Bedrock "
-            "assessment role. Partial, ceiling reached" in denied
+            "assessment role, so this read was not made. The API returns the "
+            "field, so a grant of backup:ListRecoveryPointsByResource would let "
+            "the check judge it" in denied
         )
+        assert "ceiling reached" not in denied
         assert "Bucket b" in throttled
         assert "is not granted" not in throttled
         assert "ceiling reached" not in throttled
@@ -26648,8 +26796,11 @@ class TestBR52DataPathObjectLock:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert (
             "backup:DescribeRecoveryPoint is not granted to the Bedrock assessment "
-            "role. Partial, ceiling reached" in rows[0]["Finding_Details"]
+            "role, so this read was not made. The API returns the field, so a "
+            "grant of backup:DescribeRecoveryPoint would let the check judge it"
+            in rows[0]["Finding_Details"]
         )
+        assert "ceiling reached" not in rows[0]["Finding_Details"]
 
     def test_br52_locked_backup_clears_a_bucket_whose_object_lock_is_unreadable(self):
         _, rows = self._run(
@@ -26767,6 +26918,7 @@ class TestBR53OwnerTagSweep:
     SM_OWNED = "arn:aws:sagemaker:us-east-1:123456789012:endpoint/owned"
     SM_TBD = "arn:aws:sagemaker:us-east-1:123456789012:endpoint/tbd"
     SM_LATE = "arn:aws:sagemaker:us-east-1:123456789012:model/late"
+    SM_TRAINING = "arn:aws:sagemaker:us-east-1:123456789012:training-job/never"
     AC_BARE = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
 
     LIST_KEYS = {
@@ -26776,6 +26928,7 @@ class TestBR53OwnerTagSweep:
         "list_memories": "memories",
         "list_gateways": "items",
         "list_browsers": "browserSummaries",
+        "list_training_jobs": "TrainingJobSummaries",
     }
 
     def _run(self, pages, errors=None, runtimes=None, lists=None):
@@ -26865,9 +27018,13 @@ class TestBR53OwnerTagSweep:
         details = rows[0]["Finding_Details"]
         assert "1 of the 1 SageMaker and AgentCore" in details
         assert "a resource never tagged is not listed" in details
-        assert "APIReference/API_GetResources.html). Partial, ceiling reached." in (
-            details
+        assert "APIReference/API_GetResources.html)." in details
+        assert (
+            "the Bedrock assessment role is not granted sagemaker:ListDomains or "
+            "bedrock-agentcore:ListCodeInterpreters, so those two types are held "
+            "back by a missing grant, not a ceiling." in details
         )
+        assert "ceiling reached" not in details
         assert "bedrock-agentcore:ListAgentRuntimes" in details
 
     def test_an_unowned_resource_on_a_later_page_is_failed(self):
@@ -27019,6 +27176,7 @@ class TestBR53OwnerTagSweep:
                 "list_gateways": [{"gatewayId": "gw-a"}, {"gatewayId": "gw-b"}],
                 "list_memories": [{"arn": self.AC_MEMORY}],
                 "list_browsers": [{"browserArn": self.AC_BROWSER}],
+                "list_training_jobs": [{"TrainingJobArn": self.SM_TRAINING}],
             },
         )
         failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
@@ -27029,6 +27187,7 @@ class TestBR53OwnerTagSweep:
             "gateway gw-b": "bedrock-agentcore:ListGateways",
             self.AC_MEMORY: "bedrock-agentcore:ListMemories",
             self.AC_BROWSER: "bedrock-agentcore:ListBrowsers",
+            self.SM_TRAINING: "sagemaker:ListTrainingJobs",
         }
         assert len(failed) == len(named)
         for resource, action in named.items():
@@ -27048,8 +27207,10 @@ class TestBR53OwnerTagSweep:
             "bedrock-agentcore:ListGateways listed 2 gateway(s), 1 of them absent"
             in summary
         )
-        assert "Partial, ceiling reached" in summary
+        assert "ceiling reached" not in summary
+        assert "bedrock-agentcore:ListCodeInterpreters" in summary
         tagging.list_browsers.assert_called_once_with(maxResults=100, type="CUSTOM")
+        tagging.list_training_jobs.assert_called_once_with(MaxResults=100)
         tagging.list_endpoints.assert_called_once_with(MaxResults=100)
 
     def test_sagemaker_arn_case_does_not_fake_a_never_tagged_resource(self):

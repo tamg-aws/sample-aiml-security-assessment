@@ -999,6 +999,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"kms:ListGrants", "kms:DescribeKey"}
 
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"kms:GrantConstraintType"}
 
+# Confirmed on 2026-09-28 from the bedrock service-reference JSON for BR-07's
+# prompt write leg: DeletePrompt and RenderPrompt are both defined on the prompt
+# and prompt-version resource types, and the near-misses
+# bedrock:DeletePromptVersion and bedrock:RenderPrompts are defined by no action.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock:DeletePrompt", "bedrock:RenderPrompt"}
+
 # Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
 # AgentCore payment manager and harness legs of AC-02 and AC-48, one statement
 # per name. The negative controls bedrock-agentcore:ListPaymentManager,

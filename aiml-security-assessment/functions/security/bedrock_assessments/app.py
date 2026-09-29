@@ -4669,6 +4669,13 @@ BEDROCK_INFERENCE_DATA_EVENT_TYPES = (
 
 BEDROCK_EVENT_SOURCE = "bedrock.amazonaws.com"
 
+# bedrock-mantle calls carry their own eventSource (logging-cloudtrail-mantle),
+# so a management selector that keeps only bedrock.amazonaws.com drops them.
+BEDROCK_MANAGEMENT_EVENT_SOURCES = (
+    BEDROCK_EVENT_SOURCE,
+    "bedrock-mantle.amazonaws.com",
+)
+
 CLOUDTRAIL_DATA_EVENT_RESOLUTION = (
     "Add an advanced event selector with resources.type Equals {} to a "
     "multi-region trail, with no other field than eventCategory Equals Data. "
@@ -4813,14 +4820,19 @@ def _selector_field_map(selector: Any) -> Dict[str, Dict[str, Any]]:
 
 
 def _event_source_admits_bedrock(field: Dict[str, Any]) -> bool:
-    """Whether an eventSource field selector leaves bedrock.amazonaws.com in."""
+    """
+    Whether an eventSource field selector leaves both bedrock.amazonaws.com and
+    bedrock-mantle.amazonaws.com in.
+    """
     operators = {key for key in field if key != "Field"}
     if operators - {"Equals", "NotEquals"}:
         return False
     equals = field.get("Equals") or []
-    if equals and BEDROCK_EVENT_SOURCE not in equals:
-        return False
-    return BEDROCK_EVENT_SOURCE not in (field.get("NotEquals") or [])
+    not_equals = field.get("NotEquals") or []
+    return all(
+        (not equals or source in equals) and source not in not_equals
+        for source in BEDROCK_MANAGEMENT_EVENT_SOURCES
+    )
 
 
 def _trail_bedrock_management_coverage(
@@ -4838,10 +4850,13 @@ def _trail_bedrock_management_coverage(
             "IncludeManagementEvents"
         ):
             continue
-        if BEDROCK_EVENT_SOURCE in (
-            selector.get("ExcludeManagementEventSources") or []
-        ):
-            gaps.append(f"excludes {BEDROCK_EVENT_SOURCE} from its management events")
+        excluded = [
+            source
+            for source in BEDROCK_MANAGEMENT_EVENT_SOURCES
+            if source in (selector.get("ExcludeManagementEventSources") or [])
+        ]
+        if excluded:
+            gaps.append(f"excludes {', '.join(excluded)} from its management events")
             continue
         read_write = selector.get("ReadWriteType")
         if read_write == "All":
@@ -6080,7 +6095,13 @@ def _flow_prompt_version_findings(
     return rows
 
 
-PROMPT_WRITE_ACTIONS = ("bedrock:updateprompt", "bedrock:createpromptversion")
+PROMPT_WRITE_ACTIONS = (
+    "bedrock:updateprompt",
+    "bedrock:createpromptversion",
+    "bedrock:deleteprompt",
+)
+
+PROMPT_RENDER_ACTION = "bedrock:renderprompt"
 
 PROMPT_WRITE_SCOPE_FINDING = "Bedrock Prompt Change Permission Scope"
 
@@ -6104,8 +6125,8 @@ def _prompt_write_scope_findings(
                 finding_name=PROMPT_WRITE_SCOPE_FINDING,
                 finding_details=(
                     "The IAM permissions cache is unavailable, so which principals "
-                    "may call bedrock:UpdatePrompt or bedrock:CreatePromptVersion "
-                    "was not read."
+                    "may call bedrock:UpdatePrompt, bedrock:CreatePromptVersion or "
+                    "bedrock:DeletePrompt was not read."
                 ),
                 resolution=COULD_NOT_ASSESS_RESOLUTION,
                 reference=PROMPT_MANAGEMENT_REFERENCE,
@@ -6116,6 +6137,7 @@ def _prompt_write_scope_findings(
         ]
     unbounded = []
     scoped = []
+    renderers = []
     for collection, kind in (
         ("role_permissions", "role"),
         ("user_permissions", "user"),
@@ -6151,23 +6173,47 @@ def _prompt_write_scope_findings(
                 unbounded.append(f"{kind} '{name}' ({'; '.join(sorted(set(gaps)))})")
             elif granted:
                 scoped.append(f"{kind} '{name}'")
+            if (
+                granted
+                and _boundary_allowance(permissions, PROMPT_RENDER_ACTION) != "denied"
+                and not any(
+                    _merged_account_wide_deny(st, PROMPT_RENDER_ACTION)
+                    for st in statements
+                )
+                and any(
+                    str(st.get("Effect", "")).upper() == "ALLOW"
+                    and _merged_statement_matches(st, PROMPT_RENDER_ACTION)
+                    for st in statements
+                )
+            ):
+                renderers.append(f"{kind} '{name}'")
 
     findings: Dict[str, Any] = {"status": "PASS", "csv_data": []}
-    if unbounded:
+    if unbounded or renderers:
+        details = []
+        if unbounded:
+            details.append(
+                "{} role(s) or user(s) may change, version or delete prompts on "
+                "a Resource with a wildcard in it, so they can alter any prompt "
+                "the pattern reaches: {}.".format(
+                    len(unbounded), "; ".join(unbounded[:MAX_REPORTED_PROMPTS])
+                )
+            )
+        if renderers:
+            details.append(
+                "{} role(s) or user(s) may both render prompts "
+                "(bedrock:RenderPrompt) and change them: {}. A caller that "
+                "renders a prompt can then rewrite the template it runs.".format(
+                    len(renderers), "; ".join(renderers[:MAX_REPORTED_PROMPTS])
+                )
+            )
+        details.append(SCP_NOT_EVALUATED_NOTE)
         findings["csv_data"].append(
             create_finding(
                 check_id="BR-07",
                 finding_name=PROMPT_WRITE_SCOPE_FINDING,
-                finding_details=(
-                    "{} role(s) or user(s) may change prompts or publish prompt "
-                    "versions on a Resource with a wildcard in it, so they can "
-                    "alter any prompt the pattern reaches: {}. {}".format(
-                        len(unbounded),
-                        "; ".join(unbounded[:MAX_REPORTED_PROMPTS]),
-                        SCP_NOT_EVALUATED_NOTE,
-                    )
-                ),
-                resolution="Scope bedrock:UpdatePrompt and bedrock:CreatePromptVersion to the ARNs of the prompts each principal owns, with no wildcard in any segment.",
+                finding_details=" ".join(details),
+                resolution="Scope bedrock:UpdatePrompt, bedrock:CreatePromptVersion and bedrock:DeletePrompt to the ARNs of the prompts each principal owns, with no wildcard in any segment, and grant them to principals that do not also hold bedrock:RenderPrompt.",
                 reference=PROMPT_MANAGEMENT_REFERENCE,
                 severity="Medium",
                 status="Failed",
@@ -6180,9 +6226,9 @@ def _prompt_write_scope_findings(
                 check_id="BR-07",
                 finding_name=PROMPT_WRITE_SCOPE_FINDING,
                 finding_details=(
-                    "{} role(s) or user(s) may change prompts or publish prompt "
-                    "versions, and each such grant names prompt ARNs with no "
-                    "wildcard{}.".format(
+                    "{} role(s) or user(s) may change, version or delete prompts, "
+                    "each such grant names prompt ARNs with no wildcard, and none "
+                    "of them may also call bedrock:RenderPrompt{}.".format(
                         len(scoped),
                         ": " + "; ".join(scoped[:MAX_REPORTED_PROMPTS])
                         if scoped
@@ -22679,7 +22725,7 @@ def check_bedrock_api_key_governance(
         }
 
 
-AI_WRITE_SERVICES = ("bedrock", "sagemaker", "bedrock-agentcore")
+AI_WRITE_SERVICES = ("bedrock", "sagemaker", "bedrock-agentcore", "bedrock-mantle")
 
 # An action whose name starts with one of these verbs only reads. A pattern that
 # begins with any other letters, or with a wildcard, can match a write.
@@ -22687,7 +22733,7 @@ AI_READ_ACTION_VERBS = ("get", "list", "describe", "search")
 
 AI_USER_SCOPE_NOTE = (
     "The population is IAM users whose attached, inline or group policies allow a "
-    "non-read Bedrock, SageMaker AI or AgentCore action and whose permissions "
+    "non-read Bedrock, bedrock-mantle, SageMaker AI or AgentCore action and whose permissions "
     "boundary, if set, allows one too. Deny statements and service control "
     "policies are not evaluated per principal, so a user they block can still be "
     "counted."
@@ -22697,7 +22743,7 @@ AI_USER_SCOPE_NOTE = (
 # user allowed only reads is in its population.
 AI_ACCESS_SCOPE_NOTE = (
     "The population is IAM users whose attached, inline or group policies allow any "
-    "Bedrock, SageMaker AI or AgentCore action, reads included, and whose "
+    "Bedrock, bedrock-mantle, SageMaker AI or AgentCore action, reads included, and whose "
     "permissions boundary, if set, allows one too. Deny statements and service "
     "control policies are not evaluated per principal, so a user they block can "
     "still be counted."
@@ -22764,7 +22810,7 @@ def _ai_write_users(
 ) -> Dict[str, Any]:
     """
     Select the cached IAM users (or, with cache_key "role_permissions", roles)
-    that hold a non-read Bedrock, SageMaker AI or AgentCore permission (any such
+    that hold a non-read Bedrock, bedrock-mantle, SageMaker AI or AgentCore permission (any such
     permission when include_reads is set), with the grants that put each one in
     scope.
 
@@ -22898,7 +22944,7 @@ def check_bedrock_ai_user_access_keys(
             findings["csv_data"].append(
                 row(
                     "No IAM user in the permissions cache holds any "
-                    f"Bedrock, SageMaker AI or AgentCore permission. "
+                    f"Bedrock, bedrock-mantle, SageMaker AI or AgentCore permission. "
                     f"{AI_ACCESS_SCOPE_NOTE}",
                     "No action required",
                     "Informational",
@@ -23452,7 +23498,7 @@ def check_bedrock_ai_user_console_mfa(
     permission_cache, region: str = "", identity_center_region: str = ""
 ) -> Dict[str, Any]:
     """
-    BR-51: Flag identities that can change Bedrock, SageMaker AI or AgentCore
+    BR-51: Flag identities that can change Bedrock, bedrock-mantle, SageMaker AI or AgentCore
     resources without MFA: an IAM user with a console password and no MFA
     device, an IAM user with an active access key and no Deny requiring MFA,
     and an IAM role whose trust policy lets a user or account assume it
@@ -23543,7 +23589,7 @@ def check_bedrock_ai_user_console_mfa(
             findings["csv_data"].append(
                 row(
                     "No IAM user or role in the permissions cache holds a "
-                    "non-read Bedrock, SageMaker AI or AgentCore permission. "
+                    "non-read Bedrock, bedrock-mantle, SageMaker AI or AgentCore permission. "
                     f"{AI_USER_SCOPE_NOTE} {identity_center['note']}",
                     "No action required",
                     "Informational",
@@ -25776,13 +25822,14 @@ def _backup_vault_lock_evidence(region: str, now: datetime) -> str:
     )
 
 
-def _backup_grant_ceiling(error: Exception, action: str) -> str:
+def _backup_grant_gap(error: Exception, action: str) -> str:
     """Name the ungranted AWS Backup read behind an AccessDenied."""
     if not _is_access_denied_client_error(error):
         return ""
     return (
-        f"; {action} is not granted to the Bedrock assessment role. Partial, "
-        "ceiling reached"
+        f"; {action} is not granted to the Bedrock assessment role, so this read "
+        f"was not made. The API returns the field, so a grant of {action} would "
+        "let the check judge it"
     )
 
 
@@ -25814,7 +25861,7 @@ def _bucket_backup_lock(
                 "its AWS Backup recovery points were not read "
                 f"(backup:ListRecoveryPointsByResource: "
                 f"{get_assessment_error_label(error)})"
-                + _backup_grant_ceiling(error, "backup:ListRecoveryPointsByResource")
+                + _backup_grant_gap(error, "backup:ListRecoveryPointsByResource")
             ),
         }
     usable = [
@@ -25879,7 +25926,7 @@ def _bucket_backup_lock(
                 "the lock date, so its own retention decides how long it is kept, "
                 "but it was not read (backup:DescribeRecoveryPoint: "
                 f"{get_assessment_error_label(error)})"
-                + _backup_grant_ceiling(error, "backup:DescribeRecoveryPoint")
+                + _backup_grant_gap(error, "backup:DescribeRecoveryPoint")
             ),
         }
     delete_at = (point.get("CalculatedLifecycle") or {}).get("DeleteAt")
@@ -26545,6 +26592,17 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         {},
     ),
     (
+        "sagemaker",
+        "SageMaker",
+        "training job",
+        "sagemaker",
+        "list_training_jobs",
+        "TrainingJobSummaries",
+        "TrainingJobArn",
+        "sagemaker:ListTrainingJobs",
+        {},
+    ),
+    (
         "bedrock-agentcore",
         "AgentCore",
         "agent runtime",
@@ -26592,14 +26650,16 @@ RESOURCE_OWNER_SWEEP_LISTS = (
 
 # Resource types the list reads above do not enumerate, so one never tagged is
 # still invisible to this check.
-RESOURCE_OWNER_SWEEP_CEILING = (
+RESOURCE_OWNER_SWEEP_GAP = (
     "SageMaker and AgentCore resource types other than endpoints, models, "
-    "notebook instances, agent runtimes, memories, gateways and custom browsers "
-    "(for example SageMaker domains and training jobs, and AgentCore code "
-    "interpreters) are listed only by GetResources, which returns only resources "
-    "that are or were tagged, so a resource never tagged is not listed "
+    "notebook instances, training jobs, agent runtimes, memories, gateways and "
+    "custom browsers are read only through GetResources, which returns only "
+    "resources that are or were tagged, so a resource never tagged is not listed "
     "(https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/"
-    "API_GetResources.html). Partial, ceiling reached."
+    "API_GetResources.html). SageMaker domains and AgentCore code interpreters "
+    "have list APIs, but the Bedrock assessment role is not granted "
+    "sagemaker:ListDomains or bedrock-agentcore:ListCodeInterpreters, so those "
+    "two types are held back by a missing grant, not a ceiling."
 )
 
 
@@ -26785,7 +26845,7 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
                 owned,
                 returned,
                 list_note,
-                RESOURCE_OWNER_SWEEP_CEILING,
+                RESOURCE_OWNER_SWEEP_GAP,
                 unread_note,
             ),
             COULD_NOT_ASSESS_RESOLUTION,
