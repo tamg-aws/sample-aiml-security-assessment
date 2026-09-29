@@ -261,6 +261,9 @@ section.
 
 ### Fixed
 
+- `BR-02` no longer calls `ecs:ListTasks` without a cluster when
+  `ecs:ListClusters` is denied. The grant admits only a named cluster, so that
+  call would be denied; the row now says no standalone task was listed.
 - `AR-10` credited a rule filtered on `region`, `time`, `id` or any other
   top-level field beyond `source`, `detail-type`, `detail`, `resources` and
   `account` as routing every approval transition. Every such field now
@@ -1137,6 +1140,27 @@ ARNs (`BR-46`, `BR-47`, `BR-52`). `aoss:ListAccessPolicies`,
 in the IAM service authorization reference. All six are read-only. Each
 stack creates one more customer managed policy, named with the stack name as
 its prefix.
+
+`BedrockAssessmentReadsPolicy` gains, in both SAM templates:
+`account:ListRegions` on the account ARN (`BR-51`),
+`events:ListTargetsByRule` on the account's `rule/*` ARNs (`BR-33`),
+`sagemaker:DescribeEndpoint`, `sagemaker:DescribeEndpointConfig`,
+`sagemaker:DescribeModel` and `sagemaker:DescribeInferenceComponent` on the
+account's `endpoint/*`, `endpoint-config/*`, `model/*` and
+`inference-component/*` ARNs, `eks:DescribeCluster` and
+`eks:ListPodIdentityAssociations` on `cluster/*`,
+`eks:DescribePodIdentityAssociation` on `podidentityassociation/*/*` and
+`ecs:DescribeTasks` on `task/*` (`BR-02`). It gains on `*`, because none has
+a resource type in the IAM service authorization reference,
+`sagemaker:ListInferenceComponents` and `eks:ListClusters` (`BR-02`), and
+`sagemaker:ListDomains` and `bedrock-agentcore:ListCodeInterpreters`
+(`BR-53`). `ecs:ListTasks` (`BR-02`) is granted on `*` only under an
+`ArnLike` `ecs:cluster` condition on the account's `cluster/*` ARNs. The two
+AWS sources disagree here: the service authorization reference gives
+`ListTasks` the `container-instance` resource type, which a listing by
+cluster does not name, while the Amazon ECS developer guide's `ListTasks`
+example grants `*` under the `ecs:cluster` key. The grant follows the
+developer guide. All are read-only, and the same CodeBuild run applies them.
 
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a

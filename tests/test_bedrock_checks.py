@@ -2070,6 +2070,23 @@ class TestBR02WorkloadConnectivity:
         )
         self.ecs.list_services.assert_called_once_with(maxResults=100)
 
+    def test_br02_tasks_are_never_listed_without_a_cluster(self):
+        # ecs:ListTasks is granted only under an ecs:cluster condition, so a
+        # call with no cluster argument would be denied and must not be made.
+        inventory = self._inventory(
+            clusters=_make_client_error("AccessDeniedException"),
+            tasks={None: [self._task("t1", "family:batch")]},
+            task_roles={"td-batch:1": "arn:aws:iam::123456789012:role/BatchTask"},
+        )
+        assert self._names(inventory) == []
+        self.ecs.list_tasks.assert_not_called()
+        assert inventory["errors"] == [
+            "ECS clusters were not listed with ecs:ListClusters "
+            "(AccessDeniedException), so only the default cluster's services "
+            "were read, and no standalone task was listed, because "
+            "ecs:ListTasks is granted only for a named cluster"
+        ]
+
     def test_br02_ecs_services_are_described_ten_at_a_time(self):
         listed = [self._service(f"s{i:02d}", "td:1") for i in range(11)]
         inventory = self._inventory(

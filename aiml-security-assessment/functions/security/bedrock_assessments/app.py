@@ -2594,7 +2594,8 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
         inventory["errors"].append(
             "ECS clusters were not listed with ecs:ListClusters "
             f"({get_assessment_error_label(error)}), so only the default "
-            "cluster's services were read"
+            "cluster's services were read, and no standalone task was listed, "
+            "because ecs:ListTasks is granted only for a named cluster"
         )
         clusters = [None]
     subnet_cache: Dict[str, Optional[str]] = {}
@@ -2702,9 +2703,11 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                     or [],
                     "container instances its tasks run on",
                 )
+        if not cluster:
+            continue
         try:
             task_arns = _list_all_items(
-                ecs_client, "list_tasks", "taskArns", **cluster_kwargs
+                ecs_client, "list_tasks", "taskArns", cluster=cluster
             )
         except (ClientError, BotoCoreError, TypeError) as error:
             inventory["errors"].append(
