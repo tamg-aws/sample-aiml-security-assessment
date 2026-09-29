@@ -4738,7 +4738,9 @@ class TestAC08VPCEndpoints:
 
         findings = extract_csv_data(agentcore_app.check_agentcore_vpc_endpoints())
 
-        assert findings[0]["Finding_Details"] == "No VPCs found in the account"
+        assert findings[0]["Finding_Details"].startswith(
+            "1 runtime(s) exist in this Region and the account has no VPC here"
+        )
         assert mock_ac.list_agent_runtimes.call_count == 2
         mock_ac.list_agent_runtimes.assert_any_call(nextToken="runtime-page-2")
 
@@ -9565,6 +9567,312 @@ def _ac08_endpoint(endpoint_id, service, state="available", groups=("sg-closed",
     }
 
 
+class TestGW04EndpointPathsByValue:
+    """GW-04: AC-08 without a VPC, endpoint policies equal to the default, and
+    AC-27 aws:SourceVpce values matched to the account's gateway endpoints."""
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_gateways_with_no_vpc_fail_as_missing(self, mock_ac, mock_ec2):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-0"}, {"gatewayId": "gw-1"}]
+        }
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": []}
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore VPC Endpoints Missing"
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "High"
+        assert "2 gateway(s)" in findings[0]["Finding_Details"]
+        assert "has no VPC" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_runtimes_and_gateways_with_no_vpc_are_both_counted(
+        self, mock_ac, mock_ec2
+    ):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-0"}, {"agentRuntimeId": "rt-1"}]
+        }
+        mock_ac.list_gateways.return_value = {"items": [{"gatewayId": "gw-0"}]}
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": []}
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "2 runtime(s) and 1 gateway(s)" in findings[0]["Finding_Details"]
+
+    @staticmethod
+    def _policy_endpoint(endpoint_id, statement, service="bedrock-agentcore.gateway"):
+        endpoint = _ac08_endpoint(endpoint_id, service)
+        endpoint["PolicyDocument"] = json.dumps({"Statement": [statement]})
+        return {
+            "vpc_id": "vpc-1",
+            "service": endpoint["ServiceName"],
+            "state": "available",
+            "endpoint": endpoint,
+        }
+
+    @staticmethod
+    def _policy_verdicts(mock_ec2, entries):
+        mock_ec2.describe_security_groups.return_value = {"SecurityGroups": []}
+        findings = agentcore_app._agentcore_endpoint_scope_findings(entries)
+        return [
+            (f["Finding"], f["Status"])
+            for f in findings
+            if f["Finding"].startswith("AgentCore VPC Endpoint Policy")
+        ]
+
+    _NARROW = {
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+        "Action": "bedrock-agentcore:InvokeGateway",
+        "Resource": "*",
+    }
+
+    @pytest.mark.parametrize(
+        "action,resource,principal",
+        [
+            ("bedrock-agentcore:*", "*", "*"),
+            ("*:*", "*", "*"),
+            ("*", "arn:aws:bedrock-agentcore:*:*:*", "*"),
+            ("*", "arn:*", "*"),
+            (
+                "bedrock-agentcore:*",
+                "arn:aws:bedrock-agentcore:us-east-1:*:*",
+                {"AWS": "*"},
+            ),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    def test_a_statement_with_the_default_effect_is_unrestricted(
+        self, mock_ec2, action, resource, principal
+    ):
+        wide = {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": action,
+            "Resource": resource,
+        }
+        verdicts = self._policy_verdicts(
+            mock_ec2,
+            [
+                self._policy_endpoint("vpce-narrow", self._NARROW),
+                self._policy_endpoint("vpce-wide", wide),
+            ],
+        )
+
+        assert verdicts == [
+            ("AgentCore VPC Endpoint Policy", "Passed"),
+            ("AgentCore VPC Endpoint Policy Unrestricted", "Failed"),
+        ]
+
+    @pytest.mark.parametrize(
+        "action,resource,condition",
+        [
+            ("s3:*", "*", None),
+            ("bedrock-agentcore:Invoke*", "*", None),
+            ("*", "arn:aws:bedrock-agentcore:us-east-1:*:gateway/*", None),
+            ("*", "arn:aws:bedrock-agentcore:us-east-1:123456789012:*", None),
+            (
+                "*",
+                "*",
+                {"StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+            ),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    def test_a_narrower_statement_is_not_unrestricted(
+        self, mock_ec2, action, resource, condition
+    ):
+        statement = {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": action,
+            "Resource": resource,
+        }
+        if condition:
+            statement["Condition"] = condition
+
+        verdicts = self._policy_verdicts(
+            mock_ec2, [self._policy_endpoint("vpce-1", statement)]
+        )
+
+        assert verdicts == [("AgentCore VPC Endpoint Policy", "Passed")]
+
+    @patch("agentcore_app.ec2_client")
+    def test_the_unrestricted_text_names_the_service_wide_grant(self, mock_ec2):
+        mock_ec2.describe_security_groups.return_value = {"SecurityGroups": []}
+        wide = {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "bedrock-agentcore:*",
+            "Resource": "*",
+        }
+        findings = agentcore_app._agentcore_endpoint_scope_findings(
+            [self._policy_endpoint("vpce-wide", wide)]
+        )
+        failed = next(
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore VPC Endpoint Policy Unrestricted"
+        )
+        assert (
+            "the same effect as the default endpoint policy"
+            in (failed["Finding_Details"])
+        )
+
+    _GW = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/"
+
+    @staticmethod
+    def _vpce_deny(values):
+        return json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+                        "Action": "bedrock-agentcore:InvokeGateway",
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "bedrock-agentcore:InvokeGateway",
+                        "Resource": "*",
+                        "Condition": {"StringNotEquals": {"aws:SourceVpce": values}},
+                    },
+                ]
+            }
+        )
+
+    def _network(self, mock_ac, mock_iam, mock_ec2, policies, endpoints):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": g} for g in policies]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayArn": self._GW + gatewayIdentifier,
+            "roleArn": f"arn:aws:iam::123456789012:role/Role-{gatewayIdentifier}",
+        }
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": policies[resourceArn.rsplit("/", 1)[-1]]
+        }
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "AssumeRolePolicyDocument": _service_trust(
+                    {
+                        "StringEquals": {"aws:SourceAccount": "123456789012"},
+                        "ArnLike": {
+                            "aws:SourceArn": self._GW + RoleName[len("Role-") :]
+                        },
+                    }
+                )
+            }
+        }
+        if isinstance(endpoints, Exception):
+            mock_ec2.describe_vpc_endpoints.side_effect = endpoints
+        else:
+            mock_ec2.describe_vpc_endpoints.return_value = {"VpcEndpoints": endpoints}
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        return [f for f in findings if "Network Path" in f["Finding"]]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_vpce_naming_no_gateway_endpoint_here_fails(
+        self, mock_ac, mock_iam, mock_ec2
+    ):
+        network = self._network(
+            mock_ac,
+            mock_iam,
+            mock_ec2,
+            {
+                "gw-a": self._vpce_deny("vpce-gw"),
+                "gw-b": self._vpce_deny(["vpce-gw", "vpce-foreign", "vpce-rt"]),
+            },
+            [
+                _ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway"),
+                _ac08_endpoint("vpce-rt", "bedrock-agentcore"),
+            ],
+        )
+
+        assert [(f["Finding"], f["Status"]) for f in network] == [
+            ("AgentCore Gateway Network Path Scope", "Passed"),
+            ("AgentCore Gateway Network Path Endpoint Not Found", "Failed"),
+        ]
+        details = network[1]["Finding_Details"]
+        assert "(gw-b)" in details
+        assert "vpce-foreign (not found in this account and Region)" in details
+        assert (
+            "vpce-rt (an endpoint for com.amazonaws.us-east-1.bedrock-agentcore)"
+            in (details)
+        )
+        assert "vpce-gw" not in details.split("names ")[1].split(".")[0]
+        assert network[1]["Severity"] == "Medium"
+        assert_finding_schema(network[1])
+        assert "vpce-gw" in network[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_endpoints_are_read_once_for_every_gateway(
+        self, mock_ac, mock_iam, mock_ec2
+    ):
+        network = self._network(
+            mock_ac,
+            mock_iam,
+            mock_ec2,
+            {"gw-a": self._vpce_deny("vpce-gw"), "gw-b": self._vpce_deny("vpce-gw")},
+            [_ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway")],
+        )
+
+        assert [f["Status"] for f in network] == ["Passed", "Passed"]
+        assert mock_ec2.describe_vpc_endpoints.call_count == 1
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_endpoint_list_withholds_the_passed(
+        self, mock_ac, mock_iam, mock_ec2
+    ):
+        network = self._network(
+            mock_ac,
+            mock_iam,
+            mock_ec2,
+            {"gw-a": self._vpce_deny("vpce-gw")},
+            ClientError(
+                {"Error": {"Code": "UnauthorizedOperation"}}, "DescribeVpcEndpoints"
+            ),
+        )
+
+        assert [(f["Finding"], f["Status"]) for f in network] == [
+            ("AgentCore Gateway Network Path Scope", "N/A")
+        ]
+        assert "UnauthorizedOperation" in network[0]["Finding_Details"]
+        assert "vpce-gw" in network[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_vpc_restriction_does_not_read_endpoints(
+        self, mock_ac, mock_iam, mock_ec2
+    ):
+        policy = json.loads(self._vpce_deny("vpce-x"))
+        policy["Statement"][1]["Condition"] = {
+            "StringNotEquals": {"aws:SourceVpc": "vpc-1"}
+        }
+        network = self._network(
+            mock_ac, mock_iam, mock_ec2, {"gw-a": json.dumps(policy)}, []
+        )
+
+        assert [f["Status"] for f in network] == ["Passed"]
+        mock_ec2.describe_vpc_endpoints.assert_not_called()
+
+
 class TestAC08SurfaceEndpoints:
     """AC-08: the endpoint each surface in use is called through, over its VPCs."""
 
@@ -11171,10 +11479,18 @@ class TestAC27GatewayPolicyConditions:
 
         mock_iam.get_role.side_effect = get_role
 
+    @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
-    def test_both_verdicts_are_reached_on_all_three_legs(self, mock_ac, mock_iam):
+    def test_both_verdicts_are_reached_on_all_three_legs(
+        self, mock_ac, mock_iam, mock_ec2
+    ):
         self._wire(mock_ac, mock_iam)
+        # The Deny's aws:SourceVpce value is matched to the Region's gateway
+        # endpoints, so vpce-1 is one.
+        mock_ec2.describe_vpc_endpoints.return_value = {
+            "VpcEndpoints": [_ac08_endpoint("vpce-1", "bedrock-agentcore.gateway")]
+        }
 
         findings = agentcore_app.check_agentcore_gateway_policy_conditions()
 
@@ -24189,9 +24505,17 @@ class TestAC47DenyForm:
 
         assert caller == {(True, "Passed"), (False, "Failed")}
 
+    @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
-    def test_the_gateway_network_leg_needs_a_bounded_deny(self, mock_ac, mock_iam):
+    def test_the_gateway_network_leg_needs_a_bounded_deny(
+        self, mock_ac, mock_iam, mock_ec2
+    ):
+        # The Deny's aws:SourceVpce value is matched to the Region's gateway
+        # endpoints, so vpce-1 is one.
+        mock_ec2.describe_vpc_endpoints.return_value = {
+            "VpcEndpoints": [_ac08_endpoint("vpce-1", "bedrock-agentcore.gateway")]
+        }
         policies = {
             "gw-deny": [
                 _deny_invoke(
@@ -24436,11 +24760,17 @@ class TestAC47EveryInvokeAction:
         assert leg["Status"] == "Failed"
         assert "also requires aws:viaawsservice" in leg["Finding_Details"]
 
+    @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
     def test_the_gateway_network_leg_accepts_the_via_aws_service_form(
-        self, mock_ac, mock_iam
+        self, mock_ac, mock_iam, mock_ec2
     ):
+        # The Deny's aws:SourceVpce value is matched to the Region's gateway
+        # endpoints, so vpce-1 is one.
+        mock_ec2.describe_vpc_endpoints.return_value = {
+            "VpcEndpoints": [_ac08_endpoint("vpce-1", "bedrock-agentcore.gateway")]
+        }
         policies = {
             "gw-exempt": [
                 _deny_invoke(

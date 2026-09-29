@@ -8142,20 +8142,64 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
     return findings
 
 
-def _vpc_endpoint_policy_is_full_access(policy_document: Any) -> bool:
+def _endpoint_action_is_every_call(action: str, service_prefix: str) -> bool:
+    """Return whether one Action value reaches every call an endpoint carries.
+
+    `*` and `*:*` reach every action, and `<prefix>:*` reaches every action of
+    the service the endpoint serves.
+    """
+    prefix, _, name = action.partition(":")
+    if set(prefix) <= {"*"}:
+        return True
+    return bool(name) and set(name) <= {"*"} and prefix == service_prefix
+
+
+def _endpoint_resource_is_every_resource(resource: str) -> bool:
+    """Return whether one Resource value reaches every resource of the service.
+
+    `*` does, and so does an ARN whose account and resource parts are empty or
+    only `*`, such as arn:aws:bedrock-agentcore:*:*:* or arn:aws:s3:::*. An ARN
+    cut short by a trailing `*`, such as arn:*, matches the rest of every ARN. A
+    literal partition, service or Region is left alone: the endpoint carries
+    calls to one service in its own Region, so naming them narrows nothing.
+    """
+    resource = resource.strip()
+    if set(resource) <= {"*"}:
+        return bool(resource)
+    parts = resource.split(":", 5)
+    if parts[0] != "arn":
+        return False
+    if len(parts) < 6:
+        return set(parts[-1]) <= {"*"} and bool(parts[-1])
+    return set(parts[4]) <= {"*"} and set(parts[5]) <= {"*"} and bool(parts[5])
+
+
+def _vpc_endpoint_policy_is_full_access(
+    policy_document: Any, service_prefix: str = ""
+) -> bool:
     """Return whether an endpoint policy allows every principal every action.
 
-    AWS attaches exactly this document when no policy is supplied, so an endpoint
-    carrying it contributes a private network path and no authorization. One
-    unconditioned statement of that shape has the effect no matter what else the
-    document holds, which is why the statements are not scored together.
+    AWS attaches the allow-everything document when no policy is supplied, so an
+    endpoint carrying it contributes a private network path and no
+    authorization. One unconditioned statement with that effect is enough no
+    matter what else the document holds, which is why the statements are not
+    scored together. The effect is read by value: `service_prefix` is the IAM
+    prefix of the endpoint's service, so bedrock-agentcore:* on an AgentCore
+    endpoint, and a Resource ARN open in its account and resource parts, count
+    as every action and every resource.
     """
     for statement in _document_statements(policy_document, effect="Allow"):
         if statement.get("Condition"):
             continue
         if (
-            "*" in _statement_actions(statement)
-            and "*" in _statement_resources(statement)
+            any(
+                _endpoint_action_is_every_call(action, service_prefix)
+                for action in _statement_actions(statement)
+            )
+            and any(
+                _endpoint_resource_is_every_resource(resource)
+                for resource in _statement_resources(statement)
+            )
             and "*" in _statement_principals(statement)
         ):
             return True
@@ -8414,6 +8458,17 @@ def _is_agentcore_service_endpoint(service_name: str) -> bool:
     return AGENTCORE_SERVICE_ENDPOINT_TOKEN in (service_name or "").lower()
 
 
+def _endpoint_service_prefix(service_name: str) -> str:
+    """Return the IAM prefix of the service one VPC endpoint service name serves.
+
+    com.amazonaws.<region>.<service>[.<surface>] names the service in its fourth
+    part: bedrock-agentcore for both AgentCore surfaces, and s3, dynamodb or
+    sagemaker for the data-path endpoints.
+    """
+    parts = str(service_name or "").lower().split(".")
+    return parts[3] if len(parts) > 3 else ""
+
+
 def _is_agentcore_data_path_endpoint(service_name: str) -> bool:
     """Return whether one VPC endpoint carries an AgentCore workload's data."""
     lowered = (service_name or "").lower()
@@ -8501,16 +8556,19 @@ def _agentcore_endpoint_scope_findings(
                     status=StatusEnum.NA,
                 )
             )
-        elif _vpc_endpoint_policy_is_full_access(policy_document):
+        elif _vpc_endpoint_policy_is_full_access(
+            policy_document, _endpoint_service_prefix(entry["service"])
+        ):
             findings.append(
                 create_finding(
                     check_id="AC-08",
                     finding_name="AgentCore VPC Endpoint Policy Unrestricted",
                     finding_details=(
-                        f"AgentCore VPC {label} carries the default endpoint "
-                        "policy, which allows every principal every action on "
-                        "every resource. The endpoint keeps the traffic off the "
-                        "public internet and authorizes nothing."
+                        f"AgentCore VPC {label} carries an unconditioned policy "
+                        "statement that allows every principal every action of "
+                        "its service on every resource, the same effect as the "
+                        "default endpoint policy. The endpoint keeps the traffic "
+                        "off the public internet and authorizes nothing."
                     ),
                     resolution=(
                         "Replace the default endpoint policy with one that names "
@@ -8982,15 +9040,35 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
         )
 
         if not vpcs:
+            # A VPC endpoint lives in a VPC, so with none in the Region every
+            # call to the runtimes and gateways listed above reaches the public
+            # service endpoint.
+            in_use = " and ".join(
+                f"{count} {surface}(s)"
+                for surface, count in (
+                    ("runtime", len(runtimes)),
+                    ("gateway", len(gateways)),
+                )
+                if count
+            )
             findings.append(
                 create_finding(
                     check_id="AC-08",
-                    finding_name="AgentCore VPC Endpoints Check",
-                    finding_details="No VPCs found in the account",
-                    resolution="No action required",
+                    finding_name="AgentCore VPC Endpoints Missing",
+                    finding_details=(
+                        f"{in_use} exist in this Region and the account has no "
+                        "VPC here, so no VPC endpoint can carry their calls and "
+                        "every call reaches the public service endpoint."
+                    ),
+                    resolution=(
+                        "Create a VPC for the callers and an interface endpoint "
+                        "for com.amazonaws.<region>.bedrock-agentcore and "
+                        "com.amazonaws.<region>.bedrock-agentcore.gateway in it, "
+                        "for the surfaces in use."
+                    ),
                     reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
-                    severity=SeverityEnum.INFORMATIONAL,
-                    status=StatusEnum.NA,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
                 )
             )
             return findings
@@ -14438,6 +14516,7 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
 
     findings = []
     trust_cache: Dict[str, Any] = {}
+    endpoint_cache: Dict[str, Any] = {}
     held: List[Tuple[str, str, Dict[str, Any]]] = []
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId", "unknown")
@@ -14474,7 +14553,9 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
             and other.get("roleArn") != role_arn
         ]
         findings.extend(
-            _gateway_resource_policy_findings(label, detail.get("gatewayArn"))
+            _gateway_resource_policy_findings(
+                label, detail.get("gatewayArn"), endpoint_cache
+            )
         )
         findings.extend(
             _gateway_role_trust_findings(
@@ -14485,10 +14566,70 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
     return findings
 
 
+def _region_vpc_endpoint_services(cache: Dict[str, Any]) -> Any:
+    """Return {endpoint id: service name} for this Region's VPC endpoints, read
+    once per invocation into `cache`, or a string naming why they were not read.
+    """
+    if "endpoints" not in cache:
+        if ec2_client is None:
+            cache["endpoints"] = "the EC2 client is not available in this Region"
+        else:
+            try:
+                cache["endpoints"] = {
+                    str(endpoint.get("VpcEndpointId")): str(
+                        endpoint.get("ServiceName", "")
+                    )
+                    for endpoint in _paginate_aws_list(
+                        ec2_client,
+                        "describe_vpc_endpoints",
+                        "VpcEndpoints",
+                        token_request_key="NextToken",
+                        token_response_key="NextToken",
+                    )
+                }
+            except Exception as error:
+                logger.warning(f"Could not describe VPC endpoints: {error}")
+                cache["endpoints"] = (
+                    "ec2:DescribeVpcEndpoints failed with "
+                    f"{_assessment_error_label(error)}"
+                )
+    return cache["endpoints"]
+
+
+def _restricting_source_vpce_values(
+    statements: List[Dict[str, Any]], gateway_arn: str
+) -> List[str]:
+    """Return the aws:SourceVpce values named by each Deny that restricts
+    InvokeGateway on `gateway_arn` by that key."""
+    values: Set[str] = set()
+    for statement in statements:
+        named, _ = _restricting_deny(
+            statement,
+            "bedrock-agentcore:InvokeGateway",
+            gateway_arn,
+            NETWORK_PATH_CONDITION_KEYS,
+            _network_values_are_bounded,
+            exempt_aws_service=True,
+        )
+        if "aws:sourcevpce" not in named:
+            continue
+        for entries in statement["Condition"].values():
+            for key, raw in entries.items():
+                if str(key).strip().lower() == "aws:sourcevpce":
+                    values.update(value.strip() for value in _condition_values(raw))
+    return sorted(values)
+
+
 def _gateway_resource_policy_findings(
-    label: str, gateway_arn: Any
+    label: str, gateway_arn: Any, endpoint_cache: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
-    """Judge one gateway resource policy's confused-deputy and network conditions."""
+    """Judge one gateway resource policy's confused-deputy and network conditions.
+
+    An aws:SourceVpce value in the restricting Deny is matched to this Region's
+    VPC endpoints, read once into `endpoint_cache`: an id that is not an
+    AgentCore gateway endpoint here is either another account's endpoint, whose
+    VPC then reaches the gateway, or a path that carries no gateway call.
+    """
     if not gateway_arn:
         return [
             create_finding(
@@ -14623,7 +14764,68 @@ def _gateway_resource_policy_findings(
         _network_values_are_bounded,
         exempt_aws_service=True,
     )
-    if network_keys:
+    vpce_values = (
+        _restricting_source_vpce_values(_document_statements(policy), str(gateway_arn))
+        if "aws:sourcevpce" in network_keys
+        else []
+    )
+    endpoints = (
+        _region_vpc_endpoint_services(
+            endpoint_cache if endpoint_cache is not None else {}
+        )
+        if vpce_values
+        else {}
+    )
+    if isinstance(endpoints, str):
+        findings.append(
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Network Path Scope",
+                finding_details=(
+                    f"{label} has a resource policy Deny whose aws:SourceVpce "
+                    f"names {', '.join(vpce_values)}, which could not be matched "
+                    f"to this account's VPC endpoints: {endpoints}. An id that is "
+                    "not a gateway endpoint here may be another account's "
+                    "endpoint, whose VPC then reaches the gateway."
+                ),
+                resolution="Grant ec2:DescribeVpcEndpoints and retry.",
+                reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+    unmatched = [
+        f"{value} (not found in this account and Region)"
+        if value not in endpoints
+        else f"{value} (an endpoint for {endpoints[value]})"
+        for value in vpce_values
+        if not endpoints.get(value, "").lower().endswith(".bedrock-agentcore.gateway")
+    ]
+    if unmatched:
+        findings.append(
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Network Path Endpoint Not Found",
+                finding_details=(
+                    f"{label} has a resource policy Deny whose aws:SourceVpce "
+                    f"names {', '.join(unmatched)}. Each is not an AgentCore "
+                    "gateway interface endpoint in this account and Region: an "
+                    "id owned by another account lets that account's VPC reach "
+                    "the gateway, and an endpoint for another service carries no "
+                    "gateway call."
+                ),
+                resolution=(
+                    "Name only the com.amazonaws.<region>.bedrock-agentcore."
+                    "gateway interface endpoints this workload calls through in "
+                    "the aws:SourceVpce condition."
+                ),
+                reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+    elif network_keys:
         findings.append(
             create_finding(
                 check_id="AC-27",
@@ -14634,6 +14836,13 @@ def _gateway_resource_policy_findings(
                     "request from outside the network path named by "
                     f"{', '.join(network_keys)}, and every value it names is "
                     "bounded."
+                    + (
+                        f" Its aws:SourceVpce value(s) {', '.join(vpce_values)} "
+                        "each name an AgentCore gateway interface endpoint in "
+                        "this account and Region."
+                        if vpce_values
+                        else ""
+                    )
                     + (
                         " A Deny exempts calls an AWS service makes on the "
                         "caller's behalf (Bool aws:ViaAWSService false)."
