@@ -16467,22 +16467,26 @@ def _notifying_alarm_names(
     return notifying
 
 
-def _get_invocation_log_group_name(region: str = "") -> Optional[str]:
-    """Return the CloudWatch log group that receives Bedrock invocation logs."""
+def _get_invocation_log_group_name(region: str = "") -> Tuple[Optional[str], Any]:
+    """
+    Return the CloudWatch log group that receives Bedrock invocation logs, and
+    textDataDeliveryEnabled as returned (None when absent).
+    """
     client = boto3.client("bedrock", config=boto3_config, region_name=region)
     response = client.get_model_invocation_logging_configuration()
     if not isinstance(response, dict):
-        return None
+        return None, None
     logging_config = response.get("loggingConfig")
     if not isinstance(logging_config, dict):
-        return None
+        return None, None
+    text_delivery = logging_config.get("textDataDeliveryEnabled")
     cloudwatch_config = logging_config.get("cloudWatchConfig")
     if not isinstance(cloudwatch_config, dict):
-        return None
+        return None, text_delivery
     log_group_name = cloudwatch_config.get("logGroupName")
     if isinstance(log_group_name, str) and log_group_name:
-        return log_group_name
-    return None
+        return log_group_name, text_delivery
+    return None, text_delivery
 
 
 def _find_guardrail_intervention_metric_filters(
@@ -16914,10 +16918,11 @@ def _guardrail_intervention_signal_finding(
     )
 
     log_group_name = None
+    text_delivery = None
     filters = {"matched": [], "rejected": []}
     signal_error = None
     try:
-        log_group_name = _get_invocation_log_group_name(region)
+        log_group_name, text_delivery = _get_invocation_log_group_name(region)
         if log_group_name:
             filters = _find_guardrail_intervention_metric_filters(
                 log_group_name, region
@@ -16942,6 +16947,11 @@ def _guardrail_intervention_signal_finding(
         )
 
     gaps = list(alarm_gaps)
+    if alarmed_filters and text_delivery is False:
+        gaps.append(
+            f"invocation logging sets textDataDeliveryEnabled false, so the log carries no output body and no intervention for metric filter(s) {', '.join(sorted(alarmed_filters))} to match"
+        )
+        alarmed_filters = []
     if silent_alarms:
         gaps.append(
             f"alarm(s) {', '.join(silent_alarms)} on {GUARDRAIL_INTERVENTION_METRIC} reach no action"
@@ -16977,6 +16987,13 @@ def _guardrail_intervention_signal_finding(
 
     resolution = "Send model invocation logs to CloudWatch Logs, add a metric filter on amazon-bedrock-guardrailAction=INTERVENED (Converse: stopReason=guardrail_intervened), and alarm on the metric it emits with an enabled alarm action. Where ApplyGuardrail is called, alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace for each GuardrailArn and GuardrailVersion callers name. Forward the invocation logs to the SIEM."
 
+    if alarmed_filters and text_delivery is None and apply_guardrail_called is not True:
+        return row(
+            f"{scope_text} Guardrail interventions would reach an acting alarm through {' and '.join(observed)}, but GetModelInvocationLoggingConfiguration did not return textDataDeliveryEnabled, so whether the log carries the output body that metric filter(s) {', '.join(sorted(alarmed_filters))} match was not read, and this is not reported as Passed.{gap_text}{forwarding}",
+            "Set textDataDeliveryEnabled to true in the model invocation logging configuration and retry.",
+            "Informational",
+            "N/A",
+        )
     if alarmed_filters and apply_guardrail_called is False:
         return row(
             f"{scope_text} Guardrail interventions reach an acting alarm through {' and '.join(observed)}.{gap_text}{forwarding}",

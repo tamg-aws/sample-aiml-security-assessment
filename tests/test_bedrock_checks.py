@@ -18313,7 +18313,8 @@ class TestBR32CloudWatchAlarms:
                 "cloudWatchConfig": {
                     "logGroupName": "/aws/bedrock/invocations",
                     "roleArn": "arn:aws:iam::123456789012:role/BedrockLogs",
-                }
+                },
+                "textDataDeliveryEnabled": True,
             },
             metric_filters=[
                 {
@@ -18470,7 +18471,8 @@ INVOCATION_LOGGING = {
     "cloudWatchConfig": {
         "logGroupName": "/aws/bedrock/invocations",
         "roleArn": "arn:aws:iam::123456789012:role/BedrockLogs",
-    }
+    },
+    "textDataDeliveryEnabled": True,
 }
 
 
@@ -18796,6 +18798,49 @@ class TestBR32ActingIntervention:
         )
         assert signal["Status"] == "Passed"
         assert "Wide (alarm intervened-spike)" in signal["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "text_delivery, status, text",
+        [
+            (
+                False,
+                "Failed",
+                "invocation logging sets textDataDeliveryEnabled false, so the "
+                "log carries no output body and no intervention for metric "
+                "filter(s) Wide (alarm intervened-spike) to match",
+            ),
+            (
+                None,
+                "N/A",
+                "GetModelInvocationLoggingConfiguration did not return "
+                "textDataDeliveryEnabled, so whether the log carries the output "
+                "body that metric filter(s) Wide (alarm intervened-spike) match "
+                "was not read",
+            ),
+            (True, "Passed", "Wide (alarm intervened-spike)"),
+        ],
+    )
+    def test_a_filter_is_credited_only_when_text_output_is_logged(
+        self, text_delivery, status, text
+    ):
+        config = {
+            key: value
+            for key, value in INVOCATION_LOGGING.items()
+            if key != "textDataDeliveryEnabled"
+        }
+        if text_delivery is not None:
+            config["textDataDeliveryEnabled"] = text_delivery
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "Wide", '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" }'
+                )
+            ],
+            logging_config=config,
+        )
+        assert signal["Status"] == status
+        assert text in signal["Finding_Details"]
 
     def test_one_alarmed_filter_among_unalarmed_ones_passes(self):
         _, signal = self._run(
