@@ -3373,6 +3373,70 @@ def _condition_pins_value(
     return False
 
 
+def _pass_role_statement_excludes_agentcore(statement: Dict[str, Any]) -> bool:
+    """Return whether a PassRole statement's condition cannot hold for AgentCore.
+
+    Each condition entry is ANDed, so one iam:PassedToService entry that the
+    AgentCore service principal fails (StringEquals naming lambda.amazonaws.com
+    only, StringNotEquals naming AgentCore) keeps the statement from passing any
+    role to AgentCore. The key is always in a PassRole request and holds one
+    value, so IfExists and the set prefixes read as the plain operator.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return False
+    for operator, entries in condition.items():
+        if not isinstance(entries, dict):
+            continue
+        name = _normalized_condition_operator(operator)
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != IAM_PASSED_TO_SERVICE_CONDITION_KEY:
+                continue
+            matched = any(
+                _condition_string_matches(
+                    value,
+                    AGENTCORE_SERVICE_PRINCIPAL,
+                    like=name in ("stringlike", "stringnotlike"),
+                    ignore_case=name.endswith("ignorecase"),
+                )
+                for value in _condition_values(raw)
+            )
+            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS and not matched:
+                return True
+            if name in SCP_DENY_VALUE_EXCLUDES_OPERATORS and matched:
+                return True
+    return False
+
+
+def _pass_role_pattern_other_roles(
+    resource: str, role_names: Iterable[str], own_role_names: Iterable[str]
+) -> Optional[List[str]]:
+    """Return the cached roles outside `own_role_names` a PassRole pattern reaches.
+
+    None means the pattern cannot be bounded by role name: the cache keys roles
+    by name and holds no path, so a pattern with a path after `role/`, one whose
+    name part starts with a wildcard and so reaches every name, and one that
+    does not name a 12-digit account are all read as reaching other roles.
+    """
+    parts = str(resource).split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn" or parts[2] != "iam":
+        return None
+    if not (parts[4].isdigit() and len(parts[4]) == 12):
+        return None
+    if not parts[5].startswith("role/"):
+        return None
+    name_pattern = parts[5][len("role/") :]
+    if not name_pattern or name_pattern[0] in "*?" or "/" in name_pattern:
+        return None
+    own = set(own_role_names)
+    return sorted(
+        name
+        for name in role_names
+        if name not in own
+        and _condition_string_matches(name_pattern, name, like=True, ignore_case=False)
+    )
+
+
 def _payment_duty_collisions(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
@@ -3407,6 +3471,8 @@ def _writer_pass_role_gaps(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
     write_actions: Tuple[str, ...],
+    role_names: Optional[Iterable[str]] = None,
+    own_role_names: Iterable[str] = (),
 ) -> List[str]:
     """Return each writer of an AgentCore resource whose iam:PassRole is not scoped.
 
@@ -3417,10 +3483,15 @@ def _writer_pass_role_gaps(
     hand any role it reaches to that resource, or hand the role to another
     service. A Resource with a wildcard anywhere, such as `role/payments-*`,
     names a set of roles and not the one role the resource needs, so it is a
-    gap too. Whether the literal ARN is the resource's own role is not compared
-    here: the cache carries no resource. iam:PassedToService is always in a
-    PassRole request, so its IfExists form is read as the plain one.
+    gap too, unless `role_names` is given: then a role-name pattern is a gap
+    only when it reaches a cached role outside `own_role_names`, or cannot be
+    bounded by name. Whether the literal ARN is the resource's own role is not
+    compared here: the cache carries no resource. A statement whose
+    iam:PassedToService condition excludes AgentCore cannot pass it a role and
+    is skipped. iam:PassedToService is always in a PassRole request, so its
+    IfExists form is read as the plain one.
     """
+    names = list(role_names) if role_names is not None else None
     labels: List[str] = []
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
@@ -3444,14 +3515,28 @@ def _writer_pass_role_gaps(
             for statement in statements:
                 if not _statement_matches_action(statement, IAM_PASS_ROLE_ACTION):
                     continue
+                if _pass_role_statement_excludes_agentcore(statement):
+                    continue
                 if _statement_resource_is_unbounded(statement):
                     missing.add(PAYMENT_PASS_ROLE_WIDE_RESOURCE_LEG)
-                elif any(
-                    wildcard in str(resource)
-                    for resource in _statement_resources(statement)
-                    for wildcard in ("*", "?")
-                ):
-                    missing.add(PAYMENT_PASS_ROLE_PATTERN_LEG)
+                else:
+                    for resource in _statement_resources(statement):
+                        if "*" not in str(resource) and "?" not in str(resource):
+                            continue
+                        others = (
+                            None
+                            if names is None
+                            else _pass_role_pattern_other_roles(
+                                resource, names, own_role_names
+                            )
+                        )
+                        if others is None:
+                            missing.add(PAYMENT_PASS_ROLE_PATTERN_LEG)
+                        elif others:
+                            missing.add(
+                                f"its Resource {resource} also reaches "
+                                + ", ".join(f"role {name}" for name in others)
+                            )
                 if not _condition_pins_value(
                     statement,
                     IAM_PASSED_TO_SERVICE_CONDITION_KEY,
@@ -22198,6 +22283,7 @@ def _evaluation_pass_role_grants(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
     role_arns: List[str],
+    role_names: Optional[Iterable[str]] = None,
 ) -> Tuple[List[Tuple[str, List[str]]], int]:
     """Return every principal that can pass an evaluation execution role.
 
@@ -22211,9 +22297,16 @@ def _evaluation_pass_role_grants(
     principal's own unconditioned Deny or permissions boundary removes does not
     count, and a NotResource reaches every role it does not list. The condition
     leg holds only when iam:PassedToService names the AgentCore service
-    principal and nothing else. The second value names each principal with a
-    policy that could not be parsed.
+    principal and nothing else: a statement that passes an evaluation role to
+    another service is a gap here, even though it cannot reach AgentCore. With
+    `role_names`, a role-name pattern such as the
+    recommendation's `role/AgentCoreEvaluationRole*` is wide only when it
+    reaches a cached role that is not one of `role_arns`, or cannot be bounded
+    by name. The second value names each principal with a policy that could not
+    be parsed.
     """
+    names = list(role_names) if role_names is not None else None
+    own_names = [arn.rsplit("/", 1)[-1] for arn in role_arns]
     grants: List[Tuple[str, List[str]]] = []
     unreadable: List[str] = []
 
@@ -22260,8 +22353,22 @@ def _evaluation_pass_role_grants(
                     continue
 
                 missing: List[str] = []
-                if any("*" in resource or "?" in resource for resource in reaching):
-                    missing.append(PASS_ROLE_WIDE_RESOURCE_LEG)
+                for resource in reaching:
+                    if "*" not in resource and "?" not in resource:
+                        continue
+                    others = (
+                        None
+                        if names is None
+                        else _pass_role_pattern_other_roles(resource, names, own_names)
+                    )
+                    if others is None:
+                        if PASS_ROLE_WIDE_RESOURCE_LEG not in missing:
+                            missing.append(PASS_ROLE_WIDE_RESOURCE_LEG)
+                    elif others:
+                        missing.append(
+                            f"its Resource {resource} also reaches "
+                            + ", ".join(f"role {name}" for name in others)
+                        )
                 if not _condition_pins_value(
                     statement,
                     IAM_PASSED_TO_SERVICE_CONDITION_KEY,
@@ -22346,13 +22453,29 @@ def check_agentcore_evaluation_pass_role_scope(
     )
     findings.extend(gap_rows)
 
+    role_arns = sorted(
+        {
+            str(detail.get("evaluationExecutionRoleArn"))
+            for _, detail in details
+            if detail.get("evaluationExecutionRoleArn")
+        }
+    )
+    own_role_names = [arn.rsplit("/", 1)[-1] for arn in role_arns]
     writer_gaps = (
         [
             *_writer_pass_role_gaps(
-                role_permissions, "role", EVALUATION_CONFIG_WRITE_ACTIONS
+                role_permissions,
+                "role",
+                EVALUATION_CONFIG_WRITE_ACTIONS,
+                role_names=role_permissions,
+                own_role_names=own_role_names,
             ),
             *_writer_pass_role_gaps(
-                user_permissions, "user", EVALUATION_CONFIG_WRITE_ACTIONS
+                user_permissions,
+                "user",
+                EVALUATION_CONFIG_WRITE_ACTIONS,
+                role_names=role_permissions,
+                own_role_names=own_role_names,
             ),
         ]
         if assess_writers
@@ -22365,14 +22488,17 @@ def check_agentcore_evaluation_pass_role_scope(
                 finding_name="AgentCore Evaluation Writer Pass Role Unbounded",
                 finding_details=(
                     "The following principals can create or update an online "
-                    "evaluation configuration and hold an iam:PassRole grant that "
-                    "would let them name any role it matches as its execution "
-                    "role, whether or not a configuration exists today: "
+                    "evaluation configuration and hold an iam:PassRole grant whose "
+                    "condition does not exclude AgentCore and that misses the guard "
+                    "named beside it, whether or not a configuration exists today; "
+                    "a role reached by name is compared with the execution roles "
+                    "online evaluation configurations in this region name: "
                     f"{'; '.join(sorted(writer_gaps))}. {IAM_CACHE_SCP_NOTE}"
                 ),
                 resolution=(
-                    "Scope iam:PassRole to the evaluation execution role's own ARN "
-                    "and add an iam:PassedToService condition naming "
+                    "Scope iam:PassRole to the evaluation execution role's own ARN, "
+                    "or to a role-name pattern that reaches no other role, and add "
+                    "an iam:PassedToService condition naming "
                     f"{AGENTCORE_SERVICE_PRINCIPAL}."
                 ),
                 reference=IAM_PASS_ROLE_REFERENCE_URL,
@@ -22382,13 +22508,6 @@ def check_agentcore_evaluation_pass_role_scope(
             )
         )
 
-    role_arns = sorted(
-        {
-            str(detail.get("evaluationExecutionRoleArn"))
-            for _, detail in details
-            if detail.get("evaluationExecutionRoleArn")
-        }
-    )
     if not role_arns:
         findings.append(
             create_finding(
@@ -22430,10 +22549,10 @@ def check_agentcore_evaluation_pass_role_scope(
         return findings
 
     role_grants, role_unreadable = _evaluation_pass_role_grants(
-        role_permissions, "role", role_arns
+        role_permissions, "role", role_arns, role_names=role_permissions
     )
     user_grants, user_unreadable = _evaluation_pass_role_grants(
-        user_permissions, "user", role_arns
+        user_permissions, "user", role_arns, role_names=role_permissions
     )
     grants = sorted(role_grants + user_grants)
     unbounded = [(label, missing) for label, missing in grants if missing]
@@ -22474,7 +22593,8 @@ def check_agentcore_evaluation_pass_role_scope(
                 finding_name="AgentCore Evaluation Pass Role Scope",
                 finding_details=(
                     "The following principals can pass an evaluation execution role "
-                    f"({named_roles}) only by its own ARN and only to "
+                    f"({named_roles}) only by its own ARN, or by a role-name "
+                    "pattern that reaches no other cached role, and only to "
                     f"{AGENTCORE_SERVICE_PRINCIPAL}: {', '.join(bounded)}."
                 ),
                 resolution="No action required.",

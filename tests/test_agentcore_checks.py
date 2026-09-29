@@ -31712,6 +31712,9 @@ class TestAC42WholePopulation:
                 "scoped-writer": _principal_with(
                     [self._WRITE, self._pass(resource=_EVALUATION_ROLE_ARN)]
                 ),
+                # The pattern is judged by the cached roles it reaches, so the
+                # role it reaches beside the execution role is what fails it.
+                "eval-admin": _principal_with([]),
             }
         )
 
@@ -31726,7 +31729,8 @@ class TestAC42WholePopulation:
         ]
         assert [f["Status"] for f in writer_rows] == ["Failed"]
         assert (
-            "role pattern-writer, where its Resource names roles"
+            "role pattern-writer, where its Resource "
+            "arn:aws:iam::123456789012:role/eval-* also reaches role eval-admin"
             in (writer_rows[0]["Finding_Details"])
         )
         assert "scoped-writer" not in writer_rows[0]["Finding_Details"]
@@ -31753,6 +31757,292 @@ class TestAC42WholePopulation:
         assert len(calls) == 1
         keywords = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
         assert keywords == {"assess_writers": "is_primary_region"}
+
+
+class TestAC42PassRoleReachAndPattern:
+    """AC-42 skips a PassRole that cannot reach AgentCore, and judges a role-name
+    pattern by the cached roles it reaches."""
+
+    _WRITE = TestAC42WholePopulation._WRITE
+    _pass = staticmethod(TestAC42WholePopulation._pass)
+    _PATTERN = "arn:aws:iam::123456789012:role/EvaluationRole*"
+
+    @staticmethod
+    def _writer_rows(findings):
+        return [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Evaluation Writer Pass Role Unbounded"
+        ]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}},
+            {"StringEqualsIfExists": {"iam:PassedToService": "lambda.amazonaws.com"}},
+            {"StringLike": {"iam:PassedToService": "lambda.*"}},
+            {"ForAllValues:StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}},
+            {
+                "StringNotEquals": {
+                    "iam:PassedToService": "bedrock-agentcore.amazonaws.com"
+                }
+            },
+            {"StringNotLike": {"iam:PassedToService": "bedrock-*"}},
+        ],
+        ids=["equals", "if-exists", "like", "for-all", "not-equals", "not-like"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_writer_whose_pass_role_cannot_reach_agentcore_is_not_reported(
+        self, mock_ac, condition
+    ):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "lambda-writer": _principal_with(
+                    [
+                        self._WRITE,
+                        self._pass(
+                            resource="arn:aws:iam::123456789012:role/Unrelated",
+                            condition=condition,
+                        ),
+                    ]
+                ),
+                "open-writer": _principal_with(
+                    [self._WRITE, self._pass(resource="*", condition=None)]
+                ),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=True
+        )
+
+        rows = self._writer_rows(findings)
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "role open-writer" in rows[0]["Finding_Details"]
+        assert "lambda-writer" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {
+                "StringEquals": {
+                    "iam:PassedToService": [
+                        "lambda.amazonaws.com",
+                        "bedrock-agentcore.amazonaws.com",
+                    ]
+                }
+            },
+            {"StringLike": {"iam:PassedToService": "bedrock-*"}},
+            {"StringNotEquals": {"iam:PassedToService": "ec2.amazonaws.com"}},
+            None,
+        ],
+        ids=["two-services", "like-agentcore", "not-another", "none"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_writer_whose_pass_role_can_reach_agentcore_is_still_reported(
+        self, mock_ac, condition
+    ):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "writer": _principal_with(
+                    [
+                        self._WRITE,
+                        self._pass(
+                            resource="arn:aws:iam::123456789012:role/Unrelated",
+                            condition=condition,
+                        ),
+                    ]
+                )
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=True
+        )
+
+        rows = self._writer_rows(findings)
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "role writer, where it does not pin" in rows[0]["Finding_Details"]
+
+    def test_a_payment_writer_whose_pass_role_names_lambda_is_not_reported(self):
+        lambda_only = {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}
+        write = {
+            "Effect": "Allow",
+            "Action": "bedrock-agentcore:CreatePaymentManager",
+            "Resource": "*",
+        }
+        permissions = {
+            "lambda-writer": _principal_with(
+                [write, self._pass(resource="*", condition=lambda_only)]
+            ),
+            "open-writer": _principal_with([write, self._pass(resource="*")]),
+        }
+
+        gaps = agentcore_app._writer_pass_role_gaps(
+            permissions, "role", agentcore_app.PAYMENT_MANAGER_WRITE_ACTIONS
+        )
+
+        assert gaps == [
+            "role open-writer, where its Resource reaches every role",
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_writer_row_does_not_claim_any_role_can_be_named(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "writer": _principal_with(
+                    [
+                        self._WRITE,
+                        self._pass(resource=_EVALUATION_ROLE_ARN, condition=None),
+                    ]
+                )
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=True
+        )
+
+        details = self._writer_rows(findings)[0]["Finding_Details"]
+        assert "would let them name any role" not in details
+        assert "misses the guard named beside it" in details
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_recommended_role_name_pattern_passes(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "EvaluationDeployer": _principal_with(
+                    [self._WRITE, self._pass(resource=self._PATTERN)]
+                ),
+                "EvaluationRole": _principal_with([]),
+                "Admin": _principal_with([]),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=True
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "role EvaluationDeployer" in findings[0]["Finding_Details"]
+        assert "reaches no other cached role" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pattern_reaching_a_second_configured_role_passes(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluationExecutionRoleArn=(
+                        "arn:aws:iam::123456789012:role/EvaluationRole2"
+                    ),
+                ),
+            ],
+        )
+        cache = _v2_cache(
+            roles={
+                "Deployer": _principal_with([self._pass(resource=self._PATTERN)]),
+                "EvaluationRole": _principal_with([]),
+                "EvaluationRole2": _principal_with([]),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize("assess_writers", [True, False], ids=["writer", "grant"])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pattern_reaching_another_cached_role_fails_and_names_it(
+        self, mock_ac, assess_writers
+    ):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "Deployer": _principal_with(
+                    [self._WRITE, self._pass(resource=self._PATTERN)]
+                ),
+                "EvaluationRole": _principal_with([]),
+                "EvaluationRoleAdmin": _principal_with([]),
+                "Admin": _principal_with([]),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=assess_writers
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        expected = 2 if assess_writers else 1
+        assert len(failed) == expected
+        for finding in failed:
+            assert (
+                f"its Resource {self._PATTERN} also reaches role EvaluationRoleAdmin"
+                in finding["Finding_Details"]
+            )
+            assert "role Admin" not in finding["Finding_Details"]
+            assert ", role EvaluationRole " not in finding["Finding_Details"]
+        assert "Passed" not in [f["Status"] for f in findings]
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:iam::123456789012:role/*Role",
+            "arn:aws:iam::123456789012:role/?valuationRole",
+            "arn:aws:iam::123456789012:role/team/EvaluationRole*",
+            "arn:aws:iam::*:role/EvaluationRole*",
+            "arn:aws:iam::123456789012:*",
+        ],
+        ids=["leading-star", "leading-question", "path", "any-account", "no-role"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pattern_the_cache_cannot_bound_by_name_stays_wide(
+        self, mock_ac, resource
+    ):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluationExecutionRoleArn=(
+                        "arn:aws:iam::123456789012:role/EvaluationRole"
+                    )
+                ),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluationExecutionRoleArn=(
+                        "arn:aws:iam::123456789012:role/team/EvaluationRole"
+                    ),
+                ),
+            ],
+        )
+        cache = _v2_cache(
+            roles={
+                "Deployer": _principal_with(
+                    [self._WRITE, self._pass(resource=resource)]
+                ),
+                "EvaluationRole": _principal_with([]),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=True
+        )
+
+        statuses = [f["Status"] for f in findings]
+        assert statuses == ["Failed", "Failed"]
+        assert "also reaches other roles" in findings[1]["Finding_Details"]
+        assert any(
+            leg in findings[0]["Finding_Details"]
+            for leg in ("names roles by a wildcard pattern", "reaches every role")
+        )
 
 
 class TestAC44WholePopulation:
