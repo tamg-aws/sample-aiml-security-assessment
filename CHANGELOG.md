@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `AR-10` credited a rule filtered on `region`, `time`, `id` or any other
+  top-level field beyond `source`, `detail-type`, `detail`, `resources` and
+  `account` as routing every approval transition. Every such field now
+  narrows the rule, which is reported `N/A` and not credited. An `account` or
+  `region` filter that matches the rule's own account or Region, read from
+  the rule ARN, no longer narrows, because every Registry event the check
+  judges carries those values.
 - `BR-10` counts a guardrail direction only from a content filter with
   strength `LOW`, `MEDIUM` or `HIGH` and action `BLOCK`, where any configured
   element used to count. An identity that names no guardrail passes when a

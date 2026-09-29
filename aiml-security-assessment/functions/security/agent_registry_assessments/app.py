@@ -2015,9 +2015,30 @@ def _classify_event_pattern(rule: Dict[str, Any]) -> Dict[str, Any]:
         if detail_types is None
         else set(detail_types),
         "narrowed_by": sorted(
-            field for field in ("detail", "resources", "account") if field in pattern
+            field
+            for field in pattern
+            if field not in ("source", "detail-type")
+            and not _matches_own_scope(pattern, field, rule)
         ),
     }
+
+
+def _matches_own_scope(
+    pattern: Dict[str, Any], field: str, rule: Dict[str, Any]
+) -> bool:
+    """Whether an `account` or `region` filter matches the rule's own account or
+    Region, which every Registry event this check judges carries.
+
+    Any other field, and an own value that no element decidedly matches, narrows.
+    """
+    rule_parts = str(rule.get("Arn", "")).split(":", 5)
+    if len(rule_parts) != 6:
+        return False
+    own = {"region": rule_parts[3], "account": rule_parts[4]}.get(field)
+    if not own:
+        return False
+    matched, _ = _event_pattern_reach(pattern, field, (own,))
+    return own in matched
 
 
 def _event_bus_target(
@@ -2324,7 +2345,7 @@ def _forwarded_routing(
                 _na(
                     "AR-10",
                     f"{finding} Incomplete" if target_error else finding,
-                    "EventBridge rule '{}' forwards Registry lifecycle events to event bus '{}', where rule(s) {} match them but could not be assessed, because a pattern or target list could not be read or the pattern also filters on detail, resources or account.".format(
+                    "EventBridge rule '{}' forwards Registry lifecycle events to event bus '{}', where rule(s) {} match them but could not be assessed, because a pattern or target list could not be read or the pattern also filters on a field beyond source and detail-type.".format(
                         name,
                         bus["name"],
                         ", ".join(f"'{hop_name}'" for hop_name in undecided),
@@ -2465,7 +2486,7 @@ def check_agent_registry_lifecycle_event_routing(
                         scope,
                     ),
                     EVENT_ROUTING_REFERENCE_URL,
-                    "Confirm the filter passes every approval event you need reviewed, or add a rule matching the approval detail types with no detail, resources or account filter.",
+                    "Confirm the filter passes every approval event you need reviewed, or add a rule matching the approval detail types that filters on no field beyond source and detail-type.",
                 )
             )
             continue
@@ -2516,7 +2537,7 @@ def check_agent_registry_lifecycle_event_routing(
             else f"The {matching} rule(s) on the {REGISTRY_EVENT_BUS_NAME} event bus that match Registry lifecycle events route none of them to a target, so no lifecycle state change of {scope} is observed."
         )
         if narrowed_rules:
-            details += f" {narrowed_rules} of them filter on detail, resources or account and are reported separately, because they route only the events that match the filter."
+            details += f" {narrowed_rules} of them filter on a field beyond source and detail-type and are reported separately, because they route only the events that match the filter."
         findings.append(
             create_finding(
                 "AR-10",

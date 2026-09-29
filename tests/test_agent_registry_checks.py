@@ -1610,13 +1610,18 @@ def test_ar10_preview_source_rule_naming_an_approval_type_is_still_stale():
         {"detail": {"registryId": ["reg-one"]}},
         {"resources": ["arn:aws:bedrock-agentcore:us-east-1:123456789012:registry/r1"]},
         {"account": ["111122223333"]},
+        {"region": ["eu-west-1"]},
+        {"region": [{"prefix": "eu-"}]},
+        {"time": [{"prefix": "2026-"}]},
+        {"id": ["00000000-0000-0000-0000-000000000000"]},
     ],
 )
 def test_ar10_a_rule_narrowed_beyond_source_and_detail_type_is_not_full_coverage(
     narrowing,
 ):
-    # A detail, resources or account filter passes only the matching events,
-    # so the rule cannot be credited with every approval transition.
+    # Any field beyond source and detail-type passes only the matching events,
+    # so the rule cannot be credited with every approval transition unless the
+    # field provably matches every event of the rule's own account and Region.
     pattern = _approval_pattern()
     pattern.update(narrowing)
     field = next(iter(narrowing))
@@ -1628,6 +1633,30 @@ def test_ar10_a_rule_narrowed_beyond_source_and_detail_type_is_not_full_coverage
     assert "filtered-approvals" in findings[0]["Finding_Details"]
     assert f"'{field}'" in findings[0]["Finding_Details"]
     assert "route none of them to a target" in findings[1]["Finding_Details"]
+
+
+@pytest.mark.parametrize(
+    "own_scope",
+    [
+        {"region": ["us-east-1"]},
+        {"region": ["eu-west-1", "us-east-1"]},
+        {"account": ["123456789012"]},
+        {"account": [{"prefix": "1234"}], "region": [{"prefix": "us-"}]},
+    ],
+    ids=["own-region", "own-region-in-list", "own-account", "own-both-by-prefix"],
+)
+def test_ar10_a_field_matching_the_rules_own_account_and_region_does_not_narrow(
+    own_scope,
+):
+    # The rule's ARN names us-east-1 and 123456789012, and every Registry event
+    # of that account and Region carries those values, so these filters drop
+    # none of the events the check judges.
+    pattern = _approval_pattern()
+    pattern.update(own_scope)
+    findings, _ = _routing_findings(
+        [_rule("own-scope", pattern)], targets={"own-scope": 1}
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
 
 
 def test_ar10_rule_listing_both_sources_counts_as_ga_coverage():
