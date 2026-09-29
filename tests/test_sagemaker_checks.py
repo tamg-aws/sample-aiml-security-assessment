@@ -2415,6 +2415,48 @@ class TestSM23DriftDetection:
             assert_finding_schema(f)
 
 
+class TestSM23NoEndpointToJudge:
+    """EP-06: a Region with no InService endpoint has nothing drift can pass on."""
+
+    @staticmethod
+    def _rows(endpoints):
+        sm = _pages_client(
+            {
+                "list_endpoints": [{"Endpoints": endpoints}],
+                "list_monitoring_schedules": [{"MonitoringScheduleSummaries": []}],
+            }
+        )
+        with patch("sagemaker_app.boto3.client", return_value=sm):
+            return extract_csv_data(
+                sagemaker_app.check_model_drift_detection(region="us-east-1")
+            )
+
+    @pytest.mark.parametrize(
+        "endpoints",
+        [
+            [],
+            [
+                {"EndpointName": "a", "EndpointStatus": "Creating"},
+                {"EndpointName": "b", "EndpointStatus": "Failed"},
+            ],
+        ],
+    )
+    def test_no_in_service_endpoint_is_na(self, endpoints):
+        rows = self._rows(endpoints)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "No InService endpoints" in rows[0]["Finding_Details"]
+
+    def test_an_in_service_endpoint_without_a_schedule_fails(self):
+        rows = self._rows(
+            [
+                {"EndpointName": "a", "EndpointStatus": "Creating"},
+                {"EndpointName": "live", "EndpointStatus": "InService"},
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'live'" in rows[0]["Finding_Details"]
+
+
 # ===================================================================
 # SM-24: check_ab_testing_shadow_deployment
 # ===================================================================

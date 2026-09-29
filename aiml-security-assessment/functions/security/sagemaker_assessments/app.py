@@ -8838,8 +8838,8 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
                         finding_details="No InService endpoints found to monitor.",
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor.html",
-                        severity="Medium",
-                        status="Passed",
+                        severity="Informational",
+                        status="N/A",
                         region=region,
                     )
                 )

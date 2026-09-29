@@ -261,6 +261,9 @@ section.
 
 ### Fixed
 
+- `SM-23` reports a Region with no InService endpoint as `N/A`, where it used
+  to pass with no endpoint to judge.
+
 - `SM-14` names a model whose `DescribeModel` call failed, or a failed
   `ListModels`, in an `N/A` Incomplete row and withholds `Passed`. Such a
   model used to be logged and dropped, so the rest could pass, and a failed
