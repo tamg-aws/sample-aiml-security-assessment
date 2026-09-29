@@ -23371,6 +23371,31 @@ class TestAC01EgressFiltering:
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
+    def test_a_sandbox_failure_names_the_control_default_and_the_config_rule(
+        self, mock_ac, mock_ec2
+    ):
+        # RT-08 names SANDBOX the production default for non-regulated data, so
+        # a Failed row on it has to say why it still fails: no allow-list, and
+        # the AWS managed Config rule is NON_COMPLIANT for SANDBOX too.
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(network_mode="SANDBOX", security_groups=None)
+            ],
+        )
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert [(f["Status"], f["Severity"]) for f in egress] == [("Failed", "Medium")]
+        details = egress[0]["Finding_Details"]
+        assert "production default for non-regulated data" in details
+        assert "no explicit allow-list" in details
+        assert "bedrockagentcore-codeinterpreter-networkmode-check" in details
+        assert "NON_COMPLIANT for PUBLIC or SANDBOX" in details
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
     def test_a_browsers_outbound_rules_are_judged_too(self, mock_ac, mock_ec2):
         _wire_runtimes(mock_ac, [])
         _wire_tools(mock_ac, browsers=[_browser(security_groups=["sg-browser"])])

@@ -2260,7 +2260,12 @@ def _agentcore_egress_findings(
                         f"{label} runs in SANDBOX network mode, which the devguide "
                         "describes as limited external network access and which "
                         "attaches no customer security group, so no outbound rule "
-                        "of this account names the destinations it reaches."
+                        "of this account names the destinations it reaches. The "
+                        "RT-08 control text calls SANDBOX the production default "
+                        "for non-regulated data, but this row fails it because "
+                        "SANDBOX has no explicit allow-list, and the AWS managed "
+                        "Config rule bedrockagentcore-codeinterpreter-networkmode-"
+                        "check is NON_COMPLIANT for PUBLIC or SANDBOX."
                     ),
                     resolution=(
                         "Move the tool to VPC network mode and attach security "
