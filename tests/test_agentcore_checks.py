@@ -8118,6 +8118,206 @@ class TestAC19TracesAndRuntimes:
         assert not [f for f in findings if f["Status"] == "Passed"]
 
 
+class TestAC19ToolsAndIdentity:
+    """AC-19: custom built-in tools need application logs, identity needs traces."""
+
+    _CI = f"{_AC19_ARN}:code-interpreter-custom/ci-1"
+    _CI2 = f"{_AC19_ARN}:code-interpreter-custom/ci-2"
+    _BROWSER = f"{_AC19_ARN}:browser-custom/br-1"
+    _OAUTH = f"{_AC19_ARN}:token-vault/default/oauth2credentialprovider/github"
+    _APIKEY = f"{_AC19_ARN}:token-vault/default/apikeycredentialprovider/search"
+    _WORKLOAD = (
+        f"{_AC19_ARN}:workload-identity-directory/default/workload-identity/agent-a"
+    )
+
+    _row = staticmethod(TestAC19TracesAndRuntimes._row)
+
+    @staticmethod
+    def _tools(mock_ac, interpreters=(), browsers=()):
+        mock_ac.list_code_interpreters.return_value = {
+            "codeInterpreterSummaries": [
+                {"codeInterpreterId": arn.rsplit("/", 1)[1], "codeInterpreterArn": arn}
+                for arn in interpreters
+            ]
+        }
+        mock_ac.list_browsers.return_value = {
+            "browserSummaries": [
+                {"browserId": arn.rsplit("/", 1)[1], "browserArn": arn}
+                for arn in browsers
+            ]
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_code_interpreter_without_application_logs_fails_beside_one_with_them(
+        self, mock_logs, mock_ac
+    ):
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("ci1-logs", self._CI, "APPLICATION_LOGS"),
+                _delivery_source("ci2-logs", self._CI2, "APPLICATION_LOGS"),
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered("ci1-logs")
+        _empty_agentcore_inventory(mock_ac)
+        self._tools(mock_ac, interpreters=(self._CI, self._CI2))
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        assert self._row(findings, "(ci-1)")["Status"] == "Passed"
+        bad = self._row(findings, "(ci-2)")
+        assert bad["Status"] == "Failed"
+        assert bad["Finding_Details"].startswith("Code interpreter 'ci-2' (ci-2)")
+        assert "no delivery to a destination" in bad["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_tool_needs_no_traces_delivery(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("br-logs", self._BROWSER, "APPLICATION_LOGS")
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered("br-logs")
+        _empty_agentcore_inventory(mock_ac)
+        self._tools(mock_ac, browsers=(self._BROWSER,))
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        row = self._row(findings, "Browser 'br-1' (br-1)")
+        assert row["Status"] == "Passed"
+        assert (
+            "application logs through delivery source br-logs"
+            in (row["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_tool_with_no_source_fails(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {"deliverySources": []}
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+        self._tools(mock_ac, browsers=(self._BROWSER,))
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        row = self._row(findings, "Browser 'br-1' (br-1)")
+        assert row["Status"] == "Failed"
+        assert (
+            "no bedrock-agentcore APPLICATION_LOGS delivery source"
+            in (row["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_only_custom_tools_are_listed(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {"deliverySources": []}
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+
+        agentcore_app.check_agentcore_log_delivery_configuration()
+
+        assert mock_ac.list_code_interpreters.call_args.kwargs == {"type": "CUSTOM"}
+        assert mock_ac.list_browsers.call_args.kwargs == {"type": "CUSTOM"}
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_each_identity_resource_is_judged_on_traces(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("gh-traces", self._OAUTH, "TRACES"),
+                _delivery_source("search-logs", self._APIKEY, "APPLICATION_LOGS"),
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered(
+            "gh-traces", "search-logs"
+        )
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_oauth2_credential_providers.return_value = {
+            "credentialProviders": [
+                {"name": "github", "credentialProviderArn": self._OAUTH}
+            ]
+        }
+        mock_ac.list_api_key_credential_providers.return_value = {
+            "credentialProviders": [
+                {"name": "search", "credentialProviderArn": self._APIKEY}
+            ]
+        }
+        mock_ac.list_workload_identities.return_value = {
+            "workloadIdentities": [
+                {"name": "agent-a", "workloadIdentityArn": self._WORKLOAD}
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        oauth = self._row(findings, "OAuth2 credential provider 'github'")
+        assert oauth["Status"] == "Passed"
+        assert "traces through delivery source gh-traces" in oauth["Finding_Details"]
+        # An application-logs source does not stand in for the traces one.
+        apikey = self._row(findings, "API key credential provider 'search'")
+        assert apikey["Status"] == "Failed"
+        assert (
+            "no bedrock-agentcore TRACES delivery source" in (apikey["Finding_Details"])
+        )
+        workload = self._row(findings, "Workload identity 'agent-a'")
+        assert workload["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_unlistable_family_is_na_beside_the_others(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("ci1-logs", self._CI, "APPLICATION_LOGS")
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered("ci1-logs")
+        _empty_agentcore_inventory(mock_ac)
+        self._tools(mock_ac, interpreters=(self._CI,))
+        mock_ac.list_browsers.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        mock_ac.list_workload_identities.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        assert self._row(findings, "(ci-1)")["Status"] == "Passed"
+        browsers = self._row(findings, "Browsers could not be listed")
+        assert browsers["Status"] == "N/A"
+        assert "bedrock-agentcore:ListBrowsers" in browsers["Resolution"]
+        workloads = self._row(findings, "Workload identities could not be listed")
+        assert workloads["Status"] == "N/A"
+        assert "bedrock-agentcore:ListWorkloadIdentities" in workloads["Resolution"]
+
+    @patch("agentcore_app.xray_client")
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_identity_resource_alone_reads_transaction_search(
+        self, mock_logs, mock_ac, mock_xray
+    ):
+        mock_logs.describe_delivery_sources.return_value = {"deliverySources": []}
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_oauth2_credential_providers.return_value = {
+            "credentialProviders": [
+                {"name": "github", "credentialProviderArn": self._OAUTH}
+            ]
+        }
+        mock_xray.get_trace_segment_destination.return_value = {
+            "Destination": "XRay",
+            "Status": "ACTIVE",
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        search = [f for f in findings if f["Finding"] == "AgentCore Transaction Search"]
+        assert [f["Status"] for f in search] == ["Failed"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+
 # ===================================================================
 # AC-20: check_agentcore_log_group_data_protection
 # ===================================================================

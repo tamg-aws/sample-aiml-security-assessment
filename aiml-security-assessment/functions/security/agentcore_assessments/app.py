@@ -787,6 +787,71 @@ AGENTCORE_RESOURCE_DELIVERY_TYPES = (
     AGENTCORE_VENDED_LOG_TYPE,
     AGENTCORE_VENDED_TRACE_TYPE,
 )
+# A custom code interpreter or browser writes application logs only through a
+# delivery. Identity resources are judged on traces, because WorkloadIdentity
+# log delivery is configured on the runtime or gateway that uses it.
+AGENTCORE_TOOL_DELIVERY_TYPES = (AGENTCORE_VENDED_LOG_TYPE,)
+AGENTCORE_IDENTITY_DELIVERY_TYPES = (AGENTCORE_VENDED_TRACE_TYPE,)
+# The families AC-19 matches on the exact ARN their list API returns: list
+# operation, result key, list arguments, ARN field, id field, row label,
+# the listing-failure subject and the delivery types required.
+AGENTCORE_ARN_MATCHED_DELIVERY_FAMILIES = (
+    (
+        "list_code_interpreters",
+        "codeInterpreterSummaries",
+        {"type": "CUSTOM"},
+        "codeInterpreterArn",
+        "codeInterpreterId",
+        "Code interpreter",
+        "Code interpreters",
+        "ListCodeInterpreters",
+        AGENTCORE_TOOL_DELIVERY_TYPES,
+    ),
+    (
+        "list_browsers",
+        "browserSummaries",
+        {"type": "CUSTOM"},
+        "browserArn",
+        "browserId",
+        "Browser",
+        "Browsers",
+        "ListBrowsers",
+        AGENTCORE_TOOL_DELIVERY_TYPES,
+    ),
+    (
+        "list_workload_identities",
+        "workloadIdentities",
+        {},
+        "workloadIdentityArn",
+        None,
+        "Workload identity",
+        "Workload identities",
+        "ListWorkloadIdentities",
+        AGENTCORE_IDENTITY_DELIVERY_TYPES,
+    ),
+    (
+        "list_oauth2_credential_providers",
+        "credentialProviders",
+        {},
+        "credentialProviderArn",
+        None,
+        "OAuth2 credential provider",
+        "OAuth2 credential providers",
+        "ListOauth2CredentialProviders",
+        AGENTCORE_IDENTITY_DELIVERY_TYPES,
+    ),
+    (
+        "list_api_key_credential_providers",
+        "credentialProviders",
+        {},
+        "credentialProviderArn",
+        None,
+        "API key credential provider",
+        "API key credential providers",
+        "ListApiKeyCredentialProviders",
+        AGENTCORE_IDENTITY_DELIVERY_TYPES,
+    ),
+)
 AGENTCORE_DELIVERY_TYPE_LABELS = {
     AGENTCORE_VENDED_LOG_TYPE: "application logs",
     AGENTCORE_VENDED_TRACE_TYPE: "traces",
@@ -11252,11 +11317,14 @@ def _agentcore_transaction_search_finding() -> Dict[str, Any]:
 
 
 def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
-    """AC-19: Report log and trace delivery per runtime, gateway and memory.
+    """AC-19: Report log and trace delivery per AgentCore resource.
 
     A gateway or memory needs an APPLICATION_LOGS and a TRACES delivery, because
     AgentCore configures no destination for either. A runtime needs a TRACES
     delivery only: AgentCore creates a log group for its service-provided logs.
+    A custom code interpreter or browser needs an APPLICATION_LOGS delivery, and
+    a workload identity or credential provider a TRACES delivery, each matched
+    on the exact ARN its list API returns.
     When any of them exists, the region's trace segment destination is read,
     because AgentCore tracing needs CloudWatch Transaction Search, which
     requires the CloudWatchLogs destination.
@@ -11396,7 +11464,55 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
             )
         )
 
-    if runtimes or gateways or memories:
+    judged_elsewhere = 0
+    for (
+        operation_name,
+        result_key,
+        list_kwargs,
+        arn_field,
+        id_field,
+        row_label,
+        subject,
+        action,
+        required_log_types,
+    ) in AGENTCORE_ARN_MATCHED_DELIVERY_FAMILIES:
+        try:
+            items = _agentcore_list_all(operation_name, [result_key], **list_kwargs)
+        except Exception as error:
+            items = []
+            findings.append(
+                create_finding(
+                    check_id="AC-19",
+                    finding_name="AgentCore Log Delivery Configuration",
+                    finding_details=(
+                        f"{subject} could not be listed: {type(error).__name__}."
+                    ),
+                    resolution=f"Grant bedrock-agentcore:{action} and retry.",
+                    reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        for item in items:
+            resource_arn = item.get(arn_field)
+            if not resource_arn:
+                continue
+            judged_elsewhere += 1
+            item_id = item.get(id_field) if id_field else None
+            name = item.get("name") or item_id or resource_arn
+            findings.append(
+                _log_delivery_finding(
+                    f"{row_label} '{name}' ({item_id})"
+                    if item_id
+                    else f"{row_label} '{name}'",
+                    resource_arn,
+                    arn_sources,
+                    delivered_source_names,
+                    required_log_types,
+                )
+            )
+
+    if runtimes or gateways or memories or judged_elsewhere:
         findings.append(_agentcore_transaction_search_finding())
 
     if not findings:
@@ -11405,7 +11521,8 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
                 check_id="AC-19",
                 finding_name="AgentCore Log Delivery Configuration",
                 finding_details=(
-                    "No AgentCore runtime, gateway or memory resources found in "
+                    "No AgentCore runtime, gateway, memory, custom code "
+                    "interpreter, custom browser or identity resources found in "
                     "this region."
                 ),
                 resolution="No action required.",
@@ -11415,27 +11532,25 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
             )
         )
 
-    # AWS documents a configurable log destination for memory, gateway and
-    # built-in tool resources only. Runtime logging is service-managed,
     # WorkloadIdentity log delivery is configured on the associated runtime or
-    # gateway resource, and policy engines have no log-destination surface. A
-    # built-in tool emits no service logs at all, so whether a missing delivery
-    # loses anything depends on the workload writing its own logs.
+    # gateway resource, so identity resources are judged on traces only, and
+    # policy engines have no log-destination surface. The AWS-managed code
+    # interpreter and browser are not listed with type CUSTOM.
     findings.append(
         create_finding(
             check_id="AC-19",
             finding_name="AgentCore Log Delivery Configuration",
             finding_details=(
-                "Built-in tool log delivery is not assessed: AgentCore provides "
-                "no tool logs by default, so a missing delivery only loses data "
-                "when the workload writes its own logs. Identity log delivery is "
-                "configured on the associated runtime or gateway resource, and "
-                "policy engines have no log-destination configuration."
+                "Built-in tool log delivery is not assessed for the AWS-managed "
+                "code interpreter and browser; each custom code interpreter and "
+                "browser is judged on its own row. WorkloadIdentity log delivery "
+                "is configured on the associated runtime or gateway resource, so "
+                "identity resources are judged on traces only, and policy "
+                "engines have no log-destination configuration."
             ),
             resolution=(
-                "Where a built-in tool writes its own logs, add a CloudWatch "
-                "Logs, Amazon S3 or Firehose destination for that tool in the "
-                "AgentCore console."
+                "Turn on tracing for each gateway a policy engine is attached "
+                "to, because the engine's decision spans appear only there."
             ),
             reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
             severity=SeverityEnum.INFORMATIONAL,
