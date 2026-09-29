@@ -12632,10 +12632,21 @@ class TestBR46KnowledgeBaseSourceClassification:
         training_jobs=None,
         training_error=None,
         ingestion_pages=None,
+        pii_jobs=(),
+        pii_jobs_error=None,
     ):
         agent_client = MagicMock()
         ingestion_jobs = ingestion_jobs or {}
         ingestion_pages = ingestion_pages or {}
+        comprehend_client = MagicMock()
+        if pii_jobs_error:
+            comprehend_client.list_pii_entities_detection_jobs.side_effect = (
+                pii_jobs_error
+            )
+        else:
+            comprehend_client.list_pii_entities_detection_jobs.return_value = {
+                "PiiEntitiesDetectionJobPropertiesList": list(pii_jobs)
+            }
 
         def list_ingestion_jobs(**kwargs):
             # ingestion_pages maps a data source to a list of pages of startedAt
@@ -12757,6 +12768,7 @@ class TestBR46KnowledgeBaseSourceClassification:
                 "bedrock": bedrock_client,
                 "macie2": macie_client,
                 "sagemaker": sagemaker_client,
+                "comprehend": comprehend_client,
             }[service],
         ):
             return extract_csv_data(
@@ -12910,17 +12922,61 @@ class TestBR46KnowledgeBaseSourceClassification:
                 in (finding["Finding_Details"])
             )
 
-    def test_br46_macie_not_enabled_is_not_a_bucket_failure(self):
+    def test_br46_macie_not_enabled_fails_sources_no_comprehend_job_screens(self):
         findings = self._two_bucket_estate(
             session_error=_make_client_error(
                 "AccessDeniedException", "Macie is not enabled"
             )
         )
 
-        assert [f["Status"] for f in findings] == ["N/A"]
+        assert [f["Status"] for f in findings] == ["Failed"]
         assert "Amazon Macie is not enabled" in findings[0]["Finding_Details"]
         assert "FS-44" in findings[0]["Finding_Details"]
         assert "support-bucket" in findings[0]["Finding_Details"]
+        assert "hr-bucket" in findings[0]["Finding_Details"]
+
+    @staticmethod
+    def _pii_job(name, uri, status="COMPLETED"):
+        return {
+            "JobName": name,
+            "JobStatus": status,
+            "Mode": "ONLY_OFFSETS",
+            "InputDataConfig": {"S3Uri": uri},
+            "EndTime": "2026-09-01T00:00:00+00:00",
+        }
+
+    def test_br46_macie_off_names_a_comprehend_screened_source_without_passing(self):
+        findings = self._two_bucket_estate(
+            hr_prefixes=["policies/"],
+            session_error=_make_client_error(
+                "AccessDeniedException", "Macie is not enabled"
+            ),
+            pii_jobs=[
+                self._pii_job("hr-scan", "s3://hr-bucket/policies/"),
+                self._pii_job("support-running", "s3://support-bucket/", "IN_PROGRESS"),
+                self._pii_job("support-other", "s3://support-bucket/archive/"),
+            ],
+        )
+
+        assert sorted(f["Status"] for f in findings) == ["Failed", "N/A"]
+        failed = self._status(findings, "Failed")[0]["Finding_Details"]
+        screened = self._status(findings, "N/A")[0]["Finding_Details"]
+        assert "support-bucket" in failed and "hr-bucket" not in failed
+        assert "'hr-scan'" in screened and "support-bucket" not in screened
+        assert "not reported as Passed" in screened
+
+    def test_br46_macie_off_with_unread_comprehend_jobs_is_na(self):
+        findings = self._two_bucket_estate(
+            session_error=_make_client_error(
+                "AccessDeniedException", "Macie is not enabled"
+            ),
+            pii_jobs_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "comprehend:ListPiiEntitiesDetectionJobs" in findings[0]["Finding_Details"]
+        )
 
     def test_br46_missing_macie_grant_is_a_permissions_finding(self):
         findings = self._two_bucket_estate(

@@ -112,7 +112,20 @@ AI_SUBJECT_ROWS = [
         [],
         3,
     ),
-    ("AIR-BDR-KB-01", COVERED, None, "bedrock_assessments", ["BR-46"], "", [], 3),
+    (
+        "AIR-BDR-KB-01",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-46"],
+        "BR-46 passes a knowledge base S3 source only when a recurring, full-depth "
+        "Macie job scopes in its prefix. With Macie off, a source that no completed "
+        "Comprehend PII detection job read fails, and a Comprehend-screened source "
+        "is N/A. Whether classification is carried into per-document metadata needs "
+        "s3:GetObject on the metadata sidecars, which the Bedrock role is not granted",
+        [],
+        3,
+    ),
     ("AIR-BDR-MDL-01", COVERED, None, "bedrock_assessments", ["BR-42"], "", [], 3),
     ("AIR-BDR-MDL-03", COVERED, None, "bedrock_assessments", ["BR-43"], "", [], 3),
     ("AIR-BDR-MDL-04", COVERED, None, "bedrock_assessments", ["BR-44"], "", [], 3),
@@ -1103,8 +1116,10 @@ AI_SUBJECT_ROWS = [
         "before the Macie job was created fails. An exclude condition on extension, "
         "size, date or tag is N/A, and a failed read is N/A. The order of "
         "classification and ingestion per object needs object write times, which "
-        "are not read, and the pre-ingest Comprehend detection the control also "
-        "recommends is not recorded by any account configuration",
+        "are not read. When Macie is off, completed Comprehend PII detection jobs "
+        "(comprehend:ListPiiEntitiesDetectionJobs) are read: a source no job read "
+        "in full fails, and a screened source is N/A, since a one-time job does not "
+        "reach later objects. Real-time DetectPiiEntities calls are not read",
         [],
         5,
     ),

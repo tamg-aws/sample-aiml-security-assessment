@@ -15141,6 +15141,40 @@ def _comprehend_redaction_outputs(region: str) -> Tuple[List[Dict[str, str]], st
     return outputs, ""
 
 
+def _comprehend_detection_inputs(region: str) -> Tuple[List[Dict[str, str]], str]:
+    """
+    List the S3 input location and end time of completed Comprehend PII
+    detection jobs, in either mode, or return the reason they were not read.
+    """
+    try:
+        client = boto3.client("comprehend", config=boto3_config, region_name=region)
+        jobs = _list_all_items(
+            client,
+            "list_pii_entities_detection_jobs",
+            "PiiEntitiesDetectionJobPropertiesList",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            max_results=500,
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return [], get_assessment_error_label(error)
+    inputs = []
+    for job in jobs:
+        uri = str((job.get("InputDataConfig") or {}).get("S3Uri") or "")
+        if job.get("JobStatus") != "COMPLETED" or not uri.startswith("s3://"):
+            continue
+        bucket, _, prefix = uri[len("s3://") :].partition("/")
+        inputs.append(
+            {
+                "name": str(job.get("JobName") or job.get("JobId") or "unnamed"),
+                "bucket": bucket,
+                "prefix": prefix,
+                "end": str(job.get("EndTime") or "an unrecorded time"),
+            }
+        )
+    return inputs, ""
+
+
 def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
     """
     True when the guardrail version passes _sensitive_information_verdict:
@@ -24076,12 +24110,6 @@ MACIE_NOT_ENABLED_MARKERS = ("not enabled", "not been onboarded", "no macie acco
 # FS-44 in responsible_ai_grc_assessments already reports the account-level Macie
 # state as a failure. BR-46 asserts the per-bucket leg that FS-44's docstring
 # explicitly disclaims, so it must not emit a second failure for the same fact.
-MACIE_ACCOUNT_STATE_OWNER = (
-    "The account-level Macie state is asserted by FS-44 in the responsible AI "
-    "governance assessment, so it is not reported as a failure twice."
-)
-
-
 CLASSIFICATION_JOB_FINDING = "Knowledge Base Source Classification Job Coverage"
 
 # JobStatus values that mean a scheduled job will run again. PAUSED, USER_PAUSED
@@ -24733,8 +24761,9 @@ def check_bedrock_knowledge_base_source_classification(
     and scopes in the source's whole key prefix.
 
     FS-44 in responsible_ai_grc_assessments asserts the account-level Macie
-    state, so a Region whose Macie session is not enabled is N/A here.
-    GetClassificationScope is not used: its s3 member is an exclusion list.
+    state. A Region whose Macie session is not enabled fails each source that
+    no completed Comprehend PII detection job read, and reports a screened one
+    N/A. GetClassificationScope is not used: its s3 member is an exclusion list.
     """
     logger.debug("Starting check for knowledge base source data classification")
     check_name = "Knowledge Base Source Data Classification"
@@ -24879,24 +24908,94 @@ def check_bedrock_knowledge_base_source_classification(
         macie_client = boto3.client("macie2", config=boto3_config, region_name=region)
         precondition = _macie_discovery_precondition(macie_client)
 
-        if not precondition["session_enabled"]:
+        if not precondition["session_enabled"] and precondition["permissions"]:
             na(
                 "{} AI source bucket(s) ({}) could not be checked for sensitive data "
-                "classification because {}. {}".format(
+                "classification because {}. Grant the macie2 read actions and "
+                "retry.".format(
                     len(source_buckets),
                     ", ".join(source_buckets[:5]),
                     precondition["detail"],
-                    "Grant the macie2 read actions and retry."
-                    if precondition["permissions"]
-                    else MACIE_ACCOUNT_STATE_OWNER,
                 ),
                 "Grant macie2:GetMacieSession, macie2:DescribeBuckets, "
                 "macie2:ListClassificationJobs and macie2:DescribeClassificationJob, "
-                "then retry."
-                if precondition["permissions"]
-                else "Enable Amazon Macie in this Region and create a scheduled "
-                "classification job over each AI source bucket.",
+                "then retry.",
             )
+            return findings
+
+        if not precondition["session_enabled"]:
+            # With Macie off, a completed Comprehend PII detection job over the
+            # source prefix is the only classification left to read.
+            macie_off = (
+                f"{precondition['detail']}, so no Macie job classifies the AI "
+                f"source buckets; FS-44 reports the Macie state itself"
+            )
+            enable_macie = (
+                "Enable Amazon Macie in this Region and create a scheduled "
+                "classification job over each AI source bucket."
+            )
+            screening, screening_error = _comprehend_detection_inputs(region)
+            if screening_error:
+                na(
+                    "{}. {} AI source bucket(s) ({}) were not judged, because "
+                    "comprehend:ListPiiEntitiesDetectionJobs, which would show a "
+                    "Comprehend PII detection job over them, could not be read "
+                    "({}).".format(
+                        macie_off,
+                        len(source_buckets),
+                        ", ".join(source_buckets[:5]),
+                        screening_error,
+                    ),
+                    "Grant comprehend:ListPiiEntitiesDetectionJobs and retry. "
+                    + enable_macie,
+                )
+                return findings
+            unscreened = []
+            screened = []
+            for source in sources:
+                jobs = [job for job in screening if _redaction_job_covers(job, source)]
+                if jobs:
+                    screened.append(
+                        "{} ({}) by {}".format(
+                            source["bucket"],
+                            source["label"],
+                            ", ".join(
+                                f"'{job['name']}' (ended {job['end']})" for job in jobs
+                            ),
+                        )
+                    )
+                else:
+                    unscreened.append(f"{source['bucket']} ({source['label']})")
+            if unscreened:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-46",
+                        finding_name=check_name,
+                        finding_details=(
+                            "{}. No completed Amazon Comprehend PII detection job "
+                            "reads the whole source prefix of {} AI source(s) either, "
+                            "so nothing classifies their sensitive data before a "
+                            "knowledge base or customization job reads it: {}.".format(
+                                macie_off, len(unscreened), "; ".join(unscreened)
+                            )
+                        ),
+                        resolution=enable_macie,
+                        reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                        severity="High",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+            if screened:
+                na(
+                    "{}. A completed Amazon Comprehend PII detection job read the "
+                    "whole source prefix of {} AI source(s): {}. A Comprehend job "
+                    "reads the objects present when it runs and does not reach "
+                    "objects written after it, so this is not reported as "
+                    "Passed.".format(macie_off, len(screened), "; ".join(screened)),
+                    enable_macie,
+                )
             return findings
 
         try:
