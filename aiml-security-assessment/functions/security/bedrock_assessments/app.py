@@ -620,8 +620,19 @@ def get_guardrail_attachment_inventory(
         key = (attachment["identifier"], attachment["version"])
         if key in inventory["versions"]:
             inventory["versions"][key]["surfaces"].append(attachment["surface"])
+            if attachment.get("narrowings"):
+                inventory["versions"][key]["narrowings"][attachment["surface"]] = (
+                    attachment["narrowings"]
+                )
             continue
-        entry = {"surfaces": [attachment["surface"]], "detail": None, "error": ""}
+        entry = {
+            "surfaces": [attachment["surface"]],
+            "narrowings": {},
+            "detail": None,
+            "error": "",
+        }
+        if attachment.get("narrowings"):
+            entry["narrowings"][attachment["surface"]] = attachment["narrowings"]
         inventory["versions"][key] = entry
         target_region = attachment["region"]
         if target_region not in clients:
@@ -794,6 +805,11 @@ def _deployed_guardrail_findings(
     Judge each guardrail version a workload in this Region applies. A version
     that could not be read, or an attachment source that could not be listed,
     keeps the passing row from reading as Passed.
+
+    An account-enforced configuration that is narrowed (a model scope short of
+    ALL, SELECTIVE system or messages guarding, or inputTags HONOR) applies the
+    guardrail only to part of the traffic, so a passing version is not credited
+    through it, and the narrowing fails.
     """
     rows = []
     passed = []
@@ -810,6 +826,37 @@ def _deployed_guardrail_findings(
             )
             continue
         status, text = judge(entry["detail"])
+        narrowed = entry.get("narrowings") or {}
+        if status == "Passed" and narrowed:
+            for surface in sorted(narrowed):
+                rows.append(
+                    create_finding(
+                        check_id=check_id,
+                        finding_name=finding_name,
+                        finding_details=(
+                            f"Guardrail {identifier} version {version} passes on "
+                            f"its own settings ({text}), but {surface} applies it "
+                            f"only in part: {'; '.join(narrowed[surface])}. "
+                            "Content outside that scope is not evaluated by it. "
+                            f"{GUARDRAIL_DEPLOYMENT_CEILING}"
+                        ),
+                        resolution=(
+                            "Set the account-enforced configuration to include ALL "
+                            "models with no exclusions, guard system and messages "
+                            "content COMPREHENSIVE, and set inputTags to IGNORE."
+                        ),
+                        reference=reference,
+                        severity=severity,
+                        status="Failed",
+                        region=region,
+                    )
+                )
+            credited = [s for s in entry["surfaces"] if s not in narrowed]
+            if not credited:
+                continue
+            label = "guardrail {} version {} (applied by {})".format(
+                identifier, version, ", ".join(credited)
+            )
         if status == "Passed":
             passed.append(f"{label}: {text}")
         elif status == "Failed":
@@ -3982,10 +4029,6 @@ def _judge_log_bucket_retention(
             "retains it, so the lifecycle period is not the period the record is "
             "kept, and the write-once record shares a bucket with the expiring one"
         )
-    else:
-        retained.append(
-            f"{label} '{bucket_name}' lifecycle: {'; '.join(lifecycle['expirations'])}"
-        )
 
     try:
         replicas = _replica_buckets(s3_client, bucket_name)
@@ -3995,6 +4038,10 @@ def _judge_log_bucket_retention(
             f"{describe_api_error(error, 's3:GetReplicationConfiguration', region)}"
         )
         return
+    if not lock and not replicas:
+        retained.append(
+            f"{label} '{bucket_name}' lifecycle: {'; '.join(lifecycle['expirations'])}"
+        )
     if replicas:
         undetermined.append(
             f"{label} '{bucket_name}': an enabled replication rule copies it to "
@@ -6653,18 +6700,23 @@ def _parse_guardrail_reference(value: str, region: str) -> Dict[str, str]:
 
 GUARDRAIL_BLOCKING_STRENGTHS = ("LOW", "MEDIUM", "HIGH")
 
+# The harmful-content categories of GuardrailContentFilterType. PROMPT_ATTACK
+# screens for injection, not harmful content, so it is not one of them.
+GUARDRAIL_CONTENT_SAFETY_TYPES = ("HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE")
 
-def _guardrail_directions(detail: Dict[str, Any]) -> Dict[str, bool]:
+
+def _guardrail_unblocked_categories(detail: Dict[str, Any]) -> Dict[str, List[str]]:
     """
-    Say whether a guardrail version applies a blocking content filter to the
-    input and to the output.
+    Name, for the input and the output, the content-safety categories a
+    guardrail version does not block.
 
-    Only contentPolicy filters count as content safety. A filter covers a
-    direction when its strength there is LOW, MEDIUM or HIGH (NONE applies no
-    filtering), its enabled flag there is not false (absent means enabled), and
-    its action there is not NONE (absent means BLOCK). Denied topics, words,
-    PII entities, regexes, contextual grounding and Automated Reasoning do not
-    filter harmful content, so a version carrying only those covers neither.
+    A category is blocked on a side when a contentPolicy filter of that type
+    has a strength there of LOW, MEDIUM or HIGH (NONE applies no filtering), its
+    enabled flag there is not false (absent means enabled), and its action there
+    is not NONE (absent means BLOCK). Denied topics, words, PII entities,
+    regexes, contextual grounding, Automated Reasoning and the PROMPT_ATTACK
+    filter do not filter harmful content, so a version carrying only those
+    blocks no category.
     """
     filters = [
         content_filter
@@ -6672,16 +6724,22 @@ def _guardrail_directions(detail: Dict[str, Any]) -> Dict[str, bool]:
         if isinstance(content_filter, dict)
     ]
 
-    def covers(side: str) -> bool:
-        return any(
-            str(content_filter.get(f"{side}Strength") or "").upper()
+    def unblocked(side: str) -> List[str]:
+        blocked = {
+            str(content_filter.get("type") or "").upper()
+            for content_filter in filters
+            if str(content_filter.get(f"{side}Strength") or "").upper()
             in GUARDRAIL_BLOCKING_STRENGTHS
             and content_filter.get(f"{side}Enabled") is not False
             and str(content_filter.get(f"{side}Action") or "BLOCK").upper() != "NONE"
-            for content_filter in filters
-        )
+        }
+        return [
+            category
+            for category in GUARDRAIL_CONTENT_SAFETY_TYPES
+            if category not in blocked
+        ]
 
-    return {"input": covers("input"), "output": covers("output")}
+    return {"input": unblocked("input"), "output": unblocked("output")}
 
 
 def _read_guardrail_directions(
@@ -6730,14 +6788,14 @@ def _read_guardrail_directions(
                 guardrailIdentifier=reference["identifier"],
                 guardrailVersion=version,
             )
-            directions = _guardrail_directions(detail)
-            skipped = [side for side in ("input", "output") if not directions[side]]
-            if skipped:
-                result["gaps"].append(
-                    "version {} evaluates no {} with a blocking content filter".format(
-                        version, " and no ".join(skipped)
+            unblocked = _guardrail_unblocked_categories(detail)
+            for side in ("input", "output"):
+                if unblocked[side]:
+                    result["gaps"].append(
+                        "version {} does not block {} on the {}".format(
+                            version, ", ".join(unblocked[side]), side
+                        )
                     )
-                )
     except ClientError as error:
         if error.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
             result["missing"] = True
@@ -6881,8 +6939,8 @@ def check_bedrock_guardrail_iam_enforcement(
     An identity whose own grants are unbound is not a finding when a central
     mechanism binds every invocation in the Region (_central_guardrail_bindings),
     and the guardrails that mechanism names are read like the IAM ones. A
-    guardrail version counts only when a content filter blocks in each
-    direction (_guardrail_directions).
+    guardrail version counts only when it blocks every content-safety category
+    in each direction (_guardrail_unblocked_categories).
     """
     logger.debug("Starting check for Bedrock Guardrail IAM enforcement")
     check_name = "Bedrock Guardrail IAM Enforcement Check"
@@ -7129,18 +7187,18 @@ def check_bedrock_guardrail_iam_enforcement(
                     check_id="BR-10",
                     finding_name="Bedrock Guardrail IAM Enforcement Missing",
                     finding_details=(
-                        "{} guardrail(s) required on invocation apply no blocking "
-                        "content filter to the input or the output, so harmful "
-                        "content in that direction reaches the model or the "
-                        "caller unfiltered: {}.".format(
-                            len(direction_gaps), "; ".join(direction_gaps[:5])
-                        )
+                        "{} guardrail(s) required on invocation leave a "
+                        "content-safety category (HATE, INSULTS, MISCONDUCT, "
+                        "SEXUAL or VIOLENCE) unblocked on the input or the output, so that "
+                        "content reaches the model or the caller unfiltered: "
+                        "{}.".format(len(direction_gaps), "; ".join(direction_gaps[:5]))
                     ),
                     resolution=(
-                        "Give each version that may be named a content filter with "
-                        "strength LOW, MEDIUM or HIGH and action BLOCK on both the "
-                        "input and the output, or pin the condition to a version "
-                        "that has one."
+                        "Give each version that may be named a HATE, INSULTS, "
+                        "MISCONDUCT, SEXUAL and VIOLENCE content filter with "
+                        "strength LOW, "
+                        "MEDIUM or HIGH and action BLOCK on both the input and the "
+                        "output, or pin the condition to a version that has them."
                     ),
                     reference=GUARDRAIL_IAM_REFERENCE,
                     severity="High",
@@ -7194,8 +7252,9 @@ def check_bedrock_guardrail_iam_enforcement(
                     check_id="BR-10",
                     finding_name=check_name,
                     finding_details=(
-                        "{} Each guardrail version that may be named applies a "
-                        "blocking content filter to both input and output{}.{} "
+                        "{} Each guardrail version that may be named blocks HATE, "
+                        "INSULTS, MISCONDUCT, SEXUAL and VIOLENCE content on both "
+                        "input and output{}.{} "
                         "{}".format(
                             " ".join(statements),
                             " among those read" if unread else "",
@@ -7391,8 +7450,16 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
             paginator = bedrock_client.get_paginator("list_custom_models")
             for page in paginator.paginate():
                 custom_models.extend(page.get("modelSummaries", []))
+            # ListCustomModels returns only the models a job created. A failed or
+            # stopped job leaves its data in the same buckets, so every job's
+            # locations are read too.
+            customization = _customization_job_locations(region)
 
-            if not custom_models:
+            if (
+                not custom_models
+                and not customization["locations"]
+                and not customization["errors"]
+            ):
                 findings["details"] = "No custom models found"
                 findings["csv_data"].append(
                     create_finding(
@@ -7433,34 +7500,6 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
                     )
                     continue
 
-                # GetCustomModel names the key the model is encrypted at rest
-                # with. The customization job's outputModelKmsKeyArn is read only
-                # when the model record carries none.
-                key = str(model_details.get("modelKmsKeyArn") or "")
-                job_arn = model_details.get("jobArn")
-                if not key and job_arn:
-                    try:
-                        job_details = bedrock_client.get_model_customization_job(
-                            jobIdentifier=job_arn
-                        )
-                        # GetModelCustomizationJob reports the output key as a
-                        # top-level outputModelKmsKeyArn. Its outputDataConfig
-                        # carries s3Uri and nothing else, so the kmsKeyId read
-                        # this replaces could never be true and no model could
-                        # reach the passing branch below.
-                        if job_details.get("outputModelKmsKeyArn"):
-                            key = str(job_details["outputModelKmsKeyArn"])
-                    except Exception as job_err:
-                        logger.warning(
-                            f"Could not retrieve customization job for {model_name}: {str(job_err)}"
-                        )
-                        models_unread.append(
-                            f"custom model '{model_name}' names no modelKmsKeyArn, "
-                            "and its customization job could not be read: "
-                            f"{describe_api_error(job_err, 'bedrock:GetModelCustomizationJob', region)}"
-                        )
-                        continue
-
                 training = model_details.get("trainingDataConfig") or {}
                 locations = [
                     ("training data", training.get("s3Uri")),
@@ -7490,6 +7529,34 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
                         data_buckets.setdefault(bucket, []).append(
                             f"the {role} of custom model '{model_name}'"
                         )
+
+                # GetCustomModel names the key the model is encrypted at rest
+                # with. The customization job's outputModelKmsKeyArn is read only
+                # when the model record carries none.
+                key = str(model_details.get("modelKmsKeyArn") or "")
+                job_arn = model_details.get("jobArn")
+                if not key and job_arn:
+                    try:
+                        job_details = bedrock_client.get_model_customization_job(
+                            jobIdentifier=job_arn
+                        )
+                        # GetModelCustomizationJob reports the output key as a
+                        # top-level outputModelKmsKeyArn. Its outputDataConfig
+                        # carries s3Uri and nothing else, so the kmsKeyId read
+                        # this replaces could never be true and no model could
+                        # reach the passing branch below.
+                        if job_details.get("outputModelKmsKeyArn"):
+                            key = str(job_details["outputModelKmsKeyArn"])
+                    except Exception as job_err:
+                        logger.warning(
+                            f"Could not retrieve customization job for {model_name}: {str(job_err)}"
+                        )
+                        models_unread.append(
+                            f"custom model '{model_name}' names no modelKmsKeyArn, "
+                            "and its customization job could not be read: "
+                            f"{describe_api_error(job_err, 'bedrock:GetModelCustomizationJob', region)}"
+                        )
+                        continue
 
                 if not key:
                     models_without_cmk.append(
@@ -7570,7 +7637,39 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
                     )
                 )
 
+            for location in customization["locations"]:
+                label = (
+                    f"the {location['role']} of customization job '{location['job']}'"
+                )
+                labels = data_buckets.setdefault(_s3_uri_bucket(location["uri"]), [])
+                if label not in labels:
+                    labels.append(label)
             data_rows = _customization_data_bucket_findings(data_buckets, region)
+            if customization["errors"]:
+                unread = "; ".join(customization["errors"][:5])
+                held = [row for row in data_rows if row["Status"] == "Passed"]
+                for row in held:
+                    row["Status"] = "N/A"
+                    row["Finding_Details"] += (
+                        " This is not reported as Passed because these "
+                        f"customization job reads failed: {unread}."
+                    )
+                if not held:
+                    data_rows.append(
+                        create_finding(
+                            check_id="BR-11",
+                            finding_name=CUSTOMIZATION_DATA_ENCRYPTION_FINDING,
+                            finding_details=(
+                                "The data buckets of some model customization jobs "
+                                f"were not read, because these reads failed: {unread}."
+                            ),
+                            resolution=COULD_NOT_ASSESS_RESOLUTION,
+                            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
+                            severity="Informational",
+                            status="N/A",
+                            region=region,
+                        )
+                    )
             if any(row["Status"] == "Failed" for row in data_rows):
                 findings["status"] = "WARN"
             findings["csv_data"].extend(data_rows)
@@ -9125,9 +9224,11 @@ def _guardrail_share_grants(
     An Allow counts when it is scoped to the organization by aws:PrincipalOrgID
     or aws:PrincipalOrgPaths, or names principals in other accounts. A '*'
     principal, or one with a wildcard in its account segment, with neither key
-    shares the resource with every AWS account.
+    shares the resource with every AWS account. "org_scoped" lists the shares
+    that carry one of the two keys; a share to named accounts reaches only
+    those accounts.
     """
-    observed = {"shared": [], "unbounded": []}
+    observed = {"shared": [], "org_scoped": [], "unbounded": []}
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "ALLOW":
             continue
@@ -9164,9 +9265,9 @@ def _guardrail_share_grants(
             )
         ]
         if org_scopes:
-            observed["shared"].append(
-                f"an Allow of {action_label} scoped by " + "; ".join(org_scopes)
-            )
+            text = f"an Allow of {action_label} scoped by " + "; ".join(org_scopes)
+            observed["shared"].append(text)
+            observed["org_scoped"].append(text)
         elif open_principals:
             observed["unbounded"].append(
                 f"an Allow of {action_label} to "
@@ -9401,7 +9502,7 @@ def _guardrail_share_finding(
     except ClientError as error:
         code = error.response.get("Error", {}).get("Code", "")
         if code == "ResourceNotFoundException":
-            observed = {"shared": [], "unbounded": []}
+            observed = {"shared": [], "org_scoped": [], "unbounded": []}
         else:
             return row(
                 f"The resource policy of guardrail {guardrail_arn} could not be "
@@ -9420,24 +9521,29 @@ def _guardrail_share_finding(
             "Informational",
             "N/A",
         )
-    if observed["shared"] and not observed["unbounded"]:
+    if observed["org_scoped"] and not observed["unbounded"]:
         return row(
             f"Guardrail {guardrail_arn} is shared with member accounts through "
-            f"{'; '.join(observed['shared'][:3])}.",
+            f"{'; '.join(observed['org_scoped'][:3])}.",
             "No action required",
             "Medium",
             "Passed",
         )
+    if observed["unbounded"]:
+        problem = "; ".join(observed["unbounded"])
+        consequence = "outside the organization can also apply it"
+    elif observed["shared"]:
+        problem = (
+            "shares it only through {}, with no aws:PrincipalOrgID or "
+            "aws:PrincipalOrgPaths condition".format("; ".join(observed["shared"][:3]))
+        )
+        consequence = "that it does not name cannot apply the guardrail"
+    else:
+        problem = "grants no other account bedrock:ApplyGuardrail"
+        consequence = "cannot apply the guardrail the policy names"
     return row(
         f"Guardrail {guardrail_arn} is enforced centrally but its resource policy "
-        "{}, so member accounts {}.".format(
-            "; ".join(observed["unbounded"])
-            if observed["unbounded"]
-            else "grants no other account bedrock:ApplyGuardrail",
-            "outside the organization can also apply it"
-            if observed["unbounded"]
-            else "cannot apply the guardrail the policy names",
-        ),
+        f"{problem}, so member accounts {consequence}.",
         "Put a resource policy on the guardrail that allows bedrock:ApplyGuardrail "
         "to principals whose aws:PrincipalOrgID is the organization.",
         "High",
@@ -13235,6 +13341,8 @@ def get_knowledge_base_screening_inventory(
                 s3_configuration = configuration.get("s3Configuration") or {}
                 entry["sources"].append(
                     {
+                        "knowledge_base_id": kb_id,
+                        "data_source_id": source_id,
                         "label": f"data source '{data_source.get('name') or source_id}'",
                         "type": str(configuration.get("type") or "unspecified"),
                         "transformations": sorted(
@@ -13482,6 +13590,7 @@ def _knowledge_base_screening_findings(
     source_unread: str,
     resolution: str,
     severity: str,
+    fronts_screen_chunks: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Fail each knowledge base that has a data source with no screening step
@@ -13492,6 +13601,11 @@ def _knowledge_base_screening_findings(
     transformation step, or returns "". ``source_unread`` names a source-side
     credit that could not be read for S3 sources; while it is set, an
     unscreened S3 source cannot be failed.
+
+    ``fronts_screen_chunks`` is False for a filter that evaluates only content
+    the caller tags as guard content (PROMPT_ATTACK). An agent or flow node
+    retrieves through managed retrieval, which builds the prompt itself and
+    cannot tag the retrieved chunks, so its guardrail is not credited.
     """
 
     def row(details: str, status: str, action: str) -> Dict[str, Any]:
@@ -13582,6 +13696,16 @@ def _knowledge_base_screening_findings(
             f"the guardrail of {s} was not read with bedrock:GetGuardrail"
             for s in sorted({s for s, state in fronts if state == "unread"})
         ]
+        front_text = f"with no guardrail {screen_text}"
+        if not fronts_screen_chunks:
+            open_fronts = sorted({s for s, _ in fronts})
+            screened_fronts = []
+            unread_fronts = []
+            front_text = (
+                "through managed retrieval, which builds the prompt itself and "
+                "cannot wrap the retrieved chunks in guardContent tags, so a "
+                "guardrail on that path does not evaluate them"
+            )
         not_failed = "Bedrock {} is not failed: {}. {}".format(
             entry["label"],
             "; ".join(credited + screened_fronts + enforced_screen)
@@ -13614,8 +13738,8 @@ def _knowledge_base_screening_findings(
             rows.append(
                 row(
                     f"Bedrock {entry['label']} ingests {names} with no screening "
-                    f"step, and {', '.join(open_fronts)} retrieves from it with no "
-                    f"guardrail {screen_text}.{narrowed_note} "
+                    f"step, and {', '.join(open_fronts)} retrieves from it "
+                    f"{front_text}.{narrowed_note} "
                     f"{KNOWLEDGE_BASE_SCREENING_CEILING}",
                     "Failed",
                     resolution,
@@ -13758,10 +13882,11 @@ def check_bedrock_guardrail_prompt_attack_filter(
             lambda source: "",
             "",
             "Screen ingested content for embedded instructions with a POST_CHUNKING "
-            "transformation Lambda, and retrieve through an agent or flow node whose "
-            "guardrail blocks PROMPT_ATTACK at HIGH strength, or run Retrieve and "
-            "wrap the chunks in guardContent tags before the model call.",
+            "transformation Lambda, and run Retrieve and wrap the retrieved chunks "
+            "in guardContent tags before a model call whose guardrail blocks "
+            "PROMPT_ATTACK at HIGH strength.",
             "High",
+            fronts_screen_chunks=False,
         )
     )
     if inventory.get("list_error"):
@@ -14715,8 +14840,9 @@ SENSITIVE_INFORMATION_RESOLUTION = (
 
 def _comprehend_redaction_outputs(region: str) -> Tuple[List[Dict[str, str]], str]:
     """
-    List the S3 output locations of completed Comprehend PII redaction jobs,
-    or return the reason they were not read.
+    List the S3 output location, redacted entity types, mask mode and end
+    time of completed Comprehend PII redaction jobs, or return the reason
+    they were not read.
     """
     try:
         client = boto3.client("comprehend", config=boto3_config, region_name=region)
@@ -14740,25 +14866,38 @@ def _comprehend_redaction_outputs(region: str) -> Tuple[List[Dict[str, str]], st
         ):
             continue
         bucket, _, prefix = uri[len("s3://") :].partition("/")
+        redaction = job.get("RedactionConfig") or {}
         outputs.append(
             {
                 "name": str(job.get("JobName") or job.get("JobId") or "unnamed"),
                 "uri": uri,
                 "bucket": bucket,
                 "prefix": prefix,
+                "types": sorted(str(t) for t in redaction.get("PiiEntityTypes") or []),
+                "mask_mode": str(redaction.get("MaskMode") or "unspecified"),
+                "end": job.get("EndTime"),
             }
         )
     return outputs, ""
 
 
 def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
-    """True when some PII entity type blocks or masks on the input or the output."""
-    policy = detail.get("sensitiveInformationPolicy") or {}
-    return any(
-        _sensitive_information_action(entity, side) in SENSITIVE_INFORMATION_ACTING
-        for entity in policy.get("piiEntities") or []
-        if isinstance(entity, dict)
-        for side in ("input", "output")
+    """
+    True when the guardrail version passes _sensitive_information_verdict:
+    each credential PII entity type blocks or masks on the input and the
+    output, and a custom regex blocks or masks on the output.
+    """
+    return _sensitive_information_verdict(detail)[0] == "Passed"
+
+
+def _redaction_job_covers(job: Dict[str, Any], source: Dict[str, Any]) -> bool:
+    """True when every prefix an S3 source ingests lies under a job's output."""
+    return job["bucket"] == source["bucket"] and (
+        not job["prefix"]
+        or bool(
+            source["prefixes"]
+            and all(p.startswith(job["prefix"]) for p in source["prefixes"])
+        )
     )
 
 
@@ -14802,20 +14941,64 @@ def check_bedrock_guardrail_pii_filters(
             if knowledge_base_inventory.get("knowledge_bases")
             else ([], "")
         )
+        # A redaction job is credited only when the index was built after it
+        # completed, so each source a job's output covers has its ingestion
+        # jobs read.
+        ingestion_windows = {}
+        for entry in knowledge_base_inventory.get("knowledge_bases") or []:
+            for source in entry["sources"]:
+                key = (source.get("knowledge_base_id"), source.get("data_source_id"))
+                if (
+                    key[0]
+                    and key[1]
+                    and key not in ingestion_windows
+                    and any(_redaction_job_covers(j, source) for j in redaction_outputs)
+                ):
+                    ingestion_windows[key] = _ingestion_job_window(region, *key)
+        ingestion_errors = sorted(
+            {w["error"] for w in ingestion_windows.values() if w["error"]}
+        )
+        source_unread = (
+            [
+                "Comprehend PII redaction jobs were not read with "
+                f"comprehend:ListPiiEntitiesDetectionJobs ({redaction_error}), so a "
+                "redaction job whose output an S3 source ingests is not credited"
+            ]
+            if redaction_error
+            else []
+        )
+        source_unread += [
+            f"a data source a redaction job's output covers: {error}, so whether "
+            "it was ingested after the job completed is unknown"
+            for error in ingestion_errors
+        ]
 
         def redaction_credit(source: Dict[str, Any]) -> str:
+            window = ingestion_windows.get(
+                (source.get("knowledge_base_id"), source.get("data_source_id"))
+            )
+            if not window or window["error"]:
+                return ""
+            latest = window["latest"]
             for job in redaction_outputs:
-                if job["bucket"] == source["bucket"] and (
-                    not job["prefix"]
-                    or (
-                        source["prefixes"]
-                        and all(p.startswith(job["prefix"]) for p in source["prefixes"])
+                if not _redaction_job_covers(job, source) or "ALL" not in job["types"]:
+                    continue
+                if latest is not None:
+                    lead = _days_between(job["end"], latest)
+                    if lead is None or lead < 0:
+                        continue
+                return (
+                    f"ingests only the output of Comprehend PII redaction job "
+                    f"'{job['name']}' ({job['uri']}), which redacts ALL PII entity "
+                    f"types with MaskMode {job['mask_mode']} and completed "
+                    + (
+                        "before the latest ingestion job started"
+                        if latest is not None
+                        else "with no ingestion job recorded for the source"
                     )
-                ):
-                    return (
-                        f"ingests only the output of Comprehend PII redaction job "
-                        f"'{job['name']}' ({job['uri']})"
-                    )
+                    + "; objects written under that output location after the job "
+                    "are not read, so whether they were redacted is not judged"
+                )
             return ""
 
         deployed.extend(
@@ -14826,17 +15009,17 @@ def check_bedrock_guardrail_pii_filters(
                 region,
                 knowledge_base_inventory,
                 _pii_entity_masks,
-                "that blocks or masks a PII entity type",
+                "that blocks or masks AWS_ACCESS_KEY, AWS_SECRET_KEY and PASSWORD "
+                "on the input and the output and a custom regex on the output",
                 redaction_credit,
-                "Comprehend PII redaction jobs were not read with "
-                f"comprehend:ListPiiEntitiesDetectionJobs ({redaction_error}), so a "
-                "redaction job whose output an S3 source ingests is not credited"
-                if redaction_error
-                else "",
-                "Redact PII before ingestion with a Comprehend PII redaction job whose "
-                "output the data source ingests, or a POST_CHUNKING transformation "
-                "Lambda, and retrieve through an agent or flow node whose guardrail "
-                "sets PII entity types to BLOCK or ANONYMIZE.",
+                "; ".join(source_unread),
+                "Redact PII before ingestion with a Comprehend PII redaction job that "
+                "redacts ALL entity types, whose output the data source ingests and "
+                "that completes before the next ingestion job, or a POST_CHUNKING "
+                "transformation Lambda, and retrieve through an agent or flow node "
+                "whose guardrail sets AWS_ACCESS_KEY, AWS_SECRET_KEY, PASSWORD and "
+                "the other required PII entity types to BLOCK or ANONYMIZE on both "
+                "sides, with a custom regex on the output.",
                 "High",
             )
         )
@@ -16064,6 +16247,67 @@ GUARDRAIL_INTERVENTION_TOKEN = "intervened"
 
 GUARDRAIL_INTERVENTION_EXCLUSION = re.compile(r'!=|-"?[\w]*intervened')
 
+# Filter patterns are case sensitive (FilterAndPatternSyntax.html), so only the
+# two values as the runtime writes them select an intervention.
+GUARDRAIL_INTERVENTION_VALUES = ("INTERVENED", "guardrail_intervened")
+
+# Unstructured terms that an intervention event carries. Space-separated terms
+# are ANDed, so any other required term narrows the filter.
+GUARDRAIL_INTERVENTION_TERMS = (
+    "amazon-bedrock-guardrailaction",
+    "guardrailaction",
+    "stopreason",
+    "intervened",
+    "guardrail_intervened",
+)
+
+GUARDRAIL_UNSTRUCTURED_TERM = re.compile(r'[?-]?"[^"]*"|\S+')
+
+
+def _intervention_pattern_gap(pattern: str) -> str:
+    """
+    Say why a filter pattern that names intervened, and excludes nothing, does
+    not select every intervention, or return "" when it does.
+
+    A required term is one without a "?" prefix; beside one, the "?" terms are
+    ignored. A JSON or space-delimited pattern with && is not credited, because
+    the other test is not judged.
+    """
+    if not any(value in pattern for value in GUARDRAIL_INTERVENTION_VALUES):
+        return (
+            "names intervened in neither case the log carries (INTERVENED, "
+            "guardrail_intervened), and filter patterns are case sensitive"
+        )
+    stripped = pattern.strip()
+    if stripped.startswith(("{", "[")):
+        if "&&" in stripped:
+            return (
+                "ANDs the intervention test with another test, so it counts only "
+                "the interventions that also meet it"
+            )
+        return ""
+    if stripped.startswith("%"):
+        return ""
+    terms = GUARDRAIL_UNSTRUCTURED_TERM.findall(stripped)
+    required = [term for term in terms if not term.startswith("?")]
+    if not required:
+        return ""
+    others = [
+        term
+        for term in required
+        if term.strip('"').lower() not in GUARDRAIL_INTERVENTION_TERMS
+    ]
+    if others:
+        return "also requires the term {}, so it counts only the interventions whose event carries it".format(
+            ", ".join(others)
+        )
+    if not any(
+        value in term for term in required for value in GUARDRAIL_INTERVENTION_VALUES
+    ):
+        return "names the intervention value only in a ? term, which is ignored beside a required term"
+    return ""
+
+
 GUARDRAIL_SIGNAL_CEILING = (
     "Model invocation logging records only InvokeModel, InvokeModelWithResponseStream, "
     "Converse and ConverseStream, so an intervention raised by ApplyGuardrail reaches "
@@ -16081,6 +16325,12 @@ GUARDRAIL_SLICE_DIMENSIONS = (
 )
 
 GUARDRAIL_VERSION_DIMENSIONS = ("GuardrailArn", "GuardrailVersion")
+
+GUARDRAIL_METRIC_DIMENSIONS_NOTE = (
+    "AWS/Bedrock/Guardrails publishes InvocationsIntervened only under a "
+    "dimension (Operation, GuardrailContentSource, GuardrailPolicyType, or "
+    "GuardrailArn with GuardrailVersion; monitoring-guardrails-cw-metrics)"
+)
 
 # A statistic whose value over a period is at least 1 when one intervention
 # was counted in it. Average, Minimum and percentiles can stay below 1.
@@ -16206,11 +16456,18 @@ def _find_guardrail_intervention_metric_filters(
         if not isinstance(response, dict):
             raise TypeError("DescribeMetricFilters returned no response object")
         for metric_filter in response.get("metricFilters", []):
-            pattern = (metric_filter.get("filterPattern") or "").lower()
+            raw_pattern = metric_filter.get("filterPattern") or ""
+            pattern = raw_pattern.lower()
             name = metric_filter.get("filterName") or "unnamed"
-            if GUARDRAIL_INTERVENTION_TOKEN in pattern and not (
-                GUARDRAIL_INTERVENTION_EXCLUSION.search(pattern)
-            ):
+            gap = (
+                _intervention_pattern_gap(raw_pattern)
+                if GUARDRAIL_INTERVENTION_TOKEN in pattern
+                and not GUARDRAIL_INTERVENTION_EXCLUSION.search(pattern)
+                else None
+            )
+            if gap:
+                rejected.append({"name": name, "metrics": [], "reason": gap})
+            elif gap == "":
                 matched.append(
                     {
                         "name": name,
@@ -16227,7 +16484,7 @@ def _find_guardrail_intervention_metric_filters(
                     }
                 )
             elif "guardrail" in pattern:
-                rejected.append({"name": name, "metrics": []})
+                rejected.append({"name": name, "metrics": [], "reason": ""})
         next_token = response.get("nextToken")
         if not next_token:
             break
@@ -16510,11 +16767,12 @@ def _guardrail_intervention_signal_finding(
     filter over the invocation log group derives from INTERVENED.
 
     An acting alarm counts only when one intervention in one period raises it
-    (_single_event_alarm_gap) and, on InvocationsIntervened, when it carries
-    no dimension. A slice dimension counts part of the interventions and fails;
-    an alarm scoped to one guardrail version by GuardrailArn and
-    GuardrailVersion keeps the row from Passed, because which versions callers
-    name is not read.
+    (_single_event_alarm_gap). On InvocationsIntervened, an alarm with no
+    dimension is not credited, because the metric is published only under the
+    dimension sets GUARDRAIL_METRIC_DIMENSIONS_NOTE names. A slice dimension
+    counts part of the interventions and fails; an alarm scoped to one guardrail
+    version by GuardrailArn and GuardrailVersion keeps the row from Passed,
+    because which versions callers name is not read.
     """
     finding_name = "Guardrail Intervention Monitoring Signal"
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html"
@@ -16559,7 +16817,6 @@ def _guardrail_intervention_signal_finding(
             ns == GUARDRAIL_METRIC_NAMESPACE and name == GUARDRAIL_INTERVENTION_METRIC
         )
     )
-    acting_alarms = []
     alarm_gaps = []
     version_scoped = []
     unjudged = []
@@ -16593,7 +16850,11 @@ def _guardrail_intervention_signal_finding(
                 )
             )
         else:
-            acting_alarms.append(alarm_name)
+            alarm_gaps.append(
+                f"alarm {alarm_name} names no dimension, and "
+                f"{GUARDRAIL_METRIC_DIMENSIONS_NOTE}, so the alarm evaluates a "
+                "series that receives no datapoint"
+            )
     other_guardrail_alarms = sorted(
         set().union(
             *alarms_on(
@@ -16603,7 +16864,6 @@ def _guardrail_intervention_signal_finding(
                 )
             )
         )
-        - set(acting_alarms)
         - set(silent_alarms)
     )
 
@@ -16648,28 +16908,30 @@ def _guardrail_intervention_signal_finding(
         gaps.append(
             f"metric filter(s) {', '.join(sorted(unalarmed_filters))} match an intervention but no acting alarm evaluates the metric they emit"
         )
-    if filters["rejected"]:
+    unselecting = sorted(f["name"] for f in filters["rejected"] if not f["reason"])
+    if unselecting:
         gaps.append(
-            f"metric filter(s) {', '.join(sorted(f['name'] for f in filters['rejected']))} name a guardrail field without selecting INTERVENED"
+            f"metric filter(s) {', '.join(unselecting)} name a guardrail field without selecting INTERVENED"
         )
+    gaps.extend(
+        f"metric filter {f['name']} {f['reason']}"
+        for f in sorted(filters["rejected"], key=lambda f: f["name"])
+        if f["reason"]
+    )
     gap_text = f" Not credited: {'; '.join(gaps)}." if gaps else ""
     forwarding = (
         " " + _describe_log_forwarding(log_group_name, region) if log_group_name else ""
     )
 
     observed = []
-    if acting_alarms:
-        observed.append(
-            f"CloudWatch alarm(s) {', '.join(acting_alarms)} on {GUARDRAIL_METRIC_NAMESPACE} {GUARDRAIL_INTERVENTION_METRIC}"
-        )
     if alarmed_filters:
         observed.append(
             f"metric filter(s) on log group '{log_group_name}' selecting INTERVENED with an acting alarm: {', '.join(sorted(alarmed_filters))}"
         )
 
-    resolution = "Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace with an enabled alarm action, or send model invocation logs to CloudWatch Logs, add a metric filter on amazon-bedrock-guardrailAction=INTERVENED (Converse: stopReason=guardrail_intervened), and alarm on the metric it emits. Forward the invocation logs to the SIEM."
+    resolution = "Send model invocation logs to CloudWatch Logs, add a metric filter on amazon-bedrock-guardrailAction=INTERVENED (Converse: stopReason=guardrail_intervened), and alarm on the metric it emits with an enabled alarm action. Where ApplyGuardrail is called, alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace for each GuardrailArn and GuardrailVersion callers name. Forward the invocation logs to the SIEM."
 
-    if acting_alarms or (alarmed_filters and apply_guardrail_called is False):
+    if alarmed_filters and apply_guardrail_called is False:
         return row(
             f"{scope_text} Guardrail interventions reach an acting alarm through {' and '.join(observed)}.{gap_text}{forwarding}",
             "No action required. Confirm the alarm action reaches the security monitoring destination that is reviewed.",
@@ -16679,7 +16941,7 @@ def _guardrail_intervention_signal_finding(
     if alarmed_filters and apply_guardrail_called is None:
         return row(
             f"{scope_text} Interventions on the four logged inference APIs reach an acting alarm through {' and '.join(observed)}, but whether ApplyGuardrail is called here was not read (cloudtrail:LookupEvents), and its interventions reach no metric filter, so this is not reported as Passed.{gap_text}{forwarding}",
-            "Grant cloudtrail:LookupEvents and retry, or alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace.",
+            "Grant cloudtrail:LookupEvents and retry.",
             "Informational",
             "N/A",
         )
@@ -16689,7 +16951,7 @@ def _guardrail_intervention_signal_finding(
             + "; ".join(version_scoped + unjudged)
             + ". Which guardrail versions callers name is not read, and a metric math result is not evaluated, so this is not reported as Passed or Failed."
             + f"{gap_text}{forwarding}",
-            "Alarm on InvocationsIntervened with no dimension, statistic Sum, a threshold of GreaterThanOrEqualToThreshold 1 over one datapoint, and an enabled alarm action, or confirm that the per-version alarms cover every version callers name.",
+            "Confirm that the per-version alarms cover every guardrail version callers name, each with statistic Sum, a threshold of GreaterThanOrEqualToThreshold 1 over one datapoint, and an enabled alarm action.",
             "Informational",
             "N/A",
         )
@@ -18768,11 +19030,13 @@ MANTLE_MODEL_CONDITION_KEY = "bedrock-mantle:model"
 
 TRAINING_DATA_READ_ACTION = "s3:getobject"
 
-# The _ai_data_path_buckets labels that name a customization job's input.
+# The _ai_data_path_buckets labels that name a customization job's or a
+# SageMaker training job's input.
 TRAINING_DATA_LABEL_PREFIXES = (
     "the training data of",
     "the validation data of",
     "the invocation log source of",
+    "the training data channel ",
 )
 
 # Stands in for any object key when asking whether a pattern reaches a bucket.
@@ -18998,7 +19262,8 @@ def _training_data_reach(
 def _training_data_buckets() -> Dict[str, Any]:
     """
     Resolve the S3 buckets model customization jobs read training, validation
-    and distillation input from, in every assessed Region.
+    and distillation input from, and SageMaker training jobs read their input
+    channels from, in every assessed Region.
     """
     buckets: Dict[str, List[str]] = {}
     errors = []
@@ -19018,7 +19283,10 @@ def _training_data_buckets() -> Dict[str, Any]:
         errors.extend(
             f"{region} {error}"
             for error in inventory["errors"]
-            if error.startswith(("model customization jobs", "customization job "))
+            if error.startswith(
+                ("model customization jobs", "customization job ", "SageMaker ")
+            )
+            or "older SageMaker training job(s)" in error
         )
     return {
         "buckets": buckets,
@@ -19273,9 +19541,9 @@ def check_bedrock_model_allow_list(
                     check_id="BR-42",
                     finding_name=check_name,
                     finding_details=(
-                        "Access to model customization training data was not fully "
-                        "assessed because the customization jobs could not all be "
-                        "read: {}.".format(
+                        "Access to model training data was not fully assessed "
+                        "because the model customization and SageMaker training "
+                        "jobs could not all be read: {}.".format(
                             "; ".join(training_data.get("errors") or [])[:1500]
                         )
                     ),
@@ -19289,16 +19557,19 @@ def check_bedrock_model_allow_list(
         elif training_buckets:
             training_note = (
                 " s3:GetObject grants were tested against {} training data "
-                "bucket(s) of model customization jobs in {} assessed Region(s); "
+                "bucket(s) of model customization and SageMaker training jobs in "
+                "{} assessed Region(s); "
                 "statement conditions on those grants are not evaluated.".format(
                     len(training_buckets), len(training_data.get("regions") or [])
                 )
             )
         else:
             training_note = (
-                " No model customization job in the {} assessed Region(s) reads "
-                "training data from S3, so there was no training data grant to "
-                "test.".format(len(training_data.get("regions") or []))
+                " No model customization or SageMaker training job in the {} "
+                "assessed Region(s) reads training data from S3, so there was no "
+                "training data grant to test.".format(
+                    len(training_data.get("regions") or [])
+                )
             )
 
         if scoped:
@@ -19321,6 +19592,15 @@ def check_bedrock_model_allow_list(
                     region=region,
                 )
             )
+            if training_data.get("errors"):
+                # The training data leg was not fully read, so an unscoped
+                # s3:GetObject grant on an unread job's bucket may be missed.
+                row = findings["csv_data"][-1]
+                row["Status"] = "N/A"
+                row["Finding_Details"] = (
+                    f"{row['Finding_Details']} This is not reported as Passed "
+                    "because the training data buckets were not all read."
+                )
 
         if not scoped and not unrestricted:
             findings["details"] = "No cached identity grants Bedrock model invocation"
@@ -19379,8 +19659,9 @@ REGION_CONDITION_KEY = "aws:requestedregion"
 
 # Every IAM action that sends a prompt to a model: Converse and ConverseStream
 # authorize as InvokeModel and InvokeModelWithResponseStream, agents, flows and
-# RetrieveAndGenerate invoke a model on the caller's behalf, and an AgentCore
-# runtime is invoked through bedrock-agentcore:InvokeAgentRuntime.
+# RetrieveAndGenerate invoke a model on the caller's behalf, an AgentCore
+# runtime is invoked through bedrock-agentcore:InvokeAgentRuntime, and the
+# bedrock-mantle endpoint sends a prompt through bedrock-mantle:CreateInference.
 REGION_CONTROL_ACTIONS = (
     "bedrock:invokemodel",
     "bedrock:invokemodelwithresponsestream",
@@ -19390,6 +19671,7 @@ REGION_CONTROL_ACTIONS = (
     "bedrock:invokeflow",
     "bedrock:retrieveandgenerate",
     "bedrock-agentcore:invokeagentruntime",
+    "bedrock-mantle:createinference",
 )
 
 GLOBAL_INFERENCE_REGION_VALUE = "unspecified"
@@ -19901,6 +20183,29 @@ def check_bedrock_region_invocation_control(
                     "every assessed Region, then re-run the assessment.",
                     "Informational",
                     "N/A",
+                )
+            )
+        elif allow_listed and not uncovered and not global_open and outside_profiles:
+            findings["status"] = "WARN"
+            findings["details"] = "The Region allow-list omits a profile destination"
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) condition Bedrock "
+                    "invocation on the request Region: {}, but the allowed set "
+                    "does not include every destination Region of the inference "
+                    "profiles available in the assessed Regions.{} Which profiles "
+                    "are in use is not read. Observed routing: {}.{}".format(
+                        len(described),
+                        "; ".join(described[:5]),
+                        destination_text,
+                        routing_text,
+                        notes,
+                    ),
+                    "Add {} to the Region allow-list, or deny the geographic "
+                    "profiles that route there so no workload depends on "
+                    "them.".format(", ".join(sorted(outside_regions))),
+                    "Medium",
+                    "Failed",
                 )
             )
         elif allow_listed and not uncovered and not global_open:
@@ -20637,15 +20942,90 @@ def _names_a_model_list(value: Any) -> bool:
     ) and not _pattern_covers_every_model(value)
 
 
+# The condition keys whose value is the model or inference profile a request
+# invokes, from the Service Authorization Reference. A negated test on another
+# key denies by that key's value, whatever model ARNs its values name.
+MODEL_LIST_CONDITION_KEYS = ("bedrock:modelarn", "bedrock:inferenceprofilearn")
+
+
+def _mantle_model_list_control(statement: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Describe a Deny on bedrock-mantle:CreateInference outside a list of models
+    named by a negated test on bedrock-mantle:Model, or None when the statement
+    is no such Deny. The action authorizes against a project ARN, so a Resource
+    that is not "*" denies inference only in the projects it names.
+    """
+    if not _statement_matches_action(statement, MANTLE_INFERENCE_ACTION):
+        return None
+    conditions = _condition_keys_by_operator(statement)
+    list_test = next(
+        (
+            (operator, values)
+            for operator, key, values in conditions
+            if key == MANTLE_MODEL_CONDITION_KEY
+            and _strip_condition_set_operator(operator).startswith("stringnot")
+        ),
+        None,
+    )
+    if list_test is None or not list_test[1]:
+        return None
+    operator, values = list_test
+    named = [str(value) for value in values]
+    gaps = []
+    open_values = [value for value in named if any(char in value for char in "*?")]
+    if open_values:
+        gaps.append(
+            "its list value {} has a wildcard, so every model it matches is "
+            "exempt".format(", ".join(open_values))
+        )
+    resources = [str(r).strip() for r in _as_list(statement.get("Resource"))]
+    if "NotResource" in statement or "*" not in resources:
+        gaps.append(
+            "its Resource {} does not match every project, so it denies only "
+            "inference in what that names".format(
+                ", ".join(
+                    map(
+                        str,
+                        _as_list(
+                            statement.get("NotResource") or statement.get("Resource")
+                        ),
+                    )
+                )
+                or "is absent and"
+            )
+        )
+    narrowing = sorted(
+        {
+            f"{other} on {key}"
+            for other, key, _ in conditions
+            if key != MANTLE_MODEL_CONDITION_KEY
+        }
+    )
+    if narrowing:
+        gaps.append(
+            "it also requires {}, so it denies only the requests that meet "
+            "that test too".format(", ".join(narrowing))
+        )
+    return {
+        "actions": [MANTLE_INFERENCE_ACTION],
+        "form": f"{operator} on {MANTLE_MODEL_CONDITION_KEY}",
+        "models": named,
+        "gaps": gaps,
+    }
+
+
 def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
     """
     Describe every Deny statement that denies model invocation outside a list of
     named models.
 
     The list is either a NotResource naming model or inference-profile ARNs, or
-    a negated condition whose values name them. A Deny written with NotAction
+    a negated condition on a MODEL_LIST_CONDITION_KEYS key whose values name
+    them. A condition-form Deny must also have a Resource that matches every
+    model, or it denies only the resources it names. A Deny written with NotAction
     covers every action it does not name. A pattern that matches every model,
-    such as arn:aws:bedrock:*::foundation-model/*, is no list at all.
+    such as arn:aws:bedrock:*::foundation-model/*, is no list at all. A Deny on
+    bedrock-mantle:CreateInference is judged by _mantle_model_list_control.
 
     ``gaps`` names what keeps a control from denying every unlisted model: a
     list value with a wildcard in its resource type or ID, which exempts every
@@ -20656,6 +21036,9 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "DENY":
             continue
+        mantle = _mantle_model_list_control(statement)
+        if mantle is not None:
+            controls.append(mantle)
         if "NotAction" in statement:
             covered = [
                 action_name
@@ -20684,7 +21067,10 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
         if not named:
             form = "condition"
             for operator, key, values in conditions:
-                if "not" not in _strip_condition_set_operator(operator):
+                if (
+                    "not" not in _strip_condition_set_operator(operator)
+                    or str(key).lower() not in MODEL_LIST_CONDITION_KEYS
+                ):
                     continue
                 named = [str(value) for value in values if _names_a_model_list(value)]
                 if named:
@@ -20705,6 +21091,15 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
                 "its list value {} has a wildcard in the model or profile ID, so "
                 "every model it matches is exempt".format(", ".join(open_values))
             )
+        if list_key is not None:
+            resources = [str(r).strip() for r in _as_list(statement.get("Resource"))]
+            if not any(r == "*" or _pattern_covers_every_model(r) for r in resources):
+                gaps.append(
+                    "its Resource {} does not match every model, so it denies "
+                    "only invocation of what that names".format(
+                        ", ".join(resources) or "is absent and"
+                    )
+                )
         narrowing = sorted(
             {
                 f"{operator} on {key}"
@@ -20865,7 +21260,9 @@ def check_bedrock_approved_model_control(
                 )
 
         uncovered = [
-            action for action in MODEL_INVOKE_ACTIONS if action not in covered_actions
+            action
+            for action in MODEL_INVOKE_ACTIONS + (MANTLE_INFERENCE_ACTION,)
+            if action not in covered_actions
         ]
         scope_note = (
             "The approved model list is the customer's decision and is not judged "
@@ -20903,8 +21300,10 @@ def check_bedrock_approved_model_control(
                         ", ".join(uncovered),
                         scope_note,
                     ),
-                    "Extend the service control policy Deny so it covers both the "
-                    "standard and the streaming model invocation actions.",
+                    "Extend the service control policy Deny so it covers the "
+                    "standard and the streaming model invocation actions, and add "
+                    "a Deny on bedrock-mantle:CreateInference with StringNotEquals "
+                    "on bedrock-mantle:Model naming the approved models.",
                     "Medium",
                     "Failed",
                 )
@@ -21002,7 +21401,34 @@ def _product_values_are_named(values: List[Any]) -> bool:
     )
 
 
-def _marketplace_statement_binding(statement: Dict[str, Any]) -> Dict[str, Any]:
+def _marketplace_absent_product_denied(
+    statements: List[Dict[str, Any]], action: str
+) -> bool:
+    """
+    True when a Deny on the action has a Null true test on
+    aws-marketplace:ProductId and no other condition, so a request that
+    carries no product is denied.
+    """
+    for statement in statements:
+        if str(
+            statement.get("Effect", "")
+        ).upper() != "DENY" or not _statement_matches_action(statement, action):
+            continue
+        conditions = _condition_keys_by_operator(statement)
+        if conditions and all(
+            key == MARKETPLACE_PRODUCT_CONDITION_KEY
+            and _strip_condition_set_operator(operator) == "null"
+            and values
+            and all(str(value).strip().lower() == "true" for value in values)
+            for operator, key, values in conditions
+        ):
+            return True
+    return False
+
+
+def _marketplace_statement_binding(
+    statement: Dict[str, Any], absent_denied: bool = False
+) -> Dict[str, Any]:
     """
     Judge how one statement bounds Marketplace subscription by product.
 
@@ -21010,7 +21436,10 @@ def _marketplace_statement_binding(statement: Dict[str, Any]) -> Dict[str, Any]:
     values each name a product. ForAllValues: is true when the key is absent, so
     it binds only beside a Null false test on the same key. A Deny is an
     allow-list only with a negated test over named products and no other key; a
-    Deny naming products positively leaves every other product allowed.
+    Deny naming products positively leaves every other product allowed, and
+    ForAnyValue: is false when the key is absent, so that Deny binds only when
+    ``absent_denied``: another Deny refuses a request with no product key
+    (_marketplace_absent_product_denied).
     """
     conditions = _condition_keys_by_operator(statement)
     product_tests = [
@@ -21071,6 +21500,12 @@ def _marketplace_statement_binding(statement: Dict[str, Any]) -> Dict[str, Any]:
                     f"Deny with {operator} is false when any requested product is "
                     "approved, so a mixed request is not denied"
                 )
+            elif operator.startswith("foranyvalue:") and not absent_denied:
+                reasons.append(
+                    f"Deny with {operator} is false when the product key is "
+                    "absent, and no Deny with a Null true test on it refuses a "
+                    "request that carries no product"
+                )
             elif other_keys:
                 reasons.append(
                     "Deny is also conditioned on {}, which narrows it to part of "
@@ -21118,19 +21553,24 @@ def _marketplace_scp_bounds(
     observed["unread"].extend(scp_inventory.get("errors") or [])
     if scp_inventory.get("management_account"):
         return observed
+    documents = []
     for item in scp_inventory.get("items") or []:
         try:
-            statements = _policy_statements(item.get("content") or "{}")
+            documents.append((item, _policy_statements(item.get("content") or "{}")))
         except (ValueError, TypeError) as error:
             observed["unread"].append(
                 f"policy '{item.get('name')}': {get_assessment_error_label(error)}"
             )
-            continue
+    every_statement = [st for _, statements in documents for st in statements]
+    for item, statements in documents:
         for statement in statements:
             if str(statement.get("Effect", "")).upper() != "DENY":
                 continue
-            binding = _marketplace_statement_binding(statement)
             for action in MARKETPLACE_CHANGE_ACTIONS:
+                binding = _marketplace_statement_binding(
+                    statement,
+                    _marketplace_absent_product_denied(every_statement, action),
+                )
                 if _identity_denies_everywhere(statement, action):
                     observed["bounded"].setdefault(action, []).append(
                         "policy '{}' (denies {} with no condition)".format(
@@ -21247,8 +21687,11 @@ def check_bedrock_marketplace_model_control(
                 ]
                 credited_deny = None
                 deny_reasons = []
+                absent_denied = _marketplace_absent_product_denied(
+                    [statement for _, statement in denies], action
+                )
                 for label, statement in denies:
-                    binding = _marketplace_statement_binding(statement)
+                    binding = _marketplace_statement_binding(statement, absent_denied)
                     if binding["bound"]:
                         credited_deny = f"{label}: {binding['detail']}"
                         break
@@ -21597,6 +22040,33 @@ def _bedrock_api_key_scp_controls(statements: List[tuple]) -> Dict[str, Any]:
             elif not conditions or keys == {BEDROCK_CREDENTIAL_SERVICE_NAME_KEY}:
                 result["age"].append(f"{label} denies creating the credential at all")
             else:
+                null_true = any(
+                    _strip_condition_set_operator(operator) == "null"
+                    and values
+                    and all(str(value).strip().lower() == "true" for value in values)
+                    for operator, values in age_tests
+                )
+                caps = [
+                    (operator, values)
+                    for operator, values in age_tests
+                    if _strip_condition_set_operator(operator) != "null"
+                ]
+                if null_true and caps:
+                    # Conditions in one statement are ANDed: Null true holds only
+                    # when the key is absent, so the cap never denies a lifetime.
+                    result["gaps"].append(
+                        "{} tests {} and Null true in the same statement, which "
+                        "together match only a credential with no expiry, so it "
+                        "denies no lifetime".format(
+                            label, ", ".join(operator for operator, _ in caps)
+                        )
+                    )
+                    if all(
+                        _strip_condition_set_operator(operator).endswith("ifexists")
+                        for operator, _ in caps
+                    ):
+                        result["null_age"].append(label)
+                    age_tests = []
                 for operator, values in age_tests:
                     base = _strip_condition_set_operator(operator)
                     if base == "null":
@@ -22706,10 +23176,12 @@ def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
             "note": (
                 f"sso:ListInstances in {sso_region} returned no IAM Identity "
                 "Center instance. An instance homed only in another Region is "
-                "not listed here."
+                "not listed here, so this is not reported as Passed: whether "
+                "people sign in through an instance in another Region was not "
+                "read."
             ),
-            "status": "Passed",
-            "severity": "High",
+            "status": "N/A",
+            "severity": "Informational",
             "unguarded": [],
         }
     permission_sets = _identity_center_ai_permission_sets(
@@ -22791,15 +23263,19 @@ def _ai_write_services(permissions: Dict[str, Any]) -> List[str]:
     return sorted(services)
 
 
-def _mfa_deny_statement_services(statement: Dict[str, Any]) -> List[str]:
+def _mfa_deny_statement_services(
+    statement: Dict[str, Any], console: bool = True
+) -> List[str]:
     """
     Return the AI services whose every action a Deny statement blocks when the
     request was not signed with MFA.
 
     Only BoolIfExists false or Null true on aws:MultiFactorAuthPresent is
     credited: a request signed with a long-term access key carries no such key,
-    so a plain Bool false test never fires for it. A second condition key
-    narrows the Deny and is not credited.
+    so a plain Bool false test never fires for it. A console session carries the
+    key as false, so Null true never fires for it, and with console set only
+    BoolIfExists false is credited. A second condition key narrows the Deny and
+    is not credited.
     """
     if str(statement.get("Effect", "")).upper() != "DENY":
         return []
@@ -22811,6 +23287,8 @@ def _mfa_deny_statement_services(statement: Dict[str, Any]) -> List[str]:
     for operator, _, values in conditions:
         base = _strip_condition_set_operator(operator)
         wanted = {"boolifexists": "false", "null": "true"}.get(base)
+        if console and base == "null":
+            return []
         if wanted is None or not values:
             return []
         if any(str(value).strip().lower() != wanted for value in values):
@@ -22893,10 +23371,11 @@ def _principal_tag_deny_statement(statement: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _mfa_deny_source(permissions: Dict[str, Any]) -> str:
+def _mfa_deny_source(permissions: Dict[str, Any], console: bool = True) -> str:
     """
     Name the Deny that requires MFA on every AI write service an identity holds,
-    from its own policies or its permissions boundary, or return "".
+    from its own policies or its permissions boundary, or return "". With
+    console set, only a Deny that also fires for console sessions is named.
     """
     needed = set(_ai_write_services(permissions))
     if not needed:
@@ -22912,7 +23391,7 @@ def _mfa_deny_source(permissions: Dict[str, Any]) -> str:
     names = []
     for label, document in sources:
         for statement in _policy_statements(document):
-            services = set(_mfa_deny_statement_services(statement)) & needed
+            services = set(_mfa_deny_statement_services(statement, console)) & needed
             if services - covered:
                 covered |= services
                 names.append(label)
@@ -23085,6 +23564,9 @@ def check_bedrock_ai_user_console_mfa(
             if deny_source:
                 deny_protected.append(f"{user_name} ({deny_source})")
                 continue
+            key_deny_source = _mfa_deny_source(
+                permission_cache["user_permissions"][user_name], console=False
+            )
             try:
                 iam_client.get_login_profile(UserName=user_name)
                 console = True
@@ -23164,7 +23646,13 @@ def check_bedrock_ai_user_console_mfa(
                 )
                 continue
             active = [key for key in keys if key.get("Status") == "Active"]
-            if active:
+            if active and key_deny_source:
+                if has_device or not console:
+                    deny_protected.append(
+                        f"{user_name} ({key_deny_source}, which holds its access "
+                        "keys to MFA)"
+                    )
+            elif active:
                 findings["status"] = "WARN"
                 findings["csv_data"].append(
                     row(
@@ -28354,14 +28842,17 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
     path or the account itself is read. ListPolicies and DescribePolicy answer
     only in the management account or a delegated administrator, so a
     member-account run reports the leg as unassessed instead of reporting no
-    delegation. ``locking`` names each policy that locks the default at every
-    placement, and ``open`` names what each other policy leaves open.
+    delegation. ``locking`` names each policy attached to the root that locks
+    the default at every placement, ``locked_below`` each such policy attached
+    only below the root, which binds no policy attached above it, and ``open``
+    names what each other policy leaves open.
     """
     result = {
         "readable": False,
         "delegating": [],
         "errors": [],
         "locking": [],
+        "locked_below": [],
         "open": [],
         "account": "",
     }
@@ -28381,6 +28872,7 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
         )
         return result
     path_ids = {target["Id"] for target in path}
+    root_id = path[-1]["Id"]
 
     try:
         policies = _list_all_items(
@@ -28459,8 +28951,10 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
         described = f"'{policy_name}' (attached to {', '.join(attached_to)})"
         if gaps:
             result["open"].append(f"{described}: {'; '.join(gaps)}")
-        else:
+        elif any(target.get("TargetId") == root_id for target in targets):
             result["locking"].append(described)
+        else:
+            result["locked_below"].append(described)
 
     return result
 
@@ -28649,6 +29143,7 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                     f"{get_assessment_error_label(error)}"
                 ],
                 "locking": [],
+                "locked_below": [],
                 "open": [],
                 "account": "",
             }
@@ -28684,7 +29179,7 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                     "path of account {} or the account itself sets "
                     '["@@none"] at all of {}, so a child policy can add a service '
                     "section that opts back in, as AWS Example 2 shows for Amazon "
-                    "Lex. {} policy(ies) apply{}.{}".format(
+                    "Lex. {} policy(ies) apply{}.{}{}".format(
                         effective_clause,
                         overrides["account"] or "unknown",
                         lock_placements,
@@ -28692,11 +29187,19 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                         ": " + " | ".join(overrides["open"][:5])
                         if overrides["open"]
                         else "",
+                        " {} lock(s) the default at every placement but is "
+                        "attached below the root, so a policy attached to the root "
+                        "or an OU above it is not bound by that lock and can add a "
+                        "section that opts back in.".format(
+                            " and ".join(overrides["locked_below"][:3])
+                        )
+                        if overrides["locked_below"]
+                        else "",
                         child_clause if overrides["delegating"] else "",
                     )
                 )
                 lock_resolution = (
-                    "In the opt-out policy attached highest in the organization, set "
+                    "In an opt-out policy attached to the organization root, set "
                     '"@@operators_allowed_for_child_policies": ["@@none"] under '
                     "services, under services.default and under "
                     "services.default.opt_out_policy, as in AWS Example 1."
@@ -28706,7 +29209,8 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                 lock_status = "N/A"
                 lock_detail = (
                     "{}, but whether a child policy can opt a service back in was "
-                    "not established, and no readable policy was found that locks "
+                    "not established, and no readable policy attached to the root was "
+                    "found that locks "
                     "the default at all of {}: {}.".format(
                         effective_clause,
                         lock_placements,
@@ -28731,6 +29235,33 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                     reference=AI_SERVICES_OPT_OUT_REFERENCE,
                     severity=lock_severity,
                     status=lock_status,
+                    region=region,
+                )
+            )
+        elif default_opts_out and not scope["opted_in"] and overrides["errors"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        '{}, and {} sets ["@@none"] at {}, but {} other source '
+                        "opt-out policy read(s) failed, so the policies that apply "
+                        "to this account were not all read: {}.".format(
+                            effective_clause,
+                            " and ".join(overrides["locking"][:3]),
+                            lock_placements,
+                            len(overrides["errors"]),
+                            "; ".join(overrides["errors"][:5]),
+                        )
+                    ),
+                    resolution=(
+                        "Grant organizations:ListTargetsForPolicy and "
+                        "organizations:DescribePolicy for every opt-out policy, "
+                        "then retry."
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
                     region=region,
                 )
             )
