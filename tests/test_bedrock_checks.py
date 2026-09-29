@@ -902,12 +902,14 @@ class TestBR02VPCEndpointHardening:
 
 
 def _empty_ecs_and_sagemaker():
-    """ECS and SageMaker clients that list no clusters, services or notebooks."""
+    """ECS, SageMaker and AgentCore clients that list no workloads."""
     ecs = MagicMock()
     ecs.list_clusters.return_value = {"clusterArns": []}
     sagemaker = MagicMock()
     sagemaker.list_notebook_instances.return_value = {"NotebookInstances": []}
-    return {"ecs": ecs, "sagemaker": sagemaker}
+    agentcore = MagicMock()
+    agentcore.list_agent_runtimes.return_value = {"agentRuntimes": []}
+    return {"ecs": ecs, "sagemaker": sagemaker, "bedrock-agentcore-control": agentcore}
 
 
 class TestBR02WorkloadConnectivity:
@@ -1113,11 +1115,22 @@ class TestBR02WorkloadConnectivity:
 
         detail = rows[0]["Finding_Details"]
         assert (
-            "Lambda functions, EC2 instances, ECS services and SageMaker notebook "
-            "instances are read." in detail
+            "Lambda functions, EC2 instances, ECS services, SageMaker notebook "
+            "instances and VPC-mode AgentCore runtime versions are read." in detail
         )
-        assert "EKS pods and SageMaker endpoints are not read" in detail
-        assert "an ECS task started outside a service is not listed" in detail
+        for action in (
+            "sagemaker:DescribeEndpoint",
+            "sagemaker:DescribeEndpointConfig",
+            "sagemaker:DescribeModel",
+            "eks:ListClusters",
+            "eks:DescribeCluster",
+            "eks:ListPodIdentityAssociations",
+            "ecs:ListTasks",
+            "ecs:DescribeTasks",
+        ):
+            assert action in detail
+        assert "are not granted to this assessment" in detail
+        assert "ceiling" not in detail.lower()
         for action in (
             "ecs:ListServices",
             "ecs:DescribeServices",
@@ -1348,6 +1361,9 @@ class TestBR02WorkloadConnectivity:
         notebook_details=None,
         subnets=None,
         describe_failures=(),
+        runtimes=None,
+        runtime_details=None,
+        runtime_endpoints=None,
     ):
         """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired.
 
@@ -1443,12 +1459,28 @@ class TestBR02WorkloadConnectivity:
             return outcome
 
         sagemaker.describe_notebook_instance.side_effect = describe_notebook
+        agentcore = MagicMock()
+        if isinstance(runtimes, Exception):
+            agentcore.list_agent_runtimes.side_effect = runtimes
+        else:
+            agentcore.list_agent_runtimes.return_value = {
+                "agentRuntimes": list(runtimes or [])
+            }
+        runtime_endpoints = runtime_endpoints or {}
+        agentcore.list_agent_runtime_endpoints.side_effect = lambda **kwargs: {
+            "runtimeEndpoints": runtime_endpoints.get(kwargs["agentRuntimeId"], [])
+        }
+        runtime_details = runtime_details or {}
+        agentcore.get_agent_runtime.side_effect = lambda **kwargs: runtime_details[
+            (kwargs["agentRuntimeId"], kwargs["agentRuntimeVersion"])
+        ]
         clients = {
             "lambda": lambda_client,
             "ec2": ec2_client,
             "iam": MagicMock(),
             "ecs": ecs,
             "sagemaker": sagemaker,
+            "bedrock-agentcore-control": agentcore,
         }
         with patch(
             "bedrock_app.boto3.client",
@@ -1464,6 +1496,87 @@ class TestBR02WorkloadConnectivity:
             (w["kind"], w["name"], w["vpc_id"], w["role"])
             for w in inventory["workloads"]
         ]
+
+    @staticmethod
+    def _runtime_version(mode, role, subnets=None):
+        network = {"networkMode": mode} if mode else {}
+        if subnets is not None:
+            network["networkModeConfig"] = {"subnets": list(subnets)}
+        return {
+            "roleArn": f"arn:aws:iam::123456789012:role/{role}",
+            "networkConfiguration": network,
+        }
+
+    def test_br02_vpc_mode_agentcore_runtime_versions_carry_their_role_and_vpc(
+        self,
+    ):
+        inventory = self._inventory(
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+            runtimes=[
+                {
+                    "agentRuntimeId": "rt-1",
+                    "agentRuntimeName": "planner",
+                    "agentRuntimeVersion": "2",
+                },
+                {
+                    "agentRuntimeId": "rt-2",
+                    "agentRuntimeName": "chat",
+                    "agentRuntimeVersion": "1",
+                },
+            ],
+            runtime_endpoints={"rt-1": [{"liveVersion": "1", "targetVersion": "2"}]},
+            runtime_details={
+                ("rt-1", "1"): self._runtime_version("VPC", "OldRole", ["subnet-1"]),
+                ("rt-1", "2"): self._runtime_version("VPC", "NewRole", ["subnet-2"]),
+                ("rt-2", "1"): self._runtime_version("PUBLIC", "ChatRole"),
+            },
+        )
+
+        assert inventory["errors"] == []
+        assert [
+            workload
+            for workload in self._names(inventory)
+            if workload[0] == "AgentCore runtime"
+        ] == [
+            ("AgentCore runtime", "planner version 1", "vpc-1", "OldRole"),
+            ("AgentCore runtime", "planner version 2", "vpc-2", "NewRole"),
+        ]
+
+    @pytest.mark.parametrize(
+        "runtime_version, phrase",
+        [
+            ((None, "Role", None), "returned no networkMode"),
+            (("VPC", "Role", []), "names no subnets"),
+            (("VPC", "Role", ["subnet-9"]), "subnet-9"),
+        ],
+    )
+    def test_br02_an_unresolved_runtime_network_is_named(self, runtime_version, phrase):
+        inventory = self._inventory(
+            runtimes=[
+                {
+                    "agentRuntimeId": "rt-1",
+                    "agentRuntimeName": "planner",
+                    "agentRuntimeVersion": "1",
+                }
+            ],
+            runtime_details={("rt-1", "1"): self._runtime_version(*runtime_version)},
+        )
+
+        assert not [w for w in self._names(inventory) if w[0] == "AgentCore runtime"]
+        assert len(inventory["errors"]) == 1
+        assert "AgentCore runtime 'planner' version 1" in inventory["errors"][0]
+        assert phrase in inventory["errors"][0]
+
+    def test_br02_unlisted_agentcore_runtimes_are_named(self):
+        inventory = self._inventory(
+            runtimes=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+                "ListAgentRuntimes",
+            )
+        )
+
+        assert len(inventory["errors"]) == 1
+        assert "bedrock-agentcore:ListAgentRuntimes" in inventory["errors"][0]
 
     def test_br02_ecs_services_in_every_cluster_carry_their_task_role_and_vpc(
         self,

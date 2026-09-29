@@ -2554,11 +2554,16 @@ def _granted_bedrock_surfaces(
 WORKLOAD_CONNECTIVITY_FINDING = "Bedrock Workload Private Connectivity"
 
 WORKLOAD_CONNECTIVITY_CEILING = (
-    "Lambda functions, EC2 instances, ECS services and SageMaker notebook "
-    "instances are read. EKS pods and SageMaker endpoints are not read, and an "
-    "ECS task started outside a service is not listed. AgentCore runtimes are "
-    "judged by AC-08. Endpoints reached from another VPC through a shared private "
-    "hosted zone are not read."
+    "Lambda functions, EC2 instances, ECS services, SageMaker notebook "
+    "instances and VPC-mode AgentCore runtime versions are read. A PUBLIC-mode "
+    "AgentCore runtime is judged by AC-01. SageMaker endpoints are not read "
+    "because sagemaker:DescribeEndpoint, sagemaker:DescribeEndpointConfig and "
+    "sagemaker:DescribeModel are not granted to this assessment. EKS clusters "
+    "are not read because eks:ListClusters, eks:DescribeCluster and "
+    "eks:ListPodIdentityAssociations are not granted. An ECS task started "
+    "outside a service is not listed because ecs:ListTasks and "
+    "ecs:DescribeTasks are not granted. Endpoints reached from another VPC "
+    "through a shared private hosted zone are not read."
 )
 
 
@@ -2758,10 +2763,109 @@ def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
         )
 
 
+def _agentcore_runtime_workloads(region: str, inventory: Dict[str, Any]) -> None:
+    """
+    Add every VPC-mode version of every AgentCore runtime, with the VPC of its
+    subnets and its role. A version an endpoint serves is read beside the
+    latest one. A PUBLIC-mode version is left to AC-01.
+    """
+    runtime_client = boto3.client(
+        "bedrock-agentcore-control", config=boto3_config, region_name=region
+    )
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    try:
+        runtimes = _list_all_items(
+            runtime_client, "list_agent_runtimes", "agentRuntimes"
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        inventory["errors"].append(
+            "AgentCore runtimes were not listed with "
+            f"bedrock-agentcore:ListAgentRuntimes ({get_assessment_error_label(error)})"
+        )
+        return
+    subnet_cache: Dict[str, Optional[str]] = {}
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId")
+        name = runtime.get("agentRuntimeName") or runtime_id
+        try:
+            versions = {str(runtime.get("agentRuntimeVersion") or "")}
+            for endpoint in _list_all_items(
+                runtime_client,
+                "list_agent_runtime_endpoints",
+                "runtimeEndpoints",
+                agentRuntimeId=runtime_id,
+            ):
+                for field in ("liveVersion", "targetVersion"):
+                    if endpoint.get(field):
+                        versions.add(str(endpoint[field]))
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"the endpoints of AgentCore runtime '{name}' were not listed with "
+                "bedrock-agentcore:ListAgentRuntimeEndpoints "
+                f"({get_assessment_error_label(error)})"
+            )
+            versions = {str(runtime.get("agentRuntimeVersion") or "")}
+        for version in sorted(version for version in versions if version):
+            label = f"AgentCore runtime '{name}' version {version}"
+            try:
+                detail = runtime_client.get_agent_runtime(
+                    agentRuntimeId=runtime_id, agentRuntimeVersion=version
+                )
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"{label} was not read with bedrock-agentcore:GetAgentRuntime "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            network = detail.get("networkConfiguration") or {}
+            mode = network.get("networkMode")
+            if mode == "PUBLIC":
+                continue
+            if mode != "VPC":
+                inventory["errors"].append(
+                    f"{label} returned no networkMode from "
+                    "bedrock-agentcore:GetAgentRuntime"
+                )
+                continue
+            subnets = (network.get("networkModeConfig") or {}).get("subnets") or []
+            if not subnets:
+                inventory["errors"].append(
+                    f"{label} runs in VPC mode but names no subnets"
+                )
+                continue
+            try:
+                vpcs = _subnet_vpcs(ec2_client, subnets, subnet_cache)
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"the subnets of {label} were not read with "
+                    f"ec2:DescribeSubnets ({get_assessment_error_label(error)})"
+                )
+                continue
+            missing = sorted(subnet for subnet, vpc in vpcs.items() if not vpc)
+            if missing:
+                inventory["errors"].append(
+                    "subnet(s) {} of {} were not returned by ec2:DescribeSubnets".format(
+                        ", ".join(missing), label
+                    )
+                )
+                continue
+            role_arn = str(detail.get("roleArn") or "")
+            for vpc_id in sorted(set(vpcs.values())):
+                inventory["workloads"].append(
+                    {
+                        "kind": "AgentCore runtime",
+                        "name": f"{name} version {version}",
+                        "vpc_id": vpc_id,
+                        "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                    }
+                )
+
+
 def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     """
-    List Lambda functions, ECS services, SageMaker notebook instances and EC2
-    instances with the VPC and role each runs as.
+    List Lambda functions, ECS services, SageMaker notebook instances,
+    VPC-mode AgentCore runtime versions and EC2 instances with the VPC and
+    role each runs as.
 
     A listing that fails is named in ``errors`` so the population is never
     reported complete without it.
@@ -2790,6 +2894,7 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
 
     _ecs_service_workloads(region, inventory)
     _notebook_workloads(region, inventory)
+    _agentcore_runtime_workloads(region, inventory)
 
     try:
         ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)

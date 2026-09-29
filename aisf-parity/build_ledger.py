@@ -1270,9 +1270,12 @@ AI_SUBJECT_ROWS = [
         "AgentCore data plane, control plane and Gateway each count) with no private-DNS "
         "endpoint for that surface in the function's VPC, and does the same for EC2 "
         "instances, ECS services (every cluster, awsvpc subnets, task definition role) "
-        "and SageMaker notebook instances, failing a notebook with no subnet. Ceiling: "
-        "EKS pods, SageMaker endpoints and ECS tasks started outside a service are not "
-        "read",
+        "and SageMaker notebook instances, failing a notebook with no subnet, and for "
+        "each VPC-mode AgentCore runtime version, including the versions its endpoints "
+        "serve. Not read for want of a grant: SageMaker endpoints "
+        "(sagemaker:DescribeEndpoint, DescribeEndpointConfig, DescribeModel), EKS "
+        "clusters (eks:ListClusters, DescribeCluster, ListPodIdentityAssociations) and "
+        "ECS tasks started outside a service (ecs:ListTasks, DescribeTasks)",
         [],
         5,
     ),
