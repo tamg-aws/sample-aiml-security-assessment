@@ -21477,7 +21477,9 @@ class TestAC44EvaluationJudgeModelScope:
 
     @patch("agentcore_app.agentcore_client")
     def test_a_named_model_passes(self, mock_ac):
-        _online_evaluation_client(mock_ac)
+        # Built-in evaluators need no model grant, so the named grant passes
+        # only beside a custom judge that calls it.
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator("anthropic.claude-3")})
         cache = {
             "role_permissions": {
                 "EvaluationRole": {
@@ -21533,9 +21535,9 @@ class TestAC44EvaluationJudgeModelScope:
 
     @patch("agentcore_app.agentcore_client")
     def test_a_partial_model_id_is_bounded(self, mock_ac):
-        # A pattern naming part of a model id is narrower than every model, and
-        # which models belong inside it is the workload owner's decision.
-        _online_evaluation_client(mock_ac)
+        # A pattern naming part of a model id is narrower than every model, so it
+        # is not Unbounded, but it reaches models the judge does not call.
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator("anthropic.claude-3")})
         cache = {
             "role_permissions": {
                 "EvaluationRole": {
@@ -21551,7 +21553,10 @@ class TestAC44EvaluationJudgeModelScope:
 
         findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
 
-        assert findings[0]["Status"] == "Passed"
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Evaluation Judge Model Pattern"
+        ]
+        assert findings[0]["Status"] == "Failed"
 
     @pytest.mark.parametrize(
         "action",
@@ -21665,14 +21670,16 @@ class TestAC44EvaluationJudgeModelScope:
 
     @patch("agentcore_app.agentcore_client")
     def test_every_execution_role_is_judged_not_only_the_first(self, mock_ac):
-        _online_evaluation_client(
+        _ac44_custom(
             mock_ac,
-            [
-                _online_evaluation_detail(),
+            {"judge-1": _judge_evaluator("anthropic.claude-3")},
+            configs=[
+                _online_evaluation_detail(evaluators=[{"evaluatorId": "judge-1"}]),
                 _online_evaluation_detail(
                     onlineEvaluationConfigId="oec-2",
                     onlineEvaluationConfigName="second",
                     evaluationExecutionRoleArn="arn:aws:iam::123456789012:role/SecondRole",
+                    evaluators=[{"evaluatorId": "judge-1"}],
                 ),
             ],
         )
@@ -32151,14 +32158,17 @@ class TestAC44WholePopulation:
     _INVOKE = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
 
     def _two_roles(self, mock_ac):
-        _online_evaluation_client(
+        # Both judges call the named model, so a named grant is in use.
+        _ac44_custom(
             mock_ac,
-            [
-                _online_evaluation_detail(),
+            {"judge-1": _judge_evaluator("anthropic.claude-3")},
+            configs=[
+                _online_evaluation_detail(evaluators=[{"evaluatorId": "judge-1"}]),
                 _online_evaluation_detail(
                     onlineEvaluationConfigId="oec-2",
                     onlineEvaluationConfigName="second",
                     evaluationExecutionRoleArn="arn:aws:iam::123456789012:role/SecondRole",
+                    evaluators=[{"evaluatorId": "judge-1"}],
                 ),
             ],
         )
@@ -32325,7 +32335,7 @@ class TestAC44WholePopulation:
 
     @patch("agentcore_app.agentcore_client")
     def test_a_v1_cache_says_principal_errors_were_not_recorded(self, mock_ac):
-        _online_evaluation_client(mock_ac)
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator("anthropic.claude-3")})
         cache = {
             "role_permissions": {
                 "EvaluationRole": _principal_with([self._allow(self._NAMED)])
@@ -32645,6 +32655,195 @@ def _ac44_role(*resources, name="EvaluationRole"):
     }
 
 
+class TestAC44BuiltInOnlyAndModelPatterns:
+    """AC-44 fails a model grant no judge needs, and a model-id wildcard."""
+
+    _SECOND = "arn:aws:iam::123456789012:role/SecondRole"
+
+    def _roles(self, first, second):
+        roles = _ac44_role(*first)
+        roles.update(_ac44_role(*second, name="SecondRole"))
+        return roles
+
+    def _custom_and_builtin(self, mock_ac):
+        _ac44_custom(
+            mock_ac,
+            {"judge-1": _judge_evaluator("anthropic.claude-3")},
+            configs=[
+                _online_evaluation_detail(evaluators=[{"evaluatorId": "judge-1"}]),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluationExecutionRoleArn=self._SECOND,
+                ),
+            ],
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_built_in_only_role_with_a_named_grant_fails_beside_a_judge_role(
+        self, mock_ac
+    ):
+        self._custom_and_builtin(mock_ac)
+        cache = _v2_cache(roles=self._roles([_JUDGE_FM], [_JUDGE_FM]))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "EvaluationRole" in findings[0]["Finding_Details"]
+        assert findings[1]["Finding"].endswith("Unused Grant")
+        assert "SecondRole" in findings[1]["Finding_Details"]
+        assert (
+            "Its 1 configuration(s) attach only built-in evaluators"
+            in findings[1]["Finding_Details"]
+        )
+        assert _JUDGE_FM in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_with_one_custom_configuration_is_not_built_in_only(self, mock_ac):
+        # The same role runs a built-in-only configuration and one with a judge,
+        # so the judge uses the grant.
+        _ac44_custom(
+            mock_ac,
+            {"judge-1": _judge_evaluator("anthropic.claude-3")},
+            configs=[
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluators=[{"evaluatorId": "judge-1"}],
+                ),
+            ],
+        )
+        cache = _v2_cache(roles=_ac44_role(_JUDGE_FM))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "evaluators",
+        [None, [{"evaluatorId": "ThirdParty.Toxicity"}]],
+        ids=["no-evaluator-list", "third-party"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unknown_or_third_party_list_is_not_built_in_only(
+        self, mock_ac, evaluators
+    ):
+        detail = _online_evaluation_detail()
+        if evaluators is None:
+            del detail["evaluators"]
+        else:
+            detail["evaluators"] = evaluators
+        _online_evaluation_client(mock_ac, [detail])
+        cache = _v2_cache(roles=_ac44_role(_JUDGE_FM))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert not any(f["Finding"].endswith("Unused Grant") for f in findings)
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.*",
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-?",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.*",
+        ],
+        ids=["provider-star", "question-mark", "profile-star"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_model_id_wildcard_fails_on_the_second_role_only(self, mock_ac, pattern):
+        _ac44_custom(
+            mock_ac,
+            {"judge-1": _judge_evaluator("us.anthropic.claude-3")},
+            configs=[
+                _online_evaluation_detail(evaluators=[{"evaluatorId": "judge-1"}]),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluationExecutionRoleArn=self._SECOND,
+                    evaluators=[{"evaluatorId": "judge-1"}],
+                ),
+            ],
+        )
+        named = (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+            "us.anthropic.claude-3"
+        )
+        cache = _v2_cache(roles=self._roles([named, _JUDGE_FM], [pattern, _JUDGE_FM]))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert findings[1]["Finding"] == "AgentCore Evaluation Judge Model Pattern"
+        assert "SecondRole" in findings[1]["Finding_Details"]
+        assert f"wildcard in the model id: {pattern}." in findings[1]["Finding_Details"]
+        assert "call us.anthropic.claude-3" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_region_wildcard_on_a_named_model_passes(self, mock_ac):
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator("anthropic.claude-3")})
+        cache = _v2_cache(
+            roles=_ac44_role("arn:aws:bedrock:*::foundation-model/anthropic.claude-3")
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unused_and_a_wide_pattern_are_both_reported(self, mock_ac):
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator("anthropic.claude-3")})
+        wide = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.*"
+        cache = _v2_cache(roles=_ac44_role(wide, _JUDGE_OTHER))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Evaluation Judge Model Pattern",
+            "AgentCore Evaluation Judge Model Unused Grant",
+        ]
+        assert wide in findings[0]["Finding_Details"]
+        assert _JUDGE_OTHER not in findings[0]["Finding_Details"]
+        assert f"call: {_JUDGE_OTHER}." in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unused_wildcard_pattern_is_reported_once_as_unused(self, mock_ac):
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator("anthropic.claude-3")})
+        unused = "arn:aws:bedrock:us-east-1::foundation-model/meta.*"
+        cache = _v2_cache(roles=_ac44_role(_JUDGE_FM, unused))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Evaluation Judge Model Unused Grant"
+        ]
+        assert unused in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_is_not_judged_when_no_evaluator_names_a_model(self, mock_ac):
+        code_based = {
+            "evaluatorId": "judge-1",
+            "evaluatorConfig": {
+                "codeBased": {
+                    "lambdaConfig": {
+                        "lambdaArn": "arn:aws:lambda:us-east-1:123456789012:function:f"
+                    }
+                }
+            },
+        }
+        _ac44_custom(mock_ac, {"judge-1": code_based})
+        cache = _v2_cache(
+            roles=_ac44_role("arn:aws:bedrock:us-east-1::foundation-model/anthropic.*")
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "name no Bedrock judge model" in findings[0]["Finding_Details"]
+
+
 class TestAC44JudgeModelsCalled:
     """AC-44 compares each bounded model pattern to the models the judges call."""
 
@@ -32726,13 +32925,16 @@ class TestAC44JudgeModelsCalled:
 
     @patch("agentcore_app.agentcore_client")
     def test_built_in_evaluators_are_not_read(self, mock_ac):
+        # Built-in evaluators run on AWS-managed models, so a model grant on a
+        # role whose configurations attach only built-ins is used by no judge.
         _online_evaluation_client(mock_ac)
         cache = _v2_cache(roles=_ac44_role(_JUDGE_FM))
 
         findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
 
-        assert findings[0]["Status"] == "Passed"
-        assert "attach no custom evaluator" in findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Unused Grant")
+        assert "attach only built-in evaluators" in findings[0]["Finding_Details"]
         mock_ac.get_evaluator.assert_not_called()
 
     @patch("agentcore_app.agentcore_client")

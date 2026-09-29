@@ -23007,6 +23007,37 @@ def _evaluator_judge_models(detail: Dict[str, Any]) -> List[str]:
 CROSS_REGION_PROFILE_PREFIXES = ("us.", "eu.", "apac.", "global.", "us-gov.")
 
 
+def _model_pattern_names_models_by_wildcard(pattern: str) -> bool:
+    """Whether a bounded model Resource pattern carries a wildcard in its model id.
+
+    `foundation-model/anthropic.*` reaches every model of one provider, which is
+    more than the models a judge calls. A wildcard in the Region segment is not
+    one: a model id names the same model in every Region.
+    """
+    resource_part = pattern.split(":", 5)[5] if pattern.count(":") >= 5 else pattern
+    model_id = resource_part.split("/", 1)[-1]
+    return "*" in model_id or "?" in model_id
+
+
+def _configurations_attach_only_builtins(
+    details: List[Tuple[str, Dict[str, Any]]],
+) -> bool:
+    """Whether every configuration lists its evaluators and each is Builtin.
+
+    A configuration whose response carries no evaluator list is not read as
+    built-in only, since what it attaches is unknown.
+    """
+    return bool(details) and all(
+        isinstance(detail.get("evaluators"), list)
+        and all(
+            isinstance(evaluator, dict)
+            and str(evaluator.get("evaluatorId") or "").startswith("Builtin.")
+            for evaluator in detail["evaluators"]
+        )
+        for _, detail in details
+    )
+
+
 def _model_pattern_reaches(pattern: str, model_id: str) -> bool:
     """Whether one bounded model Resource pattern reaches one judge model id."""
     if model_id.startswith("arn:"):
@@ -23035,8 +23066,11 @@ def check_agentcore_evaluation_judge_model_scope(
     decision, so this check asserts that the grant names models at all, and then
     that every model pattern it names reaches a model one of the role's custom
     evaluators calls, as GetEvaluator reports it. A pattern no attached evaluator
-    uses fails, and an evaluator that could not be read withholds the pass.
-    Built-in evaluators are not read.
+    uses fails, a pattern with a wildcard in its model id fails beside judges it
+    reaches because it also reaches models they do not call, and an evaluator
+    that could not be read withholds the pass. Built-in evaluators are not read:
+    they run on AWS-managed models, so a role whose configurations attach only
+    built-ins needs no model grant and any it holds fails as unused.
     """
     if agentcore_client is None:
         return [
@@ -23226,13 +23260,37 @@ def check_agentcore_evaluation_judge_model_scope(
         elif unreadable:
             continue
         elif bounded:
-            evaluator_ids = _attached_custom_evaluator_ids(
-                [
-                    (label, detail)
-                    for label, detail in details
-                    if detail.get("evaluationExecutionRoleArn") == role_arn
-                ]
-            )
+            role_details = [
+                (label, detail)
+                for label, detail in details
+                if detail.get("evaluationExecutionRoleArn") == role_arn
+            ]
+            if _configurations_attach_only_builtins(role_details):
+                findings.append(
+                    create_finding(
+                        check_id="AC-44",
+                        finding_name="AgentCore Evaluation Judge Model Unused Grant",
+                        finding_details=(
+                            f"Evaluation execution role {role_name} can invoke "
+                            f"{len(bounded)} model pattern(s): {', '.join(bounded)}. "
+                            f"Its {len(role_details)} configuration(s) attach only "
+                            "built-in evaluators, which run on AWS-managed models "
+                            "and need no bedrock:InvokeModel in this account, so no "
+                            "judge uses the grant and a changed configuration could "
+                            f"send the scored text to these models.{v1_note}"
+                        ),
+                        resolution=(
+                            "Remove the model-invocation grant from the role, or "
+                            "keep it only for a custom evaluator that names the "
+                            "model."
+                        ),
+                        reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+                continue
+            evaluator_ids = _attached_custom_evaluator_ids(role_details)
             evaluators, evaluator_errors = _custom_evaluator_details(evaluator_ids)
             if evaluator_errors:
                 findings.append(
@@ -23277,6 +23335,37 @@ def check_agentcore_evaluation_judge_model_scope(
                 if called
                 and not any(_model_pattern_reaches(pattern, model) for model in called)
             ]
+            by_wildcard = [
+                pattern
+                for pattern in bounded
+                if called
+                and pattern not in unused
+                and _model_pattern_names_models_by_wildcard(pattern)
+            ]
+            if by_wildcard:
+                findings.append(
+                    create_finding(
+                        check_id="AC-44",
+                        finding_name="AgentCore Evaluation Judge Model Pattern",
+                        finding_details=(
+                            f"Evaluation execution role {role_name} can invoke "
+                            f"models through {len(by_wildcard)} pattern(s) with a "
+                            f"wildcard in the model id: {', '.join(by_wildcard)}. "
+                            f"Its judges call {', '.join(called)}, and each "
+                            "pattern also reaches models they do not call, which a "
+                            "changed evaluator could send the scored text to."
+                            f"{v1_note}"
+                        ),
+                        resolution=(
+                            "Replace each pattern with the foundation model and "
+                            "inference profile ARNs of the models the evaluators "
+                            "name."
+                        ),
+                        reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
             if unused:
                 findings.append(
                     create_finding(
@@ -23302,6 +23391,7 @@ def check_agentcore_evaluation_judge_model_scope(
                         status=StatusEnum.FAILED,
                     )
                 )
+            if unused or by_wildcard:
                 continue
             if called:
                 judge_note = (
