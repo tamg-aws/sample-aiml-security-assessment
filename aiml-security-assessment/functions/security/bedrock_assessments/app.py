@@ -7212,15 +7212,21 @@ def _parse_guardrail_reference(value: str, region: str) -> Dict[str, str]:
 
 GUARDRAIL_BLOCKING_STRENGTHS = ("LOW", "MEDIUM", "HIGH")
 
+GUARDRAIL_PROMPT_ATTACK_NOTE = (
+    "PROMPT_ATTACK is not counted, because it detects and blocks malicious "
+    "intents in user inputs and filters no harmful content (Amazon Bedrock "
+    "User Guide, guardrails-prompt-attack.html)."
+)
+
 # The harmful-content categories of GuardrailContentFilterType. PROMPT_ATTACK
 # screens for injection, not harmful content, so it is not one of them.
 GUARDRAIL_CONTENT_SAFETY_TYPES = ("HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE")
 
 
-def _guardrail_unblocked_categories(detail: Dict[str, Any]) -> Dict[str, List[str]]:
+def _guardrail_blocked_categories(detail: Dict[str, Any]) -> Dict[str, List[str]]:
     """
     Name, for the input and the output, the content-safety categories a
-    guardrail version does not block.
+    guardrail version blocks.
 
     A category is blocked on a side when a contentPolicy filter of that type
     has a strength there of LOW, MEDIUM or HIGH (NONE applies no filtering), its
@@ -7236,8 +7242,8 @@ def _guardrail_unblocked_categories(detail: Dict[str, Any]) -> Dict[str, List[st
         if isinstance(content_filter, dict)
     ]
 
-    def unblocked(side: str) -> List[str]:
-        blocked = {
+    def blocked(side: str) -> List[str]:
+        found = {
             str(content_filter.get("type") or "").upper()
             for content_filter in filters
             if str(content_filter.get(f"{side}Strength") or "").upper()
@@ -7246,12 +7252,10 @@ def _guardrail_unblocked_categories(detail: Dict[str, Any]) -> Dict[str, List[st
             and str(content_filter.get(f"{side}Action") or "BLOCK").upper() != "NONE"
         }
         return [
-            category
-            for category in GUARDRAIL_CONTENT_SAFETY_TYPES
-            if category not in blocked
+            category for category in GUARDRAIL_CONTENT_SAFETY_TYPES if category in found
         ]
 
-    return {"input": unblocked("input"), "output": unblocked("output")}
+    return {"input": blocked("input"), "output": blocked("output")}
 
 
 def _read_guardrail_directions(
@@ -7271,7 +7275,13 @@ def _read_guardrail_directions(
             "bedrock", config=boto3_config, region_name=target_region
         )
     client = clients[target_region]
-    result = {"value": value, "missing": False, "unread": "", "gaps": []}
+    result = {
+        "value": value,
+        "missing": False,
+        "unread": "",
+        "gaps": [],
+        "blocked": [],
+    }
     versions = [reference["version"]] if reference["version"] else []
     try:
         if not versions:
@@ -7300,14 +7310,20 @@ def _read_guardrail_directions(
                 guardrailIdentifier=reference["identifier"],
                 guardrailVersion=version,
             )
-            unblocked = _guardrail_unblocked_categories(detail)
+            blocked = _guardrail_blocked_categories(detail)
             for side in ("input", "output"):
-                if unblocked[side]:
+                if not blocked[side]:
                     result["gaps"].append(
-                        "version {} does not block {} on the {}".format(
-                            version, ", ".join(unblocked[side]), side
-                        )
+                        f"version {version} blocks no content-safety category "
+                        f"on the {side}"
                     )
+            result["blocked"].append(
+                "version {} blocks {} on the input and {} on the output".format(
+                    version,
+                    ", ".join(blocked["input"]) or "nothing",
+                    ", ".join(blocked["output"]) or "nothing",
+                )
+            )
     except ClientError as error:
         if error.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
             result["missing"] = True
@@ -7451,8 +7467,8 @@ def check_bedrock_guardrail_iam_enforcement(
     An identity whose own grants are unbound is not a finding when a central
     mechanism binds every invocation in the Region (_central_guardrail_bindings),
     and the guardrails that mechanism names are read like the IAM ones. A
-    guardrail version counts only when it blocks every content-safety category
-    in each direction (_guardrail_unblocked_categories).
+    guardrail version counts only when it blocks at least one content-safety
+    category in each direction (_guardrail_blocked_categories).
     """
     logger.debug("Starting check for Bedrock Guardrail IAM enforcement")
     check_name = "Bedrock Guardrail IAM Enforcement Check"
@@ -7676,6 +7692,7 @@ def check_bedrock_guardrail_iam_enforcement(
             )
 
         direction_gaps = []
+        blocked_by_value = []
         missing = []
         unread = []
         for value in sorted(named_values):
@@ -7691,6 +7708,10 @@ def check_bedrock_guardrail_iam_enforcement(
                         value, holders, "; ".join(reading["gaps"])
                     )
                 )
+            else:
+                blocked_by_value.extend(
+                    f"{value} {blocked}" for blocked in reading["blocked"]
+                )
 
         if direction_gaps:
             findings["status"] = "WARN"
@@ -7699,18 +7720,22 @@ def check_bedrock_guardrail_iam_enforcement(
                     check_id="BR-10",
                     finding_name="Bedrock Guardrail IAM Enforcement Missing",
                     finding_details=(
-                        "{} guardrail(s) required on invocation leave a "
-                        "content-safety category (HATE, INSULTS, MISCONDUCT, "
-                        "SEXUAL or VIOLENCE) unblocked on the input or the output, so that "
-                        "content reaches the model or the caller unfiltered: "
-                        "{}.".format(len(direction_gaps), "; ".join(direction_gaps[:5]))
+                        "{} guardrail(s) required on invocation block none of "
+                        "the content-safety categories (HATE, INSULTS, "
+                        "MISCONDUCT, SEXUAL or VIOLENCE) on the input or the "
+                        "output, so harmful content reaches the model or the "
+                        "caller unfiltered: {}. {}".format(
+                            len(direction_gaps),
+                            "; ".join(direction_gaps[:5]),
+                            GUARDRAIL_PROMPT_ATTACK_NOTE,
+                        )
                     ),
                     resolution=(
                         "Give each version that may be named a HATE, INSULTS, "
-                        "MISCONDUCT, SEXUAL and VIOLENCE content filter with "
-                        "strength LOW, "
-                        "MEDIUM or HIGH and action BLOCK on both the input and the "
-                        "output, or pin the condition to a version that has them."
+                        "MISCONDUCT, SEXUAL or VIOLENCE content filter with "
+                        "strength LOW, MEDIUM or HIGH and action BLOCK on the "
+                        "input and on the output, or pin the condition to a "
+                        "version that has them."
                     ),
                     reference=GUARDRAIL_IAM_REFERENCE,
                     severity="High",
@@ -7764,12 +7789,19 @@ def check_bedrock_guardrail_iam_enforcement(
                     check_id="BR-10",
                     finding_name=check_name,
                     finding_details=(
-                        "{} Each guardrail version that may be named blocks HATE, "
-                        "INSULTS, MISCONDUCT, SEXUAL and VIOLENCE content on both "
-                        "input and output{}.{} "
-                        "{}".format(
+                        "{} Each guardrail version that may be named blocks at "
+                        "least one content-safety category on both input and "
+                        "output{}: {}. Filter strength above LOW is not judged. "
+                        "{}{} {}".format(
                             " ".join(statements),
                             " among those read" if unread else "",
+                            "; ".join(blocked_by_value[:10])
+                            + (
+                                "; and {} more".format(len(blocked_by_value) - 10)
+                                if len(blocked_by_value) > 10
+                                else ""
+                            ),
+                            GUARDRAIL_PROMPT_ATTACK_NOTE,
                             " {} named guardrail(s) do not exist, so the grants "
                             "naming them cannot be exercised: {}.".format(
                                 len(missing), ", ".join(missing[:5])

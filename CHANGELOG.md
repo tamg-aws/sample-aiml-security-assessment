@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `BR-10` needs, on the input and on the output of each guardrail version
+  that may be named, at least one `HATE`, `INSULTS`, `MISCONDUCT`, `SEXUAL`
+  or `VIOLENCE` content filter that blocks at `LOW` or above. It had required
+  all five on both sides, which the control text for `AIR-BDR-GRD-01` does
+  not ask for. `PROMPT_ATTACK` still counts for neither side, because it
+  screens user inputs for malicious intent. The `Passed` row names the
+  categories found on each side and says strength above `LOW` is not judged.
 - `BR-02` no longer calls `ecs:ListTasks` without a cluster when
   `ecs:ListClusters` is denied. The grant admits only a named cluster, so that
   call would be denied; the row now says no standalone task was listed.

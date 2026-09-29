@@ -5966,7 +5966,7 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         assert (
-            "version 1 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the output"
+            "version 1 blocks no content-safety category on the output"
             in findings[0]["Finding_Details"]
         )
         assert "role 'BoundRole'" in findings[0]["Finding_Details"]
@@ -5982,7 +5982,7 @@ class TestBR10GuardrailBinding:
                         "piiEntities": [{"type": "EMAIL", "action": "BLOCK"}]
                     },
                 },
-                "HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input",
+                "blocks no content-safety category on the input",
             ),
             (
                 {
@@ -5996,7 +5996,7 @@ class TestBR10GuardrailBinding:
                         ]
                     }
                 },
-                "HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the output",
+                "blocks no content-safety category on the output",
             ),
             (
                 {
@@ -6011,7 +6011,7 @@ class TestBR10GuardrailBinding:
                         ]
                     }
                 },
-                "HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input",
+                "blocks no content-safety category on the input",
             ),
         ],
     )
@@ -6026,9 +6026,9 @@ class TestBR10GuardrailBinding:
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
-        assert f"version 1 does not block {skipped}" in findings[0]["Finding_Details"]
+        assert f"version 1 {skipped}" in findings[0]["Finding_Details"]
 
-    def test_prompt_attack_and_one_category_block_neither_side(self):
+    def test_prompt_attack_and_a_disabled_input_category_leave_the_input_open(self):
         guardrail = {
             "contentPolicy": {
                 "filters": [
@@ -6055,14 +6055,8 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
-        assert (
-            "version 1 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
-            in details
-        )
-        assert (
-            "version 1 does not block HATE, MISCONDUCT, SEXUAL, VIOLENCE on the output"
-            in details
-        )
+        assert "version 1 blocks no content-safety category on the input" in details
+        assert "category on the output" not in details
 
     def test_every_content_safety_category_on_both_sides_passes(self):
         findings, _ = self._run(
@@ -6091,11 +6085,14 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Passed"]
         assert (
-            "blocks HATE, INSULTS, MISCONDUCT, SEXUAL and VIOLENCE content on both input and output"
+            "version 1 blocks HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the "
+            "input and HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the output"
             in findings[0]["Finding_Details"]
         )
 
-    def test_one_category_missing_on_one_side_fails(self):
+    def test_one_category_missing_on_one_side_still_passes(self):
+        # BR-10 needs one blocking content-safety category per side, so an
+        # output with four of the five blocking is covered.
         filters = [
             {"type": category, "inputStrength": "HIGH", "outputStrength": "HIGH"}
             for category in ("HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE")
@@ -6108,11 +6105,116 @@ class TestBR10GuardrailBinding:
             guardrail={"contentPolicy": {"filters": filters}},
         )
 
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "version 1 blocks HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the "
+            "input and HATE, INSULTS, MISCONDUCT, VIOLENCE on the output"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_prompt_attack_alone_on_both_sides_fails(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail={
+                "contentPolicy": {
+                    "filters": [
+                        {
+                            "type": "PROMPT_ATTACK",
+                            "inputStrength": "HIGH",
+                            "outputStrength": "HIGH",
+                        }
+                    ]
+                }
+            },
+        )
+
         assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
-        assert "version 1 does not block SEXUAL on the output" in details
-        assert "version 1 does not block" not in details.replace(
-            "version 1 does not block SEXUAL on the output", ""
+        assert "version 1 blocks no content-safety category on the input" in details
+        assert "version 1 blocks no content-safety category on the output" in details
+
+    def test_one_category_on_the_input_only_fails(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail={
+                "contentPolicy": {
+                    "filters": [
+                        {
+                            "type": "HATE",
+                            "inputStrength": "LOW",
+                            "outputStrength": "NONE",
+                        }
+                    ]
+                }
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "version 1 blocks no content-safety category on the output" in details
+        assert "category on the input" not in details
+
+    def test_one_category_on_both_sides_passes(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail={
+                "contentPolicy": {
+                    "filters": [
+                        {
+                            "type": "PROMPT_ATTACK",
+                            "inputStrength": "HIGH",
+                            "outputStrength": "NONE",
+                        },
+                        {
+                            "type": "HATE",
+                            "inputStrength": "LOW",
+                            "outputStrength": "LOW",
+                        },
+                    ]
+                }
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert (
+            GR_ARN + ":1 version 1 blocks HATE on the input and HATE on the output"
+            in details
+        )
+        assert "Filter strength above LOW is not judged" in details
+        assert "PROMPT_ATTACK is not counted" in details
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"outputStrength": "NONE"},
+            {"inputStrength": "NONE"},
+            {"outputAction": "NONE"},
+            {"inputAction": "NONE"},
+            {"outputEnabled": False},
+        ],
+    )
+    def test_the_one_category_unblocked_on_a_side_fails(self, change):
+        hate = {"type": "HATE", "inputStrength": "LOW", "outputStrength": "LOW"}
+        hate.update(change)
+        side = "input" if any(key.startswith("input") for key in change) else "output"
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail={"contentPolicy": {"filters": [hate]}},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            f"version 1 blocks no content-safety category on the {side}"
+            in findings[0]["Finding_Details"]
         )
 
     def test_one_weak_version_fails_the_binding_among_full_ones(self):
@@ -6142,7 +6244,7 @@ class TestBR10GuardrailBinding:
                         "inputStrength": "HIGH",
                         "outputStrength": "NONE",
                     },
-                    {"type": "HATE", "inputStrength": "LOW", "outputStrength": "LOW"},
+                    {"type": "HATE", "inputStrength": "LOW", "outputStrength": "NONE"},
                 ]
             }
         }
@@ -6160,12 +6262,10 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
-        assert (
-            "version 2 does not block INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
-            in details
-        )
-        assert "version 1 does not block" not in details
-        assert "version DRAFT does not block" not in details
+        assert "version 2 blocks no content-safety category on the output" in details
+        assert "category on the input" not in details
+        assert "version 1 blocks no" not in details
+        assert "version DRAFT blocks no" not in details
 
     def test_a_central_mechanism_binds_an_unbound_identity(self):
         central = {
@@ -6212,7 +6312,7 @@ class TestBR10GuardrailBinding:
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "named by the effective policy Y" in findings[0]["Finding_Details"]
         assert (
-            "version 4 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the output"
+            "version 4 blocks no content-safety category on the output"
             in findings[0]["Finding_Details"]
         )
 
@@ -6248,7 +6348,7 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         assert (
-            "version 2 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
+            "version 2 blocks no content-safety category on the input"
             in findings[0]["Finding_Details"]
         )
 
@@ -6281,10 +6381,7 @@ class TestBR10GuardrailBinding:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
-        assert (
-            "version 2 does not block HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE on the input"
-            in details
-        )
+        assert "version 2 blocks no content-safety category on the input" in details
         assert "role 'OpenVersionRole'" in details
         assert "PinnedRole" not in details
         read = sorted(
