@@ -8478,6 +8478,7 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
 
 MONITOR_REPORT_FINDING = "Model Monitor Recent Report"
 MONITOR_ALARM_FINDING = "Model Monitor Violation Alarm"
+MONITOR_BASELINE_FINDING = "Model Monitor Baseline Constraints"
 MODEL_MONITOR_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor.html"
 )
@@ -8562,18 +8563,76 @@ def _schedule_cadence(expression: str) -> timedelta:
     return timedelta(days=1)
 
 
+def _schedule_baseline_constraints(
+    sagemaker_client: Any, name: str, detail: Dict[str, Any]
+) -> tuple:
+    """
+    Where a described monitoring schedule's baseline constraints file is.
+
+    Returns ("baselined", uri), ("missing", text) when the job definition
+    names no constraints file, or ("unread", text) when that was not read. Only the DataQuality job definition describe is granted, so a
+    schedule naming a ModelQuality, ModelBias, or ModelExplainability
+    definition is unread.
+    """
+    config = detail.get("MonitoringScheduleConfig") or {}
+    if "MonitoringJobDefinition" in config:
+        baseline = (config.get("MonitoringJobDefinition") or {}).get(
+            "BaselineConfig"
+        ) or {}
+        where = "its inline job definition"
+    elif config.get("MonitoringJobDefinitionName"):
+        definition = config["MonitoringJobDefinitionName"]
+        kind = config.get("MonitoringType") or detail.get("MonitoringType")
+        if kind != "DataQuality":
+            return "unread", (
+                f"schedule '{name}': its {kind or 'untyped'} job definition "
+                f"'{definition}' was not read (only "
+                "sagemaker:DescribeDataQualityJobDefinition is granted)"
+            )
+        try:
+            baseline = (
+                sagemaker_client.describe_data_quality_job_definition(
+                    JobDefinitionName=definition
+                ).get("DataQualityBaselineConfig")
+                or {}
+            )
+        except Exception as error:
+            return "unread", (
+                f"sagemaker:DescribeDataQualityJobDefinition {definition} of "
+                f"schedule '{name}' ({get_assessment_error_label(error)})"
+            )
+        where = f"its job definition '{definition}'"
+    else:
+        return "unread", f"schedule '{name}' names no job definition"
+    uri = (baseline.get("ConstraintsResource") or {}).get("S3Uri")
+    if uri:
+        return "baselined", uri
+    if baseline.get("BaseliningJobName"):
+        # Whether monitoring falls back to the baselining job's output for its
+        # constraints is not established, so this is neither pass nor fail.
+        return "unread", (
+            f"schedule '{name}': {where} names baselining job "
+            f"'{baseline['BaseliningJobName']}' but no constraints file"
+        )
+    return "missing", f"schedule '{name}': {where} names no baseline constraints file"
+
+
 def _monitor_report_and_alarm_findings(
     sagemaker_client: Any, schedules: List[Dict[str, Any]], region: str
 ) -> List[Dict[str, Any]]:
     """
-    For each monitoring schedule on an InService endpoint, require a report
-    produced within two cadences and an alarm with an action on its metrics.
+    For each monitoring schedule on an InService endpoint, require a baseline
+    constraints file, a report produced within two cadences, and an alarm with
+    an action on its metrics.
     """
     rows = []
     now = datetime.now(timezone.utc)
     stale = []
     fresh = []
     unread = []
+    unbaselined = []
+    baselined = []
+    baseline_unread = []
     for schedule in schedules:
         name = schedule["name"]
         try:
@@ -8585,7 +8644,15 @@ def _monitor_report_and_alarm_findings(
                 f"sagemaker:DescribeMonitoringSchedule {name} "
                 f"({get_assessment_error_label(error)})"
             )
+            baseline_unread.append(unread[-1])
             continue
+        state, text = _schedule_baseline_constraints(sagemaker_client, name, detail)
+        if state == "baselined":
+            baselined.append(f"{name} ({text})")
+        elif state == "missing":
+            unbaselined.append(text)
+        else:
+            baseline_unread.append(text)
         expression = (
             (detail.get("MonitoringScheduleConfig") or {}).get("ScheduleConfig") or {}
         ).get("ScheduleExpression") or ""
@@ -8616,6 +8683,54 @@ def _monitor_report_and_alarm_findings(
             )
         else:
             fresh.append(f"{name} ({status} at {scheduled.isoformat()})")
+    for problem in unbaselined[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_BASELINE_FINDING,
+                finding_details=(
+                    f"Monitoring {problem}, so its reports have no baseline "
+                    "constraints to be validated against and cannot record a "
+                    "violation."
+                ),
+                resolution=(
+                    "Run a baselining job on the training data and set its "
+                    "constraints.json as the schedule's baseline ConstraintsResource."
+                ),
+                reference=MODEL_MONITOR_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if baselined and not unbaselined and not baseline_unread:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_BASELINE_FINDING,
+                finding_details=(
+                    f"All {len(baselined)} monitoring schedule(s) name a baseline "
+                    f"constraints file: {', '.join(baselined[:5])}."
+                ),
+                resolution="No action required",
+                reference=MODEL_MONITOR_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    if baseline_unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-23",
+                MONITOR_BASELINE_FINDING,
+                baseline_unread,
+                f"{len(baselined) + len(unbaselined)} of {len(schedules)} "
+                "schedule(s) had their baseline read.",
+                MODEL_MONITOR_REFERENCE,
+                region,
+            )
+        )
     for problem in stale[:20]:
         rows.append(
             create_finding(
