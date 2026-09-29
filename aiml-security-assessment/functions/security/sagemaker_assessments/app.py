@@ -15174,8 +15174,9 @@ WORKLOAD_SEGMENTATION_REFERENCE = (
     "https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/"
     "security-network.html"
 )
-BROAD_IPV4_PREFIX = 16
-BROAD_IPV6_PREFIX = 48
+# A CIDR wider than a /24 (IPv6 /64) is not read as a declared dependency.
+BROAD_IPV4_PREFIX = 23
+BROAD_IPV6_PREFIX = 63
 
 
 def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
@@ -15202,7 +15203,7 @@ def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
 
 
 def _broad_rule_targets(permission: Dict[str, Any]) -> List[str]:
-    """CIDRs in one rule that cover a whole VPC or more."""
+    """CIDRs in one rule wider than BROAD_IPV4_PREFIX or BROAD_IPV6_PREFIX."""
     broad = []
     for entry in permission.get("IpRanges") or []:
         cidr = entry.get("CidrIp") or ""
@@ -15230,18 +15231,34 @@ def _rule_ports(permission: Dict[str, Any]) -> str:
     return f"{protocol} {ports}"
 
 
-def _security_group_problems(group: Dict[str, Any], check_ingress: bool) -> List[str]:
-    problems = []
+def _security_group_permissions(group: Dict[str, Any], check_ingress: bool):
+    """(direction, preposition, permission) for each rule the check judges."""
     directions = [("egress", "IpPermissionsEgress", "to")]
     if check_ingress:
         directions.insert(0, ("ingress", "IpPermissions", "from"))
     for direction, key, preposition in directions:
         for permission in group.get(key) or []:
-            broad = _broad_rule_targets(permission)
-            if broad:
+            yield direction, preposition, permission
+
+
+def _security_group_problems(
+    group: Dict[str, Any], check_ingress: bool, referenced: Dict[str, Any]
+) -> List[str]:
+    problems = []
+    for direction, preposition, permission in _security_group_permissions(
+        group, check_ingress
+    ):
+        rule = f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)}"
+        broad = _broad_rule_targets(permission)
+        if broad:
+            problems.append(f"{rule} {preposition} {', '.join(broad[:3])}")
+        for pair in permission.get("UserIdGroupPairs") or []:
+            target = referenced.get(pair.get("GroupId")) or {}
+            if target.get("GroupName") == "default":
                 problems.append(
-                    f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)} "
-                    f"{preposition} {', '.join(broad[:3])}"
+                    f"{rule} {preposition} {pair.get('GroupId')}, the default "
+                    "security group of its VPC, which holds every resource "
+                    "launched there without a security group of its own"
                 )
     return problems
 
@@ -15450,6 +15467,53 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
         )
         groups = None
 
+    referenced = {}
+    if groups:
+        pending = {}
+        for group_id in group_ids:
+            group = groups.get(group_id)
+            if group is None:
+                continue
+            for _, _, permission in _security_group_permissions(group, True):
+                for entry in permission.get("PrefixListIds") or []:
+                    unread.append(
+                        f"prefix list {entry.get('PrefixListId')} in {group_id} (its "
+                        "entries are not read: ec2:GetManagedPrefixListEntries is "
+                        "not granted)"
+                    )
+                for pair in permission.get("UserIdGroupPairs") or []:
+                    target = pair.get("GroupId")
+                    if not target or target == group_id:
+                        continue
+                    if target in groups:
+                        referenced[target] = groups[target]
+                    elif pair.get("UserId") in (None, group.get("OwnerId")):
+                        pending.setdefault(target, group_id)
+                    else:
+                        unread.append(
+                            f"security group {target} referenced by {group_id} "
+                            f"(owned by account {pair.get('UserId')})"
+                        )
+        targets = sorted(pending)
+        try:
+            for start in range(0, len(targets), 100):
+                response = ec2_client.describe_security_groups(
+                    GroupIds=targets[start : start + 100]
+                )
+                for group in response.get("SecurityGroups", []):
+                    referenced[group.get("GroupId")] = group
+        except Exception as error:
+            unread.append(
+                "ec2:DescribeSecurityGroups on referenced groups "
+                f"({get_assessment_error_label(error)})"
+            )
+        else:
+            unread.extend(
+                f"security group {target} referenced by {pending[target]}"
+                for target in targets
+                if target not in referenced
+            )
+
     users = {}
     for workload in workloads:
         for group in workload["groups"]:
@@ -15480,7 +15544,9 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                     unread.append(f"security group {group}")
                     continue
                 found.extend(
-                    _security_group_problems(groups[group], workload["ingress"])
+                    _security_group_problems(
+                        groups[group], workload["ingress"], referenced
+                    )
                 )
         if found:
             problems.append(f"{workload['label']}: {'; '.join(found[:4])}")
@@ -15499,8 +15565,9 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 finding_details=(
                     f"{problem}. A workload reaches only its declared dependencies "
                     "when its own security group allows traffic to and from the "
-                    "dependency's security group or prefix list, not a CIDR "
-                    f"of /{BROAD_IPV4_PREFIX} (IPv6 /{BROAD_IPV6_PREFIX}) or wider."
+                    "dependency's security group or prefix list, not the VPC "
+                    f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
+                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider."
                 ),
                 resolution=(
                     "Give every agent service and function its own security group, "
@@ -15547,9 +15614,10 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 finding_name=WORKLOAD_SEGMENTATION_FINDING,
                 finding_details=(
                     f"All {len(workloads)} ECS service(s) and Lambda function(s) run "
-                    "in their own security groups with no rule to or from a CIDR "
-                    f"of /{BROAD_IPV4_PREFIX} or wider. Standalone EC2 instances "
-                    "are not read."
+                    "in their own security groups with no rule to or from the VPC "
+                    f"default security group or a CIDR of /{BROAD_IPV4_PREFIX} "
+                    f"(IPv6 /{BROAD_IPV6_PREFIX}) or wider, and none that names a "
+                    "prefix list. Standalone EC2 instances are not read."
                     if workloads
                     else "No ECS services or Lambda functions found in this region."
                 ),

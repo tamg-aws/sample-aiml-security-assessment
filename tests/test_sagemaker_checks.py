@@ -8790,7 +8790,12 @@ class TestSM39WorkloadSegmentation:
         errors = errors or {}
         by_cluster = services or {}
         functions = functions or []
-        groups = {g["GroupId"]: g for g in groups or []}
+        # The dependency groups the fixtures' rules reference, readable unless a
+        # test passes its own copy.
+        groups = {
+            g: {"GroupId": g, "GroupName": g[len("sg-") :]}
+            for g in ("sg-dep", "sg-alb")
+        } | {g["GroupId"]: g for g in groups or []}
         eks = eks or {}
 
         def source(key, pages):
@@ -8956,6 +8961,133 @@ class TestSM39WorkloadSegmentation:
         details = seg[0]["Finding_Details"]
         assert "allows ingress tcp 443 from 10.0.0.0/16" in details
         assert "10.0.12.0/24" not in details
+
+    @pytest.mark.parametrize(
+        ("cidr", "v6"),
+        [("10.0.0.0/17", False), ("10.0.0.0/23", False), ("2001:db8::/56", True)],
+    )
+    @pytest.mark.parametrize("wide_first", [True, False])
+    def test_a_cidr_wider_than_a_24_fails_only_its_workload(self, cidr, v6, wide_first):
+        services = [
+            self._service("wide", ["sg-w"]),
+            self._service("narrow", ["sg-n"]),
+        ]
+        if not wide_first:
+            services.reverse()
+        seg = self._seg(
+            self._run(
+                services={"agents": services},
+                groups=[
+                    self._sg("sg-w", egress=[self._open(cidr, "tcp", 443, v6=v6)]),
+                    self._sg(
+                        "sg-n",
+                        egress=[
+                            self._open("10.0.12.0/24", "tcp", 5432),
+                            self._open("2001:db8:0:1::/64", "tcp", 5432, v6=True),
+                        ],
+                    ),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert f"sg-w allows egress tcp 443 to {cidr}" in details
+        assert "narrow" not in details
+
+    def test_a_prefix_list_rule_withholds_the_pass(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("tool", ["sg-a"]),
+                    self._function("other", ["sg-b"]),
+                ],
+                groups=[
+                    self._sg(
+                        "sg-a",
+                        egress=[
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 443,
+                                "ToPort": 443,
+                                "PrefixListIds": [{"PrefixListId": "pl-1"}],
+                            }
+                        ],
+                    ),
+                    self._sg("sg-b"),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        details = seg[0]["Finding_Details"]
+        assert "prefix list pl-1 in sg-a" in details
+        assert "ec2:GetManagedPrefixListEntries" in details
+        assert "sg-b" not in details
+
+    @pytest.mark.parametrize("default_first", [True, False])
+    def test_a_rule_to_the_vpc_default_group_fails_only_its_workload(
+        self, default_first
+    ):
+        functions = [
+            self._function("loose", ["sg-a"]),
+            self._function("scoped", ["sg-b"]),
+        ]
+        if not default_first:
+            functions.reverse()
+        seg = self._seg(
+            self._run(
+                functions=functions,
+                groups=[
+                    self._sg(
+                        "sg-a",
+                        egress=[
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 443,
+                                "ToPort": 443,
+                                "UserIdGroupPairs": [{"GroupId": "sg-def"}],
+                            }
+                        ],
+                    ),
+                    self._sg("sg-b"),
+                    {"GroupId": "sg-def", "GroupName": "default"},
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert details.startswith("Lambda function loose:")
+        assert (
+            "sg-a allows egress tcp 443 to sg-def, the default security group of "
+            "its VPC"
+        ) in details
+        assert "scoped" not in details
+
+    def test_an_unread_referenced_group_withholds_the_pass(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[
+                    self._sg(
+                        "sg-a",
+                        egress=[
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 443,
+                                "ToPort": 443,
+                                "UserIdGroupPairs": [
+                                    {"GroupId": "sg-gone"},
+                                    {"GroupId": "sg-far", "UserId": "444455556666"},
+                                ],
+                            }
+                        ],
+                    )
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        details = seg[0]["Finding_Details"]
+        assert "security group sg-gone referenced by sg-a" in details
+        assert "security group sg-far referenced by sg-a" in details
 
     def test_ipv6_any_egress_fails(self):
         seg = self._seg(

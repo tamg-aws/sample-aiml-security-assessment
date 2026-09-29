@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-39` workload segmentation fails a security group rule to or from a
+  CIDR wider than a /24 (IPv6 /64), where only /16 (IPv6 /48) or wider
+  failed, and a rule that references the VPC's default security group. A
+  rule that names a prefix list, whose entries need the ungranted
+  `ec2:GetManagedPrefixListEntries`, or references a group that was not
+  read now withholds `Passed` in an `N/A` row.
+
 - `SM-40` fails a secret whose rotation schedule allows a gap longer than 90
   days, the default of Security Hub control `SecretsManager.4`, so
   `rate(365 days)` no longer passes. An ECS service that injects a rotating
