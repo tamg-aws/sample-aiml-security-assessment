@@ -23082,7 +23082,13 @@ def _custom_evaluator_details(
 def _attached_custom_evaluator_ids(
     details: List[Tuple[str, Dict[str, Any]]],
 ) -> List[str]:
-    """Return the ids of the custom evaluators the given configurations attach."""
+    """Return the ids of the custom evaluators the given configurations attach.
+
+    Builtin and ThirdParty evaluators are service-authored: their ARN names no
+    account, and GetEvaluator returns no kmsKeyArn or judge model the account
+    set, so neither is read.
+    """
+    service_prefixes = tuple(f"{kind}." for kind in SERVICE_AUTHORED_EVALUATOR_TYPES)
     return sorted(
         {
             str(evaluator.get("evaluatorId"))
@@ -23090,7 +23096,7 @@ def _attached_custom_evaluator_ids(
             for evaluator in detail.get("evaluators") or []
             if isinstance(evaluator, dict)
             and evaluator.get("evaluatorId")
-            and not str(evaluator.get("evaluatorId")).startswith("Builtin.")
+            and not str(evaluator.get("evaluatorId")).startswith(service_prefixes)
         }
     )
 

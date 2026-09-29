@@ -32678,6 +32678,57 @@ class TestAC41EvaluationKeyProtection:
         )
 
     @patch("agentcore_app.agentcore_client")
+    def test_a_third_party_evaluator_is_not_charged_a_key(self, mock_ac):
+        # ThirdParty evaluators are service-authored like Builtin ones: their ARN
+        # names no account and GetEvaluator returns no kmsKeyArn to set.
+        third_party = "ThirdParty.DeepEval.Toxicity"
+        findings, _ = self._run(
+            mock_ac,
+            {
+                third_party: {"evaluatorId": third_party},
+                "judge-1": {"evaluatorId": "judge-1"},
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Custom evaluator judge-1" in findings[0]["Finding_Details"]
+        assert third_party not in findings[0]["Finding_Details"]
+        called = [c.kwargs["evaluatorId"] for c in mock_ac.get_evaluator.call_args_list]
+        assert called == ["judge-1"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_batch_attaching_only_third_party_evaluators_judges_the_batch_only(
+        self, mock_ac
+    ):
+        batches = [
+            {
+                "batchEvaluationId": "be-1",
+                "batchEvaluationName": "nightly",
+                "kmsKeyArn": _BATCH_KEY,
+                "evaluators": [{"evaluatorId": "ThirdParty.DeepEval.Bias"}],
+            }
+        ]
+        findings, _ = self._run(
+            mock_ac, {}, batches=batches, batch_details={"be-1": {}}
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].startswith(
+            "Batch evaluation 'nightly' (be-1)"
+        )
+        mock_ac.get_evaluator.assert_not_called()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_evaluator_named_like_third_party_is_still_read(self, mock_ac):
+        # EvaluatorId allows a custom id to start with ThirdParty; only the dotted
+        # ThirdParty.<provider>.<name> form is service-authored.
+        custom = "ThirdPartyCheck-abcdefghij"
+        findings, _ = self._run(mock_ac, {custom: {"evaluatorId": custom}})
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert f"{custom} names no kmsKeyArn" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
     def test_each_batch_evaluation_key_and_results_group_is_judged(self, mock_ac):
         batches = [
             {
