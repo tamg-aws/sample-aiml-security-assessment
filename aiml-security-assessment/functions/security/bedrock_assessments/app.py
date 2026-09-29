@@ -17431,8 +17431,8 @@ def _lambda_has_bedrock_indicator(function_config: Dict[str, Any]) -> bool:
 INSPECTOR_LAMBDA_EXCLUSION_TAG = ("inspectorexclusion", "lambdastandardscanning")
 
 INSPECTOR_LAMBDA_CEILING = (
-    "Container-image functions are scanned through ECR and judged by AC-50. No AWS "
-    "API records whether a deployment pipeline blocks on an Inspector finding, and "
+    "A container-image function is judged by the ECR coverage record of the image "
+    "digest it resolves to, and no CODE record is required of it. No AWS API records whether a deployment pipeline blocks on an Inspector finding, and "
     "the targets of an EventBridge rule are not read (events:ListTargetsByRule is "
     "not granted). Partial, ceiling reached."
 )
@@ -17442,17 +17442,114 @@ INSPECTOR_LAMBDA_CEILING = (
 INSPECTOR_LAMBDA_SCAN_TYPES = ("PACKAGE", "CODE")
 
 
+def _inspector_image_coverage(
+    inspector_client,
+    functions: List[Dict[str, Any]],
+    skip: set,
+    images: Dict[str, Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """
+    Name each in-scope container-image function whose resolved image digest
+    has no ACTIVE ECR coverage record. ``images`` maps a function name to the
+    Code block lambda:GetFunction returned for it.
+    """
+    inactive = []
+    unread = []
+    by_repository: Dict[str, List[tuple]] = {}
+    for function in functions:
+        name = function.get("FunctionName") or "unnamed"
+        if function.get("PackageType") != "Image" or name in skip:
+            continue
+        if name not in images:
+            continue
+        # <account>.dkr.ecr.<region>.amazonaws.com/<repository>@sha256:<digest>
+        registry, _, rest = str(images[name].get("ResolvedImageUri") or "").partition(
+            "/"
+        )
+        repository, _, digest = rest.partition("@")
+        if not repository or not digest.startswith("sha256:"):
+            unread.append(
+                f"'{name}' (lambda:GetFunction returned no resolved image digest)"
+            )
+            continue
+        image_account = registry.split(".", 1)[0]
+        function_account = (
+            str(function.get("FunctionArn") or "").split(":") + [""] * 5
+        )[4]
+        if image_account != function_account:
+            unread.append(
+                f"'{name}' runs image {repository}@{digest} from account "
+                f"{image_account}, whose Inspector coverage this account does not read"
+            )
+            continue
+        by_repository.setdefault(repository, []).append((name, digest))
+    for repository, entries in sorted(by_repository.items()):
+        try:
+            records = _list_all_items(
+                inspector_client,
+                "list_coverage",
+                "coveredResources",
+                max_results=200,
+                filterCriteria={
+                    "resourceType": [
+                        {"comparison": "EQUALS", "value": "AWS_ECR_CONTAINER_IMAGE"}
+                    ],
+                    "ecrRepositoryName": [
+                        {"comparison": "EQUALS", "value": repository}
+                    ],
+                },
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            unread.append(
+                f"image coverage for repository {repository} (inspector2:ListCoverage, "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        status = {}
+        for record in records:
+            if record.get("resourceType") != "AWS_ECR_CONTAINER_IMAGE":
+                continue
+            resource_id = str(record.get("resourceId") or "")
+            if "sha256:" not in resource_id:
+                continue
+            scan_status = record.get("scanStatus") or {}
+            status[resource_id[resource_id.rfind("sha256:") :]] = (
+                scan_status.get("statusCode"),
+                scan_status.get("reason"),
+            )
+        for name, digest in entries:
+            code, reason = status.get(digest, (None, None))
+            if code is None:
+                inactive.append(
+                    f"'{name}' is not scanned: no coverage record for image "
+                    f"{repository}@{digest}"
+                )
+            elif code != "ACTIVE":
+                inactive.append(
+                    f"'{name}' is not scanned: PACKAGE scan {code} "
+                    f"({reason or 'no reason'}) on image {repository}@{digest}"
+                )
+    return {"inactive": inactive, "unread": unread}
+
+
 def _inspector_lambda_coverage(
-    region: str, functions: List[Dict[str, Any]], skip: set
+    region: str,
+    functions: List[Dict[str, Any]],
+    skip: set,
+    images: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, List[str]]:
     """
     Read every Lambda coverage record and name each in-scope zip function whose
     $LATEST PACKAGE or CODE record is missing or not ACTIVE. Functions in
-    ``skip`` are already reported as not scanned.
+    ``skip`` are already reported as not scanned. With ``images``, each
+    container-image function is judged by its image digest's coverage record.
     """
+    inspector_client = boto3.client(
+        "inspector2", config=boto3_config, region_name=region
+    )
     try:
         records = _list_all_items(
-            boto3.client("inspector2", config=boto3_config, region_name=region),
+            inspector_client,
             "list_coverage",
             "coveredResources",
             max_results=200,
@@ -17497,7 +17594,13 @@ def _inspector_lambda_coverage(
                 problems.append(f"{scan_type} scan {code} ({reason or 'no reason'})")
         if problems:
             inactive.append("'{}' is not scanned: {}".format(name, ", ".join(problems)))
-    return {"inactive": inactive, "unread": []}
+    if images is None:
+        return {"inactive": inactive, "unread": []}
+    image_legs = _inspector_image_coverage(inspector_client, functions, skip, images)
+    return {
+        "inactive": inactive + image_legs["inactive"],
+        "unread": image_legs["unread"],
+    }
 
 
 def _inspector_finding_rules(region: str) -> str:
@@ -17594,12 +17697,14 @@ def _inspector_lambda_exclusions(
     Name each in-scope function that Inspector does not scan: one encrypted with
     a customer managed key, or one tagged for exclusion. GetFunction returns
     tags only to a caller allowed lambda:ListTags, so a function whose tags did
-    not come back is named in ``unread``.
+    not come back is named in ``unread``. The Code block GetFunction returns
+    for each container-image function is kept in ``images``.
     """
     lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
     excluded = []
     excluded_names = set()
     unread = []
+    images = {}
     for function in functions:
         name = function.get("FunctionName") or "unnamed"
         if function.get("KMSKeyArn"):
@@ -17620,6 +17725,8 @@ def _inspector_lambda_exclusions(
                 )
             )
             continue
+        if function.get("PackageType") == "Image":
+            images[name] = response.get("Code") or {}
         tags = response.get("Tags")
         if not isinstance(tags, dict):
             code = (response.get("TagsError") or {}).get("ErrorCode") or "no tags"
@@ -17633,7 +17740,12 @@ def _inspector_lambda_exclusions(
             excluded.append(
                 f"'{name}' carries InspectorExclusion=LambdaStandardScanning"
             )
-    return {"excluded": excluded, "excluded_names": excluded_names, "unread": unread}
+    return {
+        "excluded": excluded,
+        "excluded_names": excluded_names,
+        "unread": unread,
+        "images": images,
+    }
 
 
 def check_inspector_lambda_code_scanning(
@@ -17836,7 +17948,7 @@ def check_inspector_lambda_code_scanning(
         if lambda_enabled and lambda_code_enabled:
             legs = _inspector_lambda_exclusions(region, bedrock_related_lambdas)
             coverage = _inspector_lambda_coverage(
-                region, bedrock_related_lambdas, legs["excluded_names"]
+                region, bedrock_related_lambdas, legs["excluded_names"], legs["images"]
             )
             legs["excluded"] = legs["excluded"] + coverage["inactive"]
             legs["unread"] = legs["unread"] + coverage["unread"]
@@ -17899,7 +18011,9 @@ def check_inspector_lambda_code_scanning(
                             f"the {len(bedrock_related_lambdas)} in-scope Lambda "
                             "function(s) is encrypted with a customer managed key or "
                             "tagged for exclusion, and each zip function has ACTIVE "
-                            "$LATEST PACKAGE and CODE coverage records in "
+                            "$LATEST PACKAGE and CODE coverage records, and "
+                            "each container-image function's image digest an "
+                            "ACTIVE coverage record, in "
                             f"inspector2:ListCoverage: {sample_functions}"
                             f"{more_functions}. {rules_note} {INSPECTOR_LAMBDA_CEILING}"
                             + (

@@ -1578,7 +1578,7 @@ FOUNDATION_ROWS = [
         ],
         ["BR-33", "AC-50"],
         "BR-33 ('Amazon Inspector Lambda Code Scanning Check') covers Lambda "
-        "functions and no container image. Its population is every function that "
+        "functions, zip and container image. Its population is every function that "
         "names Bedrock in its configuration or whose role the IAM cache shows "
         "granted a Bedrock or AgentCore action, and it fails a function encrypted "
         "with a customer managed key, which Inspector does not scan, or tagged "
@@ -1587,8 +1587,12 @@ FOUNDATION_ROWS = [
         "function whose tags were still withheld is Not Applicable. It reads "
         "every inspector2:ListCoverage page and fails a zip function whose "
         "$LATEST PACKAGE or CODE record is missing or not ACTIVE, naming the "
-        "reason, and names the enabled EventBridge rules that match Inspector "
-        "findings without reading their targets. AC-50 covers the images: it reads "
+        "reason. A container-image function fails when the image digest "
+        "GetFunction resolves it to has no ACTIVE AWS_ECR_CONTAINER_IMAGE "
+        "coverage record in its repository, and an image with no resolved "
+        "digest or from another account is Not Applicable. It also names the enabled EventBridge rules that match Inspector "
+        "findings without reading their targets. AC-50 covers AgentCore runtime "
+        "images: it reads "
         "GetRegistryScanningConfiguration and passes when scanType is ENHANCED "
         "and a CONTINUOUS_SCAN rule has wildcard filters that match every ECR "
         "repository an AgentCore runtime's containerUri names, and every one "

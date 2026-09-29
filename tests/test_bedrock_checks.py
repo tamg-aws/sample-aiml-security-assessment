@@ -20146,21 +20146,157 @@ class TestBR33InspectorLambdaCodeScanning:
         assert "'bedrock-second' is not scanned" in findings[0]["Finding_Details"]
         assert inspector_client.list_coverage.call_count == 2
 
+    IMAGE_DIGEST = "sha256:" + "a" * 64
+    OTHER_DIGEST = "sha256:" + "b" * 64
+
+    def _image_lambda(self, name="bedrock-image", repo="chat-api", account=None):
+        function = {**self._bedrock_lambda(name), "PackageType": "Image"}
+        registry = f"{account or '123456789012'}.dkr.ecr.us-east-1.amazonaws.com"
+        code = {
+            "ImageUri": f"{registry}/{repo}:latest",
+            "ResolvedImageUri": f"{registry}/{repo}@{self.IMAGE_DIGEST}",
+        }
+        return function, {
+            function["FunctionArn"]: {"Configuration": {}, "Tags": {}, "Code": code}
+        }
+
+    @staticmethod
+    def _image_coverage(repo, digest, status="ACTIVE", reason="SUCCESSFUL"):
+        return {
+            "resourceType": "AWS_ECR_CONTAINER_IMAGE",
+            "resourceId": (
+                f"arn:aws:ecr:us-east-1:123456789012:repository/{repo}/{digest}"
+            ),
+            "scanType": "PACKAGE",
+            "scanStatus": {"statusCode": status, "reason": reason},
+        }
+
     @patch("bedrock_app.boto3.client")
-    def test_br33_container_image_function_is_left_to_ac50(self, mock_client):
-        image = {**self._bedrock_lambda("bedrock-image"), "PackageType": "Image"}
+    def test_br33_container_image_function_without_image_coverage_fails(
+        self, mock_client
+    ):
+        """Stricter than before: an unscanned image function no longer passes."""
+        image, tags = self._image_lambda()
         ok = self._bedrock_lambda("bedrock-ok")
         findings, _ = self._br33(
             mock_client,
             [ok, image],
+            tags=tags,
             coverage=[
                 self._coverage(ok["FunctionArn"], "PACKAGE"),
                 self._coverage(ok["FunctionArn"], "CODE"),
+                self._image_coverage("chat-api", self.OTHER_DIGEST),
             ],
         )
 
-        assert [row["Status"] for row in findings] == ["Passed"]
-        assert "judged by AC-50" in findings[0]["Finding_Details"]
+        assert [row["Status"] for row in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert (
+            f"'bedrock-image' is not scanned: no coverage record for image "
+            f"chat-api@{self.IMAGE_DIGEST}" in detail
+        )
+        assert "'bedrock-ok'" not in detail
+
+    @pytest.mark.parametrize(
+        "status, reason, expected",
+        [
+            ("ACTIVE", "SUCCESSFUL", "Passed"),
+            ("INACTIVE", "SCAN_FREQUENCY_MANUAL", "Failed"),
+            ("INACTIVE", "SCAN_ELIGIBILITY_EXPIRED", "Failed"),
+        ],
+    )
+    @patch("bedrock_app.boto3.client")
+    def test_br33_container_image_function_is_judged_by_its_digest(
+        self, mock_client, status, reason, expected
+    ):
+        image, tags = self._image_lambda()
+        findings, inspector_client = self._br33(
+            mock_client,
+            [image],
+            tags=tags,
+            coverage=[
+                self._image_coverage("chat-api", self.IMAGE_DIGEST, status, reason)
+            ],
+        )
+
+        assert [row["Status"] for row in findings] == [expected]
+        detail = findings[0]["Finding_Details"]
+        if expected == "Passed":
+            assert "each container-image function's image digest" in detail
+            assert "judged by AC-50" not in detail
+        else:
+            assert f"PACKAGE scan {status} ({reason})" in detail
+        image_calls = [
+            call.kwargs["filterCriteria"]
+            for call in inspector_client.list_coverage.call_args_list
+            if "ecrRepositoryName" in call.kwargs["filterCriteria"]
+        ]
+        assert image_calls == [
+            {
+                "resourceType": [
+                    {"comparison": "EQUALS", "value": "AWS_ECR_CONTAINER_IMAGE"}
+                ],
+                "ecrRepositoryName": [{"comparison": "EQUALS", "value": "chat-api"}],
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "code, phrase",
+        [
+            ({}, "returned no resolved image digest"),
+            (
+                {
+                    "ImageUri": "999999999999.dkr.ecr.us-east-1.amazonaws.com/x:1",
+                    "ResolvedImageUri": "999999999999.dkr.ecr.us-east-1."
+                    "amazonaws.com/x@sha256:" + "c" * 64,
+                },
+                "account 999999999999",
+            ),
+        ],
+    )
+    @patch("bedrock_app.boto3.client")
+    def test_br33_unresolved_image_is_not_a_pass(self, mock_client, code, phrase):
+        image, tags = self._image_lambda()
+        tags[image["FunctionArn"]]["Code"] = code
+        findings, _ = self._br33(mock_client, [image], tags=tags, coverage=[])
+
+        assert "Passed" not in [row["Status"] for row in findings]
+        assert any(
+            "'bedrock-image'" in row["Finding_Details"]
+            and phrase in row["Finding_Details"]
+            for row in findings
+            if row["Status"] == "N/A"
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_unread_image_coverage_is_not_a_pass(self, mock_client):
+        image, tags = self._image_lambda()
+        ok = self._bedrock_lambda("bedrock-ok")
+        lambda_records = [
+            self._coverage(ok["FunctionArn"], "PACKAGE"),
+            self._coverage(ok["FunctionArn"], "CODE"),
+        ]
+
+        def list_coverage(**kwargs):
+            if "ecrRepositoryName" in kwargs["filterCriteria"]:
+                raise _make_client_error("AccessDeniedException")
+            return {"coveredResources": lambda_records}
+
+        _, inspector_client = self._wire_clients(
+            mock_client, lambda_functions=[ok, image], tags=tags
+        )
+        inspector_client.list_coverage.side_effect = list_coverage
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1", permission_cache=self._cache({})
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["N/A", "N/A"]
+        assert (
+            "image coverage for repository chat-api (inspector2:ListCoverage, "
+            "AccessDeniedException)" in findings[1]["Finding_Details"]
+        )
 
     @patch("bedrock_app.boto3.client")
     def test_br33_coverage_read_denied_blocks_a_pass(self, mock_client):
