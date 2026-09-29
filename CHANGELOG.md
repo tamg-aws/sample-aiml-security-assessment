@@ -298,6 +298,14 @@ section.
 
 ### Fixed
 
+- `AC-33` judges the user id token action on JWT runtimes. It never read
+  whether a runtime whose every caller arrives with a JWT still lets its role
+  call `GetWorkloadAccessTokenForUserId`, which lets agent code mint a token
+  for any user id it names. A new `AgentCore Token Issuance By User ID` row
+  fails that role at Medium unless its own Deny or boundary removes the grant,
+  passes a role without it, and is `N/A` for a role outside the IAM cache or
+  an unread runtime. `InvokeAgentRuntimeForUser` is not judged.
+
 - `AC-46` reads the capacity provider a runtime names. Its `Passed`
   resolution said the control plane carries no per-session memory limit, which
   is not true of a runtime on a capacity provider: its sessions run on the

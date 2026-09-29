@@ -18601,15 +18601,20 @@ def _principals_issuing_agent_tokens(
     return unbounded, directory_only, scoped, unreadable, named_identities
 
 
-def _workload_identities_by_role() -> Tuple[Dict[str, Set[str]], List[str]]:
+def _workload_identities_by_role() -> Tuple[
+    Dict[str, Set[str]], List[str], Dict[str, List[str]]
+]:
     """Map each runtime or gateway role name to the workload identities it runs as.
 
     GetAgentRuntime and GetGateway return the resource's roleArn beside its
     workloadIdentityDetails, which is the only record of which identity is a
     role's own agent. The second list names each read that failed, by action.
+    The third maps each role name to the runtimes running as it whose inbound
+    authorizer is a custom JWT authorizer, so every caller arrives with a JWT.
     """
     own: Dict[str, Set[str]] = {}
     unread: List[str] = []
+    jwt_runtimes: Dict[str, List[str]] = {}
     families = (
         (
             "list_agent_runtimes",
@@ -18664,7 +18669,153 @@ def _workload_identities_by_role() -> Tuple[Dict[str, Set[str]], List[str]]:
             )
             if role_name and identity:
                 own.setdefault(role_name, set()).add(str(identity).lower())
-    return own, unread
+            if (
+                role_name
+                and get_method == "get_agent_runtime"
+                and (detail.get("authorizerConfiguration") or {}).get(
+                    "customJWTAuthorizer"
+                )
+            ):
+                name = detail.get("agentRuntimeName") or item_id
+                jwt_runtimes.setdefault(role_name, []).append(f"'{name}' ({item_id})")
+    return own, unread, jwt_runtimes
+
+
+def _user_id_token_findings(
+    jwt_runtimes: Dict[str, List[str]],
+    role_permissions: Dict[str, Any],
+    runtime_reads_failed: List[str],
+) -> List[Dict[str, Any]]:
+    """Judge whether each JWT runtime's role can mint a token by user id.
+
+    Every caller of a runtime with a custom JWT authorizer arrives with a JWT, so
+    GetWorkloadAccessTokenForJWT identifies the user by a verified token and
+    GetWorkloadAccessTokenForUserId only lets agent code name any user it likes.
+    InvokeAgentRuntimeForUser is called by a runtime's callers, not by its role,
+    and is not judged here.
+    """
+    permissions_by_name = {
+        str(name).lower(): (name, permissions)
+        for name, permissions in role_permissions.items()
+    }
+    can_mint: List[str] = []
+    cannot: List[str] = []
+    missing: List[str] = []
+    for role_name, runtimes in sorted(jwt_runtimes.items()):
+        entry = permissions_by_name.get(role_name)
+        if entry is None:
+            missing.append(f"role {role_name} (runtime {', '.join(runtimes)})")
+            continue
+        name, permissions = entry
+        label = f"role {name} (runtime {', '.join(runtimes)})"
+        granted = False
+        for policy in _principal_policies(permissions):
+            try:
+                statements = list(_allow_statements(policy))
+            except (TypeError, ValueError):
+                continue
+            if any(
+                _statement_reached_actions(
+                    statement, ("getworkloadaccesstokenforuserid",)
+                )
+                for statement in statements
+            ):
+                granted = True
+        if granted and _grant_survives(
+            permissions, "bedrock-agentcore:getworkloadaccesstokenforuserid"
+        ):
+            can_mint.append(label)
+        else:
+            cannot.append(label)
+
+    findings = []
+    if can_mint:
+        findings.append(
+            create_finding(
+                check_id="AC-33",
+                finding_name="AgentCore Token Issuance By User ID",
+                finding_details=(
+                    "These runtimes have a custom JWT authorizer, so every caller "
+                    "arrives with a JWT, yet the role each runs as is granted "
+                    "GetWorkloadAccessTokenForUserId after its own Deny statements "
+                    "and permissions boundary, so agent code can mint a token for "
+                    f"any user id it names: {'; '.join(can_mint)}. "
+                    f"{IAM_CACHE_SCP_NOTE}"
+                ),
+                resolution=(
+                    "Add an explicit Deny on "
+                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId to each "
+                    "role, so user identity reaches the agent only through "
+                    "GetWorkloadAccessTokenForJWT."
+                ),
+                reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+    if runtime_reads_failed:
+        findings.append(
+            create_finding(
+                check_id="AC-33",
+                finding_name="AgentCore Token Issuance By User ID",
+                finding_details=(
+                    "These runtime reads failed, so whether the runtimes they "
+                    "missed have a custom JWT authorizer and a role that can call "
+                    "GetWorkloadAccessTokenForUserId was not judged: "
+                    f"{', '.join(runtime_reads_failed)}."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:ListAgentRuntimes and "
+                    "bedrock-agentcore:GetAgentRuntime, then rerun the assessment."
+                ),
+                reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+    if missing:
+        findings.append(
+            create_finding(
+                check_id="AC-33",
+                finding_name="AgentCore Token Issuance By User ID",
+                finding_details=(
+                    "These runtimes have a custom JWT authorizer, and the role each "
+                    "runs as is not in the IAM permission cache, so whether it can "
+                    "call GetWorkloadAccessTokenForUserId was not judged: "
+                    f"{'; '.join(missing)}."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. A role in another account is not cached; assess that "
+                    "account."
+                ),
+                reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+    if cannot:
+        findings.append(
+            create_finding(
+                check_id="AC-33",
+                finding_name="AgentCore Token Issuance By User ID",
+                finding_details=(
+                    "These runtimes have a custom JWT authorizer, and the role each "
+                    "runs as is not granted GetWorkloadAccessTokenForUserId after "
+                    "its own Deny statements and permissions boundary: "
+                    f"{'; '.join(cannot)}."
+                ),
+                resolution="No action required.",
+                reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+    return findings
 
 
 def check_agentcore_token_issuance_scope(
@@ -18721,14 +18872,22 @@ def check_agentcore_token_issuance_scope(
         foreign: List[str] = []
         unattributed: List[str] = []
         attributed: List[str] = []
+        jwt_runtimes: Dict[str, List[str]] = {}
+        if agentcore_client is None:
+            own_by_role: Dict[str, Set[str]] = {}
+            unread = ["the AgentCore client is not available in this region"]
+            assessed_region = ""
+        else:
+            own_by_role, unread, jwt_runtimes = _workload_identities_by_role()
+            assessed_region = agentcore_client.meta.region_name
+            findings.extend(
+                _user_id_token_findings(
+                    jwt_runtimes,
+                    role_permissions,
+                    [read for read in unread if "AgentRuntime" in read],
+                )
+            )
         if scoped:
-            if agentcore_client is None:
-                own_by_role: Dict[str, Set[str]] = {}
-                unread = ["the AgentCore client is not available in this region"]
-                assessed_region = ""
-            else:
-                own_by_role, unread = _workload_identities_by_role()
-                assessed_region = agentcore_client.meta.region_name
             for label in scoped:
                 kind, _, name = label.partition(" ")
                 own = own_by_role.get(name.lower(), set()) if kind == "role" else set()

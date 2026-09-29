@@ -354,7 +354,10 @@ AI_SUBJECT_ROWS = [
         "directory is reported separately at medium, because the service authorization "
         "reference marks both the directory and the identity required on these actions "
         "and never says whether the directory alone authorizes the call, so that grant "
-        "either reaches every identity the directory holds or authorizes nothing",
+        "either reaches every identity the directory holds or authorizes nothing. The "
+        "role of each runtime with a custom JWT authorizer fails when it can still call "
+        "GetWorkloadAccessTokenForUserId after its own Deny and boundary, and an uncached "
+        "role or an unread runtime is N/A. InvokeAgentRuntimeForUser is not judged",
         [],
         4,
     ),

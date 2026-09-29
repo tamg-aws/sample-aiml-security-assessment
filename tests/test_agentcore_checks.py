@@ -34026,7 +34026,13 @@ class TestAC33OwnAgentIdentity:
         )
 
         assert "Failed" not in [f["Status"] for f in findings]
-        na = [f for f in findings if f["Status"] == "N/A"]
+        # The user id leg reports the same unread list on its own row.
+        user_id = [
+            f for f in findings if f["Finding"] == "AgentCore Token Issuance By User ID"
+        ]
+        assert [f["Status"] for f in user_id] == ["N/A"]
+        assert "bedrock-agentcore:ListAgentRuntimes" in user_id[0]["Finding_Details"]
+        na = [f for f in findings if f["Status"] == "N/A" and f not in user_id]
         assert len(na) == 1
         assert "bedrock-agentcore:ListAgentRuntimes" in na[0]["Finding_Details"]
         assert "role agent-1-role" in na[0]["Finding_Details"]
@@ -34186,6 +34192,109 @@ class TestAC33WholePopulation:
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC33UserIdTokenOnJwtRuntimes:
+    """AC-33: a JWT runtime's role should not mint tokens for a named user id."""
+
+    _FOR_USER_ID = "bedrock-agentcore:GetWorkloadAccessTokenForUserId"
+    _ROW = "AgentCore Token Issuance By User ID"
+
+    @staticmethod
+    def _wire(mock_ac, role="agent-role", jwt=True):
+        mock_ac.meta.region_name = "us-east-1"
+        detail = {
+            "agentRuntimeName": "support",
+            "roleArn": f"arn:aws:iam::123456789012:role/service/{role}",
+            "workloadIdentityDetails": {"workloadIdentityArn": _IDENTITY_ARN},
+        }
+        if jwt:
+            detail["authorizerConfiguration"] = {
+                "customJWTAuthorizer": {
+                    "discoveryUrl": "https://idp.example.com/.well-known/openid-configuration"
+                }
+            }
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        mock_ac.get_agent_runtime.return_value = detail
+        mock_ac.list_gateways.return_value = {"items": []}
+
+    def _rows(self, statements, **wire):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac, **wire)
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(roles={"agent-role": _principal_with(statements)})
+            )
+        return [f for f in findings if f["Finding"] == self._ROW]
+
+    def _allow(self, action):
+        return {
+            "Effect": "Allow",
+            "Action": action,
+            "Resource": [_DIRECTORY_ARN, _IDENTITY_ARN],
+        }
+
+    def test_a_jwt_runtime_role_that_can_mint_by_user_id_fails(self):
+        rows = self._rows([self._allow(self._FOR_USER_ID)])
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert rows[0]["Severity"] == "Medium"
+        assert "role agent-role" in rows[0]["Finding_Details"]
+        assert "'support' (rt-1)" in rows[0]["Finding_Details"]
+        assert "GetWorkloadAccessTokenForUserId" in rows[0]["Resolution"]
+
+    def test_a_service_wildcard_reaches_the_user_id_action(self):
+        rows = self._rows([self._allow("bedrock-agentcore:*")])
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+
+    def test_an_explicit_deny_on_the_user_id_action_passes(self):
+        rows = self._rows(
+            [
+                self._allow(self._FOR_USER_ID),
+                {"Effect": "Deny", "Action": self._FOR_USER_ID, "Resource": "*"},
+            ]
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "role agent-role" in rows[0]["Finding_Details"]
+
+    def test_a_role_granted_only_the_jwt_exchange_passes(self):
+        rows = self._rows(
+            [self._allow("bedrock-agentcore:GetWorkloadAccessTokenForJWT")]
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_a_runtime_without_a_jwt_authorizer_is_not_judged(self):
+        rows = self._rows([self._allow(self._FOR_USER_ID)], jwt=False)
+
+        assert rows == []
+
+    def test_an_unread_runtime_is_na_for_the_user_id_leg(self):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac)
+            mock_ac.get_agent_runtime.side_effect = _make_client_error(
+                "AccessDeniedException", "denied"
+            )
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(
+                    roles={
+                        "agent-role": _principal_with([self._allow(self._FOR_USER_ID)])
+                    }
+                )
+            )
+        rows = [f for f in findings if f["Finding"] == self._ROW]
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "GetAgentRuntime on rt-1" in rows[0]["Finding_Details"]
+
+    def test_a_jwt_runtime_role_missing_from_the_cache_is_na(self):
+        rows = self._rows([self._allow(self._FOR_USER_ID)], role="other-role")
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "role other-role" in rows[0]["Finding_Details"]
 
 
 class TestAC42WholePopulation:
