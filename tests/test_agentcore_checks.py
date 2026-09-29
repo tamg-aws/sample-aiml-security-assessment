@@ -19940,6 +19940,175 @@ def _published(*metrics):
     }
 
 
+class TestAC40AlarmTiedToTheScore:
+    """AC-40 ties a score alarm to the configuration and evaluators it reads."""
+
+    _NS = "Bedrock-AgentCore/Evaluations"
+    _HARM = "Builtin.Harmfulness"
+    _TOOL = "Builtin.ToolSelectionAccuracy"
+    _HELP = "Builtin.Helpfulness"
+
+    def _run(self, mock_ac, alarms, metrics, details=None):
+        _online_evaluation_client(mock_ac, details)
+        with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            mock_cw.describe_alarms.return_value = {"MetricAlarms": alarms}
+            mock_cw.list_metrics.side_effect = lambda Namespace, **_: (
+                _published(*metrics) if Namespace == self._NS else {"Metrics": []}
+            )
+            return agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+    def _alarm(self, name, metric, **dims):
+        return _score_alarm(
+            name=name,
+            MetricName=metric,
+            Dimensions=[{"Name": k, "Value": v} for k, v in dims.items()],
+        )
+
+    def _two_configs(self):
+        return [
+            _online_evaluation_detail(),
+            _online_evaluation_detail(
+                onlineEvaluationConfigId="oec-2", onlineEvaluationConfigName="second"
+            ),
+        ]
+
+    @pytest.mark.parametrize(
+        "own, other", [("oec-1", "oec-2"), ("continuous", "second")], ids=["id", "name"]
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_on_another_configurations_score_counts_only_for_it(
+        self, mock_ac, own, other
+    ):
+        metrics = [
+            (self._NS, "Score", {"Config": config, "Evaluator": ev})
+            for config in (own, other)
+            for ev in (self._HARM, self._TOOL)
+        ]
+        alarms = [
+            self._alarm(f"second-{ev}", "Score", Config=other, Evaluator=ev)
+            for ev in (self._HARM, self._TOOL)
+        ]
+
+        findings = self._run(mock_ac, alarms, metrics, self._two_configs())
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "oec-1" in findings[0]["Finding_Details"]
+        assert (
+            "alarm(s) second-Builtin.Harmfulness, second-Builtin.ToolSelectionAccuracy "
+            "read only another configuration's scores" in findings[0]["Finding_Details"]
+        )
+        assert "second-Builtin.Harmfulness" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_on_a_quality_score_does_not_alert_on_safety(self, mock_ac):
+        details = [
+            _online_evaluation_detail(
+                evaluators=[
+                    {"evaluatorId": self._HARM},
+                    {"evaluatorId": self._TOOL},
+                    {"evaluatorId": self._HELP},
+                ]
+            )
+        ]
+        metrics = [
+            (self._NS, "Score", {"Evaluator": ev})
+            for ev in (self._HARM, self._TOOL, self._HELP)
+        ]
+        alarms = [
+            self._alarm("helpful-drop", "Score", Evaluator=self._HELP),
+            self._alarm("tool-drop", "Score", Evaluator=self._TOOL),
+        ]
+
+        findings = self._run(mock_ac, alarms, metrics, details)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            f"has no CloudWatch alarm with actions on the score of {self._HARM}"
+            in findings[0]["Finding_Details"]
+        )
+        assert f"on the score of {self._TOOL}" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_safety_alarm_without_a_tool_choice_alarm_fails(self, mock_ac):
+        metrics = [(self._NS, ev, {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)]
+        alarms = [self._alarm("harm-drop", self._HARM, Evaluator=self._HARM)]
+
+        findings = self._run(mock_ac, alarms, metrics)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            f"has no CloudWatch alarm with actions on the score of {self._TOOL}"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_alarm_per_category_passes_and_names_what_it_reads(self, mock_ac):
+        metrics = [
+            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+        ]
+        alarms = [
+            self._alarm("harm-drop", "Score", Evaluator=self._HARM),
+            self._alarm("tool-drop", "Score", Evaluator=self._TOOL),
+        ]
+
+        findings = self._run(mock_ac, alarms, metrics)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            f"alarm(s) harm-drop read the score of {self._HARM}"
+            in findings[0]["Finding_Details"]
+        )
+        assert (
+            f"alarm(s) tool-drop read the score of {self._TOOL}"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_on_a_score_that_names_no_configuration_counts_for_each(
+        self, mock_ac
+    ):
+        metrics = [
+            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+        ]
+        alarms = [
+            self._alarm("harm-drop", "Score", Evaluator=self._HARM),
+            self._alarm("tool-drop", "Score", Evaluator=self._TOOL),
+        ]
+
+        findings = self._run(mock_ac, alarms, metrics, self._two_configs())
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_category_listmetrics_does_not_list_is_not_required(self, mock_ac):
+        # No tool-choice score has recent data, so an alarm on it could not be
+        # told from one on a misspelled metric; the safety alarm alone passes.
+        metrics = [(self._NS, "Score", {"Evaluator": self._HARM})]
+        alarms = [self._alarm("harm-drop", "Score", Evaluator=self._HARM)]
+
+        findings = self._run(mock_ac, alarms, metrics)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            f"ListMetrics lists no score of {self._TOOL}"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_metrics_that_name_no_evaluator_keep_the_namespace_match(self, mock_ac):
+        metrics = [(self._NS, "Score", {"Label": "Harmful"})]
+        alarms = [self._alarm("any-drop", "Score", Label="Harmful")]
+
+        findings = self._run(mock_ac, alarms, metrics)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "no listed metric in Bedrock-AgentCore/Evaluations or Bedrock "
+            "AgentCore/Evaluations names an attached evaluator"
+            in findings[0]["Finding_Details"]
+        )
+
+
 class TestAC40PublishedScoreMetrics:
     """AC-40 counts a score alarm only on a metric ListMetrics lists."""
 

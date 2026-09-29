@@ -21335,8 +21335,9 @@ EVALUATION_DEFAULT_METRICS_NAMESPACES = (
 EVALUATION_SCORE_ALARM_NOTE = (
     "A score alarm counts when it reads a metric in the configuration's metrics "
     "namespace, has ActionsEnabled true and names at least one AlarmActions "
-    "target. The metric dimensions an alarm narrows on are not judged, because "
-    "the dimension names the service emits are not API fields."
+    "target. The dimension names the service emits are not API fields, so an "
+    "alarm is tied to a configuration or an evaluator by a metric name or "
+    "dimension value equal to its id, and only when ListMetrics lists one."
 )
 
 
@@ -21382,6 +21383,11 @@ def _alarm_metric_keys(alarm: Dict[str, Any]) -> List[Tuple[Any, Any, frozenset]
     return keys
 
 
+def _metric_identifying_values(key: Tuple[Any, Any, frozenset]) -> Set[str]:
+    """Return the metric name and dimension values of one metric key."""
+    return {str(key[1])} | {str(value) for _, value in key[2]}
+
+
 def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     """AC-40: Judge whether an online evaluation scores safety and tool choice.
 
@@ -21395,7 +21401,10 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     nobody when it falls. When ListMetrics lists metrics in that namespace, an
     alarm counts only when a metric it reads matches a listed one by name and
     dimension set, because an alarm on a metric that is never published stays in
-    INSUFFICIENT_DATA and never fires.
+    INSUFFICIENT_DATA and never fires. When a listed metric names a
+    configuration by its id or name, an alarm reading only another
+    configuration's scores does not count, and when one names an attached
+    safety or tool-choice evaluator, an alarm has to read that evaluator's score.
     """
     if agentcore_client is None:
         return [
@@ -21526,6 +21535,15 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         except Exception as error:
             alarm_error = _assessment_error_label(error)
 
+    config_values = {
+        str(value)
+        for _, detail in details
+        for value in (
+            detail.get("onlineEvaluationConfigId"),
+            detail.get("onlineEvaluationConfigName"),
+        )
+        if value
+    }
     published_by_namespace: Dict[str, Any] = {}
     for label, detail in details:
         output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
@@ -21599,9 +21617,6 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
             )
         else:
             metric_note = ""
-        watching = sorted(
-            alarm_labels[str(alarm.get("AlarmName"))] for alarm in watching_alarms
-        )
         attached = [
             str(reference.get("evaluatorId"))
             for reference in detail.get("evaluators") or []
@@ -21610,6 +21625,95 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         safety_attached = sorted(set(attached) & safety_ids)
         tool_call_attached = sorted(set(attached) & tool_call_ids)
         unclassifiable = sorted(set(attached) - service_authored_ids)
+
+        tie_missing: List[str] = []
+        tie_notes: List[str] = []
+        elsewhere_note = ""
+        if published and not metric_error and watching_alarms:
+            listed_values = set().union(
+                *(_metric_identifying_values(key) for key in published)
+            )
+            alarm_values = {
+                str(alarm.get("AlarmName")): set().union(
+                    set(),
+                    *(
+                        _metric_identifying_values(key)
+                        for key in _alarm_metric_keys(alarm)
+                        if key in published
+                    ),
+                )
+                for alarm in watching_alarms
+            }
+            own_values = {
+                str(value)
+                for value in (
+                    detail.get("onlineEvaluationConfigId"),
+                    detail.get("onlineEvaluationConfigName"),
+                )
+                if value
+            }
+            if listed_values & config_values:
+                elsewhere = [
+                    alarm
+                    for alarm in watching_alarms
+                    if alarm_values[str(alarm.get("AlarmName"))] & config_values
+                    and not alarm_values[str(alarm.get("AlarmName"))] & own_values
+                ]
+                if elsewhere:
+                    elsewhere_note = (
+                        " (alarm(s) "
+                        + ", ".join(
+                            sorted(
+                                alarm_labels[str(alarm.get("AlarmName"))]
+                                for alarm in elsewhere
+                            )
+                        )
+                        + " read only another configuration's scores)"
+                    )
+                    watching_alarms = [
+                        alarm for alarm in watching_alarms if alarm not in elsewhere
+                    ]
+            if not listed_values & set(attached):
+                tie_notes.append(
+                    f"no listed metric in {namespace_text} names an attached "
+                    "evaluator, so each alarm is counted for the namespace and not "
+                    "tied to a score"
+                )
+            elif watching_alarms:
+                for category, ids in (
+                    ("safety", safety_attached),
+                    ("tool-choice", tool_call_attached),
+                ):
+                    if not ids:
+                        continue
+                    listed = sorted(set(ids) & listed_values)
+                    if not listed:
+                        tie_notes.append(
+                            f"ListMetrics lists no score of {', '.join(ids)}, so no "
+                            "alarm on it is required"
+                        )
+                        continue
+                    readers = sorted(
+                        alarm_labels[str(alarm.get("AlarmName"))]
+                        for alarm in watching_alarms
+                        if alarm_values[str(alarm.get("AlarmName"))] & set(listed)
+                    )
+                    if readers:
+                        tie_notes.append(
+                            f"alarm(s) {', '.join(readers)} read the score of "
+                            f"{', '.join(listed)}"
+                        )
+                    else:
+                        tie_missing.append(
+                            "has no CloudWatch alarm with actions on the score of "
+                            f"{', '.join(listed)}, which ListMetrics lists in "
+                            f"{namespace_text}, so a falling {category} score "
+                            "notifies nobody"
+                        )
+        tie_note = f" Of those, {'; '.join(tie_notes)}." if tie_notes else ""
+        watching = sorted(
+            alarm_labels[str(alarm.get("AlarmName"))] for alarm in watching_alarms
+        )
 
         owner_note = (
             f" The {len(unclassifiable)} attached evaluator(s) written in this "
@@ -21635,8 +21739,11 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         if not alarm_error and not watching:
             missing.append(
                 "has no CloudWatch alarm with actions on a metric in "
-                f"{namespace_text}, so a falling score notifies nobody"
+                f"{namespace_text}{elsewhere_note}, so a falling score notifies "
+                "nobody"
             )
+        elif not alarm_error:
+            missing.extend(tie_missing)
         alarm_note = (
             f" CloudWatch alarms could not be read ({alarm_error}), so whether a "
             "falling score notifies anyone is unknown."
@@ -21652,7 +21759,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} attaches {len(attached)} evaluator(s) and "
                         f"{'; and '.join(missing)}.{owner_note}{alarm_note}"
-                        f"{metric_note}"
+                        f"{metric_note}{tie_note}"
                     ),
                     resolution=(
                         "Attach a safety evaluator and a tool-choice evaluator from "
@@ -21715,6 +21822,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                         f"tool choice with {', '.join(tool_call_attached)}, and "
                         f"alarm(s) {', '.join(watching)} with actions read its "
                         f"scores in {namespace_text}.{owner_note}{metric_note}"
+                        f"{tie_note}"
                     ),
                     resolution=(
                         "No action required for this check. "
