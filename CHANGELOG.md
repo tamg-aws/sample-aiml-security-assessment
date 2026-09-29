@@ -261,6 +261,9 @@ section.
 
 ### Fixed
 
+- `BR-32` `Passed` rows name, as an UNVERIFIED open edge, whether guardrail
+  metrics for a guardrail that another account owns, or that the
+  organization enforces, are emitted in this account.
 - `BR-10` needs, on the input and on the output of each guardrail version
   that may be named, at least one `HATE`, `INSULTS`, `MISCONDUCT`, `SEXUAL`
   or `VIOLENCE` content filter that blocks at `LOW` or above. It had required

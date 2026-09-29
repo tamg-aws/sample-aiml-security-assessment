@@ -17042,6 +17042,13 @@ GUARDRAIL_SLICE_DIMENSIONS = (
 
 GUARDRAIL_VERSION_DIMENSIONS = ("GuardrailArn", "GuardrailVersion")
 
+GUARDRAIL_METRIC_ACCOUNT_EDGE = (
+    " Open edge, UNVERIFIED: whether AWS/Bedrock/Guardrails metrics for a "
+    "guardrail that another account owns, or that the organization enforces, "
+    "are emitted in this account is not confirmed, so the interventions of "
+    "such a guardrail may not reach this alarm."
+)
+
 GUARDRAIL_METRIC_DIMENSIONS_NOTE = (
     "AWS/Bedrock/Guardrails publishes InvocationsIntervened only under a "
     "dimension (Operation, GuardrailContentSource, GuardrailPolicyType, or "
@@ -17734,7 +17741,7 @@ def _guardrail_intervention_signal_finding(
 
     if operation_alarms:
         return row(
-            f"{scope_text} Guardrail interventions reach an acting alarm: alarm {', '.join(operation_alarms)} evaluates {GUARDRAIL_INTERVENTION_METRIC} under Operation ApplyGuardrail alone. ApplyGuardrail is the one Operation value {GUARDRAIL_METRIC_NAMESPACE} publishes, and AWS counts the guardrail evaluations made during model invocation as ApplyGuardrail calls (logging-using-cloudtrail), so the alarm counts the interventions of every guardrail evaluated in this Region.{gap_text}{forwarding}",
+            f"{scope_text} Guardrail interventions reach an acting alarm: alarm {', '.join(operation_alarms)} evaluates {GUARDRAIL_INTERVENTION_METRIC} under Operation ApplyGuardrail alone. ApplyGuardrail is the one Operation value {GUARDRAIL_METRIC_NAMESPACE} publishes, and AWS counts the guardrail evaluations made during model invocation as ApplyGuardrail calls (logging-using-cloudtrail), so the alarm counts the interventions of every guardrail evaluated in this Region.{GUARDRAIL_METRIC_ACCOUNT_EDGE}{gap_text}{forwarding}",
             "No action required. Confirm the alarm action reaches the security monitoring destination that is reviewed.",
             "Low",
             "Passed",
@@ -17746,7 +17753,7 @@ def _guardrail_intervention_signal_finding(
         uncovered = sorted(population - set(version_alarms))
         if population and not uncovered and not version_errors and not unjudged:
             return row(
-                f"{scope_text} Guardrail interventions reach an acting alarm: every one of the {len(population)} guardrail version(s) defined or applied in this Region, DRAFT included, has an acting alarm on {GUARDRAIL_INTERVENTION_METRIC} with that GuardrailArn and GuardrailVersion ({', '.join(sorted(version_alarms[key] for key in population))}).{gap_text}{forwarding}",
+                f"{scope_text} Guardrail interventions reach an acting alarm: every one of the {len(population)} guardrail version(s) defined or applied in this Region, DRAFT included, has an acting alarm on {GUARDRAIL_INTERVENTION_METRIC} with that GuardrailArn and GuardrailVersion ({', '.join(sorted(version_alarms[key] for key in population))}).{GUARDRAIL_METRIC_ACCOUNT_EDGE}{gap_text}{forwarding}",
                 "No action required. Add a per-version alarm whenever a guardrail version is created, or alarm on Operation=ApplyGuardrail instead.",
                 "Low",
                 "Passed",

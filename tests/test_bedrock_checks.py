@@ -19750,6 +19750,11 @@ class TestBR32ActingIntervention:
             "alarm all evaluates InvocationsIntervened under Operation "
             "ApplyGuardrail alone" in signal["Finding_Details"]
         )
+        assert (
+            "Open edge, UNVERIFIED: whether AWS/Bedrock/Guardrails metrics for a "
+            "guardrail that another account owns, or that the organization "
+            "enforces, are emitted in this account" in signal["Finding_Details"]
+        )
 
     @pytest.mark.parametrize(
         "dimensions, text",
@@ -19809,6 +19814,7 @@ class TestBR32ActingIntervention:
             "included, has an acting alarm on InvocationsIntervened"
             in signal["Finding_Details"]
         )
+        assert "Open edge, UNVERIFIED" in signal["Finding_Details"]
         listed = sorted(
             call.kwargs["guardrailIdentifier"]
             for call in self.bedrock_client.list_guardrails.call_args_list
