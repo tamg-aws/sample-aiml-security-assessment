@@ -40326,6 +40326,11 @@ class TestAC53CoordinationAnomalyAlarms:
             ],
         }
 
+    def _latency_band(self, alarm_name, metric, **kwargs):
+        return self._band_alarm(
+            alarm_name, dict(metric, MetricName="Latency"), **kwargs
+        )
+
     def _run(
         self, metrics, alarms, runtimes=None, gateways=None, engines=None, composites=()
     ):
@@ -40380,9 +40385,13 @@ class TestAC53CoordinationAnomalyAlarms:
 
     def test_an_anomaly_band_alarm_on_the_edge_passes(self):
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
-        findings, cloudwatch = self._run([edge], [self._band_alarm("a-to-b", edge)])
+        findings, cloudwatch = self._run(
+            [edge],
+            [self._band_alarm("a-to-b", edge), self._latency_band("a-to-b-lat", edge)],
+        )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "a-to-b on Fault" in findings[0]["Finding_Details"]
+        assert "a-to-b-lat on Latency" in findings[0]["Finding_Details"]
         called = {
             c.kwargs["MetricName"] for c in cloudwatch.list_metrics.call_args_list
         }
@@ -40393,7 +40402,13 @@ class TestAC53CoordinationAnomalyAlarms:
     def test_only_the_second_of_two_edges_alarmed_fails_the_first(self):
         first = self._metric("Latency", "alpha.DEFAULT", "beta.DEFAULT")
         second = self._metric("Latency", "alpha.DEFAULT", "gamma.DEFAULT")
-        findings, _ = self._run([first, second], [self._band_alarm("a-to-g", second)])
+        findings, _ = self._run(
+            [first, second],
+            [
+                self._band_alarm("a-to-g", second),
+                self._band_alarm("a-to-g-err", dict(second, MetricName="Error")),
+            ],
+        )
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "gamma-CCCCCCCCCC" not in findings[0]["Finding_Details"]
         assert "beta-BBBBBBBBBB" in findings[0]["Finding_Details"]
@@ -40401,7 +40416,13 @@ class TestAC53CoordinationAnomalyAlarms:
     def test_only_the_first_of_two_edges_alarmed_fails_the_second(self):
         first = self._metric("Latency", "alpha.DEFAULT", "beta.DEFAULT")
         second = self._metric("Latency", "alpha.DEFAULT", "gamma.DEFAULT")
-        findings, _ = self._run([first, second], [self._band_alarm("a-to-b", first)])
+        findings, _ = self._run(
+            [first, second],
+            [
+                self._band_alarm("a-to-b", first),
+                self._band_alarm("a-to-b-err", dict(first, MetricName="Error")),
+            ],
+        )
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "gamma-CCCCCCCCCC" in findings[0]["Finding_Details"]
         assert "beta-BBBBBBBBBB" not in findings[0]["Finding_Details"]
@@ -40420,7 +40441,12 @@ class TestAC53CoordinationAnomalyAlarms:
         second = self._metric("Fault", "tools-gw-dddddddddd", "AWS::gamma-CCCCCCCCCC")
         findings, _ = self._run(
             [first, second],
-            [self._band_alarm("one", first), self._band_alarm("two", second)],
+            [
+                self._band_alarm("one", first),
+                self._latency_band("one-lat", first),
+                self._band_alarm("two", second),
+                self._latency_band("two-lat", second),
+            ],
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "2 AgentCore caller and callee pair" in findings[0]["Finding_Details"]
@@ -40457,7 +40483,13 @@ class TestAC53CoordinationAnomalyAlarms:
         no_env["Dimensions"] = [
             d for d in edge["Dimensions"] if d["Name"] != "Environment"
         ]
-        findings, _ = self._run([edge], [self._band_alarm("no-env", no_env)])
+        findings, _ = self._run(
+            [edge],
+            [
+                self._band_alarm("no-env", no_env),
+                self._latency_band("no-env-lat", no_env),
+            ],
+        )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "no-env on Fault" in findings[0]["Finding_Details"]
 
@@ -40466,7 +40498,13 @@ class TestAC53CoordinationAnomalyAlarms:
         one_op = self._metric(
             "Fault", "alpha.DEFAULT", "beta.DEFAULT", Operation="POST /invocations"
         )
-        findings, _ = self._run([edge, one_op], [self._band_alarm("one-op", one_op)])
+        findings, _ = self._run(
+            [edge, one_op],
+            [
+                self._band_alarm("one-op", one_op),
+                self._latency_band("one-op-lat", one_op),
+            ],
+        )
         assert [f["Status"] for f in findings] == ["Passed"]
 
     def test_a_band_without_the_remote_service_dimension_does_not_count(self):
@@ -40533,7 +40571,7 @@ class TestAC53CoordinationAnomalyAlarms:
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
         findings, _ = self._run(
             [edge, self._metric("Fault", "gamma.DEFAULT", "UnknownRemoteService")],
-            [self._band_alarm("a-to-b", edge)],
+            [self._band_alarm("a-to-b", edge), self._latency_band("a-to-b-lat", edge)],
         )
         assert [f["Status"] for f in findings] == ["N/A", "Passed"]
         assert "'gamma.DEFAULT'" in findings[0]["Finding_Details"]
@@ -40650,6 +40688,83 @@ class TestAC53CoordinationAnomalyAlarms:
         with patch.object(agentcore_app, "cloudwatch_client", None):
             findings = agentcore_app.check_agentcore_coordination_anomaly_alarms()
         assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_a_latency_band_alone_leaves_the_error_rate_unwatched(self):
+        edge = self._metric("Latency", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run([edge], [self._band_alarm("lat-only", edge)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "lat-only on Latency" in details
+        assert "no alarm with actions watches its Error or Fault metric" in details
+        assert "Error or Fault" in findings[0]["Resolution"]
+
+    def test_an_error_band_alone_leaves_the_latency_unwatched(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run([edge], [self._band_alarm("fault-only", edge)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "fault-only on Fault" in details
+        assert "no alarm with actions watches its Latency metric" in details
+        assert "Latency" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize("error_metric", ["Error", "Fault"])
+    def test_either_error_metric_with_latency_passes(self, error_metric):
+        edge = self._metric(error_metric, "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run(
+            [edge], [self._band_alarm("err", edge), self._latency_band("lat", edge)]
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_error_and_fault_without_latency_still_fail(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run(
+            [edge],
+            [
+                self._band_alarm("fault", edge),
+                self._band_alarm("error", dict(edge, MetricName="Error")),
+            ],
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "watches its Latency metric" in findings[0]["Finding_Details"]
+
+    def test_each_pair_needs_both_kinds_of_its_own(self):
+        full = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        half = self._metric("Fault", "alpha.DEFAULT", "gamma.DEFAULT")
+        findings, _ = self._run(
+            [full, half],
+            [
+                self._band_alarm("full-err", full),
+                self._latency_band("full-lat", full),
+                self._band_alarm("half-err", half),
+                # a Latency band on the other pair does not cover this one
+                self._latency_band("elsewhere", full),
+            ],
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "gamma-CCCCCCCCCC" in findings[0]["Finding_Details"]
+        assert "beta-BBBBBBBBBB" not in findings[0]["Finding_Details"]
+        assert "watches its Latency metric" in findings[0]["Finding_Details"]
+
+    def test_the_hidden_direction_latency_elsewhere_and_error_here(self):
+        here = self._metric("Error", "alpha.DEFAULT", "beta.DEFAULT")
+        there = self._metric("Latency", "alpha.DEFAULT", "gamma.DEFAULT")
+        findings, _ = self._run(
+            [here, there],
+            [self._band_alarm("here-err", here), self._band_alarm("there-lat", there)],
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        by_callee = {
+            "beta": next(
+                f for f in findings if "beta-BBBBBBBBBB" in f["Finding_Details"]
+            ),
+            "gamma": next(
+                f for f in findings if "gamma-CCCCCCCCCC" in f["Finding_Details"]
+            ),
+        }
+        assert "watches its Latency metric" in by_callee["beta"]["Finding_Details"]
+        assert (
+            "watches its Error or Fault metric" in by_callee["gamma"]["Finding_Details"]
+        )
 
 
 class TestAC53Registration:
@@ -40854,9 +40969,15 @@ class TestAgentCoreCompositeAlarmCredit:
             [first, second],
             [
                 suite._band_alarm("a-to-b", first, actions=False),
+                suite._band_alarm(
+                    "a-to-b-err", dict(first, MetricName="Error"), actions=False
+                ),
                 suite._band_alarm("a-to-g", second, actions=False),
+                suite._band_alarm(
+                    "a-to-g-err", dict(second, MetricName="Error"), actions=False
+                ),
             ],
-            composites=[_composite("rollup", 'ALARM("a-to-b")')],
+            composites=[_composite("rollup", 'ALARM("a-to-b") OR ALARM("a-to-b-err")')],
         )
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "gamma-CCCCCCCCCC" in findings[0]["Finding_Details"]
@@ -40867,8 +40988,11 @@ class TestAgentCoreCompositeAlarmCredit:
         edge = suite._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
         findings, _ = suite._run(
             [edge],
-            [suite._band_alarm("a-to-b", edge, actions=False)],
-            composites=[_composite("rollup", 'ALARM("a-to-b")')],
+            [
+                suite._band_alarm("a-to-b", edge, actions=False),
+                suite._latency_band("a-to-b-lat", edge, actions=False),
+            ],
+            composites=[_composite("rollup", 'ALARM("a-to-b") OR ALARM("a-to-b-lat")')],
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert (

@@ -29533,9 +29533,11 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     from a gateway to its policy engine is excluded, because Policy in AgentCore
     decides tool access and is not an agent.
 
-    Each edge needs a metric alarm with actions whose threshold is an
-    ANOMALY_DETECTION_BAND over the edge's Error, Fault or Latency metric with
-    the edge's Service and RemoteService, whatever other dimensions it carries.
+    Each edge needs metric alarms with actions whose threshold is an
+    ANOMALY_DETECTION_BAND over the edge's Latency metric and over its Error or
+    Fault metric, with the edge's Service and RemoteService, whatever other
+    dimensions they carry. One band watches either how long the pair takes or
+    how often it fails, and DET-10 asks for both.
     A pair whose RemoteService is UnknownRemoteService is N/A by name, never
     Passed. A runtime not instrumented with Application Signals publishes no
     edge, so it cannot be assessed.
@@ -29703,7 +29705,33 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
 
     findings: List[Dict[str, Any]] = list(unnamed)
     for (service, remote), (kind, callee_id) in sorted(edges.items()):
-        if (service, remote) in alarmed:
+        labels = alarmed.get((service, remote), [])
+        watched = {label.rsplit(" on ", 1)[1] for label in labels}
+        has_error = bool(watched & {"Error", "Fault"})
+        has_latency = "Latency" in watched
+        if has_error and has_latency:
+            continue
+        if labels:
+            missing, effect = (
+                ("Latency", "how long that pair takes")
+                if has_error
+                else ("Error or Fault", "how often that pair fails")
+            )
+            findings.append(
+                finding(
+                    f"Calls from '{service}' to {kind} {callee_id} (RemoteService "
+                    f"'{remote}') are alarmed on an anomaly detection band by "
+                    f"{', '.join(sorted(labels))}, but no alarm with actions "
+                    f"watches its {missing} metric, so a change in {effect} "
+                    "notifies nobody.",
+                    "Create a CloudWatch alarm with an anomaly detection band on "
+                    f"the {APPLICATION_SIGNALS_NAMESPACE} {missing} metric with "
+                    "this pair's Environment, Service and RemoteService "
+                    "dimensions, and give it an alarm action.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
             continue
         findings.append(
             finding(
@@ -29712,8 +29740,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                 "ANOMALY_DETECTION_BAND over the pair's Error, Fault or Latency "
                 "metric, so a change in how often that pair fails or how long it "
                 "takes notifies nobody.",
-                "Create a CloudWatch alarm with an anomaly detection band on the "
-                f"{APPLICATION_SIGNALS_NAMESPACE} Error, Fault or Latency metric "
+                "Create CloudWatch alarms with anomaly detection bands on the "
+                f"{APPLICATION_SIGNALS_NAMESPACE} Latency metric and the Error or "
+                "Fault metric "
                 "with this pair's Environment, Service and RemoteService "
                 "dimensions, and give it an alarm action.",
                 SeverityEnum.MEDIUM,
@@ -29729,8 +29758,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     return unnamed + [
         finding(
             f"Every one of the {len(edges)} AgentCore caller and callee pair(s) "
-            "Application Signals records has an alarm with actions on an anomaly "
-            f"detection band: {covered}.",
+            "Application Signals records has alarms with actions on anomaly "
+            "detection bands over its Latency metric and its Error or Fault "
+            f"metric: {covered}.",
             "No action required.",
             SeverityEnum.MEDIUM,
             StatusEnum.PASSED,
