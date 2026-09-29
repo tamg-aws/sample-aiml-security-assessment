@@ -4621,6 +4621,80 @@ class TestSM23MonitorReportAndAlarm:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "'mq'" in rows[0]["Finding_Details"]
 
+    DOC_DATA_NAMESPACE = "/aws/sagemaker/Endpoints/data-metric"
+
+    def _doc_alarm(self, schedule, endpoint, namespace=DOC_DATA_NAMESPACE):
+        alarm = self._alarm(schedule, namespace)
+        alarm["Dimensions"] = [
+            {"Name": "EndpointName", "Value": endpoint},
+            {"Name": "ScheduleName", "Value": schedule},
+        ]
+        return alarm
+
+    def _split_rows(self, mock_client, alarms):
+        return self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=[
+                self._schedule("dq", "DataQuality"),
+                self._schedule("mq", "ModelQuality", endpoint="ep2"),
+            ],
+            endpoints=("ep", "ep2"),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=alarms,
+        )
+
+    @pytest.mark.parametrize("doc_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_the_data_quality_doc_spelling_credits_its_schedule(
+        self, mock_client, doc_first
+    ):
+        # One schedule alarmed under each documented spelling.
+        existing = self._alarm("mq", "aws/sagemaker/Endpoints/model-metrics")
+        existing["Dimensions"] = [
+            {"Name": "Endpoint", "Value": "ep2"},
+            {"Name": "MonitoringSchedule", "Value": "mq"},
+        ]
+        alarms = [self._doc_alarm("dq", "ep"), existing]
+        if not doc_first:
+            alarms.reverse()
+        rows = self._split_rows(mock_client, alarms)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "dimensions",
+        [
+            [{"Name": "ScheduleName", "Value": "dq"}],
+            [{"Name": "EndpointName", "Value": "ep"}],
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_either_doc_dimension_alone_credits_only_its_schedule(
+        self, mock_client, dimensions
+    ):
+        alarm = self._doc_alarm("dq", "ep")
+        alarm["Dimensions"] = dimensions
+        rows = self._split_rows(mock_client, [alarm])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "'dq'" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "namespace",
+        ["/aws/sagemaker/Endpoints", "AWS/SageMaker", "/aws/sagemaker/Endpoints/x"],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_an_endpoint_name_on_another_namespace_does_not_credit(
+        self, mock_client, namespace
+    ):
+        rows = self._split_rows(
+            mock_client,
+            [self._doc_alarm("dq", "ep"), self._doc_alarm("mq", "ep2", namespace)],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "'dq'" not in rows[0]["Finding_Details"]
+
     @patch("sagemaker_app.boto3.client")
     def test_alarm_without_action_does_not_count(self, mock_client):
         silent = self._alarm("mq")

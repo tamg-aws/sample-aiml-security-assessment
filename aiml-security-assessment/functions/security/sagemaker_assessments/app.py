@@ -8611,7 +8611,12 @@ MONITOR_CLOUDWATCH_REFERENCE = (
     "model-monitor-interpreting-cloudwatch.html"
 )
 # Namespaces Model Monitor publishes schedule metrics to, one per monitoring type.
+# The AWS data quality page names /aws/sagemaker/Endpoints/data-metric with
+# EndpointName and ScheduleName dimensions, while the other monitoring pages name
+# aws/sagemaker/Endpoints/*-metrics with Endpoint and MonitoringSchedule, so both
+# spellings are credited.
 MODEL_MONITOR_METRIC_NAMESPACES = (
+    "/aws/sagemaker/Endpoints/data-metric",
     "aws/sagemaker/Endpoints/data-metrics",
     "aws/sagemaker/Endpoints/model-metrics",
     "aws/sagemaker/Endpoints/bias-metrics",
@@ -8925,8 +8930,19 @@ def _monitor_report_and_alarm_findings(
     for alarm in alarms:
         for namespace, _, dimensions in _alarm_metric_dimensions(alarm):
             if namespace in MODEL_MONITOR_METRIC_NAMESPACES:
-                alarmed.add(("schedule", dimensions.get("MonitoringSchedule")))
-                alarmed.add(("endpoint", dimensions.get("Endpoint")))
+                alarmed.add(
+                    (
+                        "schedule",
+                        dimensions.get("MonitoringSchedule")
+                        or dimensions.get("ScheduleName"),
+                    )
+                )
+                alarmed.add(
+                    (
+                        "endpoint",
+                        dimensions.get("Endpoint") or dimensions.get("EndpointName"),
+                    )
+                )
     unalarmed = [
         schedule
         for schedule in schedules
