@@ -611,7 +611,12 @@ AI_SUBJECT_ROWS = [
         "the temporal policy: one with no eventResource fails as Session Rule Resource "
         "Unscoped, and a temporal policy with no readable event pattern is N/A. The "
         "session-id propagation path is fail-closed by the service, since a request to "
-        "an engine holding a temporal policy fails validation without the header",
+        "an engine holding a temporal policy fails validation without the header. "
+        "On a gateway holding a temporal policy, AC-38 reads the execution role's "
+        "bedrock-agentcore:GetWorkloadAccessToken grant from the IAM cache on the "
+        "gateway's workload identity and its directory, and fails a role with no "
+        "surviving unconditioned grant, because the Gateway mints the token that "
+        "carries the session identity with that role. SCPs are not read",
         [],
         4,
     ),

@@ -19991,6 +19991,15 @@ class TestAC37CheckRegistration:
         )
 
 
+def _session_binding_rows():
+    """AC-38's session binding rows; TestAC38WorkloadTokenGrant judges the grant."""
+    return [
+        finding
+        for finding in agentcore_app.check_agentcore_policy_session_binding()
+        if finding["Finding"] != "AgentCore Policy Session Token Grant"
+    ]
+
+
 class TestAC38PolicySessionBinding:
     """AC-38: a temporal policy only isolates sessions on an authenticated gateway."""
 
@@ -20009,7 +20018,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert len(findings) == 1
         assert findings[0]["Check_ID"] == "AC-38"
@@ -20032,7 +20041,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Severity"] == "High"
@@ -20053,7 +20062,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Passed"
 
@@ -20070,7 +20079,7 @@ class TestAC38PolicySessionBinding:
             ]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Severity"] == "Medium"
@@ -20089,7 +20098,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("abac_permit", _LIVE_TAG_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Finding"].endswith("Absent")
@@ -20119,7 +20128,7 @@ class TestAC38PolicySessionBinding:
             ]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Passed"
         assert "spend_cap" in findings[0]["Finding_Details"]
@@ -20147,7 +20156,7 @@ class TestAC38PolicySessionBinding:
             ]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Finding"].endswith("Absent")
@@ -20157,7 +20166,7 @@ class TestAC38PolicySessionBinding:
         mock_ac.list_gateways.return_value = {"items": self._GATEWAYS}
         mock_ac.get_gateway.return_value = {"authorizerType": "CUSTOM_JWT"}
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert "AG-25" in findings[0]["Finding_Details"]
@@ -20170,7 +20179,7 @@ class TestAC38PolicySessionBinding:
             mode="LOG_ONLY", authorizerType="CUSTOM_JWT"
         )
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert "enforces no policy engine" in findings[0]["Finding_Details"]
@@ -20189,7 +20198,7 @@ class TestAC38PolicySessionBinding:
             {"policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]},
         ]
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert mock_ac.list_policies.call_count == 2
         assert findings[0]["Status"] == "Passed"
@@ -20211,7 +20220,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert mock_ac.list_gateways.call_count == 2
         assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
@@ -20235,7 +20244,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
         assert "bedrock-agentcore:ListPolicies" in findings[0]["Resolution"]
@@ -20247,7 +20256,7 @@ class TestAC38PolicySessionBinding:
             "ListGateways",
         )
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert findings[0]["Finding"].endswith("Incomplete")
@@ -20255,12 +20264,12 @@ class TestAC38PolicySessionBinding:
     @patch("agentcore_app.agentcore_client")
     def test_no_gateways_is_na(self, mock_ac):
         mock_ac.list_gateways.return_value = {"items": []}
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
         assert [finding["Status"] for finding in findings] == ["N/A"]
 
     @patch("agentcore_app.agentcore_client", None)
     def test_no_client_is_na(self):
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Check_ID"] == "AC-38"
 
@@ -20296,6 +20305,196 @@ class TestAC38CheckRegistration:
         # The failing legs are the authorizer types left over, so the check has
         # something to fail on.
         assert modelled - set(agentcore_app.GATEWAY_SESSION_BINDING_AUTHORIZERS)
+
+
+class TestAC38WorkloadTokenGrant:
+    """AC-38: a temporal policy needs a gateway role that can mint the WAT."""
+
+    _GATEWAYS = [{"gatewayId": "gw-1", "name": "Payments"}]
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/GatewayExecution"
+    _DIRECTORY = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+        "workload-identity-directory/default"
+    )
+    _IDENTITY = _DIRECTORY + "/workload-identity/gw-1-abc"
+
+    def _detail(self, **extra):
+        fields = {
+            "authorizerType": "CUSTOM_JWT",
+            "roleArn": self._ROLE_ARN,
+            "workloadIdentityDetails": {"workloadIdentityArn": self._IDENTITY},
+        }
+        fields.update(extra)
+        return _policy_engine_gateway(**fields)
+
+    @staticmethod
+    def _cache(*statements, boundary=None):
+        permissions = {
+            "inline_policies": [
+                {
+                    "policy_name": "GatewayPolicy",
+                    "document": {"Statement": list(statements)},
+                }
+            ]
+        }
+        if boundary is not None:
+            permissions["permissions_boundary"] = boundary
+        return {"role_permissions": {"GatewayExecution": permissions}}
+
+    def _run(self, mock_ac, cache, detail=None, statement=_TEMPORAL_PERMIT):
+        mock_ac.list_gateways.return_value = {"items": self._GATEWAYS}
+        mock_ac.get_gateway.return_value = detail or self._detail()
+        mock_ac.list_policies.return_value = {
+            "policies": [_cedar_policy("verify_payee", statement)]
+        }
+        return [
+            finding
+            for finding in agentcore_app.check_agentcore_policy_session_binding(cache)
+            if finding["Finding"].startswith("AgentCore Policy Session Token Grant")
+        ]
+
+    def _grant(self, resource, **extra):
+        return {
+            "Effect": "Allow",
+            "Action": "bedrock-agentcore:GetWorkloadAccessToken",
+            "Resource": resource,
+            **extra,
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_granting_the_directory_and_identity_passes(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant(
+                    [self._DIRECTORY, self._DIRECTORY + "/workload-identity/gw-1*"]
+                )
+            ),
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "Passed"
+        assert "GatewayExecution" in rows[0]["Finding_Details"]
+        assert self._IDENTITY in rows[0]["Finding_Details"]
+        assert "Service control policies" in rows[0]["Finding_Details"]
+        assert_finding_schema(rows[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_without_the_grant_fails(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:AuthorizeAction",
+                    "Resource": "*",
+                }
+            ),
+        )
+
+        assert rows[0]["Status"] == "Failed"
+        assert rows[0]["Severity"] == "High"
+        assert "bedrock-agentcore:GetWorkloadAccessToken" in rows[0]["Resolution"]
+        assert "workload-identity-directory/default" in rows[0]["Resolution"]
+        assert "enforcement fails" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_on_another_gateways_identity_is_not_credited(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant(
+                    [self._DIRECTORY, self._DIRECTORY + "/workload-identity/gw-2*"]
+                )
+            ),
+        )
+
+        assert rows[0]["Status"] == "N/A"
+        assert self._IDENTITY in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_on_the_identity_alone_is_not_credited(self, mock_ac):
+        rows = self._run(mock_ac, self._cache(self._grant(self._IDENTITY)))
+
+        assert rows[0]["Status"] == "N/A"
+        assert "workload-identity-directory/default" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_grant_fails(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant("*"),
+                {
+                    "Effect": "Deny",
+                    "Action": "bedrock-agentcore:GetWorkloadAccessToken",
+                    "Resource": "*",
+                },
+            ),
+        )
+
+        assert rows[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_grant_is_not_credited(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant(
+                    "*",
+                    Condition={"StringEquals": {"aws:ResourceTag/team": "payments"}},
+                )
+            ),
+        )
+
+        assert rows[0]["Status"] == "N/A"
+        assert "condition" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_missing_from_the_cache_is_na(self, mock_ac):
+        rows = self._run(mock_ac, {"role_permissions": {"Other": {}}})
+
+        assert rows[0]["Status"] == "N/A"
+        assert self._ROLE_ARN in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_the_cache_could_not_read_is_na(self, mock_ac):
+        cache = self._cache(self._grant("*"))
+        cache["principal_errors"] = [
+            {"type": "role", "name": "GatewayExecution", "error": "AccessDenied"}
+        ]
+        rows = self._run(mock_ac, cache)
+
+        assert rows[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_without_a_workload_identity_is_na(self, mock_ac):
+        detail = self._detail()
+        del detail["workloadIdentityDetails"]
+        rows = self._run(mock_ac, self._cache(self._grant("*")), detail=detail)
+
+        assert rows[0]["Status"] == "N/A"
+        assert "workloadIdentityDetails" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_without_a_temporal_policy_is_not_judged(self, mock_ac):
+        rows = self._run(mock_ac, self._cache(), statement=_LIVE_TAG_PERMIT)
+
+        assert rows == []
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_grant_is_judged_on_an_unauthenticated_gateway_too(self, mock_ac):
+        rows = self._run(
+            mock_ac, self._cache(), detail=self._detail(authorizerType="NONE")
+        )
+
+        assert rows[0]["Status"] == "Failed"
+
+    def test_the_handler_passes_the_permission_cache(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert (
+            "lambda: check_agentcore_policy_session_binding(permission_cache)" in source
+        )
 
 
 # ===================================================================
@@ -38748,7 +38947,7 @@ class TestAC38EventResource:
                 )
             ]
         }
-        return agentcore_app.check_agentcore_policy_session_binding()
+        return _session_binding_rows()
 
     @patch("agentcore_app.agentcore_client")
     def test_each_gateway_is_judged_by_its_own_event_patterns(self, mock_ac):

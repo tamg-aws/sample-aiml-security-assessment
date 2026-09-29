@@ -1164,7 +1164,7 @@
         "Agentic AI Gateway Tool Policy Enforcement",
         "AgentCore Policy Session Binding"
       ],
-      "gap": "AG-25 counts enforcing policies and reads their text. AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity, and reads each event pattern of the temporal policy: one with no eventResource fails as Session Rule Resource Unscoped, and a temporal policy with no readable event pattern is N/A. The session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header",
+      "gap": "AG-25 counts enforcing policies and reads their text. AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity, and reads each event pattern of the temporal policy: one with no eventResource fails as Session Rule Resource Unscoped, and a temporal policy with no readable event pattern is N/A. The session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header. On a gateway holding a temporal policy, AC-38 reads the execution role's bedrock-agentcore:GetWorkloadAccessToken grant from the IAM cache on the gateway's workload identity and its directory, and fails a role with no surviving unconditioned grant, because the Gateway mints the token that carries the session identity with that role. SCPs are not read",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",

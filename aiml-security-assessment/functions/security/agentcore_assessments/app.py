@@ -216,6 +216,10 @@ AGENTCORE_POLICY_SESSION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "policy-session-based-temporal.html"
 )
+AGENTCORE_POLICY_PERMISSIONS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "policy-permissions.html#policy-permissions-session-temporal"
+)
 AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "policy-guardrails-in-policies.html"
@@ -22127,7 +22131,177 @@ def _temporal_event_patterns(conditions: str) -> Tuple[List[str], bool]:
     return bodies, len(bodies) == len(matches)
 
 
-def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
+WORKLOAD_TOKEN_ACTION = "bedrock-agentcore:GetWorkloadAccessToken"
+WORKLOAD_TOKEN_ACTION_LOOKUP = WORKLOAD_TOKEN_ACTION.lower()
+
+
+def _workload_token_grant_finding(
+    label: str,
+    named: str,
+    detail: Dict[str, Any],
+    permission_cache: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Judge whether a gateway role can mint the token a temporal policy needs.
+
+    policy-permissions.html states the Gateway mints a Workload Access Token to
+    carry the session identity once temporal policy is active, that its role
+    needs bedrock-agentcore:GetWorkloadAccessToken scoped to the gateway's
+    workload-identity directory, and that without it tool invocations fail at
+    the token-mint step. The service reference lists both the directory and the
+    identity as resource types of the action, so a grant counts only when an
+    unconditioned Allow reaches both, and it survives the role's own Deny
+    statements and permissions boundary.
+    """
+    role_arn = detail.get("roleArn") or ""
+    role_name = role_arn.rsplit("/", 1)[-1]
+    identity = str(
+        (detail.get("workloadIdentityDetails") or {}).get("workloadIdentityArn") or ""
+    )
+    role_permissions = permission_cache.get("role_permissions") or {}
+    gap_labels, recorded = _cache_principal_read_gaps(permission_cache, ("role",))
+    unread_roles = {
+        str(entry.get("name", ""))
+        for entry in (permission_cache.get("principal_errors") or [])
+        if isinstance(entry, dict) and entry.get("type") == "role"
+    }
+
+    def row(details: str, resolution: str, status: StatusEnum) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-38",
+            finding_name="AgentCore Policy Session Token Grant",
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENTCORE_POLICY_PERMISSIONS_REFERENCE_URL,
+            severity=(
+                SeverityEnum.INFORMATIONAL
+                if status == StatusEnum.NA
+                else SeverityEnum.HIGH
+            ),
+            status=status,
+        )
+
+    retry = (
+        "No action is required on the assessed workload based on this result. "
+        "Resolve the read named here and rerun the assessment."
+    )
+    if "/workload-identity/" not in identity:
+        return row(
+            f"{label} enforces temporal policy {named}, but GetGateway returned "
+            "no workloadIdentityDetails naming a workload identity, so the "
+            f"resource its role mints the token on is unknown and the "
+            f"{WORKLOAD_TOKEN_ACTION} grant was not judged.",
+            retry,
+            StatusEnum.NA,
+        )
+    directory = identity.split("/workload-identity/", 1)[0]
+    if role_name in unread_roles:
+        return row(
+            f"{label} enforces temporal policy {named}, and the IAM permission "
+            f"cache could not read its execution role '{role_name}', so the "
+            f"{WORKLOAD_TOKEN_ACTION} grant was not judged: "
+            + ", ".join(
+                gap for gap in gap_labels if gap.startswith(f"role {role_name} (")
+            )
+            + ".",
+            retry,
+            StatusEnum.NA,
+        )
+    if role_name not in role_permissions:
+        return row(
+            f"{label} enforces temporal policy {named}, and its execution role "
+            f"{role_arn or 'is unreported'}, which is not in the IAM permissions "
+            f"snapshot, so the {WORKLOAD_TOKEN_ACTION} grant could not be read.",
+            "Confirm the gateway execution role is in the account the assessment "
+            "caches IAM for, then rerun the assessment.",
+            StatusEnum.NA,
+        )
+
+    permissions = role_permissions[role_name]
+    covered: Set[str] = set()
+    conditioned = False
+    unreadable_documents = 0
+    for document in _principal_policies(permissions):
+        try:
+            for statement in _allow_statements(document):
+                if not _statement_matches_action(
+                    statement, WORKLOAD_TOKEN_ACTION_LOOKUP
+                ):
+                    continue
+                reached = {
+                    arn
+                    for arn in (directory, identity)
+                    if _statement_resource_covers(statement, [arn])
+                }
+                if reached and statement.get("Condition"):
+                    conditioned = True
+                else:
+                    covered |= reached
+        except Exception as error:
+            unreadable_documents += 1
+            logger.warning(f"Error parsing policy for role {role_name}: {error}")
+    survives = _grant_survives(permissions, WORKLOAD_TOKEN_ACTION_LOOKUP)
+    grant_resolution = (
+        f"Grant {WORKLOAD_TOKEN_ACTION} to the gateway execution role "
+        f"'{role_name}' on {directory} and {identity}, then invoke a tool "
+        "through the gateway with a policy session id and confirm it is not "
+        "denied at the token-mint step."
+    )
+
+    if covered == {directory, identity} and survives and not unreadable_documents:
+        return row(
+            f"{label} enforces temporal policy {named}, and its execution role "
+            f"'{role_name}' grants {WORKLOAD_TOKEN_ACTION} with no condition on "
+            f"its workload identity {identity} and on the directory it sits in, "
+            "so the gateway can mint the token that carries the session "
+            f"identity. {IAM_CACHE_SCP_NOTE}"
+            + ("" if recorded else " " + IAM_CACHE_V1_NOTE),
+            "No action required.",
+            StatusEnum.PASSED,
+        )
+    if unreadable_documents:
+        return row(
+            f"{label} enforces temporal policy {named}, and "
+            f"{unreadable_documents} policy document(s) on its execution role "
+            f"'{role_name}' could not be parsed, so whether the role grants "
+            f"{WORKLOAD_TOKEN_ACTION} is unknown.",
+            "Review the IAM Permission Caching task for this role, then rerun "
+            "the assessment.",
+            StatusEnum.NA,
+        )
+    if survives and conditioned:
+        return row(
+            f"{label} enforces temporal policy {named}, and its execution role "
+            f"'{role_name}' grants {WORKLOAD_TOKEN_ACTION} on its workload "
+            "identity only under a condition this check does not evaluate, so "
+            "whether the gateway can mint the token is unknown.",
+            grant_resolution,
+            StatusEnum.NA,
+        )
+    if survives and covered:
+        missing = identity if directory in covered else directory
+        return row(
+            f"{label} enforces temporal policy {named}, and its execution role "
+            f"'{role_name}' grants {WORKLOAD_TOKEN_ACTION} on one of the two "
+            f"resource types the action lists but not on {missing}, so whether "
+            "the token mint is allowed is not judged.",
+            grant_resolution,
+            StatusEnum.NA,
+        )
+    return row(
+        f"{label} enforces temporal policy {named}, but its execution role "
+        f"'{role_name}' has no {WORKLOAD_TOKEN_ACTION} grant on its workload "
+        f"identity {identity} that survives the role's own Deny statements and "
+        "permissions boundary. The devguide states that without it tool "
+        "invocations fail at the token-mint step, so temporal policy "
+        "enforcement fails on this gateway.",
+        grant_resolution,
+        StatusEnum.FAILED,
+    )
+
+
+def check_agentcore_policy_session_binding(
+    permission_cache: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """AC-38: Judge session-aware policy and whether a session binds to a caller.
 
     A rule that only reads across a sequence of actions, such as an unverified
@@ -22145,6 +22319,10 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
     the ones written, and whether the first caller sends the session id header,
     are not readable from any API: the rules have no declared counterpart to
     compare against, and the header is set per request.
+
+    A gateway holding a temporal policy also has its execution role's
+    GetWorkloadAccessToken grant judged, because the Gateway mints the token
+    that carries the session identity with that role.
     """
     if agentcore_client is None:
         return [
@@ -22275,6 +22453,14 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
 
         authorizer_type = detail.get("authorizerType") or gateway.get("authorizerType")
 
+        if temporal_policies:
+            token_grant = _workload_token_grant_finding(
+                label,
+                ", ".join(sorted(set(temporal_policies))),
+                detail,
+                permission_cache or {},
+            )
+
         if not temporal_policies:
             findings.append(
                 create_finding(
@@ -22400,6 +22586,7 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
                     status=StatusEnum.FAILED,
                 )
             )
+        findings.append(token_grant)
 
     return findings
 
@@ -31724,7 +31911,7 @@ def lambda_handler(event, context):
             (
                 ["AC-38"],
                 "Policy Session Binding",
-                check_agentcore_policy_session_binding,
+                lambda: check_agentcore_policy_session_binding(permission_cache),
             ),
             (
                 ["AC-39"],

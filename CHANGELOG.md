@@ -298,6 +298,17 @@ section.
 
 ### Fixed
 
+- `AC-38` judges the gateway role's `GetWorkloadAccessToken` grant. The
+  devguide states the Gateway mints a Workload Access Token to carry the
+  session identity once temporal policy is active, and that without this grant
+  tool invocations fail at the token-mint step. AC-38 passed such a gateway
+  without reading its role. A new `AgentCore Policy Session Token Grant` row
+  fails a gateway holding a temporal policy at High when no unconditioned Allow
+  on its workload identity survives the role's own Deny or boundary, passes one
+  granted on both the identity and its directory, and is `N/A` for a
+  conditioned or half-scoped grant, a role outside the IAM cache, or a gateway
+  with no `workloadIdentityDetails`. SCPs are not read.
+
 - `AC-33` judges the user id token action on JWT runtimes. It never read
   whether a runtime whose every caller arrives with a JWT still lets its role
   call `GetWorkloadAccessTokenForUserId`, which lets agent code mint a token
