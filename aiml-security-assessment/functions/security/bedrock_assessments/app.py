@@ -5010,6 +5010,48 @@ def _invocation_record_state(region: str) -> Dict[str, Any]:
     return state
 
 
+def _knowledge_base_source_versioning(
+    inventory: Dict[str, Any], region: str
+) -> Dict[str, List[str]]:
+    """
+    Read GetBucketVersioning on every S3 bucket a knowledge base ingests from.
+
+    A chunk can be traced to the document version it came from only while the
+    bucket keeps earlier versions, so a bucket counts only with Status Enabled.
+    A bucket never versioned returns no Status.
+    """
+    unread = list(inventory["errors"])
+    unversioned = []
+    versioned = []
+    by_bucket: Dict[str, List[str]] = {}
+    for source in inventory["s3_sources"]:
+        by_bucket.setdefault(source["bucket"], []).append(source["label"])
+    if by_bucket:
+        s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+    for bucket, labels in sorted(by_bucket.items()):
+        try:
+            status = s3_client.get_bucket_versioning(Bucket=bucket).get("Status")
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"s3:GetBucketVersioning on '{bucket}' "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        if status == "Enabled":
+            versioned.append(bucket)
+        else:
+            unversioned.append(
+                f"'{bucket}' (versioning {status or 'never enabled'}, source of "
+                f"{', '.join(labels)})"
+            )
+    return {
+        "versioned": versioned,
+        "unversioned": unversioned,
+        "unread": unread,
+        "other": list(inventory["other_sources"]),
+    }
+
+
 def _bedrock_data_event_findings(
     data_event_trails: Dict[str, List[str]],
     narrowed_types: Dict[str, List[str]],
@@ -5018,12 +5060,14 @@ def _bedrock_data_event_findings(
     record: Dict[str, Any],
     region: str,
     event_data_stores: Dict[str, Any],
+    source_versions: Dict[str, List[str]],
 ) -> List[Dict[str, Any]]:
     """
     BR-06 data-event legs: knowledge base retrieval traceability
     (AIR-BDR-KB-06) and end-to-end inference traceability (AIR-BDR-MDL-07).
     The Region's ENABLED event data stores are credited beside the trails,
-    and a trail gap is a verdict only when every store was read.
+    and a trail gap is a verdict only when every store was read. Retrieval
+    traceability also needs versioning Enabled on every S3 source bucket.
     """
     store_unread = _event_data_store_unread(event_data_stores)
     store_note = _event_data_store_note(event_data_stores)
@@ -5055,12 +5099,32 @@ def _bedrock_data_event_findings(
         if knowledge_base_count
         else ""
     )
-    if kb_trails and record["logging"] is True and record["text_delivery"] is True:
+    other_note = (
+        f" Data sources outside S3 keep document versions with their provider, "
+        f"and their versioning is not judged: {'; '.join(source_versions['other'])}."
+        if source_versions["other"]
+        else ""
+    )
+    if (
+        kb_trails
+        and record["logging"] is True
+        and record["text_delivery"] is True
+        and not source_versions["unversioned"]
+        and not source_versions["unread"]
+    ):
+        version_note = (
+            f" {len(source_versions['versioned'])} S3 source bucket(s) have "
+            "versioning Enabled, so the object version a chunk was ingested from "
+            "is kept."
+            if source_versions["versioned"]
+            else " No data source ingests from S3, so no source bucket versioning "
+            "applies."
+        )
         data_event_findings.append(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
-                finding_details=f"Trail(s) or event data store(s) {', '.join(sorted(set(kb_trails)))} name {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so each Retrieve and RetrieveAndGenerate call is recorded with the knowledge base that served it, and model invocation logging records the response it informed. The citations that tie a response to a source chunk are returned in the RetrieveAndGenerate response and are not read by this check.{kb_inventory}",
+                finding_details=f"Trail(s) or event data store(s) {', '.join(sorted(set(kb_trails)))} name {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so each Retrieve and RetrieveAndGenerate call is recorded with the knowledge base that served it, and model invocation logging records the response it informed.{version_note} The citations that tie a response to a source chunk are returned in the RetrieveAndGenerate response and are not read by this check.{other_note}{kb_inventory}",
                 resolution="No action required. Retain the data events long enough to answer which source document informed a past response.",
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
@@ -5095,7 +5159,15 @@ def _bedrock_data_event_findings(
             kb_gaps.append(
                 "model invocation logging has textDataDeliveryEnabled not true, so the text of the response a retrieval informed is not recorded"
             )
+        if source_versions["unversioned"]:
+            kb_gaps.append(
+                f"source bucket(s) {', '.join(source_versions['unversioned'])} do "
+                "not have versioning Enabled, so a document overwritten after "
+                "ingestion keeps no earlier version for a retrieved chunk to be "
+                "traced back to"
+            )
         unread = list(unread_trails) if not kb_trails else []
+        unread.extend(source_versions["unread"])
         if not kb_trails and not unread_trails and store_unread:
             unread.append(
                 f"no logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, but {store_unread}"
@@ -5116,7 +5188,12 @@ def _bedrock_data_event_findings(
                     resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(
                         BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE
                     )
-                    + " Enable model invocation logging with textDataDeliveryEnabled true.",
+                    + " Enable model invocation logging with textDataDeliveryEnabled true."
+                    + (
+                        " Enable S3 versioning on each knowledge base source bucket."
+                        if source_versions["unversioned"]
+                        else ""
+                    ),
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                     severity="Medium",
                     status="Failed",
@@ -5418,20 +5495,22 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
             # data events, which have to be selected by resource type.
             knowledge_base_count = None
             try:
-                bedrock_agent_client = boto3.client(
-                    "bedrock-agent", config=boto3_config, region_name=region
-                )
-                knowledge_base_count = len(
-                    _list_all_items(
-                        bedrock_agent_client,
-                        "list_knowledge_bases",
-                        "knowledgeBaseSummaries",
-                    )
-                )
+                inventory = _knowledge_base_s3_sources(region)
+                knowledge_base_count = inventory["knowledge_base_count"]
+                source_versions = _knowledge_base_source_versioning(inventory, region)
             except Exception as error:
                 logger.warning(
                     f"Knowledge base inventory unavailable for the CloudTrail data event legs: {str(error)}"
                 )
+                source_versions = {
+                    "versioned": [],
+                    "unversioned": [],
+                    "unread": [
+                        "the knowledge base data sources "
+                        f"({get_assessment_error_label(error)})"
+                    ],
+                    "other": [],
+                }
 
             findings["csv_data"].extend(
                 _bedrock_data_event_findings(
@@ -5442,6 +5521,7 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                     _invocation_record_state(region),
                     region,
                     event_data_stores,
+                    source_versions,
                 )
             )
 

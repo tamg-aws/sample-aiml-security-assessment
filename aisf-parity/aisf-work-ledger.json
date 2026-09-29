@@ -226,7 +226,7 @@
       "incumbent_names": [
         "Bedrock CloudTrail Logging Check"
       ],
-      "gap": "",
+      "gap": "BR-06 credits retrieval traceability only when a trail or event data store records AWS::Bedrock::KnowledgeBase data events, invocation logging records text, and every S3 source bucket has versioning Enabled (s3:GetBucketVersioning); an unread data source or bucket is N/A. The RetrieveAndGenerate citations are not read, and sources outside S3 are not judged for versioning",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",

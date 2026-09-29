@@ -2587,6 +2587,7 @@ class TestBR06CloudTrailLogging:
         mock_ct.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": list(knowledge_bases)
         }
+        mock_ct.list_data_sources.return_value = {"dataSourceSummaries": []}
         mock_ct.list_event_data_stores.return_value = {"EventDataStores": []}
         return mock_ct
 
@@ -2708,6 +2709,102 @@ class TestBR06CloudTrailLogging:
         assert model["Status"] == "Failed"
         assert "observed data-event resource types: none" in model["Finding_Details"]
 
+    def _versioned_source_client(self, versioning=None, error=None):
+        client = self._trail_client(
+            {
+                "kb-trail": {
+                    "logging": True,
+                    "selectors": [self._data_event_selector([self.KB_TYPE])],
+                }
+            },
+            knowledge_bases=[{"knowledgeBaseId": "kb-1", "name": "docs"}],
+        )
+        client.list_data_sources.return_value = {
+            "dataSourceSummaries": [{"dataSourceId": "ds-1"}]
+        }
+        client.get_data_source.return_value = {
+            "dataSource": {
+                "name": "manuals",
+                "dataSourceConfiguration": {
+                    "type": "S3",
+                    "s3Configuration": {"bucketArn": "arn:aws:s3:::kb-src"},
+                },
+            }
+        }
+        if error is not None:
+            client.get_bucket_versioning.side_effect = error
+        else:
+            client.get_bucket_versioning.return_value = versioning
+        return client
+
+    @pytest.mark.parametrize(
+        "versioning, expected, phrase",
+        [
+            (
+                {"Status": "Enabled"},
+                "Passed",
+                "1 S3 source bucket(s) have versioning Enabled",
+            ),
+            ({"Status": "Suspended"}, "Failed", "'kb-src' (versioning Suspended"),
+            ({}, "Failed", "'kb-src' (versioning never enabled"),
+        ],
+    )
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br06_retrieval_leg_needs_a_versioned_source_bucket(
+        self, mock_footprint, mock_client, versioning, expected, phrase
+    ):
+        mock_client.return_value = self._versioned_source_client(versioning)
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_cloudtrail_logging())
+
+        kb = self._by_finding_name(
+            findings, "Bedrock Knowledge Base Retrieval Data Event Logging"
+        )
+        assert kb["Status"] == expected
+        assert phrase in kb["Finding_Details"]
+        mock_client.return_value.get_bucket_versioning.assert_called_once_with(
+            Bucket="kb-src"
+        )
+        if expected == "Failed":
+            assert "Enable S3 versioning" in kb["Resolution"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br06_unread_source_versioning_is_not_a_retrieval_pass(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.return_value = self._versioned_source_client(
+            error=_client_error("AccessDenied", "denied", "GetBucketVersioning")
+        )
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_cloudtrail_logging())
+
+        kb = self._by_finding_name(
+            findings, "Bedrock Knowledge Base Retrieval Data Event Logging"
+        )
+        assert kb["Status"] == "N/A"
+        assert "s3:GetBucketVersioning on 'kb-src'" in kb["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br06_unread_data_sources_are_not_a_retrieval_pass(
+        self, mock_footprint, mock_client
+    ):
+        client = self._versioned_source_client({"Status": "Enabled"})
+        client.list_data_sources.side_effect = _client_error(
+            "AccessDeniedException", "denied", "ListDataSources"
+        )
+        mock_client.return_value = client
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_cloudtrail_logging())
+
+        kb = self._by_finding_name(
+            findings, "Bedrock Knowledge Base Retrieval Data Event Logging"
+        )
+        assert kb["Status"] == "N/A"
+        assert "knowledge base 'docs' data sources" in kb["Finding_Details"]
+
     @patch("boto3.client")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
     def test_br06_stopped_trail_data_events_are_not_coverage(
@@ -2814,6 +2911,7 @@ class TestBR06SelectorValues:
         client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": list(knowledge_bases)
         }
+        client.list_data_sources.return_value = {"dataSourceSummaries": []}
         client.list_event_data_stores.side_effect = (
             event_data_stores
             if isinstance(event_data_stores, Exception)

@@ -72,7 +72,21 @@ AI_SUBJECT_ROWS = [
     ("AIR-BDR-GRD-04", COVERED, None, "bedrock_assessments", ["BR-32"], "", [], 3),
     ("AIR-BDR-GRD-09", COVERED, None, "bedrock_assessments", ["BR-27"], "", [], 3),
     ("AIR-BDR-GRD-10", COVERED, None, "bedrock_assessments", ["BR-41"], "", [], 3),
-    ("AIR-BDR-KB-06", COVERED, None, "bedrock_assessments", ["BR-06"], "", [], 3),
+    (
+        "AIR-BDR-KB-06",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-06"],
+        "BR-06 credits retrieval traceability only when a trail or event data store "
+        "records AWS::Bedrock::KnowledgeBase data events, invocation logging records "
+        "text, and every S3 source bucket has versioning Enabled "
+        "(s3:GetBucketVersioning); an unread data source or bucket is N/A. The "
+        "RetrieveAndGenerate citations are not read, and sources outside S3 are not "
+        "judged for versioning",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-MDL-07",
         COVERED,
