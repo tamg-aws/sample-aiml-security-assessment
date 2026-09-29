@@ -14441,9 +14441,13 @@ def _role_outside_cached_account(role_arn: Any, resource_arn: Any) -> str:
     return ""
 
 
-def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -> bool:
-    """Return whether the statement pins aws:SourceAccount or aws:SourceArn to
-    `account_id` by value.
+def _confused_deputy_guard_account(
+    statement: Dict[str, Any],
+    account_id: str,
+    keys: Tuple[str, ...] = ("aws:sourceaccount", "aws:sourcearn"),
+) -> bool:
+    """Return whether the statement pins one of `keys` (aws:SourceAccount or
+    aws:SourceArn) to `account_id` by value.
 
     Every value of the guarding entry must name the account literally: an
     aws:SourceArn whose account segment carries a wildcard, or an
@@ -14467,6 +14471,8 @@ def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -
             if not values:
                 continue
             key = str(key).strip().lower()
+            if key not in keys:
+                continue
             if key == "aws:sourceaccount" and all(
                 value.strip() == account_id for value in values
             ):
@@ -26059,6 +26065,18 @@ def check_agentcore_execution_role_trust_and_sharing(
             for statement in statements
             if _statement_trusts_whole_account(statement)
         ]
+        source_arn_missing = [
+            statement
+            for statement in statements
+            if statement not in exposed
+            and any(
+                principal == "*" or principal.endswith(".amazonaws.com")
+                for principal in _statement_principals(statement)
+            )
+            and not _confused_deputy_guard_account(
+                statement, account_id, keys=("aws:sourcearn",)
+            )
+        ]
 
         if exposed:
             findings.append(
@@ -26108,7 +26126,33 @@ def check_agentcore_execution_role_trust_and_sharing(
                     status=StatusEnum.FAILED,
                 )
             )
-        if not exposed and not account_wide:
+        if source_arn_missing:
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trust Source ARN Missing",
+                    finding_details=(
+                        f"{used_by} runs as {role_name}, which has "
+                        f"{len(source_arn_missing)} of {len(statements)} Allow "
+                        "statement(s) trusting an AWS service principal or every "
+                        "principal under an aws:SourceAccount condition with no "
+                        "aws:SourceArn condition whose every value names account "
+                        f"{account_id}. Any AgentCore resource in the account, "
+                        "including one another team creates, can have the "
+                        "service assume the role."
+                    ),
+                    resolution=(
+                        "Add an aws:SourceArn condition under ArnLike or "
+                        "ArnEquals naming this account's AgentCore resources, as "
+                        "the AgentCore Runtime trust policy does, to every "
+                        "statement that trusts the service."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if not exposed and not account_wide and not source_arn_missing:
             findings.append(
                 create_finding(
                     check_id="AC-48",
@@ -26117,8 +26161,8 @@ def check_agentcore_execution_role_trust_and_sharing(
                         f"{used_by} runs as {role_name}, whose {len(statements)} "
                         "Allow statement(s) name no account root without a "
                         "condition naming the caller, and no service or wildcard "
-                        "principal without an aws:SourceAccount or aws:SourceArn "
-                        f"condition naming account {account_id}."
+                        "principal without an aws:SourceArn condition naming "
+                        f"account {account_id}."
                     ),
                     resolution=(
                         "No action required. Confirm the aws:SourceArn pattern "
@@ -26186,7 +26230,10 @@ def check_agentcore_execution_role_trust_and_sharing(
                     f"The {sum(len(users) for users in roles.values())} AgentCore "
                     "resource(s) that name an "
                     f"execution role name {len(roles)} distinct role ARN(s), so "
-                    "no role is assumed on behalf of more than one resource."
+                    "no role is assumed on behalf of more than one resource in "
+                    "this region. A resource in another region that names one of "
+                    "these roles is not compared, because each region is "
+                    "assessed on its own."
                 ),
                 resolution="No action required.",
                 reference=AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,

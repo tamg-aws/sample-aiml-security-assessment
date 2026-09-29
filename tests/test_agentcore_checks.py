@@ -25377,6 +25377,257 @@ class TestAC48ExecutionRoleTrustAndSharing:
         assert agentcore_app._agentcore_tool_family("Something 'x' (id)") == "tool"
 
 
+def _ac48_trust(condition, principal=None):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": principal
+                or {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": condition,
+            }
+        ],
+    }
+
+
+_AC48_ACCOUNT_ONLY = {"StringEquals": {"aws:SourceAccount": "123456789012"}}
+
+
+class TestAC48SourceArnRequired:
+    """AC-48: a trust guarded by aws:SourceAccount alone lets every AgentCore
+    resource in the account assume the role, and the sharing row compares only
+    the resources of the assessed region."""
+
+    _arn = TestAC48ExecutionRoleTrustAndSharing._arn
+    _wire = TestAC48ExecutionRoleTrustAndSharing._wire
+    _named = TestAC48ExecutionRoleTrustAndSharing._named
+
+    _MISSING = "AgentCore Execution Role Trust Source ARN Missing"
+
+    @pytest.mark.parametrize(
+        "principal",
+        [{"Service": "bedrock-agentcore.amazonaws.com"}, "*"],
+        ids=["service", "wildcard"],
+    )
+    @pytest.mark.parametrize(
+        "family", ["runtimes", "gateways", "interpreters", "browsers"]
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_account_only_trust_fails(
+        self, mock_ac, mock_iam, family, principal
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            trust={"AccountOnlyRole": _ac48_trust(_AC48_ACCOUNT_ONLY, principal)},
+            **{family: ["AccountOnlyRole"]},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        missing = self._named(findings, self._MISSING)
+
+        assert len(missing) == 1
+        assert missing[0]["Status"] == "Failed"
+        assert missing[0]["Severity"] == "Medium"
+        assert "AccountOnlyRole" in missing[0]["Finding_Details"]
+        assert "1 of 1 Allow statement(s)" in missing[0]["Finding_Details"]
+        assert "aws:SourceArn" in missing[0]["Resolution"]
+        assert not self._named(findings, "AgentCore Execution Role Trust")
+        assert not self._named(findings, "AgentCore Execution Role Trust Guard Missing")
+        assert_finding_schema(missing[0])
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_role_is_judged_on_its_own_trust(self, mock_ac, mock_iam):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["GuardedRole", "AccountOnlyRole"],
+            browsers=["SecondAccountOnlyRole"],
+            trust={
+                "AccountOnlyRole": _ac48_trust(_AC48_ACCOUNT_ONLY),
+                "SecondAccountOnlyRole": _ac48_trust(_AC48_ACCOUNT_ONLY),
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        missing = self._named(findings, self._MISSING)
+        passed = self._named(findings, "AgentCore Execution Role Trust")
+
+        assert len(missing) == 2
+        assert {"AccountOnlyRole", "SecondAccountOnlyRole"} == {
+            finding["Finding_Details"].split(" runs as ", 1)[1].split(",", 1)[0]
+            for finding in missing
+        }
+        assert len(passed) == 1
+        assert passed[0]["Status"] == "Passed"
+        assert "GuardedRole" in passed[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_account_only_statement_is_counted(self, mock_ac, mock_iam):
+        document = _ac48_trust(_AC48_ACCOUNT_ONLY)
+        document["Statement"] = _GUARDED_TRUST["Statement"] + document["Statement"]
+        inventory = self._wire(
+            mock_ac, mock_iam, runtimes=["MixedRole"], trust={"MixedRole": document}
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        missing = self._named(findings, self._MISSING)
+
+        assert len(missing) == 1
+        assert "1 of 2 Allow statement(s)" in missing[0]["Finding_Details"]
+        assert not self._named(findings, "AgentCore Execution Role Trust")
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unguarded_statement_is_reported_once_by_the_guard_row(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["OpenRole"],
+            trust={"OpenRole": _ac48_trust({})},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        assert (
+            len(self._named(findings, "AgentCore Execution Role Trust Guard Missing"))
+            == 1
+        )
+        assert not self._named(findings, self._MISSING)
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {
+                "StringEquals": {"aws:SourceAccount": "123456789012"},
+                "ArnLike": {
+                    "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:*"
+                },
+            },
+            {
+                "ArnEquals": {
+                    "aws:SourceArn": (
+                        "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-0"
+                    )
+                }
+            },
+            {
+                "StringEquals": {"aws:SourceAccount": "123456789012"},
+                "ForAnyValue:StringLike": {
+                    "aws:SourceArn": [
+                        "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/*",
+                        "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/*",
+                    ]
+                },
+            },
+        ],
+        ids=["devguide-trust", "source-arn-only", "for-any-value-list"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_arn_naming_the_account_passes(self, mock_ac, mock_iam, condition):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["PinnedRole"],
+            trust={"PinnedRole": _ac48_trust(condition)},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        passed = self._named(findings, "AgentCore Execution Role Trust")
+
+        assert not self._named(findings, self._MISSING)
+        assert len(passed) == 1
+        assert passed[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "source_arn_entry",
+        [
+            {
+                "ArnLike": {
+                    "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:444455556666:*"
+                }
+            },
+            {
+                "ArnLike": {
+                    "aws:SourceArn": [
+                        "arn:aws:bedrock-agentcore:us-east-1:123456789012:*",
+                        "arn:aws:bedrock-agentcore:us-east-1:*:*",
+                    ]
+                }
+            },
+            {
+                "ArnNotLike": {
+                    "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:444455556666:*"
+                }
+            },
+            {
+                "ArnLikeIfExists": {
+                    "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:*"
+                }
+            },
+        ],
+        ids=["other-account", "one-value-any-account", "negated", "if-exists"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_arn_that_does_not_name_the_account_fails(
+        self, mock_ac, mock_iam, source_arn_entry
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["LooseRole"],
+            trust={
+                "LooseRole": _ac48_trust({**_AC48_ACCOUNT_ONLY, **source_arn_entry})
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        assert len(self._named(findings, self._MISSING)) == 1
+        assert not self._named(findings, "AgentCore Execution Role Trust Guard Missing")
+        assert not self._named(findings, "AgentCore Execution Role Trust")
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_sharing_pass_names_its_region_scope(self, mock_ac, mock_iam):
+        inventory = self._wire(
+            mock_ac, mock_iam, runtimes=["RuntimeRole"], browsers=["BrowserRole"]
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        sharing = self._named(findings, "AgentCore Execution Role Sharing")
+
+        assert len(sharing) == 1
+        assert sharing[0]["Status"] == "Passed"
+        assert (
+            "A resource in another region that names one of these roles is not "
+            "compared" in sharing[0]["Finding_Details"]
+        )
+
+
 # ===================================================================
 # AC-49 DNS egress control
 # ===================================================================
