@@ -787,6 +787,71 @@ AGENTCORE_RESOURCE_DELIVERY_TYPES = (
     AGENTCORE_VENDED_LOG_TYPE,
     AGENTCORE_VENDED_TRACE_TYPE,
 )
+# A custom code interpreter or browser writes application logs only through a
+# delivery. Identity resources are judged on traces, because WorkloadIdentity
+# log delivery is configured on the runtime or gateway that uses it.
+AGENTCORE_TOOL_DELIVERY_TYPES = (AGENTCORE_VENDED_LOG_TYPE,)
+AGENTCORE_IDENTITY_DELIVERY_TYPES = (AGENTCORE_VENDED_TRACE_TYPE,)
+# The families AC-19 matches on the exact ARN their list API returns: list
+# operation, result key, list arguments, ARN field, id field, row label,
+# the listing-failure subject and the delivery types required.
+AGENTCORE_ARN_MATCHED_DELIVERY_FAMILIES = (
+    (
+        "list_code_interpreters",
+        "codeInterpreterSummaries",
+        {"type": "CUSTOM"},
+        "codeInterpreterArn",
+        "codeInterpreterId",
+        "Code interpreter",
+        "Code interpreters",
+        "ListCodeInterpreters",
+        AGENTCORE_TOOL_DELIVERY_TYPES,
+    ),
+    (
+        "list_browsers",
+        "browserSummaries",
+        {"type": "CUSTOM"},
+        "browserArn",
+        "browserId",
+        "Browser",
+        "Browsers",
+        "ListBrowsers",
+        AGENTCORE_TOOL_DELIVERY_TYPES,
+    ),
+    (
+        "list_workload_identities",
+        "workloadIdentities",
+        {},
+        "workloadIdentityArn",
+        None,
+        "Workload identity",
+        "Workload identities",
+        "ListWorkloadIdentities",
+        AGENTCORE_IDENTITY_DELIVERY_TYPES,
+    ),
+    (
+        "list_oauth2_credential_providers",
+        "credentialProviders",
+        {},
+        "credentialProviderArn",
+        None,
+        "OAuth2 credential provider",
+        "OAuth2 credential providers",
+        "ListOauth2CredentialProviders",
+        AGENTCORE_IDENTITY_DELIVERY_TYPES,
+    ),
+    (
+        "list_api_key_credential_providers",
+        "credentialProviders",
+        {},
+        "credentialProviderArn",
+        None,
+        "API key credential provider",
+        "API key credential providers",
+        "ListApiKeyCredentialProviders",
+        AGENTCORE_IDENTITY_DELIVERY_TYPES,
+    ),
+)
 AGENTCORE_DELIVERY_TYPE_LABELS = {
     AGENTCORE_VENDED_LOG_TYPE: "application logs",
     AGENTCORE_VENDED_TRACE_TYPE: "traces",
@@ -3333,6 +3398,13 @@ def _normalized_condition_operator(operator: str) -> str:
     return name
 
 
+def _operator_admits_an_absent_key(operator: str) -> bool:
+    """True when a condition operator is met by a request without the key: the
+    IfExists form, and ForAllValues, which holds for an empty set of values."""
+    name = str(operator).strip().lower()
+    return name.endswith("ifexists") or name.startswith("forallvalues:")
+
+
 def _condition_pins_value(
     statement: Dict[str, Any], key: str, expected: str, if_exists_counts: bool = True
 ) -> bool:
@@ -3342,7 +3414,9 @@ def _condition_pins_value(
     wildcard value in StringLike reaches more than the one value, so it does not
     pin it. The IfExists form counts only where the key is always in the
     request, which the caller decides by the key it passes or by passing
-    `if_exists_counts=False` for a key a request can omit.
+    `if_exists_counts=False` for a key a request can omit. ForAllValues is read
+    the same way, because it is true for a request that carries no value for
+    the key.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict):
@@ -3351,7 +3425,7 @@ def _condition_pins_value(
     for operator, entries in condition.items():
         if not isinstance(entries, dict):
             continue
-        if not if_exists_counts and str(operator).strip().lower().endswith("ifexists"):
+        if not if_exists_counts and _operator_admits_an_absent_key(operator):
             continue
         if _normalized_condition_operator(operator) not in CONDITION_EQUALS_OPERATORS:
             continue
@@ -3362,6 +3436,70 @@ def _condition_pins_value(
             if values and all(value == expected for value in values):
                 return True
     return False
+
+
+def _pass_role_statement_excludes_agentcore(statement: Dict[str, Any]) -> bool:
+    """Return whether a PassRole statement's condition cannot hold for AgentCore.
+
+    Each condition entry is ANDed, so one iam:PassedToService entry that the
+    AgentCore service principal fails (StringEquals naming lambda.amazonaws.com
+    only, StringNotEquals naming AgentCore) keeps the statement from passing any
+    role to AgentCore. The key is always in a PassRole request and holds one
+    value, so IfExists and the set prefixes read as the plain operator.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return False
+    for operator, entries in condition.items():
+        if not isinstance(entries, dict):
+            continue
+        name = _normalized_condition_operator(operator)
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != IAM_PASSED_TO_SERVICE_CONDITION_KEY:
+                continue
+            matched = any(
+                _condition_string_matches(
+                    value,
+                    AGENTCORE_SERVICE_PRINCIPAL,
+                    like=name in ("stringlike", "stringnotlike"),
+                    ignore_case=name.endswith("ignorecase"),
+                )
+                for value in _condition_values(raw)
+            )
+            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS and not matched:
+                return True
+            if name in SCP_DENY_VALUE_EXCLUDES_OPERATORS and matched:
+                return True
+    return False
+
+
+def _pass_role_pattern_other_roles(
+    resource: str, role_names: Iterable[str], own_role_names: Iterable[str]
+) -> Optional[List[str]]:
+    """Return the cached roles outside `own_role_names` a PassRole pattern reaches.
+
+    None means the pattern cannot be bounded by role name: the cache keys roles
+    by name and holds no path, so a pattern with a path after `role/`, one whose
+    name part starts with a wildcard and so reaches every name, and one that
+    does not name a 12-digit account are all read as reaching other roles.
+    """
+    parts = str(resource).split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn" or parts[2] != "iam":
+        return None
+    if not (parts[4].isdigit() and len(parts[4]) == 12):
+        return None
+    if not parts[5].startswith("role/"):
+        return None
+    name_pattern = parts[5][len("role/") :]
+    if not name_pattern or name_pattern[0] in "*?" or "/" in name_pattern:
+        return None
+    own = set(own_role_names)
+    return sorted(
+        name
+        for name in role_names
+        if name not in own
+        and _condition_string_matches(name_pattern, name, like=True, ignore_case=False)
+    )
 
 
 def _payment_duty_collisions(
@@ -3398,6 +3536,8 @@ def _writer_pass_role_gaps(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
     write_actions: Tuple[str, ...],
+    role_names: Optional[Iterable[str]] = None,
+    own_role_names: Iterable[str] = (),
 ) -> List[str]:
     """Return each writer of an AgentCore resource whose iam:PassRole is not scoped.
 
@@ -3408,10 +3548,15 @@ def _writer_pass_role_gaps(
     hand any role it reaches to that resource, or hand the role to another
     service. A Resource with a wildcard anywhere, such as `role/payments-*`,
     names a set of roles and not the one role the resource needs, so it is a
-    gap too. Whether the literal ARN is the resource's own role is not compared
-    here: the cache carries no resource. iam:PassedToService is always in a
-    PassRole request, so its IfExists form is read as the plain one.
+    gap too, unless `role_names` is given: then a role-name pattern is a gap
+    only when it reaches a cached role outside `own_role_names`, or cannot be
+    bounded by name. Whether the literal ARN is the resource's own role is not
+    compared here: the cache carries no resource. A statement whose
+    iam:PassedToService condition excludes AgentCore cannot pass it a role and
+    is skipped. iam:PassedToService is always in a PassRole request, so its
+    IfExists form is read as the plain one.
     """
+    names = list(role_names) if role_names is not None else None
     labels: List[str] = []
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
@@ -3435,14 +3580,28 @@ def _writer_pass_role_gaps(
             for statement in statements:
                 if not _statement_matches_action(statement, IAM_PASS_ROLE_ACTION):
                     continue
+                if _pass_role_statement_excludes_agentcore(statement):
+                    continue
                 if _statement_resource_is_unbounded(statement):
                     missing.add(PAYMENT_PASS_ROLE_WIDE_RESOURCE_LEG)
-                elif any(
-                    wildcard in str(resource)
-                    for resource in _statement_resources(statement)
-                    for wildcard in ("*", "?")
-                ):
-                    missing.add(PAYMENT_PASS_ROLE_PATTERN_LEG)
+                else:
+                    for resource in _statement_resources(statement):
+                        if "*" not in str(resource) and "?" not in str(resource):
+                            continue
+                        others = (
+                            None
+                            if names is None
+                            else _pass_role_pattern_other_roles(
+                                resource, names, own_role_names
+                            )
+                        )
+                        if others is None:
+                            missing.add(PAYMENT_PASS_ROLE_PATTERN_LEG)
+                        elif others:
+                            missing.add(
+                                f"its Resource {resource} also reaches "
+                                + ", ".join(f"role {name}" for name in others)
+                            )
                 if not _condition_pins_value(
                     statement,
                     IAM_PASSED_TO_SERVICE_CONDITION_KEY,
@@ -3489,7 +3648,9 @@ def _payment_retrieval_trust_gaps(
     Every Allow statement must name only the AgentCore service principal and pin
     aws:SourceArn to this payment manager by value. A SourceArn value that names
     the payment manager literally also names its account, so aws:SourceAccount
-    is not required on top of it.
+    is not required on top of it. A pattern that matches this manager's ARN,
+    such as `payment-manager/pm-*`, also matches every manager created later
+    whose id it matches, so only the literal ARN pins.
     """
     statements = _document_statements(document, effect="Allow")
     gaps: List[str] = []
@@ -3511,11 +3672,7 @@ def _payment_retrieval_trust_gaps(
                 f"statement {index} does not pin aws:SourceArn with StringEquals, "
                 "StringLike, ArnEquals or ArnLike"
             )
-        elif not all(
-            fnmatchcase(payment_manager_arn, value)
-            and not _arn_pattern_is_unbounded(value)
-            for value in source_arns
-        ):
+        elif not all(value == payment_manager_arn for value in source_arns):
             gaps.append(
                 f"statement {index} lets aws:SourceArn be "
                 f"{', '.join(sorted(set(source_arns)))}, which is not this "
@@ -3524,7 +3681,52 @@ def _payment_retrieval_trust_gaps(
     return gaps, len(statements)
 
 
-def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
+def _payment_writer_literal_pass_roles(
+    permissions_by_name: Dict[str, Any], principal_kind: str
+) -> Dict[str, Set[str]]:
+    """Return the literal role ARNs each payment manager writer may pass AgentCore.
+
+    A pattern Resource is the global AC-02 Pass Role Scope leg's to judge, and a
+    statement whose iam:PassedToService excludes AgentCore passes it no role.
+    """
+    literals: Dict[str, Set[str]] = {}
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        if not any(
+            _principal_holds_action(permissions, action)
+            for action in PAYMENT_MANAGER_WRITE_ACTIONS
+        ):
+            continue
+        if not _grant_survives(permissions, IAM_PASS_ROLE_ACTION):
+            continue
+        for policy in _principal_policies(permissions):
+            try:
+                statements = list(_allow_statements(policy))
+            except Exception as error:
+                logger.warning(
+                    f"Error parsing policy for {principal_kind} "
+                    f"{principal_name}: {error}"
+                )
+                continue
+            for statement in statements:
+                if not _statement_matches_action(statement, IAM_PASS_ROLE_ACTION):
+                    continue
+                if _pass_role_statement_excludes_agentcore(statement):
+                    continue
+                literals.setdefault(f"{principal_kind} {principal_name}", set()).update(
+                    str(resource)
+                    for resource in _statement_resources(statement)
+                    if ":role/" in str(resource)
+                    and "*" not in str(resource)
+                    and "?" not in str(resource)
+                )
+    return literals
+
+
+def check_agentcore_payment_retrieval_role_trust(
+    permission_cache: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """AC-02 (PAY-01): Judge each payment manager's ResourceRetrievalRole trust.
 
     The IAM cache carries no trust policies, so this leg lists the payment
@@ -3581,6 +3783,7 @@ def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
 
     findings: List[Dict[str, Any]] = []
     trust_cache: Dict[str, Any] = {}
+    manager_roles: Set[str] = set()
     for manager in managers:
         manager_id = manager.get("paymentManagerId") or "unknown"
         label = f"Payment manager '{manager.get('name') or manager_id}' ({manager_id})"
@@ -3613,6 +3816,8 @@ def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
                 continue
             manager_arn = detail.get("paymentManagerArn") or manager_arn
             role_arn = detail.get("roleArn") or role_arn
+        if role_arn:
+            manager_roles.add(str(role_arn))
         if not role_arn:
             findings.append(
                 create_finding(
@@ -3701,6 +3906,46 @@ def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
                 status=StatusEnum.PASSED,
             )
         )
+
+    if isinstance(permission_cache, dict) and manager_roles:
+        writers = {
+            **_payment_writer_literal_pass_roles(
+                permission_cache.get("role_permissions") or {}, "role"
+            ),
+            **_payment_writer_literal_pass_roles(
+                permission_cache.get("user_permissions") or {}, "user"
+            ),
+        }
+        reaches = [
+            f"{label} ({', '.join(sorted(roles - manager_roles))})"
+            for label, roles in sorted(writers.items())
+            if roles - manager_roles
+        ]
+        if reaches:
+            findings.append(
+                create_finding(
+                    check_id="AC-02",
+                    finding_name="AgentCore Payments Pass Role Reaches Other Roles",
+                    finding_details=(
+                        "The following principals can create or update an "
+                        "AgentCore payment manager and may pass AgentCore a role "
+                        "that no payment manager in this region names as its "
+                        f"roleArn: {'; '.join(reaches)}. UpdatePaymentManager can "
+                        "point a manager at any role the grant names, and the "
+                        "manager then retrieves payment credentials as that role. "
+                        "A role the payment managers of another region name reads "
+                        f"as a role no manager names. {IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        "Grant iam:PassRole to the payment manager writers only on "
+                        "the ResourceRetrievalRole ARNs their managers name, and "
+                        "pass other AgentCore roles from a separate identity."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
 
     return findings
 
@@ -4381,8 +4626,9 @@ def check_agentcore_full_access_roles(
                         "retrieves payment credentials as the role passed in its "
                         "roleArn, so an unscoped PassRole lets setup hand it any "
                         "role the grant matches, or hand the retrieval role to "
-                        "another service. A grant naming one role's ARN is not "
-                        "compared to the payment manager's own roleArn. "
+                        "another service. A grant naming one role's ARN is "
+                        "compared with the payment managers' roleArn per region, by "
+                        "the Payments Pass Role Reaches Other Roles row. "
                         f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
@@ -5677,10 +5923,48 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                 status=StatusEnum.NA,
             )
         ]
+    not_judged = []
     try:
-        runtime_images, _ = _agentcore_runtime_images()
-    except ClientError:
-        runtime_images = {}
+        runtime_images, unread_runtimes = _agentcore_runtime_images()
+    except ClientError as error:
+        runtime_images, unread_runtimes = {}, []
+        not_judged.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details=(
+                    "AgentCore runtimes could not be listed, so the repositories "
+                    "their container images come from were not identified and "
+                    "only repositories named for AgentCore were judged: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:ListAgentRuntimes and "
+                    "bedrock-agentcore:GetAgentRuntime, then rerun the assessment."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    for note in unread_runtimes:
+        not_judged.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details=(
+                    f"The container image of AgentCore {note}, so whether "
+                    "Inspector scans the repository it comes from was not judged."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:GetAgentRuntime, then rerun the "
+                    "assessment."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
     try:
         repositories, _ = _agentcore_ecr_repositories(runtime_images)
     except (BotoCoreError, ClientError) as error:
@@ -5692,9 +5976,31 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                 reference=reference,
             )
         ]
+    for key, runtimes in runtime_images.items():
+        registry, region, repo_name = key.split("/", 2)
+        not_judged.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details=(
+                    f"AgentCore runtime(s) {', '.join(runtimes)} run images from "
+                    f"repository '{repo_name}' in registry {registry} in "
+                    f"{region}, which is not a repository this assessment listed "
+                    "in this account and region, so whether Inspector scans it "
+                    "was not judged."
+                ),
+                resolution=(
+                    "Assess the registry that holds the repository, or move the "
+                    "image into this account's registry in this region."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
     names = sorted({str(repo.get("repositoryName")) for repo in repositories if repo})
     if not names:
-        return [
+        return not_judged or [
             create_finding(
                 check_id="AC-50",
                 finding_name=coverage_name,
@@ -5709,7 +6015,7 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
             )
         ]
 
-    findings = []
+    findings = not_judged
     coverage_error = None
     covered: Dict[str, Dict[str, Any]] = {}
     if inspector2_client is None:
@@ -7372,7 +7678,9 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
 
     With no runtime in the region, REQUIRE_AGENTCORE_ONLINE_EVALUATION set to
     true still requires one running configuration, for agents hosted outside
-    AgentCore Runtime whose traces reach CloudWatch; unset, that case is N/A.
+    AgentCore Runtime whose traces reach CloudWatch. Unset, a log group under
+    the runtime prefix requires one as well, because the AgentCore guide has
+    such an agent write there; with no such group, that case is N/A.
     """
     finding_name = "AgentCore Online Evaluation Coverage"
     if agentcore_client is None:
@@ -7472,16 +7780,70 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                 "ENABLED with a sampling percentage above zero."
             )
         else:
-            status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
-            details_text = (
-                "No AgentCore runtimes found in this region, so no runtime needs "
-                "online evaluation. AC-39 judges any configuration that exists."
-            )
-            resolution = (
-                "No action required unless agents hosted outside AgentCore Runtime "
-                "run here. Set REQUIRE_AGENTCORE_ONLINE_EVALUATION to true to "
-                "require online evaluation for them."
-            )
+            # The AgentCore guide has an agent hosted outside AgentCore Runtime
+            # write to a log group it creates under the runtime prefix, so a
+            # group there with no runtime in the region is that agent's.
+            agent_groups: List[str] = []
+            groups_error = None
+            if logs_client is not None:
+                try:
+                    agent_groups = sorted(
+                        group["logGroupName"]
+                        for group in _paginate_aws_list(
+                            logs_client,
+                            "describe_log_groups",
+                            "logGroups",
+                            logGroupNamePrefix=AGENTCORE_RUNTIME_LOG_GROUP_PREFIX,
+                        )
+                        if group.get("logGroupName")
+                    )
+                except (BotoCoreError, ClientError) as error:
+                    groups_error = _assessment_error_label(error)
+            if agent_groups:
+                status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
+                details_text = (
+                    "No AgentCore runtimes found in this region, but "
+                    f"{len(agent_groups)} log group(s) under "
+                    f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}, where the AgentCore "
+                    "guide has agents hosted outside AgentCore Runtime write, "
+                    f"exist: {', '.join(agent_groups)}. No online evaluation "
+                    f"configuration is running ({len(judged)} found). A group a "
+                    "deleted runtime left behind reads the same."
+                )
+                resolution = (
+                    "Create an online evaluation configuration over these log "
+                    "groups with the agent's service name, and set it ENABLED "
+                    "with a sampling percentage above zero. Delete a group no "
+                    "agent writes to."
+                )
+            elif groups_error:
+                status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                details_text = (
+                    "No AgentCore runtimes found in this region, and whether an "
+                    "agent hosted outside AgentCore Runtime writes traces here "
+                    "was not established: logs:DescribeLogGroups failed with "
+                    f"{groups_error}."
+                )
+                resolution = "Grant logs:DescribeLogGroups and retry."
+            else:
+                status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                details_text = (
+                    "No AgentCore runtimes found in this region"
+                    + (
+                        f", and no log group under "
+                        f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}, where agents "
+                        "hosted outside AgentCore Runtime write"
+                        if logs_client is not None
+                        else ""
+                    )
+                    + ", so no agent here needs online evaluation. AC-39 judges "
+                    "any configuration that exists."
+                )
+                resolution = (
+                    "No action required unless agents hosted outside AgentCore "
+                    "Runtime run here. Set REQUIRE_AGENTCORE_ONLINE_EVALUATION to "
+                    "true to require online evaluation for them."
+                )
         return [
             create_finding(
                 check_id="AC-17",
@@ -8048,20 +8410,64 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
     return findings
 
 
-def _vpc_endpoint_policy_is_full_access(policy_document: Any) -> bool:
+def _endpoint_action_is_every_call(action: str, service_prefix: str) -> bool:
+    """Return whether one Action value reaches every call an endpoint carries.
+
+    `*` and `*:*` reach every action, and `<prefix>:*` reaches every action of
+    the service the endpoint serves.
+    """
+    prefix, _, name = action.partition(":")
+    if set(prefix) <= {"*"}:
+        return True
+    return bool(name) and set(name) <= {"*"} and prefix == service_prefix
+
+
+def _endpoint_resource_is_every_resource(resource: str) -> bool:
+    """Return whether one Resource value reaches every resource of the service.
+
+    `*` does, and so does an ARN whose account and resource parts are empty or
+    only `*`, such as arn:aws:bedrock-agentcore:*:*:* or arn:aws:s3:::*. An ARN
+    cut short by a trailing `*`, such as arn:*, matches the rest of every ARN. A
+    literal partition, service or Region is left alone: the endpoint carries
+    calls to one service in its own Region, so naming them narrows nothing.
+    """
+    resource = resource.strip()
+    if set(resource) <= {"*"}:
+        return bool(resource)
+    parts = resource.split(":", 5)
+    if parts[0] != "arn":
+        return False
+    if len(parts) < 6:
+        return set(parts[-1]) <= {"*"} and bool(parts[-1])
+    return set(parts[4]) <= {"*"} and set(parts[5]) <= {"*"} and bool(parts[5])
+
+
+def _vpc_endpoint_policy_is_full_access(
+    policy_document: Any, service_prefix: str = ""
+) -> bool:
     """Return whether an endpoint policy allows every principal every action.
 
-    AWS attaches exactly this document when no policy is supplied, so an endpoint
-    carrying it contributes a private network path and no authorization. One
-    unconditioned statement of that shape has the effect no matter what else the
-    document holds, which is why the statements are not scored together.
+    AWS attaches the allow-everything document when no policy is supplied, so an
+    endpoint carrying it contributes a private network path and no
+    authorization. One unconditioned statement with that effect is enough no
+    matter what else the document holds, which is why the statements are not
+    scored together. The effect is read by value: `service_prefix` is the IAM
+    prefix of the endpoint's service, so bedrock-agentcore:* on an AgentCore
+    endpoint, and a Resource ARN open in its account and resource parts, count
+    as every action and every resource.
     """
     for statement in _document_statements(policy_document, effect="Allow"):
         if statement.get("Condition"):
             continue
         if (
-            "*" in _statement_actions(statement)
-            and "*" in _statement_resources(statement)
+            any(
+                _endpoint_action_is_every_call(action, service_prefix)
+                for action in _statement_actions(statement)
+            )
+            and any(
+                _endpoint_resource_is_every_resource(resource)
+                for resource in _statement_resources(statement)
+            )
             and "*" in _statement_principals(statement)
         ):
             return True
@@ -8320,6 +8726,17 @@ def _is_agentcore_service_endpoint(service_name: str) -> bool:
     return AGENTCORE_SERVICE_ENDPOINT_TOKEN in (service_name or "").lower()
 
 
+def _endpoint_service_prefix(service_name: str) -> str:
+    """Return the IAM prefix of the service one VPC endpoint service name serves.
+
+    com.amazonaws.<region>.<service>[.<surface>] names the service in its fourth
+    part: bedrock-agentcore for both AgentCore surfaces, and s3, dynamodb or
+    sagemaker for the data-path endpoints.
+    """
+    parts = str(service_name or "").lower().split(".")
+    return parts[3] if len(parts) > 3 else ""
+
+
 def _is_agentcore_data_path_endpoint(service_name: str) -> bool:
     """Return whether one VPC endpoint carries an AgentCore workload's data."""
     lowered = (service_name or "").lower()
@@ -8407,16 +8824,19 @@ def _agentcore_endpoint_scope_findings(
                     status=StatusEnum.NA,
                 )
             )
-        elif _vpc_endpoint_policy_is_full_access(policy_document):
+        elif _vpc_endpoint_policy_is_full_access(
+            policy_document, _endpoint_service_prefix(entry["service"])
+        ):
             findings.append(
                 create_finding(
                     check_id="AC-08",
                     finding_name="AgentCore VPC Endpoint Policy Unrestricted",
                     finding_details=(
-                        f"AgentCore VPC {label} carries the default endpoint "
-                        "policy, which allows every principal every action on "
-                        "every resource. The endpoint keeps the traffic off the "
-                        "public internet and authorizes nothing."
+                        f"AgentCore VPC {label} carries an unconditioned policy "
+                        "statement that allows every principal every action of "
+                        "its service on every resource, the same effect as the "
+                        "default endpoint policy. The endpoint keeps the traffic "
+                        "off the public internet and authorizes nothing."
                     ),
                     resolution=(
                         "Replace the default endpoint policy with one that names "
@@ -8888,15 +9308,35 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
         )
 
         if not vpcs:
+            # A VPC endpoint lives in a VPC, so with none in the Region every
+            # call to the runtimes and gateways listed above reaches the public
+            # service endpoint.
+            in_use = " and ".join(
+                f"{count} {surface}(s)"
+                for surface, count in (
+                    ("runtime", len(runtimes)),
+                    ("gateway", len(gateways)),
+                )
+                if count
+            )
             findings.append(
                 create_finding(
                     check_id="AC-08",
-                    finding_name="AgentCore VPC Endpoints Check",
-                    finding_details="No VPCs found in the account",
-                    resolution="No action required",
+                    finding_name="AgentCore VPC Endpoints Missing",
+                    finding_details=(
+                        f"{in_use} exist in this Region and the account has no "
+                        "VPC here, so no VPC endpoint can carry their calls and "
+                        "every call reaches the public service endpoint."
+                    ),
+                    resolution=(
+                        "Create a VPC for the callers and an interface endpoint "
+                        "for com.amazonaws.<region>.bedrock-agentcore and "
+                        "com.amazonaws.<region>.bedrock-agentcore.gateway in it, "
+                        "for the surfaces in use."
+                    ),
                     reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
-                    severity=SeverityEnum.INFORMATIONAL,
-                    status=StatusEnum.NA,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
                 )
             )
             return findings
@@ -10933,11 +11373,14 @@ def _agentcore_transaction_search_finding() -> Dict[str, Any]:
 
 
 def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
-    """AC-19: Report log and trace delivery per runtime, gateway and memory.
+    """AC-19: Report log and trace delivery per AgentCore resource.
 
     A gateway or memory needs an APPLICATION_LOGS and a TRACES delivery, because
     AgentCore configures no destination for either. A runtime needs a TRACES
     delivery only: AgentCore creates a log group for its service-provided logs.
+    A custom code interpreter or browser needs an APPLICATION_LOGS delivery, and
+    a workload identity or credential provider a TRACES delivery, each matched
+    on the exact ARN its list API returns.
     When any of them exists, the region's trace segment destination is read,
     because AgentCore tracing needs CloudWatch Transaction Search, which
     requires the CloudWatchLogs destination.
@@ -11077,7 +11520,55 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
             )
         )
 
-    if runtimes or gateways or memories:
+    judged_elsewhere = 0
+    for (
+        operation_name,
+        result_key,
+        list_kwargs,
+        arn_field,
+        id_field,
+        row_label,
+        subject,
+        action,
+        required_log_types,
+    ) in AGENTCORE_ARN_MATCHED_DELIVERY_FAMILIES:
+        try:
+            items = _agentcore_list_all(operation_name, [result_key], **list_kwargs)
+        except Exception as error:
+            items = []
+            findings.append(
+                create_finding(
+                    check_id="AC-19",
+                    finding_name="AgentCore Log Delivery Configuration",
+                    finding_details=(
+                        f"{subject} could not be listed: {type(error).__name__}."
+                    ),
+                    resolution=f"Grant bedrock-agentcore:{action} and retry.",
+                    reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        for item in items:
+            resource_arn = item.get(arn_field)
+            if not resource_arn:
+                continue
+            judged_elsewhere += 1
+            item_id = item.get(id_field) if id_field else None
+            name = item.get("name") or item_id or resource_arn
+            findings.append(
+                _log_delivery_finding(
+                    f"{row_label} '{name}' ({item_id})"
+                    if item_id
+                    else f"{row_label} '{name}'",
+                    resource_arn,
+                    arn_sources,
+                    delivered_source_names,
+                    required_log_types,
+                )
+            )
+
+    if runtimes or gateways or memories or judged_elsewhere:
         findings.append(_agentcore_transaction_search_finding())
 
     if not findings:
@@ -11086,7 +11577,8 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
                 check_id="AC-19",
                 finding_name="AgentCore Log Delivery Configuration",
                 finding_details=(
-                    "No AgentCore runtime, gateway or memory resources found in "
+                    "No AgentCore runtime, gateway, memory, custom code "
+                    "interpreter, custom browser or identity resources found in "
                     "this region."
                 ),
                 resolution="No action required.",
@@ -11096,27 +11588,25 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
             )
         )
 
-    # AWS documents a configurable log destination for memory, gateway and
-    # built-in tool resources only. Runtime logging is service-managed,
     # WorkloadIdentity log delivery is configured on the associated runtime or
-    # gateway resource, and policy engines have no log-destination surface. A
-    # built-in tool emits no service logs at all, so whether a missing delivery
-    # loses anything depends on the workload writing its own logs.
+    # gateway resource, so identity resources are judged on traces only, and
+    # policy engines have no log-destination surface. The AWS-managed code
+    # interpreter and browser are not listed with type CUSTOM.
     findings.append(
         create_finding(
             check_id="AC-19",
             finding_name="AgentCore Log Delivery Configuration",
             finding_details=(
-                "Built-in tool log delivery is not assessed: AgentCore provides "
-                "no tool logs by default, so a missing delivery only loses data "
-                "when the workload writes its own logs. Identity log delivery is "
-                "configured on the associated runtime or gateway resource, and "
-                "policy engines have no log-destination configuration."
+                "Built-in tool log delivery is not assessed for the AWS-managed "
+                "code interpreter and browser; each custom code interpreter and "
+                "browser is judged on its own row. WorkloadIdentity log delivery "
+                "is configured on the associated runtime or gateway resource, so "
+                "identity resources are judged on traces only, and policy "
+                "engines have no log-destination configuration."
             ),
             resolution=(
-                "Where a built-in tool writes its own logs, add a CloudWatch "
-                "Logs, Amazon S3 or Firehose destination for that tool in the "
-                "AgentCore console."
+                "Turn on tracing for each gateway a policy engine is attached "
+                "to, because the engine's decision spans appear only there."
             ),
             reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
             severity=SeverityEnum.INFORMATIONAL,
@@ -11533,18 +12023,35 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
 
 LOGS_UNMASK_ACTION = "logs:unmask"
 
+# The kinds of AgentCore log group under each prefix, and two resource ids no
+# customer names a group after. A pattern that matches the group names built
+# from both ids reaches every group of that kind, including ones created later.
+AGENTCORE_LOG_GROUP_KINDS = (
+    "",
+    "runtimes/",
+    "evaluations/results/",
+    "memory/",
+    "gateway/",
+    "code-interpreter/",
+    "browser/",
+)
+AGENTCORE_LOG_GROUP_PROBE_IDS = ("zq1x9k", "Kp7w2Tm4Rb8")
+
 
 def _logs_resource_is_unbounded(resource: str) -> bool:
-    """Return whether one logs Resource pattern reaches every AgentCore log group.
+    """Return whether one logs Resource pattern reaches a whole kind of
+    AgentCore log group.
 
     A log group name may contain `/`, so the generic ARN rule would read the
     prefix `log-group:/aws/bedrock-agentcore/*` as a whole resource type. Here
-    the name after `log-group:` is one component: it is unbounded when it is
-    made of wildcards alone, or when it is a literal head that every name under
-    an AgentCore prefix starts with followed by wildcards alone, so
-    `/aws/bedrock-agentcore/*` and `/aws/*` count as `*` does. A wildcard in
-    the partition, service, region or account segment, or in the resource
-    type, is unbounded as it is elsewhere.
+    the name after `log-group:` is one pattern, matched with IAM's `*` and `?`
+    against probe names: for each AgentCore prefix and kind, two names that
+    differ only in the resource id, with and without a runtime's `-DEFAULT`
+    endpoint suffix. A pattern matching both names of one pair reaches every
+    group of that kind, so `/aws/bedrock-agentcore/runtimes/*`, `*agentcore*`
+    and `/aws/*` count as `*` does, while `runtimes/myagent-*` names one
+    runtime's groups. A wildcard in the partition, service, region or account
+    segment, or in the resource type, is unbounded as it is elsewhere.
     """
     resource = str(resource).strip()
     parts = resource.split(":", 5)
@@ -11565,17 +12072,17 @@ def _logs_resource_is_unbounded(resource: str) -> bool:
     name = name.split(":log-stream", 1)[0]
     if name.endswith(":*"):
         name = name[:-2]
-    wildcard_at = min(
-        (index for index in (name.find("*"), name.find("?")) if index >= 0),
-        default=-1,
-    )
-    if wildcard_at < 0:
-        return not name
-    head, tail = name[:wildcard_at], name[wildcard_at:]
-    return (
-        "*" in tail
-        and set(tail) <= {"*", "?"}
-        and any(prefix.startswith(head) for prefix in AGENTCORE_LOG_GROUP_PREFIXES)
+    if not name:
+        return True
+    pattern = name.replace("[", "[[]")
+    return any(
+        all(
+            fnmatchcase(f"{prefix}{kind}{resource_id}{suffix}", pattern)
+            for resource_id in AGENTCORE_LOG_GROUP_PROBE_IDS
+        )
+        for prefix in AGENTCORE_LOG_GROUP_PREFIXES
+        for kind in AGENTCORE_LOG_GROUP_KINDS
+        for suffix in ("", "-DEFAULT")
     )
 
 
@@ -11717,8 +12224,9 @@ def check_agentcore_log_unmask_restriction(
                     finding_name="AgentCore Log Unmask Restriction",
                     finding_details=(
                         "The following principals can unmask the masked values of "
-                        "every AgentCore log group, through a resource of wildcards "
-                        "alone or a wildcard after an AgentCore log group prefix: "
+                        "every AgentCore log group of at least one kind, through a "
+                        "resource whose wildcards reach every resource id under an "
+                        "AgentCore log group prefix: "
                         f"{', '.join(unscoped)}. "
                         f"{IAM_CACHE_SCP_NOTE}"
                     ),
@@ -11740,12 +12248,15 @@ def check_agentcore_log_unmask_restriction(
                     check_id="AC-21",
                     finding_name="AgentCore Log Unmask Restriction",
                     finding_details=(
-                        "The following principals hold logs:Unmask only on named "
-                        f"log group resources: {', '.join(scoped)}."
+                        "The following principals hold logs:Unmask only on log "
+                        "group resources that stop short of a whole kind of "
+                        "AgentCore log group, such as one named group or one "
+                        f"runtime's groups: {', '.join(scoped)}."
                     ),
                     resolution=(
-                        "No action required. Confirm the named log groups are the "
-                        "ones this principal is authorized to unmask."
+                        "No action required. Confirm the log groups these "
+                        "resources reach are the ones this principal is "
+                        "authorized to unmask."
                     ),
                     reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -11918,6 +12429,162 @@ AGENTCORE_OAM_TELEMETRY_TYPES = (
     "AWS::CloudWatch::Metric",
 )
 
+# The data-event types an account creates itself. The unsuffixed CodeInterpreter
+# and Browser types are the AWS-managed SYSTEM tools every account lists, and the
+# directory, vault and runtime endpoint types count a resource already counted.
+AGENTCORE_ACCOUNT_OWNED_TYPES = (
+    "AWS::BedrockAgentCore::Runtime",
+    "AWS::BedrockAgentCore::Memory",
+    "AWS::BedrockAgentCore::CodeInterpreterCustom",
+    "AWS::BedrockAgentCore::BrowserCustom",
+    "AWS::BedrockAgentCore::Gateway",
+    "AWS::BedrockAgentCore::WorkloadIdentity",
+    "AWS::BedrockAgentCore::OAuth2CredentialProvider",
+    "AWS::BedrockAgentCore::APIKeyCredentialProvider",
+    "AWS::BedrockAgentCore::PolicyEngine",
+    "AWS::BedrockAgentCore::Policy",
+    "AWS::BedrockAgentCore::Evaluator",
+)
+
+
+def _agentcore_unlinked_member_findings() -> List[Dict[str, Any]]:
+    """Judge a region with no sink and no link.
+
+    Outside an organization this is a single-account deployment. Inside one, the
+    region's AgentCore telemetry never reaches the monitoring account.
+    """
+    single_account = create_finding(
+        check_id="AC-22",
+        finding_name="AgentCore Telemetry Sink Scope",
+        finding_details=(
+            "No observability sink found in this region, so no telemetry is "
+            "aggregated into this account, and ListLinks returned no link, so this "
+            "region's telemetry is not shared with a monitoring account."
+        ),
+        resolution=(
+            "No action required for a single-account deployment. For a "
+            "multi-account one, link this account to a sink in the "
+            "monitoring account."
+        ),
+        reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+        severity=SeverityEnum.INFORMATIONAL,
+        status=StatusEnum.NA,
+    )
+    if organizations_client is None:
+        return [single_account]
+    try:
+        organization_id = (
+            organizations_client.describe_organization()
+            .get("Organization", {})
+            .get("Id", "")
+        )
+    except ClientError as error:
+        if (
+            error.response.get("Error", {}).get("Code")
+            == "AWSOrganizationsNotInUseException"
+        ):
+            return [single_account]
+        organization_error = _assessment_error_label(error)
+    except BotoCoreError as error:
+        organization_error = _assessment_error_label(error)
+    else:
+        if not organization_id:
+            return [single_account]
+        organization_error = ""
+    if organization_error:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    "No observability sink or link found in this region. Whether "
+                    "this account belongs to an organization whose monitoring "
+                    "account should receive its telemetry was not read: "
+                    f"organizations:DescribeOrganization failed with "
+                    f"{organization_error}."
+                ),
+                resolution="Grant organizations:DescribeOrganization and retry.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    owned: Dict[str, int] = {}
+    unread = []
+    for family in AGENTCORE_DATA_EVENT_FAMILIES:
+        try:
+            type_counts, _ = _agentcore_family_inventory(family)
+        except (BotoCoreError, ClientError) as error:
+            unread.append(f"{family['label']} ({_assessment_error_label(error)})")
+            continue
+        count = sum(
+            type_counts.get(resource_type, 0)
+            for resource_type in AGENTCORE_ACCOUNT_OWNED_TYPES
+        )
+        if count:
+            owned[family["label"]] = count
+    total = sum(owned.values())
+    if total:
+        per_family = ", ".join(f"{label} {count}" for label, count in owned.items())
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Not Centralized",
+                finding_details=(
+                    f"This account belongs to organization {organization_id} and "
+                    f"holds {total} AgentCore resource(s) in this region "
+                    f"({per_family}), but the region has no observability sink "
+                    "and ListLinks returned no link, so their logs, traces and "
+                    "metrics never reach a monitoring account."
+                ),
+                resolution=(
+                    "Link this account to the organization's monitoring sink with "
+                    "CreateLink, sharing AWS::Logs::LogGroup, AWS::XRay::Trace and "
+                    "AWS::CloudWatch::Metric."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+    if unread:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    f"This account belongs to organization {organization_id} and "
+                    "this region has no observability sink or link. Whether it "
+                    "holds AgentCore resources whose telemetry should be shared "
+                    f"was not read for {', '.join(unread)}."
+                ),
+                resolution=(
+                    "Grant the AgentCore list permissions for these resource "
+                    "families and retry."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="AC-22",
+            finding_name="AgentCore Telemetry Sink Scope",
+            finding_details=(
+                f"This account belongs to organization {organization_id} and this "
+                "region has no observability sink or link, but it holds no "
+                "AgentCore resource of its own, so there is no AgentCore "
+                "telemetry to share."
+            ),
+            resolution="No action required.",
+            reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    ]
+
 
 def _agentcore_telemetry_link_findings() -> List[Dict[str, Any]]:
     """Judge the links an account with no sink uses to share its telemetry.
@@ -11951,25 +12618,7 @@ def _agentcore_telemetry_link_findings() -> List[Dict[str, Any]]:
             )
         ]
     if not links:
-        return [
-            create_finding(
-                check_id="AC-22",
-                finding_name="AgentCore Telemetry Sink Scope",
-                finding_details=(
-                    f"{no_sink}aggregated into this account, and ListLinks "
-                    "returned no link, so this region's telemetry is not shared "
-                    "with a monitoring account."
-                ),
-                resolution=(
-                    "No action required for a single-account deployment. For a "
-                    "multi-account one, link this account to a sink in the "
-                    "monitoring account."
-                ),
-                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            )
-        ]
+        return _agentcore_unlinked_member_findings()
     findings = []
     for link in links:
         label = link.get("Label") or link.get("Arn") or "unnamed link"
@@ -12004,7 +12653,11 @@ def _agentcore_telemetry_link_findings() -> List[Dict[str, Any]]:
                     f"Link '{label}' shares {', '.join(AGENTCORE_OAM_TELEMETRY_TYPES)} "
                     f"with {sink_arn}. That sink's policy is judged by AC-22 in "
                     "the account that owns it, and the link's log group and "
-                    "metric filters are not read."
+                    "metric filters are not read. Whether account "
+                    f"{_arn_account(sink_arn) or 'unknown'} belongs to this "
+                    "account's organization is not read, because "
+                    "organizations:DescribeAccount answers only in the management "
+                    "account or a delegated administrator."
                 ),
                 resolution="No action required.",
                 reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
@@ -12685,23 +13338,90 @@ def check_agentcore_memory_record_access_scope(
     return findings
 
 
-def _gateway_rate_limit_is_bounded(rate_limit: Dict[str, Any]) -> bool:
+def _gateway_rate_limit_caller_keys(rate_limit: Dict[str, Any]) -> List[str]:
+    """Return the dimension keys of a limit that name the caller."""
+    return [
+        str(key)
+        for key in rate_limit.get("dimensionKeys") or []
+        if str(key).startswith("$.context.")
+    ]
+
+
+def _gateway_rate_limit_named_entries(rate_limit: Dict[str, Any]) -> List[str]:
+    """Return one `key=value` list per rated entry that names a caller value.
+
+    An entry's `dimensions` map selects the requests its rate applies to, and a
+    value is either exact or `*`. A caller dimension with an exact value bounds
+    that one caller, so only a rated entry with `*` on every caller dimension
+    bounds every caller. Returns empty when such an entry exists.
+    """
+    caller_keys = _gateway_rate_limit_caller_keys(rate_limit)
+    named: List[str] = []
+    for entry in rate_limit.get("entries") or []:
+        if not isinstance(entry, dict) or not any(
+            entry.get(key) for key in GATEWAY_RATE_LIMIT_VALUE_KEYS
+        ):
+            continue
+        values = entry.get("dimensions")
+        values = values if isinstance(values, dict) else {}
+        exact = [
+            f"{key}={values.get(key, '(absent)')}"
+            for key in caller_keys
+            if values.get(key) != "*"
+        ]
+        if not exact:
+            return []
+        named.append(", ".join(exact))
+    return named
+
+
+def _gateway_rate_limit_unsupplied_dimensions(
+    rate_limit: Dict[str, Any], authorizer_type: Any
+) -> List[str]:
+    """Return the caller dimension keys the gateway's authorizer supplies no
+    value for.
+
+    $.context.iam.* is the SigV4 caller, which only AWS_IAM and
+    AUTHENTICATE_ONLY gateways authenticate, and $.context.jwt.* is a claim of
+    the bearer token only a CUSTOM_JWT gateway reads. A gateway that reported
+    no authorizer type is not judged here.
+    """
+    if not authorizer_type:
+        return []
+    supplied = []
+    if authorizer_type in GATEWAY_AUTHORIZER_SIGV4_VALUES:
+        supplied.append("$.context.iam.")
+    if authorizer_type == GATEWAY_AUTHORIZER_JWT_VALUE:
+        supplied.append("$.context.jwt.")
+    return [
+        key
+        for key in _gateway_rate_limit_caller_keys(rate_limit)
+        if not key.startswith(tuple(supplied))
+    ]
+
+
+def _gateway_rate_limit_is_bounded(
+    rate_limit: Dict[str, Any], authorizer_type: Any = None
+) -> bool:
     """Return whether an active rate limit bounds a throughput value.
 
     `dimensions` is the only required member of a limit entry, so a limit can be
     ACTIVE, name a dimension, and bound nothing. Only `requests`, `tokens` or
     `connections` carries a rate, and a limit still CREATING or DELETING is not
-    in force.
+    in force. A rated entry must also reach every caller, and each caller
+    dimension must be one the gateway's authorizer gives a value.
     """
     if rate_limit.get("status") != "ACTIVE":
         return False
     if _gateway_rate_limit_per_token_dimensions(rate_limit):
         return False
+    if _gateway_rate_limit_unsupplied_dimensions(rate_limit, authorizer_type):
+        return False
     for entry in rate_limit.get("entries") or []:
         if not isinstance(entry, dict):
             continue
         if any(entry.get(key) for key in GATEWAY_RATE_LIMIT_VALUE_KEYS):
-            return True
+            return not _gateway_rate_limit_named_entries(rate_limit)
     return False
 
 
@@ -12788,6 +13508,7 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
         gateway_id = gateway.get("gatewayId", "unknown")
         gateway_name = gateway.get("name", gateway_id)
         label = f"Gateway '{gateway_name}' ({gateway_id})"
+        authorizer_type = gateway.get("authorizerType")
 
         try:
             rate_limits = _agentcore_list_all(
@@ -12818,7 +13539,7 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
         bounded = [
             rate_limit
             for rate_limit in rate_limits
-            if _gateway_rate_limit_is_bounded(rate_limit)
+            if _gateway_rate_limit_is_bounded(rate_limit, authorizer_type)
         ]
         if bounded:
             findings.append(
@@ -12858,6 +13579,37 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
                 if per_token
                 else ""
             )
+            unsupplied = [
+                f"'{rate_limit.get('rateLimitId', 'unknown')}' is keyed on "
+                + ", ".join(
+                    _gateway_rate_limit_unsupplied_dimensions(
+                        rate_limit, authorizer_type
+                    )
+                )
+                for rate_limit in rate_limits
+                if _gateway_rate_limit_unsupplied_dimensions(
+                    rate_limit, authorizer_type
+                )
+            ]
+            if unsupplied:
+                per_token_note += (
+                    f" Limit {'; '.join(unsupplied)}, for which the gateway's "
+                    f"authorizerType {authorizer_type} supplies no value, so the "
+                    "limit is not known to count its callers."
+                )
+            named = [
+                f"'{rate_limit.get('rateLimitId', 'unknown')}' has entries only "
+                "for named values ("
+                + "; ".join(_gateway_rate_limit_named_entries(rate_limit))
+                + ")"
+                for rate_limit in rate_limits
+                if _gateway_rate_limit_named_entries(rate_limit)
+            ]
+            if named:
+                per_token_note += (
+                    f" Limit {'; '.join(named)}, so a caller outside them has no "
+                    "ceiling."
+                )
             findings.append(
                 create_finding(
                     check_id="AC-24",
@@ -12901,6 +13653,25 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
             )
 
     return findings
+
+
+def _oauth_return_url_problem(provider: Dict[str, Any]) -> Optional[str]:
+    """Say why an AUTHORIZATION_CODE provider's return URL cannot bind consent.
+
+    The AgentCore guide has the user's browser return to a publicly reachable
+    HTTPS endpoint that checks the session before calling
+    CompleteResourceTokenAuth. A missing URL, plain http and a loopback host
+    (what `agentcore dev` serves) cannot be that endpoint in production.
+    """
+    return_url = provider.get("defaultReturnUrl")
+    if not return_url:
+        return "sets grantType AUTHORIZATION_CODE with no defaultReturnUrl"
+    parts = urlsplit(str(return_url))
+    if parts.scheme != "https":
+        return f"returns the user to {return_url}, which is not HTTPS"
+    if (parts.hostname or "") in {"localhost", "127.0.0.1", "::1"}:
+        return f"returns the user to {return_url}, a loopback address"
+    return None
 
 
 def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
@@ -13002,22 +13773,69 @@ def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
                 )
                 continue
 
-            provider_types = [
-                str(configuration.get("credentialProviderType"))
-                for configuration in detail.get("credentialProviderConfigurations")
-                or []
-                if isinstance(configuration, dict)
-                and configuration.get("credentialProviderType")
-            ]
+            provider_types = []
+            return_url_problems = []
+            for configuration in detail.get("credentialProviderConfigurations") or []:
+                if not isinstance(configuration, dict) or not configuration.get(
+                    "credentialProviderType"
+                ):
+                    continue
+                provider_type = str(configuration["credentialProviderType"])
+                oauth = (configuration.get("credentialProvider") or {}).get(
+                    "oauthCredentialProvider"
+                ) or {}
+                grant_type = oauth.get("grantType")
+                if grant_type:
+                    provider_type += f" (grantType {grant_type}"
+                    if grant_type == "AUTHORIZATION_CODE":
+                        problem = _oauth_return_url_problem(oauth)
+                        if problem:
+                            return_url_problems.append(problem)
+                        else:
+                            provider_type += (
+                                f", returning the user to {oauth['defaultReturnUrl']}"
+                            )
+                    provider_type += ")"
+                provider_types.append(provider_type)
 
-            if provider_types:
+            if return_url_problems:
+                findings.append(
+                    create_finding(
+                        check_id="AC-25",
+                        finding_name="AgentCore Gateway Target OAuth Return URL",
+                        finding_details=(
+                            f"{label} {'; it '.join(return_url_problems)}, so the "
+                            "user who grants consent does not reach an endpoint "
+                            "that checks the session before "
+                            "CompleteResourceTokenAuth, and the grant can bind to "
+                            "another user."
+                        ),
+                        resolution=(
+                            "Set the OAuth credential provider's defaultReturnUrl "
+                            "to the public HTTPS callback that verifies the user "
+                            "session, or to <portalUrl>/connect/callback when a "
+                            "consent portal serves this target."
+                        ),
+                        reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            elif provider_types:
+                portal_note = (
+                    " Whether a return URL is the consent portal's "
+                    "<portalUrl>/connect/callback is not compared, because the "
+                    "pinned botocore model has no consent portal operation."
+                    if any("AUTHORIZATION_CODE" in text for text in provider_types)
+                    else ""
+                )
                 findings.append(
                     create_finding(
                         check_id="AC-25",
                         finding_name="AgentCore Gateway Target Authorization",
                         finding_details=(
                             f"{label} authenticates outbound calls with "
-                            f"{', '.join(provider_types)}."
+                            f"{', '.join(provider_types)}.{portal_note}"
                         ),
                         resolution=(
                             "No action required. Confirm the credential the "
@@ -13509,9 +14327,10 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
 
     A log group with no retention keeps agent prompts, tool arguments and memory
     records forever, which turns an investigation aid into a growing store of the
-    data the workload was careful about elsewhere. AC-20 asserts that a customer
-    managed key is set; this check asserts that the key policy behind it narrows
-    who can read through it.
+    data the workload was careful about elsewhere. A group with no customer
+    managed key fails here as well as in AC-20, because AIR-FND-DET-09 asks for
+    one and reads this check, not AC-20; with a key, this check asserts that the
+    key policy behind it narrows who can read through it.
 
     A runtime log group and the aws/spans group also need deletion protection:
     without it, a principal allowed to delete log groups erases the record an
@@ -13634,6 +14453,11 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                     "principal ARN or source, and binds the CloudWatch Logs "
                     "service grant to this account's log groups"
                 )
+        else:
+            problems.append(
+                "has no customer managed KMS key (no kmsKeyId), so no key policy "
+                "of this account decides who can read its events"
+            )
 
         if problems:
             findings.append(
@@ -13645,8 +14469,9 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                     ),
                     resolution=(
                         "Set a retention period on the log group that matches the "
-                        "investigation window this workload commits to, bind "
-                        "every wildcard-principal decrypt grant in the encryption "
+                        "investigation window this workload commits to, encrypt "
+                        "it with a customer managed key, bind every "
+                        "wildcard-principal decrypt grant in the encryption "
                         "key's policy with kms:CallerAccount, aws:PrincipalOrgID "
                         "or aws:PrincipalArn, and turn on deletion "
                         "protection for each runtime and vended-log group."
@@ -14062,9 +14887,13 @@ def _role_outside_cached_account(role_arn: Any, resource_arn: Any) -> str:
     return ""
 
 
-def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -> bool:
-    """Return whether the statement pins aws:SourceAccount or aws:SourceArn to
-    `account_id` by value.
+def _confused_deputy_guard_account(
+    statement: Dict[str, Any],
+    account_id: str,
+    keys: Tuple[str, ...] = ("aws:sourceaccount", "aws:sourcearn"),
+) -> bool:
+    """Return whether the statement pins one of `keys` (aws:SourceAccount or
+    aws:SourceArn) to `account_id` by value.
 
     Every value of the guarding entry must name the account literally: an
     aws:SourceArn whose account segment carries a wildcard, or an
@@ -14088,6 +14917,8 @@ def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -
             if not values:
                 continue
             key = str(key).strip().lower()
+            if key not in keys:
+                continue
             if key == "aws:sourceaccount" and all(
                 value.strip() == account_id for value in values
             ):
@@ -14099,9 +14930,12 @@ def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -
     return False
 
 
-def _source_arn_names_resource_type(value: str, account_id: str) -> bool:
+def _source_arn_names_resource_type(
+    value: str, account_id: str, resource_types: Optional[Tuple[str, ...]] = None
+) -> bool:
     """Return whether an aws:SourceArn value names `account_id` and fixes every
-    segment up to the resource type.
+    segment up to the resource type, and, when `resource_types` is given, names
+    an AgentCore resource of one of those types.
 
     `arn:aws:bedrock-agentcore:*:111122223333:*` names the account yet matches
     every AgentCore resource in every Region, so it scopes no more than
@@ -14115,10 +14949,16 @@ def _source_arn_names_resource_type(value: str, account_id: str) -> bool:
     if any("*" in part or "?" in part for part in parts[1:4]):
         return False
     resource_type = re.split(r"[/:]", parts[5], maxsplit=1)[0]
+    if resource_types is not None:
+        return parts[2] == "bedrock-agentcore" and resource_type in resource_types
     return bool(resource_type) and "*" not in resource_type and "?" not in resource_type
 
 
-def _statement_scopes_source_arn(statement: Dict[str, Any], account_id: str) -> bool:
+def _statement_scopes_source_arn(
+    statement: Dict[str, Any],
+    account_id: str,
+    resource_types: Optional[Tuple[str, ...]] = None,
+) -> bool:
     """Return whether the statement carries an aws:SourceArn entry whose every
     value names this account, a Region and a resource type with no wildcard.
 
@@ -14142,7 +14982,9 @@ def _statement_scopes_source_arn(statement: Dict[str, Any], account_id: str) -> 
                 values
                 and str(key).strip().lower() == "aws:sourcearn"
                 and all(
-                    _source_arn_names_resource_type(value.strip(), account_id)
+                    _source_arn_names_resource_type(
+                        value.strip(), account_id, resource_types
+                    )
                     for value in values
                 )
             ):
@@ -14150,11 +14992,83 @@ def _statement_scopes_source_arn(statement: Dict[str, Any], account_id: str) -> 
     return False
 
 
+SOURCE_ARN_NEGATED_OPERATORS = {
+    "stringnotequals",
+    "stringnotequalsignorecase",
+    "stringnotlike",
+    "arnnotequals",
+    "arnnotlike",
+}
+
+
+def _source_arn_value_matches(operator: str, pattern: str, arn: str) -> bool:
+    """Return whether one aws:SourceArn condition value matches `arn`.
+
+    ArnEquals and ArnLike both read `*` and `?` as wildcards and match each of
+    the six colon-separated ARN parts on its own. The String operators match the
+    whole string, with wildcards only in the Like form.
+    """
+    if operator in SOURCE_ARN_NEGATED_OPERATORS:
+        operator = operator.replace("not", "", 1)
+    if operator.startswith("arn"):
+        pattern_parts, arn_parts = pattern.split(":", 5), arn.split(":", 5)
+        return len(pattern_parts) == len(arn_parts) == 6 and all(
+            _condition_string_matches(part, value, like=True, ignore_case=False)
+            for part, value in zip(pattern_parts, arn_parts)
+        )
+    return _condition_string_matches(
+        pattern,
+        arn,
+        like=operator == "stringlike",
+        ignore_case=operator.endswith("ignorecase"),
+    )
+
+
+def _statement_source_arn_admits(statement: Dict[str, Any], arn: str) -> bool:
+    """Return whether every aws:SourceArn condition in the statement lets `arn`
+    through.
+
+    Condition entries are ANDed and the values of one entry are ORed, so a
+    positive entry needs one value that matches and a negated entry needs none.
+    A statement with no positive aws:SourceArn entry admits nothing here: it is
+    judged by the scoping test before this is asked.
+    """
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return False
+    positive = False
+    for operator, entries in conditions.items():
+        if not isinstance(entries, dict):
+            continue
+        name = str(operator).strip().lower()
+        if name.startswith("foranyvalue:"):
+            name = name[len("foranyvalue:") :]
+        if name.endswith("ifexists"):
+            name = name[: -len("ifexists")]
+        negated = name in SOURCE_ARN_NEGATED_OPERATORS
+        if not negated and name not in CONFUSED_DEPUTY_GUARD_OPERATORS:
+            continue
+        for key, raw in entries.items():
+            if str(key).strip().lower() != "aws:sourcearn":
+                continue
+            matched = any(
+                _source_arn_value_matches(name, value.strip(), arn)
+                for value in _condition_values(raw)
+            )
+            if matched == negated:
+                return False
+            positive = positive or not negated
+    return positive
+
+
 def _statements_without_scoped_source_arn(
-    statements: List[Dict[str, Any]], account_id: str
+    statements: List[Dict[str, Any]],
+    account_id: str,
+    resource_types: Optional[Tuple[str, ...]] = None,
 ) -> List[Dict[str, Any]]:
     """Return the Allow statements trusting a service or `*` whose aws:SourceArn
-    is absent or open across Regions or resource types."""
+    is absent, open across Regions or resource types, or, when `resource_types`
+    is given, names a resource of another type."""
     return [
         statement
         for statement in statements
@@ -14162,7 +15076,7 @@ def _statements_without_scoped_source_arn(
             principal == "*" or principal.endswith(".amazonaws.com")
             for principal in _statement_principals(statement)
         )
-        and not _statement_scopes_source_arn(statement, account_id)
+        and not _statement_scopes_source_arn(statement, account_id, resource_types)
     ]
 
 
@@ -14240,6 +15154,8 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
 
     findings = []
     trust_cache: Dict[str, Any] = {}
+    endpoint_cache: Dict[str, Any] = {}
+    held: List[Tuple[str, str, Dict[str, Any]]] = []
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId", "unknown")
         gateway_name = gateway.get("name", gateway_id)
@@ -14262,21 +15178,96 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
                 )
             )
             continue
+        held.append((gateway_id, label, detail))
 
+    unread = len(gateways) - len(held)
+    for gateway_id, label, detail in held:
+        role_arn = detail.get("roleArn")
+        others = [
+            (other_id, str(other.get("gatewayArn")), str(other.get("roleArn")))
+            for other_id, _, other in held
+            if other_id != gateway_id
+            and other.get("gatewayArn")
+            and other.get("roleArn") != role_arn
+        ]
         findings.extend(
-            _gateway_resource_policy_findings(label, detail.get("gatewayArn"))
+            _gateway_resource_policy_findings(
+                label, detail.get("gatewayArn"), endpoint_cache
+            )
         )
         findings.extend(
-            _gateway_role_trust_findings(label, detail.get("roleArn"), trust_cache)
+            _gateway_role_trust_findings(
+                label, role_arn, trust_cache, others=others, unread=unread
+            )
         )
 
     return findings
 
 
+def _region_vpc_endpoint_services(cache: Dict[str, Any]) -> Any:
+    """Return {endpoint id: service name} for this Region's VPC endpoints, read
+    once per invocation into `cache`, or a string naming why they were not read.
+    """
+    if "endpoints" not in cache:
+        if ec2_client is None:
+            cache["endpoints"] = "the EC2 client is not available in this Region"
+        else:
+            try:
+                cache["endpoints"] = {
+                    str(endpoint.get("VpcEndpointId")): str(
+                        endpoint.get("ServiceName", "")
+                    )
+                    for endpoint in _paginate_aws_list(
+                        ec2_client,
+                        "describe_vpc_endpoints",
+                        "VpcEndpoints",
+                        token_request_key="NextToken",
+                        token_response_key="NextToken",
+                    )
+                }
+            except Exception as error:
+                logger.warning(f"Could not describe VPC endpoints: {error}")
+                cache["endpoints"] = (
+                    "ec2:DescribeVpcEndpoints failed with "
+                    f"{_assessment_error_label(error)}"
+                )
+    return cache["endpoints"]
+
+
+def _restricting_source_vpce_values(
+    statements: List[Dict[str, Any]], gateway_arn: str
+) -> List[str]:
+    """Return the aws:SourceVpce values named by each Deny that restricts
+    InvokeGateway on `gateway_arn` by that key."""
+    values: Set[str] = set()
+    for statement in statements:
+        named, _ = _restricting_deny(
+            statement,
+            "bedrock-agentcore:InvokeGateway",
+            gateway_arn,
+            NETWORK_PATH_CONDITION_KEYS,
+            _network_values_are_bounded,
+            exempt_aws_service=True,
+        )
+        if "aws:sourcevpce" not in named:
+            continue
+        for entries in statement["Condition"].values():
+            for key, raw in entries.items():
+                if str(key).strip().lower() == "aws:sourcevpce":
+                    values.update(value.strip() for value in _condition_values(raw))
+    return sorted(values)
+
+
 def _gateway_resource_policy_findings(
-    label: str, gateway_arn: Any
+    label: str, gateway_arn: Any, endpoint_cache: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
-    """Judge one gateway resource policy's confused-deputy and network conditions."""
+    """Judge one gateway resource policy's confused-deputy and network conditions.
+
+    An aws:SourceVpce value in the restricting Deny is matched to this Region's
+    VPC endpoints, read once into `endpoint_cache`: an id that is not an
+    AgentCore gateway endpoint here is either another account's endpoint, whose
+    VPC then reaches the gateway, or a path that carries no gateway call.
+    """
     if not gateway_arn:
         return [
             create_finding(
@@ -14411,7 +15402,68 @@ def _gateway_resource_policy_findings(
         _network_values_are_bounded,
         exempt_aws_service=True,
     )
-    if network_keys:
+    vpce_values = (
+        _restricting_source_vpce_values(_document_statements(policy), str(gateway_arn))
+        if "aws:sourcevpce" in network_keys
+        else []
+    )
+    endpoints = (
+        _region_vpc_endpoint_services(
+            endpoint_cache if endpoint_cache is not None else {}
+        )
+        if vpce_values
+        else {}
+    )
+    if isinstance(endpoints, str):
+        findings.append(
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Network Path Scope",
+                finding_details=(
+                    f"{label} has a resource policy Deny whose aws:SourceVpce "
+                    f"names {', '.join(vpce_values)}, which could not be matched "
+                    f"to this account's VPC endpoints: {endpoints}. An id that is "
+                    "not a gateway endpoint here may be another account's "
+                    "endpoint, whose VPC then reaches the gateway."
+                ),
+                resolution="Grant ec2:DescribeVpcEndpoints and retry.",
+                reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+    unmatched = [
+        f"{value} (not found in this account and Region)"
+        if value not in endpoints
+        else f"{value} (an endpoint for {endpoints[value]})"
+        for value in vpce_values
+        if not endpoints.get(value, "").lower().endswith(".bedrock-agentcore.gateway")
+    ]
+    if unmatched:
+        findings.append(
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Network Path Endpoint Not Found",
+                finding_details=(
+                    f"{label} has a resource policy Deny whose aws:SourceVpce "
+                    f"names {', '.join(unmatched)}. Each is not an AgentCore "
+                    "gateway interface endpoint in this account and Region: an "
+                    "id owned by another account lets that account's VPC reach "
+                    "the gateway, and an endpoint for another service carries no "
+                    "gateway call."
+                ),
+                resolution=(
+                    "Name only the com.amazonaws.<region>.bedrock-agentcore."
+                    "gateway interface endpoints this workload calls through in "
+                    "the aws:SourceVpce condition."
+                ),
+                reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+    elif network_keys:
         findings.append(
             create_finding(
                 check_id="AC-27",
@@ -14422,6 +15474,13 @@ def _gateway_resource_policy_findings(
                     "request from outside the network path named by "
                     f"{', '.join(network_keys)}, and every value it names is "
                     "bounded."
+                    + (
+                        f" Its aws:SourceVpce value(s) {', '.join(vpce_values)} "
+                        "each name an AgentCore gateway interface endpoint in "
+                        "this account and Region."
+                        if vpce_values
+                        else ""
+                    )
                     + (
                         " A Deny exempts calls an AWS service makes on the "
                         "caller's behalf (Bool aws:ViaAWSService false)."
@@ -14477,13 +15536,23 @@ def _gateway_resource_policy_findings(
 
 
 def _gateway_role_trust_findings(
-    label: str, role_arn: Any, trust_cache: Dict[str, Any]
+    label: str,
+    role_arn: Any,
+    trust_cache: Dict[str, Any],
+    others: Iterable[Tuple[str, str, str]] = (),
+    unread: int = 0,
 ) -> List[Dict[str, Any]]:
     """Judge one gateway execution role's trust policy for a confused-deputy guard.
 
     The permission cache stores attached and inline policies only, so the trust
     policy is read from IAM here. Roles are cached per invocation because several
     gateways in one account share one execution role.
+
+    `others` holds (id, gatewayArn, roleArn) for every other gateway read in this
+    Region that runs with a different role. An aws:SourceArn that names a
+    gateway resource can still be a pattern, such as gateway/*, that admits
+    those gateways too; each held ARN is matched against it by value. `unread`
+    counts the gateways GetGateway could not read, whose ARNs were not compared.
     """
     if not role_arn:
         return [
@@ -14593,7 +15662,9 @@ def _gateway_role_trust_findings(
             )
         ]
 
-    unscoped = _statements_without_scoped_source_arn(statements, account_id)
+    unscoped = _statements_without_scoped_source_arn(
+        statements, account_id, resource_types=("gateway",)
+    )
     if unscoped:
         return findings + [
             create_finding(
@@ -14606,9 +15677,10 @@ def _gateway_role_trust_findings(
                     "guard names account "
                     f"{account_id} but carries no aws:SourceArn condition whose "
                     "every value names that account, a Region and a resource "
-                    "type with no wildcard. The service can assume the role for "
-                    "any AgentCore resource in the account, in any Region, not "
-                    "only for this gateway."
+                    "type with no wildcard, and names a gateway resource. The "
+                    "service can assume the role for any AgentCore resource in "
+                    "the account, in any Region, or for a resource that is not a "
+                    "gateway, not only for this gateway."
                 ),
                 resolution=(
                     "Add an ArnLike aws:SourceArn condition naming this gateway's "
@@ -14622,6 +15694,54 @@ def _gateway_role_trust_findings(
             )
         ]
 
+    service_statements = [
+        statement
+        for statement in statements
+        if any(
+            principal == "*" or principal.endswith(".amazonaws.com")
+            for principal in _statement_principals(statement)
+        )
+    ]
+    reached = [
+        f"{other_id} (role {str(other_role).rsplit('/', 1)[-1]})"
+        for other_id, other_arn, other_role in others
+        if any(
+            _statement_source_arn_admits(statement, other_arn)
+            for statement in service_statements
+        )
+    ]
+    if reached:
+        return findings + [
+            create_finding(
+                check_id="AC-27",
+                finding_name=(
+                    "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+                ),
+                finding_details=(
+                    f"{label} uses execution role {role_name}, whose trust policy "
+                    "aws:SourceArn also admits "
+                    f"{len(reached)} other gateway(s) in this Region that run "
+                    f"with another role: {', '.join(reached)}. If one of them is "
+                    "pointed at this role, the service assumes it for that "
+                    "gateway with no trust policy change."
+                ),
+                resolution=(
+                    "Name this gateway's ARN, or the ARNs of only the gateways "
+                    "that use this role, in the trust policy's aws:SourceArn "
+                    "condition."
+                ),
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+
+    unread_note = (
+        f" {unread} gateway(s) could not be read, so their ARNs were not "
+        "compared with the pattern."
+        if unread
+        else ""
+    )
     return findings + [
         create_finding(
             check_id="AC-27",
@@ -14630,12 +15750,14 @@ def _gateway_role_trust_findings(
                 f"{label} uses execution role {role_name}, whose "
                 f"{len(statements)} Allow statement(s) each carry an "
                 "aws:SourceArn condition whose every value names account "
-                f"{account_id}, a Region and a resource type with no wildcard, "
-                "or name no service or wildcard principal."
+                f"{account_id}, a Region and a gateway resource with no "
+                "wildcard, or name no service or wildcard principal. The "
+                "aws:SourceArn admits no other gateway in this Region that runs "
+                f"with another role.{unread_note}"
             ),
             resolution=(
-                "No action required. Confirm the aws:SourceArn pattern names this "
-                "gateway rather than every gateway in the account."
+                "No action required. A gateway created later is not compared; "
+                "name this gateway's ARN in aws:SourceArn to exclude it."
             ),
             reference=CONFUSED_DEPUTY_REFERENCE_URL,
             severity=SeverityEnum.HIGH,
@@ -14741,6 +15863,22 @@ def _condition_values(raw: Any) -> List[str]:
     return [str(raw)]
 
 
+def _condition_string_matches(
+    pattern: str, value: str, like: bool, ignore_case: bool
+) -> bool:
+    """Return whether one condition value matches `value` under a String operator.
+
+    String operators compare case-sensitively unless the operator is an
+    IgnoreCase form. The Like forms read `*` and `?` as wildcards and nothing
+    else: IAM has no character class, so `[` is escaped before fnmatchcase.
+    """
+    if ignore_case:
+        pattern, value = pattern.casefold(), value.casefold()
+    if not like:
+        return pattern == value
+    return fnmatchcase(value, pattern.replace("[", "[[]"))
+
+
 def _statement_condition_denies_value(
     statement: Dict[str, Any], key: str, value: str
 ) -> bool:
@@ -14770,10 +15908,18 @@ def _statement_condition_denies_value(
         for entry_key, raw in entries.items():
             if str(entry_key).strip().lower() != key:
                 return False
-            values = {entry.strip().upper() for entry in _condition_values(raw)}
-            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS and value in values:
+            matched = any(
+                _condition_string_matches(
+                    entry,
+                    value,
+                    like=name in ("stringlike", "stringnotlike"),
+                    ignore_case=name.endswith("ignorecase"),
+                )
+                for entry in _condition_values(raw)
+            )
+            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS and matched:
                 fires = True
-            elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS and value not in values:
+            elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS and not matched:
                 fires = True
             else:
                 return False
@@ -16204,12 +17350,15 @@ def _deny_requires_vpc_placement(
 
 
 def _deny_pins_vpc_placement(
-    statement: Dict[str, Any], action: str, context: Dict[str, str]
+    statement: Dict[str, Any], action: str, context: Dict[str, str], key: str
 ) -> bool:
-    """Return whether a Deny fires on any subnet or group outside a fixed list.
+    """Return whether a Deny fires on any value of `key`, subnets or security
+    groups, outside a fixed list.
 
-    A listed value with a wildcard admits every subnet or group it matches, so
-    it pins nothing.
+    Every condition entry must be on `key`. Entries are ANDed, so a deny that
+    also names the other key fires only when both are outside their lists, and
+    an approved subnet then admits any security group. A listed value with a
+    wildcard admits every subnet or group it matches, so it pins nothing.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict) or not condition:
@@ -16221,8 +17370,8 @@ def _deny_pins_vpc_placement(
             name = name[: -len("ifexists")]
         if name not in AGENTCORE_VPC_PIN_OPERATORS or not isinstance(entries, dict):
             return False
-        for key, raw in entries.items():
-            if str(key).strip().lower() not in AGENTCORE_VPC_PLACEMENT_KEYS:
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != key:
                 return False
             values = [value.strip() for value in _condition_values(raw)]
             if not values or any("*" in value or "?" in value for value in values):
@@ -16262,18 +17411,38 @@ def check_agentcore_vpc_placement_scp() -> List[Dict[str, Any]]:
                 ),
             },
             {
-                "finding_name": "VPC Pin Guardrail",
+                "finding_name": "VPC Subnet Pin Guardrail",
                 "actions": AGENTCORE_VPC_PLACEMENT_ACTIONS,
-                "denies": _deny_pins_vpc_placement,
-                "guard_text": (
-                    "when a subnet or security group is outside a fixed list"
+                "denies": lambda statement, action, context: _deny_pins_vpc_placement(
+                    statement, action, context, "bedrock-agentcore:subnets"
                 ),
+                "guard_text": "when a subnet is outside a fixed list",
                 "remediation": (
                     "Attach a service control policy that denies the four "
                     "actions with ForAnyValue:StringNotEquals on "
-                    "bedrock-agentcore:subnets and "
-                    "bedrock-agentcore:securityGroups, listing the approved "
-                    "subnet and security group IDs without wildcards."
+                    "bedrock-agentcore:subnets alone, listing the approved "
+                    "subnet IDs without wildcards. A statement that also names "
+                    "bedrock-agentcore:securityGroups denies only when both are "
+                    "outside their lists."
+                ),
+            },
+            {
+                "finding_name": "VPC Security Group Pin Guardrail",
+                "actions": AGENTCORE_VPC_PLACEMENT_ACTIONS,
+                "denies": lambda statement, action, context: _deny_pins_vpc_placement(
+                    statement,
+                    action,
+                    context,
+                    "bedrock-agentcore:securitygroups",
+                ),
+                "guard_text": "when a security group is outside a fixed list",
+                "remediation": (
+                    "Attach a service control policy that denies the four "
+                    "actions with ForAnyValue:StringNotEquals on "
+                    "bedrock-agentcore:securityGroups alone, listing the "
+                    "approved security group IDs without wildcards. A "
+                    "statement that also names bedrock-agentcore:subnets "
+                    "denies only when both are outside their lists."
                 ),
             },
         ],
@@ -16898,16 +18067,12 @@ INBOUND_JWT_EXCHANGE_ACTIONS = (
     "getworkloadaccesstokenforjwt",
 )
 
-# The claims that bind which identity provider minted the token and which
-# application it was minted for. scope and sub bound what the token may ask for
-# and which end user it speaks for, so neither keeps a token from an unapproved
-# issuer out. client_id is available only when the JWT carries that claim under
-# that exact name, which is why the resolution names all three.
-INBOUND_JWT_ISSUER_CONDITION_KEYS = (
-    "bedrock-agentcore:inboundjwtclaim/aud",
-    "bedrock-agentcore:inboundjwtclaim/client_id",
-    "bedrock-agentcore:inboundjwtclaim/iss",
-)
+# The claim that binds which identity provider minted the token. scope and sub
+# bound what the token may ask for and which end user it speaks for, and any
+# identity provider can mint a token whose aud or client_id carries an approved
+# value, so none of them keeps a token from an unapproved issuer out. The
+# resolution still names aud and client_id to bind the application.
+INBOUND_JWT_ISSUER_KEY = "bedrock-agentcore:inboundjwtclaim/iss"
 
 
 # Operators under which an issuer condition keeps a token from another issuer
@@ -16917,9 +18082,11 @@ INBOUND_JWT_PIN_OPERATORS = {"stringequals", "stringequalsignorecase", "stringli
 
 
 def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement binds the exchange to named issuers or clients.
+    """Return whether one statement binds the exchange to named issuers.
 
-    The claim must sit under StringEquals or StringLike, optionally qualified
+    An aud or client_id condition names the application, and any issuer can
+    mint a token carrying that value, so only an iss condition pins. The claim
+    must sit under StringEquals or StringLike, optionally qualified
     with ForAnyValue, and every value must name something narrower than a
     wildcard. Under StringLike any `*` or `?` fails the pin, because a pattern
     such as `https://cognito-idp.*.amazonaws.com/*` admits every user pool.
@@ -16936,7 +18103,7 @@ def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
         if operator_name not in INBOUND_JWT_PIN_OPERATORS:
             continue
         for key, values in block.items():
-            if str(key).strip().lower() not in INBOUND_JWT_ISSUER_CONDITION_KEYS:
+            if str(key).strip().lower() != INBOUND_JWT_ISSUER_KEY:
                 continue
             if isinstance(values, str):
                 values = [values]
@@ -17082,9 +18249,11 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                     finding_details=(
                         "The following principals can exchange an end user's JWT "
                         "for a workload access token with no condition on the "
-                        "token's issuer, audience or client id, so a token minted "
-                        "by any issuer the workload trusts is accepted: "
-                        f"{', '.join(unpinned)}. A condition under IfExists, "
+                        "token's issuer, so a token minted by any issuer the "
+                        f"workload trusts is accepted: {', '.join(unpinned)}. An "
+                        "audience or client id condition alone does not pin the "
+                        "issuer, because any identity provider can mint a token "
+                        "carrying that value. A condition under IfExists, "
                         "ForAllValues or a negated operator, or with a "
                         f"wildcard-only value, does not pin. {IAM_CACHE_SCP_NOTE}"
                     ),
@@ -17114,8 +18283,8 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                     finding_name="AgentCore Inbound JWT Issuer Conditions",
                     finding_details=(
                         "The following principals exchange inbound JWTs only under "
-                        "an issuer, audience or client id condition that names a "
-                        "value under StringEquals or StringLike: "
+                        "an issuer condition that names a value under StringEquals "
+                        "or StringLike: "
                         f"{', '.join(pinned)}."
                     ),
                     resolution=(
@@ -17186,12 +18355,13 @@ def _resource_names_one_workload_identity(resource: str) -> bool:
 
     A workload identity's ARN nests under its directory's, so the directory ARN
     ends at `workload-identity-directory/<name>` and never carries this segment:
-    `workload-identity-directory/` does not contain `workload-identity/`.
+    `workload-identity-directory/` does not contain `workload-identity/`. A `?`
+    matches any one character, so it widens the name as `*` does.
     """
     _, separator, identity_name = resource.partition(WORKLOAD_IDENTITY_ARN_SEGMENT)
     if not separator:
         return False
-    return bool(identity_name) and "*" not in identity_name
+    return bool(identity_name) and not any(c in identity_name for c in "*?")
 
 
 def _token_issuance_scope_verdict(statement: Dict[str, Any]) -> str:
@@ -17202,13 +18372,17 @@ def _token_issuance_scope_verdict(statement: Dict[str, Any]) -> str:
     directory ARN in the list is not the widening. A trailing wildcard is: it
     reaches every identity, vault or provider under that prefix. So is a
     wildcard in the partition, service, region or account segment, which
-    reaches the same name in every region or account, and a NotResource.
+    reaches the same name in every region or account, and a NotResource. So is a
+    `*` or `?` inside a workload identity name, which reaches every identity the
+    pattern matches however many exact names sit beside it.
     """
     if "NotResource" in statement:
         return "unbounded"
     resources = _statement_resources(statement)
     if any(
-        resource.endswith(("*", "?")) or _arn_pattern_is_unbounded(resource)
+        resource.endswith(("*", "?"))
+        or _arn_pattern_is_unbounded(resource)
+        or any(c in resource.partition(WORKLOAD_IDENTITY_ARN_SEGMENT)[2] for c in "*?")
         for resource in resources
     ):
         return "unbounded"
@@ -18528,26 +19702,90 @@ def _cedar_condition_blocks(conditions: str) -> List[Tuple[str, str]]:
         position = index
 
 
+def _cedar_unwrap_parentheses(expression: str) -> str:
+    """Drop parentheses that wrap the whole expression, however many there are."""
+    expression = expression.strip()
+    while expression.startswith("(") and expression.endswith(")"):
+        inner = expression[1:-1]
+        depth = 0
+        balanced = True
+        for character in re.sub(r'"(?:[^"\\]|\\.)*"', '""', inner):
+            depth += {"(": 1, ")": -1}.get(character, 0)
+            if depth < 0:
+                balanced = False
+                break
+        if not balanced or depth:
+            break
+        expression = inner.strip()
+    return expression
+
+
+def _cedar_expression_reads_principal(expression: str) -> bool:
+    """Return whether every caller a when-block expression admits was read.
+
+    An `||` admits a caller when any branch holds, so each branch has to read
+    the principal; an `&&` admits one only when every conjunct holds, so one
+    conjunct that reads it is enough. A negated read (`!` or `!=`) admits every
+    caller but the one it names, `principal == principal` holds for every
+    caller, and `has principal` tests an attribute named principal.
+    """
+    expression = _cedar_unwrap_parentheses(expression)
+    disjuncts = [part for part in _cedar_split(expression, "|") if part.strip()]
+    if len(disjuncts) > 1:
+        return all(_cedar_expression_reads_principal(part) for part in disjuncts)
+    conjuncts = [part for part in _cedar_split(expression, "&") if part.strip()]
+    if len(conjuncts) > 1:
+        return any(_cedar_expression_reads_principal(part) for part in conjuncts)
+    if expression.startswith("!"):
+        return False
+    blanked = re.sub(r'"(?:[^"\\]|\\.)*"', '""', expression)
+    if "!=" in blanked:
+        return False
+    sides = blanked.split("==")
+    if len(sides) == 2 and sides[0].strip() == sides[1].strip():
+        return False
+    blanked = re.sub(r"\bhas\s+principal\b", "has _", blanked)
+    return bool(re.search(r"(?<![.\w])principal\b", blanked))
+
+
+def _cedar_expression_is_always_true(expression: str) -> bool:
+    """Return whether a when-block expression holds for every request.
+
+    Only the forms that need no attribute values are recognized: the literal
+    `true`, a term compared equal with itself, and `||` and `&&` built from
+    them. Anything else is taken as able to be false.
+    """
+    expression = _cedar_unwrap_parentheses(expression)
+    disjuncts = [part for part in _cedar_split(expression, "|") if part.strip()]
+    if len(disjuncts) > 1:
+        return any(_cedar_expression_is_always_true(part) for part in disjuncts)
+    conjuncts = [part for part in _cedar_split(expression, "&") if part.strip()]
+    if len(conjuncts) > 1:
+        return all(_cedar_expression_is_always_true(part) for part in conjuncts)
+    if expression == "true":
+        return True
+    sides = _cedar_split(expression, "=")
+    return len(sides) == 3 and not sides[1] and sides[0].strip() == sides[2].strip()
+
+
 def _cedar_principal_is_bounded(scope: List[str], conditions: str) -> bool:
     """Return whether a permit names the callers it admits.
 
     `principal is AgentCore::OAuthUser`, `principal == ...` and `principal in
     ...` name a type or an entity; the recommendation asks for a principal type.
     A bare `principal` admits every caller the gateway's authorizer lets
-    through, unless a `when` block reads the principal, as the attribute-based
-    pattern `principal.getTag(...)` does. An `unless` block only removes callers
-    from a permit that otherwise admits all of them, a word inside a string
-    literal is not a read, and `context.principal` is a context attribute. The
-    condition body is not evaluated: a `when` block that reads the principal is
-    taken as the bound it was written to be.
+    through, unless a `when` block admits only callers it reads, as the
+    attribute-based pattern `principal.getTag(...)` does. An `unless` block only
+    removes callers from a permit that otherwise admits all of them, a word
+    inside a string literal is not a read, and `context.principal` is a context
+    attribute. The when block is judged by its `||` and `&&` structure (see
+    _cedar_expression_reads_principal); the values it compares against are not
+    evaluated.
     """
     if len(scope[0].split()) > 1:
         return True
     return any(
-        keyword == "when"
-        and re.search(
-            r"(?<![.\w])principal\b", re.sub(r'"(?:[^"\\]|\\.)*"', '""', body)
-        )
+        keyword == "when" and _cedar_expression_reads_principal(body)
         for keyword, body in _cedar_condition_blocks(conditions)
     )
 
@@ -18571,7 +19809,9 @@ def _cedar_allow_all_permits(
     the ones whose text could not be read.
 
     Such a permit leaves the engine's default-deny nothing to decide, so an
-    engine in ENFORCE mode that holds one enforces nothing.
+    engine in ENFORCE mode that holds one enforces nothing. A permit whose only
+    conditions are plain when blocks that hold for every request, such as
+    `when { true }`, is unconditioned too.
     """
     allow_all: List[str] = []
     unreadable: List[str] = []
@@ -18586,7 +19826,16 @@ def _cedar_allow_all_permits(
         if any(
             effect == "permit"
             and _cedar_scope_is_unconstrained(scope, "action")
-            and not _cedar_condition_qualifiers(conditions)
+            and (
+                not _cedar_condition_qualifiers(conditions)
+                or (
+                    _cedar_condition_qualifiers(conditions) == {""}
+                    and all(
+                        keyword == "when" and _cedar_expression_is_always_true(body)
+                        for keyword, body in _cedar_condition_blocks(conditions)
+                    )
+                )
+            )
             for effect, scope, conditions in parsed
         ):
             allow_all.append(policy_name)
@@ -18837,9 +20086,11 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} enforces policy engine {policy_engine_id}, whose "
                         f"policy {', '.join(sorted(set(caller_wide)))} permits "
-                        "named tools to a bare principal and no condition reads "
-                        "the principal in a when block, so every caller the "
-                        "gateway authorizer accepts may call them."
+                        "named tools to a bare principal and nothing in a when "
+                        "block limits callers by the principal (a negated read, "
+                        "a principal compared with itself or an || branch that "
+                        "never reads it admits every caller), so every caller "
+                        "the gateway authorizer accepts may call them."
                     ),
                     resolution=(
                         "Name the caller population in the permit head, for "
@@ -18988,8 +20239,9 @@ def _binds_policy_engine_context(statement: Dict[str, Any], engine_arn: str) -> 
     Every value of the kms:EncryptionContext entry must name the
     bedrock-agentcore service and a policy-engine resource and match this
     engine's ARN, so `*` or a value naming another resource type binds nothing.
-    The IfExists form is not read, because a call without the context then
-    passes it.
+    The IfExists and ForAllValues forms are not read, because a call without
+    the context then passes them. A wildcard region and account are credited:
+    the policy encryption guide's key policy names the engines that way.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict):
@@ -18998,7 +20250,7 @@ def _binds_policy_engine_context(statement: Dict[str, Any], engine_arn: str) -> 
     for operator, entries in condition.items():
         if not isinstance(entries, dict):
             continue
-        if str(operator).strip().lower().endswith("ifexists"):
+        if _operator_admits_an_absent_key(operator):
             continue
         if _normalized_condition_operator(operator) not in CONDITION_EQUALS_OPERATORS:
             continue
@@ -19134,18 +20386,21 @@ def _event_pattern_matches(pattern: Dict[str, Any], event: Dict[str, Any]) -> bo
     return True
 
 
-def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
+def _kms_key_loss_alarm_leg() -> Tuple[str, List[str], List[str]]:
     """Return what alarms on a key's DisableKey and ScheduleKeyDeletion calls in
-    this region, or "", and each read that failed.
+    this region, or "", each read that failed, and each matching rule that has
+    no target.
 
     An enabled rule on the default bus counts when its pattern matches both
-    calls as CloudTrail delivers them, so a rule that also filters on the key id
-    is not credited: the id's form depends on how the caller named the key. A
+    calls as CloudTrail delivers them and it has a target, so a rule that also
+    filters on the key id is not credited: the id's form depends on how the
+    caller named the key. What the target does with the event is not read. A
     metric filter counts when its pattern names both calls and an alarm with an
-    action watches its metric. Neither the rule's targets nor which trail feeds
-    the filter's log group is read.
+    action watches its metric. Which trail feeds the filter's log group is not
+    read.
     """
     unread: List[str] = []
+    untargeted: List[str] = []
     if events_client is None:
         unread.append("events:ListRules (no EventBridge client)")
     else:
@@ -19181,14 +20436,36 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
                     )
                     for event_name in KMS_KEY_LOSS_EVENTS
                 ):
+                    try:
+                        targets = _paginate_aws_list(
+                            events_client,
+                            "list_targets_by_rule",
+                            "Targets",
+                            token_request_key="NextToken",
+                            token_response_key="NextToken",
+                            Rule=rule.get("Name"),
+                        )
+                    except Exception as error:
+                        unread.append(
+                            f"events:ListTargetsByRule on rule {rule.get('Name')} "
+                            f"({_assessment_error_label(error)})"
+                        )
+                        continue
+                    if not targets:
+                        untargeted.append(str(rule.get("Name")))
+                        continue
                     return (
                         f"enabled EventBridge rule {rule.get('Name')} matches its "
                         f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
                         [],
+                        [],
                     )
     alarm, alarm_unread = _metric_filter_alarm(
         lambda metric_filter: all(
-            event_name in str(metric_filter.get("filterPattern") or "")
+            _filter_pattern_selects_event(
+                metric_filter.get("filterPattern"),
+                {"eventSource": "kms.amazonaws.com", "eventName": event_name},
+            )
             for event_name in KMS_KEY_LOSS_EVENTS
         )
     )
@@ -19197,8 +20474,178 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
             f"{alarm}, whose pattern names its "
             f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
             [],
+            [],
         )
-    return "", unread + alarm_unread
+    return "", unread + alarm_unread, untargeted
+
+
+FILTER_PATTERN_COMPARISON = re.compile(
+    r"\$\.([A-Za-z0-9_.]+)\s*"
+    r'(?:(!=|=|<=|>=|<|>)\s*("(?:[^"\\]|\\.)*"|[^\s()&|"]+)'
+    r"|(NOT\s+EXISTS|IS\s+NULL|IS\s+TRUE|IS\s+FALSE)\b)"
+)
+FILTER_PATTERN_TERM = re.compile(r'"((?:[^"\\]|\\.)*)"|(\S+)')
+
+
+def _parse_json_filter_pattern(body: str) -> Any:
+    """Parse the inside of a `{ ... }` CloudWatch Logs JSON filter pattern.
+
+    Returns nested ("and"|"or", [terms]) and ("cmp", path, operator, value)
+    tuples. A level that mixes && and || without parentheses raises ValueError,
+    because the CloudWatch Logs pattern syntax page does not state which binds
+    tighter.
+    """
+    position = 0
+
+    def skip() -> None:
+        nonlocal position
+        while position < len(body) and body[position].isspace():
+            position += 1
+
+    def term() -> Any:
+        nonlocal position
+        skip()
+        if body.startswith("(", position):
+            position += 1
+            inner = expression()
+            skip()
+            if not body.startswith(")", position):
+                raise ValueError("unclosed parenthesis")
+            position += 1
+            return inner
+        match = FILTER_PATTERN_COMPARISON.match(body, position)
+        if not match:
+            raise ValueError(f"no comparison at {position}")
+        position = match.end()
+        path, operator, value, keyword = match.groups()
+        if keyword:
+            return ("cmp", path, " ".join(keyword.split()).upper(), "")
+        if value.startswith('"'):
+            value = value[1:-1]
+        return ("cmp", path, operator, value)
+
+    def expression() -> Any:
+        nonlocal position
+        terms = [term()]
+        joins = set()
+        while True:
+            skip()
+            join = body[position : position + 2]
+            if join not in ("&&", "||"):
+                break
+            position += 2
+            joins.add(join)
+            terms.append(term())
+        if len(joins) > 1:
+            raise ValueError("&& and || mixed at one level")
+        if not joins:
+            return terms[0]
+        return ("and" if joins == {"&&"} else "or", terms)
+
+    tree = expression()
+    skip()
+    if position != len(body):
+        raise ValueError(f"trailing text at {position}")
+    return tree
+
+
+def _json_filter_selects(tree: Any, event: Dict[str, str]) -> bool:
+    """Evaluate a parsed JSON filter pattern against a flat event.
+
+    A field the event does not carry fails every test except NOT EXISTS, so a
+    filter narrowed by a field outside the event is not credited. `=` and `!=`
+    read `*` as a wildcard, and ordering tests never match a string.
+    """
+    if tree[0] == "and":
+        return all(_json_filter_selects(part, event) for part in tree[1])
+    if tree[0] == "or":
+        return any(_json_filter_selects(part, event) for part in tree[1])
+    _, path, operator, value = tree
+    if path not in event:
+        return operator == "NOT EXISTS"
+    if operator in ("=", "!="):
+        matched = fnmatchcase(
+            event[path], value.replace("[", "[[]").replace("?", "[?]")
+        )
+        return matched if operator == "=" else not matched
+    return False
+
+
+def _plain_filter_terms(pattern: str) -> Optional[List[str]]:
+    """Return the terms of a term-matching filter pattern, or None when a term
+    excludes (`-term`), the terms mix `?` alternatives with required ones, or
+    the pattern is a space-delimited `[...]` one. Leading `?` is kept."""
+    if pattern.startswith("["):
+        return None
+    terms = []
+    for quoted, bare in FILTER_PATTERN_TERM.findall(pattern):
+        term = quoted if quoted else bare
+        if not quoted and term.startswith("-"):
+            return None
+        terms.append(term)
+    optional = {term.startswith("?") for term in terms}
+    if not terms or len(optional) > 1:
+        return None
+    return terms
+
+
+def _filter_pattern_selects_event(pattern: str, event: Dict[str, str]) -> bool:
+    """Return whether a metric filter pattern selects one CloudTrail event.
+
+    A JSON pattern is evaluated against the event's fields. A term pattern
+    matches when every term, or one `?` term, is a substring of the event's
+    JSON text. A pattern that cannot be read is not credited.
+    """
+    pattern = str(pattern or "").strip()
+    if not pattern:
+        return False
+    if pattern.startswith("{"):
+        if not pattern.endswith("}"):
+            return False
+        try:
+            tree = _parse_json_filter_pattern(pattern[1:-1])
+        except ValueError:
+            return False
+        return _json_filter_selects(tree, event)
+    terms = _plain_filter_terms(pattern)
+    if terms is None:
+        return False
+    line = json.dumps(event)
+    if terms[0].startswith("?"):
+        return any(term[1:] in line for term in terms)
+    return all(term in line for term in terms)
+
+
+def _filter_pattern_requires_word(pattern: str, word: str) -> bool:
+    """Return whether a filter pattern selects only lines carrying `word`.
+
+    For a log line whose shape is not documented: a term pattern whose required
+    terms, or every `?` term, contain the word, or a JSON pattern whose tests
+    all require it through `=`. Case is folded, as the line's wording is not
+    known either.
+    """
+    pattern = str(pattern or "").strip()
+    word = word.casefold()
+    if pattern.startswith("{") and pattern.endswith("}"):
+        try:
+            tree = _parse_json_filter_pattern(pattern[1:-1])
+        except ValueError:
+            return False
+
+        def requires(node: Any) -> bool:
+            if node[0] == "and":
+                return any(requires(part) for part in node[1])
+            if node[0] == "or":
+                return all(requires(part) for part in node[1])
+            return node[2] == "=" and word in node[3].casefold()
+
+        return requires(tree)
+    terms = _plain_filter_terms(pattern)
+    if terms is None:
+        return False
+    if terms[0].startswith("?"):
+        return all(word in term[1:].casefold() for term in terms)
+    return any(word in term.casefold() for term in terms)
 
 
 COMPOSITE_ALARM_TERM = re.compile(r'\bALARM\(\s*"?([^")]+?)"?\s*\)')
@@ -19570,7 +21017,7 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                     problems.append(grant_gap)
         if alarm_leg is None:
             alarm_leg = _kms_key_loss_alarm_leg()
-        alarm, alarm_unread = alarm_leg
+        alarm, alarm_unread, untargeted = alarm_leg
         if alarm_unread and not alarm:
             unread.append(
                 "whether an alarm in this region covers the key's "
@@ -19585,7 +21032,13 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
             problems.append(
                 "is watched by no alarm in this region on its "
                 f"{' or '.join(KMS_KEY_LOSS_EVENTS)} calls: no enabled EventBridge "
-                "rule matches both, and no metric filter naming both feeds an "
+                "rule that matches both has a target"
+                + (
+                    f" (rule {', '.join(untargeted)} matches both and has no target)"
+                    if untargeted
+                    else ""
+                )
+                + ", and no metric filter naming both feeds an "
                 "alarm with an action, so losing the key, which denies every "
                 "Cedar decision, raises nothing"
             )
@@ -19762,23 +21215,37 @@ def _guardrail_policy_verdict(effect: str, conditions: str) -> Tuple[str, str]:
     when its condition is true, so a comparison no discrete score satisfies,
     such as greaterThan(decimal("1.0")), never acts; a permit acts regardless of
     the score when every score satisfies it. A call whose categories or data
-    paths are an empty list scores nothing. The policy is inert only when every
-    call is, which holds under any combination of `&&` and `||`; a `!` could
-    invert that, so a condition carrying one is left unread.
+    paths are an empty list scores nothing. The policy is inert when no score
+    changes its decision, read through the `&&` and `||` that join the calls
+    and the when blocks, which are joined by `&&`: a forbid conjunction holding
+    a call that never acts never acts, and a permit disjunction holding a call
+    that always holds always applies. A `!` or an unless block could invert
+    that, so a condition carrying one is left unread.
     """
     flat = re.sub(r"\s+", "", conditions)
     if re.search(r"!(?!=)", flat):
         return "unread", "its guardrail condition is negated"
+    blocks = _cedar_condition_blocks(conditions)
+    if any(
+        keyword == "unless" and "BedrockGuardrails::" in body
+        for keyword, body in blocks
+    ):
+        return "unread", "a guardrail call sits in an unless block, which negates it"
     calls = list(GUARDRAIL_CALL_PATTERN.finditer(flat))
     if not calls or len(calls) != flat.count("BedrockGuardrails::"):
         return "unread", "a guardrail call could not be read"
     inert: List[str] = []
     summaries: List[str] = []
+    # Each call's value when no score can move it: False for a forbid call
+    # that never acts, True for a permit call that always holds, None when the
+    # score decides it.
+    fixed: Dict[str, Optional[bool]] = {}
     for call in calls:
         safeguard, categories, paths, aggregate, operator, threshold = call.groups()
         label = f"{safeguard}({categories or 'no category'})"
         if not categories or not paths:
             inert.append(f"{label} names no category or no data path")
+            fixed[call.group(0)] = effect == "permit"
             continue
         fires = (
             _guardrail_scores_that_fire(operator, threshold)
@@ -19792,19 +21259,71 @@ def _guardrail_policy_verdict(effect: str, conditions: str) -> Tuple[str, str]:
                 f"{label} {operator}({threshold}) holds for every score, so the "
                 "permit applies whatever the guardrail returns"
             )
+            fixed[call.group(0)] = True
         elif effect != "permit" and not fires:
             inert.append(
                 f"{label} {operator}({threshold}) holds for no score the "
                 "guardrail returns, so the policy never acts"
             )
+            fixed[call.group(0)] = False
         else:
             summaries.append(
                 f"{label} on {paths} acts at score "
                 f"{', '.join(f'{score:g}' for score in fires)}"
             )
+            fixed[call.group(0)] = None
     if len(inert) == len(calls):
         return "inert", "; ".join(inert)
+    if not inert:
+        return "scored", "; ".join(summaries)
+    joined = [
+        _guardrail_join_value(re.sub(r"\s+", "", body), fixed)
+        for keyword, body in blocks
+        if keyword == "when"
+    ]
+    if "unread" in joined or not any(
+        keyword == "when" and "BedrockGuardrails::" in body for keyword, body in blocks
+    ):
+        return "unread", "a guardrail call is compared or nested in a way not read"
+    if _guardrail_join(joined, "&&") != "scored":
+        return "inert", (
+            f"{'; '.join(inert)}, and the && and || joining it to "
+            f"{'; '.join(summaries)} mean no score changes the decision"
+        )
     return "scored", "; ".join(summaries + inert)
+
+
+def _guardrail_join(values: List[Any], operator: str) -> Any:
+    """Join the values of guardrail sub-expressions by && or ||.
+
+    A value is True or False when no score changes it, "plain" when only
+    something other than a score decides it, "scored" when a score can, and
+    "unread" when it could not be read.
+    """
+    if "unread" in values:
+        return "unread"
+    absorbing = operator == "||"
+    if absorbing in values:
+        return absorbing
+    remaining = [value for value in values if value is not (not absorbing)]
+    if not remaining:
+        return not absorbing
+    return "scored" if "scored" in remaining else "plain"
+
+
+def _guardrail_join_value(expression: str, fixed: Dict[str, Optional[bool]]) -> Any:
+    """Return the _guardrail_join value of one when-block expression, with
+    every guardrail call read from `fixed` by its whitespace-free text."""
+    expression = _cedar_unwrap_parentheses(expression)
+    for operator, separator in (("||", "|"), ("&&", "&")):
+        parts = [part for part in _cedar_split(expression, separator) if part]
+        if len(parts) > 1:
+            return _guardrail_join(
+                [_guardrail_join_value(part, fixed) for part in parts], operator
+            )
+    if expression in fixed:
+        return "scored" if fixed[expression] is None else fixed[expression]
+    return "unread" if "BedrockGuardrails::" in expression else "plain"
 
 
 def check_agentcore_policy_guardrail_wiring(
@@ -20837,8 +22356,9 @@ EVALUATION_DEFAULT_METRICS_NAMESPACES = (
 EVALUATION_SCORE_ALARM_NOTE = (
     "A score alarm counts when it reads a metric in the configuration's metrics "
     "namespace, has ActionsEnabled true and names at least one AlarmActions "
-    "target. The metric dimensions an alarm narrows on are not judged, because "
-    "the dimension names the service emits are not API fields."
+    "target. The dimension names the service emits are not API fields, so an "
+    "alarm is tied to a configuration or an evaluator by a metric name or "
+    "dimension value equal to its id, and only when ListMetrics lists one."
 )
 
 
@@ -20884,6 +22404,11 @@ def _alarm_metric_keys(alarm: Dict[str, Any]) -> List[Tuple[Any, Any, frozenset]
     return keys
 
 
+def _metric_identifying_values(key: Tuple[Any, Any, frozenset]) -> Set[str]:
+    """Return the metric name and dimension values of one metric key."""
+    return {str(key[1])} | {str(value) for _, value in key[2]}
+
+
 def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     """AC-40: Judge whether an online evaluation scores safety and tool choice.
 
@@ -20897,7 +22422,10 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     nobody when it falls. When ListMetrics lists metrics in that namespace, an
     alarm counts only when a metric it reads matches a listed one by name and
     dimension set, because an alarm on a metric that is never published stays in
-    INSUFFICIENT_DATA and never fires.
+    INSUFFICIENT_DATA and never fires. When a listed metric names a
+    configuration by its id or name, an alarm reading only another
+    configuration's scores does not count, and when one names an attached
+    safety or tool-choice evaluator, an alarm has to read that evaluator's score.
     """
     if agentcore_client is None:
         return [
@@ -21028,6 +22556,15 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         except Exception as error:
             alarm_error = _assessment_error_label(error)
 
+    config_values = {
+        str(value)
+        for _, detail in details
+        for value in (
+            detail.get("onlineEvaluationConfigId"),
+            detail.get("onlineEvaluationConfigName"),
+        )
+        if value
+    }
     published_by_namespace: Dict[str, Any] = {}
     for label, detail in details:
         output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
@@ -21101,9 +22638,6 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
             )
         else:
             metric_note = ""
-        watching = sorted(
-            alarm_labels[str(alarm.get("AlarmName"))] for alarm in watching_alarms
-        )
         attached = [
             str(reference.get("evaluatorId"))
             for reference in detail.get("evaluators") or []
@@ -21112,6 +22646,95 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         safety_attached = sorted(set(attached) & safety_ids)
         tool_call_attached = sorted(set(attached) & tool_call_ids)
         unclassifiable = sorted(set(attached) - service_authored_ids)
+
+        tie_missing: List[str] = []
+        tie_notes: List[str] = []
+        elsewhere_note = ""
+        if published and not metric_error and watching_alarms:
+            listed_values = set().union(
+                *(_metric_identifying_values(key) for key in published)
+            )
+            alarm_values = {
+                str(alarm.get("AlarmName")): set().union(
+                    set(),
+                    *(
+                        _metric_identifying_values(key)
+                        for key in _alarm_metric_keys(alarm)
+                        if key in published
+                    ),
+                )
+                for alarm in watching_alarms
+            }
+            own_values = {
+                str(value)
+                for value in (
+                    detail.get("onlineEvaluationConfigId"),
+                    detail.get("onlineEvaluationConfigName"),
+                )
+                if value
+            }
+            if listed_values & config_values:
+                elsewhere = [
+                    alarm
+                    for alarm in watching_alarms
+                    if alarm_values[str(alarm.get("AlarmName"))] & config_values
+                    and not alarm_values[str(alarm.get("AlarmName"))] & own_values
+                ]
+                if elsewhere:
+                    elsewhere_note = (
+                        " (alarm(s) "
+                        + ", ".join(
+                            sorted(
+                                alarm_labels[str(alarm.get("AlarmName"))]
+                                for alarm in elsewhere
+                            )
+                        )
+                        + " read only another configuration's scores)"
+                    )
+                    watching_alarms = [
+                        alarm for alarm in watching_alarms if alarm not in elsewhere
+                    ]
+            if not listed_values & set(attached):
+                tie_notes.append(
+                    f"no listed metric in {namespace_text} names an attached "
+                    "evaluator, so each alarm is counted for the namespace and not "
+                    "tied to a score"
+                )
+            elif watching_alarms:
+                for category, ids in (
+                    ("safety", safety_attached),
+                    ("tool-choice", tool_call_attached),
+                ):
+                    if not ids:
+                        continue
+                    listed = sorted(set(ids) & listed_values)
+                    if not listed:
+                        tie_notes.append(
+                            f"ListMetrics lists no score of {', '.join(ids)}, so no "
+                            "alarm on it is required"
+                        )
+                        continue
+                    readers = sorted(
+                        alarm_labels[str(alarm.get("AlarmName"))]
+                        for alarm in watching_alarms
+                        if alarm_values[str(alarm.get("AlarmName"))] & set(listed)
+                    )
+                    if readers:
+                        tie_notes.append(
+                            f"alarm(s) {', '.join(readers)} read the score of "
+                            f"{', '.join(listed)}"
+                        )
+                    else:
+                        tie_missing.append(
+                            "has no CloudWatch alarm with actions on the score of "
+                            f"{', '.join(listed)}, which ListMetrics lists in "
+                            f"{namespace_text}, so a falling {category} score "
+                            "notifies nobody"
+                        )
+        tie_note = f" Of those, {'; '.join(tie_notes)}." if tie_notes else ""
+        watching = sorted(
+            alarm_labels[str(alarm.get("AlarmName"))] for alarm in watching_alarms
+        )
 
         owner_note = (
             f" The {len(unclassifiable)} attached evaluator(s) written in this "
@@ -21137,8 +22760,11 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         if not alarm_error and not watching:
             missing.append(
                 "has no CloudWatch alarm with actions on a metric in "
-                f"{namespace_text}, so a falling score notifies nobody"
+                f"{namespace_text}{elsewhere_note}, so a falling score notifies "
+                "nobody"
             )
+        elif not alarm_error:
+            missing.extend(tie_missing)
         alarm_note = (
             f" CloudWatch alarms could not be read ({alarm_error}), so whether a "
             "falling score notifies anyone is unknown."
@@ -21154,7 +22780,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} attaches {len(attached)} evaluator(s) and "
                         f"{'; and '.join(missing)}.{owner_note}{alarm_note}"
-                        f"{metric_note}"
+                        f"{metric_note}{tie_note}"
                     ),
                     resolution=(
                         "Attach a safety evaluator and a tool-choice evaluator from "
@@ -21217,6 +22843,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                         f"tool choice with {', '.join(tool_call_attached)}, and "
                         f"alarm(s) {', '.join(watching)} with actions read its "
                         f"scores in {namespace_text}.{owner_note}{metric_note}"
+                        f"{tie_note}"
                     ),
                     resolution=(
                         "No action required for this check. "
@@ -21799,6 +23426,7 @@ def _evaluation_pass_role_grants(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
     role_arns: List[str],
+    role_names: Optional[Iterable[str]] = None,
 ) -> Tuple[List[Tuple[str, List[str]]], int]:
     """Return every principal that can pass an evaluation execution role.
 
@@ -21812,9 +23440,16 @@ def _evaluation_pass_role_grants(
     principal's own unconditioned Deny or permissions boundary removes does not
     count, and a NotResource reaches every role it does not list. The condition
     leg holds only when iam:PassedToService names the AgentCore service
-    principal and nothing else. The second value names each principal with a
-    policy that could not be parsed.
+    principal and nothing else: a statement that passes an evaluation role to
+    another service is a gap here, even though it cannot reach AgentCore. With
+    `role_names`, a role-name pattern such as the
+    recommendation's `role/AgentCoreEvaluationRole*` is wide only when it
+    reaches a cached role that is not one of `role_arns`, or cannot be bounded
+    by name. The second value names each principal with a policy that could not
+    be parsed.
     """
+    names = list(role_names) if role_names is not None else None
+    own_names = [arn.rsplit("/", 1)[-1] for arn in role_arns]
     grants: List[Tuple[str, List[str]]] = []
     unreadable: List[str] = []
 
@@ -21861,8 +23496,22 @@ def _evaluation_pass_role_grants(
                     continue
 
                 missing: List[str] = []
-                if any("*" in resource or "?" in resource for resource in reaching):
-                    missing.append(PASS_ROLE_WIDE_RESOURCE_LEG)
+                for resource in reaching:
+                    if "*" not in resource and "?" not in resource:
+                        continue
+                    others = (
+                        None
+                        if names is None
+                        else _pass_role_pattern_other_roles(resource, names, own_names)
+                    )
+                    if others is None:
+                        if PASS_ROLE_WIDE_RESOURCE_LEG not in missing:
+                            missing.append(PASS_ROLE_WIDE_RESOURCE_LEG)
+                    elif others:
+                        missing.append(
+                            f"its Resource {resource} also reaches "
+                            + ", ".join(f"role {name}" for name in others)
+                        )
                 if not _condition_pins_value(
                     statement,
                     IAM_PASSED_TO_SERVICE_CONDITION_KEY,
@@ -21947,13 +23596,29 @@ def check_agentcore_evaluation_pass_role_scope(
     )
     findings.extend(gap_rows)
 
+    role_arns = sorted(
+        {
+            str(detail.get("evaluationExecutionRoleArn"))
+            for _, detail in details
+            if detail.get("evaluationExecutionRoleArn")
+        }
+    )
+    own_role_names = [arn.rsplit("/", 1)[-1] for arn in role_arns]
     writer_gaps = (
         [
             *_writer_pass_role_gaps(
-                role_permissions, "role", EVALUATION_CONFIG_WRITE_ACTIONS
+                role_permissions,
+                "role",
+                EVALUATION_CONFIG_WRITE_ACTIONS,
+                role_names=role_permissions,
+                own_role_names=own_role_names,
             ),
             *_writer_pass_role_gaps(
-                user_permissions, "user", EVALUATION_CONFIG_WRITE_ACTIONS
+                user_permissions,
+                "user",
+                EVALUATION_CONFIG_WRITE_ACTIONS,
+                role_names=role_permissions,
+                own_role_names=own_role_names,
             ),
         ]
         if assess_writers
@@ -21966,14 +23631,17 @@ def check_agentcore_evaluation_pass_role_scope(
                 finding_name="AgentCore Evaluation Writer Pass Role Unbounded",
                 finding_details=(
                     "The following principals can create or update an online "
-                    "evaluation configuration and hold an iam:PassRole grant that "
-                    "would let them name any role it matches as its execution "
-                    "role, whether or not a configuration exists today: "
+                    "evaluation configuration and hold an iam:PassRole grant whose "
+                    "condition does not exclude AgentCore and that misses the guard "
+                    "named beside it, whether or not a configuration exists today; "
+                    "a role reached by name is compared with the execution roles "
+                    "online evaluation configurations in this region name: "
                     f"{'; '.join(sorted(writer_gaps))}. {IAM_CACHE_SCP_NOTE}"
                 ),
                 resolution=(
-                    "Scope iam:PassRole to the evaluation execution role's own ARN "
-                    "and add an iam:PassedToService condition naming "
+                    "Scope iam:PassRole to the evaluation execution role's own ARN, "
+                    "or to a role-name pattern that reaches no other role, and add "
+                    "an iam:PassedToService condition naming "
                     f"{AGENTCORE_SERVICE_PRINCIPAL}."
                 ),
                 reference=IAM_PASS_ROLE_REFERENCE_URL,
@@ -21983,13 +23651,6 @@ def check_agentcore_evaluation_pass_role_scope(
             )
         )
 
-    role_arns = sorted(
-        {
-            str(detail.get("evaluationExecutionRoleArn"))
-            for _, detail in details
-            if detail.get("evaluationExecutionRoleArn")
-        }
-    )
     if not role_arns:
         findings.append(
             create_finding(
@@ -22031,10 +23692,10 @@ def check_agentcore_evaluation_pass_role_scope(
         return findings
 
     role_grants, role_unreadable = _evaluation_pass_role_grants(
-        role_permissions, "role", role_arns
+        role_permissions, "role", role_arns, role_names=role_permissions
     )
     user_grants, user_unreadable = _evaluation_pass_role_grants(
-        user_permissions, "user", role_arns
+        user_permissions, "user", role_arns, role_names=role_permissions
     )
     grants = sorted(role_grants + user_grants)
     unbounded = [(label, missing) for label, missing in grants if missing]
@@ -22075,7 +23736,8 @@ def check_agentcore_evaluation_pass_role_scope(
                 finding_name="AgentCore Evaluation Pass Role Scope",
                 finding_details=(
                     "The following principals can pass an evaluation execution role "
-                    f"({named_roles}) only by its own ARN and only to "
+                    f"({named_roles}) only by its own ARN, or by a role-name "
+                    "pattern that reaches no other cached role, and only to "
                     f"{AGENTCORE_SERVICE_PRINCIPAL}: {', '.join(bounded)}."
                 ),
                 resolution="No action required.",
@@ -22130,6 +23792,11 @@ def check_agentcore_evaluation_pass_role_scope(
         )
 
     return findings
+
+
+# The resource types the devguide's evaluation execution role trust policy names
+# in aws:SourceArn.
+EVALUATION_SOURCE_ARN_RESOURCE_TYPES = ("evaluator", "online-evaluation-config")
 
 
 def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
@@ -22274,7 +23941,9 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
             )
             continue
 
-        unscoped = _statements_without_scoped_source_arn(statements, account_id)
+        unscoped = _statements_without_scoped_source_arn(
+            statements, account_id, EVALUATION_SOURCE_ARN_RESOURCE_TYPES
+        )
         if unscoped:
             findings.append(
                 create_finding(
@@ -22286,9 +23955,11 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
                         "service principal or every principal whose guard names "
                         f"account {account_id} but carries no aws:SourceArn "
                         "condition whose every value names that account, a Region "
-                        "and a resource type with no wildcard. The service can "
-                        "assume the role for any AgentCore resource in the "
-                        "account, in any Region, not only for an evaluation."
+                        "and a resource type with no wildcard, and names an "
+                        "evaluator or online-evaluation-config resource. The "
+                        "service can assume the role for another AgentCore "
+                        "resource in the account, or in another Region, not only "
+                        "for an evaluation."
                     ),
                     resolution=(
                         "Add an ArnLike aws:SourceArn condition naming "
@@ -22310,15 +23981,11 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} runs as {role_name}, whose {len(statements)} Allow "
                         "statement(s) each carry an aws:SourceArn condition whose "
-                        f"every value names account {account_id}, a Region and a "
-                        "resource type with no wildcard, or name no service or "
-                        "wildcard principal."
+                        f"every value names account {account_id}, a Region and "
+                        "an evaluator or online-evaluation-config resource, or "
+                        "name no service or wildcard principal."
                     ),
-                    resolution=(
-                        "No action required. Confirm the aws:SourceArn pattern names "
-                        "this account's evaluator and online-evaluation-config "
-                        "resources rather than other AgentCore resource types."
-                    ),
+                    resolution="No action required.",
                     reference=CONFUSED_DEPUTY_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.PASSED,
@@ -22436,7 +24103,13 @@ def _custom_evaluator_details(
 def _attached_custom_evaluator_ids(
     details: List[Tuple[str, Dict[str, Any]]],
 ) -> List[str]:
-    """Return the ids of the custom evaluators the given configurations attach."""
+    """Return the ids of the custom evaluators the given configurations attach.
+
+    Builtin and ThirdParty evaluators are service-authored: their ARN names no
+    account, and GetEvaluator returns no kmsKeyArn or judge model the account
+    set, so neither is read.
+    """
+    service_prefixes = tuple(f"{kind}." for kind in SERVICE_AUTHORED_EVALUATOR_TYPES)
     return sorted(
         {
             str(evaluator.get("evaluatorId"))
@@ -22444,7 +24117,7 @@ def _attached_custom_evaluator_ids(
             for evaluator in detail.get("evaluators") or []
             if isinstance(evaluator, dict)
             and evaluator.get("evaluatorId")
-            and not str(evaluator.get("evaluatorId")).startswith("Builtin.")
+            and not str(evaluator.get("evaluatorId")).startswith(service_prefixes)
         }
     )
 
@@ -22467,6 +24140,37 @@ def _evaluator_judge_models(detail: Dict[str, Any]) -> List[str]:
 # id such as global.anthropic.claude-x routes to foundation-model/anthropic.
 # claude-x, so a grant on that foundation model serves the profile's evaluator.
 CROSS_REGION_PROFILE_PREFIXES = ("us.", "eu.", "apac.", "global.", "us-gov.")
+
+
+def _model_pattern_names_models_by_wildcard(pattern: str) -> bool:
+    """Whether a bounded model Resource pattern carries a wildcard in its model id.
+
+    `foundation-model/anthropic.*` reaches every model of one provider, which is
+    more than the models a judge calls. A wildcard in the Region segment is not
+    one: a model id names the same model in every Region.
+    """
+    resource_part = pattern.split(":", 5)[5] if pattern.count(":") >= 5 else pattern
+    model_id = resource_part.split("/", 1)[-1]
+    return "*" in model_id or "?" in model_id
+
+
+def _configurations_attach_only_builtins(
+    details: List[Tuple[str, Dict[str, Any]]],
+) -> bool:
+    """Whether every configuration lists its evaluators and each is Builtin.
+
+    A configuration whose response carries no evaluator list is not read as
+    built-in only, since what it attaches is unknown.
+    """
+    return bool(details) and all(
+        isinstance(detail.get("evaluators"), list)
+        and all(
+            isinstance(evaluator, dict)
+            and str(evaluator.get("evaluatorId") or "").startswith("Builtin.")
+            for evaluator in detail["evaluators"]
+        )
+        for _, detail in details
+    )
 
 
 def _model_pattern_reaches(pattern: str, model_id: str) -> bool:
@@ -22497,8 +24201,11 @@ def check_agentcore_evaluation_judge_model_scope(
     decision, so this check asserts that the grant names models at all, and then
     that every model pattern it names reaches a model one of the role's custom
     evaluators calls, as GetEvaluator reports it. A pattern no attached evaluator
-    uses fails, and an evaluator that could not be read withholds the pass.
-    Built-in evaluators are not read.
+    uses fails, a pattern with a wildcard in its model id fails beside judges it
+    reaches because it also reaches models they do not call, and an evaluator
+    that could not be read withholds the pass. Built-in evaluators are not read:
+    they run on AWS-managed models, so a role whose configurations attach only
+    built-ins needs no model grant and any it holds fails as unused.
     """
     if agentcore_client is None:
         return [
@@ -22688,13 +24395,37 @@ def check_agentcore_evaluation_judge_model_scope(
         elif unreadable:
             continue
         elif bounded:
-            evaluator_ids = _attached_custom_evaluator_ids(
-                [
-                    (label, detail)
-                    for label, detail in details
-                    if detail.get("evaluationExecutionRoleArn") == role_arn
-                ]
-            )
+            role_details = [
+                (label, detail)
+                for label, detail in details
+                if detail.get("evaluationExecutionRoleArn") == role_arn
+            ]
+            if _configurations_attach_only_builtins(role_details):
+                findings.append(
+                    create_finding(
+                        check_id="AC-44",
+                        finding_name="AgentCore Evaluation Judge Model Unused Grant",
+                        finding_details=(
+                            f"Evaluation execution role {role_name} can invoke "
+                            f"{len(bounded)} model pattern(s): {', '.join(bounded)}. "
+                            f"Its {len(role_details)} configuration(s) attach only "
+                            "built-in evaluators, which run on AWS-managed models "
+                            "and need no bedrock:InvokeModel in this account, so no "
+                            "judge uses the grant and a changed configuration could "
+                            f"send the scored text to these models.{v1_note}"
+                        ),
+                        resolution=(
+                            "Remove the model-invocation grant from the role, or "
+                            "keep it only for a custom evaluator that names the "
+                            "model."
+                        ),
+                        reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+                continue
+            evaluator_ids = _attached_custom_evaluator_ids(role_details)
             evaluators, evaluator_errors = _custom_evaluator_details(evaluator_ids)
             if evaluator_errors:
                 findings.append(
@@ -22739,6 +24470,37 @@ def check_agentcore_evaluation_judge_model_scope(
                 if called
                 and not any(_model_pattern_reaches(pattern, model) for model in called)
             ]
+            by_wildcard = [
+                pattern
+                for pattern in bounded
+                if called
+                and pattern not in unused
+                and _model_pattern_names_models_by_wildcard(pattern)
+            ]
+            if by_wildcard:
+                findings.append(
+                    create_finding(
+                        check_id="AC-44",
+                        finding_name="AgentCore Evaluation Judge Model Pattern",
+                        finding_details=(
+                            f"Evaluation execution role {role_name} can invoke "
+                            f"models through {len(by_wildcard)} pattern(s) with a "
+                            f"wildcard in the model id: {', '.join(by_wildcard)}. "
+                            f"Its judges call {', '.join(called)}, and each "
+                            "pattern also reaches models they do not call, which a "
+                            "changed evaluator could send the scored text to."
+                            f"{v1_note}"
+                        ),
+                        resolution=(
+                            "Replace each pattern with the foundation model and "
+                            "inference profile ARNs of the models the evaluators "
+                            "name."
+                        ),
+                        reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
             if unused:
                 findings.append(
                     create_finding(
@@ -22764,6 +24526,7 @@ def check_agentcore_evaluation_judge_model_scope(
                         status=StatusEnum.FAILED,
                     )
                 )
+            if unused or by_wildcard:
                 continue
             if called:
                 judge_note = (
@@ -23035,18 +24798,25 @@ AGENTCORE_COMMAND_SHELL_EVENT = "InvokeAgentRuntimeCommandShell"
 def _command_shell_filter_matches(metric_filter: Dict[str, Any]) -> bool:
     """Return whether a metric filter counts shell connections.
 
-    A filter counts when its pattern names the InvokeAgentRuntimeCommandShell
-    event, as a filter on a CloudTrail log group would, or when it sits on an
-    AgentCore runtime log group and its pattern names a shell. The runtime log
-    line for a shell connection is not documented, so the second form is
-    matched by name and not against the line.
+    A filter counts when its pattern selects the InvokeAgentRuntimeCommandShell
+    CloudTrail event, as a filter on a CloudTrail log group would, or when it
+    sits on an AgentCore runtime log group and its pattern selects only lines
+    naming a shell. The runtime log line for a shell connection is not
+    documented, so the second form is matched by the word and not against the
+    line.
     """
-    pattern = str(metric_filter.get("filterPattern") or "")
-    if AGENTCORE_COMMAND_SHELL_EVENT in pattern:
+    pattern = metric_filter.get("filterPattern")
+    if _filter_pattern_selects_event(
+        pattern,
+        {
+            "eventSource": AGENTCORE_SERVICE_PRINCIPAL,
+            "eventName": AGENTCORE_COMMAND_SHELL_EVENT,
+        },
+    ):
         return True
     return str(metric_filter.get("logGroupName") or "").startswith(
         AGENTCORE_RUNTIME_LOG_GROUP_PREFIX
-    ) and ("shell" in pattern.lower())
+    ) and _filter_pattern_requires_word(pattern, "shell")
 
 
 def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -24764,6 +26534,18 @@ def check_agentcore_execution_role_trust_and_sharing(
             for statement in statements
             if _statement_trusts_whole_account(statement)
         ]
+        source_arn_missing = [
+            statement
+            for statement in statements
+            if statement not in exposed
+            and any(
+                principal == "*" or principal.endswith(".amazonaws.com")
+                for principal in _statement_principals(statement)
+            )
+            and not _confused_deputy_guard_account(
+                statement, account_id, keys=("aws:sourcearn",)
+            )
+        ]
 
         if exposed:
             findings.append(
@@ -24813,7 +26595,33 @@ def check_agentcore_execution_role_trust_and_sharing(
                     status=StatusEnum.FAILED,
                 )
             )
-        if not exposed and not account_wide:
+        if source_arn_missing:
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trust Source ARN Missing",
+                    finding_details=(
+                        f"{used_by} runs as {role_name}, which has "
+                        f"{len(source_arn_missing)} of {len(statements)} Allow "
+                        "statement(s) trusting an AWS service principal or every "
+                        "principal under an aws:SourceAccount condition with no "
+                        "aws:SourceArn condition whose every value names account "
+                        f"{account_id}. Any AgentCore resource in the account, "
+                        "including one another team creates, can have the "
+                        "service assume the role."
+                    ),
+                    resolution=(
+                        "Add an aws:SourceArn condition under ArnLike or "
+                        "ArnEquals naming this account's AgentCore resources, as "
+                        "the AgentCore Runtime trust policy does, to every "
+                        "statement that trusts the service."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if not exposed and not account_wide and not source_arn_missing:
             findings.append(
                 create_finding(
                     check_id="AC-48",
@@ -24822,8 +26630,8 @@ def check_agentcore_execution_role_trust_and_sharing(
                         f"{used_by} runs as {role_name}, whose {len(statements)} "
                         "Allow statement(s) name no account root without a "
                         "condition naming the caller, and no service or wildcard "
-                        "principal without an aws:SourceAccount or aws:SourceArn "
-                        f"condition naming account {account_id}."
+                        "principal without an aws:SourceArn condition naming "
+                        f"account {account_id}."
                     ),
                     resolution=(
                         "No action required. Confirm the aws:SourceArn pattern "
@@ -24891,7 +26699,10 @@ def check_agentcore_execution_role_trust_and_sharing(
                     f"The {sum(len(users) for users in roles.values())} AgentCore "
                     "resource(s) that name an "
                     f"execution role name {len(roles)} distinct role ARN(s), so "
-                    "no role is assumed on behalf of more than one resource."
+                    "no role is assumed on behalf of more than one resource in "
+                    "this region. A resource in another region that names one of "
+                    "these roles is not compared, because each region is "
+                    "assessed on its own."
                 ),
                 resolution="No action required.",
                 reference=AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
@@ -25612,7 +27423,7 @@ def check_agentcore_dns_egress_control(
 
 
 # AC-49's second leg reads the AWS Network Firewall each hosting subnet's
-# default route reaches. A domain allow-list rule group names the hosts agents
+# internet routes reach. A domain allow-list rule group names the hosts agents
 # may reach by TLS SNI and by HTTP Host header, and drops the traffic of those
 # protocols that matches no name. The AWS managed threat signature groups and
 # the domain reputation groups are the inspection AIR-FND-NET-04 names. A
@@ -25634,6 +27445,15 @@ NETWORK_FIREWALL_REPUTATION_GROUPS = (
     "AbusedLegitMalwareDomains",
 )
 NETWORK_FIREWALL_ORDER_SUFFIXES = ("StrictOrder", "ActionOrder")
+# A pass rule over these protocols and ports can carry the TLS and HTTP traffic
+# the domain allow-list judges. Stateless rules name protocols by IANA number.
+NETWORK_FIREWALL_WEB_PROTOCOLS = ("ip", "tcp", "tls", "http", "http2")
+NETWORK_FIREWALL_WEB_PORTS = (80, 443)
+NETWORK_FIREWALL_TCP_PROTOCOL_NUMBER = 6
+# A pass rule scoped by one of these sticky buffers admits named hosts, as the
+# allow-list's own pass rules do.
+NETWORK_FIREWALL_NAME_KEYWORDS = re.compile(r"\b(?:tls\.sni|http\.host|tls_sni)\b")
+SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _network_firewall_managed_group_name(arn: str) -> Optional[str]:
@@ -25662,17 +27482,35 @@ def _route_table_for_subnet(
     return main
 
 
-def _default_routes(table: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
-    """Return (destination, target key, target id) for a table's default routes.
+def _network_reaches_internet(network: Any) -> bool:
+    """Return whether a network holds an address outside the private, link-local
+    and shared (100.64.0.0/10) ranges, so traffic to it can leave the network."""
+    return not network.is_private and not (
+        network.version == 4 and network.subnet_of(SHARED_ADDRESS_SPACE)
+    )
 
-    A blackhole route drops what it matches, so it sends nothing anywhere.
+
+def _egress_routes(table: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
+    """Return (destination, target key, target id) for a table's internet routes.
+
+    A route carries internet traffic when its destination holds an internet
+    address, so 0.0.0.0/1 plus 128.0.0.0/1 is followed as 0.0.0.0/0 is, and a
+    narrower public range beside 0.0.0.0/0 is followed too. The VPC's local
+    route stays inside the VPC, and a blackhole route drops what it matches, so
+    neither sends anything anywhere. A prefix-list destination is not read.
     """
     routes = []
     for route in (table or {}).get("Routes") or []:
         destination = route.get("DestinationCidrBlock") or route.get(
             "DestinationIpv6CidrBlock"
         )
-        if destination not in ("0.0.0.0/0", "::/0"):
+        if not destination or route.get("GatewayId") == "local":
+            continue
+        try:
+            network = ipaddress.ip_network(str(destination), strict=False)
+        except ValueError:
+            continue
+        if not _network_reaches_internet(network):
             continue
         if route.get("State") == "blackhole":
             continue
@@ -25695,6 +27533,170 @@ def _default_routes(table: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str
         else:
             routes.append((destination, "no target", "none"))
     return routes
+
+
+def _network_firewall_address_reach(
+    value: str, subnet_cidrs: Dict[str, str], side: str
+) -> Optional[bool]:
+    """Return whether a rule address reaches the side it stands for, or None.
+
+    For the destination side that is an internet address; for the source side it
+    is a hosting subnet. ANY and the HOME_NET and EXTERNAL_NET variables are
+    read at their defaults: HOME_NET is the firewall's VPC and EXTERNAL_NET is
+    everything outside it. A negation or another variable is not read.
+    """
+    value = str(value).strip()
+    if value.startswith("[") and value.endswith("]"):
+        results = [
+            _network_firewall_address_reach(part, subnet_cidrs, side)
+            for part in value[1:-1].split(",")
+            if part.strip()
+        ]
+        if any(results):
+            return True
+        return None if None in results else False
+    if value.lower() == "any":
+        return True
+    if value == "$HOME_NET":
+        return side == "source"
+    if value == "$EXTERNAL_NET":
+        return side == "destination"
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+    if side == "destination":
+        return _network_reaches_internet(network)
+    for cidr in subnet_cidrs.values():
+        try:
+            subnet = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if subnet.version == network.version and subnet.overlaps(network):
+            return True
+    return False
+
+
+def _network_firewall_port_reach(value: str) -> Optional[bool]:
+    """Return whether a stateful rule port spec holds port 80 or 443, or None."""
+    value = str(value).strip()
+    if value.startswith("[") and value.endswith("]"):
+        results = [
+            _network_firewall_port_reach(part)
+            for part in value[1:-1].split(",")
+            if part.strip()
+        ]
+        if any(results):
+            return True
+        return None if None in results else False
+    if value.lower() == "any":
+        return True
+    low, separator, high = value.partition(":")
+    try:
+        first = int(low) if low else 0
+        last = (int(high) if high else 65535) if separator else first
+    except ValueError:
+        return None
+    return any(first <= port <= last for port in NETWORK_FIREWALL_WEB_PORTS)
+
+
+def _network_firewall_pass_rules(
+    group: Dict[str, Any],
+) -> List[Tuple[str, str, str, str, str, bool]]:
+    """Return (protocol, source, destination, port, text, name scoped) for every
+    pass rule of a customer stateful group, from StatefulRules or RulesString.
+
+    A rule string line that is not a whole Suricata header comes back with an
+    empty protocol, so the caller reports it as not read.
+    """
+    source = group.get("RulesSource") or {}
+    rules = []
+    for rule in source.get("StatefulRules") or []:
+        if str(rule.get("Action") or "").upper() != "PASS":
+            continue
+        header = rule.get("Header") or {}
+        options = " ".join(
+            str(option.get("Keyword") or "") for option in rule.get("RuleOptions") or []
+        )
+        rules.append(
+            (
+                str(header.get("Protocol") or ""),
+                str(header.get("Source") or ""),
+                str(header.get("Destination") or ""),
+                str(header.get("DestinationPort") or ""),
+                f"PASS {header.get('Protocol')} to {header.get('Destination')} "
+                f"port {header.get('DestinationPort')}",
+                bool(NETWORK_FIREWALL_NAME_KEYWORDS.search(options)),
+            )
+        )
+    for line in str(source.get("RulesString") or "").splitlines():
+        line = line.strip()
+        if not line.startswith("pass"):
+            continue
+        head, _, options = line.partition("(")
+        tokens = re.findall(r"\[[^\]]*\]|\S+", head)
+        if len(tokens) != 7 or tokens[0] != "pass":
+            rules.append(("", "", "", "", line, False))
+            continue
+        rules.append(
+            (
+                tokens[1],
+                tokens[2],
+                tokens[5],
+                tokens[6],
+                " ".join(tokens),
+                bool(NETWORK_FIREWALL_NAME_KEYWORDS.search(options)),
+            )
+        )
+    return rules
+
+
+def _network_firewall_stateless_passes(
+    group: Dict[str, Any], subnet_cidrs: Dict[str, str]
+) -> Tuple[bool, bool]:
+    """Return (web traffic passed, any traffic passed) to internet addresses from
+    the hosting subnets by a customer stateless group's aws:pass rules.
+
+    Every field is a list of numbers or CIDRs, and an empty list matches
+    everything. A higher-priority rule that drops or forwards the same packets
+    first is not read, so such a pass is reported as it is written.
+    """
+    web = everything = False
+    stateless = (group.get("RulesSource") or {}).get(
+        "StatelessRulesAndCustomActions"
+    ) or {}
+    for rule in stateless.get("StatelessRules") or []:
+        definition = rule.get("RuleDefinition") or {}
+        if "aws:pass" not in (definition.get("Actions") or []):
+            continue
+        match = definition.get("MatchAttributes") or {}
+
+        def reaches(field: str, side: str) -> bool:
+            entries = match.get(field) or []
+            return not entries or any(
+                _network_firewall_address_reach(
+                    entry.get("AddressDefinition"), subnet_cidrs, side
+                )
+                for entry in entries
+            )
+
+        if not (
+            reaches("Sources", "source") and reaches("Destinations", "destination")
+        ):
+            continue
+        everything = True
+        protocols = match.get("Protocols") or []
+        ports = match.get("DestinationPorts") or []
+        if (not protocols or NETWORK_FIREWALL_TCP_PROTOCOL_NUMBER in protocols) and (
+            not ports
+            or any(
+                (port.get("FromPort") or 0) <= web_port <= (port.get("ToPort") or 0)
+                for port in ports
+                for web_port in NETWORK_FIREWALL_WEB_PORTS
+            )
+        ):
+            web = True
+    return web, everything
 
 
 def _network_firewall_policy_gaps(
@@ -25816,6 +27818,7 @@ def _network_firewall_policy_gaps(
     signatures: List[str] = []
     reputation: List[str] = []
     alerting: List[str] = []
+    threat_priorities: List[int] = []
     for reference in references:
         name = _network_firewall_managed_group_name(reference.get("ResourceArn"))
         if not name:
@@ -25827,6 +27830,111 @@ def _network_firewall_policy_gaps(
             signatures.append(name)
         elif name in NETWORK_FIREWALL_REPUTATION_GROUPS:
             reputation.append(name)
+        else:
+            continue
+        threat_priorities.append(int(reference.get("Priority") or 0))
+
+    defaults = policy.get("StatelessDefaultActions")
+    if defaults is None:
+        unread.append(
+            f"firewall {firewall_name}'s policy reports no stateless default "
+            "action, so whether unmatched packets reach the stateful groups is "
+            "not read"
+        )
+    elif "aws:pass" in defaults:
+        skipped = (
+            f"firewall {firewall_name}'s stateless default action is aws:pass, so "
+            "packets no stateless rule forwards leave without reaching the "
+            "stateful rule groups"
+        )
+        allow_gaps.append(skipped)
+        threat_gaps.append(skipped)
+    for reference in policy.get("StatelessRuleGroupReferences") or []:
+        arn = str(reference.get("ResourceArn") or "")
+        group = rule_groups.get(arn)
+        if group is None:
+            continue
+        web, everything = _network_firewall_stateless_passes(group, subnet_cidrs)
+        label = (
+            f"firewall {firewall_name}'s stateless rule group {arn.rsplit('/', 1)[-1]}"
+        )
+        if web:
+            allow_gaps.append(
+                f"{label} passes TCP traffic on port 80 or 443 from the hosting "
+                "subnets to internet addresses past the stateful engine, so the "
+                "domain allow-list never checks it"
+            )
+        if everything:
+            threat_gaps.append(
+                f"{label} passes traffic from the hosting subnets to internet "
+                "addresses past the stateful engine, so the threat groups never "
+                "inspect it"
+            )
+
+    strict = rule_order == "STRICT_ORDER"
+    allow_priority = min(
+        (
+            int(reference.get("Priority") or 0)
+            for reference in references
+            if rule_groups.get(str(reference.get("ResourceArn") or "")) in allow_groups
+        ),
+        default=0,
+    )
+    threat_priority = min(threat_priorities, default=0)
+    for reference in references:
+        arn = str(reference.get("ResourceArn") or "")
+        group = rule_groups.get(arn)
+        if group is None:
+            continue
+        priority = int(reference.get("Priority") or 0)
+        label = (
+            f"firewall {firewall_name}'s stateful rule group {arn.rsplit('/', 1)[-1]}"
+        )
+        for (
+            protocol,
+            rule_source,
+            destination,
+            port,
+            text,
+            named,
+        ) in _network_firewall_pass_rules(group):
+            if not protocol:
+                unread.append(f"{label} holds the pass rule {text}, which is not read")
+                continue
+            if named:
+                continue
+            source_reach = _network_firewall_address_reach(
+                rule_source, subnet_cidrs, "source"
+            )
+            destination_reach = _network_firewall_address_reach(
+                destination, subnet_cidrs, "destination"
+            )
+            if source_reach is False or destination_reach is False:
+                continue
+            if source_reach is None or destination_reach is None:
+                unread.append(
+                    f"{label} holds the pass rule {text}, whose addresses are not read"
+                )
+                continue
+            web_reach = (
+                _network_firewall_port_reach(port)
+                if protocol.lower() in NETWORK_FIREWALL_WEB_PROTOCOLS
+                else False
+            )
+            if web_reach and (not strict or priority < allow_priority):
+                allow_gaps.append(
+                    f"{label} holds the pass rule {text}, which lets that "
+                    "traffic leave before the domain allow-list checks its name"
+                )
+            elif web_reach is None and (not strict or priority < allow_priority):
+                unread.append(
+                    f"{label} holds the pass rule {text}, whose ports are not read"
+                )
+            if not strict or priority < threat_priority:
+                threat_gaps.append(
+                    f"{label} holds the pass rule {text}, which lets that "
+                    "traffic leave before the threat groups inspect it"
+                )
     alert_note = (
         f" ({', '.join(sorted(alerting))} are overridden to DROP_TO_ALERT, so they "
         "only alert)"
@@ -25858,22 +27966,29 @@ def check_agentcore_network_firewall_egress(
     elsewhere, so the recommendation pairs DNS Firewall with an AWS Network
     Firewall domain allow-list over TLS SNI and HTTP Host.
 
-    Each hosting subnet's default routes are followed one hop: to a firewall
-    endpoint in the VPC, or through a NAT gateway to the endpoint the NAT
-    gateway's subnet routes to. A route to an internet gateway, or a NAT gateway
-    whose subnet routes to one, bypasses inspection and fails. A transit gateway,
-    a Gateway Load Balancer endpoint or any other target is not followed and is
-    not judged. A subnet with no default route reaches only its routed
-    destinations, which this leg does not judge.
+    Each hosting subnet's internet routes, every route whose destination holds
+    an internet address (see _egress_routes), are followed one hop: to a
+    firewall endpoint in the VPC, or through a NAT gateway to the endpoint the
+    NAT gateway's subnet routes to. A route to an internet gateway, or a NAT
+    gateway whose subnet routes to one, bypasses inspection and fails. A transit
+    gateway, a Gateway Load Balancer endpoint or any other target is not
+    followed and is not judged. A subnet with no internet route reaches only
+    private destinations, which this leg does not judge.
 
     Two rows are reported for each VPC. The egress row judges each reached
     firewall's policy for an ALLOWLIST domain group matching TLS_SNI and
     HTTP_HOST, no REJECTLIST or ALERTLIST domain group beside it under
     DEFAULT_ACTION_ORDER, and a HOME_NET that holds the hosting subnets where one
     is set. The threat row requires an AWS managed ThreatSignatures group and a
-    domain reputation group that are not overridden to DROP_TO_ALERT. A denied
-    network-firewall or ec2 read makes the rows informational N/A naming the
-    action, never Passed.
+    domain reputation group that are not overridden to DROP_TO_ALERT. Both rows
+    fail a stateless default action of aws:pass, a customer stateless aws:pass
+    rule from the hosting subnets to internet addresses, and a customer stateful
+    pass rule that is not scoped to a TLS SNI or HTTP Host name and acts before
+    the row's drops: always under DEFAULT_ACTION_ORDER, and under STRICT_ORDER
+    when its group's priority comes first. The egress row counts only passes
+    that can carry TCP on port 80 or 443. A pass rule whose addresses or ports
+    are not read makes the rows N/A. A denied network-firewall or ec2 read makes
+    the rows informational N/A naming the action, never Passed.
     """
     egress_name = "AgentCore Network Firewall Egress"
     threat_name = "AgentCore Network Firewall Threat Inspection"
@@ -26065,7 +28180,7 @@ def check_agentcore_network_firewall_egress(
         nat_error = None
         nat_subnets: Dict[str, Optional[str]] = {}
         for subnet_id in sorted(hosting):
-            routes = _default_routes(_route_table_for_subnet(tables, subnet_id))
+            routes = _egress_routes(_route_table_for_subnet(tables, subnet_id))
             if not routes:
                 unrouted.append(subnet_id)
             for destination, key, target in routes:
@@ -26086,7 +28201,7 @@ def check_agentcore_network_firewall_egress(
                             )
                         except (BotoCoreError, ClientError) as error:
                             nat_error = (
-                                f"NAT gateway {target}, the default route of "
+                                f"NAT gateway {target}, an internet route of "
                                 f"hosting subnet {subnet_id}, could not be read: "
                                 f"{_assessment_error_label(error)}"
                             )
@@ -26103,9 +28218,7 @@ def check_agentcore_network_firewall_egress(
                     if not nat_subnet:
                         unresolved.append(f"{where}, whose subnet is not reported")
                         continue
-                    onward = _default_routes(
-                        _route_table_for_subnet(tables, nat_subnet)
-                    )
+                    onward = _egress_routes(_route_table_for_subnet(tables, nat_subnet))
                     for _, onward_key, onward_target in onward:
                         if onward_key == "VpcEndpointId" and onward_target in endpoints:
                             firewall = endpoints[onward_target]
@@ -26158,7 +28271,9 @@ def check_agentcore_network_firewall_egress(
                 continue
             groups: Dict[str, Dict[str, Any]] = {}
             group_error = None
-            for group_reference in policy.get("StatefulRuleGroupReferences") or []:
+            for group_reference in (policy.get("StatefulRuleGroupReferences") or []) + (
+                policy.get("StatelessRuleGroupReferences") or []
+            ):
                 group_arn = str(group_reference.get("ResourceArn") or "")
                 if not group_arn or _network_firewall_managed_group_name(group_arn):
                     continue
@@ -26189,13 +28304,13 @@ def check_agentcore_network_firewall_egress(
         route_text = ""
         if unresolved:
             route_text += (
-                f" Default route(s) {'; '.join(unresolved)} are not followed, so "
+                f" Internet route(s) {'; '.join(unresolved)} are not followed, so "
                 "whether that traffic is inspected is not judged."
             )
         if unrouted:
             route_text += (
                 f" Hosting subnet(s) {', '.join(sorted(set(unrouted)))} have no "
-                "default route past the VPC."
+                "route toward an internet address."
             )
         reached_text = ", ".join(
             sorted(str(f.get("FirewallName") or arn) for arn, f in reached.items())
@@ -26209,18 +28324,18 @@ def check_agentcore_network_firewall_egress(
             if bypassing:
                 problems.insert(
                     0,
-                    f"default route(s) {'; '.join(bypassing)} reach the internet "
+                    f"internet route(s) {'; '.join(bypassing)} reach the internet "
                     "through no Network Firewall",
                 )
             if problems:
                 status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
                 details = f"{subject} {'; and '.join(problems)}.{route_text}"
                 resolution = (
-                    "Route each hosting subnet's default route through a Network "
+                    "Route each hosting subnet's internet routes through a Network "
                     "Firewall endpoint whose policy holds an ALLOWLIST domain rule "
                     "group matching TLS_SNI and HTTP_HOST"
                     if row_name == egress_name
-                    else "Route each hosting subnet's default route through a "
+                    else "Route each hosting subnet's internet routes through a "
                     "Network Firewall whose policy references an AWS managed "
                     "ThreatSignatures rule group and a domain reputation group, "
                     "neither overridden to DROP_TO_ALERT"
@@ -26239,7 +28354,7 @@ def check_agentcore_network_firewall_egress(
             elif not reached:
                 status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
                 details = (
-                    f"{subject} has no hosting subnet whose default route reaches "
+                    f"{subject} has no hosting subnet whose internet route reaches "
                     f"a Network Firewall in the VPC ({len(endpoints)} firewall "
                     f"endpoint(s) listed).{route_text}"
                 )
@@ -26260,7 +28375,7 @@ def check_agentcore_network_firewall_egress(
             else:
                 status, severity = StatusEnum.PASSED, SeverityEnum.MEDIUM
                 details = (
-                    f"{subject} routes every hosting subnet's default route through "
+                    f"{subject} routes every hosting subnet's internet routes through "
                     f"firewall(s) {reached_text}, "
                     + (
                         "whose policy holds a domain allow-list over TLS_SNI and "
@@ -26328,12 +28443,13 @@ WAF_ANTI_DDOS_DEFAULT_CHALLENGE_SENSITIVITY = "HIGH"
 def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
     """Return one node per statement in a rule's statement tree.
 
-    AndStatement and OrStatement nest a list of statements, and a rate-based or
-    managed-rule-group statement nests the scope-down statement that decides
-    which requests it applies to, so a match statement inside any of them is
-    still inspecting requests. NotStatement is not descended into: it matches
-    everything its child does not, so a SQL injection match inside one is not
-    SQL injection coverage.
+    AndStatement and OrStatement nest a list of statements, so a match
+    statement inside either is still inspecting requests. A rate-based or
+    managed-rule-group statement's ScopeDownStatement is not descended into: it
+    only picks the requests the outer statement counts or inspects, so a SQL
+    injection match there blocks nothing on its own. NotStatement is not
+    descended into either: it matches everything its child does not, so a SQL
+    injection match inside one is not SQL injection coverage.
     """
     if not isinstance(statement, dict):
         return []
@@ -26344,10 +28460,6 @@ def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
         if isinstance(nested, dict):
             for child in nested.get("Statements") or []:
                 nodes.extend(_waf_statement_nodes(child))
-    for key in ("RateBasedStatement", "ManagedRuleGroupStatement"):
-        nested = statement.get(key)
-        if isinstance(nested, dict):
-            nodes.extend(_waf_statement_nodes(nested.get("ScopeDownStatement")))
     return nodes
 
 
@@ -26377,7 +28489,11 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
     Only a rule whose action is Block filters: Allow lets the matching request
     through, Count observes it, and Captcha and Challenge let through a request
     that carries a valid token. A rule group whose OverrideAction is Count
-    blocks nothing. Inside an AWS managed rule group, a rule overridden to any
+    blocks nothing. Rules are read in the order given, which
+    _web_acl_with_firewall_manager_rules sorts by Priority, and an Allow rule
+    ends evaluation for the requests it matches, so a filter in a later rule is
+    listed under shadowed and not credited: the statement of the Allow is not
+    judged for how many requests it matches. Inside an AWS managed rule group, a rule overridden to any
     action but Block, or excluded, does not block, so a group is not credited
     with SQL injection or cross-site scripting inspection when a rule that
     provides it is overridden. The group's rule list is not read, so a group
@@ -26409,8 +28525,28 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
         "anti_ddos_overridden": [],
         "anti_ddos_config": None,
         "weakened": [],
+        "shadowed": [],
         "evidence": {},
     }
+    allowed_by: List[str] = []
+    labels = {
+        "sqli": "SQL injection inspection",
+        "xss": "cross-site scripting inspection",
+    }
+
+    def credit(kind: str, evidence: str, what: str) -> bool:
+        """Credit a filter unless an earlier Allow rule lets requests past it."""
+        if allowed_by:
+            coverage["shadowed"].append(
+                f"{what} in {evidence} runs after {', '.join(allowed_by)}, whose "
+                "Allow action lets a request it matches through uninspected"
+            )
+            return False
+        if not coverage[kind]:
+            coverage[kind] = True
+            coverage["evidence"][kind] = evidence
+        return True
+
     # Match statements that credit a filter only once a rule blocks the
     # oversized body they decline to match.
     no_match_pending: List[Tuple[str, str]] = []
@@ -26467,15 +28603,16 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                 if weakness:
                     coverage["weakened"].extend(weakness)
                 elif oversize == "NO_MATCH":
-                    no_match_pending.append((kind, f"rule '{rule_name}'"))
-                elif not coverage[kind]:
-                    coverage[kind] = True
-                    coverage["evidence"][kind] = f"rule '{rule_name}'"
+                    if not allowed_by:
+                        no_match_pending.append((kind, f"rule '{rule_name}'"))
+                    else:
+                        credit(kind, f"rule '{rule_name}'", labels[kind])
+                else:
+                    credit(kind, f"rule '{rule_name}'", labels[kind])
             if blocks and _waf_blocks_oversized_body(node):
                 body_size_rule = True
-            if blocks and "RateBasedStatement" in node and not coverage["rate"]:
-                coverage["rate"] = True
-                coverage["evidence"]["rate"] = f"rule '{rule_name}'"
+            if blocks and "RateBasedStatement" in node:
+                credit("rate", f"rule '{rule_name}'", "a rate-based rule")
 
             referenced = node.get("RuleGroupReferenceStatement")
             if isinstance(referenced, dict):
@@ -26512,9 +28649,9 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                         f"{member} of {name} in rule '{rule_name}' is set to {action}"
                         for member, action in disabled
                     )
-                elif not coverage["anti_ddos"]:
-                    coverage["anti_ddos"] = True
-                    coverage["evidence"]["anti_ddos"] = f"rule '{rule_name}'"
+                elif not coverage["anti_ddos"] and credit(
+                    "anti_ddos", f"rule '{rule_name}'", WAF_ANTI_DDOS_RULE_GROUP
+                ):
                     coverage["anti_ddos_config"] = next(
                         (
                             config[WAF_ANTI_DDOS_RULE_GROUP]
@@ -26535,9 +28672,7 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 else:
                     provides = True
-                    if not coverage["sqli"]:
-                        coverage["sqli"] = True
-                        coverage["evidence"]["sqli"] = f"{name} in rule '{rule_name}'"
+                    credit("sqli", f"{name} in rule '{rule_name}'", labels["sqli"])
             if WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN in lowered:
                 xss_overridden = [
                     (member, action)
@@ -26551,15 +28686,16 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 else:
                     provides = True
-                    if not coverage["xss"]:
-                        coverage["xss"] = True
-                        coverage["evidence"]["xss"] = f"{name} in rule '{rule_name}'"
+                    credit("xss", f"{name} in rule '{rule_name}'", labels["xss"])
 
             if (provides or not non_blocking) and not coverage["block"]:
                 coverage["block"] = True
                 coverage["evidence"]["block"] = (
                     f"the blocking rules of {name} in rule '{rule_name}'"
                 )
+
+        if "Allow" in (rule.get("Action") or {}):
+            allowed_by.append(f"rule '{rule_name}'")
 
     for kind, evidence in no_match_pending:
         if not body_size_rule:
@@ -26622,8 +28758,13 @@ def _gateway_waf_rule_findings(
     WAF cannot be evaluated: FAIL_OPEN lets the request through, so the ACL
     filters nothing while AWS WAF is unreachable or times out. The API states no
     default for an absent failureMode, so an unset value is not judged.
+
+    Rules are read in the order AWS WAF runs them: the Firewall Manager groups
+    that run before the ACL's rules, the rules by Priority, then the groups that
+    run after. A filter in a rule after an Allow rule is not credited, because
+    the Allow ends evaluation for the requests it matches.
     """
-    coverage = _waf_rule_coverage(web_acl)
+    coverage = _waf_rule_coverage(_web_acl_with_firewall_manager_rules(web_acl))
     body_limit = _waf_body_inspection_limit(web_acl)
     body_filters = bool(body_limit) and body_limit != WAF_DEFAULT_BODY_INSPECTION_LIMIT
     acl_name = web_acl.get("Name") or web_acl_arn
@@ -26654,15 +28795,24 @@ def _gateway_waf_rule_findings(
         if present
     )
     overridden = (
-        " Not credited because the rule is overridden or excluded: "
-        f"{'; '.join(coverage['overridden'])}."
-        if coverage["overridden"]
-        else ""
-    ) + (
-        " Not credited because the match statement does not inspect the whole "
-        f"request: {'; '.join(coverage['weakened'])}."
-        if coverage["weakened"]
-        else ""
+        (
+            " Not credited because the rule is overridden or excluded: "
+            f"{'; '.join(coverage['overridden'])}."
+            if coverage["overridden"]
+            else ""
+        )
+        + (
+            " Not credited because the match statement does not inspect the whole "
+            f"request: {'; '.join(coverage['weakened'])}."
+            if coverage["weakened"]
+            else ""
+        )
+        + (
+            " Not credited because an earlier rule ends evaluation first: "
+            f"{'; '.join(coverage['shadowed'])}."
+            if coverage["shadowed"]
+            else ""
+        )
     )
     fails_open = (
         " The gateway's wafConfiguration failureMode is FAIL_OPEN, so the gateway "
@@ -26817,18 +28967,28 @@ def _web_acl_with_firewall_manager_rules(web_acl: Dict[str, Any]) -> Dict[str, A
     Firewall Manager adds rule groups that run before and after the ACL's own
     rules and keeps them out of Rules. Each carries its managed rule group in
     FirewallManagerStatement, so it reads as a rule whose statement is that.
+    AWS WAF runs each of the three lists in Priority order, so each is sorted
+    by Priority, and the order among them is pre-process, Rules, post-process.
     """
+
+    def by_priority(rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(rules, key=lambda rule: rule.get("Priority") or 0)
+
     merged = dict(web_acl)
     merged["Rules"] = (
-        [
-            {**group, "Statement": group.get("FirewallManagerStatement")}
-            for group in web_acl.get("PreProcessFirewallManagerRuleGroups") or []
-        ]
-        + list(web_acl.get("Rules") or [])
-        + [
-            {**group, "Statement": group.get("FirewallManagerStatement")}
-            for group in web_acl.get("PostProcessFirewallManagerRuleGroups") or []
-        ]
+        by_priority(
+            [
+                {**group, "Statement": group.get("FirewallManagerStatement")}
+                for group in web_acl.get("PreProcessFirewallManagerRuleGroups") or []
+            ]
+        )
+        + by_priority(list(web_acl.get("Rules") or []))
+        + by_priority(
+            [
+                {**group, "Statement": group.get("FirewallManagerStatement")}
+                for group in web_acl.get("PostProcessFirewallManagerRuleGroups") or []
+            ]
+        )
     )
     return merged
 
@@ -26895,7 +29055,9 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
 
     The group is paired with a rate-based rule whose action is Block, which caps
     the request rate per caller and so the inference spend a flood runs up. The
-    rule's limit and scope-down statement are not judged. A web ACL with no such
+    rule's limit and scope-down statement are not judged. Neither the group nor
+    the rule is credited when it runs after an Allow rule, which ends
+    evaluation for the requests it matches. A web ACL with no such
     rule among the rules this check reads, and a rule group whose rules live in
     another resource, is not judged on that leg.
     """
@@ -27020,6 +29182,12 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             " It applies no rate-based rule whose action is Block, so no rule "
             "caps the request rate of a single caller."
         )
+        shadowed = (
+            " Not credited because an earlier rule ends evaluation first: "
+            f"{'; '.join(coverage['shadowed'])}."
+            if coverage["shadowed"]
+            else ""
+        )
         opaque_rate = (
             " It applies no rate-based rule whose action is Block in the rules "
             f"this check reads, and delegates to {len(coverage['opaque'])} rule "
@@ -27060,7 +29228,7 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             else:
                 findings.append(
                     finding(
-                        f"{runs}{no_rate} A flood from one caller runs up inference "
+                        f"{runs}{no_rate}{shadowed} A flood from one caller runs up inference "
                         "spend below the level the Anti-DDoS group treats as an "
                         "event.",
                         rate_resolution,
@@ -27081,6 +29249,7 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
                 f"{label} is associated with web ACL {acl_name}, which does not "
                 f"run {WAF_ANTI_DDOS_RULE_GROUP}, so a request flood spread across "
                 f"many clients reaches the gateway unmitigated.{not_credited}"
+                f"{shadowed}"
                 f"{'' if coverage['rate'] or coverage['opaque'] else no_rate}",
                 f"Add the AWS managed rule group {WAF_ANTI_DDOS_RULE_GROUP} to the "
                 "web ACL with no Count override on the group and no rule inside it "
@@ -27608,9 +29777,11 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     from a gateway to its policy engine is excluded, because Policy in AgentCore
     decides tool access and is not an agent.
 
-    Each edge needs a metric alarm with actions whose threshold is an
-    ANOMALY_DETECTION_BAND over the edge's Error, Fault or Latency metric with
-    the edge's Service and RemoteService, whatever other dimensions it carries.
+    Each edge needs metric alarms with actions whose threshold is an
+    ANOMALY_DETECTION_BAND over the edge's Latency metric and over its Error or
+    Fault metric, with the edge's Service and RemoteService, whatever other
+    dimensions they carry. One band watches either how long the pair takes or
+    how often it fails, and DET-10 asks for both.
     A pair whose RemoteService is UnknownRemoteService is N/A by name, never
     Passed. A runtime not instrumented with Application Signals publishes no
     edge, so it cannot be assessed.
@@ -27778,7 +29949,33 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
 
     findings: List[Dict[str, Any]] = list(unnamed)
     for (service, remote), (kind, callee_id) in sorted(edges.items()):
-        if (service, remote) in alarmed:
+        labels = alarmed.get((service, remote), [])
+        watched = {label.rsplit(" on ", 1)[1] for label in labels}
+        has_error = bool(watched & {"Error", "Fault"})
+        has_latency = "Latency" in watched
+        if has_error and has_latency:
+            continue
+        if labels:
+            missing, effect = (
+                ("Latency", "how long that pair takes")
+                if has_error
+                else ("Error or Fault", "how often that pair fails")
+            )
+            findings.append(
+                finding(
+                    f"Calls from '{service}' to {kind} {callee_id} (RemoteService "
+                    f"'{remote}') are alarmed on an anomaly detection band by "
+                    f"{', '.join(sorted(labels))}, but no alarm with actions "
+                    f"watches its {missing} metric, so a change in {effect} "
+                    "notifies nobody.",
+                    "Create a CloudWatch alarm with an anomaly detection band on "
+                    f"the {APPLICATION_SIGNALS_NAMESPACE} {missing} metric with "
+                    "this pair's Environment, Service and RemoteService "
+                    "dimensions, and give it an alarm action.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
             continue
         findings.append(
             finding(
@@ -27787,8 +29984,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                 "ANOMALY_DETECTION_BAND over the pair's Error, Fault or Latency "
                 "metric, so a change in how often that pair fails or how long it "
                 "takes notifies nobody.",
-                "Create a CloudWatch alarm with an anomaly detection band on the "
-                f"{APPLICATION_SIGNALS_NAMESPACE} Error, Fault or Latency metric "
+                "Create CloudWatch alarms with anomaly detection bands on the "
+                f"{APPLICATION_SIGNALS_NAMESPACE} Latency metric and the Error or "
+                "Fault metric "
                 "with this pair's Environment, Service and RemoteService "
                 "dimensions, and give it an alarm action.",
                 SeverityEnum.MEDIUM,
@@ -27804,8 +30002,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     return unnamed + [
         finding(
             f"Every one of the {len(edges)} AgentCore caller and callee pair(s) "
-            "Application Signals records has an alarm with actions on an anomaly "
-            f"detection band: {covered}.",
+            "Application Signals records has alarms with actions on anomaly "
+            "detection bands over its Latency metric and its Error or Fault "
+            f"metric: {covered}.",
             "No action required.",
             SeverityEnum.MEDIUM,
             StatusEnum.PASSED,
@@ -28820,7 +31019,7 @@ def lambda_handler(event, context):
             (
                 ["AC-02"],
                 "Payments Retrieval Role Trust",
-                check_agentcore_payment_retrieval_role_trust,
+                lambda: check_agentcore_payment_retrieval_role_trust(permission_cache),
             ),
             (
                 ["AC-01"],
