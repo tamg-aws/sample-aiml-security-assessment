@@ -3583,7 +3583,9 @@ def _payment_retrieval_trust_gaps(
     Every Allow statement must name only the AgentCore service principal and pin
     aws:SourceArn to this payment manager by value. A SourceArn value that names
     the payment manager literally also names its account, so aws:SourceAccount
-    is not required on top of it.
+    is not required on top of it. A pattern that matches this manager's ARN,
+    such as `payment-manager/pm-*`, also matches every manager created later
+    whose id it matches, so only the literal ARN pins.
     """
     statements = _document_statements(document, effect="Allow")
     gaps: List[str] = []
@@ -3605,11 +3607,7 @@ def _payment_retrieval_trust_gaps(
                 f"statement {index} does not pin aws:SourceArn with StringEquals, "
                 "StringLike, ArnEquals or ArnLike"
             )
-        elif not all(
-            fnmatchcase(payment_manager_arn, value)
-            and not _arn_pattern_is_unbounded(value)
-            for value in source_arns
-        ):
+        elif not all(value == payment_manager_arn for value in source_arns):
             gaps.append(
                 f"statement {index} lets aws:SourceArn be "
                 f"{', '.join(sorted(set(source_arns)))}, which is not this "
@@ -3618,7 +3616,52 @@ def _payment_retrieval_trust_gaps(
     return gaps, len(statements)
 
 
-def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
+def _payment_writer_literal_pass_roles(
+    permissions_by_name: Dict[str, Any], principal_kind: str
+) -> Dict[str, Set[str]]:
+    """Return the literal role ARNs each payment manager writer may pass AgentCore.
+
+    A pattern Resource is the global AC-02 Pass Role Scope leg's to judge, and a
+    statement whose iam:PassedToService excludes AgentCore passes it no role.
+    """
+    literals: Dict[str, Set[str]] = {}
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        if not any(
+            _principal_holds_action(permissions, action)
+            for action in PAYMENT_MANAGER_WRITE_ACTIONS
+        ):
+            continue
+        if not _grant_survives(permissions, IAM_PASS_ROLE_ACTION):
+            continue
+        for policy in _principal_policies(permissions):
+            try:
+                statements = list(_allow_statements(policy))
+            except Exception as error:
+                logger.warning(
+                    f"Error parsing policy for {principal_kind} "
+                    f"{principal_name}: {error}"
+                )
+                continue
+            for statement in statements:
+                if not _statement_matches_action(statement, IAM_PASS_ROLE_ACTION):
+                    continue
+                if _pass_role_statement_excludes_agentcore(statement):
+                    continue
+                literals.setdefault(f"{principal_kind} {principal_name}", set()).update(
+                    str(resource)
+                    for resource in _statement_resources(statement)
+                    if ":role/" in str(resource)
+                    and "*" not in str(resource)
+                    and "?" not in str(resource)
+                )
+    return literals
+
+
+def check_agentcore_payment_retrieval_role_trust(
+    permission_cache: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """AC-02 (PAY-01): Judge each payment manager's ResourceRetrievalRole trust.
 
     The IAM cache carries no trust policies, so this leg lists the payment
@@ -3675,6 +3718,7 @@ def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
 
     findings: List[Dict[str, Any]] = []
     trust_cache: Dict[str, Any] = {}
+    manager_roles: Set[str] = set()
     for manager in managers:
         manager_id = manager.get("paymentManagerId") or "unknown"
         label = f"Payment manager '{manager.get('name') or manager_id}' ({manager_id})"
@@ -3707,6 +3751,8 @@ def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
                 continue
             manager_arn = detail.get("paymentManagerArn") or manager_arn
             role_arn = detail.get("roleArn") or role_arn
+        if role_arn:
+            manager_roles.add(str(role_arn))
         if not role_arn:
             findings.append(
                 create_finding(
@@ -3795,6 +3841,46 @@ def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
                 status=StatusEnum.PASSED,
             )
         )
+
+    if isinstance(permission_cache, dict) and manager_roles:
+        writers = {
+            **_payment_writer_literal_pass_roles(
+                permission_cache.get("role_permissions") or {}, "role"
+            ),
+            **_payment_writer_literal_pass_roles(
+                permission_cache.get("user_permissions") or {}, "user"
+            ),
+        }
+        reaches = [
+            f"{label} ({', '.join(sorted(roles - manager_roles))})"
+            for label, roles in sorted(writers.items())
+            if roles - manager_roles
+        ]
+        if reaches:
+            findings.append(
+                create_finding(
+                    check_id="AC-02",
+                    finding_name="AgentCore Payments Pass Role Reaches Other Roles",
+                    finding_details=(
+                        "The following principals can create or update an "
+                        "AgentCore payment manager and may pass AgentCore a role "
+                        "that no payment manager in this region names as its "
+                        f"roleArn: {'; '.join(reaches)}. UpdatePaymentManager can "
+                        "point a manager at any role the grant names, and the "
+                        "manager then retrieves payment credentials as that role. "
+                        "A role the payment managers of another region name reads "
+                        f"as a role no manager names. {IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        "Grant iam:PassRole to the payment manager writers only on "
+                        "the ResourceRetrievalRole ARNs their managers name, and "
+                        "pass other AgentCore roles from a separate identity."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
 
     return findings
 
@@ -4475,8 +4561,9 @@ def check_agentcore_full_access_roles(
                         "retrieves payment credentials as the role passed in its "
                         "roleArn, so an unscoped PassRole lets setup hand it any "
                         "role the grant matches, or hand the retrieval role to "
-                        "another service. A grant naming one role's ARN is not "
-                        "compared to the payment manager's own roleArn. "
+                        "another service. A grant naming one role's ARN is "
+                        "compared with the payment managers' roleArn per region, by "
+                        "the Payments Pass Role Reaches Other Roles row. "
                         f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
@@ -30386,7 +30473,7 @@ def lambda_handler(event, context):
             (
                 ["AC-02"],
                 "Payments Retrieval Role Trust",
-                check_agentcore_payment_retrieval_role_trust,
+                lambda: check_agentcore_payment_retrieval_role_trust(permission_cache),
             ),
             (
                 ["AC-01"],

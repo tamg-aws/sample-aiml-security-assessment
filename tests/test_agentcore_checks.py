@@ -2365,8 +2365,8 @@ class TestAC02WholePopulation:
         assert "reaches every role" not in finding["Finding_Details"]
         assert "Scoped" not in finding["Finding_Details"]
         assert (
-            "is not compared to the payment manager's own roleArn"
-            in (finding["Finding_Details"])
+            "is compared with the payment managers' roleArn per region, by the "
+            "Payments Pass Role Reaches Other Roles row" in (finding["Finding_Details"])
         )
 
     def test_two_literal_role_arns_are_not_a_pattern(self):
@@ -31009,6 +31009,229 @@ class TestAC02PaymentRetrievalRoleTrust:
         assert source.index(
             "check_agentcore_payment_retrieval_role_trust"
         ) < source.index("check_agentcore_vpc_configuration(browser_inventory)")
+
+
+class TestAC02PaymentManagerPinAndPassRoleReach:
+    """AC-02 PAY-01 pins aws:SourceArn by value and compares PassRole with roleArn."""
+
+    _PM = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:payment-manager/"
+    _ROLE = f"arn:aws:iam::{_ACCOUNT}:role/"
+
+    def _run(self, mock_ac, mock_iam, trusts, permission_cache=None):
+        mock_ac.list_payment_managers.return_value = {
+            "paymentManagers": [
+                {
+                    "paymentManagerId": name,
+                    "name": name,
+                    "paymentManagerArn": self._PM + name,
+                    "roleArn": f"{self._ROLE}Retrieval-{name}",
+                }
+                for name in trusts
+            ]
+        }
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": trusts[RoleName.split("-", 1)[1]]}
+        }
+        return agentcore_app.check_agentcore_payment_retrieval_role_trust(
+            permission_cache
+        )
+
+    def _pinned(self, value, operator="ArnEquals"):
+        return _service_trust(
+            {
+                "StringEquals": {"aws:SourceAccount": _ACCOUNT},
+                operator: {"aws:SourceArn": value},
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "value, operator",
+        [
+            (_PM + "good*", "ArnLike"),
+            (_PM + "goo?", "ArnLike"),
+            (_PM + "g*d", "StringLike"),
+        ],
+        ids=["prefix", "one-character", "infix"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pattern_matching_this_manager_is_not_its_arn_alone(
+        self, mock_ac, mock_iam, value, operator
+    ):
+        # Each pattern matches bad's own ARN, and also every manager created
+        # later whose id it matches, such as good-2 or goo1.
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {
+                "exact": self._pinned(self._PM + "exact"),
+                "good": self._pinned(value, operator),
+            },
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1 and len(passed) == 1
+        assert "(good)" in failed[0]["Finding_Details"]
+        assert "not this payment manager's ARN alone" in failed[0]["Finding_Details"]
+        assert "(exact)" in passed[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("operator", ["ArnEquals", "ArnLike", "StringLike"])
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_exact_arn_passes_under_every_positive_operator(
+        self, mock_ac, mock_iam, operator
+    ):
+        findings = self._run(
+            mock_ac, mock_iam, {"good": self._pinned(self._PM + "good", operator)}
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def _writer(self, resource, service="bedrock-agentcore.amazonaws.com"):
+        return _principal_with(
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:UpdatePaymentManager",
+                    "Resource": "*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "iam:PassRole",
+                    "Resource": resource,
+                    "Condition": {"StringEquals": {"iam:PassedToService": service}},
+                },
+            ]
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_writer_passing_a_role_no_manager_uses_fails_only_that_writer(
+        self, mock_ac, mock_iam
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {
+                "one": self._pinned(self._PM + "one"),
+                "two": self._pinned(self._PM + "two"),
+            },
+            _v2_cache(
+                roles={
+                    "setup": self._writer(
+                        [self._ROLE + "Retrieval-one", self._ROLE + "AdminRole"]
+                    ),
+                    "narrow": self._writer(
+                        [self._ROLE + "Retrieval-one", self._ROLE + "Retrieval-two"]
+                    ),
+                }
+            ),
+        )
+        reach = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Payments Pass Role Reaches Other Roles"
+        ]
+        assert [f["Status"] for f in reach] == ["Failed"]
+        details = reach[0]["Finding_Details"]
+        assert f"role setup ({self._ROLE}AdminRole)" in details
+        assert "Retrieval-one" not in details
+        assert "role narrow" not in details
+        assert reach[0]["Severity"] == "High"
+        assert_finding_schema(reach[0])
+        assert sorted(
+            f["Status"]
+            for f in findings
+            if f["Finding"] == "AgentCore Payments Retrieval Role Trust"
+        ) == ["Passed", "Passed"]
+
+    @pytest.mark.parametrize(
+        "cache",
+        [
+            None,
+            {"role_permissions": {}, "user_permissions": {}},
+        ],
+        ids=["no-cache", "empty-cache"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_cache_adds_no_reach_row(self, mock_ac, mock_iam, cache):
+        findings = self._run(
+            mock_ac, mock_iam, {"one": self._pinned(self._PM + "one")}, cache
+        )
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Payments Retrieval Role Trust"
+        ]
+
+    @pytest.mark.parametrize(
+        "writer",
+        [
+            # PassedToService names another service, so AgentCore gets no role.
+            ("AdminRole", "lambda.amazonaws.com", True),
+            # A pattern is the global AC-02 leg's, not this one's.
+            ("Admin*", "bedrock-agentcore.amazonaws.com", True),
+            ("Admin?", "bedrock-agentcore.amazonaws.com", True),
+            # A principal that cannot write a payment manager passes nothing to one.
+            ("AdminRole", "bedrock-agentcore.amazonaws.com", False),
+        ],
+        ids=["other-service", "pattern", "one-character-pattern", "not-a-writer"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_grants_that_cannot_repoint_a_manager_add_no_reach_row(
+        self, mock_ac, mock_iam, writer
+    ):
+        name, service, writes = writer
+        permissions = self._writer(self._ROLE + name, service)
+        if not writes:
+            permissions["attached_policies"][0]["document"]["Statement"].pop(0)
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"one": self._pinned(self._PM + "one")},
+            _v2_cache(users={"setup": permissions}),
+        )
+        assert "AgentCore Payments Pass Role Reaches Other Roles" not in [
+            f["Finding"] for f in findings
+        ]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_reach_row_when_no_manager_role_was_read(self, mock_ac, mock_iam):
+        # With no roleArn read there is nothing to compare, so every literal
+        # grant would read as reaching another role.
+        mock_ac.list_payment_managers.return_value = {
+            "paymentManagers": [{"paymentManagerId": "pm-1"}]
+        }
+        mock_ac.get_payment_manager.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "GetPaymentManager"
+        )
+        findings = agentcore_app.check_agentcore_payment_retrieval_role_trust(
+            _v2_cache(roles={"setup": self._writer(self._ROLE + "AdminRole")})
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_user_writer_is_read_too(self, mock_ac, mock_iam):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"one": self._pinned(self._PM + "one")},
+            _v2_cache(users={"ops": self._writer(self._ROLE + "AdminRole")}),
+        )
+        reach = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Payments Pass Role Reaches Other Roles"
+        ]
+        assert len(reach) == 1
+        assert f"user ops ({self._ROLE}AdminRole)" in reach[0]["Finding_Details"]
+
+    def test_the_handler_passes_the_permission_cache(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert (
+            "check_agentcore_payment_retrieval_role_trust(permission_cache)" in source
+        )
 
 
 class TestAC03WholePopulation:
