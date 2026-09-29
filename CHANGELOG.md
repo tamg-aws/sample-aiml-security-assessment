@@ -298,6 +298,17 @@ section.
 
 ### Fixed
 
+- `AC-48` execution role sharing compares every assessed Region. An IAM
+  role is global, so a runtime in one Region and a gateway in another could
+  share a role while each Region's `Sharing` row passed. The state machine
+  now passes the resolved Region list to the AgentCore function as
+  `TargetRegions`, and the primary Region (Map index 0) reads the execution
+  roles of every other Region and fails a role that resources in two Regions
+  name. A Region whose `ListAgentRuntimes` probe fails for a reason other
+  than no endpoint or no opt-in is `N/A` naming the Region, and the other
+  Regions no longer emit a sharing row. A row that passed can now be
+  `Failed` or `N/A`.
+
 - `AG-39` gateway WAF rule coverage and `AC-51` web ACL Anti-DDoS fail a
   filter that runs after an `Allow` rule only when the `Allow` matches on the
   same attack class: a SQL injection match ahead of SQL injection inspection,
@@ -1288,6 +1299,11 @@ section.
     now be `Failed` or `N/A`.
 
 ### Deployment impact
+
+**State machine definition.** `statemachine/assessments.asl.json` adds
+`TargetRegions` to the AgentCore task payload, so the deployment stack must
+be updated for `AC-48` to compare Regions. Until it is, the function
+receives no `TargetRegions` and compares each Region on its own, as before.
 
 **AgentCore role grants.** The AgentCore assessment role gains seven
 read-only grants: `events:ListTargetsByRule` on `rule/*`,

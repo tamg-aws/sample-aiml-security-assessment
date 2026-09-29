@@ -26268,6 +26268,203 @@ class TestAC48SourceArnRequired:
         )
 
 
+class TestAC48CrossRegionSharing:
+    """AC-48: at RegionIndex 0 the sharing leg compares every assessed Region,
+    because an execution role is global and a runtime in one Region can share
+    it with a gateway in another."""
+
+    _arn = TestAC48ExecutionRoleTrustAndSharing._arn
+    _wire = TestAC48ExecutionRoleTrustAndSharing._wire
+    _named = TestAC48ExecutionRoleTrustAndSharing._named
+
+    _SHARED = "AgentCore Execution Role Shared Across Workloads"
+
+    def _remote(self, **families):
+        remote = MagicMock()
+        self._wire(remote, MagicMock(), **families)
+        remote.list_browsers.return_value = {"browserSummaries": []}
+        return remote
+
+    def _run(self, mock_ac, clients, regions, primary=True, inventory=None):
+        mock_ac.meta.region_name = regions[0]
+        with patch("agentcore_app.boto3.client") as factory:
+            factory.side_effect = lambda service, **kwargs: clients[
+                kwargs["region_name"]
+            ]
+            findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+                inventory, target_regions=regions, is_primary_region=primary
+            )
+        return findings, factory
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_shared_with_another_region_fails_at_the_primary(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["SharedRole"])
+        clients = {"us-west-2": self._remote(gateways=["SharedRole"])}
+
+        findings, factory = self._run(
+            mock_ac, clients, ["us-east-1", "us-west-2"], inventory=inventory
+        )
+        shared = self._named(findings, self._SHARED)
+
+        assert len(shared) == 1
+        assert shared[0]["Status"] == "Failed"
+        details = shared[0]["Finding_Details"]
+        assert "Runtime 'rt-0' (rt-0) in us-east-1 [runtime family]" in details
+        assert "Gateway 'gw-0' (gw-0) in us-west-2 [gateway family]" in details
+        factory.assert_called_once_with(
+            "bedrock-agentcore-control",
+            config=agentcore_app.boto3_config,
+            region_name="us-west-2",
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_distinct_roles_across_regions_pass_and_name_the_regions(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole"])
+        clients = {"us-west-2": self._remote(gateways=["GatewayRole"])}
+
+        findings, _ = self._run(
+            mock_ac, clients, ["us-east-1", "us-west-2"], inventory=inventory
+        )
+        sharing = self._named(findings, "AgentCore Execution Role Sharing")
+
+        assert not self._named(findings, self._SHARED)
+        assert len(sharing) == 1
+        assert sharing[0]["Status"] == "Passed"
+        details = sharing[0]["Finding_Details"]
+        assert details.startswith(
+            "The 2 AgentCore resource(s) that name an execution role name 2 "
+            "distinct role ARN(s)"
+        )
+        assert "across the 2 assessed region(s): us-east-1, us-west-2" in details
+        assert "is not compared" not in details
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_region_is_na_and_an_absent_one_is_skipped(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole"])
+        denied = self._remote()
+        denied.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        absent = self._remote()
+        absent.list_agent_runtimes.side_effect = EndpointConnectionError(
+            endpoint_url="https://bedrock-agentcore-control.eu-west-1.amazonaws.com"
+        )
+        clients = {"us-west-2": denied, "eu-west-1": absent}
+
+        findings, _ = self._run(
+            mock_ac,
+            clients,
+            ["us-east-1", "us-west-2", "eu-west-1"],
+            inventory=inventory,
+        )
+        incomplete = self._named(
+            findings, "AgentCore Execution Role Sharing Incomplete"
+        )
+
+        assert not self._named(findings, "AgentCore Execution Role Sharing")
+        assert len(incomplete) == 1
+        assert incomplete[0]["Status"] == "N/A"
+        details = incomplete[0]["Finding_Details"]
+        assert "region us-west-2" in details
+        assert "eu-west-1" not in details
+        assert "bedrock-agentcore:ListAgentRuntimes" in incomplete[0]["Resolution"]
+        assert denied.get_agent_runtime.call_count == 0
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_failed_read_in_another_region_is_named_with_its_region(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole"])
+        remote = self._remote(gateways=["GatewayRole"])
+        remote.get_gateway.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings, _ = self._run(
+            mock_ac,
+            {"us-west-2": remote},
+            ["us-east-1", "us-west-2"],
+            inventory=inventory,
+        )
+        incomplete = self._named(
+            findings, "AgentCore Execution Role Sharing Incomplete"
+        )
+
+        assert len(incomplete) == 1
+        assert "Gateway 'gw-0' (gw-0) in us-west-2" in incomplete[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetGateway" in incomplete[0]["Resolution"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_primary_compares_other_regions_when_it_holds_no_resource(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam)
+        clients = {
+            "us-west-2": self._remote(runtimes=["SharedRole"]),
+            "eu-west-1": self._remote(browsers=["SharedRole"]),
+        }
+        clients["eu-west-1"].list_browsers.return_value = {
+            "browserSummaries": [{"browserId": "br-9", "name": "br-9"}]
+        }
+        clients["eu-west-1"].get_browser.return_value = {
+            "executionRoleArn": self._arn("SharedRole")
+        }
+
+        findings, _ = self._run(
+            mock_ac,
+            clients,
+            ["us-east-1", "us-west-2", "eu-west-1"],
+            inventory=inventory,
+        )
+        shared = self._named(findings, self._SHARED)
+
+        assert len(shared) == 1
+        assert "in us-west-2 [runtime family]" in shared[0]["Finding_Details"]
+        assert "in eu-west-1 [browser family]" in shared[0]["Finding_Details"]
+        assert mock_iam.get_role.call_count == 0
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_non_primary_region_leaves_sharing_to_the_primary(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(
+            mock_ac, mock_iam, runtimes=["SharedRole"], gateways=["SharedRole"]
+        )
+
+        findings, factory = self._run(
+            mock_ac, {}, ["us-west-2", "us-east-1"], primary=False, inventory=inventory
+        )
+
+        assert not self._named(findings, self._SHARED)
+        assert not self._named(findings, "AgentCore Execution Role Sharing")
+        assert factory.call_count == 0
+        assert len(self._named(findings, "AgentCore Execution Role Trust")) == 1
+
+    def test_the_handler_passes_the_assessed_regions_to_ac48(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+
+        assert 'target_regions = event.get("TargetRegions")' in source
+        call = source[
+            source.index("lambda: check_agentcore_execution_role_trust_and_sharing(") :
+        ]
+        call = call[: call.index(")")]
+        assert "browser_inventory, target_regions, is_primary_region" in " ".join(
+            call.split()
+        )
+
+
 # ===================================================================
 # AC-49 DNS egress control
 # ===================================================================

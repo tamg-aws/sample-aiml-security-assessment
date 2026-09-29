@@ -26416,8 +26416,58 @@ def _agentcore_execution_role_references(
     return references, errors
 
 
+def _agentcore_other_region_role_references(
+    regions: List[str],
+) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, Exception, str]]]:
+    """Return the execution role references of the AgentCore resources in `regions`.
+
+    Each label ends with its Region. A Region where AgentCore has no endpoint,
+    or that the account has not opted into, holds no resource and is skipped,
+    as the handler skips it. A Region whose probe fails for any other reason is
+    returned as an error naming it, so a role shared there is not read as
+    absent.
+    """
+    global agentcore_client
+    references: List[Tuple[str, str, str]] = []
+    errors: List[Tuple[str, Exception, str]] = []
+    held = agentcore_client
+    try:
+        for region in regions:
+            label = f"The AgentCore resources in region {region}"
+            try:
+                client = boto3.client(
+                    "bedrock-agentcore-control", config=boto3_config, region_name=region
+                )
+                client.list_agent_runtimes(maxResults=1)
+            except EndpointConnectionError:
+                continue
+            except ClientError as error:
+                code = error.response.get("Error", {}).get("Code", "")
+                if code in REGION_UNAVAILABLE_ERROR_CODES:
+                    continue
+                errors.append((label, error, "bedrock-agentcore:ListAgentRuntimes"))
+                continue
+            except Exception as error:
+                errors.append((label, error, "bedrock-agentcore:ListAgentRuntimes"))
+                continue
+            agentcore_client = client
+            found, failed = _agentcore_execution_role_references()
+            references.extend(
+                (family, f"{name} in {region}", role_arn)
+                for family, name, role_arn in found
+            )
+            errors.extend(
+                (f"{name} in {region}", error, action) for name, error, action in failed
+            )
+    finally:
+        agentcore_client = held
+    return references, errors
+
+
 def check_agentcore_execution_role_trust_and_sharing(
     browser_inventory: Dict[str, Any] = None,
+    target_regions: Optional[List[str]] = None,
+    is_primary_region: bool = True,
 ) -> List[Dict[str, Any]]:
     """AC-48: Judge who may assume each AgentCore execution role, and its reuse.
 
@@ -26433,6 +26483,11 @@ def check_agentcore_execution_role_trust_and_sharing(
     AC-27 already judges the deputy guard on the roles that gateways name. The
     runtime, browser and code interpreter families had no trust policy read by
     anything, and no check read the account-wide principal or the sharing.
+
+    An IAM role is global, so reuse can span Regions. When the handler passes
+    the assessed Regions, the primary Region reads every other Region's
+    resources for the sharing leg and the other Regions leave it to the
+    primary. Trust is judged in the Region that holds the resource.
     """
     reference = CONFUSED_DEPUTY_REFERENCE_URL
     if agentcore_client is None:
@@ -26460,7 +26515,18 @@ def check_agentcore_execution_role_trust_and_sharing(
             )
         ]
 
-    if not references and not errors:
+    region = agentcore_client.meta.region_name
+    judge_sharing = target_regions is None or is_primary_region
+    compared_regions = [region]
+    remote_references: List[Tuple[str, str, str]] = []
+    remote_errors: List[Tuple[str, Exception, str]] = []
+    if target_regions is not None and is_primary_region:
+        compared_regions += [r for r in target_regions if r and r != region]
+        remote_references, remote_errors = _agentcore_other_region_role_references(
+            compared_regions[1:]
+        )
+
+    if not references and not errors and not remote_references and not remote_errors:
         return [
             create_finding(
                 check_id="AC-48",
@@ -26649,7 +26715,22 @@ def check_agentcore_execution_role_trust_and_sharing(
                 )
             )
 
-    shared = {role_arn: users for role_arn, users in roles.items() if len(users) > 1}
+    if not judge_sharing:
+        return findings
+
+    sharing_roles = roles
+    sharing_errors = errors + remote_errors
+    if target_regions is not None:
+        sharing_roles = {
+            role_arn: [(family, f"{label} in {region}") for family, label in users]
+            for role_arn, users in roles.items()
+        }
+        for family, label, role_arn in remote_references:
+            if role_arn:
+                sharing_roles.setdefault(role_arn, []).append((family, label))
+    shared = {
+        role_arn: users for role_arn, users in sharing_roles.items() if len(users) > 1
+    }
     for role_arn, users in shared.items():
         role_name = str(role_arn).rsplit("/", 1)[-1]
         used_by = ", ".join(f"{label} [{family} family]" for family, label in users)
@@ -26673,21 +26754,21 @@ def check_agentcore_execution_role_trust_and_sharing(
             )
         )
 
-    if roles and not shared and errors:
+    if (sharing_roles or remote_errors) and not shared and sharing_errors:
         findings.append(
             create_finding(
                 check_id="AC-48",
                 finding_name="AgentCore Execution Role Sharing Incomplete",
                 finding_details=(
-                    f"The {sum(len(users) for users in roles.values())} AgentCore "
-                    f"resource(s) read name {len(roles)} distinct role ARN(s), but "
-                    f"{len(errors)} read(s) failed, so a resource that shares one "
-                    "of these roles may be missing: "
-                    f"{', '.join(label for label, _, _ in errors)}."
+                    f"The {sum(len(users) for users in sharing_roles.values())} "
+                    f"AgentCore resource(s) read name {len(sharing_roles)} distinct "
+                    f"role ARN(s), but {len(sharing_errors)} read(s) failed, so a "
+                    "resource that shares one of these roles may be missing: "
+                    f"{', '.join(label for label, _, _ in sharing_errors)}."
                 ),
                 resolution=(
                     "Grant "
-                    f"{', '.join(sorted({action for _, _, action in errors}))} "
+                    f"{', '.join(sorted({action for _, _, action in sharing_errors}))} "
                     "and rerun the assessment."
                 ),
                 reference=AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
@@ -26695,19 +26776,24 @@ def check_agentcore_execution_role_trust_and_sharing(
                 status=StatusEnum.NA,
             )
         )
-    elif roles and not shared:
+    elif sharing_roles and not shared:
+        scope = (
+            "this region. A resource in another region that names one of these "
+            "roles is not compared, because each region is assessed on its own."
+            if target_regions is None
+            else f"across the {len(compared_regions)} assessed region(s): "
+            f"{', '.join(compared_regions)}."
+        )
         findings.append(
             create_finding(
                 check_id="AC-48",
                 finding_name="AgentCore Execution Role Sharing",
                 finding_details=(
-                    f"The {sum(len(users) for users in roles.values())} AgentCore "
-                    "resource(s) that name an "
-                    f"execution role name {len(roles)} distinct role ARN(s), so "
-                    "no role is assumed on behalf of more than one resource in "
-                    "this region. A resource in another region that names one of "
-                    "these roles is not compared, because each region is "
-                    "assessed on its own."
+                    f"The {sum(len(users) for users in sharing_roles.values())} "
+                    "AgentCore resource(s) that name an "
+                    f"execution role name {len(sharing_roles)} distinct role "
+                    "ARN(s), so no role is assumed on behalf of more than one "
+                    f"resource {scope}"
                 ),
                 resolution="No action required.",
                 reference=AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
@@ -30736,6 +30822,11 @@ def lambda_handler(event, context):
         # IAM is global: only the primary region (Map index 0) runs IAM-only checks.
         is_primary_region = int(event.get("RegionIndex", 0)) == 0
         logger.info(f"Scanning region: {region} (primary={is_primary_region})")
+        # Every Region the Map assesses. AC-48 and AC-26 read the other Regions
+        # from the primary; an older state machine sends none.
+        target_regions = event.get("TargetRegions")
+        if not isinstance(target_regions, list):
+            target_regions = None
 
         execution_id = event.get("Execution", {}).get("Name", "unknown")
 
@@ -31336,7 +31427,7 @@ def lambda_handler(event, context):
                 ["AC-48"],
                 "Execution Role Trust And Sharing",
                 lambda: check_agentcore_execution_role_trust_and_sharing(
-                    browser_inventory
+                    browser_inventory, target_regions, is_primary_region
                 ),
             ),
             (

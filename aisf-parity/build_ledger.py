@@ -1217,7 +1217,9 @@ AI_SUBJECT_ROWS = [
         "the assessed account in every value, fails an account-root or bare account-id "
         "principal unless its condition names the calling principal, and fails a role "
         "that more than one AgentCore resource names, since the shared role carries "
-        "the union of what each needs. The sharing Passed is withheld while any family "
+        "the union of what each needs. The sharing leg runs at the primary Region and "
+        "compares the roles of every assessed Region, and an unread Region is N/A. "
+        "The sharing Passed is withheld while any family "
         "could not be listed, so it reads N/A until "
         "bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are "
         "granted. AC-27 also reads the gateway roles",
