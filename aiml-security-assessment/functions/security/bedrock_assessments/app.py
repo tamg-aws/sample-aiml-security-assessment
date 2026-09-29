@@ -17532,9 +17532,9 @@ INSPECTOR_LAMBDA_EXCLUSION_TAG = ("inspectorexclusion", "lambdastandardscanning"
 
 INSPECTOR_LAMBDA_CEILING = (
     "A container-image function is judged by the ECR coverage record of the image "
-    "digest it resolves to, and no CODE record is required of it. No AWS API records whether a deployment pipeline blocks on an Inspector finding, and "
-    "the targets of an EventBridge rule are not read (events:ListTargetsByRule is "
-    "not granted). Partial, ceiling reached."
+    "digest it resolves to, and no CODE record is required of it. No AWS API records "
+    "whether a deployment pipeline blocks on an Inspector finding. Partial, ceiling "
+    "reached."
 )
 
 # ListCoverage scan types Inspector reports for a Lambda function: PACKAGE is
@@ -17704,10 +17704,11 @@ def _inspector_lambda_coverage(
 
 
 def _inspector_finding_rules(region: str) -> str:
-    """Name the ENABLED default-bus EventBridge rules that match Inspector events."""
+    """Name the ENABLED default-bus EventBridge rules that match Inspector events, and their targets."""
+    events_client = boto3.client("events", config=boto3_config, region_name=region)
     try:
         rules = _list_all_items(
-            boto3.client("events", config=boto3_config, region_name=region),
+            events_client,
             "list_rules",
             "Rules",
             max_results_param="Limit",
@@ -17735,8 +17736,33 @@ def _inspector_finding_rules(region: str) -> str:
             "No ENABLED EventBridge rule on the default event bus matches source "
             "aws.inspector2, so no Inspector finding is routed automatically."
         )
-    return "ENABLED EventBridge rule(s) matching source aws.inspector2: {}.".format(
-        ", ".join(sorted(matching)[:10])
+    notes = []
+    for name in sorted(matching)[:10]:
+        try:
+            targets = _list_all_items(
+                events_client,
+                "list_targets_by_rule",
+                "Targets",
+                max_results_param="Limit",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                max_results=100,
+                Rule=name,
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            notes.append(
+                f"The targets of rule {name} were not read (events:ListTargetsByRule, "
+                f"{get_assessment_error_label(error)})."
+            )
+            continue
+        arns = sorted(str(t.get("Arn")) for t in targets if isinstance(t, dict))
+        notes.append(
+            f"Rule {name} sends matching events to {', '.join(arns)}."
+            if arns
+            else f"Rule {name} has no target, so the events it matches reach nothing."
+        )
+    return "ENABLED EventBridge rule(s) matching source aws.inspector2: {}. {}".format(
+        ", ".join(sorted(matching)[:10]), " ".join(notes)
     )
 
 

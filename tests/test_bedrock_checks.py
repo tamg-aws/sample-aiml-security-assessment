@@ -19763,6 +19763,7 @@ class TestBR33InspectorLambdaCodeScanning:
         coverage_error=None,
         rules=(),
         rules_error=None,
+        targets=None,
     ):
         lambda_client = MagicMock()
         tags = tags or {}
@@ -19809,6 +19810,17 @@ class TestBR33InspectorLambdaCodeScanning:
             events_client.list_rules.side_effect = rules_error
         else:
             events_client.list_rules.return_value = {"Rules": list(rules)}
+
+        def list_targets(Rule, **kwargs):
+            listed = (targets or {}).get(Rule, [])
+            if isinstance(listed, Exception):
+                raise listed
+            return {
+                "Targets": [{"Id": str(i), "Arn": arn} for i, arn in enumerate(listed)]
+            }
+
+        events_client.list_targets_by_rule.side_effect = list_targets
+        self.events_client = events_client
 
         def client(service_name, *args, **kwargs):
             if service_name == "lambda":
@@ -20555,6 +20567,50 @@ class TestBR33InspectorLambdaCodeScanning:
         assert "matching source aws.inspector2: route-findings." in detail
         assert "disabled-findings" not in detail
         assert "ec2-state" not in detail
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_names_the_targets_of_each_inspector_rule(self, mock_client):
+        rules = [
+            {
+                "Name": name,
+                "State": "ENABLED",
+                "EventPattern": '{"source": ["aws.inspector2"]}',
+            }
+            for name in ("route-findings", "idle-findings", "locked-findings")
+        ]
+        findings, _ = self._br33(
+            mock_client,
+            [self._bedrock_lambda("bedrock-ok")],
+            rules=rules,
+            targets={
+                "route-findings": [
+                    "arn:aws:sns:us-east-1:123456789012:findings",
+                    "arn:aws:lambda:us-east-1:123456789012:function:triage",
+                ],
+                "idle-findings": [],
+                "locked-findings": _make_client_error("AccessDeniedException"),
+            },
+        )
+
+        detail = findings[0]["Finding_Details"]
+        assert (
+            "Rule route-findings sends matching events to "
+            "arn:aws:lambda:us-east-1:123456789012:function:triage, "
+            "arn:aws:sns:us-east-1:123456789012:findings." in detail
+        )
+        assert (
+            "Rule idle-findings has no target, so the events it matches reach "
+            "nothing." in detail
+        )
+        assert (
+            "The targets of rule locked-findings were not read "
+            "(events:ListTargetsByRule, AccessDeniedException)." in detail
+        )
+        assert "events:ListTargetsByRule is not granted" not in detail
+        assert sorted(
+            call.kwargs["Rule"]
+            for call in self.events_client.list_targets_by_rule.call_args_list
+        ) == ["idle-findings", "locked-findings", "route-findings"]
 
     @patch("bedrock_app.boto3.client")
     def test_br33_no_rule_and_unread_rules_are_said_apart(self, mock_client):

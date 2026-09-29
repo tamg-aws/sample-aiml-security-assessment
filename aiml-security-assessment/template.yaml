@@ -329,6 +329,13 @@ Resources:
             Action:
               - account:ListRegions # BR-51
             Resource: !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
+          - Sid: EventBridgeRuleTargetList
+            # BR-33 names the targets of each default-bus rule that matches
+            # Inspector findings.
+            Effect: Allow
+            Action:
+              - events:ListTargetsByRule # BR-33
+            Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
