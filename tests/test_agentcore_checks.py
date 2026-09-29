@@ -20286,6 +20286,113 @@ class TestAC17RuntimeCoverage:
         assert findings[0]["Status"] == verdict
 
 
+class TestAC17AgentsOutsideRuntime:
+    """AC-17: a region with no runtime is judged by its agent trace log groups."""
+
+    _GROUPS = {
+        "/aws/bedrock-agentcore/runtimes/": [
+            {"logGroupName": "/aws/bedrock-agentcore/runtimes/lambda-agent"},
+            {"logGroupName": "/aws/bedrock-agentcore/runtimes/ecs-agent"},
+        ],
+        "/aws/vendedlogs/bedrock-agentcore/": [
+            {"logGroupName": "/aws/vendedlogs/bedrock-agentcore/memory/m1"}
+        ],
+    }
+
+    @staticmethod
+    def _run(mock_ac, mock_logs, groups, details=()):
+        _online_evaluation_client(mock_ac, list(details) or None)
+        if not details:
+            mock_ac.list_online_evaluation_configs.return_value = {
+                "onlineEvaluationConfigs": []
+            }
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        if isinstance(groups, Exception):
+            mock_logs.describe_log_groups.side_effect = groups
+        else:
+            mock_logs.describe_log_groups.side_effect = _log_group_side_effect(groups)
+        with patch.dict(os.environ, {}, clear=True):
+            findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+        assert len(findings) == 1, findings
+        return findings[0]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_agent_log_groups_without_a_running_configuration_fail(
+        self, mock_ac, mock_logs
+    ):
+        finding = self._run(mock_ac, mock_logs, self._GROUPS)
+
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "Medium"
+        details = finding["Finding_Details"]
+        assert "/aws/bedrock-agentcore/runtimes/lambda-agent" in details
+        assert "/aws/bedrock-agentcore/runtimes/ecs-agent" in details
+        assert "memory/m1" not in details
+        assert "deleted runtime" in details
+        assert_finding_schema(finding)
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_stopped_configuration_does_not_clear_the_groups(
+        self, mock_ac, mock_logs
+    ):
+        finding = self._run(
+            mock_ac,
+            mock_logs,
+            self._GROUPS,
+            [_ac17_reads("lambda-agent", executionStatus="DISABLED")],
+        )
+
+        assert finding["Status"] == "Failed"
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_running_configuration_passes_with_the_groups_present(
+        self, mock_ac, mock_logs
+    ):
+        finding = self._run(
+            mock_ac, mock_logs, self._GROUPS, [_ac17_reads("lambda-agent")]
+        )
+
+        assert finding["Status"] == "Passed"
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_runtime_prefix_is_read(self, mock_ac, mock_logs):
+        finding = self._run(
+            mock_ac,
+            mock_logs,
+            {
+                "/aws/vendedlogs/bedrock-agentcore/": self._GROUPS[
+                    "/aws/vendedlogs/bedrock-agentcore/"
+                ]
+            },
+        )
+
+        assert finding["Status"] == "N/A"
+        assert [
+            call.kwargs.get("logGroupNamePrefix")
+            for call in mock_logs.describe_log_groups.call_args_list
+        ] == ["/aws/bedrock-agentcore/runtimes/"]
+        assert (
+            "no log group under /aws/bedrock-agentcore/runtimes/"
+            in (finding["Finding_Details"])
+        )
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_log_group_list_is_na(self, mock_ac, mock_logs):
+        finding = self._run(
+            mock_ac,
+            mock_logs,
+            _make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert finding["Status"] == "N/A"
+        assert "logs:DescribeLogGroups" in finding["Resolution"]
+
+
 def _ac17_endpoints(mock_ac, by_runtime):
     """List each runtime's endpoints by name, keyed on the runtime id."""
     mock_ac.list_agent_runtime_endpoints.side_effect = lambda agentRuntimeId, **_: {

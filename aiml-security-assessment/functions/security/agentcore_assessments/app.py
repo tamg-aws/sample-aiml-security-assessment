@@ -7678,7 +7678,9 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
 
     With no runtime in the region, REQUIRE_AGENTCORE_ONLINE_EVALUATION set to
     true still requires one running configuration, for agents hosted outside
-    AgentCore Runtime whose traces reach CloudWatch; unset, that case is N/A.
+    AgentCore Runtime whose traces reach CloudWatch. Unset, a log group under
+    the runtime prefix requires one as well, because the AgentCore guide has
+    such an agent write there; with no such group, that case is N/A.
     """
     finding_name = "AgentCore Online Evaluation Coverage"
     if agentcore_client is None:
@@ -7778,16 +7780,70 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                 "ENABLED with a sampling percentage above zero."
             )
         else:
-            status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
-            details_text = (
-                "No AgentCore runtimes found in this region, so no runtime needs "
-                "online evaluation. AC-39 judges any configuration that exists."
-            )
-            resolution = (
-                "No action required unless agents hosted outside AgentCore Runtime "
-                "run here. Set REQUIRE_AGENTCORE_ONLINE_EVALUATION to true to "
-                "require online evaluation for them."
-            )
+            # The AgentCore guide has an agent hosted outside AgentCore Runtime
+            # write to a log group it creates under the runtime prefix, so a
+            # group there with no runtime in the region is that agent's.
+            agent_groups: List[str] = []
+            groups_error = None
+            if logs_client is not None:
+                try:
+                    agent_groups = sorted(
+                        group["logGroupName"]
+                        for group in _paginate_aws_list(
+                            logs_client,
+                            "describe_log_groups",
+                            "logGroups",
+                            logGroupNamePrefix=AGENTCORE_RUNTIME_LOG_GROUP_PREFIX,
+                        )
+                        if group.get("logGroupName")
+                    )
+                except (BotoCoreError, ClientError) as error:
+                    groups_error = _assessment_error_label(error)
+            if agent_groups:
+                status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
+                details_text = (
+                    "No AgentCore runtimes found in this region, but "
+                    f"{len(agent_groups)} log group(s) under "
+                    f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}, where the AgentCore "
+                    "guide has agents hosted outside AgentCore Runtime write, "
+                    f"exist: {', '.join(agent_groups)}. No online evaluation "
+                    f"configuration is running ({len(judged)} found). A group a "
+                    "deleted runtime left behind reads the same."
+                )
+                resolution = (
+                    "Create an online evaluation configuration over these log "
+                    "groups with the agent's service name, and set it ENABLED "
+                    "with a sampling percentage above zero. Delete a group no "
+                    "agent writes to."
+                )
+            elif groups_error:
+                status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                details_text = (
+                    "No AgentCore runtimes found in this region, and whether an "
+                    "agent hosted outside AgentCore Runtime writes traces here "
+                    "was not established: logs:DescribeLogGroups failed with "
+                    f"{groups_error}."
+                )
+                resolution = "Grant logs:DescribeLogGroups and retry."
+            else:
+                status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                details_text = (
+                    "No AgentCore runtimes found in this region"
+                    + (
+                        f", and no log group under "
+                        f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}, where agents "
+                        "hosted outside AgentCore Runtime write"
+                        if logs_client is not None
+                        else ""
+                    )
+                    + ", so no agent here needs online evaluation. AC-39 judges "
+                    "any configuration that exists."
+                )
+                resolution = (
+                    "No action required unless agents hosted outside AgentCore "
+                    "Runtime run here. Set REQUIRE_AGENTCORE_ONLINE_EVALUATION to "
+                    "true to require online evaluation for them."
+                )
         return [
             create_finding(
                 check_id="AC-17",
