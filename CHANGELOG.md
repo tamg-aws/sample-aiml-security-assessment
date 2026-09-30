@@ -298,6 +298,14 @@ section.
 
 ### Fixed
 
+- `AC-34` reads the environment variables of every runtime version an
+  endpoint serves. It read only the version `GetAgentRuntime` returns by
+  default, so an endpoint still serving an older version with an API key in
+  its environment passed ID-05. Each other `liveVersion` and `targetVersion`
+  from `ListAgentRuntimeEndpoints` is now read with `agentRuntimeVersion` and
+  judged on its own row. When the endpoints cannot be listed, a clean default
+  version is `N/A` and a failing one stays `Failed`. No new IAM action.
+
 - `AC-26` judges retention and key scope on a log group a `bedrock-agentcore`
   delivery writes to outside the AgentCore prefixes. AC-20 already read those
   groups through `DescribeDeliveryDestinations`, but AC-26 read only the

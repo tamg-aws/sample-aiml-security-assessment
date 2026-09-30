@@ -19454,7 +19454,14 @@ def _harness_inline_credentials(harness: Dict[str, Any]) -> Tuple[List[str], int
 
 
 def _agentcore_runtime_credential_findings() -> List[Dict[str, Any]]:
-    """AC-34's runtime leg: one finding per runtime's environment variables."""
+    """AC-34's runtime leg: one finding per runtime version's environment variables.
+
+    GetAgentRuntime with no agentRuntimeVersion returns one version. An endpoint
+    can serve an older version, or roll toward a newer one, whose environment
+    variables differ, so each liveVersion and targetVersion that
+    ListAgentRuntimeEndpoints reports is read and judged on its own row, as
+    AC-30 does for the inbound authorizer.
+    """
     try:
         runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
     except Exception as error:
@@ -19467,6 +19474,85 @@ def _agentcore_runtime_credential_findings() -> List[Dict[str, Any]]:
             )
         ]
 
+    def unread_finding(label: str, error: Exception) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-34",
+            finding_name="AgentCore Runtime Inline Credentials",
+            finding_details=(
+                f"{label} environment variables could not be read: "
+                f"{_assessment_error_label(error)}."
+            ),
+            resolution=(
+                "Grant bedrock-agentcore:GetAgentRuntime on this runtime and retry."
+            ),
+            reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    def judge(label: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        environment_variables = details.get("environmentVariables") or {}
+        if not environment_variables:
+            return create_finding(
+                check_id="AC-34",
+                finding_name="AgentCore Runtime Inline Credentials",
+                finding_details=(
+                    f"{label} carries no environment variables, so its "
+                    "definition holds no inline credential."
+                ),
+                resolution=f"No action required. {AC34_CODE_CEILING}",
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+
+        literals, pointers = _credential_entries(environment_variables)
+
+        if literals:
+            return create_finding(
+                check_id="AC-34",
+                finding_name="AgentCore Runtime Inline Credential Found",
+                finding_details=(
+                    f"{label} holds credential material inline in the "
+                    f"environment variable(s) {', '.join(literals)}, which "
+                    "every process in the microVM reads. The values are "
+                    "withheld from this report."
+                ),
+                resolution=(
+                    "Move each value into the AgentCore Identity token vault "
+                    "or AWS Secrets Manager, set the variable to the secret's "
+                    "ARN, and rotate the exposed credential."
+                ),
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+
+        scanned = (
+            f"{len(environment_variables)} environment variable(s), of which "
+            f"{', '.join(pointers)} name a credential and hold a reference to one"
+            if pointers
+            else f"{len(environment_variables)} environment variable(s)"
+        )
+        return create_finding(
+            check_id="AC-34",
+            finding_name="AgentCore Runtime Inline Credentials",
+            finding_details=(
+                f"{label} was scanned across {scanned}, and none holds "
+                "credential material inline."
+            ),
+            resolution=(
+                "No action required. This scan reads variable names and value "
+                "shapes: a value containing a slash reads as a secret name "
+                "unless it is a base64 string of 40 or more characters, so "
+                "confirm the remaining values are references and not literals. "
+                f"{AC34_CODE_CEILING}"
+            ),
+            reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.PASSED,
+        )
+
     findings = []
     for runtime in runtimes:
         runtime_id = runtime.get("agentRuntimeId", "unknown")
@@ -19476,94 +19562,66 @@ def _agentcore_runtime_credential_findings() -> List[Dict[str, Any]]:
         try:
             details = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
         except Exception as error:
-            findings.append(
-                create_finding(
+            findings.append(unread_finding(label, error))
+            continue
+
+        finding = judge(label, details)
+        try:
+            endpoints = _agentcore_list_all(
+                "list_agent_runtime_endpoints",
+                ["runtimeEndpoints"],
+                agentRuntimeId=runtime_id,
+            )
+        except (BotoCoreError, ClientError) as error:
+            unread = (
+                " The versions its endpoints serve could not be listed: "
+                "ListAgentRuntimeEndpoints failed with "
+                f"{_assessment_error_label(error)}."
+            )
+            if finding["Status"] == StatusEnum.PASSED.value:
+                finding = create_finding(
                     check_id="AC-34",
                     finding_name="AgentCore Runtime Inline Credentials",
                     finding_details=(
-                        f"{label} environment variables could not be read: "
-                        f"{_assessment_error_label(error)}."
+                        f"{finding['Finding_Details']}{unread} A version an "
+                        "endpoint serves may carry other environment variables, "
+                        "so the runtime is not reported as clean."
                     ),
                     resolution=(
-                        "Grant bedrock-agentcore:GetAgentRuntime on this runtime "
-                        "and retry."
+                        "Grant bedrock-agentcore:ListAgentRuntimeEndpoints and retry."
                     ),
                     reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
-            )
+            else:
+                finding["Finding_Details"] += unread
+            findings.append(finding)
             continue
+        findings.append(finding)
 
-        environment_variables = details.get("environmentVariables") or {}
-        if not environment_variables:
-            findings.append(
-                create_finding(
-                    check_id="AC-34",
-                    finding_name="AgentCore Runtime Inline Credentials",
-                    finding_details=(
-                        f"{label} carries no environment variables, so its "
-                        "definition holds no inline credential."
-                    ),
-                    resolution=f"No action required. {AC34_CODE_CEILING}",
-                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
+        served: Dict[str, List[str]] = {}
+        for endpoint in endpoints:
+            endpoint_name = endpoint.get("name") or endpoint.get("id") or "unnamed"
+            for field in ("liveVersion", "targetVersion"):
+                version = endpoint.get(field)
+                if version and endpoint_name not in served.setdefault(str(version), []):
+                    served[str(version)].append(endpoint_name)
+
+        default_version = str(details.get("agentRuntimeVersion"))
+        for version in sorted(v for v in served if v != default_version):
+            version_label = (
+                f"{label} version {version}, served by endpoint(s) "
+                f"{', '.join(sorted(served[version]))},"
+            )
+            try:
+                version_details = agentcore_client.get_agent_runtime(
+                    agentRuntimeId=runtime_id, agentRuntimeVersion=version
                 )
-            )
-            continue
-
-        literals, pointers = _credential_entries(environment_variables)
-
-        if literals:
-            findings.append(
-                create_finding(
-                    check_id="AC-34",
-                    finding_name="AgentCore Runtime Inline Credential Found",
-                    finding_details=(
-                        f"{label} holds credential material inline in the "
-                        f"environment variable(s) {', '.join(literals)}, which "
-                        "every process in the microVM reads. The values are "
-                        "withheld from this report."
-                    ),
-                    resolution=(
-                        "Move each value into the AgentCore Identity token vault "
-                        "or AWS Secrets Manager, set the variable to the secret's "
-                        "ARN, and rotate the exposed credential."
-                    ),
-                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.FAILED,
-                )
-            )
-            continue
-
-        scanned = (
-            f"{len(environment_variables)} environment variable(s), of which "
-            f"{', '.join(pointers)} name a credential and hold a reference to one"
-            if pointers
-            else f"{len(environment_variables)} environment variable(s)"
-        )
-        findings.append(
-            create_finding(
-                check_id="AC-34",
-                finding_name="AgentCore Runtime Inline Credentials",
-                finding_details=(
-                    f"{label} was scanned across {scanned}, and none holds "
-                    "credential material inline."
-                ),
-                resolution=(
-                    "No action required. This scan reads variable names and value "
-                    "shapes: a value containing a slash reads as a secret name "
-                    "unless it is a base64 string of 40 or more characters, so "
-                    "confirm the remaining values are references and not literals. "
-                    f"{AC34_CODE_CEILING}"
-                ),
-                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
-                severity=SeverityEnum.HIGH,
-                status=StatusEnum.PASSED,
-            )
-        )
+            except (BotoCoreError, ClientError) as error:
+                findings.append(unread_finding(version_label, error))
+                continue
+            findings.append(judge(version_label, version_details))
 
     return findings
 

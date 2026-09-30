@@ -16698,6 +16698,130 @@ def _ac34_by_resource(findings, marker):
     return [finding for finding in findings if marker in finding["Finding_Details"]]
 
 
+class TestAC34RuntimeServedVersions:
+    """AIR-ACR-ID-05: AC-34 reads the environment variables of every version an
+    endpoint serves, not only the version GetAgentRuntime returns by default."""
+
+    _CLEAN = {"LOG_LEVEL": "INFO"}
+    _INLINE = {"API_KEY": _SECRET_VALUE}
+
+    @classmethod
+    def _wire(cls, mock_ac, versions, endpoints_by_runtime, deny_version=None):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": rid, "agentRuntimeName": rid.upper()}
+                for rid in versions
+            ]
+        }
+
+        def get_agent_runtime(agentRuntimeId, agentRuntimeVersion=None):
+            by_version = versions[agentRuntimeId]
+            if agentRuntimeVersion is None:
+                agentRuntimeVersion = by_version["default"]
+            if agentRuntimeVersion == deny_version:
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {
+                "agentRuntimeVersion": agentRuntimeVersion,
+                "environmentVariables": by_version[agentRuntimeVersion],
+            }
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+        def list_endpoints(agentRuntimeId, **_):
+            endpoints = endpoints_by_runtime[agentRuntimeId]
+            if isinstance(endpoints, Exception):
+                raise endpoints
+            return {"runtimeEndpoints": endpoints}
+
+        mock_ac.list_agent_runtime_endpoints.side_effect = list_endpoints
+
+    @staticmethod
+    def _rows(findings):
+        rows = [
+            f
+            for f in findings
+            if f["Finding"].startswith("AgentCore Runtime Inline Credential")
+        ]
+        for row in rows:
+            assert row["Check_ID"] == "AC-34"
+            assert_finding_schema(row)
+            assert _SECRET_VALUE not in str(row)
+        return rows
+
+    _VERSIONS = {
+        "rt-a": {"default": "3", "1": _INLINE, "2": _CLEAN, "3": _CLEAN},
+        "rt-b": {"default": "5", "5": _CLEAN},
+    }
+    _ENDPOINTS = [
+        {"name": "prod", "liveVersion": "1"},
+        {"name": "canary", "liveVersion": "3", "targetVersion": "2"},
+    ]
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_an_older_served_version_with_an_inline_credential_fails(
+        self, mock_ac, reverse
+    ):
+        endpoints = list(reversed(self._ENDPOINTS)) if reverse else self._ENDPOINTS
+        self._wire(
+            mock_ac,
+            self._VERSIONS,
+            {"rt-a": endpoints, "rt-b": [{"name": "DEFAULT", "liveVersion": "5"}]},
+        )
+        rows = self._rows(agentcore_app.check_agentcore_runtime_inline_credentials())
+        assert [r["Status"] for r in rows] == [
+            "Passed",
+            "Failed",
+            "Passed",
+            "Passed",
+        ]
+        rt_a_old = rows[1]["Finding_Details"]
+        assert "(rt-a) version 1, served by endpoint(s) prod," in rt_a_old
+        assert "API_KEY" in rt_a_old
+        assert (
+            "(rt-a) version 2, served by endpoint(s) canary,"
+            in (rows[2]["Finding_Details"])
+        )
+        assert "(rt-b)" in rows[3]["Finding_Details"]
+        assert " version " not in rows[3]["Finding_Details"]
+        called = sorted(
+            call.kwargs.get("agentRuntimeVersion") or ""
+            for call in mock_ac.get_agent_runtime.call_args_list
+        )
+        assert called == ["", "", "1", "2"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlisted_endpoint_set_withholds_a_pass_and_keeps_a_fail(self, mock_ac):
+        denied = _make_client_error("AccessDeniedException", "denied")
+        self._wire(
+            mock_ac,
+            {
+                "rt-a": {"default": "3", "3": self._CLEAN},
+                "rt-b": {"default": "5", "5": self._INLINE},
+            },
+            {"rt-a": denied, "rt-b": denied},
+        )
+        rows = self._rows(agentcore_app.check_agentcore_runtime_inline_credentials())
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "bedrock-agentcore:ListAgentRuntimeEndpoints" in rows[0]["Resolution"]
+        for row in rows:
+            assert "ListAgentRuntimeEndpoints failed" in row["Finding_Details"]
+            assert "AccessDeniedException" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_served_version_is_na_on_its_own_row(self, mock_ac):
+        self._wire(
+            mock_ac,
+            self._VERSIONS,
+            {"rt-a": self._ENDPOINTS, "rt-b": []},
+            deny_version="1",
+        )
+        rows = self._rows(agentcore_app.check_agentcore_runtime_inline_credentials())
+        assert [r["Status"] for r in rows] == ["Passed", "N/A", "Passed", "Passed"]
+        assert "version 1, served by endpoint(s) prod," in rows[1]["Finding_Details"]
+        assert "AccessDeniedException" in rows[1]["Finding_Details"]
+
+
 class TestAC34ValueShapes:
     """AC-34: the slash rule and URL values, judged on the runtime leg."""
 
