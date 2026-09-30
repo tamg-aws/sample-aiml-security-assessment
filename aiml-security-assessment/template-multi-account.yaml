@@ -1372,7 +1372,7 @@ Resources:
                 # each needs Resource '*'.
                 - xray:GetTraceSegmentDestination # AC-19
                 - logs:DescribeDeliveryDestinations # AC-20, AC-26
-                - organizations:DescribeOrganization # AC-22
+                - organizations:DescribeOrganization # AC-06, AC-22
                 - oam:ListLinks # AC-22
                 - s3:GetAccountPublicAccessBlock # AC-06
                 - events:ListRules # AC-36, AC-50

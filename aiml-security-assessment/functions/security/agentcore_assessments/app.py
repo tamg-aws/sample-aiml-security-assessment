@@ -16,7 +16,7 @@ import re
 import time
 from fnmatch import fnmatchcase
 from io import StringIO
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from botocore.config import Config
@@ -6248,8 +6248,9 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
 
 # AC-06 judges where recordings go as well as whether they are on. A recording
 # holds every page the agent saw, so its bucket must encrypt with a KMS key,
-# block public access, refuse the recordings over plaintext and expire them,
-# and the browser's execution role must be able to write them.
+# block public access, refuse the recordings over plaintext, let no other
+# account read them and expire them, and the browser's execution role must be
+# able to write them.
 BROWSER_RECORDING_KMS_ALGORITHMS = ("aws:kms", "aws:kms:dsse")
 S3_PUBLIC_ACCESS_BLOCK_FIELDS = (
     "BlockPublicAcls",
@@ -6283,6 +6284,7 @@ BROWSER_RECORDING_BUCKET_READS = (
     ("versioning", "get_bucket_versioning", None, "s3:GetBucketVersioning"),
 )
 BROWSER_RECORDING_WRITE_ACTION = "s3:putobject"
+BROWSER_RECORDING_READ_ACTION = "s3:getobject"
 BROWSER_RECORDING_WRITE_CEILING = (
     "Service control policies, the bucket key's policy and the role's use of "
     "that key are not evaluated for this write, so any of them may still refuse "
@@ -6515,7 +6517,11 @@ def _recording_bucket_gaps(
 
     state, response = reads["policy"]
     if state == "error":
-        not_read("policy", "bucket policy")
+        not_read(
+            "policy",
+            "bucket policy, which decides the TLS leg and who else may "
+            "s3:GetObject the recordings",
+        )
     else:
         statements = _document_statements((response or {}).get("Policy"))
         if any(_statement_refuses_plaintext(st, object_arn) for st in statements):
@@ -6596,11 +6602,16 @@ def _recording_bucket_gaps(
     return problems, fixes, unread, retries, facts
 
 
-BROWSER_RECORDING_READ_ACTION = "s3:getobject"
+def _statement_reaches_object(
+    statement: Dict[str, Any], action: str, object_arn: str
+) -> bool:
+    """Return whether a statement reaches `action` on any key under object_arn.
 
-
-def _recording_prefix_reached(statement: Dict[str, Any], object_arn: str) -> bool:
-    """Return whether one statement's resources reach the recording prefix."""
+    A Resource narrower than the prefix, such as one session's keys, still
+    reaches some recordings, so the match runs in both directions.
+    """
+    if not _statement_matches_action(statement, action):
+        return False
     if "NotResource" in statement:
         return _statement_resource_covers(statement, [object_arn])
     return any(
@@ -6626,43 +6637,88 @@ def _restrict_public_buckets(reads: Dict[str, Tuple[str, Any]]) -> Optional[bool
     return account_config.get("RestrictPublicBuckets") is True
 
 
+# The condition keys S3 accepts as making a bucket policy statement non-public
+# when they are set to fixed values, from "The meaning of public" in the S3
+# Block Public Access guide.
+S3_NON_PUBLIC_CONDITION_KEYS = {
+    "aws:principalarn",
+    "aws:principalaccount",
+    "aws:principalorgid",
+    "aws:sourceip",
+    "aws:sourcearn",
+    "aws:sourcevpc",
+    "aws:sourcevpce",
+    "aws:sourceowner",
+    "aws:sourceaccount",
+    "aws:userid",
+    "s3:dataaccesspointarn",
+    "s3:dataaccesspointaccount",
+}
+
+
+def _s3_public_statement(statement: Dict[str, Any]) -> bool:
+    """Return whether S3 would read one bucket policy Allow as public.
+
+    It is public when it trusts Principal "*" or uses NotPrincipal and no
+    condition sets a key in S3_NON_PUBLIC_CONDITION_KEYS to values with no
+    wildcard or policy variable. Any operator counts, so a statement S3 might
+    still call public is judged by what its condition admits.
+    """
+    if statement.get("Effect") != "Allow":
+        return False
+    if "NotPrincipal" not in statement and "*" not in _statement_principals(statement):
+        return False
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return True
+    for entries in conditions.values():
+        if not isinstance(entries, dict):
+            continue
+        for key, raw in entries.items():
+            values = _condition_values(raw)
+            if (
+                str(key).strip().lower() in S3_NON_PUBLIC_CONDITION_KEYS
+                and values
+                and not any(
+                    "*" in value or "?" in value or "${" in value for value in values
+                )
+            ):
+                return False
+    return True
+
+
 def _recording_bucket_read_grants(
     statements: List[Dict[str, Any]],
     object_arn: str,
     account: str,
     restrict: Optional[bool],
-) -> List[str]:
+    read_organization_id: Callable[[], str],
+) -> Tuple[List[str], List[Tuple[str, str]]]:
     """Return the bucket policy Allows that open the recordings past the account.
 
-    An unconditioned Allow of s3:GetObject reaching the recording prefix counts
-    when it names Principal "*", uses NotPrincipal, or names a principal in
-    another account. A service principal is not counted, and neither is any
-    Allow with a condition, which is not evaluated. RestrictPublicBuckets limits
-    a bucket with a public policy to its own account, so the public grants count
-    only when it is known to be off, and while it is on a grant to another
-    account counts only when no unconditioned Allow in the policy is public.
+    Returns (open grants, (statement, grant) pairs bound only to an
+    organization that could not be read). An Allow of s3:GetObject reaching
+    the recording prefix counts when it names Principal "*", uses NotPrincipal,
+    or names a principal in another account, unless aws:PrincipalAccount or
+    aws:SourceAccount names `account` by value or aws:PrincipalOrgID names this
+    account's organization. A service principal is not counted.
+    RestrictPublicBuckets limits a bucket with a public policy to its own
+    account and AWS service principals, so while it is on and any statement is
+    public no grant counts, and a public "*" or NotPrincipal grant counts only
+    when it is known to be off.
     """
-    public = any(
-        statement.get("Effect") == "Allow"
-        and not statement.get("Condition")
-        and ("NotPrincipal" in statement or "*" in _statement_principals(statement))
-        for statement in statements
-    )
-    if restrict and public:
-        return []
+    if restrict and any(_s3_public_statement(st) for st in statements):
+        return [], []
     grants: List[str] = []
-    for statement in statements:
-        if (
-            statement.get("Effect") != "Allow"
-            or statement.get("Condition")
-            or not _statement_matches_action(statement, BROWSER_RECORDING_READ_ACTION)
-            or not _recording_prefix_reached(statement, object_arn)
+    org_bound: List[Tuple[str, str]] = []
+    for index, statement in enumerate(statements, start=1):
+        if statement.get("Effect") != "Allow" or not _statement_reaches_object(
+            statement, BROWSER_RECORDING_READ_ACTION, object_arn
         ):
             continue
+        open_to_all = restrict is False or not _s3_public_statement(statement)
         if "NotPrincipal" in statement:
-            wide = (
-                ["every principal NotPrincipal leaves out"] if restrict is False else []
-            )
+            wide = ["every principal NotPrincipal leaves out"] if open_to_all else []
         else:
             wide = []
             for principal in _statement_principals(statement):
@@ -6671,15 +6727,35 @@ def _recording_bucket_read_grants(
                     if len(principal) == 12 and principal.isdigit()
                     else _arn_account(principal)
                 )
-                if (principal == "*" and restrict is False) or (
-                    owner and owner != account
-                ):
+                if (principal == "*" and open_to_all) or (owner and owner != account):
                     wide.append(principal)
-        if wide:
-            sid = statement.get("Sid")
-            source = f"statement '{sid}'" if sid else "a statement"
-            grants.append(f"{source} to {', '.join(sorted(wide))}")
-    return grants
+        if not wide:
+            continue
+        accounts = _guard_condition_values(statement, "aws:principalaccount")
+        if accounts and all(value == account for value in accounts):
+            continue
+        if _confused_deputy_guard_account(
+            statement, account, keys=("aws:sourceaccount",)
+        ):
+            continue
+        scope = _sink_statement_scope(statement, account, read_organization_id)
+        if scope == "scoped":
+            continue
+        sid = statement.get("Sid")
+        source = f"statement '{sid}'" if sid else f"statement {index}"
+        grantees = ", ".join(sorted(wide))
+        if statement.get("Condition"):
+            grant = (
+                f"by {source} to {grantees}, whose condition limits it to neither "
+                f"account {account} nor its organization"
+            )
+        else:
+            grant = f"with no condition by {source} to {grantees}"
+        if scope == "org_unread":
+            org_bound.append((source, grant))
+        else:
+            grants.append(grant)
+    return grants, org_bound
 
 
 def _recording_cached_readers(permission_cache: Any, object_arn: str) -> str:
@@ -6707,8 +6783,9 @@ def _recording_cached_readers(permission_cache: Any, object_arn: str) -> str:
                 continue
             if any(
                 statement.get("Effect") == "Allow"
-                and _statement_matches_action(statement, BROWSER_RECORDING_READ_ACTION)
-                and _recording_prefix_reached(statement, object_arn)
+                and _statement_reaches_object(
+                    statement, BROWSER_RECORDING_READ_ACTION, object_arn
+                )
                 for statement in statements
             ) and _grant_survives(permissions, BROWSER_RECORDING_READ_ACTION):
                 readers.append(f"{kind} {name}")
@@ -6785,13 +6862,8 @@ def _recording_write_verdict(
     }
 
     def reaches(statement: Dict[str, Any]) -> bool:
-        if not _statement_matches_action(statement, BROWSER_RECORDING_WRITE_ACTION):
-            return False
-        if "NotResource" in statement:
-            return _statement_resource_covers(statement, [object_arn])
-        return any(
-            fnmatchcase(object_arn, pattern) or fnmatchcase(pattern, object_arn)
-            for pattern in _statement_resources(statement)
+        return _statement_reaches_object(
+            statement, BROWSER_RECORDING_WRITE_ACTION, object_arn
         )
 
     def applies_to_role(statement: Dict[str, Any]) -> bool:
@@ -6884,10 +6956,10 @@ def check_browser_tool_recording(
     The population is every custom browser. The AWS managed browser has no
     recording configuration to change. A recording browser passes only when its
     bucket, owned by the browser's account, encrypts with a KMS key, blocks
-    public access, denies the recording prefix without TLS and expires it, has no
-    unconditioned bucket policy Allow of s3:GetObject on the prefix to Principal
-    "*" or another account, and its execution role may write the prefix. Every
-    row names the cached roles and users whose identity policies read the
+    public access, denies the recording prefix without TLS and expires it, lets
+    no caller outside its account and organization s3:GetObject the prefix
+    through its bucket policy, and its execution role may write the prefix.
+    Every row names the cached roles and users whose identity policies read the
     prefix. A bucket leg or role that could
     not be read is N/A and never Passed, and it never hides a Failed leg.
     """
@@ -6938,6 +7010,29 @@ def check_browser_tool_recording(
                 )
             )
             return findings
+
+        organization: Dict[str, Any] = {}
+
+        def read_organization_id() -> str:
+            if "id" not in organization:
+                organization["id"] = ""
+                if organizations_client is None:
+                    organization["error"] = "was not called: no Organizations client"
+                else:
+                    try:
+                        organization["id"] = (
+                            organizations_client.describe_organization()
+                            .get("Organization", {})
+                            .get("Id", "")
+                        )
+                    except (BotoCoreError, ClientError) as error:
+                        organization["absent"] = (
+                            _s3_error_code(error) == "AWSOrganizationsNotInUseException"
+                        )
+                        organization["error"] = (
+                            f"failed with {_assessment_error_label(error)}"
+                        )
+            return organization["id"]
 
         bucket_reads: Dict[str, Dict[str, Tuple[str, Any]]] = {}
         for item in browsers:
@@ -7013,37 +7108,72 @@ def check_browser_tool_recording(
                 ):
                     found.extend(bucket_list)
                 policy_state, policy = reads["policy"]
-                if policy_state != "error":
-                    read_grants = _recording_bucket_read_grants(
-                        _document_statements((policy or {}).get("Policy")),
+                bucket_statements = (
+                    None
+                    if policy_state == "error"
+                    else _document_statements((policy or {}).get("Policy"))
+                )
+                if bucket_statements is not None:
+                    restrict = _restrict_public_buckets(reads)
+                    read_grants, org_bound = _recording_bucket_read_grants(
+                        bucket_statements,
                         object_arn,
                         account,
-                        _restrict_public_buckets(reads),
+                        restrict,
+                        read_organization_id,
                     )
+                    if organization.get("absent"):
+                        # An account outside any organization has no
+                        # organization for a PrincipalOrgID condition to name.
+                        read_grants += [grant for _, grant in org_bound]
+                        org_bound = []
                     if read_grants:
                         problems.append(
                             f"bucket '{bucket}' policy allows s3:GetObject on "
-                            f"{object_arn} with no condition by "
-                            f"{'; '.join(read_grants)}, so principals beyond the "
-                            f"ones account {account} grants it can read the "
-                            "recordings"
+                            f"{object_arn} {'; '.join(read_grants)}, so principals "
+                            f"beyond the ones account {account} grants it can read "
+                            "the recordings"
                         )
                         fixes.append(
-                            "Remove the bucket policy Allow of s3:GetObject on "
-                            "the recording prefix to Principal '*' or another "
-                            "account, or condition it on aws:PrincipalArn."
+                            "Remove the bucket policy Allow of s3:GetObject on the "
+                            "recording prefix to Principal '*' or another account, "
+                            "or add an aws:PrincipalOrgID or aws:PrincipalAccount "
+                            "condition naming this organization or account."
+                        )
+                    if org_bound:
+                        unread.append(
+                            "whether bucket policy "
+                            f"{', '.join(source for source, _ in org_bound)} limits "
+                            "s3:GetObject on the recordings to this account's "
+                            "organization (organizations:DescribeOrganization "
+                            f"{organization.get('error', 'returned no id')})"
+                        )
+                        retries.append(
+                            "Grant organizations:DescribeOrganization and retry."
+                        )
+                    if not read_grants and not org_bound:
+                        restricted = (
+                            ", because RestrictPublicBuckets confines its public "
+                            f"statements to account {account} and AWS service "
+                            "principals"
+                            if restrict
+                            and any(
+                                _s3_public_statement(st) for st in bucket_statements
+                            )
+                            else ""
+                        )
+                        facts.append(
+                            "its bucket policy allows no other account and no "
+                            f"anonymous caller s3:GetObject on {object_arn}"
+                            f"{restricted} (statements naming a service principal "
+                            "and object ACLs are not judged)"
                         )
                 reader_note = _recording_cached_readers(permission_cache, object_arn)
                 if role_arn:
-                    policy_state, policy = reads["policy"]
                     verdict, text = _recording_write_verdict(
                         str(role_arn),
                         permission_cache,
-                        (
-                            None
-                            if policy_state == "error"
-                            else _document_statements((policy or {}).get("Policy"))
-                        ),
+                        bucket_statements,
                         object_arn,
                         account,
                         partition,
@@ -27165,6 +27295,192 @@ def _open_actions_text(open_actions: List[str]) -> str:
     )
 
 
+# A gateway target reaches a runtime through an http agentcoreRuntime target, or
+# through an MCP server or passthrough endpoint at the runtime's invocation URL,
+# whose path carries the URL-encoded runtime ARN.
+AGENTCORE_RUNTIME_INVOCATION_PATH = re.compile(r"/runtimes/([^/?#]+)/invocations")
+
+
+def _gateway_target_runtime_arns(detail: Dict[str, Any]) -> Set[str]:
+    """Return the runtime ARNs one gateway target routes to."""
+    configuration = detail.get("targetConfiguration") or {}
+    http = configuration.get("http") or {}
+    arns = set()
+    runtime_arn = (http.get("agentcoreRuntime") or {}).get("arn")
+    if runtime_arn:
+        arns.add(str(runtime_arn))
+    for endpoint in (
+        ((configuration.get("mcp") or {}).get("mcpServer") or {}).get("endpoint"),
+        (http.get("passthrough") or {}).get("endpoint"),
+    ):
+        match = AGENTCORE_RUNTIME_INVOCATION_PATH.search(str(endpoint or ""))
+        if match:
+            arns.add(unquote(match.group(1)))
+    return arns
+
+
+def _runtime_fronting_gateways() -> Tuple[Dict[str, List[Dict[str, str]]], List[str]]:
+    """Map each runtime ARN to the gateways with a target that routes to it.
+
+    Each gateway is its ARN, a label and the name of the workload identity
+    GetGateway reports in workloadIdentityDetails. The second list names each
+    read that failed, by action, since a gateway that was not read may front
+    any runtime.
+    """
+    fronting: Dict[str, List[Dict[str, str]]] = {}
+    unread: List[str] = []
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return {}, [
+            f"bedrock-agentcore:ListGateways ({_assessment_error_label(error)})"
+        ]
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId") or "unknown"
+        try:
+            targets = _agentcore_list_all(
+                "list_gateway_targets",
+                ["items", "targets"],
+                gatewayIdentifier=gateway_id,
+            )
+        except Exception as error:
+            unread.append(
+                f"bedrock-agentcore:ListGatewayTargets on {gateway_id} "
+                f"({_assessment_error_label(error)})"
+            )
+            continue
+        runtime_arns: Set[str] = set()
+        for target in targets:
+            target_id = target.get("targetId")
+            if not target_id:
+                continue
+            try:
+                runtime_arns |= _gateway_target_runtime_arns(
+                    agentcore_client.get_gateway_target(
+                        gatewayIdentifier=gateway_id, targetId=target_id
+                    )
+                )
+            except Exception as error:
+                unread.append(
+                    f"bedrock-agentcore:GetGatewayTarget on {gateway_id} target "
+                    f"{target_id} ({_assessment_error_label(error)})"
+                )
+        if not runtime_arns:
+            continue
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except Exception as error:
+            unread.append(
+                f"bedrock-agentcore:GetGateway on {gateway_id} "
+                f"({_assessment_error_label(error)})"
+            )
+            continue
+        identity = str(
+            (detail.get("workloadIdentityDetails") or {}).get("workloadIdentityArn")
+            or ""
+        )
+        entry = {
+            "arn": str(detail.get("gatewayArn") or gateway.get("gatewayArn") or ""),
+            "label": f"gateway '{gateway.get('name') or gateway_id}' ({gateway_id})",
+            "identity": identity.rsplit("/", 1)[-1] if identity else "",
+        }
+        for runtime_arn in runtime_arns:
+            fronting.setdefault(runtime_arn, []).append(entry)
+    return fronting, unread
+
+
+def _allowed_workload_verdict(
+    allowed: Dict[str, Any],
+    runtime_arn: str,
+    fronting: Dict[str, List[Dict[str, str]]],
+    unread: List[str],
+) -> Tuple[str, str]:
+    """Compare a runtime's allowedWorkloadConfiguration with its fronting gateways.
+
+    Returns ("passed" | "failed" | "na", text). A hosting environment names a
+    gateway by ARN and a workload identity names the identity a gateway runs
+    as. The configuration passes only when it admits a gateway with a target
+    routing to this runtime and admits nothing else: a wildcard, or a workload
+    that is no fronting gateway, can invoke the runtime without passing through
+    the gateway.
+    """
+    environments = [
+        str(entry.get("arn") or "") if isinstance(entry, dict) else str(entry)
+        for entry in allowed.get("hostingEnvironments") or []
+    ]
+    identities = [str(name) for name in allowed.get("workloadIdentities") or []]
+    wildcards = [
+        value for value in environments + identities if "*" in value or "?" in value
+    ]
+    if wildcards:
+        return "failed", (
+            "has an allowedWorkloadConfiguration naming the wildcard value(s) "
+            f"{', '.join(wildcards)}, so it admits workloads other than the "
+            "gateway in front of it"
+        )
+    gateways = fronting.get(runtime_arn) or []
+    if not gateways:
+        if unread:
+            return "na", (
+                "has an allowedWorkloadConfiguration, but no fronting gateway "
+                f"could be determined, because {'; '.join(unread)} could not be "
+                "read"
+            )
+        return "na", (
+            "has an allowedWorkloadConfiguration, but no gateway target in this "
+            "region routes to it, so no fronting gateway was determined to "
+            "compare it with"
+        )
+    labels = ", ".join(gateway["label"] for gateway in gateways)
+    admitted = [
+        gateway["label"]
+        for gateway in gateways
+        if gateway["arn"] in environments
+        or (gateway["identity"] and gateway["identity"] in identities)
+    ]
+    extras = [
+        value
+        for value in environments
+        if value not in {gateway["arn"] for gateway in gateways}
+    ] + [
+        value
+        for value in identities
+        if value not in {gateway["identity"] for gateway in gateways}
+    ]
+    if extras and unread:
+        return "na", (
+            "has an allowedWorkloadConfiguration that admits "
+            f"{', '.join(extras)}, which is none of {labels} but may be a "
+            f"gateway that was not read: {'; '.join(unread)}"
+        )
+    if not admitted:
+        return "failed", (
+            "has an allowedWorkloadConfiguration that admits none of "
+            f"{labels}, the gateway(s) in this region with a target routing "
+            "to it, so the workloads it names invoke the agent without passing "
+            "through that gateway"
+        )
+    if extras:
+        return "failed", (
+            "has an allowedWorkloadConfiguration that admits "
+            f"{', '.join(admitted)} but also admits {', '.join(extras)}, which "
+            "is no gateway in this region with a target routing to it, so that "
+            "workload invokes the agent without passing through the gateway"
+        )
+    refused = [
+        gateway["label"] for gateway in gateways if gateway["label"] not in admitted
+    ]
+    return "passed", (
+        f"an allowedWorkloadConfiguration that admits only {', '.join(admitted)}, "
+        "the gateway(s) with a target routing to it"
+        + (
+            f" ({', '.join(refused)} also routes to it and is not admitted)"
+            if refused
+            else ""
+        )
+    )
+
+
 def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
     """AC-47: Judge the network path and the caller allowed to invoke a runtime.
 
@@ -27178,7 +27494,9 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
     allowedWorkloadConfiguration is the service's own answer for the caller leg.
     The API documents it as restricting "which workloads in the request's
     identity chain are allowed to invoke the target", supported for AgentCore
-    Runtime targets, where "the allowed workloads are AgentCore Gateways".
+    Runtime targets, where "the allowed workloads are AgentCore Gateways". It
+    is credited only when it admits the gateway whose target routes to the
+    runtime and nothing else, and is N/A when no such gateway is found.
     """
     if agentcore_client is None:
         return [
@@ -27219,6 +27537,7 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
         ]
 
     findings = []
+    fronting: Optional[Tuple[Dict[str, List[Dict[str, str]]], List[str]]] = None
     for runtime in runtimes:
         runtime_id = runtime.get("agentRuntimeId", "unknown")
         runtime_name = runtime.get("agentRuntimeName", runtime_id)
@@ -27373,14 +27692,17 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
         ) or {}
         allowed_workload = jwt_authorizer.get("allowedWorkloadConfiguration") or {}
         restrictions = []
-        hosting_environments = allowed_workload.get("hostingEnvironments") or []
-        workload_identities = allowed_workload.get("workloadIdentities") or []
-        if hosting_environments or workload_identities:
-            restrictions.append(
-                "an allowedWorkloadConfiguration naming "
-                f"{len(hosting_environments)} hosting environment(s) and "
-                f"{len(workload_identities)} workload identity(ies)"
+        workload_verdict, workload_text = "", ""
+        if allowed_workload.get("hostingEnvironments") or allowed_workload.get(
+            "workloadIdentities"
+        ):
+            if fronting is None:
+                fronting = _runtime_fronting_gateways()
+            workload_verdict, workload_text = _allowed_workload_verdict(
+                allowed_workload, str(runtime_arn or ""), *fronting
             )
+            if workload_verdict == "passed":
+                restrictions.append(workload_text)
 
         caller_keys, caller_gaps, caller_open = _runtime_invoke_restriction(
             statements,
@@ -27397,14 +27719,37 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                 "every principal outside a bounded aws:PrincipalArn list"
             )
 
-        if restrictions:
+        if workload_verdict == "failed":
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Caller Unrestricted",
+                    finding_details=f"{label} {workload_text}.",
+                    resolution=(
+                        "Set allowedWorkloadConfiguration on the runtime's JWT "
+                        "authorizer to the hosting environment ARN or workload "
+                        "identity of the gateway whose target routes to this "
+                        "runtime, and to nothing else."
+                    ),
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif restrictions:
+            workload_note = (
+                f" Its allowedWorkloadConfiguration was not credited: {label} "
+                f"{workload_text}."
+                if workload_verdict == "na"
+                else ""
+            )
             findings.append(
                 create_finding(
                     check_id="AC-47",
                     finding_name="AgentCore Runtime Caller Scope",
                     finding_details=(
                         f"{label} restricts who may invoke it through "
-                        f"{' and '.join(restrictions)}."
+                        f"{' and '.join(restrictions)}.{workload_note}"
                     ),
                     resolution=(
                         "No action required. Confirm the named workloads or "
@@ -27414,6 +27759,27 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                     reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.PASSED,
+                )
+            )
+        elif workload_verdict == "na":
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Caller Scope",
+                    finding_details=(
+                        f"{label} {workload_text}, so the caller leg is not "
+                        "reported as restricted."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:ListGateways, ListGatewayTargets, "
+                        "GetGatewayTarget and GetGateway and retry."
+                        if fronting and fronting[1]
+                        else "Confirm which gateway fronts this runtime: no "
+                        "gateway target in this region routes to it."
+                    ),
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
             )
         else:

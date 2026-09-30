@@ -358,13 +358,26 @@ section.
   `custom_jwt` under `StringNotEquals` fails too. The resolution says why a
   deny-list fails.
 
-- `AC-06` reads who else can fetch browser recordings. RT-09 asks who can
+- `AC-06` judges who else can read a browser's recordings. RT-09 asks who can
   read the recording prefix, but AC-06 judged only encryption, TLS, expiry and
-  the execution role's write, so a bucket policy granting `s3:GetObject` on the
-  prefix to another account passed. Such a grant now fails and names the
-  statement, a public grant fails when `RestrictPublicBuckets` is off on the
-  bucket and account, and every row names the cached roles and users whose
-  identity policies read the prefix.
+  the execution role's write, so a bucket policy that let another account
+  `s3:GetObject` the prefix passed. A bucket policy `Allow` that reaches
+  `s3:GetObject` on any recording key and names another account now fails and
+  names the statement, unless `aws:PrincipalAccount` or `aws:SourceAccount`
+  names the browser's account by value or `aws:PrincipalOrgID` names this
+  account's organization. A grant to `*` or through `NotPrincipal` fails the
+  same way when `RestrictPublicBuckets` is off on the bucket and account, or
+  when a fixed-value condition makes it non-public. S3 confines a bucket whose
+  policy is public to its own account and AWS service principals while
+  `RestrictPublicBuckets` is on, so no grant fails then, including one to a
+  named account. The organization is read with the
+  `organizations:DescribeOrganization` grant the function already holds; a
+  statement bound to an organization that could not be read is `N/A` naming
+  that action, and one in an account outside any organization fails. An unread
+  bucket policy stays `N/A` naming `s3:GetBucketPolicy`. Statements naming a
+  service principal and object ACLs are not judged, and the Passed row says
+  so. Every row names the cached roles and users whose identity policies read
+  the prefix. No new IAM action.
 - `AC-37` reads the service control policies binding the account before it
   reports a gateway's guardrail wiring as `Passed`. POL-06 asks whether the
   guardrail call can succeed, and an attached Deny on
@@ -374,6 +387,18 @@ section.
   High and names the policy and its attachment target, a conditioned one or an
   unreadable policy is `N/A`, and the management account is named as outside
   SCP scope.
+- `AC-47` credits a runtime's `allowedWorkloadConfiguration` only when it
+  admits the gateway in front of the runtime. Any non-empty configuration
+  passed the caller leg, so one naming an unrelated workload, or a wildcard,
+  read as restricted. The check now finds the gateways in the region with a
+  target routing to the runtime (an `http.agentcoreRuntime` target, or an MCP
+  or passthrough endpoint at the runtime's invocation URL) and compares their
+  ARNs and workload identities with the configuration. It fails when the
+  configuration admits none of them, admits another workload beside them, or
+  holds a wildcard. It is `N/A`, and says why, when no gateway target routes
+  to the runtime or a gateway read is denied, naming the action. A `Deny` on
+  `aws:PrincipalArn` still passes the caller leg on its own. No new IAM
+  action.
 - `AC-33` adds an `AgentCore Runtime Invocation By User ID` row. ID-10
   asks for an explicit Deny on `InvokeAgentRuntimeForUser` as well as
   `GetWorkloadAccessTokenForUserId`, but AC-33 judged only the token action,
