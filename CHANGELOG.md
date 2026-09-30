@@ -298,6 +298,15 @@ section.
 
 ### Fixed
 
+- `AC-29`'s `AgentCore Gateway Identity Authorizer Guardrail` row no longer
+  passes a deny-list. ID-04 asks for `StringNotEquals` `CUSTOM_JWT` on
+  `CreateGateway` and `UpdateGateway`, but the row credited a Deny that named
+  `AWS_IAM`, `AUTHENTICATE_ONLY` and `NONE`, which leaves open any authorizer
+  type the condition key does not list. The Deny must now also fire on an
+  unlisted type and must not fire on `CUSTOM_JWT`, so a case-folded
+  `custom_jwt` under `StringNotEquals` fails too. The resolution says why a
+  deny-list fails.
+
 - `AC-06` reads who else can fetch browser recordings. RT-09 asks who can
   read the recording prefix, but AC-06 judged only encryption, TLS, expiry and
   the execution role's write, so a bucket policy granting `s3:GetObject` on the

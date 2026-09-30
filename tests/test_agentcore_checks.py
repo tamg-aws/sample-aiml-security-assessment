@@ -14878,12 +14878,64 @@ class TestAC29GatewayIdentitySCP:
         assert "DenyNone" not in finding["Finding_Details"]
 
     @patch("agentcore_app.organizations_client")
-    def test_a_deny_list_naming_all_three_modes_passes(self, mock_orgs):
+    def test_a_deny_list_naming_all_three_modes_fails(self, mock_orgs):
+        # The control asks for StringNotEquals CUSTOM_JWT because a deny-list
+        # leaves open any authorizer type the key's documented list omits.
         finding = self._finding(
             mock_orgs,
             {
                 "DenyList": _gateway_guard(
                     value=["AWS_IAM", "AUTHENTICATE_ONLY", "NONE"]
+                )
+            },
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Missing")
+        assert (
+            "a deny-list of authorizer types does not deny a type the condition "
+            "key does not enumerate; use StringNotEquals CUSTOM_JWT"
+        ) in finding["Resolution"]
+
+    @pytest.mark.parametrize("deny_list_first", [False, True])
+    @patch("agentcore_app.organizations_client")
+    def test_two_deny_lists_fail_in_either_order(self, mock_orgs, deny_list_first):
+        deny_list = {
+            "DenyList": _gateway_guard(value=["AWS_IAM", "AUTHENTICATE_ONLY", "NONE"])
+        }
+        like_list = {
+            "DenyLike": _gateway_guard(
+                operator="StringLike", value=["AWS_*", "AUTHENTICATE_*", "NONE"]
+            )
+        }
+        documents = (
+            {**deny_list, **like_list}
+            if deny_list_first
+            else {**like_list, **deny_list}
+        )
+        finding = self._finding(mock_orgs, documents)
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Missing")
+
+    @pytest.mark.parametrize(
+        "operator", ["StringNotEquals", "StringNotLike"], ids=["equals", "like"]
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_case_folded_custom_jwt_does_not_pass(self, mock_orgs, operator):
+        # String operators compare case-sensitively, so this Deny also fires on
+        # CUSTOM_JWT and blocks every gateway write instead of pinning JWT.
+        finding = self._finding(
+            mock_orgs,
+            {"FoldedJwt": _gateway_guard(operator=operator, value="custom_jwt")},
+        )
+        assert finding["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_ignore_case_not_equals_custom_jwt_passes(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {
+                "RequireJwt": _gateway_guard(
+                    operator="StringNotEqualsIgnoreCase", value="custom_jwt"
                 )
             },
         )

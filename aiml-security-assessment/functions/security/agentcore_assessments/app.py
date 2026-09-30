@@ -17802,6 +17802,9 @@ def check_agentcore_vpc_placement_scp() -> List[Dict[str, Any]]:
 # AWS_IAM and AUTHENTICATE_ONLY authenticate a SigV4 caller and NONE
 # authenticates nobody, so only CUSTOM_JWT propagates a user.
 GATEWAY_AUTHORIZER_NO_USER_IDENTITY_VALUES = ("AWS_IAM", "AUTHENTICATE_ONLY", "NONE")
+# A type the condition key's documented list does not name. A Deny must fire on
+# it too, so a deny-list of the documented types is not credited.
+GATEWAY_AUTHORIZER_UNLISTED_VALUE = "AISF_UNLISTED_AUTHORIZER_TYPE"
 
 
 def _deny_requires_gateway_jwt(
@@ -17810,14 +17813,27 @@ def _deny_requires_gateway_jwt(
     """Return whether one Deny fires on every gateway authorizer type but
     CUSTOM_JWT, on every gateway.
 
-    StringNotEquals CUSTOM_JWT is the shape the condition-key guide shows; a
-    deny-list credits only when the one statement names all three types.
+    StringNotEquals CUSTOM_JWT is the shape the control and the condition-key
+    guide show. A deny-list of AWS_IAM, AUTHENTICATE_ONLY and NONE does not
+    deny a type the key does not enumerate, so the Deny must also fire on an
+    unlisted type. A Deny that also fires on CUSTOM_JWT, such as a case-folded
+    `custom_jwt` under a case-sensitive operator, blocks every gateway write
+    and pins nothing, so it is not credited either.
     """
-    return _scp_deny_reaches_every_resource(statement, "gateway") and all(
-        _statement_condition_denies_value(
-            statement, GATEWAY_AUTHORIZER_CONDITION_KEY, value
+    return (
+        _scp_deny_reaches_every_resource(statement, "gateway")
+        and all(
+            _statement_condition_denies_value(
+                statement, GATEWAY_AUTHORIZER_CONDITION_KEY, value
+            )
+            for value in (
+                *GATEWAY_AUTHORIZER_NO_USER_IDENTITY_VALUES,
+                GATEWAY_AUTHORIZER_UNLISTED_VALUE,
+            )
         )
-        for value in GATEWAY_AUTHORIZER_NO_USER_IDENTITY_VALUES
+        and not _statement_condition_denies_value(
+            statement, GATEWAY_AUTHORIZER_CONDITION_KEY, "CUSTOM_JWT"
+        )
     )
 
 
@@ -17828,7 +17844,7 @@ def check_agentcore_gateway_identity_authorizer_scp() -> List[Dict[str, Any]]:
     AWS_IAM or AUTHENTICATE_ONLY, and neither propagates a validated end-user
     identity to the tools behind it. This leg reads whether a service control
     policy that binds this account denies CreateGateway and UpdateGateway for
-    all three.
+    every type but CUSTOM_JWT, a type the condition key does not list included.
     """
     return _scp_guardrail_findings(
         "AC-29",
@@ -17840,14 +17856,17 @@ def check_agentcore_gateway_identity_authorizer_scp() -> List[Dict[str, Any]]:
                 "denies": _deny_requires_gateway_jwt,
                 "guard_text": (
                     "unless bedrock-agentcore:GatewayAuthorizerType is "
-                    "CUSTOM_JWT, with AWS_IAM, AUTHENTICATE_ONLY and NONE "
-                    "denied by one statement that reaches every gateway"
+                    "CUSTOM_JWT, with every other type, listed or not, denied "
+                    "by one statement that reaches every gateway"
                 ),
                 "remediation": (
-                    "Attach a service control policy that denies CreateGateway "
-                    "and UpdateGateway on Resource * with StringNotEquals "
-                    "bedrock-agentcore:GatewayAuthorizerType CUSTOM_JWT, and "
-                    "prove it in a test organizational unit before rollout."
+                    "Replace any deny-list: a deny-list of authorizer types "
+                    "does not deny a type the condition key does not enumerate; "
+                    "use StringNotEquals CUSTOM_JWT. Attach a service control "
+                    "policy that denies CreateGateway and UpdateGateway on "
+                    "Resource * with that condition on "
+                    "bedrock-agentcore:GatewayAuthorizerType, and prove it in a "
+                    "test organizational unit before rollout."
                 ),
             }
         ],
