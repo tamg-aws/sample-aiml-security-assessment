@@ -34458,12 +34458,19 @@ class TestAC33OwnAgentIdentity:
         )
 
         assert "Failed" not in [f["Status"] for f in findings]
-        # The user id leg reports the same unread list on its own row.
+        # The two user id legs report the same unread list on their own rows.
         user_id = [
-            f for f in findings if f["Finding"] == "AgentCore Token Issuance By User ID"
+            f
+            for f in findings
+            if f["Finding"]
+            in (
+                "AgentCore Token Issuance By User ID",
+                "AgentCore Runtime Invocation By User ID",
+            )
         ]
-        assert [f["Status"] for f in user_id] == ["N/A"]
-        assert "bedrock-agentcore:ListAgentRuntimes" in user_id[0]["Finding_Details"]
+        assert [f["Status"] for f in user_id] == ["N/A", "N/A"]
+        for row in user_id:
+            assert "bedrock-agentcore:ListAgentRuntimes" in row["Finding_Details"]
         na = [f for f in findings if f["Status"] == "N/A" and f not in user_id]
         assert len(na) == 1
         assert "bedrock-agentcore:ListAgentRuntimes" in na[0]["Finding_Details"]
@@ -34727,6 +34734,185 @@ class TestAC33UserIdTokenOnJwtRuntimes:
 
         assert [f["Status"] for f in rows] == ["N/A"]
         assert "role other-role" in rows[0]["Finding_Details"]
+
+
+class TestAC33InvokeForUserOnJwtRuntimes:
+    """AC-33: no principal should invoke a JWT runtime for a user id it names."""
+
+    _ROW = "AgentCore Runtime Invocation By User ID"
+    _FOR_USER = "bedrock-agentcore:InvokeAgentRuntimeForUser"
+    _WS_FOR_USER = "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser"
+    _RUNTIME = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/{}"
+
+    def _wire(self, mock_ac, order):
+        mock_ac.meta.region_name = "us-east-1"
+        details = {}
+        for runtime_id, jwt in (("rt-1", True), ("rt-2", True), ("rt-3", False)):
+            detail = {
+                "agentRuntimeArn": self._RUNTIME.format(runtime_id),
+                "agentRuntimeName": f"agent-{runtime_id}",
+                "roleArn": f"arn:aws:iam::123456789012:role/{runtime_id}-role",
+            }
+            if jwt:
+                detail["authorizerConfiguration"] = {
+                    "customJWTAuthorizer": {
+                        "discoveryUrl": "https://idp.example.com/.well-known/openid-configuration"
+                    }
+                }
+            details[runtime_id] = detail
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": runtime_id} for runtime_id in order]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: details[
+            agentRuntimeId
+        ]
+        mock_ac.list_gateways.return_value = {"items": []}
+
+    def _rows(self, roles, users=None, order=("rt-1", "rt-2", "rt-3")):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac, order)
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(roles=roles, users=users)
+            )
+        return [f for f in findings if f["Finding"] == self._ROW]
+
+    def _allow(self, action, resource):
+        return {"Effect": "Allow", "Action": action, "Resource": resource}
+
+    def _population(self):
+        return {
+            "caller-a": _principal_with(
+                [self._allow(self._FOR_USER, self._RUNTIME.format("rt-1"))]
+            ),
+            "caller-b": _principal_with(
+                [
+                    self._allow(
+                        self._WS_FOR_USER,
+                        self._RUNTIME.format("rt-2") + "/runtime-endpoint/DEFAULT",
+                    )
+                ]
+            ),
+            "sigv4-caller": _principal_with(
+                [self._allow(self._FOR_USER, self._RUNTIME.format("rt-3"))]
+            ),
+            "denied": _principal_with(
+                [
+                    self._allow("bedrock-agentcore:*", "*"),
+                    {
+                        "Effect": "Deny",
+                        "Action": [self._FOR_USER, self._WS_FOR_USER],
+                        "Resource": "*",
+                    },
+                ]
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        "order", [("rt-1", "rt-2", "rt-3"), ("rt-3", "rt-2", "rt-1")]
+    )
+    def test_only_principals_reaching_a_jwt_runtime_fail(self, order):
+        rows = self._rows(self._population(), order=order)
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "role caller-a (InvokeAgentRuntimeForUser on 'agent-rt-1' (rt-1))" in (
+            details
+        )
+        assert (
+            "role caller-b (InvokeAgentRuntimeWithWebSocketStreamForUser on "
+            "'agent-rt-2' (rt-2))"
+        ) in details
+        assert "sigv4-caller" not in details
+        assert "role denied" not in details
+        assert "rt-3" not in details
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in details
+        assert "InvokeAgentRuntimeForUser" in rows[0]["Resolution"]
+        assert rows[0]["Severity"] == "Medium"
+
+    def test_the_failed_row_does_not_depend_on_runtime_order(self):
+        forward = self._rows(self._population(), order=("rt-1", "rt-2", "rt-3"))
+        reverse = self._rows(self._population(), order=("rt-3", "rt-2", "rt-1"))
+
+        assert forward[0]["Finding_Details"] == reverse[0]["Finding_Details"]
+
+    def test_a_user_grant_is_read_beside_the_roles(self):
+        rows = self._rows(
+            {},
+            users={
+                "alice": _principal_with(
+                    [self._allow("bedrock-agentcore:InvokeAgentRuntime*", "*")]
+                )
+            },
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "user alice (InvokeAgentRuntimeForUser" in details
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" in details
+        assert "rt-3" not in details
+
+    def test_a_grant_on_another_runtime_does_not_reach_the_jwt_runtimes(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [self._allow(self._FOR_USER, self._RUNTIME.format("rt-9"))]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "'agent-rt-1' (rt-1)" in rows[0]["Finding_Details"]
+        assert "'agent-rt-2' (rt-2)" in rows[0]["Finding_Details"]
+        assert "rt-3" not in rows[0]["Finding_Details"]
+
+    def test_a_not_resource_excluding_one_jwt_runtime_reaches_the_other(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        {
+                            "Effect": "Allow",
+                            "Action": self._FOR_USER,
+                            "NotResource": [
+                                self._RUNTIME.format("rt-1"),
+                                self._RUNTIME.format("rt-1") + "/runtime-endpoint/*",
+                            ],
+                        }
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-2' (rt-2)" in details
+        assert "'agent-rt-1' (rt-1)" not in details
+
+    def test_an_explicit_deny_on_both_actions_passes(self):
+        population = self._population()
+        rows = self._rows({"denied": population["denied"]})
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_no_jwt_runtime_writes_no_row(self):
+        rows = self._rows(self._population(), order=("rt-3",))
+
+        assert rows == []
+
+    def test_an_unread_runtime_is_na_for_the_invoke_leg(self):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac, ("rt-1",))
+            mock_ac.get_agent_runtime.side_effect = _make_client_error(
+                "AccessDeniedException", "denied"
+            )
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(roles=self._population())
+            )
+        rows = [f for f in findings if f["Finding"] == self._ROW]
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "GetAgentRuntime on rt-1" in rows[0]["Finding_Details"]
 
 
 class TestAC42WholePopulation:

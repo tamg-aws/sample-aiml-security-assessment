@@ -298,6 +298,15 @@ section.
 
 ### Fixed
 
+- `AC-33` adds an `AgentCore Runtime Invocation By User ID` row. ID-10
+  asks for an explicit Deny on `InvokeAgentRuntimeForUser` as well as
+  `GetWorkloadAccessTokenForUserId`, but AC-33 judged only the token action,
+  so a caller could still invoke a custom JWT runtime for any user id it named
+  without that user's JWT. The row fails every cached role and user whose
+  Allow of `InvokeAgentRuntimeForUser` or
+  `InvokeAgentRuntimeWithWebSocketStreamForUser` reaches such a runtime or one
+  of its endpoints and survives its own Deny and boundary. No new IAM action.
+
 - `AC-29` adds an `AgentCore Gateway Identity Authorizer Guardrail` row. ID-04
   asks for an SCP that keeps every gateway on `CUSTOM_JWT`, but AC-29 read
   runtimes only and AC-28 asks only that `NONE` be denied, so a gateway could

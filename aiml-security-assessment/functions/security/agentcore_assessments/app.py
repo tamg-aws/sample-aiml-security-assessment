@@ -18701,7 +18701,7 @@ def _principals_issuing_agent_tokens(
 
 
 def _workload_identities_by_role() -> Tuple[
-    Dict[str, Set[str]], List[str], Dict[str, List[str]]
+    Dict[str, Set[str]], List[str], Dict[str, List[str]], Dict[str, str]
 ]:
     """Map each runtime or gateway role name to the workload identities it runs as.
 
@@ -18710,10 +18710,12 @@ def _workload_identities_by_role() -> Tuple[
     role's own agent. The second list names each read that failed, by action.
     The third maps each role name to the runtimes running as it whose inbound
     authorizer is a custom JWT authorizer, so every caller arrives with a JWT.
+    The fourth maps each of those runtimes' ARNs to its label.
     """
     own: Dict[str, Set[str]] = {}
     unread: List[str] = []
     jwt_runtimes: Dict[str, List[str]] = {}
+    jwt_runtime_arns: Dict[str, str] = {}
     families = (
         (
             "list_agent_runtimes",
@@ -18777,7 +18779,10 @@ def _workload_identities_by_role() -> Tuple[
             ):
                 name = detail.get("agentRuntimeName") or item_id
                 jwt_runtimes.setdefault(role_name, []).append(f"'{name}' ({item_id})")
-    return own, unread, jwt_runtimes
+                arn = detail.get("agentRuntimeArn") or item.get("agentRuntimeArn")
+                if arn:
+                    jwt_runtime_arns[str(arn)] = f"'{name}' ({item_id})"
+    return own, unread, jwt_runtimes, jwt_runtime_arns
 
 
 def _user_id_token_findings(
@@ -18791,7 +18796,7 @@ def _user_id_token_findings(
     GetWorkloadAccessTokenForJWT identifies the user by a verified token and
     GetWorkloadAccessTokenForUserId only lets agent code name any user it likes.
     InvokeAgentRuntimeForUser is called by a runtime's callers, not by its role,
-    and is not judged here.
+    and _user_id_invoke_findings judges it.
     """
     permissions_by_name = {
         str(name).lower(): (name, permissions)
@@ -18917,6 +18922,149 @@ def _user_id_token_findings(
     return findings
 
 
+USER_ID_INVOKE_ACTIONS = (
+    "InvokeAgentRuntimeForUser",
+    "InvokeAgentRuntimeWithWebSocketStreamForUser",
+)
+
+
+def _allow_reaches_runtime(statement: Dict[str, Any], runtime_arn: str) -> bool:
+    """Return whether one Allow statement's resources reach a runtime or its endpoints.
+
+    The ForUser invoke actions accept the runtime and runtime-endpoint resource
+    types, so a pattern naming the runtime, one of its endpoints, or a wildcard
+    over either reaches it. A NotResource statement reaches it unless its
+    exclusions match both the runtime and every endpoint under it.
+    """
+    probes = (runtime_arn, f"{runtime_arn}/runtime-endpoint/*")
+    if "NotResource" in statement:
+        excluded = statement.get("NotResource")
+        excluded = excluded if isinstance(excluded, list) else [excluded]
+        return not all(
+            any(fnmatchcase(probe, str(pattern)) for pattern in excluded if pattern)
+            for probe in probes
+        )
+    return any(
+        fnmatchcase(probe, pattern)
+        or pattern.startswith(f"{runtime_arn}/runtime-endpoint/")
+        for pattern in _statement_resources(statement)
+        for probe in probes
+    )
+
+
+def _user_id_invoke_findings(
+    jwt_runtime_arns: Dict[str, str],
+    principals: List[Tuple[str, Dict[str, Any]]],
+    runtime_reads_failed: List[str],
+) -> List[Dict[str, Any]]:
+    """Judge whether any cached principal can invoke a JWT runtime by user id.
+
+    InvokeAgentRuntimeForUser and its WebSocket twin let a SigV4 caller name the
+    user the runtime acts for, so on a runtime whose callers all carry a JWT the
+    grant is a way around the authorizer. A grant counts when an Allow reaches
+    the action and the runtime and survives the principal's own unconditioned
+    Deny statements and permissions boundary. Conditions on the Allow are not
+    read, and neither is a resource-based policy on the runtime.
+    """
+    findings: List[Dict[str, Any]] = []
+    if jwt_runtime_arns:
+        granted: List[str] = []
+        for label, permissions in sorted(principals, key=lambda entry: entry[0]):
+            reached: List[str] = []
+            for action in USER_ID_INVOKE_ACTIONS:
+                if not _grant_survives(
+                    permissions, f"bedrock-agentcore:{action.lower()}"
+                ):
+                    continue
+                runtimes = set()
+                for policy in _principal_policies(permissions):
+                    try:
+                        statements = list(_allow_statements(policy))
+                    except (TypeError, ValueError):
+                        continue
+                    for statement in statements:
+                        if not _statement_reached_actions(statement, (action.lower(),)):
+                            continue
+                        runtimes.update(
+                            arn
+                            for arn in jwt_runtime_arns
+                            if _allow_reaches_runtime(statement, arn)
+                        )
+                if runtimes:
+                    names = ", ".join(jwt_runtime_arns[arn] for arn in sorted(runtimes))
+                    reached.append(f"{action} on {names}")
+            if reached:
+                granted.append(f"{label} ({'; '.join(reached)})")
+        judged = ", ".join(jwt_runtime_arns[arn] for arn in sorted(jwt_runtime_arns))
+        if granted:
+            findings.append(
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Runtime Invocation By User ID",
+                    finding_details=(
+                        "These principals are granted InvokeAgentRuntimeForUser or "
+                        "InvokeAgentRuntimeWithWebSocketStreamForUser on a runtime "
+                        "with a custom JWT authorizer, after their own Deny "
+                        "statements and permissions boundary, so they can invoke it "
+                        "for any user id they name instead of presenting that user's "
+                        f"JWT: {', '.join(granted)}. Conditions on the Allow were "
+                        "not read. "
+                        f"{IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        "Add an explicit Deny on "
+                        "bedrock-agentcore:InvokeAgentRuntimeForUser and "
+                        "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser "
+                        "on these runtimes to each principal, or remove the grant."
+                    ),
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Runtime Invocation By User ID",
+                    finding_details=(
+                        "No cached role or user is granted InvokeAgentRuntimeForUser "
+                        "or InvokeAgentRuntimeWithWebSocketStreamForUser, after its "
+                        "own Deny statements and permissions boundary, on these "
+                        f"runtimes with a custom JWT authorizer: {judged}."
+                    ),
+                    resolution="No action required.",
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+    if runtime_reads_failed:
+        findings.append(
+            create_finding(
+                check_id="AC-33",
+                finding_name="AgentCore Runtime Invocation By User ID",
+                finding_details=(
+                    "These runtime reads failed, so whether the runtimes they "
+                    "missed have a custom JWT authorizer that a principal can "
+                    "bypass with InvokeAgentRuntimeForUser was not judged: "
+                    f"{', '.join(runtime_reads_failed)}."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:ListAgentRuntimes and "
+                    "bedrock-agentcore:GetAgentRuntime, then rerun the assessment."
+                ),
+                reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+    return findings
+
+
 def check_agentcore_token_issuance_scope(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -18977,13 +19125,31 @@ def check_agentcore_token_issuance_scope(
             unread = ["the AgentCore client is not available in this region"]
             assessed_region = ""
         else:
-            own_by_role, unread, jwt_runtimes = _workload_identities_by_role()
+            own_by_role, unread, jwt_runtimes, jwt_runtime_arns = (
+                _workload_identities_by_role()
+            )
             assessed_region = agentcore_client.meta.region_name
+            runtime_reads_failed = [read for read in unread if "AgentRuntime" in read]
             findings.extend(
                 _user_id_token_findings(
                     jwt_runtimes,
                     role_permissions,
-                    [read for read in unread if "AgentRuntime" in read],
+                    runtime_reads_failed,
+                )
+            )
+            findings.extend(
+                _user_id_invoke_findings(
+                    jwt_runtime_arns,
+                    [
+                        (f"{kind} {name}", permissions)
+                        for kind, population in (
+                            ("role", role_permissions),
+                            ("user", user_permissions),
+                        )
+                        for name, permissions in population.items()
+                        if isinstance(permissions, dict)
+                    ],
+                    runtime_reads_failed,
                 )
             )
         if scoped:
