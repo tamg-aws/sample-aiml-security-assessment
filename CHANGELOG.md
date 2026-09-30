@@ -298,6 +298,14 @@ section.
 
 ### Fixed
 
+- `AC-29` adds an `AgentCore Gateway Identity Authorizer Guardrail` row. ID-04
+  asks for an SCP that keeps every gateway on `CUSTOM_JWT`, but AC-29 read
+  runtimes only and AC-28 asks only that `NONE` be denied, so a gateway could
+  still be created or updated to `AWS_IAM` or `AUTHENTICATE_ONLY`, neither of
+  which carries a validated end user. The row passes when an attached SCP
+  denies `CreateGateway` and `UpdateGateway` for all three types in one
+  statement reaching every gateway. No new IAM action.
+
 - `AC-34` reads the environment variables of every runtime version an
   endpoint serves. It read only the version `GetAgentRuntime` returns by
   default, so an endpoint still serving an older version with an API key in

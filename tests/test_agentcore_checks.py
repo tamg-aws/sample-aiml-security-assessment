@@ -14846,6 +14846,115 @@ class TestSCPGuardrailRegistration:
         assert "check_agentcore_trail_log_file_validation" in source
 
 
+@pytest.mark.usefixtures("_member_account")
+class TestAC29GatewayIdentitySCP:
+    """AIR-ACR-ID-04: an attached SCP keeps a gateway on CUSTOM_JWT. AWS_IAM,
+    AUTHENTICATE_ONLY and NONE carry no validated end-user identity, so a Deny
+    on NONE alone (AC-28's GW-02 guard) leaves two of them open."""
+
+    _run = TestSCPAttachment._run
+
+    def _finding(self, mock_orgs, documents, targets=None):
+        (finding,) = self._run(
+            mock_orgs,
+            "check_agentcore_gateway_identity_authorizer_scp",
+            documents,
+            targets,
+        )
+        assert finding["Check_ID"] == "AC-29"
+        return finding
+
+    @pytest.mark.parametrize("decoy_first", [False, True])
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_equals_custom_jwt_deny_passes(self, mock_orgs, decoy_first):
+        documents = {
+            "RequireJwt": _gateway_guard(operator="StringNotEquals", value="CUSTOM_JWT")
+        }
+        decoy = {"DenyNone": _gateway_guard()}
+        documents = {**decoy, **documents} if decoy_first else {**documents, **decoy}
+        finding = self._finding(mock_orgs, documents)
+        assert finding["Status"] == "Passed"
+        assert "RequireJwt" in finding["Finding_Details"]
+        assert "DenyNone" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_list_naming_all_three_modes_passes(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {
+                "DenyList": _gateway_guard(
+                    value=["AWS_IAM", "AUTHENTICATE_ONLY", "NONE"]
+                )
+            },
+        )
+        assert finding["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "value",
+        ["NONE", ["AWS_IAM", "NONE"], ["AWS_IAM", "AUTHENTICATE_ONLY"]],
+        ids=["none-only", "no-authenticate-only", "no-none"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_list_missing_a_mode_fails(self, mock_orgs, value):
+        finding = self._finding(mock_orgs, {"DenyList": _gateway_guard(value=value)})
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_create_only_deny_is_partial(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {
+                "CreateOnly": _gateway_guard(
+                    operator="StringNotEquals",
+                    value="CUSTOM_JWT",
+                    action=_GATEWAY_WRITE[:1],
+                )
+            },
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Partial")
+        assert "UpdateGateway" in finding["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_regional_resource_scope_is_not_credited(self, mock_orgs):
+        guard = _gateway_guard(operator="StringNotEquals", value="CUSTOM_JWT")
+        guard[0]["Resource"] = "arn:aws:bedrock-agentcore:us-east-1:*:gateway/*"
+        finding = self._finding(mock_orgs, {"OneRegion": guard})
+        assert finding["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unattached_guard_fails_unattached(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {
+                "RequireJwt": _gateway_guard(
+                    operator="StringNotEquals", value="CUSTOM_JWT"
+                )
+            },
+            targets={"p-0": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}]},
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Unattached")
+
+    def test_the_handler_registers_the_leg_on_both_cache_paths(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        for registration in registrations:
+            assert "check_agentcore_gateway_identity_authorizer_scp" in ast.unparse(
+                registration.value
+            )
+
+
 class TestAC29CheckRegistration:
     """AC-29 is organization-wide, so it runs once and not per scanned region."""
 

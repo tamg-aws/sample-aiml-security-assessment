@@ -17644,6 +17644,62 @@ def check_agentcore_vpc_placement_scp() -> List[Dict[str, Any]]:
     )
 
 
+# The gateway authorizer types that carry no validated end-user identity:
+# AWS_IAM and AUTHENTICATE_ONLY authenticate a SigV4 caller and NONE
+# authenticates nobody, so only CUSTOM_JWT propagates a user.
+GATEWAY_AUTHORIZER_NO_USER_IDENTITY_VALUES = ("AWS_IAM", "AUTHENTICATE_ONLY", "NONE")
+
+
+def _deny_requires_gateway_jwt(
+    statement: Dict[str, Any], action: str, context: Dict[str, str]
+) -> bool:
+    """Return whether one Deny fires on every gateway authorizer type but
+    CUSTOM_JWT, on every gateway.
+
+    StringNotEquals CUSTOM_JWT is the shape the condition-key guide shows; a
+    deny-list credits only when the one statement names all three types.
+    """
+    return _scp_deny_reaches_every_resource(statement, "gateway") and all(
+        _statement_condition_denies_value(
+            statement, GATEWAY_AUTHORIZER_CONDITION_KEY, value
+        )
+        for value in GATEWAY_AUTHORIZER_NO_USER_IDENTITY_VALUES
+    )
+
+
+def check_agentcore_gateway_identity_authorizer_scp() -> List[Dict[str, Any]]:
+    """AC-29 gateway leg: an attached SCP keeps every gateway on CUSTOM_JWT.
+
+    AC-28 asks only that NONE be denied, which leaves a gateway free to take
+    AWS_IAM or AUTHENTICATE_ONLY, and neither propagates a validated end-user
+    identity to the tools behind it. This leg reads whether a service control
+    policy that binds this account denies CreateGateway and UpdateGateway for
+    all three.
+    """
+    return _scp_guardrail_findings(
+        "AC-29",
+        AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+        [
+            {
+                "finding_name": "AgentCore Gateway Identity Authorizer Guardrail",
+                "actions": GATEWAY_WRITE_ACTIONS,
+                "denies": _deny_requires_gateway_jwt,
+                "guard_text": (
+                    "unless bedrock-agentcore:GatewayAuthorizerType is "
+                    "CUSTOM_JWT, with AWS_IAM, AUTHENTICATE_ONLY and NONE "
+                    "denied by one statement that reaches every gateway"
+                ),
+                "remediation": (
+                    "Attach a service control policy that denies CreateGateway "
+                    "and UpdateGateway on Resource * with StringNotEquals "
+                    "bedrock-agentcore:GatewayAuthorizerType CUSTOM_JWT, and "
+                    "prove it in a test organizational unit before rollout."
+                ),
+            }
+        ],
+    )
+
+
 def _jwt_allow_list_unbounded_values(values: Any) -> List[str]:
     """Return the values in one audience or client allow-list that name no application.
 
@@ -31606,6 +31662,11 @@ def lambda_handler(event, context):
                         check_agentcore_runtime_authorizer_scp,
                     ),
                     (
+                        ["AC-29"],
+                        "Gateway Identity Authorizer Guardrail",
+                        check_agentcore_gateway_identity_authorizer_scp,
+                    ),
+                    (
                         ["AC-01"],
                         "VPC Placement Guardrail",
                         check_agentcore_vpc_placement_scp,
@@ -31684,6 +31745,11 @@ def lambda_handler(event, context):
                         ["AC-29"],
                         "Runtime Authorizer Guardrail",
                         check_agentcore_runtime_authorizer_scp,
+                    ),
+                    (
+                        ["AC-29"],
+                        "Gateway Identity Authorizer Guardrail",
+                        check_agentcore_gateway_identity_authorizer_scp,
                     ),
                     (
                         ["AC-01"],
