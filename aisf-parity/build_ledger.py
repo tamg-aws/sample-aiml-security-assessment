@@ -308,11 +308,16 @@ AI_SUBJECT_ROWS = [
         "encrypt by default with a KMS key, deny every principal reads and writes of the recording "
         "prefix without TLS, and expire the prefix by lifecycle rule, including noncurrent versions "
         "when versioned. The execution role must be named and allowed to write the prefix by an "
-        "identity or bucket policy and by its boundary, with no Deny refusing it. Bucket Block Public "
-        "Access left off reads N/A because the account-level setting is not read. SCPs, the bucket "
-        "key policy and the role's use of that key are not evaluated, so a Passed write can still be "
-        "refused. Who else can read the recordings is not judged. The AWS managed browser has no "
-        "recording configuration and is outside the population",
+        "identity or bucket policy and by its boundary, with no Deny refusing it. A Block Public "
+        "Access setting the bucket leaves off fails unless the account sets it, read with "
+        "s3:GetAccountPublicAccessBlock, and is N/A naming that action when the read is denied. "
+        "A bucket policy Allow of s3:GetObject on a recording key "
+        "to *, NotPrincipal or another account fails unless aws:PrincipalAccount or "
+        "aws:SourceAccount names the account or aws:PrincipalOrgID names its organization. "
+        "Statements naming a service principal and object ACLs are not judged for reads. SCPs, the "
+        "bucket key policy and the role's use of that key are not evaluated, so a Passed write can "
+        "still be refused. The AWS managed browser has no recording configuration and is outside "
+        "the population",
         [],
         4,
     ),
@@ -474,9 +479,11 @@ AI_SUBJECT_ROWS = [
         "alone, a positive or ForAnyValue operator, a wildcard endpoint, an address "
         "list covering every address (0.0.0.0/1 plus 128.0.0.0/1 included) and a Deny "
         "that ANDs in another key or names specific principals fail. The caller leg "
-        "passes only on an allowedWorkloadConfiguration on the JWT authorizer or a "
-        "Deny outside a bounded aws:PrincipalArn list, because an Allow does not stop "
-        "a same-account caller. AC-08 requires an available bedrock-agentcore endpoint "
+        "passes only on a Deny outside a bounded aws:PrincipalArn list, because an "
+        "Allow does not stop a same-account caller, or on an allowedWorkloadConfiguration "
+        "that admits a gateway whose target routes to the runtime and nothing else. A "
+        "configuration admitting none of those gateways, another workload or a wildcard "
+        "fails, and one with no gateway target routing to the runtime is N/A. AC-08 requires an available bedrock-agentcore endpoint "
         "when runtimes exist, fails an interface endpoint with private DNS off, and "
         "fails a security group set whose inbound ranges together cover the internet. "
         "AC-10 fails an Allow that opens the runtime to any principal without binding "
