@@ -21488,6 +21488,72 @@ class TestAC17AgentsOutsideRuntime:
         assert finding["Status"] == "N/A"
         assert "logs:DescribeLogGroups" in finding["Resolution"]
 
+    _LIMIT = (
+        "A log group outside /aws/bedrock-agentcore/runtimes/ is not detected, so "
+        "a region whose agent hosted outside AgentCore Runtime writes elsewhere "
+        "reads N/A."
+    )
+
+    @staticmethod
+    def _by_prefix(names):
+        """Answer describe_log_groups the way the API does, filtering one flat
+        list by logGroupNamePrefix, so a group the code must not name is served
+        to any prefix it matches."""
+
+        def describe(**kwargs):
+            prefix = kwargs.get("logGroupNamePrefix", "")
+            return {
+                "logGroups": [
+                    {"logGroupName": name} for name in names if name.startswith(prefix)
+                ]
+            }
+
+        return describe
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_customer_named_trace_group_is_not_named_and_the_limit_is_stated(
+        self, mock_ac, mock_logs
+    ):
+        # create-online-evaluations.md shows an outside-Runtime agent writing
+        # to a customer-named group such as /aws/agentcore/test-agent-traces.
+        _online_evaluation_client(mock_ac)
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_logs.describe_log_groups.side_effect = self._by_prefix(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/agentcore/x-traces"]
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            (finding,) = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert finding["Status"] == "Failed"
+        details = finding["Finding_Details"]
+        assert "/aws/bedrock-agentcore/runtimes/a" in details
+        assert "x-traces" not in details
+        assert self._LIMIT in details
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_a_customer_named_trace_group_reads_na_with_the_limit(
+        self, mock_ac, mock_logs
+    ):
+        _online_evaluation_client(mock_ac)
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_logs.describe_log_groups.side_effect = self._by_prefix(
+            ["/aws/agentcore/x-traces"]
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            (finding,) = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert finding["Status"] == "N/A"
+        assert "x-traces" not in finding["Finding_Details"]
+        assert self._LIMIT in finding["Finding_Details"]
+
 
 def _ac17_endpoints(mock_ac, by_runtime):
     """List each runtime's endpoints by name, keyed on the runtime id."""

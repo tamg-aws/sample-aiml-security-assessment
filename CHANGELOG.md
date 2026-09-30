@@ -298,6 +298,14 @@ section.
 
 ### Fixed
 
+- `AC-17` states what its outside-Runtime agent read cannot see. In a
+  region with no runtime it finds such an agent only by a log group under
+  `/aws/bedrock-agentcore/runtimes/`, but the online evaluation guide also
+  shows one writing to a customer-named group such as
+  `/aws/agentcore/test-agent-traces`. The `Failed` and `N/A` rows now say a
+  group outside the prefix is not detected, so such a region reads `N/A`,
+  and the `N/A` row no longer says no agent there needs online evaluation.
+
 - `AC-33`'s `AgentCore Runtime Invocation By User ID` row now subtracts a
   Deny scoped to the runtimes. The row told customers to add an explicit
   Deny on these runtimes, but it counted only an unconditioned Deny on

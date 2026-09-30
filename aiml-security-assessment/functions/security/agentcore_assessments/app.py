@@ -7843,7 +7843,8 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
     true still requires one running configuration, for agents hosted outside
     AgentCore Runtime whose traces reach CloudWatch. Unset, a log group under
     the runtime prefix requires one as well, because the AgentCore guide has
-    such an agent write there; with no such group, that case is N/A.
+    such an agent write there; with no such group, that case is N/A. A group
+    outside the prefix, such as a customer-named traces group, is not detected.
     """
     finding_name = "AgentCore Online Evaluation Coverage"
     if agentcore_client is None:
@@ -7962,6 +7963,13 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                     )
                 except (BotoCoreError, ClientError) as error:
                     groups_error = _assessment_error_label(error)
+            # The online-evaluation guide also shows such an agent writing to a
+            # group the customer names, which no prefix read can find.
+            limit_note = (
+                f" A log group outside {AGENTCORE_RUNTIME_LOG_GROUP_PREFIX} is not "
+                "detected, so a region whose agent hosted outside AgentCore "
+                "Runtime writes elsewhere reads N/A."
+            )
             if agent_groups:
                 status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
                 details_text = (
@@ -7971,7 +7979,7 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                     "guide has agents hosted outside AgentCore Runtime write, "
                     f"exist: {', '.join(agent_groups)}. No online evaluation "
                     f"configuration is running ({len(judged)} found). A group a "
-                    "deleted runtime left behind reads the same."
+                    "deleted runtime left behind reads the same." + limit_note
                 )
                 resolution = (
                     "Create an online evaluation configuration over these log "
@@ -7999,8 +8007,9 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                         if logs_client is not None
                         else ""
                     )
-                    + ", so no agent here needs online evaluation. AC-39 judges "
-                    "any configuration that exists."
+                    + ", so no agent was found that needs online evaluation. "
+                    "AC-39 judges any configuration that exists."
+                    + (limit_note if logs_client is not None else "")
                 )
                 resolution = (
                     "No action required unless agents hosted outside AgentCore "
