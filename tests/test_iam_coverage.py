@@ -112,6 +112,7 @@ REQUIRED_SAGEMAKER_ACTIONS = {
     "sagemaker:DescribeNotebookInstance",
     "sagemaker:ListDomains",
     "sagemaker:DescribeDomain",
+    "sagemaker:ListUserProfiles",  # SM-09
     "sagemaker:ListTrainingJobs",
     "sagemaker:DescribeTrainingJob",
     "sagemaker:ListModelPackageGroups",
@@ -393,6 +394,15 @@ def test_required_sagemaker_actions_are_granted_to_the_sagemaker_function(templa
         "grant present elsewhere in this file does not help this function at "
         "runtime — add the action(s) to this function's own Policies block."
     )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=lambda p: os.path.basename(p))
+def test_br47_br52_browser_read_is_granted_to_the_bedrock_function(template):
+    # BR-47 and BR-52 call GetBrowser from the Bedrock function. The AgentCore
+    # function's own GetBrowser grant does not reach it, which read
+    # AccessDeniedException live and left both bucket lists incomplete.
+    granted = _granted_actions_for_resource(template, "BedrockAssessmentReadsPolicy")
+    assert "bedrock-agentcore:GetBrowser" in granted
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=lambda p: os.path.basename(p))

@@ -145,6 +145,7 @@ _EXPECTED_ACTIONS = {
         "account:ListRegions",
         "aoss:GetAccessPolicy",
         "aoss:ListAccessPolicies",
+        "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
@@ -378,6 +379,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListProcessingJobs",
         "sagemaker:ListTrainingJobs",
         "sagemaker:ListTransformJobs",
+        "sagemaker:ListUserProfiles",
         "sagemaker:ListTrials",
         "secretsmanager:ListSecrets",
         "securityhub:DescribeOrganizationConfiguration",
@@ -811,6 +813,10 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
             ),
             scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
+            scoped(
+                "bedrock-agentcore:GetBrowser",
+                "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
+            ),
             (
                 "Allow",
                 "cloudtrail:GetEventDataStore",

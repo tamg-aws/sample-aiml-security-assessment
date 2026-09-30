@@ -326,6 +326,14 @@ Resources:
             Action:
               - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
             Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
+          - Sid: AgentCoreBrowserRead
+            # BR-47 and BR-52 read the recording bucket of each custom AgentCore
+            # browser. The service authorization reference lists the
+            # browser-custom resource type for GetBrowser.
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:GetBrowser # BR-47, BR-52
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
           - Sid: AccountListRegions
             # BR-51 lists the Regions enabled for this account and sweeps each
             # for an IAM Identity Center instance.
@@ -1152,7 +1160,7 @@ Resources:
               Resource: '*'
             - Sid: ApprovedInventoryWithoutResourceType
               # Read-only inventory approved for the SageMaker legs. None of these
-              # thirteen actions has a resource type in the service authorization
+              # fourteen actions has a resource type in the service authorization
               # reference, so each needs Resource '*'.
               Effect: Allow
               Action:
@@ -1169,6 +1177,7 @@ Resources:
                 - ecr:GetSigningConfiguration # SM-43
                 - fsx:DescribeFileSystems # SM-03
                 - sagemaker:ListInferenceComponents # SM-43
+                - sagemaker:ListUserProfiles # SM-09
               Resource: '*'
             - Sid: EC2NetworkPostureInventory
               # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37

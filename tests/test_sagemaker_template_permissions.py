@@ -114,6 +114,7 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
     "ecr:GetSigningConfiguration": "ApprovedInventoryWithoutResourceType",
     "fsx:DescribeFileSystems": "ApprovedInventoryWithoutResourceType",
     "sagemaker:ListInferenceComponents": "ApprovedInventoryWithoutResourceType",
+    "sagemaker:ListUserProfiles": "ApprovedInventoryWithoutResourceType",
     # API_DescribeAlarms and API_DescribeAlarmHistory return composite alarms
     # only when the permission is scoped to '*'.
     "cloudwatch:DescribeAlarms": "CompositeAlarmRead",
@@ -125,7 +126,6 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
 UNAPPROVED_SAGEMAKER_READS = [
     "ec2:DescribeVpcs",
     "ec2:DescribeDhcpOptions",
-    "sagemaker:ListUserProfiles",
     "sagemaker:ListMonitoringExecutions",
     "guardduty:ListMembers",
     "organizations:ListAccounts",
