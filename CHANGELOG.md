@@ -298,6 +298,13 @@ section.
 
 ### Fixed
 
+- `AC-06` reads who else can fetch browser recordings. RT-09 asks who can
+  read the recording prefix, but AC-06 judged only encryption, TLS, expiry and
+  the execution role's write, so a bucket policy granting `s3:GetObject` on the
+  prefix to another account passed. Such a grant now fails and names the
+  statement, a public grant fails when `RestrictPublicBuckets` is off on the
+  bucket and account, and every row names the cached roles and users whose
+  identity policies read the prefix.
 - `AC-37` reads the service control policies binding the account before it
   reports a gateway's guardrail wiring as `Passed`. POL-06 asks whether the
   guardrail call can succeed, and an attached Deny on

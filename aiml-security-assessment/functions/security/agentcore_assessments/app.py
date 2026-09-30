@@ -6596,6 +6596,134 @@ def _recording_bucket_gaps(
     return problems, fixes, unread, retries, facts
 
 
+BROWSER_RECORDING_READ_ACTION = "s3:getobject"
+
+
+def _recording_prefix_reached(statement: Dict[str, Any], object_arn: str) -> bool:
+    """Return whether one statement's resources reach the recording prefix."""
+    if "NotResource" in statement:
+        return _statement_resource_covers(statement, [object_arn])
+    return any(
+        fnmatchcase(object_arn, pattern) or fnmatchcase(pattern, object_arn)
+        for pattern in _statement_resources(statement)
+    )
+
+
+def _restrict_public_buckets(reads: Dict[str, Tuple[str, Any]]) -> Optional[bool]:
+    """Return whether RestrictPublicBuckets binds the bucket, or None if unread."""
+    state, response = reads["public_access_block"]
+    if state == "error":
+        return None
+    config = (response or {}).get("PublicAccessBlockConfiguration") or {}
+    if config.get("RestrictPublicBuckets") is True:
+        return True
+    account_state, account_response = reads["account_public_access_block"]
+    if account_state == "error":
+        return None
+    account_config = (account_response or {}).get(
+        "PublicAccessBlockConfiguration"
+    ) or {}
+    return account_config.get("RestrictPublicBuckets") is True
+
+
+def _recording_bucket_read_grants(
+    statements: List[Dict[str, Any]],
+    object_arn: str,
+    account: str,
+    restrict: Optional[bool],
+) -> List[str]:
+    """Return the bucket policy Allows that open the recordings past the account.
+
+    An unconditioned Allow of s3:GetObject reaching the recording prefix counts
+    when it names Principal "*", uses NotPrincipal, or names a principal in
+    another account. A service principal is not counted, and neither is any
+    Allow with a condition, which is not evaluated. RestrictPublicBuckets limits
+    a bucket with a public policy to its own account, so the public grants count
+    only when it is known to be off, and while it is on a grant to another
+    account counts only when no unconditioned Allow in the policy is public.
+    """
+    public = any(
+        statement.get("Effect") == "Allow"
+        and not statement.get("Condition")
+        and ("NotPrincipal" in statement or "*" in _statement_principals(statement))
+        for statement in statements
+    )
+    if restrict and public:
+        return []
+    grants: List[str] = []
+    for statement in statements:
+        if (
+            statement.get("Effect") != "Allow"
+            or statement.get("Condition")
+            or not _statement_matches_action(statement, BROWSER_RECORDING_READ_ACTION)
+            or not _recording_prefix_reached(statement, object_arn)
+        ):
+            continue
+        if "NotPrincipal" in statement:
+            wide = (
+                ["every principal NotPrincipal leaves out"] if restrict is False else []
+            )
+        else:
+            wide = []
+            for principal in _statement_principals(statement):
+                owner = (
+                    principal
+                    if len(principal) == 12 and principal.isdigit()
+                    else _arn_account(principal)
+                )
+                if (principal == "*" and restrict is False) or (
+                    owner and owner != account
+                ):
+                    wide.append(principal)
+        if wide:
+            sid = statement.get("Sid")
+            source = f"statement '{sid}'" if sid else "a statement"
+            grants.append(f"{source} to {', '.join(sorted(wide))}")
+    return grants
+
+
+def _recording_cached_readers(permission_cache: Any, object_arn: str) -> str:
+    """Name the cached roles and users whose identity policies read the recordings.
+
+    A principal counts when an Allow of s3:GetObject reaches the recording
+    prefix and survives its own unconditioned Deny statements and permissions
+    boundary. Conditions on the Allow are not evaluated. Returns an empty string
+    when no permission cache was produced.
+    """
+    if not isinstance(permission_cache, dict):
+        return ""
+    readers: List[str] = []
+    for kind, key in (("role", "role_permissions"), ("user", "user_permissions")):
+        for name, permissions in sorted((permission_cache.get(key) or {}).items()):
+            if not isinstance(permissions, dict):
+                continue
+            try:
+                statements = [
+                    statement
+                    for policy in _principal_policies(permissions)
+                    for statement in _document_statements(_policy_document(policy))
+                ]
+            except (TypeError, ValueError):
+                continue
+            if any(
+                statement.get("Effect") == "Allow"
+                and _statement_matches_action(statement, BROWSER_RECORDING_READ_ACTION)
+                and _recording_prefix_reached(statement, object_arn)
+                for statement in statements
+            ) and _grant_survives(permissions, BROWSER_RECORDING_READ_ACTION):
+                readers.append(f"{kind} {name}")
+    if not readers:
+        return (
+            " No cached role or user has an identity policy allowing s3:GetObject "
+            f"on {object_arn}."
+        )
+    return (
+        " These cached principals have an identity policy allowing s3:GetObject "
+        f"on {object_arn} after their own Deny statements and permissions "
+        f"boundary: {', '.join(readers)}."
+    )
+
+
 def _recording_write_verdict(
     role_arn: str,
     permission_cache: Any,
@@ -6756,8 +6884,11 @@ def check_browser_tool_recording(
     The population is every custom browser. The AWS managed browser has no
     recording configuration to change. A recording browser passes only when its
     bucket, owned by the browser's account, encrypts with a KMS key, blocks
-    public access, denies the recording prefix without TLS and expires it, and
-    its execution role may write the prefix. A bucket leg or role that could
+    public access, denies the recording prefix without TLS and expires it, has no
+    unconditioned bucket policy Allow of s3:GetObject on the prefix to Principal
+    "*" or another account, and its execution role may write the prefix. Every
+    row names the cached roles and users whose identity policies read the
+    prefix. A bucket leg or role that could
     not be read is N/A and never Passed, and it never hides a Failed leg.
     """
     findings = []
@@ -6865,6 +6996,7 @@ def check_browser_tool_recording(
                     "s3:PutObject to the recording prefix."
                 )
             write_note = ""
+            reader_note = ""
             if not account:
                 unread.append(
                     "the recording bucket, because GetBrowser returned no browserArn "
@@ -6880,6 +7012,28 @@ def check_browser_tool_recording(
                     _recording_bucket_gaps(reads, bucket, key_prefix, object_arn),
                 ):
                     found.extend(bucket_list)
+                policy_state, policy = reads["policy"]
+                if policy_state != "error":
+                    read_grants = _recording_bucket_read_grants(
+                        _document_statements((policy or {}).get("Policy")),
+                        object_arn,
+                        account,
+                        _restrict_public_buckets(reads),
+                    )
+                    if read_grants:
+                        problems.append(
+                            f"bucket '{bucket}' policy allows s3:GetObject on "
+                            f"{object_arn} with no condition by "
+                            f"{'; '.join(read_grants)}, so principals beyond the "
+                            f"ones account {account} grants it can read the "
+                            "recordings"
+                        )
+                        fixes.append(
+                            "Remove the bucket policy Allow of s3:GetObject on "
+                            "the recording prefix to Principal '*' or another "
+                            "account, or condition it on aws:PrincipalArn."
+                        )
+                reader_note = _recording_cached_readers(permission_cache, object_arn)
                 if role_arn:
                     policy_state, policy = reads["policy"]
                     verdict, text = _recording_write_verdict(
@@ -6919,7 +7073,7 @@ def check_browser_tool_recording(
                         finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
                         finding_details=(
                             f"{label} records to {destination} but "
-                            f"{'; '.join(problems)}.{not_read}"
+                            f"{'; '.join(problems)}.{not_read}{reader_note}"
                         ),
                         resolution=" ".join(fixes + retries),
                         reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
@@ -6935,7 +7089,7 @@ def check_browser_tool_recording(
                         finding_details=(
                             f"{label} records to {destination}, but the destination "
                             f"could not be judged, so it is not reported as "
-                            f"protected.{not_read}"
+                            f"protected.{not_read}{reader_note}"
                         ),
                         resolution=" ".join(retries),
                         reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
@@ -6957,8 +7111,8 @@ def check_browser_tool_recording(
                         finding_details=(
                             f"{label} has session recording enabled to "
                             f"{destination}. Bucket '{bucket}' {', '.join(facts)}, "
-                            f"and {write_note}. {BROWSER_RECORDING_WRITE_CEILING}"
-                            f"{v1_note}"
+                            f"and {write_note}.{reader_note} "
+                            f"{BROWSER_RECORDING_WRITE_CEILING}{v1_note}"
                         ),
                         resolution="No action required",
                         reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,

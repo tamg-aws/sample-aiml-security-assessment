@@ -41317,6 +41317,282 @@ class TestAC46CostAnomalyAlerting:
         assert 'ce_client = boto3.client("ce"' in source
 
 
+class TestAC06RecordingReaders:
+    """AC-06: who else can read the recordings, from the bucket policy and cache."""
+
+    _OTHER_OBJECTS = "arn:aws:s3:::other/rec/*"
+
+    @staticmethod
+    def _read(principal, resource=_RECORDING_OBJECTS, **extra):
+        statement = {
+            "Sid": "Readers",
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "s3:GetObject",
+            "Resource": resource,
+        }
+        statement.update(extra)
+        return statement
+
+    def _two_buckets(self, mock_s3, policies, order=("br-1", "br-2")):
+        _wire_recording_bucket(mock_s3)
+
+        def bucket_policy(Bucket, ExpectedBucketOwner):
+            deny = _plaintext_deny(
+                Resource=[f"arn:aws:s3:::{Bucket}", f"arn:aws:s3:::{Bucket}/*"]
+            )
+            return {
+                "Policy": json.dumps(
+                    {"Version": "2012-10-17", "Statement": [deny, *policies[Bucket]]}
+                )
+            }
+
+        mock_s3.get_bucket_policy.side_effect = bucket_policy
+        buckets = {"br-1": "recordings", "br-2": "other"}
+        findings = _record(
+            _browser_inventory(
+                *(_recorded_browser(b, bucket=buckets[b]) for b in order)
+            ),
+            _recorder_cache(
+                statements=[
+                    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}
+                ]
+            ),
+        )
+        return {
+            b: next(f for f in findings if f"({b})" in f["Finding_Details"])
+            for b in order
+        }
+
+    @pytest.mark.parametrize("order", [("br-1", "br-2"), ("br-2", "br-1")])
+    @patch("agentcore_app.s3_client")
+    def test_a_cross_account_read_fails_only_its_bucket(self, mock_s3, order):
+        rows = self._two_buckets(
+            mock_s3,
+            {
+                "recordings": [
+                    self._read({"AWS": "arn:aws:iam::999988887777:role/outsider"})
+                ],
+                "other": [
+                    self._read(
+                        {"AWS": "arn:aws:iam::123456789012:role/reader"},
+                        resource=self._OTHER_OBJECTS,
+                    )
+                ],
+            },
+            order=order,
+        )
+
+        assert rows["br-1"]["Status"] == "Failed"
+        assert (
+            f"allows s3:GetObject on {_RECORDING_OBJECTS} with no condition by "
+            "statement 'Readers' to arn:aws:iam::999988887777:role/outsider"
+        ) in rows["br-1"]["Finding_Details"]
+        assert "Principal '*' or another account" in rows["br-1"]["Resolution"]
+        assert rows["br-2"]["Status"] == "Passed"
+        assert "allows s3:GetObject" not in rows["br-2"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "bucket_restrict, account, status, named",
+        [
+            (True, None, "Passed", False),
+            (False, {"RestrictPublicBuckets": True}, "Passed", False),
+            (False, {"RestrictPublicBuckets": False}, "Failed", True),
+            (False, "denied", "N/A", False),
+        ],
+        ids=["bucket-restricts", "account-restricts", "neither", "account-unread"],
+    )
+    @pytest.mark.parametrize(
+        "statement, grantee",
+        [
+            ({"Principal": "*"}, "*"),
+            (
+                {"NotPrincipal": {"AWS": "arn:aws:iam::123456789012:root"}},
+                "every principal NotPrincipal leaves out",
+            ),
+        ],
+        ids=["star", "not-principal"],
+    )
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_public_read_counts_only_when_restrict_public_buckets_is_off(
+        self,
+        mock_s3,
+        mock_s3control,
+        statement,
+        grantee,
+        bucket_restrict,
+        account,
+        status,
+        named,
+    ):
+        read = self._read("*")
+        del read["Principal"]
+        read.update(statement)
+        _wire_recording_bucket(mock_s3, statements=[_plaintext_deny(), read])
+        mock_s3.get_public_access_block.return_value["PublicAccessBlockConfiguration"][
+            "RestrictPublicBuckets"
+        ] = bucket_restrict
+        if account == "denied":
+            mock_s3control.get_public_access_block.side_effect = _make_client_error(
+                "AccessDenied", "denied"
+            )
+        else:
+            config = {f: True for f in agentcore_app.S3_PUBLIC_ACCESS_BLOCK_FIELDS}
+            config.update(account or {})
+            mock_s3control.get_public_access_block.return_value = {
+                "PublicAccessBlockConfiguration": config
+            }
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == status
+        assert (
+            f"with no condition by statement 'Readers' to {grantee}"
+            in finding["Finding_Details"]
+        ) is named
+
+    @patch("agentcore_app.s3_client")
+    def test_a_public_policy_under_restrict_public_buckets_blocks_the_other_account(
+        self, mock_s3
+    ):
+        _wire_recording_bucket(
+            mock_s3,
+            statements=[
+                _plaintext_deny(),
+                self._read({"AWS": "arn:aws:iam::999988887777:role/outsider"}),
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": "arn:aws:s3:::recordings",
+                },
+            ],
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Passed"
+        assert "999988887777" not in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "principal, status",
+        [
+            ({"AWS": "arn:aws:iam::999988887777:role/outsider"}, "Failed"),
+            ({"AWS": "999988887777"}, "Failed"),
+            ({"AWS": "arn:aws:iam::123456789012:role/reader"}, "Passed"),
+            ({"Service": "cloudfront.amazonaws.com"}, "Passed"),
+        ],
+        ids=["other-account-role", "other-account-id", "same-account", "service"],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_only_a_principal_outside_the_account_fails(
+        self, mock_s3, principal, status
+    ):
+        _wire_recording_bucket(
+            mock_s3, statements=[_plaintext_deny(), self._read(principal)]
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == status
+        if status == "Failed":
+            assert "999988887777" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {
+                "Sid": "Readers",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": _RECORDING_OBJECTS,
+                "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-1"}},
+            },
+            {
+                "Sid": "Readers",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::recordings/public/*",
+            },
+            {
+                "Sid": "Readers",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::recordings",
+            },
+        ],
+        ids=["conditioned", "other-prefix", "other-action"],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_grant_that_does_not_open_the_prefix_passes(self, mock_s3, statement):
+        _wire_recording_bucket(mock_s3, statements=[_plaintext_deny(), statement])
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_cached_readers_are_named_and_a_denied_one_is_not(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        cache = _recorder_cache()
+
+        def principal(*statements):
+            return {
+                "attached_policies": [
+                    {"policy_name": "p", "document": {"Statement": list(statements)}}
+                ]
+            }
+
+        read = {"Effect": "Allow", "Action": "s3:GetObject"}
+        cache["role_permissions"].update(
+            {
+                "reader-b": principal({**read, "Resource": _RECORDING_OBJECTS}),
+                "reader-a": principal(
+                    {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}
+                ),
+                "denied": principal(
+                    {**read, "Resource": "*"},
+                    {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*"},
+                ),
+                "elsewhere": principal({**read, "Resource": self._OTHER_OBJECTS}),
+            }
+        )
+        cache["user_permissions"] = {
+            "alice": principal(
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:Get*",
+                    "Resource": "arn:aws:s3:::recordings/*",
+                }
+            )
+        }
+
+        finding = _record(_browser_inventory(_recorded_browser()), cache)[0]
+
+        assert finding["Status"] == "Passed"
+        assert (
+            "boundary: role reader-a, role reader-b, user alice."
+            in finding["Finding_Details"]
+        )
+        for absent in ("browser-recorder,", "role denied", "elsewhere"):
+            assert absent not in finding["Finding_Details"]
+
+    @patch("agentcore_app.s3_client")
+    def test_no_cached_reader_is_stated(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert (
+            "No cached role or user has an identity policy allowing s3:GetObject "
+            f"on {_RECORDING_OBJECTS}."
+        ) in finding["Finding_Details"]
+
+
 class TestAC06AccountPublicAccessBlock:
     """AIR-ACR-RT-09: S3 applies the more restrictive of the bucket and account
     Block Public Access settings, so AC-06 reads the recording account's."""
