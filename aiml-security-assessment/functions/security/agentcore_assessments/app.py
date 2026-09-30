@@ -19125,18 +19125,51 @@ def _allow_reaches_runtime(statement: Dict[str, Any], runtime_arn: str) -> bool:
     )
 
 
+def _deny_covers_runtime(statement: Dict[str, Any], runtime_arn: str) -> bool:
+    """Return whether one Deny statement's resources cover a runtime and every
+    endpoint under it.
+
+    The probes are the ones _allow_reaches_runtime reads. A Resource list must
+    match both. A `?` read as text would match the literal `*` in the endpoint
+    probe, so a pattern carrying one covers the runtime ARN only. A NotResource
+    Deny covers the runtime only when no exclusion overlaps either probe.
+    """
+    probes = (runtime_arn, f"{runtime_arn}/runtime-endpoint/*")
+    if "NotResource" in statement:
+        excluded = statement.get("NotResource")
+        excluded = excluded if isinstance(excluded, list) else [excluded]
+        return not any(
+            _action_patterns_overlap(str(pattern), probe)
+            for pattern in excluded
+            if pattern
+            for probe in probes
+        )
+    return all(
+        any(
+            fnmatchcase(probe, pattern)
+            and not (probe != runtime_arn and "?" in pattern)
+            for pattern in _statement_resources(statement)
+        )
+        for probe in probes
+    )
+
+
 def _user_id_invoke_findings(
     jwt_runtime_arns: Dict[str, str],
     principals: List[Tuple[str, Dict[str, Any]]],
     runtime_reads_failed: List[str],
 ) -> List[Dict[str, Any]]:
-    """Judge whether any cached principal can invoke a JWT runtime by user id.
+    """Judge whether any cached principal holds the user-id invoke grant on a JWT runtime.
 
     InvokeAgentRuntimeForUser and its WebSocket twin let a SigV4 caller name the
-    user the runtime acts for, so on a runtime whose callers all carry a JWT the
-    grant is a way around the authorizer. A grant counts when an Allow reaches
+    user the runtime acts for, and the runtime OAuth guide advises an explicit
+    Deny of both for a runtime that does not need user-id delegation. Whether a
+    runtime with a JWT authorizer accepts such a call is not documented, so the
+    row reports the grant, not a tested bypass. A grant counts when an Allow reaches
     the action and the runtime and survives the principal's own unconditioned
-    Deny statements and permissions boundary. Conditions on the Allow are not
+    Deny statements and permissions boundary. An unconditioned Deny of the
+    action in the principal's own policies removes each runtime it covers
+    together with every endpoint under it. Conditions on the Allow are not
     read, and neither is a resource-based policy on the runtime.
     """
     findings: List[Dict[str, Any]] = []
@@ -19163,6 +19196,23 @@ def _user_id_invoke_findings(
                             for arn in jwt_runtime_arns
                             if _allow_reaches_runtime(statement, arn)
                         )
+                for policy in _principal_policies(permissions):
+                    try:
+                        document = _policy_document(policy)
+                    except (TypeError, ValueError):
+                        continue
+                    for statement in _document_statements(document, effect="Deny"):
+                        if _statement_condition_keys(
+                            statement
+                        ) or not _statement_reached_actions(
+                            statement, (action.lower(),)
+                        ):
+                            continue
+                        runtimes = {
+                            arn
+                            for arn in runtimes
+                            if not _deny_covers_runtime(statement, arn)
+                        }
                 if runtimes:
                     names = ", ".join(jwt_runtime_arns[arn] for arn in sorted(runtimes))
                     reached.append(f"{action} on {names}")
@@ -19175,20 +19225,25 @@ def _user_id_invoke_findings(
                     check_id="AC-33",
                     finding_name="AgentCore Runtime Invocation By User ID",
                     finding_details=(
-                        "These principals are granted InvokeAgentRuntimeForUser or "
+                        "These principals hold InvokeAgentRuntimeForUser or "
                         "InvokeAgentRuntimeWithWebSocketStreamForUser on a runtime "
-                        "with a custom JWT authorizer, after their own Deny "
-                        "statements and permissions boundary, so they can invoke it "
-                        "for any user id they name instead of presenting that user's "
-                        f"JWT: {', '.join(granted)}. Conditions on the Allow were "
-                        "not read. "
+                        "with a custom JWT authorizer with no explicit Deny, after "
+                        "their own Deny statements and permissions boundary: "
+                        f"{', '.join(granted)}. The runtime OAuth guide advises an "
+                        "explicit Deny on both actions for a runtime that does not "
+                        "need user-id delegation "
+                        f"({AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL}). Whether "
+                        "a runtime with a JWT authorizer accepts these SigV4 calls "
+                        "is not documented, so this row reports the grant, not a "
+                        "tested bypass. Conditions on the Allow were not read. "
                         f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Add an explicit Deny on "
                         "bedrock-agentcore:InvokeAgentRuntimeForUser and "
                         "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser "
-                        "on these runtimes to each principal, or remove the grant."
+                        "on these runtimes and their runtime-endpoint ARNs to each "
+                        "principal, or remove the grant."
                     ),
                     reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,

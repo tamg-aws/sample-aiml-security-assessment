@@ -298,6 +298,18 @@ section.
 
 ### Fixed
 
+- `AC-33`'s `AgentCore Runtime Invocation By User ID` row now subtracts a
+  Deny scoped to the runtimes. The row told customers to add an explicit
+  Deny on these runtimes, but it counted only an unconditioned Deny on
+  `Resource: "*"`, so a customer who followed it still failed. An
+  unconditioned Deny in the principal's own policies now removes each runtime
+  whose ARN and `runtime-endpoint/*` ARNs it covers; a Deny on the runtime ARN
+  alone, and a conditioned Deny, remove nothing. The Failed text no longer
+  says the principal can invoke the runtime for any user id, because whether
+  a JWT-configured runtime accepts the SigV4 call is not documented. It says
+  the principal holds the grant with no explicit Deny, which the runtime
+  OAuth guide advises for a runtime that does not need user-id delegation.
+
 - `AC-29`'s `AgentCore Gateway Identity Authorizer Guardrail` row no longer
   passes a deny-list. ID-04 asks for `StringNotEquals` `CUSTOM_JWT` on
   `CreateGateway` and `UpdateGateway`, but the row credited a Deny that named

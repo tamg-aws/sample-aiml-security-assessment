@@ -35186,6 +35186,123 @@ class TestAC33InvokeForUserOnJwtRuntimes:
 
         assert [f["Status"] for f in rows] == ["Passed"]
 
+    def _scoped_deny(self, runtime_ids, endpoints=True, condition=None):
+        resources = []
+        for runtime_id in runtime_ids:
+            resources.append(self._RUNTIME.format(runtime_id))
+            if endpoints:
+                resources.append(
+                    self._RUNTIME.format(runtime_id) + "/runtime-endpoint/*"
+                )
+        statement = {
+            "Effect": "Deny",
+            "Action": [self._FOR_USER, self._WS_FOR_USER],
+            "Resource": resources,
+        }
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    def test_a_deny_on_one_runtime_and_its_endpoints_removes_only_it(self):
+        # The resolution tells customers to Deny on these runtimes, so a Deny
+        # scoped to rt-1 must remove rt-1 and leave rt-2 named.
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(["rt-1"]),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-2' (rt-2)" in details
+        assert "'agent-rt-1' (rt-1)" not in details
+        assert "for any user id" not in details
+        assert "with no explicit Deny" in details
+        assert agentcore_app.AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL in details
+
+    def test_a_deny_on_both_jwt_runtimes_and_their_endpoints_passes(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(["rt-1", "rt-2"]),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_a_deny_on_the_runtime_arns_alone_leaves_the_endpoints(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(["rt-1", "rt-2"], endpoints=False),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" in details
+
+    def test_a_conditioned_deny_does_not_subtract(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(
+                            ["rt-1", "rt-2"],
+                            condition={
+                                "StringEquals": {"aws:RequestedRegion": "eu-west-1"}
+                            },
+                        ),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" in details
+
+    def test_a_not_resource_deny_exempting_one_endpoint_leaves_that_runtime(self):
+        # The exemption names one endpoint through a wildcard in the runtime
+        # segment, so it overlaps rt-1's endpoints and rt-1 is not removed.
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        {
+                            "Effect": "Deny",
+                            "Action": [self._FOR_USER, self._WS_FOR_USER],
+                            "NotResource": [
+                                self._RUNTIME.format("rt-1*") + "/runtime-endpoint/prod"
+                            ],
+                        },
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" not in details
+
     def test_no_jwt_runtime_writes_no_row(self):
         rows = self._rows(self._population(), order=("rt-3",))
 
