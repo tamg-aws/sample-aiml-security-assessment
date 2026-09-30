@@ -298,6 +298,20 @@ section.
 
 ### Fixed
 
+- `AC-06` judges who else can read a browser's recordings. It judged only the
+  write path, so a bucket policy that let any account `s3:GetObject` the
+  recording prefix still passed. A bucket policy `Allow` that reaches
+  `s3:GetObject` on any recording key and trusts `*`, uses `NotPrincipal` or
+  names another account now fails, unless `aws:PrincipalAccount` or
+  `aws:SourceAccount` names the browser's account by value or
+  `aws:PrincipalOrgID` names this account's organization. The organization is
+  read with the `organizations:DescribeOrganization` grant the function
+  already holds; a statement bound to an organization that could not be read
+  is `N/A` naming that action, and one in an account outside any organization
+  fails. An unread bucket policy stays `N/A` naming `s3:GetBucketPolicy`.
+  Statements naming a service principal and object ACLs are not judged, and
+  the Passed row says so. No new IAM action.
+
 - `AC-33` adds an `AgentCore Runtime Invocation By User ID` row. ID-10
   asks for an explicit Deny on `InvokeAgentRuntimeForUser` as well as
   `GetWorkloadAccessTokenForUserId`, but AC-33 judged only the token action,

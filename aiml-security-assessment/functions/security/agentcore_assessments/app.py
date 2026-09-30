@@ -6248,8 +6248,9 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
 
 # AC-06 judges where recordings go as well as whether they are on. A recording
 # holds every page the agent saw, so its bucket must encrypt with a KMS key,
-# block public access, refuse the recordings over plaintext and expire them,
-# and the browser's execution role must be able to write them.
+# block public access, refuse the recordings over plaintext, let no other
+# account read them and expire them, and the browser's execution role must be
+# able to write them.
 BROWSER_RECORDING_KMS_ALGORITHMS = ("aws:kms", "aws:kms:dsse")
 S3_PUBLIC_ACCESS_BLOCK_FIELDS = (
     "BlockPublicAcls",
@@ -6283,6 +6284,7 @@ BROWSER_RECORDING_BUCKET_READS = (
     ("versioning", "get_bucket_versioning", None, "s3:GetBucketVersioning"),
 )
 BROWSER_RECORDING_WRITE_ACTION = "s3:putobject"
+BROWSER_RECORDING_READ_ACTION = "s3:getobject"
 BROWSER_RECORDING_WRITE_CEILING = (
     "Service control policies, the bucket key's policy and the role's use of "
     "that key are not evaluated for this write, so any of them may still refuse "
@@ -6515,7 +6517,11 @@ def _recording_bucket_gaps(
 
     state, response = reads["policy"]
     if state == "error":
-        not_read("policy", "bucket policy")
+        not_read(
+            "policy",
+            "bucket policy, which decides the TLS leg and who else may "
+            "s3:GetObject the recordings",
+        )
     else:
         statements = _document_statements((response or {}).get("Policy"))
         if any(_statement_refuses_plaintext(st, object_arn) for st in statements):
@@ -6596,6 +6602,62 @@ def _recording_bucket_gaps(
     return problems, fixes, unread, retries, facts
 
 
+def _statement_reaches_object(
+    statement: Dict[str, Any], action: str, object_arn: str
+) -> bool:
+    """Return whether a statement reaches `action` on any key under object_arn.
+
+    A Resource narrower than the prefix, such as one session's keys, still
+    reaches some recordings, so the match runs in both directions.
+    """
+    if not _statement_matches_action(statement, action):
+        return False
+    if "NotResource" in statement:
+        return _statement_resource_covers(statement, [object_arn])
+    return any(
+        fnmatchcase(object_arn, pattern) or fnmatchcase(pattern, object_arn)
+        for pattern in _statement_resources(statement)
+    )
+
+
+def _recording_read_exposure(
+    statements: List[Dict[str, Any]],
+    object_arn: str,
+    account: str,
+    read_organization_id: Callable[[], str],
+) -> Tuple[List[str], List[str]]:
+    """Name the bucket policy Allows that let a caller outside `account` read
+    the recordings.
+
+    Returns (open statements, statements bound only to an organization that
+    could not be read). An Allow reaching s3:GetObject on any recording key is
+    open when it trusts `*`, uses NotPrincipal or names another account, unless
+    aws:PrincipalAccount or aws:SourceAccount names `account` by value, or
+    aws:PrincipalOrgID names this account's organization. A statement naming a
+    service principal is not judged here.
+    """
+    opened: List[str] = []
+    org_bound: List[str] = []
+    for index, statement in enumerate(statements, start=1):
+        if statement.get("Effect") != "Allow" or not _statement_reaches_object(
+            statement, BROWSER_RECORDING_READ_ACTION, object_arn
+        ):
+            continue
+        accounts = _guard_condition_values(statement, "aws:principalaccount")
+        if accounts and all(value == account for value in accounts):
+            continue
+        if _confused_deputy_guard_account(
+            statement, account, keys=("aws:sourceaccount",)
+        ):
+            continue
+        scope = _sink_statement_scope(statement, account, read_organization_id)
+        if scope == "scoped":
+            continue
+        name = f"statement {statement.get('Sid') or index}"
+        (org_bound if scope == "org_unread" else opened).append(name)
+    return opened, org_bound
+
+
 def _recording_write_verdict(
     role_arn: str,
     permission_cache: Any,
@@ -6657,13 +6719,8 @@ def _recording_write_verdict(
     }
 
     def reaches(statement: Dict[str, Any]) -> bool:
-        if not _statement_matches_action(statement, BROWSER_RECORDING_WRITE_ACTION):
-            return False
-        if "NotResource" in statement:
-            return _statement_resource_covers(statement, [object_arn])
-        return any(
-            fnmatchcase(object_arn, pattern) or fnmatchcase(pattern, object_arn)
-            for pattern in _statement_resources(statement)
+        return _statement_reaches_object(
+            statement, BROWSER_RECORDING_WRITE_ACTION, object_arn
         )
 
     def applies_to_role(statement: Dict[str, Any]) -> bool:
@@ -6756,7 +6813,8 @@ def check_browser_tool_recording(
     The population is every custom browser. The AWS managed browser has no
     recording configuration to change. A recording browser passes only when its
     bucket, owned by the browser's account, encrypts with a KMS key, blocks
-    public access, denies the recording prefix without TLS and expires it, and
+    public access, denies the recording prefix without TLS, grants no other
+    account s3:GetObject on it through its bucket policy and expires it, and
     its execution role may write the prefix. A bucket leg or role that could
     not be read is N/A and never Passed, and it never hides a Failed leg.
     """
@@ -6807,6 +6865,29 @@ def check_browser_tool_recording(
                 )
             )
             return findings
+
+        organization: Dict[str, Any] = {}
+
+        def read_organization_id() -> str:
+            if "id" not in organization:
+                organization["id"] = ""
+                if organizations_client is None:
+                    organization["error"] = "was not called: no Organizations client"
+                else:
+                    try:
+                        organization["id"] = (
+                            organizations_client.describe_organization()
+                            .get("Organization", {})
+                            .get("Id", "")
+                        )
+                    except (BotoCoreError, ClientError) as error:
+                        organization["absent"] = (
+                            _s3_error_code(error) == "AWSOrganizationsNotInUseException"
+                        )
+                        organization["error"] = (
+                            f"failed with {_assessment_error_label(error)}"
+                        )
+            return organization["id"]
 
         bucket_reads: Dict[str, Dict[str, Tuple[str, Any]]] = {}
         for item in browsers:
@@ -6880,16 +6961,56 @@ def check_browser_tool_recording(
                     _recording_bucket_gaps(reads, bucket, key_prefix, object_arn),
                 ):
                     found.extend(bucket_list)
+                policy_state, policy = reads["policy"]
+                bucket_statements = (
+                    None
+                    if policy_state == "error"
+                    else _document_statements((policy or {}).get("Policy"))
+                )
+                if bucket_statements is not None:
+                    opened, org_bound = _recording_read_exposure(
+                        bucket_statements, object_arn, account, read_organization_id
+                    )
+                    if organization.get("absent"):
+                        # An account outside any organization has no
+                        # organization for a PrincipalOrgID condition to name.
+                        opened, org_bound = opened + org_bound, []
+                    if opened:
+                        problems.append(
+                            f"bucket policy {', '.join(opened)} "
+                            f"{'allows' if len(opened) == 1 else 'allow'} "
+                            f"s3:GetObject on {object_arn} to callers outside "
+                            f"account {account} and its organization, so another "
+                            "account or an anonymous caller can read the recordings"
+                        )
+                        fixes.append(
+                            "Remove the bucket policy Allow of s3:GetObject on the "
+                            "recording prefix to '*' or another account, or add an "
+                            "aws:PrincipalOrgID or aws:PrincipalAccount condition "
+                            "naming this organization or account."
+                        )
+                    if org_bound:
+                        unread.append(
+                            f"whether bucket policy {', '.join(org_bound)} limits "
+                            "s3:GetObject on the recordings to this account's "
+                            "organization (organizations:DescribeOrganization "
+                            f"{organization.get('error', 'returned no id')})"
+                        )
+                        retries.append(
+                            "Grant organizations:DescribeOrganization and retry."
+                        )
+                    if not opened and not org_bound:
+                        facts.append(
+                            "its bucket policy allows no other account and no "
+                            f"anonymous caller s3:GetObject on {object_arn} "
+                            "(statements naming a service principal and object "
+                            "ACLs are not judged)"
+                        )
                 if role_arn:
-                    policy_state, policy = reads["policy"]
                     verdict, text = _recording_write_verdict(
                         str(role_arn),
                         permission_cache,
-                        (
-                            None
-                            if policy_state == "error"
-                            else _document_statements((policy or {}).get("Policy"))
-                        ),
+                        bucket_statements,
                         object_arn,
                         account,
                         partition,

@@ -4147,6 +4147,190 @@ class TestAC06RecordingDestination:
         )
 
 
+def _recording_reader(**overrides):
+    statement = {
+        "Sid": "Reader",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::recordings/*",
+    }
+    statement.update(overrides)
+    return statement
+
+
+def _record_two_buckets(mock_s3, reader, reverse):
+    """Browser br-1 records to `recordings`, which carries `reader`; browser
+    br-2 records to `clean`, whose policy only refuses plaintext."""
+    _wire_recording_bucket(mock_s3)
+    policies = {
+        "recordings": [_plaintext_deny(), reader],
+        "clean": [
+            _plaintext_deny(Resource=["arn:aws:s3:::clean", "arn:aws:s3:::clean/*"])
+        ],
+    }
+    mock_s3.get_bucket_policy.side_effect = lambda Bucket, ExpectedBucketOwner: {
+        "Policy": json.dumps({"Version": "2012-10-17", "Statement": policies[Bucket]})
+    }
+    browsers = [_recorded_browser("br-1"), _recorded_browser("br-2", bucket="clean")]
+    findings = _record(
+        _browser_inventory(*(browsers[::-1] if reverse else browsers)),
+        _recorder_cache(
+            statements=[{"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}]
+        ),
+    )
+    return {
+        finding["Finding_Details"].split("(", 2)[1][:4]: finding for finding in findings
+    }
+
+
+class TestAC06RecordingReadLeg:
+    """AC-06: the bucket policy must not let another account read the recordings."""
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            _recording_reader(),
+            _recording_reader(
+                Principal={"AWS": "*"},
+                Action="s3:*",
+                Resource="arn:aws:s3:::recordings/rec/*",
+            ),
+            _recording_reader(
+                Principal={"AWS": "arn:aws:iam::444455556666:root"}, Action="s3:Get*"
+            ),
+            _recording_reader(Principal={"AWS": ["444455556666"]}, Action="*"),
+            _recording_reader(Resource="arn:aws:s3:::recordings/rec/session-1/*"),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalAccount": "444455556666"}}
+            ),
+            _recording_reader(
+                Condition={
+                    "StringEqualsIfExists": {"aws:PrincipalAccount": "123456789012"}
+                }
+            ),
+            _recording_reader(
+                Condition={"StringLike": {"aws:SourceAccount": "12345678901?"}}
+            ),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalOrgID": "o-other"}}
+            ),
+            _recording_reader(
+                Principal=None,
+                NotPrincipal={"AWS": "arn:aws:iam::123456789012:role/blocked"},
+            ),
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_outside_reader_fails_only_its_bucket(
+        self, mock_s3, mock_orgs, reader, reverse
+    ):
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-mine"}
+        }
+        reader = {key: value for key, value in reader.items() if value is not None}
+
+        findings = _record_two_buckets(mock_s3, reader, reverse)
+
+        assert findings["br-1"]["Status"] == "Failed"
+        details = findings["br-1"]["Finding_Details"]
+        assert "bucket policy statement Reader allows" in details
+        assert f"s3:GetObject on {_RECORDING_OBJECTS}" in details
+        assert "Remove the bucket policy Allow" in findings["br-1"]["Resolution"]
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalAccount": "123456789012"}}
+            ),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:SourceAccount": "123456789012"}}
+            ),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalOrgID": "o-mine"}}
+            ),
+            _recording_reader(
+                Principal={"AWS": "arn:aws:iam::123456789012:role/reader"}
+            ),
+            _recording_reader(Action="s3:PutObject"),
+            _recording_reader(Resource="arn:aws:s3:::recordings/other/*"),
+            _recording_reader(Effect="Deny"),
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_reader_bound_to_this_account_or_org_passes(
+        self, mock_s3, mock_orgs, reader, reverse
+    ):
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-mine"}
+        }
+
+        findings = _record_two_buckets(mock_s3, reader, reverse)
+
+        assert [findings[key]["Status"] for key in ("br-1", "br-2")] == [
+            "Passed",
+            "Passed",
+        ]
+        assert (
+            "its bucket policy allows no other account and no anonymous caller "
+            f"s3:GetObject on {_RECORDING_OBJECTS}"
+        ) in findings["br-1"]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_org_bound_reader_is_na_when_the_org_is_unread(self, mock_s3, mock_orgs):
+        mock_orgs.describe_organization.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        reader = _recording_reader(
+            Condition={"StringEquals": {"aws:PrincipalOrgID": "o-mine"}}
+        )
+
+        findings = _record_two_buckets(mock_s3, reader, False)
+
+        assert findings["br-1"]["Status"] == "N/A"
+        assert "organizations:DescribeOrganization" in findings["br-1"]["Resolution"]
+        assert "statement Reader" in findings["br-1"]["Finding_Details"]
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_org_bound_reader_fails_when_the_account_has_no_org(
+        self, mock_s3, mock_orgs
+    ):
+        mock_orgs.describe_organization.side_effect = _make_client_error(
+            "AWSOrganizationsNotInUseException", "not in use"
+        )
+        reader = _recording_reader(
+            Condition={"StringEquals": {"aws:PrincipalOrgID": "o-mine"}}
+        )
+
+        findings = _record_two_buckets(mock_s3, reader, False)
+
+        assert findings["br-1"]["Status"] == "Failed"
+        assert "statement Reader allows" in findings["br-1"]["Finding_Details"]
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_an_unread_bucket_policy_names_the_read_leg(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_bucket_policy.side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "N/A"
+        assert "who else may s3:GetObject" in finding["Finding_Details"]
+        assert "Grant s3:GetBucketPolicy" in finding["Resolution"]
+
+
 # ===================================================================
 # AC-07: check_agentcore_memory_configuration
 # ===================================================================
