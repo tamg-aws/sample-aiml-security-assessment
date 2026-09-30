@@ -298,6 +298,20 @@ section.
 
 ### Fixed
 
+- `BR-47` and `BR-52` read custom AgentCore browsers. The Bedrock function
+  calls `bedrock-agentcore:GetBrowser` to find each browser's recording
+  bucket, but only the AgentCore function held that grant, so every browser
+  read `AccessDeniedException` live and both rows reported an incomplete
+  bucket list as `N/A`. `BedrockAssessmentReadsPolicy` now grants
+  `GetBrowser` on `browser-custom/*`.
+
+- `SM-09` reads each Studio domain's user profiles. The SageMaker function
+  was granted `sagemaker:DescribeUserProfile` but not
+  `sagemaker:ListUserProfiles`, so every domain read `AccessDeniedException`
+  live and its user-profile execution roles were never judged.
+  `ListUserProfiles` is now granted on `'*'`, since it has no resource type
+  in the service authorization reference.
+
 - `SM-41` judges the certificates a device policy reaches through a thing
   group. For each thing group an attached policy is attached to, it lists
   the group's things with child groups included
@@ -1480,6 +1494,11 @@ section.
     now be `Failed` or `N/A`.
 
 ### Deployment impact
+
+**Bedrock and SageMaker read grants.** `BedrockAssessmentReadsPolicy`
+gains `bedrock-agentcore:GetBrowser` on `browser-custom/*` (`BR-47`,
+`BR-52`), and the SageMaker function gains `sagemaker:ListUserProfiles` on
+`'*'` (`SM-09`). Both are read-only.
 
 **State machine definition.** `statemachine/assessments.asl.json` adds
 `TargetRegions` to the AgentCore task payload, so the deployment stack must
