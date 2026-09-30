@@ -308,10 +308,13 @@ AI_SUBJECT_ROWS = [
         "encrypt by default with a KMS key, deny every principal reads and writes of the recording "
         "prefix without TLS, and expire the prefix by lifecycle rule, including noncurrent versions "
         "when versioned. The execution role must be named and allowed to write the prefix by an "
-        "identity or bucket policy and by its boundary, with no Deny refusing it. Bucket Block Public "
-        "Access left off reads N/A because the account-level setting is not read. SCPs, the bucket "
+        "identity or bucket policy and by its boundary, with no Deny refusing it. A Block Public "
+        "Access setting the bucket leaves off is read from the account, and fails when off on both. "
+        "An unconditioned bucket policy Allow of s3:GetObject on the prefix to another account fails, "
+        "as does one to Principal * or NotPrincipal while RestrictPublicBuckets is off, and every row "
+        "names the cached roles and users whose identity policies read the prefix. SCPs, the bucket "
         "key policy and the role's use of that key are not evaluated, so a Passed write can still be "
-        "refused. Who else can read the recordings is not judged. The AWS managed browser has no "
+        "refused. The AWS managed browser has no "
         "recording configuration and is outside the population",
         [],
         4,
@@ -354,7 +357,13 @@ AI_SUBJECT_ROWS = [
         "directory is reported separately at medium, because the service authorization "
         "reference marks both the directory and the identity required on these actions "
         "and never says whether the directory alone authorizes the call, so that grant "
-        "either reaches every identity the directory holds or authorizes nothing",
+        "either reaches every identity the directory holds or authorizes nothing. The "
+        "role of each runtime with a custom JWT authorizer fails when it can still call "
+        "GetWorkloadAccessTokenForUserId after its own Deny and boundary, and an uncached "
+        "role or an unread runtime is N/A. Every cached role and user fails when an "
+        "Allow of InvokeAgentRuntimeForUser or InvokeAgentRuntimeWithWebSocketStreamForUser "
+        "reaches such a runtime or one of its endpoints and survives its own Deny and "
+        "boundary; conditions on that Allow are not read",
         [],
         4,
     ),
@@ -545,7 +554,9 @@ AI_SUBJECT_ROWS = [
         "that is not customer managed and a key that is disabled or pending deletion "
         "fail, and a key the assessment role cannot describe, which includes every key "
         "in another account, is N/A. AC-07 also requires an {actorId} variable in "
-        "every namespace of every strategy. AC-23 judges each memory read by the key "
+        "every namespace of every strategy, and fails a memory resource-based policy "
+        "whose Allow statement trusts * or an AWS service with no account or "
+        "organization condition, an unread policy being N/A. AC-23 judges each memory read by the key "
         "that action carries: namespace for record reads, actorId or sessionId for "
         "event reads. A strategyId condition alone, an IfExists, ForAllValues or "
         "negated operator and a wildcard-only value do not bound a read. A bare Action "
@@ -606,7 +617,12 @@ AI_SUBJECT_ROWS = [
         "the temporal policy: one with no eventResource fails as Session Rule Resource "
         "Unscoped, and a temporal policy with no readable event pattern is N/A. The "
         "session-id propagation path is fail-closed by the service, since a request to "
-        "an engine holding a temporal policy fails validation without the header",
+        "an engine holding a temporal policy fails validation without the header. "
+        "On a gateway holding a temporal policy, AC-38 reads the execution role's "
+        "bedrock-agentcore:GetWorkloadAccessToken grant from the IAM cache on the "
+        "gateway's workload identity and its directory, and fails a role with no "
+        "surviving unconditioned grant, because the Gateway mints the token that "
+        "carries the session identity with that role. SCPs are not read",
         [],
         4,
     ),
@@ -836,8 +852,16 @@ AI_SUBJECT_ROWS = [
         "restricts it, and an unreadable parent chain or attachment list is N/A. A "
         "policy written the other way round, denying CUSTOM_JWT, is reported "
         "separately when it is attached, because it reads as configured to anyone "
-        "counting policies. The Organizations grants are shared with GW-02's AC-28, so "
-        "ID-04 costs no further permission",
+        "counting policies. A gateway leg on AC-29 requires an attached SCP that "
+        "denies CreateGateway and UpdateGateway unless "
+        "bedrock-agentcore:GatewayAuthorizerType is CUSTOM_JWT, with one statement "
+        "reaching every gateway firing on AWS_IAM, AUTHENTICATE_ONLY and NONE, "
+        "because none of the three carries a validated end user and AC-28's Deny on "
+        "NONE leaves the other two open, and on a type the key does not list, while "
+        "not firing on CUSTOM_JWT. StringNotEquals CUSTOM_JWT passes; a deny-list of "
+        "the three fails, because it does not deny a type the key does not "
+        "enumerate. The Organizations grants are shared with "
+        "GW-02's AC-28, so ID-04 costs no further permission",
         [],
         4,
     ),
@@ -846,7 +870,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-30"],
+        ["AC-30", "AC-31"],
         "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent "
         "configuration means every invoke is SigV4-signed, and a customJWTAuthorizer "
         "that pins neither allowedAudience nor allowedClients accepts every token its "
@@ -856,8 +880,9 @@ AI_SUBJECT_ROWS = [
         "https fails as Issuer Not HTTPS whatever the lists hold. allowedScopes and "
         "customClaims are credited in the detail and cannot substitute, because a "
         "scope bounds what a token may ask for and not who it was minted for. AC-30 "
-        "reads the runtime version GetAgentRuntime returns by default, and its Passed "
-        "text says so",
+        "reads the version GetAgentRuntime returns by default and each other version "
+        "an endpoint serves, on its own row. AC-31 asks the same of each gateway "
+        "CUSTOM_JWT authorizer's allow-lists",
         [],
         4,
     ),
@@ -879,7 +904,9 @@ AI_SUBJECT_ROWS = [
         "unless every InboundJwtClaim/iss value is a literal or a pattern narrower "
         'than *. A bare Action "*" and group policies count, a grant the principal\'s '
         "own Deny or boundary removes does not, and a principal the IAM cache could "
-        "not read is N/A",
+        "not read is N/A. The gateway's third, preventive layer, an SCP denying "
+        "CreateGateway and UpdateGateway with StringNotEquals on "
+        "bedrock-agentcore:DiscoveryUrl, is not judged",
         [],
         4,
     ),
@@ -1016,7 +1043,10 @@ AI_SUBJECT_ROWS = [
         "condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, "
         "because the Policy data plane calls Bedrock Guardrails with that role's "
         "forward access session, and the grant counts after the role's own Deny and "
-        "boundary. AC-37 reads each BedrockGuardrails call by value and fails a "
+        "boundary, then fails when a service control policy attached to the account "
+        "or an OU or root above it denies the action on Resource * with no condition, "
+        "and withholds Passed for a conditioned Deny or an SCP it could not read. "
+        "AC-37 reads each BedrockGuardrails call by value and fails a "
         "guardrail policy that no returned score (0, 0.2, 0.4, 0.6, 0.8, 1.0) can make "
         "act, or whose call names no category or data path. A suppressOutput policy in "
         "a plain when block counts, a threshold it cannot read is named in an N/A row, "
@@ -1039,8 +1069,10 @@ AI_SUBJECT_ROWS = [
         "delivery to a destination, or that runs in a region where no alarm with actions "
         "reads ActiveSessionCount in AWS/Bedrock-AgentCore for Service AgentCore.Runtime. A "
         "runtime missing either lifecycle field, and a delivery or alarm inventory that could "
-        "not be read, read N/A and never Passed. AgentCore exposes no per-session memory or "
-        "cost limit to read, so usage is judged by whether it is recorded and alarmed. "
+        "not be read, read N/A and never Passed. A runtime on a capacity provider names the "
+        "instance types GetCapacityProvider reports, without judging their size, and an "
+        "unread provider is N/A. AgentCore exposes no per-session memory or cost field to "
+        "read, so usage is judged by whether it is recorded and alarmed. "
         "GetAgentRuntime reports the defaults of 900 and 28800 seconds for a runtime that "
         "sets neither field, so whether the owner chose the values is not readable, and every "
         "verdict says which values it found so the workload owner can judge whether the bound "
@@ -1217,7 +1249,9 @@ AI_SUBJECT_ROWS = [
         "the assessed account in every value, fails an account-root or bare account-id "
         "principal unless its condition names the calling principal, and fails a role "
         "that more than one AgentCore resource names, since the shared role carries "
-        "the union of what each needs. The sharing Passed is withheld while any family "
+        "the union of what each needs. The sharing leg runs at the primary Region and "
+        "compares the roles of every assessed Region, and an unread Region is N/A. "
+        "The sharing Passed is withheld while any family "
         "could not be listed, so it reads N/A until "
         "bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are "
         "granted. AC-27 also reads the gateway roles",

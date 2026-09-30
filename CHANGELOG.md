@@ -329,6 +329,152 @@ section.
   these four names, so the failure may come from a name the service does
   not use. The verdict is unchanged.
 
+- `AC-17` states what its outside-Runtime agent read cannot see. In a
+  region with no runtime it finds such an agent only by a log group under
+  `/aws/bedrock-agentcore/runtimes/`, but the online evaluation guide also
+  shows one writing to a customer-named group such as
+  `/aws/agentcore/test-agent-traces`. The `Failed` and `N/A` rows now say a
+  group outside the prefix is not detected, so such a region reads `N/A`,
+  and the `N/A` row no longer says no agent there needs online evaluation.
+
+- `AC-33`'s `AgentCore Runtime Invocation By User ID` row now subtracts a
+  Deny scoped to the runtimes. The row told customers to add an explicit
+  Deny on these runtimes, but it counted only an unconditioned Deny on
+  `Resource: "*"`, so a customer who followed it still failed. An
+  unconditioned Deny in the principal's own policies now removes each runtime
+  whose ARN and `runtime-endpoint/*` ARNs it covers; a Deny on the runtime ARN
+  alone, and a conditioned Deny, remove nothing. The Failed text no longer
+  says the principal can invoke the runtime for any user id, because whether
+  a JWT-configured runtime accepts the SigV4 call is not documented. It says
+  the principal holds the grant with no explicit Deny, which the runtime
+  OAuth guide advises for a runtime that does not need user-id delegation.
+
+- `AC-29`'s `AgentCore Gateway Identity Authorizer Guardrail` row no longer
+  passes a deny-list. ID-04 asks for `StringNotEquals` `CUSTOM_JWT` on
+  `CreateGateway` and `UpdateGateway`, but the row credited a Deny that named
+  `AWS_IAM`, `AUTHENTICATE_ONLY` and `NONE`, which leaves open any authorizer
+  type the condition key does not list. The Deny must now also fire on an
+  unlisted type and must not fire on `CUSTOM_JWT`, so a case-folded
+  `custom_jwt` under `StringNotEquals` fails too. The resolution says why a
+  deny-list fails.
+
+- `AC-06` reads who else can fetch browser recordings. RT-09 asks who can
+  read the recording prefix, but AC-06 judged only encryption, TLS, expiry and
+  the execution role's write, so a bucket policy granting `s3:GetObject` on the
+  prefix to another account passed. Such a grant now fails and names the
+  statement, a public grant fails when `RestrictPublicBuckets` is off on the
+  bucket and account, and every row names the cached roles and users whose
+  identity policies read the prefix.
+- `AC-37` reads the service control policies binding the account before it
+  reports a gateway's guardrail wiring as `Passed`. POL-06 asks whether the
+  guardrail call can succeed, and an attached Deny on
+  `bedrock:InvokeGuardrailChecks` stops it even when the execution role grants
+  the action, yet the row read `Passed` with a note that SCPs were not
+  evaluated. An unconditioned attached Deny on `Resource: "*"` now fails at
+  High and names the policy and its attachment target, a conditioned one or an
+  unreadable policy is `N/A`, and the management account is named as outside
+  SCP scope.
+- `AC-33` adds an `AgentCore Runtime Invocation By User ID` row. ID-10
+  asks for an explicit Deny on `InvokeAgentRuntimeForUser` as well as
+  `GetWorkloadAccessTokenForUserId`, but AC-33 judged only the token action,
+  so a caller could still invoke a custom JWT runtime for any user id it named
+  without that user's JWT. The row fails every cached role and user whose
+  Allow of `InvokeAgentRuntimeForUser` or
+  `InvokeAgentRuntimeWithWebSocketStreamForUser` reaches such a runtime or one
+  of its endpoints and survives its own Deny and boundary. No new IAM action.
+
+- `AC-29` adds an `AgentCore Gateway Identity Authorizer Guardrail` row. ID-04
+  asks for an SCP that keeps every gateway on `CUSTOM_JWT`, but AC-29 read
+  runtimes only and AC-28 asks only that `NONE` be denied, so a gateway could
+  still be created or updated to `AWS_IAM` or `AUTHENTICATE_ONLY`, neither of
+  which carries a validated end user. The row passes when an attached SCP
+  denies `CreateGateway` and `UpdateGateway` for all three types in one
+  statement reaching every gateway. No new IAM action.
+
+- `AC-34` reads the environment variables of every runtime version an
+  endpoint serves. It read only the version `GetAgentRuntime` returns by
+  default, so an endpoint still serving an older version with an API key in
+  its environment passed ID-05. Each other `liveVersion` and `targetVersion`
+  from `ListAgentRuntimeEndpoints` is now read with `agentRuntimeVersion` and
+  judged on its own row. When the endpoints cannot be listed, a clean default
+  version is `N/A` and a failing one stays `Failed`. No new IAM action.
+
+- `AC-26` judges retention and key scope on a log group a `bedrock-agentcore`
+  delivery writes to outside the AgentCore prefixes. AC-20 already read those
+  groups through `DescribeDeliveryDestinations`, but AC-26 read only the
+  prefixed groups, so a custom-named delivery group with no retention and no
+  key passed GW-10 by absence. An unreadable delivery chain is an `N/A` row
+  naming the three `logs:Describe*` actions, and the prefixed groups are still
+  judged. No new IAM action: the three reads were granted for AC-20.
+
+- `AC-38` judges the gateway role's `GetWorkloadAccessToken` grant. The
+  devguide states the Gateway mints a Workload Access Token to carry the
+  session identity once temporal policy is active, and that without this grant
+  tool invocations fail at the token-mint step. AC-38 passed such a gateway
+  without reading its role. A new `AgentCore Policy Session Token Grant` row
+  fails a gateway holding a temporal policy at High when no unconditioned Allow
+  on its workload identity survives the role's own Deny or boundary, passes one
+  granted on both the identity and its directory, and is `N/A` for a
+  conditioned or half-scoped grant, a role outside the IAM cache, or a gateway
+  with no `workloadIdentityDetails`. SCPs are not read.
+
+- `AC-33` judges the user id token action on JWT runtimes. It never read
+  whether a runtime whose every caller arrives with a JWT still lets its role
+  call `GetWorkloadAccessTokenForUserId`, which lets agent code mint a token
+  for any user id it names. A new `AgentCore Token Issuance By User ID` row
+  fails that role at Medium unless its own Deny or boundary removes the grant,
+  passes a role without it, and is `N/A` for a role outside the IAM cache or
+  an unread runtime. `InvokeAgentRuntimeForUser` is not judged.
+
+- `AC-46` reads the capacity provider a runtime names. Its `Passed`
+  resolution said the control plane carries no per-session memory limit, which
+  is not true of a runtime on a capacity provider: its sessions run on the
+  instance types the provider allows. The row now reads each provider once with
+  `bedrock-agentcore:GetCapacityProvider` and names its allowed instance types,
+  or says the runtime names no capacity provider. A provider that cannot be read
+  is `N/A`, so a runtime that passed can now read `N/A`.
+
+- `AC-07` reads each memory's resource-based policy. It called
+  `GetResourcePolicy` for runtimes and gateways only, so a memory whose policy
+  let any principal read its records passed on its namespaces alone. A new
+  `AgentCore Memory Resource-Based Policy` row per memory fails High on an
+  `Allow` statement that trusts `*` or an AWS service with no account or
+  organization condition, passes no policy or a bound one, and is `N/A` when
+  the read fails. The IAM policy simulator denies the existing `memory/*`
+  grant for this action, and the service authorization reference does not
+  list the memory resource type for it. A denied read is `N/A`, never
+  `Passed`.
+
+- `AC-26` log tamper guardrail probes the Bedrock model invocation log group
+  of every assessed Region. It read the logging configuration of the primary
+  Region only, so an SCP that left another Region's invocation log group
+  open passed. The primary Region now reads each Region in `TargetRegions`
+  with its own Bedrock client, fails a deny that misses any of those groups,
+  and is `N/A` naming a Region whose configuration could not be read. A
+  Region with no Bedrock endpoint, or not opted in, is skipped. A row that
+  passed can now be `Failed` or `N/A`.
+
+- `AC-48` execution role sharing compares every assessed Region. An IAM
+  role is global, so a runtime in one Region and a gateway in another could
+  share a role while each Region's `Sharing` row passed. The state machine
+  now passes the resolved Region list to the AgentCore function as
+  `TargetRegions`, and the primary Region (Map index 0) reads the execution
+  roles of every other Region and fails a role that resources in two Regions
+  name. A Region whose `ListAgentRuntimes` probe fails for a reason other
+  than no endpoint or no opt-in is `N/A` naming the Region, and the other
+  Regions no longer emit a sharing row. A row that passed can now be
+  `Failed` or `N/A`.
+
+- `AG-39` gateway WAF rule coverage and `AC-51` web ACL Anti-DDoS fail a
+  filter that runs after an `Allow` rule only when the `Allow` matches on the
+  same attack class: a SQL injection match ahead of SQL injection inspection,
+  a cross-site scripting match ahead of cross-site scripting inspection, or a
+  rate-based statement ahead of a rate-based rule. Behind any other `Allow`,
+  such as an IP set or a byte match, the filter is not judged, and a row whose
+  only gaps sit behind such an `Allow` moves from `Failed` to informational
+  `N/A` naming the rule. The check reads no `Allow` statement for how many
+  requests it lets through, so it cannot say whether those filters see them.
+
 - `SM-35` security service delegated administrator passes a service only
   when its principal also has trusted access in the organization, read with
   `organizations:ListAWSServiceAccessForOrganization` (newly granted to the
@@ -1310,16 +1456,22 @@ section.
 
 ### Deployment impact
 
-**AgentCore role grants.** The AgentCore assessment role gains seven
+**State machine definition.** `statemachine/assessments.asl.json` adds
+`TargetRegions` to the AgentCore task payload, so the deployment stack must
+be updated for `AC-48` and `AC-26` to compare Regions. Until it is, the function
+receives no `TargetRegions` and compares each Region on its own, as before.
+
+**AgentCore role grants.** The AgentCore assessment role gains eight
 read-only grants: `events:ListTargetsByRule` on `rule/*`,
 `logs:DescribeMetricFilters` on `log-group:*`, `ce:GetAnomalyMonitors` on
-`anomalymonitor/*` and `network-firewall:DescribeFirewallPolicy` on
-`firewall-policy/*` in this account, and `ec2:DescribeNatGateways`,
+`anomalymonitor/*`, `network-firewall:DescribeFirewallPolicy` on
+`firewall-policy/*` and `bedrock-agentcore:GetCapacityProvider` on
+`capacity-provider/*` in this account, and `ec2:DescribeNatGateways`,
 `bedrock:GetModelInvocationLoggingConfiguration` and
 `bedrock-agentcore:ListAgentRuntimeVersions` on `'*'`, which have no resource
 type. Its fifteen unconditioned `Resource: '*'` statements are folded into one,
 `AgentCoreReadsWithoutResourceType`, with the same set of granted actions, so
-the role renders to 8,548 inline-policy characters in `aws-us-gov`, below the
+the role renders to 8,658 inline-policy characters in `aws-us-gov`, below the
 9,000-character project budget.
 
 **Deployment-stack update and CodeBuild run required.** The

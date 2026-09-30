@@ -429,6 +429,7 @@ _EXPECTED_ACTIONS = {
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
         "bedrock-agentcore:GetBrowser",
+        "bedrock-agentcore:GetCapacityProvider",
         "bedrock-agentcore:GetCodeInterpreter",
         "bedrock-agentcore:GetGateway",
         "bedrock-agentcore:GetGatewayTarget",

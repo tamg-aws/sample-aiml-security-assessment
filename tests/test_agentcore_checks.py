@@ -4677,6 +4677,118 @@ class TestAC07MemoryConfiguration:
             KeyId=self._GOOD_KEY
         )
 
+    # --- AC-07 memory resource-based policy leg (AIR-ACR-MEM-01) ---
+
+    _MEMORY_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-123456789012"
+    )
+
+    @classmethod
+    def _policy_rows(cls, mock_ac, policy=None, error=None):
+        cls._one_memory(mock_ac, arn=cls._MEMORY_ARN)
+        if error is not None:
+            mock_ac.get_resource_policy.side_effect = error
+        else:
+            mock_ac.get_resource_policy.return_value = {"policy": policy}
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+        return [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Memory Resource-Based Policy"
+        ]
+
+    @staticmethod
+    def _policy(principal, condition=None):
+        statement = {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "bedrock-agentcore:RetrieveMemoryRecords",
+            "Resource": "*",
+        }
+        if condition:
+            statement["Condition"] = condition
+        return json.dumps({"Version": "2012-10-17", "Statement": [statement]})
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_memory_policy_open_to_everyone_fails(self, mock_ac):
+        rows = self._policy_rows(mock_ac, self._policy("*"))
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert rows[0]["Severity"] == "High"
+        assert "statement 1 (*)" in rows[0]["Finding_Details"]
+        mock_ac.get_resource_policy.assert_called_once_with(
+            resourceArn=self._MEMORY_ARN
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_memory_policy_bound_to_the_organization_passes(self, mock_ac):
+        rows = self._policy_rows(
+            mock_ac,
+            self._policy(
+                "*", {"StringEquals": {"aws:PrincipalOrgID": "o-exampleorgid"}}
+            ),
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "no Allow statement" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_memory_without_a_policy_passes(self, mock_ac):
+        rows = self._policy_rows(
+            mock_ac, error=_make_client_error("ResourceNotFoundException")
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "no resource-based policy" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_an_empty_memory_policy_passes_as_no_policy(self, mock_ac):
+        rows = self._policy_rows(mock_ac, "")
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "no resource-based policy" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_denied_memory_policy_read_is_na_naming_the_action(self, mock_ac):
+        rows = self._policy_rows(
+            mock_ac, error=_make_client_error("AccessDeniedException", "denied")
+        )
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetResourcePolicy" in rows[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_the_memory_policy_is_read_for_every_memory(self, mock_ac):
+        other_arn = self._MEMORY_ARN.replace("mem-123456789012", "mem-2")
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-123456789012", "name": "TestMemory"},
+                {"id": "mem-2", "name": "Other"},
+            ]
+        }
+        mock_ac.get_memory.side_effect = [
+            {"memory": self._memory_detail(arn=self._MEMORY_ARN)},
+            {"memory": self._memory_detail(id="mem-2", arn=other_arn)},
+        ]
+        policies = {self._MEMORY_ARN: "", other_arn: self._policy("*")}
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": policies[resourceArn]
+        }
+
+        rows = [
+            f
+            for f in extract_csv_data(
+                agentcore_app.check_agentcore_memory_configuration()
+            )
+            if f["Finding"] == "AgentCore Memory Resource-Based Policy"
+        ]
+
+        assert [f["Status"] for f in rows] == ["Passed", "Failed"]
+        assert "'Other'" in rows[1]["Finding_Details"]
+
 
 # ===================================================================
 # AC-08: check_agentcore_vpc_endpoints
@@ -14250,6 +14362,158 @@ class TestAC26LogTamperStreamsAndInvocationGroup:
         assert call.split(",", 1)[0].split("(", 1)[1].strip() == '"bedrock"'
 
 
+_WEST_GROUP = "west-invocations"
+_WEST_RESOURCES = [
+    f"arn:aws:logs:us-west-2:*:log-group:{_WEST_GROUP}",
+    f"arn:aws:logs:us-west-2:*:log-group:{_WEST_GROUP}:*",
+    f"arn:aws:logs:us-west-2:*:log-group:{_WEST_GROUP}:log-stream:*",
+]
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestAC26LogTamperEveryRegionsInvocationGroup:
+    """AC-26 SCP leg: the invocation log group of every assessed Region."""
+
+    _REGIONS = ["us-east-1", "us-west-2", "eu-west-1"]
+
+    @pytest.fixture(autouse=True)
+    def bedrock(self):
+        with patch("agentcore_app.bedrock_client") as bedrock:
+            bedrock.meta.region_name = "us-east-1"
+            bedrock.get_model_invocation_logging_configuration.return_value = {
+                "loggingConfig": {
+                    "cloudWatchConfig": {"logGroupName": _INVOCATION_GROUP}
+                }
+            }
+            yield bedrock
+
+    def _regional(self, west=None, europe=None):
+        west_client = MagicMock()
+        if isinstance(west, Exception):
+            west_client.get_model_invocation_logging_configuration.side_effect = west
+        else:
+            west_client.get_model_invocation_logging_configuration.return_value = {
+                "loggingConfig": {
+                    "cloudWatchConfig": {"logGroupName": west or _WEST_GROUP}
+                }
+            }
+        europe_client = MagicMock()
+        europe_client.get_model_invocation_logging_configuration.side_effect = (
+            europe
+            or EndpointConnectionError(
+                endpoint_url="https://bedrock.eu-west-1.amazonaws.com"
+            )
+        )
+        return {"us-west-2": west_client, "eu-west-1": europe_client}
+
+    def _findings(self, mock_orgs, documents, clients, regions=None):
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": _MEMBER_ACCOUNT}
+        with (
+            patch("agentcore_app.boto3.client") as factory,
+            patch.object(
+                agentcore_app,
+                "_ac26_every_region",
+                lambda: agentcore_app.check_agentcore_log_tamper_scp(
+                    regions or self._REGIONS
+                ),
+                create=True,
+            ),
+        ):
+            factory.side_effect = lambda service, **kwargs: (
+                sts if service == "sts" else clients[kwargs["region_name"]]
+            )
+            findings = TestSCPAttachment._run(
+                self, mock_orgs, "_ac26_every_region", documents
+            )
+        return findings, [
+            call for call in factory.call_args_list if call.args != ("sts",)
+        ]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_that_misses_another_regions_invocation_group_fails(self, mock_orgs):
+        findings, factory = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                )
+            },
+            self._regional(),
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Missing"
+        assert sorted(call.kwargs["region_name"] for call in factory) == [
+            "eu-west-1",
+            "us-west-2",
+        ]
+        for call in factory:
+            assert call.args == ("bedrock",)
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_on_every_regions_invocation_group_passes(self, mock_orgs):
+        findings, _ = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES
+                    + _INVOCATION_RESOURCES
+                    + _WEST_RESOURCES
+                )
+            },
+            self._regional(),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "the Bedrock model invocation log group each assessed Region"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unread_other_region_turns_a_pass_into_na_naming_it(self, mock_orgs):
+        findings, _ = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                )
+            },
+            self._regional(west=_make_client_error("AccessDeniedException", "denied")),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Incomplete"
+        details = findings[0]["Finding_Details"]
+        assert "could not be read in us-west-2 (AccessDeniedException" in details
+        assert "eu-west-1" not in details.split("could not be read", 1)[1]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_opted_out_region_is_skipped(self, mock_orgs):
+        findings, _ = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES
+                    + _INVOCATION_RESOURCES
+                    + _WEST_RESOURCES
+                )
+            },
+            self._regional(
+                europe=_make_client_error("UnrecognizedClientException", "opt-in")
+            ),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_both_global_check_lists_pass_the_assessed_regions(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+
+        assert source.count("check_agentcore_log_tamper_scp(target_regions)") == 2
+        assert source.count("check_agentcore_log_tamper_scp,") == 0
+
+
 class TestAC26VendedLogDeletionProtection:
     """AC-26: vended-log groups are held to deletion protection."""
 
@@ -14580,6 +14844,167 @@ class TestSCPGuardrailRegistration:
     def test_the_trail_leg_runs_per_region(self):
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert "check_agentcore_trail_log_file_validation" in source
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestAC29GatewayIdentitySCP:
+    """AIR-ACR-ID-04: an attached SCP keeps a gateway on CUSTOM_JWT. AWS_IAM,
+    AUTHENTICATE_ONLY and NONE carry no validated end-user identity, so a Deny
+    on NONE alone (AC-28's GW-02 guard) leaves two of them open."""
+
+    _run = TestSCPAttachment._run
+
+    def _finding(self, mock_orgs, documents, targets=None):
+        (finding,) = self._run(
+            mock_orgs,
+            "check_agentcore_gateway_identity_authorizer_scp",
+            documents,
+            targets,
+        )
+        assert finding["Check_ID"] == "AC-29"
+        return finding
+
+    @pytest.mark.parametrize("decoy_first", [False, True])
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_equals_custom_jwt_deny_passes(self, mock_orgs, decoy_first):
+        documents = {
+            "RequireJwt": _gateway_guard(operator="StringNotEquals", value="CUSTOM_JWT")
+        }
+        decoy = {"DenyNone": _gateway_guard()}
+        documents = {**decoy, **documents} if decoy_first else {**documents, **decoy}
+        finding = self._finding(mock_orgs, documents)
+        assert finding["Status"] == "Passed"
+        assert "RequireJwt" in finding["Finding_Details"]
+        assert "DenyNone" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_list_naming_all_three_modes_fails(self, mock_orgs):
+        # The control asks for StringNotEquals CUSTOM_JWT because a deny-list
+        # leaves open any authorizer type the key's documented list omits.
+        finding = self._finding(
+            mock_orgs,
+            {
+                "DenyList": _gateway_guard(
+                    value=["AWS_IAM", "AUTHENTICATE_ONLY", "NONE"]
+                )
+            },
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Missing")
+        assert (
+            "a deny-list of authorizer types does not deny a type the condition "
+            "key does not enumerate; use StringNotEquals CUSTOM_JWT"
+        ) in finding["Resolution"]
+
+    @pytest.mark.parametrize("deny_list_first", [False, True])
+    @patch("agentcore_app.organizations_client")
+    def test_two_deny_lists_fail_in_either_order(self, mock_orgs, deny_list_first):
+        deny_list = {
+            "DenyList": _gateway_guard(value=["AWS_IAM", "AUTHENTICATE_ONLY", "NONE"])
+        }
+        like_list = {
+            "DenyLike": _gateway_guard(
+                operator="StringLike", value=["AWS_*", "AUTHENTICATE_*", "NONE"]
+            )
+        }
+        documents = (
+            {**deny_list, **like_list}
+            if deny_list_first
+            else {**like_list, **deny_list}
+        )
+        finding = self._finding(mock_orgs, documents)
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Missing")
+
+    @pytest.mark.parametrize(
+        "operator", ["StringNotEquals", "StringNotLike"], ids=["equals", "like"]
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_case_folded_custom_jwt_does_not_pass(self, mock_orgs, operator):
+        # String operators compare case-sensitively, so this Deny also fires on
+        # CUSTOM_JWT and blocks every gateway write instead of pinning JWT.
+        finding = self._finding(
+            mock_orgs,
+            {"FoldedJwt": _gateway_guard(operator=operator, value="custom_jwt")},
+        )
+        assert finding["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_ignore_case_not_equals_custom_jwt_passes(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {
+                "RequireJwt": _gateway_guard(
+                    operator="StringNotEqualsIgnoreCase", value="custom_jwt"
+                )
+            },
+        )
+        assert finding["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "value",
+        ["NONE", ["AWS_IAM", "NONE"], ["AWS_IAM", "AUTHENTICATE_ONLY"]],
+        ids=["none-only", "no-authenticate-only", "no-none"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_list_missing_a_mode_fails(self, mock_orgs, value):
+        finding = self._finding(mock_orgs, {"DenyList": _gateway_guard(value=value)})
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_create_only_deny_is_partial(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {
+                "CreateOnly": _gateway_guard(
+                    operator="StringNotEquals",
+                    value="CUSTOM_JWT",
+                    action=_GATEWAY_WRITE[:1],
+                )
+            },
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Partial")
+        assert "UpdateGateway" in finding["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_regional_resource_scope_is_not_credited(self, mock_orgs):
+        guard = _gateway_guard(operator="StringNotEquals", value="CUSTOM_JWT")
+        guard[0]["Resource"] = "arn:aws:bedrock-agentcore:us-east-1:*:gateway/*"
+        finding = self._finding(mock_orgs, {"OneRegion": guard})
+        assert finding["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unattached_guard_fails_unattached(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {
+                "RequireJwt": _gateway_guard(
+                    operator="StringNotEquals", value="CUSTOM_JWT"
+                )
+            },
+            targets={"p-0": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}]},
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Unattached")
+
+    def test_the_handler_registers_the_leg_on_both_cache_paths(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        for registration in registrations:
+            assert "check_agentcore_gateway_identity_authorizer_scp" in ast.unparse(
+                registration.value
+            )
 
 
 class TestAC29CheckRegistration:
@@ -16432,6 +16857,130 @@ def _ac34_harnesses(mock_ac, details):
 
 def _ac34_by_resource(findings, marker):
     return [finding for finding in findings if marker in finding["Finding_Details"]]
+
+
+class TestAC34RuntimeServedVersions:
+    """AIR-ACR-ID-05: AC-34 reads the environment variables of every version an
+    endpoint serves, not only the version GetAgentRuntime returns by default."""
+
+    _CLEAN = {"LOG_LEVEL": "INFO"}
+    _INLINE = {"API_KEY": _SECRET_VALUE}
+
+    @classmethod
+    def _wire(cls, mock_ac, versions, endpoints_by_runtime, deny_version=None):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": rid, "agentRuntimeName": rid.upper()}
+                for rid in versions
+            ]
+        }
+
+        def get_agent_runtime(agentRuntimeId, agentRuntimeVersion=None):
+            by_version = versions[agentRuntimeId]
+            if agentRuntimeVersion is None:
+                agentRuntimeVersion = by_version["default"]
+            if agentRuntimeVersion == deny_version:
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {
+                "agentRuntimeVersion": agentRuntimeVersion,
+                "environmentVariables": by_version[agentRuntimeVersion],
+            }
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+        def list_endpoints(agentRuntimeId, **_):
+            endpoints = endpoints_by_runtime[agentRuntimeId]
+            if isinstance(endpoints, Exception):
+                raise endpoints
+            return {"runtimeEndpoints": endpoints}
+
+        mock_ac.list_agent_runtime_endpoints.side_effect = list_endpoints
+
+    @staticmethod
+    def _rows(findings):
+        rows = [
+            f
+            for f in findings
+            if f["Finding"].startswith("AgentCore Runtime Inline Credential")
+        ]
+        for row in rows:
+            assert row["Check_ID"] == "AC-34"
+            assert_finding_schema(row)
+            assert _SECRET_VALUE not in str(row)
+        return rows
+
+    _VERSIONS = {
+        "rt-a": {"default": "3", "1": _INLINE, "2": _CLEAN, "3": _CLEAN},
+        "rt-b": {"default": "5", "5": _CLEAN},
+    }
+    _ENDPOINTS = [
+        {"name": "prod", "liveVersion": "1"},
+        {"name": "canary", "liveVersion": "3", "targetVersion": "2"},
+    ]
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_an_older_served_version_with_an_inline_credential_fails(
+        self, mock_ac, reverse
+    ):
+        endpoints = list(reversed(self._ENDPOINTS)) if reverse else self._ENDPOINTS
+        self._wire(
+            mock_ac,
+            self._VERSIONS,
+            {"rt-a": endpoints, "rt-b": [{"name": "DEFAULT", "liveVersion": "5"}]},
+        )
+        rows = self._rows(agentcore_app.check_agentcore_runtime_inline_credentials())
+        assert [r["Status"] for r in rows] == [
+            "Passed",
+            "Failed",
+            "Passed",
+            "Passed",
+        ]
+        rt_a_old = rows[1]["Finding_Details"]
+        assert "(rt-a) version 1, served by endpoint(s) prod," in rt_a_old
+        assert "API_KEY" in rt_a_old
+        assert (
+            "(rt-a) version 2, served by endpoint(s) canary,"
+            in (rows[2]["Finding_Details"])
+        )
+        assert "(rt-b)" in rows[3]["Finding_Details"]
+        assert " version " not in rows[3]["Finding_Details"]
+        called = sorted(
+            call.kwargs.get("agentRuntimeVersion") or ""
+            for call in mock_ac.get_agent_runtime.call_args_list
+        )
+        assert called == ["", "", "1", "2"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlisted_endpoint_set_withholds_a_pass_and_keeps_a_fail(self, mock_ac):
+        denied = _make_client_error("AccessDeniedException", "denied")
+        self._wire(
+            mock_ac,
+            {
+                "rt-a": {"default": "3", "3": self._CLEAN},
+                "rt-b": {"default": "5", "5": self._INLINE},
+            },
+            {"rt-a": denied, "rt-b": denied},
+        )
+        rows = self._rows(agentcore_app.check_agentcore_runtime_inline_credentials())
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "bedrock-agentcore:ListAgentRuntimeEndpoints" in rows[0]["Resolution"]
+        for row in rows:
+            assert "ListAgentRuntimeEndpoints failed" in row["Finding_Details"]
+            assert "AccessDeniedException" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_served_version_is_na_on_its_own_row(self, mock_ac):
+        self._wire(
+            mock_ac,
+            self._VERSIONS,
+            {"rt-a": self._ENDPOINTS, "rt-b": []},
+            deny_version="1",
+        )
+        rows = self._rows(agentcore_app.check_agentcore_runtime_inline_credentials())
+        assert [r["Status"] for r in rows] == ["Passed", "N/A", "Passed", "Passed"]
+        assert "version 1, served by endpoint(s) prod," in rows[1]["Finding_Details"]
+        assert "AccessDeniedException" in rows[1]["Finding_Details"]
 
 
 class TestAC34ValueShapes:
@@ -19678,6 +20227,245 @@ class TestAC37PolicyGuardrailWiring:
         assert findings[0]["Check_ID"] == "AC-37"
 
 
+@pytest.mark.usefixtures("_member_account")
+class TestAC37GuardrailCheckSCP:
+    """AC-37: an SCP that denies InvokeGuardrailChecks stops the guardrail call."""
+
+    _ACTION = "bedrock:InvokeGuardrailChecks"
+
+    @staticmethod
+    def _role(action="bedrock:InvokeGuardrailChecks"):
+        return {
+            "attached_policies": [
+                {
+                    "policy_name": "GuardrailChecks",
+                    "document": {
+                        "Statement": [
+                            {"Effect": "Allow", "Action": action, "Resource": "*"}
+                        ]
+                    },
+                }
+            ]
+        }
+
+    def _run(self, mock_orgs, documents, targets=None, order=("gw-1", "gw-2")):
+        _attach(mock_orgs, targets)
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {"Id": f"p-{index}", "Name": name}
+                for index, name in enumerate(documents)
+            ]
+        }
+        by_id = {
+            f"p-{index}": _scp(statements)
+            for index, statements in enumerate(documents.values())
+            if not isinstance(statements, Exception)
+        }
+
+        def describe_policy(PolicyId):
+            if isinstance(documents[mock_names[PolicyId]], Exception):
+                raise documents[mock_names[PolicyId]]
+            return by_id[PolicyId]
+
+        mock_names = {f"p-{index}": name for index, name in enumerate(documents)}
+        mock_orgs.describe_policy.side_effect = describe_policy
+        roles = {"gw-1": "RoleOne", "gw-2": "RoleTwo"}
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            mock_ac.list_gateways.return_value = {
+                "items": [{"gatewayId": gw, "name": gw.upper()} for gw in order]
+            }
+            mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: (
+                _policy_engine_gateway(
+                    roleArn=f"arn:aws:iam::{_MEMBER_ACCOUNT}:role/"
+                    f"{roles[gatewayIdentifier]}"
+                )
+            )
+            mock_ac.list_policies.return_value = {
+                "policies": [_cedar_policy("block_injection", _GUARDRAIL_FORBID)]
+            }
+            findings = agentcore_app.check_agentcore_policy_guardrail_wiring(
+                {"role_permissions": {"RoleOne": self._role(), "RoleTwo": self._role()}}
+            )
+        return {
+            gw: [f for f in findings if f"({gw})" in f["Finding_Details"]]
+            for gw in ("gw-1", "gw-2")
+        }
+
+    def _deny(self, action=None, resource="*", condition=None):
+        statement = {
+            "Effect": "Deny",
+            "Action": action or self._ACTION,
+            "Resource": resource,
+        }
+        if condition:
+            statement["Condition"] = condition
+        return statement
+
+    @pytest.mark.parametrize("order", [("gw-1", "gw-2"), ("gw-2", "gw-1")])
+    @patch("agentcore_app.organizations_client")
+    def test_an_attached_unconditioned_deny_fails_every_granted_gateway(
+        self, mock_orgs, order
+    ):
+        rows = self._run(
+            mock_orgs,
+            {
+                "AllowAll": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                "NoGuardrails": [self._deny()],
+            },
+            order=order,
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["Failed"]
+            assert (
+                "NoGuardrails (attached to root r-a1b2)"
+                in rows[gw][0]["Finding_Details"]
+            )
+            assert "AllowAll" not in rows[gw][0]["Finding_Details"]
+        assert mock_orgs.list_policies.call_count == 1
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_service_wildcard_deny_reaches_the_action(self, mock_orgs):
+        rows = self._run(mock_orgs, {"NoBedrock": [self._deny("bedrock:*")]})
+
+        assert [f["Status"] for f in rows["gw-1"]] == ["Failed"]
+        assert "NoBedrock" in rows["gw-1"][0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_attached_elsewhere_passes_and_says_scps_were_read(self, mock_orgs):
+        rows = self._run(
+            mock_orgs,
+            {"NoGuardrails": [self._deny()]},
+            targets={
+                "p-0": [
+                    {"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT", "Name": "x"}
+                ]
+            },
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["Passed"]
+            details = rows[gw][0]["Finding_Details"]
+            assert "No service control policy binding this account denies" in details
+            assert "Service control policies and conditioned Deny" not in details
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            {"Effect": "Deny", "Action": "bedrock:InvokeModel", "Resource": "*"},
+            {
+                "Effect": "Deny",
+                "Action": "bedrock:InvokeGuardrailChecks",
+                "Resource": "arn:aws:bedrock:us-east-1:111122223333:guardrail/g-1",
+            },
+        ],
+        ids=["other-action", "resource-arn"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_that_does_not_reach_the_call_passes(self, mock_orgs, deny):
+        rows = self._run(mock_orgs, {"Other": [deny]})
+
+        assert [f["Status"] for f in rows["gw-1"]] == ["Passed"]
+        assert (
+            "No service control policy binding this account denies"
+            in rows["gw-1"][0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_conditioned_deny_is_na_and_names_the_policy(self, mock_orgs):
+        rows = self._run(
+            mock_orgs,
+            {
+                "RegionDeny": [
+                    self._deny(
+                        "bedrock:*",
+                        condition={
+                            "StringNotEquals": {"aws:RequestedRegion": "us-east-1"}
+                        },
+                    )
+                ]
+            },
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["N/A"]
+            assert (
+                "RegionDeny (attached to root r-a1b2)" in rows[gw][0]["Finding_Details"]
+            )
+            assert "under a condition" in rows[gw][0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unreadable_policy_withholds_passed(self, mock_orgs):
+        rows = self._run(
+            mock_orgs,
+            {
+                "Readable": [self._deny("bedrock:InvokeModel")],
+                "Hidden": _make_client_error("AccessDeniedException", "denied"),
+            },
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["N/A"]
+            assert "Hidden (AccessDeniedException)" in rows[gw][0]["Finding_Details"]
+            assert "Readable" not in rows[gw][0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unlistable_organization_keeps_the_unevaluated_wording(self, mock_orgs):
+        _attach(mock_orgs)
+        mock_orgs.list_policies.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            mock_ac.list_gateways.return_value = {
+                "items": [{"gatewayId": "gw-1", "name": "GW-1"}]
+            }
+            mock_ac.get_gateway.return_value = _policy_engine_gateway(
+                roleArn=f"arn:aws:iam::{_MEMBER_ACCOUNT}:role/RoleOne"
+            )
+            mock_ac.list_policies.return_value = {
+                "policies": [_cedar_policy("block_injection", _GUARDRAIL_FORBID)]
+            }
+            findings = agentcore_app.check_agentcore_policy_guardrail_wiring(
+                {"role_permissions": {"RoleOne": self._role()}}
+            )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "Service control policies and conditioned Deny statements are not evaluated"
+        ) in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_management_account_passes_and_says_scps_do_not_apply(self, mock_orgs):
+        _attach(mock_orgs)
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {
+                    "Id": "p-0",
+                    "Name": "NoGuardrails",
+                    "Arn": f"arn:aws:organizations::{_MEMBER_ACCOUNT}:policy/o-1/"
+                    "service_control_policy/p-0",
+                }
+            ]
+        }
+        mock_orgs.describe_policy.return_value = _scp([self._deny()])
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            mock_ac.list_gateways.return_value = {
+                "items": [{"gatewayId": "gw-1", "name": "GW-1"}]
+            }
+            mock_ac.get_gateway.return_value = _policy_engine_gateway(
+                roleArn=f"arn:aws:iam::{_MEMBER_ACCOUNT}:role/RoleOne"
+            )
+            mock_ac.list_policies.return_value = {
+                "policies": [_cedar_policy("block_injection", _GUARDRAIL_FORBID)]
+            }
+            findings = agentcore_app.check_agentcore_policy_guardrail_wiring(
+                {"role_permissions": {"RoleOne": self._role()}}
+            )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "management account" in findings[0]["Finding_Details"]
+
+
 class TestAC37CheckRegistration:
     """AC-37 reads regional gateways, and takes the handler's IAM cache."""
 
@@ -19727,6 +20515,15 @@ class TestAC37CheckRegistration:
         )
 
 
+def _session_binding_rows():
+    """AC-38's session binding rows; TestAC38WorkloadTokenGrant judges the grant."""
+    return [
+        finding
+        for finding in agentcore_app.check_agentcore_policy_session_binding()
+        if finding["Finding"] != "AgentCore Policy Session Token Grant"
+    ]
+
+
 class TestAC38PolicySessionBinding:
     """AC-38: a temporal policy only isolates sessions on an authenticated gateway."""
 
@@ -19745,7 +20542,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert len(findings) == 1
         assert findings[0]["Check_ID"] == "AC-38"
@@ -19768,7 +20565,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Severity"] == "High"
@@ -19789,7 +20586,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Passed"
 
@@ -19806,7 +20603,7 @@ class TestAC38PolicySessionBinding:
             ]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Severity"] == "Medium"
@@ -19825,7 +20622,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("abac_permit", _LIVE_TAG_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Finding"].endswith("Absent")
@@ -19855,7 +20652,7 @@ class TestAC38PolicySessionBinding:
             ]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Passed"
         assert "spend_cap" in findings[0]["Finding_Details"]
@@ -19883,7 +20680,7 @@ class TestAC38PolicySessionBinding:
             ]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Finding"].endswith("Absent")
@@ -19893,7 +20690,7 @@ class TestAC38PolicySessionBinding:
         mock_ac.list_gateways.return_value = {"items": self._GATEWAYS}
         mock_ac.get_gateway.return_value = {"authorizerType": "CUSTOM_JWT"}
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert "AG-25" in findings[0]["Finding_Details"]
@@ -19906,7 +20703,7 @@ class TestAC38PolicySessionBinding:
             mode="LOG_ONLY", authorizerType="CUSTOM_JWT"
         )
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert "enforces no policy engine" in findings[0]["Finding_Details"]
@@ -19925,7 +20722,7 @@ class TestAC38PolicySessionBinding:
             {"policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]},
         ]
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert mock_ac.list_policies.call_count == 2
         assert findings[0]["Status"] == "Passed"
@@ -19947,7 +20744,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert mock_ac.list_gateways.call_count == 2
         assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
@@ -19971,7 +20768,7 @@ class TestAC38PolicySessionBinding:
             "policies": [_cedar_policy("verify_payee", _TEMPORAL_PERMIT)]
         }
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
         assert "bedrock-agentcore:ListPolicies" in findings[0]["Resolution"]
@@ -19983,7 +20780,7 @@ class TestAC38PolicySessionBinding:
             "ListGateways",
         )
 
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert findings[0]["Finding"].endswith("Incomplete")
@@ -19991,12 +20788,12 @@ class TestAC38PolicySessionBinding:
     @patch("agentcore_app.agentcore_client")
     def test_no_gateways_is_na(self, mock_ac):
         mock_ac.list_gateways.return_value = {"items": []}
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
         assert [finding["Status"] for finding in findings] == ["N/A"]
 
     @patch("agentcore_app.agentcore_client", None)
     def test_no_client_is_na(self):
-        findings = agentcore_app.check_agentcore_policy_session_binding()
+        findings = _session_binding_rows()
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Check_ID"] == "AC-38"
 
@@ -20032,6 +20829,196 @@ class TestAC38CheckRegistration:
         # The failing legs are the authorizer types left over, so the check has
         # something to fail on.
         assert modelled - set(agentcore_app.GATEWAY_SESSION_BINDING_AUTHORIZERS)
+
+
+class TestAC38WorkloadTokenGrant:
+    """AC-38: a temporal policy needs a gateway role that can mint the WAT."""
+
+    _GATEWAYS = [{"gatewayId": "gw-1", "name": "Payments"}]
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/GatewayExecution"
+    _DIRECTORY = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+        "workload-identity-directory/default"
+    )
+    _IDENTITY = _DIRECTORY + "/workload-identity/gw-1-abc"
+
+    def _detail(self, **extra):
+        fields = {
+            "authorizerType": "CUSTOM_JWT",
+            "roleArn": self._ROLE_ARN,
+            "workloadIdentityDetails": {"workloadIdentityArn": self._IDENTITY},
+        }
+        fields.update(extra)
+        return _policy_engine_gateway(**fields)
+
+    @staticmethod
+    def _cache(*statements, boundary=None):
+        permissions = {
+            "inline_policies": [
+                {
+                    "policy_name": "GatewayPolicy",
+                    "document": {"Statement": list(statements)},
+                }
+            ]
+        }
+        if boundary is not None:
+            permissions["permissions_boundary"] = boundary
+        return {"role_permissions": {"GatewayExecution": permissions}}
+
+    def _run(self, mock_ac, cache, detail=None, statement=_TEMPORAL_PERMIT):
+        mock_ac.list_gateways.return_value = {"items": self._GATEWAYS}
+        mock_ac.get_gateway.return_value = detail or self._detail()
+        mock_ac.list_policies.return_value = {
+            "policies": [_cedar_policy("verify_payee", statement)]
+        }
+        return [
+            finding
+            for finding in agentcore_app.check_agentcore_policy_session_binding(cache)
+            if finding["Finding"].startswith("AgentCore Policy Session Token Grant")
+        ]
+
+    def _grant(self, resource, **extra):
+        return {
+            "Effect": "Allow",
+            "Action": "bedrock-agentcore:GetWorkloadAccessToken",
+            "Resource": resource,
+            **extra,
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_granting_the_directory_and_identity_passes(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant(
+                    [self._DIRECTORY, self._DIRECTORY + "/workload-identity/gw-1*"]
+                )
+            ),
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "Passed"
+        assert "GatewayExecution" in rows[0]["Finding_Details"]
+        assert self._IDENTITY in rows[0]["Finding_Details"]
+        assert "Service control policies" in rows[0]["Finding_Details"]
+        assert_finding_schema(rows[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_without_the_grant_fails(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:AuthorizeAction",
+                    "Resource": "*",
+                }
+            ),
+        )
+
+        assert rows[0]["Status"] == "Failed"
+        assert rows[0]["Severity"] == "High"
+        assert "bedrock-agentcore:GetWorkloadAccessToken" in rows[0]["Resolution"]
+        assert "workload-identity-directory/default" in rows[0]["Resolution"]
+        assert "enforcement fails" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_on_another_gateways_identity_is_not_credited(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant(
+                    [self._DIRECTORY, self._DIRECTORY + "/workload-identity/gw-2*"]
+                )
+            ),
+        )
+
+        assert rows[0]["Status"] == "N/A"
+        assert self._IDENTITY in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_on_the_identity_alone_is_not_credited(self, mock_ac):
+        rows = self._run(mock_ac, self._cache(self._grant(self._IDENTITY)))
+
+        assert rows[0]["Status"] == "N/A"
+        assert "workload-identity-directory/default" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_grant_fails(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant("*"),
+                {
+                    "Effect": "Deny",
+                    "Action": "bedrock-agentcore:GetWorkloadAccessToken",
+                    "Resource": "*",
+                },
+            ),
+        )
+
+        assert rows[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_grant_is_not_credited(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            self._cache(
+                self._grant(
+                    "*",
+                    Condition={"StringEquals": {"aws:ResourceTag/team": "payments"}},
+                )
+            ),
+        )
+
+        assert rows[0]["Status"] == "N/A"
+        assert "condition" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_missing_from_the_cache_is_na(self, mock_ac):
+        rows = self._run(mock_ac, {"role_permissions": {"Other": {}}})
+
+        assert rows[0]["Status"] == "N/A"
+        assert self._ROLE_ARN in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_the_cache_could_not_read_is_na(self, mock_ac):
+        cache = self._cache(self._grant("*"))
+        cache["principal_errors"] = [
+            {"type": "role", "name": "GatewayExecution", "error": "AccessDenied"}
+        ]
+        rows = self._run(mock_ac, cache)
+
+        assert rows[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_without_a_workload_identity_is_na(self, mock_ac):
+        detail = self._detail()
+        del detail["workloadIdentityDetails"]
+        rows = self._run(mock_ac, self._cache(self._grant("*")), detail=detail)
+
+        assert rows[0]["Status"] == "N/A"
+        assert "workloadIdentityDetails" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_without_a_temporal_policy_is_not_judged(self, mock_ac):
+        rows = self._run(mock_ac, self._cache(), statement=_LIVE_TAG_PERMIT)
+
+        assert rows == []
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_grant_is_judged_on_an_unauthenticated_gateway_too(self, mock_ac):
+        rows = self._run(
+            mock_ac, self._cache(), detail=self._detail(authorizerType="NONE")
+        )
+
+        assert rows[0]["Status"] == "Failed"
+
+    def test_the_handler_passes_the_permission_cache(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert (
+            "lambda: check_agentcore_policy_session_binding(permission_cache)" in source
+        )
 
 
 # ===================================================================
@@ -20500,6 +21487,72 @@ class TestAC17AgentsOutsideRuntime:
 
         assert finding["Status"] == "N/A"
         assert "logs:DescribeLogGroups" in finding["Resolution"]
+
+    _LIMIT = (
+        "A log group outside /aws/bedrock-agentcore/runtimes/ is not detected, so "
+        "a region whose agent hosted outside AgentCore Runtime writes elsewhere "
+        "reads N/A."
+    )
+
+    @staticmethod
+    def _by_prefix(names):
+        """Answer describe_log_groups the way the API does, filtering one flat
+        list by logGroupNamePrefix, so a group the code must not name is served
+        to any prefix it matches."""
+
+        def describe(**kwargs):
+            prefix = kwargs.get("logGroupNamePrefix", "")
+            return {
+                "logGroups": [
+                    {"logGroupName": name} for name in names if name.startswith(prefix)
+                ]
+            }
+
+        return describe
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_customer_named_trace_group_is_not_named_and_the_limit_is_stated(
+        self, mock_ac, mock_logs
+    ):
+        # create-online-evaluations.md shows an outside-Runtime agent writing
+        # to a customer-named group such as /aws/agentcore/test-agent-traces.
+        _online_evaluation_client(mock_ac)
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_logs.describe_log_groups.side_effect = self._by_prefix(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/agentcore/x-traces"]
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            (finding,) = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert finding["Status"] == "Failed"
+        details = finding["Finding_Details"]
+        assert "/aws/bedrock-agentcore/runtimes/a" in details
+        assert "x-traces" not in details
+        assert self._LIMIT in details
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_a_customer_named_trace_group_reads_na_with_the_limit(
+        self, mock_ac, mock_logs
+    ):
+        _online_evaluation_client(mock_ac)
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_logs.describe_log_groups.side_effect = self._by_prefix(
+            ["/aws/agentcore/x-traces"]
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            (finding,) = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert finding["Status"] == "N/A"
+        assert "x-traces" not in finding["Finding_Details"]
+        assert self._LIMIT in finding["Finding_Details"]
 
 
 def _ac17_endpoints(mock_ac, by_runtime):
@@ -23371,6 +24424,31 @@ class TestAC01EgressFiltering:
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
+    def test_a_sandbox_failure_names_the_control_default_and_the_config_rule(
+        self, mock_ac, mock_ec2
+    ):
+        # RT-08 names SANDBOX the production default for non-regulated data, so
+        # a Failed row on it has to say why it still fails: no allow-list, and
+        # the AWS managed Config rule is NON_COMPLIANT for SANDBOX too.
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(network_mode="SANDBOX", security_groups=None)
+            ],
+        )
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert [(f["Status"], f["Severity"]) for f in egress] == [("Failed", "Medium")]
+        details = egress[0]["Finding_Details"]
+        assert "production default for non-regulated data" in details
+        assert "no explicit allow-list" in details
+        assert "bedrockagentcore-codeinterpreter-networkmode-check" in details
+        assert "NON_COMPLIANT for PUBLIC or SANDBOX" in details
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
     def test_a_browsers_outbound_rules_are_judged_too(self, mock_ac, mock_ec2):
         _wire_runtimes(mock_ac, [])
         _wire_tools(mock_ac, browsers=[_browser(security_groups=["sg-browser"])])
@@ -24585,6 +25663,132 @@ class TestAC46SessionMonitoring:
         )
         mock_cw.describe_alarms.assert_called_once()
         mock_logs.describe_delivery_sources.assert_called_once()
+
+
+_CAPACITY_PROVIDER_ARN = (
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:capacity-provider/cp-1"
+)
+
+
+def _capacity_runtime(runtime_id="rt-1", arn=_CAPACITY_PROVIDER_ARN):
+    summary, detail = _bounded_runtime(runtime_id)
+    detail["capacityProviderConfiguration"] = {"capacityProviderArn": arn}
+    return summary, detail
+
+
+def _capacity_provider(*instance_types):
+    return {
+        "capacityProviderId": "cp-1",
+        "capacityProviderArn": _CAPACITY_PROVIDER_ARN,
+        "name": "agents",
+        "status": "READY",
+        "computeConfiguration": {
+            "ec2Configuration": {
+                "launchTemplateSource": {
+                    "launchParameters": {
+                        "operatingSystem": "LINUX_ARM64",
+                        "instanceRequirements": {
+                            "allowedInstanceTypes": list(instance_types)
+                        },
+                    }
+                }
+            }
+        },
+    }
+
+
+class TestAC46CapacityProvider:
+    """AC-46: a runtime on a capacity provider is bounded by its instance types."""
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_without_a_capacity_provider_says_so(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "no capacity provider" in findings[0]["Finding_Details"]
+        assert "carries no per-session limit" not in findings[0]["Resolution"]
+        mock_ac.get_capacity_provider.assert_not_called()
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_capacity_provider_names_its_instance_types(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_capacity_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_ac.get_capacity_provider.return_value = _capacity_provider(
+            "m7g.large", "m7g.xlarge"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "capacity provider 'agents' (cp-1)" in details
+        assert "m7g.large, m7g.xlarge" in details
+        mock_ac.get_capacity_provider.assert_called_once_with(capacityProviderId="cp-1")
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_capacity_provider_withholds_passed(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_capacity_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_ac.get_capacity_provider.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert _CAPACITY_PROVIDER_ARN in findings[0]["Finding_Details"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetCapacityProvider" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_capacity_provider_does_not_hide_a_failure(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        summary, detail = _capacity_runtime()
+        detail["lifecycleConfiguration"]["maxLifetime"] = (
+            agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS
+        )
+        _wire_runtimes(mock_ac, [(summary, detail)])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_ac.get_capacity_provider.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Not read:" in findings[0]["Finding_Details"]
+        assert _CAPACITY_PROVIDER_ARN in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_shared_capacity_provider_is_read_once(self, mock_ac, mock_logs, mock_cw):
+        _wire_runtimes(mock_ac, [_capacity_runtime("rt-1"), _capacity_runtime("rt-2")])
+        _wire_session_monitoring(mock_logs, mock_cw, delivered_ids=("rt-1", "rt-2"))
+        mock_ac.get_capacity_provider.return_value = _capacity_provider("m7g.large")
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+        mock_ac.get_capacity_provider.assert_called_once_with(capacityProviderId="cp-1")
 
 
 class TestAC47RuntimeInvocationPath:
@@ -26243,6 +27447,203 @@ class TestAC48SourceArnRequired:
         )
 
 
+class TestAC48CrossRegionSharing:
+    """AC-48: at RegionIndex 0 the sharing leg compares every assessed Region,
+    because an execution role is global and a runtime in one Region can share
+    it with a gateway in another."""
+
+    _arn = TestAC48ExecutionRoleTrustAndSharing._arn
+    _wire = TestAC48ExecutionRoleTrustAndSharing._wire
+    _named = TestAC48ExecutionRoleTrustAndSharing._named
+
+    _SHARED = "AgentCore Execution Role Shared Across Workloads"
+
+    def _remote(self, **families):
+        remote = MagicMock()
+        self._wire(remote, MagicMock(), **families)
+        remote.list_browsers.return_value = {"browserSummaries": []}
+        return remote
+
+    def _run(self, mock_ac, clients, regions, primary=True, inventory=None):
+        mock_ac.meta.region_name = regions[0]
+        with patch("agentcore_app.boto3.client") as factory:
+            factory.side_effect = lambda service, **kwargs: clients[
+                kwargs["region_name"]
+            ]
+            findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+                inventory, target_regions=regions, is_primary_region=primary
+            )
+        return findings, factory
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_shared_with_another_region_fails_at_the_primary(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["SharedRole"])
+        clients = {"us-west-2": self._remote(gateways=["SharedRole"])}
+
+        findings, factory = self._run(
+            mock_ac, clients, ["us-east-1", "us-west-2"], inventory=inventory
+        )
+        shared = self._named(findings, self._SHARED)
+
+        assert len(shared) == 1
+        assert shared[0]["Status"] == "Failed"
+        details = shared[0]["Finding_Details"]
+        assert "Runtime 'rt-0' (rt-0) in us-east-1 [runtime family]" in details
+        assert "Gateway 'gw-0' (gw-0) in us-west-2 [gateway family]" in details
+        factory.assert_called_once_with(
+            "bedrock-agentcore-control",
+            config=agentcore_app.boto3_config,
+            region_name="us-west-2",
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_distinct_roles_across_regions_pass_and_name_the_regions(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole"])
+        clients = {"us-west-2": self._remote(gateways=["GatewayRole"])}
+
+        findings, _ = self._run(
+            mock_ac, clients, ["us-east-1", "us-west-2"], inventory=inventory
+        )
+        sharing = self._named(findings, "AgentCore Execution Role Sharing")
+
+        assert not self._named(findings, self._SHARED)
+        assert len(sharing) == 1
+        assert sharing[0]["Status"] == "Passed"
+        details = sharing[0]["Finding_Details"]
+        assert details.startswith(
+            "The 2 AgentCore resource(s) that name an execution role name 2 "
+            "distinct role ARN(s)"
+        )
+        assert "across the 2 assessed region(s): us-east-1, us-west-2" in details
+        assert "is not compared" not in details
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_region_is_na_and_an_absent_one_is_skipped(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole"])
+        denied = self._remote()
+        denied.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        absent = self._remote()
+        absent.list_agent_runtimes.side_effect = EndpointConnectionError(
+            endpoint_url="https://bedrock-agentcore-control.eu-west-1.amazonaws.com"
+        )
+        clients = {"us-west-2": denied, "eu-west-1": absent}
+
+        findings, _ = self._run(
+            mock_ac,
+            clients,
+            ["us-east-1", "us-west-2", "eu-west-1"],
+            inventory=inventory,
+        )
+        incomplete = self._named(
+            findings, "AgentCore Execution Role Sharing Incomplete"
+        )
+
+        assert not self._named(findings, "AgentCore Execution Role Sharing")
+        assert len(incomplete) == 1
+        assert incomplete[0]["Status"] == "N/A"
+        details = incomplete[0]["Finding_Details"]
+        assert "region us-west-2" in details
+        assert "eu-west-1" not in details
+        assert "bedrock-agentcore:ListAgentRuntimes" in incomplete[0]["Resolution"]
+        assert denied.get_agent_runtime.call_count == 0
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_failed_read_in_another_region_is_named_with_its_region(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole"])
+        remote = self._remote(gateways=["GatewayRole"])
+        remote.get_gateway.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings, _ = self._run(
+            mock_ac,
+            {"us-west-2": remote},
+            ["us-east-1", "us-west-2"],
+            inventory=inventory,
+        )
+        incomplete = self._named(
+            findings, "AgentCore Execution Role Sharing Incomplete"
+        )
+
+        assert len(incomplete) == 1
+        assert "Gateway 'gw-0' (gw-0) in us-west-2" in incomplete[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetGateway" in incomplete[0]["Resolution"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_primary_compares_other_regions_when_it_holds_no_resource(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam)
+        clients = {
+            "us-west-2": self._remote(runtimes=["SharedRole"]),
+            "eu-west-1": self._remote(browsers=["SharedRole"]),
+        }
+        clients["eu-west-1"].list_browsers.return_value = {
+            "browserSummaries": [{"browserId": "br-9", "name": "br-9"}]
+        }
+        clients["eu-west-1"].get_browser.return_value = {
+            "executionRoleArn": self._arn("SharedRole")
+        }
+
+        findings, _ = self._run(
+            mock_ac,
+            clients,
+            ["us-east-1", "us-west-2", "eu-west-1"],
+            inventory=inventory,
+        )
+        shared = self._named(findings, self._SHARED)
+
+        assert len(shared) == 1
+        assert "in us-west-2 [runtime family]" in shared[0]["Finding_Details"]
+        assert "in eu-west-1 [browser family]" in shared[0]["Finding_Details"]
+        assert mock_iam.get_role.call_count == 0
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_non_primary_region_leaves_sharing_to_the_primary(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(
+            mock_ac, mock_iam, runtimes=["SharedRole"], gateways=["SharedRole"]
+        )
+
+        findings, factory = self._run(
+            mock_ac, {}, ["us-west-2", "us-east-1"], primary=False, inventory=inventory
+        )
+
+        assert not self._named(findings, self._SHARED)
+        assert not self._named(findings, "AgentCore Execution Role Sharing")
+        assert factory.call_count == 0
+        assert len(self._named(findings, "AgentCore Execution Role Trust")) == 1
+
+    def test_the_handler_passes_the_assessed_regions_to_ac48(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+
+        assert 'target_regions = event.get("TargetRegions")' in source
+        call = source[
+            source.index("lambda: check_agentcore_execution_role_trust_and_sharing(") :
+        ]
+        call = call[: call.index(")")]
+        assert "browser_inventory, target_regions, is_primary_region" in " ".join(
+            call.split()
+        )
+
+
 # ===================================================================
 # AC-49 DNS egress control
 # ===================================================================
@@ -27848,16 +29249,18 @@ class TestAG39GatewayWafRuleCoverage:
         if action == "Allow":
             details = findings[0]["Finding_Details"]
             assert findings[0]["Status"] == "Failed"
-            # Every filter after the Allow loses credit: its statement is not
-            # judged for which requests it matches.
-            assert "missing 3 of the five" in details
-            assert (
-                "SQL injection inspection, cross-site scripting inspection, "
-                "a rate-based rule" in details.split("It applies")[0]
-            )
+            # The SQL injection Allow is the same attack class as the filter
+            # behind it, so that filter fails. The cross-site scripting and
+            # rate filters behind it are not judged: the Allow matches on SQL
+            # injection, not on their class.
+            assert "missing 1 of the five" in details
+            assert "this check reads: SQL injection inspection." in details
             assert (
                 "SQL injection inspection in rule 'sqli-block' runs after rule "
                 "'sqli-soft'" in details
+            )
+            assert "a rate-based rule in rule 'rate' runs after rule 'sqli-soft'" in (
+                details
             )
             return
         assert findings[0]["Status"] == "Passed"
@@ -33412,7 +34815,20 @@ class TestAC33OwnAgentIdentity:
         )
 
         assert "Failed" not in [f["Status"] for f in findings]
-        na = [f for f in findings if f["Status"] == "N/A"]
+        # The two user id legs report the same unread list on their own rows.
+        user_id = [
+            f
+            for f in findings
+            if f["Finding"]
+            in (
+                "AgentCore Token Issuance By User ID",
+                "AgentCore Runtime Invocation By User ID",
+            )
+        ]
+        assert [f["Status"] for f in user_id] == ["N/A", "N/A"]
+        for row in user_id:
+            assert "bedrock-agentcore:ListAgentRuntimes" in row["Finding_Details"]
+        na = [f for f in findings if f["Status"] == "N/A" and f not in user_id]
         assert len(na) == 1
         assert "bedrock-agentcore:ListAgentRuntimes" in na[0]["Finding_Details"]
         assert "role agent-1-role" in na[0]["Finding_Details"]
@@ -33572,6 +34988,405 @@ class TestAC33WholePopulation:
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC33UserIdTokenOnJwtRuntimes:
+    """AC-33: a JWT runtime's role should not mint tokens for a named user id."""
+
+    _FOR_USER_ID = "bedrock-agentcore:GetWorkloadAccessTokenForUserId"
+    _ROW = "AgentCore Token Issuance By User ID"
+
+    @staticmethod
+    def _wire(mock_ac, role="agent-role", jwt=True):
+        mock_ac.meta.region_name = "us-east-1"
+        detail = {
+            "agentRuntimeName": "support",
+            "roleArn": f"arn:aws:iam::123456789012:role/service/{role}",
+            "workloadIdentityDetails": {"workloadIdentityArn": _IDENTITY_ARN},
+        }
+        if jwt:
+            detail["authorizerConfiguration"] = {
+                "customJWTAuthorizer": {
+                    "discoveryUrl": "https://idp.example.com/.well-known/openid-configuration"
+                }
+            }
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        mock_ac.get_agent_runtime.return_value = detail
+        mock_ac.list_gateways.return_value = {"items": []}
+
+    def _rows(self, statements, **wire):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac, **wire)
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(roles={"agent-role": _principal_with(statements)})
+            )
+        return [f for f in findings if f["Finding"] == self._ROW]
+
+    def _allow(self, action):
+        return {
+            "Effect": "Allow",
+            "Action": action,
+            "Resource": [_DIRECTORY_ARN, _IDENTITY_ARN],
+        }
+
+    def test_a_jwt_runtime_role_that_can_mint_by_user_id_fails(self):
+        rows = self._rows([self._allow(self._FOR_USER_ID)])
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert rows[0]["Severity"] == "Medium"
+        assert "role agent-role" in rows[0]["Finding_Details"]
+        assert "'support' (rt-1)" in rows[0]["Finding_Details"]
+        assert "GetWorkloadAccessTokenForUserId" in rows[0]["Resolution"]
+
+    def test_a_service_wildcard_reaches_the_user_id_action(self):
+        rows = self._rows([self._allow("bedrock-agentcore:*")])
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+
+    def test_an_explicit_deny_on_the_user_id_action_passes(self):
+        rows = self._rows(
+            [
+                self._allow(self._FOR_USER_ID),
+                {"Effect": "Deny", "Action": self._FOR_USER_ID, "Resource": "*"},
+            ]
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "role agent-role" in rows[0]["Finding_Details"]
+
+    def test_a_role_granted_only_the_jwt_exchange_passes(self):
+        rows = self._rows(
+            [self._allow("bedrock-agentcore:GetWorkloadAccessTokenForJWT")]
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_a_runtime_without_a_jwt_authorizer_is_not_judged(self):
+        rows = self._rows([self._allow(self._FOR_USER_ID)], jwt=False)
+
+        assert rows == []
+
+    def test_an_unread_runtime_is_na_for_the_user_id_leg(self):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac)
+            mock_ac.get_agent_runtime.side_effect = _make_client_error(
+                "AccessDeniedException", "denied"
+            )
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(
+                    roles={
+                        "agent-role": _principal_with([self._allow(self._FOR_USER_ID)])
+                    }
+                )
+            )
+        rows = [f for f in findings if f["Finding"] == self._ROW]
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "GetAgentRuntime on rt-1" in rows[0]["Finding_Details"]
+
+    def test_a_jwt_runtime_role_missing_from_the_cache_is_na(self):
+        rows = self._rows([self._allow(self._FOR_USER_ID)], role="other-role")
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "role other-role" in rows[0]["Finding_Details"]
+
+
+class TestAC33InvokeForUserOnJwtRuntimes:
+    """AC-33: no principal should invoke a JWT runtime for a user id it names."""
+
+    _ROW = "AgentCore Runtime Invocation By User ID"
+    _FOR_USER = "bedrock-agentcore:InvokeAgentRuntimeForUser"
+    _WS_FOR_USER = "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser"
+    _RUNTIME = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/{}"
+
+    def _wire(self, mock_ac, order):
+        mock_ac.meta.region_name = "us-east-1"
+        details = {}
+        for runtime_id, jwt in (("rt-1", True), ("rt-2", True), ("rt-3", False)):
+            detail = {
+                "agentRuntimeArn": self._RUNTIME.format(runtime_id),
+                "agentRuntimeName": f"agent-{runtime_id}",
+                "roleArn": f"arn:aws:iam::123456789012:role/{runtime_id}-role",
+            }
+            if jwt:
+                detail["authorizerConfiguration"] = {
+                    "customJWTAuthorizer": {
+                        "discoveryUrl": "https://idp.example.com/.well-known/openid-configuration"
+                    }
+                }
+            details[runtime_id] = detail
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": runtime_id} for runtime_id in order]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: details[
+            agentRuntimeId
+        ]
+        mock_ac.list_gateways.return_value = {"items": []}
+
+    def _rows(self, roles, users=None, order=("rt-1", "rt-2", "rt-3")):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac, order)
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(roles=roles, users=users)
+            )
+        return [f for f in findings if f["Finding"] == self._ROW]
+
+    def _allow(self, action, resource):
+        return {"Effect": "Allow", "Action": action, "Resource": resource}
+
+    def _population(self):
+        return {
+            "caller-a": _principal_with(
+                [self._allow(self._FOR_USER, self._RUNTIME.format("rt-1"))]
+            ),
+            "caller-b": _principal_with(
+                [
+                    self._allow(
+                        self._WS_FOR_USER,
+                        self._RUNTIME.format("rt-2") + "/runtime-endpoint/DEFAULT",
+                    )
+                ]
+            ),
+            "sigv4-caller": _principal_with(
+                [self._allow(self._FOR_USER, self._RUNTIME.format("rt-3"))]
+            ),
+            "denied": _principal_with(
+                [
+                    self._allow("bedrock-agentcore:*", "*"),
+                    {
+                        "Effect": "Deny",
+                        "Action": [self._FOR_USER, self._WS_FOR_USER],
+                        "Resource": "*",
+                    },
+                ]
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        "order", [("rt-1", "rt-2", "rt-3"), ("rt-3", "rt-2", "rt-1")]
+    )
+    def test_only_principals_reaching_a_jwt_runtime_fail(self, order):
+        rows = self._rows(self._population(), order=order)
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "role caller-a (InvokeAgentRuntimeForUser on 'agent-rt-1' (rt-1))" in (
+            details
+        )
+        assert (
+            "role caller-b (InvokeAgentRuntimeWithWebSocketStreamForUser on "
+            "'agent-rt-2' (rt-2))"
+        ) in details
+        assert "sigv4-caller" not in details
+        assert "role denied" not in details
+        assert "rt-3" not in details
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in details
+        assert "InvokeAgentRuntimeForUser" in rows[0]["Resolution"]
+        assert rows[0]["Severity"] == "Medium"
+
+    def test_the_failed_row_does_not_depend_on_runtime_order(self):
+        forward = self._rows(self._population(), order=("rt-1", "rt-2", "rt-3"))
+        reverse = self._rows(self._population(), order=("rt-3", "rt-2", "rt-1"))
+
+        assert forward[0]["Finding_Details"] == reverse[0]["Finding_Details"]
+
+    def test_a_user_grant_is_read_beside_the_roles(self):
+        rows = self._rows(
+            {},
+            users={
+                "alice": _principal_with(
+                    [self._allow("bedrock-agentcore:InvokeAgentRuntime*", "*")]
+                )
+            },
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "user alice (InvokeAgentRuntimeForUser" in details
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" in details
+        assert "rt-3" not in details
+
+    def test_a_grant_on_another_runtime_does_not_reach_the_jwt_runtimes(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [self._allow(self._FOR_USER, self._RUNTIME.format("rt-9"))]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "'agent-rt-1' (rt-1)" in rows[0]["Finding_Details"]
+        assert "'agent-rt-2' (rt-2)" in rows[0]["Finding_Details"]
+        assert "rt-3" not in rows[0]["Finding_Details"]
+
+    def test_a_not_resource_excluding_one_jwt_runtime_reaches_the_other(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        {
+                            "Effect": "Allow",
+                            "Action": self._FOR_USER,
+                            "NotResource": [
+                                self._RUNTIME.format("rt-1"),
+                                self._RUNTIME.format("rt-1") + "/runtime-endpoint/*",
+                            ],
+                        }
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-2' (rt-2)" in details
+        assert "'agent-rt-1' (rt-1)" not in details
+
+    def test_an_explicit_deny_on_both_actions_passes(self):
+        population = self._population()
+        rows = self._rows({"denied": population["denied"]})
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def _scoped_deny(self, runtime_ids, endpoints=True, condition=None):
+        resources = []
+        for runtime_id in runtime_ids:
+            resources.append(self._RUNTIME.format(runtime_id))
+            if endpoints:
+                resources.append(
+                    self._RUNTIME.format(runtime_id) + "/runtime-endpoint/*"
+                )
+        statement = {
+            "Effect": "Deny",
+            "Action": [self._FOR_USER, self._WS_FOR_USER],
+            "Resource": resources,
+        }
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    def test_a_deny_on_one_runtime_and_its_endpoints_removes_only_it(self):
+        # The resolution tells customers to Deny on these runtimes, so a Deny
+        # scoped to rt-1 must remove rt-1 and leave rt-2 named.
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(["rt-1"]),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-2' (rt-2)" in details
+        assert "'agent-rt-1' (rt-1)" not in details
+        assert "for any user id" not in details
+        assert "with no explicit Deny" in details
+        assert agentcore_app.AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL in details
+
+    def test_a_deny_on_both_jwt_runtimes_and_their_endpoints_passes(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(["rt-1", "rt-2"]),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_a_deny_on_the_runtime_arns_alone_leaves_the_endpoints(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(["rt-1", "rt-2"], endpoints=False),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" in details
+
+    def test_a_conditioned_deny_does_not_subtract(self):
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        self._scoped_deny(
+                            ["rt-1", "rt-2"],
+                            condition={
+                                "StringEquals": {"aws:RequestedRegion": "eu-west-1"}
+                            },
+                        ),
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" in details
+
+    def test_a_not_resource_deny_exempting_one_endpoint_leaves_that_runtime(self):
+        # The exemption names one endpoint through a wildcard in the runtime
+        # segment, so it overlaps rt-1's endpoints and rt-1 is not removed.
+        rows = self._rows(
+            {
+                "caller": _principal_with(
+                    [
+                        self._allow("bedrock-agentcore:*", "*"),
+                        {
+                            "Effect": "Deny",
+                            "Action": [self._FOR_USER, self._WS_FOR_USER],
+                            "NotResource": [
+                                self._RUNTIME.format("rt-1*") + "/runtime-endpoint/prod"
+                            ],
+                        },
+                    ]
+                )
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'agent-rt-1' (rt-1)" in details
+        assert "'agent-rt-2' (rt-2)" not in details
+
+    def test_no_jwt_runtime_writes_no_row(self):
+        rows = self._rows(self._population(), order=("rt-3",))
+
+        assert rows == []
+
+    def test_an_unread_runtime_is_na_for_the_invoke_leg(self):
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            self._wire(mock_ac, ("rt-1",))
+            mock_ac.get_agent_runtime.side_effect = _make_client_error(
+                "AccessDeniedException", "denied"
+            )
+            findings = agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(roles=self._population())
+            )
+        rows = [f for f in findings if f["Finding"] == self._ROW]
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "GetAgentRuntime on rt-1" in rows[0]["Finding_Details"]
 
 
 class TestAC42WholePopulation:
@@ -38025,7 +39840,7 @@ class TestAC38EventResource:
                 )
             ]
         }
-        return agentcore_app.check_agentcore_policy_session_binding()
+        return _session_binding_rows()
 
     @patch("agentcore_app.agentcore_client")
     def test_each_gateway_is_judged_by_its_own_event_patterns(self, mock_ac):
@@ -39077,6 +40892,176 @@ class TestAC20DeliveryDestinationGroups:
         assert self._by_group(findings) == {"/aws/bedrock-agentcore/x": "Failed"}
 
 
+class TestAC26DeliveryDestinationGroups:
+    """AIR-ACR-GW-10: AC-26 judges retention and key scope on a log group
+    outside the AgentCore prefixes that a delivery from an AgentCore source
+    writes to, the same population AC-20 reads."""
+
+    _wire = staticmethod(TestAC20DeliveryDestinationGroups._wire)
+    _source = staticmethod(TestAC20DeliveryDestinationGroups._source)
+    _delivery = staticmethod(TestAC20DeliveryDestinationGroups._delivery)
+    _destination = staticmethod(TestAC20DeliveryDestinationGroups._destination)
+    _KEY = TestAC26LogRetentionAndKeyScope._KEY
+
+    @staticmethod
+    def _by_group(findings):
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-26"
+            assert_finding_schema(finding)
+        return {
+            f["Finding_Details"].split("'")[1]: f["Status"]
+            for f in findings
+            if f["Finding_Details"].startswith("Log group '")
+        }
+
+    def _scoped(self, mock_kms):
+        mock_kms.get_key_policy.return_value = {
+            "Policy": TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_delivered_groups_outside_the_prefixes_are_judged(
+        self, mock_logs, mock_kms
+    ):
+        self._scoped(mock_kms)
+        self._wire(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KEY,
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    }
+                ],
+                "team/agent-logs": [
+                    {"logGroupName": "team/agent-logs"},
+                    {"logGroupName": "team/agent-logs-archive"},
+                ],
+                "team/kept-logs": [
+                    {
+                        "logGroupName": "team/kept-logs",
+                        "kmsKeyId": self._KEY,
+                        "retentionInDays": 90,
+                    }
+                ],
+                "team/other-logs": [{"logGroupName": "team/other-logs"}],
+            },
+            sources=[
+                self._source("gw-src"),
+                self._source("rt-src"),
+                self._source("mem-src"),
+                self._source("lambda-src", service="lambda"),
+            ],
+            deliveries=[
+                self._delivery("gw-src", "dd-arn-1"),
+                self._delivery("rt-src", "dd-arn-4"),
+                self._delivery("mem-src", "dd-arn-2", kind="S3"),
+                self._delivery("lambda-src", "dd-arn-3"),
+            ],
+            destinations=[
+                self._destination("dd-arn-4", "team/kept-logs"),
+                self._destination("dd-arn-1", "team/agent-logs"),
+                self._destination("dd-arn-2", "bucket", kind="S3"),
+                self._destination("dd-arn-3", "team/other-logs"),
+            ],
+        )
+        by_group = self._by_group(
+            agentcore_app.check_agentcore_log_retention_and_key_scope()
+        )
+        assert by_group == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Passed",
+            "team/agent-logs": "Failed",
+            "team/kept-logs": "Passed",
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_alone_is_judged_not_reported_absent(
+        self, mock_logs, mock_kms
+    ):
+        self._scoped(mock_kms)
+        self._wire(
+            mock_logs,
+            {"team/agent-logs": [{"logGroupName": "team/agent-logs"}]},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=[self._destination("dd-arn-1", "team/agent-logs")],
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert self._by_group(findings) == {"team/agent-logs": "Failed"}
+        assert "no retention period" in findings[0]["Finding_Details"]
+        assert not [
+            f for f in findings if "No AgentCore log groups" in f["Finding_Details"]
+        ]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_denied_destination_read_is_na_naming_the_action(
+        self, mock_logs, mock_kms
+    ):
+        self._scoped(mock_kms)
+        self._wire(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/": [
+                    {"logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1"},
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "kmsKeyId": self._KEY,
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    },
+                ]
+            },
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=_make_client_error("AccessDeniedException", "denied"),
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        (na,) = [f for f in findings if f["Status"] == "N/A"]
+        assert "AccessDeniedException" in na["Finding_Details"]
+        assert "logs:DescribeDeliveryDestinations" in na["Resolution"]
+        assert self._by_group(findings) == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Failed",
+            "/aws/bedrock-agentcore/runtimes/rt-2": "Passed",
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_denied_read_with_no_prefix_group_is_still_na(self, mock_logs, mock_kms):
+        self._wire(
+            mock_logs,
+            {},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=_make_client_error("AccessDeniedException", "denied"),
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert any(
+            "logs:DescribeDeliveryDestinations" in f["Resolution"] for f in findings
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_under_a_prefix_is_not_judged_twice(
+        self, mock_logs, mock_kms
+    ):
+        name = "/aws/vendedlogs/bedrock-agentcore/gateway/g"
+        self._wire(
+            mock_logs,
+            {"/aws/vendedlogs/bedrock-agentcore/": [{"logGroupName": name}]},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=[self._destination("dd-arn-1", name)],
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+
 class TestAC22TelemetryLinks:
     """AIR-ACR-OBS-06: an account with no sink is judged on the links it uses to
     share AgentCore telemetry with a monitoring account."""
@@ -39565,6 +41550,282 @@ class TestAC46CostAnomalyAlerting:
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count("check_agentcore_runtime_cost_alerting") == 1
         assert 'ce_client = boto3.client("ce"' in source
+
+
+class TestAC06RecordingReaders:
+    """AC-06: who else can read the recordings, from the bucket policy and cache."""
+
+    _OTHER_OBJECTS = "arn:aws:s3:::other/rec/*"
+
+    @staticmethod
+    def _read(principal, resource=_RECORDING_OBJECTS, **extra):
+        statement = {
+            "Sid": "Readers",
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "s3:GetObject",
+            "Resource": resource,
+        }
+        statement.update(extra)
+        return statement
+
+    def _two_buckets(self, mock_s3, policies, order=("br-1", "br-2")):
+        _wire_recording_bucket(mock_s3)
+
+        def bucket_policy(Bucket, ExpectedBucketOwner):
+            deny = _plaintext_deny(
+                Resource=[f"arn:aws:s3:::{Bucket}", f"arn:aws:s3:::{Bucket}/*"]
+            )
+            return {
+                "Policy": json.dumps(
+                    {"Version": "2012-10-17", "Statement": [deny, *policies[Bucket]]}
+                )
+            }
+
+        mock_s3.get_bucket_policy.side_effect = bucket_policy
+        buckets = {"br-1": "recordings", "br-2": "other"}
+        findings = _record(
+            _browser_inventory(
+                *(_recorded_browser(b, bucket=buckets[b]) for b in order)
+            ),
+            _recorder_cache(
+                statements=[
+                    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}
+                ]
+            ),
+        )
+        return {
+            b: next(f for f in findings if f"({b})" in f["Finding_Details"])
+            for b in order
+        }
+
+    @pytest.mark.parametrize("order", [("br-1", "br-2"), ("br-2", "br-1")])
+    @patch("agentcore_app.s3_client")
+    def test_a_cross_account_read_fails_only_its_bucket(self, mock_s3, order):
+        rows = self._two_buckets(
+            mock_s3,
+            {
+                "recordings": [
+                    self._read({"AWS": "arn:aws:iam::999988887777:role/outsider"})
+                ],
+                "other": [
+                    self._read(
+                        {"AWS": "arn:aws:iam::123456789012:role/reader"},
+                        resource=self._OTHER_OBJECTS,
+                    )
+                ],
+            },
+            order=order,
+        )
+
+        assert rows["br-1"]["Status"] == "Failed"
+        assert (
+            f"allows s3:GetObject on {_RECORDING_OBJECTS} with no condition by "
+            "statement 'Readers' to arn:aws:iam::999988887777:role/outsider"
+        ) in rows["br-1"]["Finding_Details"]
+        assert "Principal '*' or another account" in rows["br-1"]["Resolution"]
+        assert rows["br-2"]["Status"] == "Passed"
+        assert "allows s3:GetObject" not in rows["br-2"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "bucket_restrict, account, status, named",
+        [
+            (True, None, "Passed", False),
+            (False, {"RestrictPublicBuckets": True}, "Passed", False),
+            (False, {"RestrictPublicBuckets": False}, "Failed", True),
+            (False, "denied", "N/A", False),
+        ],
+        ids=["bucket-restricts", "account-restricts", "neither", "account-unread"],
+    )
+    @pytest.mark.parametrize(
+        "statement, grantee",
+        [
+            ({"Principal": "*"}, "*"),
+            (
+                {"NotPrincipal": {"AWS": "arn:aws:iam::123456789012:root"}},
+                "every principal NotPrincipal leaves out",
+            ),
+        ],
+        ids=["star", "not-principal"],
+    )
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_public_read_counts_only_when_restrict_public_buckets_is_off(
+        self,
+        mock_s3,
+        mock_s3control,
+        statement,
+        grantee,
+        bucket_restrict,
+        account,
+        status,
+        named,
+    ):
+        read = self._read("*")
+        del read["Principal"]
+        read.update(statement)
+        _wire_recording_bucket(mock_s3, statements=[_plaintext_deny(), read])
+        mock_s3.get_public_access_block.return_value["PublicAccessBlockConfiguration"][
+            "RestrictPublicBuckets"
+        ] = bucket_restrict
+        if account == "denied":
+            mock_s3control.get_public_access_block.side_effect = _make_client_error(
+                "AccessDenied", "denied"
+            )
+        else:
+            config = {f: True for f in agentcore_app.S3_PUBLIC_ACCESS_BLOCK_FIELDS}
+            config.update(account or {})
+            mock_s3control.get_public_access_block.return_value = {
+                "PublicAccessBlockConfiguration": config
+            }
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == status
+        assert (
+            f"with no condition by statement 'Readers' to {grantee}"
+            in finding["Finding_Details"]
+        ) is named
+
+    @patch("agentcore_app.s3_client")
+    def test_a_public_policy_under_restrict_public_buckets_blocks_the_other_account(
+        self, mock_s3
+    ):
+        _wire_recording_bucket(
+            mock_s3,
+            statements=[
+                _plaintext_deny(),
+                self._read({"AWS": "arn:aws:iam::999988887777:role/outsider"}),
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": "arn:aws:s3:::recordings",
+                },
+            ],
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Passed"
+        assert "999988887777" not in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "principal, status",
+        [
+            ({"AWS": "arn:aws:iam::999988887777:role/outsider"}, "Failed"),
+            ({"AWS": "999988887777"}, "Failed"),
+            ({"AWS": "arn:aws:iam::123456789012:role/reader"}, "Passed"),
+            ({"Service": "cloudfront.amazonaws.com"}, "Passed"),
+        ],
+        ids=["other-account-role", "other-account-id", "same-account", "service"],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_only_a_principal_outside_the_account_fails(
+        self, mock_s3, principal, status
+    ):
+        _wire_recording_bucket(
+            mock_s3, statements=[_plaintext_deny(), self._read(principal)]
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == status
+        if status == "Failed":
+            assert "999988887777" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {
+                "Sid": "Readers",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": _RECORDING_OBJECTS,
+                "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-1"}},
+            },
+            {
+                "Sid": "Readers",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::recordings/public/*",
+            },
+            {
+                "Sid": "Readers",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::recordings",
+            },
+        ],
+        ids=["conditioned", "other-prefix", "other-action"],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_grant_that_does_not_open_the_prefix_passes(self, mock_s3, statement):
+        _wire_recording_bucket(mock_s3, statements=[_plaintext_deny(), statement])
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_cached_readers_are_named_and_a_denied_one_is_not(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        cache = _recorder_cache()
+
+        def principal(*statements):
+            return {
+                "attached_policies": [
+                    {"policy_name": "p", "document": {"Statement": list(statements)}}
+                ]
+            }
+
+        read = {"Effect": "Allow", "Action": "s3:GetObject"}
+        cache["role_permissions"].update(
+            {
+                "reader-b": principal({**read, "Resource": _RECORDING_OBJECTS}),
+                "reader-a": principal(
+                    {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}
+                ),
+                "denied": principal(
+                    {**read, "Resource": "*"},
+                    {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*"},
+                ),
+                "elsewhere": principal({**read, "Resource": self._OTHER_OBJECTS}),
+            }
+        )
+        cache["user_permissions"] = {
+            "alice": principal(
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:Get*",
+                    "Resource": "arn:aws:s3:::recordings/*",
+                }
+            )
+        }
+
+        finding = _record(_browser_inventory(_recorded_browser()), cache)[0]
+
+        assert finding["Status"] == "Passed"
+        assert (
+            "boundary: role reader-a, role reader-b, user alice."
+            in finding["Finding_Details"]
+        )
+        for absent in ("browser-recorder,", "role denied", "elsewhere"):
+            assert absent not in finding["Finding_Details"]
+
+    @patch("agentcore_app.s3_client")
+    def test_no_cached_reader_is_stated(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert (
+            "No cached role or user has an identity policy allowing s3:GetObject "
+            f"on {_RECORDING_OBJECTS}."
+        ) in finding["Finding_Details"]
 
 
 class TestAC06AccountPublicAccessBlock:
@@ -42338,18 +44599,22 @@ class TestWafRuleOrderAndScope:
 
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
-    def test_an_allow_that_runs_first_fails_the_filters_behind_it(
+    def test_an_allow_that_runs_first_leaves_the_filters_behind_it_unjudged(
         self, mock_ac, mock_waf
     ):
-        # Listed last, run first: Priority decides, not the list position.
+        # Listed last, run first: Priority decides, not the list position. A
+        # byte match Allow is not judged for its reach, so the filters behind
+        # it are neither credited nor failed.
         rules = self._filters() + [_allow_every_path_rule(priority=0)]
         findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
         details = findings[0]["Finding_Details"]
-        assert "missing 3 of the five" in details
+        assert (
+            "runs SQL injection inspection, cross-site scripting inspection, "
+            "a rate-based rule only after an Allow rule" in details
+        )
         assert "rule 'allow-root'" in details
-        assert "Allow" in details
 
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42372,13 +44637,15 @@ class TestWafRuleOrderAndScope:
         findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
 
         details = findings[0]["Finding_Details"]
-        assert findings[0]["Status"] == "Failed"
-        assert "missing 2 of the five" in details
-        assert "cross-site scripting inspection, a rate-based rule" in details
-        assert "SQL injection inspection from" in details
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "runs cross-site scripting inspection, a rate-based rule only after"
+            in details
+        )
+        assert "SQL injection inspection in" not in details
 
     @pytest.mark.parametrize(
-        "allow_priority, status", [(2, "Failed"), (99, "Passed")], ids=["first", "last"]
+        "allow_priority, status", [(2, "N/A"), (99, "Passed")], ids=["first", "last"]
     )
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42400,9 +44667,9 @@ class TestWafRuleOrderAndScope:
         findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
 
         assert [f["Status"] for f in findings] == [status]
-        if status == "Failed":
+        if status == "N/A":
             details = findings[0]["Finding_Details"]
-            assert "missing 1 of the five" in details
+            assert "runs cross-site scripting inspection only after" in details
             assert (
                 "cross-site scripting inspection in rule 'xss-body' runs after "
                 "rule 'allow-root'" in details
@@ -42490,12 +44757,13 @@ class TestWafRuleOrderAndScope:
         findings = self._base._ag39(mock_ac, mock_waf, acl)
 
         details = findings[0]["Finding_Details"]
-        assert findings[0]["Status"] == "Failed"
-        assert "missing 1 of the five" in details
-        assert "a rate-based rule" in details.split("It applies")[0]
+        assert findings[0]["Status"] == "N/A"
+        assert "runs a rate-based rule only after an Allow rule" in details
+        assert "SQL injection inspection in" not in details
+        assert "cross-site scripting inspection in" not in details
 
     @pytest.mark.parametrize(
-        "allow_priority, status", [(0, "Failed"), (99, "Passed")], ids=["first", "last"]
+        "allow_priority, status", [(0, "N/A"), (99, "Passed")], ids=["first", "last"]
     )
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42518,8 +44786,10 @@ class TestWafRuleOrderAndScope:
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [f["Status"] for f in findings] == [status]
-        if status == "Failed":
-            assert "rule 'allow-root'" in findings[0]["Finding_Details"]
+        if status == "N/A":
+            details = findings[0]["Finding_Details"]
+            assert "AWSManagedRulesAntiDDoSRuleSet only after an Allow" in details
+            assert "rule 'allow-root'" in details
 
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42542,7 +44812,114 @@ class TestWafRuleOrderAndScope:
 
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
         details = findings[0]["Finding_Details"]
-        assert "rule 'rate'" in details
-        assert "rule 'allow-root'" in details
+        assert "a rate-based rule in rule 'rate' runs after rule 'allow-root'" in (
+            details
+        )
+        assert "not judged" in details
+
+    @pytest.mark.parametrize(
+        "allow_statement, status",
+        [
+            (
+                {
+                    "IPSetReferenceStatement": {
+                        "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/"
+                        "ipset/trusted/abc"
+                    }
+                },
+                "N/A",
+            ),
+            (
+                {"RateBasedStatement": {"Limit": 100, "AggregateKeyType": "IP"}},
+                "Failed",
+            ),
+        ],
+        ids=["ip-set", "same-class"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac51_fails_a_rate_rule_only_behind_a_rate_class_allow(
+        self, mock_ac, mock_waf, allow_statement, status
+    ):
+        allow = {
+            "Name": "allow-first",
+            "Priority": 2,
+            "Action": {"Allow": {}},
+            "Statement": allow_statement,
+        }
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
+            {
+                "acl": {
+                    "Name": "acl",
+                    "Rules": [
+                        {**_anti_ddos_rule(), "Priority": 1},
+                        allow,
+                        {**_rate_rule(), "Priority": 3},
+                    ],
+                }
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [f["Status"] for f in findings] == [status]
+        assert "rule 'allow-first'" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "allow_statement, status",
+        [
+            (
+                {
+                    "IPSetReferenceStatement": {
+                        "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/"
+                        "ipset/trusted/abc"
+                    }
+                },
+                "N/A",
+            ),
+            (
+                {
+                    "SqliMatchStatement": {
+                        "FieldToMatch": {"Body": {}},
+                        "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                    }
+                },
+                "Failed",
+            ),
+        ],
+        ids=["ip-set", "same-class"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_allow_fails_only_its_own_attack_class(
+        self, mock_ac, mock_waf, allow_statement, status
+    ):
+        # The same four filters behind one Allow. An IP set Allow is not judged
+        # for which callers it lets past, so the row is N/A. A SQL injection
+        # match Allow lets SQL injection past the SQL injection filter, so the
+        # row fails on that filter alone and leaves the other two unjudged.
+        allow = {
+            "Name": "allow-first",
+            "Priority": 0,
+            "Action": {"Allow": {}},
+            "Statement": allow_statement,
+        }
+        rules = [allow] + self._filters()
+        findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
+
+        assert [f["Status"] for f in findings] == [status]
+        details = findings[0]["Finding_Details"]
+        assert "rule 'allow-first'" in details
+        if status == "Failed":
+            assert "missing 1 of the five" in details
+            assert "this check reads: SQL injection inspection." in details
+            assert (
+                "cross-site scripting inspection in AWSManagedRulesCommonRuleSet "
+                "in rule 'common' runs after rule 'allow-first', whose Allow "
+                "statement is not judged" in details
+            )

@@ -702,6 +702,14 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # keys it accepts as scoping.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:GetMemory"}
 
+# Verified on 2026-09-29 with an Access Analyzer validate-policy run for the
+# AC-33 user id leg. Its negative control was one invented action
+# (bedrock-agentcore:GetWorkloadAccessTokenForUserIdNotReal), which was reported
+# as INVALID_ACTION, and the action below was not.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:GetWorkloadAccessTokenForUserId"
+}
+
 # Verified on 2026-09-25 with a third Access Analyzer validate-policy run for the
 # gateway controls AC-24 through AC-27. Its negative controls were four invented
 # actions (ec2:DescribeVpcEndpointsThatDoNotExist,

@@ -1351,15 +1351,15 @@ Resources:
                 - cloudtrail:ListTrails # AC-18, AC-26
                 # Formerly LogsDeliveryInventory
                 # AC-19 pairs each AgentCore delivery source with its delivery.
-                - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-46
-                - logs:DescribeDeliveries # AC-04, AC-19, AC-20, AC-46
+                - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-26, AC-46
+                - logs:DescribeDeliveries # AC-04, AC-19, AC-20, AC-26, AC-46
                 # Formerly LogsAccountPolicyInventory
                 - logs:DescribeAccountPolicies # AC-20
                 # Formerly ObservabilitySinkInventory
                 - oam:ListSinks # AC-22
                 # Formerly OrganizationsInventoryPermissions
                 # ListPolicies takes no resource.
-                - organizations:ListPolicies # AC-26, AC-28, AC-29
+                - organizations:ListPolicies # AC-26, AC-28, AC-29, AC-37
                 # Formerly AgentCoreCompositeAlarmRead
                 # AC-36, AC-40, AC-45, AC-46 and AC-53 credit an alarm actioned
                 # through a composite alarm. The CloudWatch API reference page
@@ -1371,7 +1371,7 @@ Resources:
                 # has a resource type in the service authorization reference, so
                 # each needs Resource '*'.
                 - xray:GetTraceSegmentDestination # AC-19
-                - logs:DescribeDeliveryDestinations # AC-20
+                - logs:DescribeDeliveryDestinations # AC-20, AC-26
                 - organizations:DescribeOrganization # AC-22
                 - oam:ListLinks # AC-22
                 - s3:GetAccountPublicAccessBlock # AC-06
@@ -1380,7 +1380,7 @@ Resources:
                 - bedrock-agentcore:ListPaymentManagers # AC-02, AC-48
                 - bedrock-agentcore:ListHarnesses # AC-34, AC-48
                 - bedrock-agentcore:ListBatchEvaluations # AC-41
-                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30, AC-34
                 - bedrock-agentcore:ListAgentRuntimeVersions # AC-01
                 - ec2:DescribeNatGateways # AC-49
                 - bedrock:GetModelInvocationLoggingConfiguration # AC-26
@@ -1418,6 +1418,9 @@ Resources:
                 # payment-manager and harness resource types for these.
                 - bedrock-agentcore:GetPaymentManager
                 - bedrock-agentcore:GetHarness
+                # AC-46 reads the capacity provider a runtime names. The service
+                # authorization reference lists the capacity-provider type.
+                - bedrock-agentcore:GetCapacityProvider
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -1430,6 +1433,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:online-evaluation-config/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:capacity-provider/*'
             # AC-18 counts workload identities and credential providers to decide
             # which identity data-event types are in use, and AC-14 reads the
             # token vault each provider ARN names. The service authorization
@@ -1574,12 +1578,12 @@ Resources:
             - Sid: OrganizationsPolicyAttachmentRead
               Effect: Allow
               Action:
-                - organizations:ListTargetsForPolicy # AC-28, AC-29
+                - organizations:ListTargetsForPolicy # AC-28, AC-29, AC-37
               Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
             - Sid: OrganizationsParentRead
               Effect: Allow
               Action:
-                - organizations:ListParents # AC-28, AC-29
+                - organizations:ListParents # AC-28, AC-29, AC-37
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
                 - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
