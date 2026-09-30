@@ -4147,6 +4147,306 @@ class TestAC06RecordingDestination:
         )
 
 
+def _recording_reader(**overrides):
+    statement = {
+        "Sid": "Reader",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::recordings/*",
+    }
+    statement.update(overrides)
+    return statement
+
+
+def _record_two_buckets(mock_s3, reader, reverse, restrict=True):
+    """Browser br-1 records to `recordings`, which carries `reader`; browser
+    br-2 records to `clean`, whose policy only refuses plaintext.
+
+    With `restrict` False, RestrictPublicBuckets is off on `recordings` and on
+    the account, so S3 does not confine a public policy to the account.
+    """
+    _wire_recording_bucket(mock_s3)
+    blocks = {
+        "recordings": {
+            field: field != "RestrictPublicBuckets" or restrict
+            for field in agentcore_app.S3_PUBLIC_ACCESS_BLOCK_FIELDS
+        },
+        "clean": {field: True for field in agentcore_app.S3_PUBLIC_ACCESS_BLOCK_FIELDS},
+    }
+    mock_s3.get_public_access_block.side_effect = lambda Bucket, ExpectedBucketOwner: {
+        "PublicAccessBlockConfiguration": blocks[Bucket]
+    }
+    policies = {
+        "recordings": [_plaintext_deny(), reader],
+        "clean": [
+            _plaintext_deny(Resource=["arn:aws:s3:::clean", "arn:aws:s3:::clean/*"])
+        ],
+    }
+    mock_s3.get_bucket_policy.side_effect = lambda Bucket, ExpectedBucketOwner: {
+        "Policy": json.dumps({"Version": "2012-10-17", "Statement": policies[Bucket]})
+    }
+    browsers = [_recorded_browser("br-1"), _recorded_browser("br-2", bucket="clean")]
+    s3control = MagicMock()
+    s3control.get_public_access_block.return_value = {
+        "PublicAccessBlockConfiguration": blocks["recordings"]
+    }
+    with patch("agentcore_app.s3control_client", s3control):
+        findings = _record(
+            _browser_inventory(*(browsers[::-1] if reverse else browsers)),
+            _recorder_cache(
+                statements=[
+                    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}
+                ]
+            ),
+        )
+    return {
+        finding["Finding_Details"].split("(", 2)[1][:4]: finding for finding in findings
+    }
+
+
+class TestAC06RecordingReadLeg:
+    """AC-06: the bucket policy must not let another account read the recordings."""
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            _recording_reader(),
+            _recording_reader(
+                Principal={"AWS": "*"},
+                Action="s3:*",
+                Resource="arn:aws:s3:::recordings/rec/*",
+            ),
+            _recording_reader(
+                Principal={"AWS": "arn:aws:iam::444455556666:root"}, Action="s3:Get*"
+            ),
+            _recording_reader(Principal={"AWS": ["444455556666"]}, Action="*"),
+            _recording_reader(Resource="arn:aws:s3:::recordings/rec/session-1/*"),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalAccount": "444455556666"}}
+            ),
+            _recording_reader(
+                Condition={
+                    "StringEqualsIfExists": {"aws:PrincipalAccount": "123456789012"}
+                }
+            ),
+            _recording_reader(
+                Condition={"StringLike": {"aws:SourceAccount": "12345678901?"}}
+            ),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalOrgID": "o-other"}}
+            ),
+            _recording_reader(
+                Principal=None,
+                NotPrincipal={"AWS": "arn:aws:iam::123456789012:role/blocked"},
+            ),
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_outside_reader_fails_only_its_bucket(
+        self, mock_s3, mock_orgs, reader, reverse
+    ):
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-mine"}
+        }
+        reader = {key: value for key, value in reader.items() if value is not None}
+
+        findings = _record_two_buckets(mock_s3, reader, reverse, restrict=False)
+
+        assert findings["br-1"]["Status"] == "Failed"
+        details = findings["br-1"]["Finding_Details"]
+        assert "bucket 'recordings' policy allows s3:GetObject on" in details
+        assert "by statement 'Reader' to " in details
+        assert f"s3:GetObject on {_RECORDING_OBJECTS}" in details
+        assert "Remove the bucket policy Allow" in findings["br-1"]["Resolution"]
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            _recording_reader(
+                Principal={"AWS": "arn:aws:iam::444455556666:root"}, Action="s3:Get*"
+            ),
+            _recording_reader(Principal={"AWS": ["444455556666"]}, Action="*"),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalAccount": "444455556666"}}
+            ),
+            _recording_reader(
+                Condition={
+                    "StringEqualsIfExists": {"aws:PrincipalAccount": "123456789012"}
+                }
+            ),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalOrgID": "o-other"}}
+            ),
+        ],
+        ids=[
+            "other-account-root",
+            "other-account-id",
+            "star-bound-to-other-account",
+            "star-if-exists",
+            "star-bound-to-other-org",
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_non_public_outside_reader_fails_under_restrict_public_buckets(
+        self, mock_s3, mock_orgs, reader, reverse
+    ):
+        # RestrictPublicBuckets applies only to a public policy, and a named
+        # account or a fixed-value condition leaves the policy non-public.
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-mine"}
+        }
+
+        findings = _record_two_buckets(mock_s3, reader, reverse)
+
+        assert findings["br-1"]["Status"] == "Failed"
+        assert "by statement 'Reader' to " in findings["br-1"]["Finding_Details"]
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            _recording_reader(),
+            _recording_reader(
+                Principal={"AWS": "*"},
+                Action="s3:*",
+                Resource="arn:aws:s3:::recordings/rec/*",
+            ),
+            _recording_reader(Resource="arn:aws:s3:::recordings/rec/session-1/*"),
+            _recording_reader(
+                Condition={"StringLike": {"aws:SourceAccount": "12345678901?"}}
+            ),
+            _recording_reader(
+                Principal=None,
+                NotPrincipal={"AWS": "arn:aws:iam::123456789012:role/blocked"},
+            ),
+        ],
+        ids=["star", "aws-star", "narrow-resource", "source-pattern", "not-principal"],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_public_reader_passes_under_restrict_public_buckets(
+        self, mock_s3, mock_orgs, reader, reverse
+    ):
+        # S3 confines a bucket whose policy is public to its own account and
+        # AWS service principals while RestrictPublicBuckets is on.
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-mine"}
+        }
+        reader = {key: value for key, value in reader.items() if value is not None}
+
+        findings = _record_two_buckets(mock_s3, reader, reverse)
+
+        assert [findings[key]["Status"] for key in ("br-1", "br-2")] == [
+            "Passed",
+            "Passed",
+        ]
+        details = findings["br-1"]["Finding_Details"]
+        assert "statement 'Reader'" not in details
+        assert (
+            "its bucket policy allows no other account and no anonymous caller "
+            f"s3:GetObject on {_RECORDING_OBJECTS}, because RestrictPublicBuckets "
+            "confines its public statements to account 123456789012"
+        ) in details
+        clean = findings["br-2"]["Finding_Details"]
+        assert "because RestrictPublicBuckets" not in clean
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalAccount": "123456789012"}}
+            ),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:SourceAccount": "123456789012"}}
+            ),
+            _recording_reader(
+                Condition={"StringEquals": {"aws:PrincipalOrgID": "o-mine"}}
+            ),
+            _recording_reader(
+                Principal={"AWS": "arn:aws:iam::123456789012:role/reader"}
+            ),
+            _recording_reader(Action="s3:PutObject"),
+            _recording_reader(Resource="arn:aws:s3:::recordings/other/*"),
+            _recording_reader(Effect="Deny"),
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_reader_bound_to_this_account_or_org_passes(
+        self, mock_s3, mock_orgs, reader, reverse
+    ):
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-mine"}
+        }
+
+        findings = _record_two_buckets(mock_s3, reader, reverse)
+
+        assert [findings[key]["Status"] for key in ("br-1", "br-2")] == [
+            "Passed",
+            "Passed",
+        ]
+        assert (
+            "its bucket policy allows no other account and no anonymous caller "
+            f"s3:GetObject on {_RECORDING_OBJECTS}"
+        ) in findings["br-1"]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_org_bound_reader_is_na_when_the_org_is_unread(self, mock_s3, mock_orgs):
+        mock_orgs.describe_organization.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        reader = _recording_reader(
+            Condition={"StringEquals": {"aws:PrincipalOrgID": "o-mine"}}
+        )
+
+        findings = _record_two_buckets(mock_s3, reader, False)
+
+        assert findings["br-1"]["Status"] == "N/A"
+        assert "organizations:DescribeOrganization" in findings["br-1"]["Resolution"]
+        assert "statement 'Reader'" in findings["br-1"]["Finding_Details"]
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_org_bound_reader_fails_when_the_account_has_no_org(
+        self, mock_s3, mock_orgs
+    ):
+        mock_orgs.describe_organization.side_effect = _make_client_error(
+            "AWSOrganizationsNotInUseException", "not in use"
+        )
+        reader = _recording_reader(
+            Condition={"StringEquals": {"aws:PrincipalOrgID": "o-mine"}}
+        )
+
+        findings = _record_two_buckets(mock_s3, reader, False)
+
+        assert findings["br-1"]["Status"] == "Failed"
+        assert "by statement 'Reader' to *" in findings["br-1"]["Finding_Details"]
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_an_unread_bucket_policy_names_the_read_leg(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_bucket_policy.side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "N/A"
+        assert "who else may s3:GetObject" in finding["Finding_Details"]
+        assert "Grant s3:GetBucketPolicy" in finding["Resolution"]
+
+
 # ===================================================================
 # AC-07: check_agentcore_memory_configuration
 # ===================================================================
@@ -25673,6 +25973,80 @@ class TestAC46CapacityProvider:
         mock_ac.get_capacity_provider.assert_called_once_with(capacityProviderId="cp-1")
 
 
+_GATEWAY_WORKLOAD_IDENTITY_PREFIX = (
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+    "workload-identity-directory/default/workload-identity/"
+)
+
+
+def _gateway_arn(gateway_id):
+    return f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{gateway_id}"
+
+
+def _runtime_target(runtime_id):
+    return {"http": {"agentcoreRuntime": {"arn": _runtime_arn(runtime_id)}}}
+
+
+def _mcp_runtime_target(runtime_id):
+    encoded = _runtime_arn(runtime_id).replace(":", "%3A").replace("/", "%2F")
+    return {
+        "mcp": {
+            "mcpServer": {
+                "endpoint": (
+                    "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/"
+                    f"{encoded}/invocations?qualifier=DEFAULT"
+                )
+            }
+        }
+    }
+
+
+def _wire_fronting_gateways(mock_ac, gateways):
+    """Stub every gateway read from {gateway id: [target configuration, ...]}.
+
+    Gateway `g` runs as workload identity `g-wi`.
+    """
+    mock_ac.list_gateways.return_value = {
+        "items": [
+            {"gatewayId": gateway_id, "name": gateway_id} for gateway_id in gateways
+        ]
+    }
+    mock_ac.list_gateway_targets.side_effect = lambda gatewayIdentifier: {
+        "items": [
+            {"targetId": f"{gatewayIdentifier}.{index}"}
+            for index in range(len(gateways[gatewayIdentifier]))
+        ]
+    }
+    mock_ac.get_gateway_target.side_effect = lambda gatewayIdentifier, targetId: {
+        "targetConfiguration": gateways[gatewayIdentifier][
+            int(targetId.rsplit(".", 1)[1])
+        ]
+    }
+    mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+        "gatewayArn": _gateway_arn(gatewayIdentifier),
+        "workloadIdentityDetails": {
+            "workloadIdentityArn": f"{_GATEWAY_WORKLOAD_IDENTITY_PREFIX}"
+            f"{gatewayIdentifier}-wi"
+        },
+    }
+
+
+def _workload_scoped_runtime(runtime_id, allowed):
+    return _vpc_runtime(
+        runtime_id,
+        authorizerConfiguration={
+            "customJWTAuthorizer": {
+                "discoveryUrl": "https://example.com/.well-known/openid-configuration",
+                "allowedWorkloadConfiguration": allowed,
+            }
+        },
+    )
+
+
+def _hosting(*gateway_ids):
+    return {"hostingEnvironments": [{"arn": _gateway_arn(g)} for g in gateway_ids]}
+
+
 class TestAC47RuntimeInvocationPath:
     """AC-47: which callers and which network paths reach a runtime."""
 
@@ -25804,8 +26178,8 @@ class TestAC47RuntimeInvocationPath:
     @pytest.mark.parametrize(
         "allowed",
         [
-            {"hostingEnvironments": ["arn:aws:bedrock-agentcore:us-east-1::gw/g"]},
-            {"workloadIdentities": ["arn:aws:bedrock-agentcore:us-east-1::wi/w"]},
+            {"hostingEnvironments": [{"arn": _gateway_arn("gw-1")}]},
+            {"workloadIdentities": ["gw-1-wi"]},
         ],
         ids=["hosting-environments", "workload-identities"],
     )
@@ -25813,6 +26187,10 @@ class TestAC47RuntimeInvocationPath:
     def test_an_allowed_workload_configuration_passes_the_caller_leg(
         self, mock_ac, allowed
     ):
+        # The API shape: hostingEnvironments is a list of {"arn": ...} and
+        # workloadIdentities a list of names. Either passes only when it names
+        # the gateway whose target routes to the runtime.
+        _wire_fronting_gateways(mock_ac, {"gw-1": [_runtime_target("rt-1")]})
         self._wire(
             mock_ac,
             authorizerConfiguration={
@@ -25975,11 +26353,12 @@ class TestAC47RuntimeInvocationPath:
             authorizerConfiguration={
                 "customJWTAuthorizer": {
                     "allowedWorkloadConfiguration": {
-                        "hostingEnvironments": ["arn:aws:bedrock-agentcore:::gw/g"]
+                        "hostingEnvironments": [{"arn": _gateway_arn("gw-1")}]
                     }
                 }
             },
         )
+        _wire_fronting_gateways(mock_ac, {"gw-1": [_runtime_target("rt-scoped")]})
         _wire_runtimes(
             mock_ac,
             [(open_summary, open_runtime), (scoped_summary, scoped_runtime)],
@@ -26013,6 +26392,223 @@ class TestAC47RuntimeInvocationPath:
         ]
         assert set(allowed.members) == {"hostingEnvironments", "workloadIdentities"}
         assert "GetResourcePolicy" in model.operation_names
+
+
+class TestAC47FrontingGateway:
+    """AC-47 credits allowedWorkloadConfiguration only when it admits the gateway
+    whose target routes to the runtime, and nothing else."""
+
+    def _callers(self, mock_ac, runtimes, reverse=False):
+        _wire_runtimes(mock_ac, runtimes[::-1] if reverse else runtimes)
+        mock_ac.get_resource_policy.return_value = {"policy": ""}
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        return {
+            finding["Finding_Details"].split("'", 2)[1]: finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime Caller")
+        }
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_passes_only_on_its_own_fronting_gateway(
+        self, mock_ac, reverse
+    ):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_mcp_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwa")),
+                _workload_scoped_runtime("rt-b", {"workloadIdentities": ["gwb-wi"]}),
+            ],
+            reverse,
+        )
+
+        assert callers["rt-a"]["Status"] == "Passed"
+        assert "admits only gateway 'gwa' (gwa)" in callers["rt-a"]["Finding_Details"]
+        assert callers["rt-b"]["Status"] == "Passed"
+        assert "admits only gateway 'gwb' (gwb)" in callers["rt-b"]["Finding_Details"]
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_that_fronts_another_runtime_fails(self, mock_ac, reverse):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwb")),
+                _workload_scoped_runtime("rt-b", {"workloadIdentities": ["gwa-wi"]}),
+            ],
+            reverse,
+        )
+
+        for runtime_id, gateway_id in (("rt-a", "gwa"), ("rt-b", "gwb")):
+            finding = callers[runtime_id]
+            assert finding["Status"] == "Failed"
+            assert finding["Severity"] == "High"
+            assert (
+                f"admits none of gateway '{gateway_id}' ({gateway_id})"
+                in finding["Finding_Details"]
+            )
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_workload_beside_the_fronting_gateway_fails(self, mock_ac, reverse):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime(
+                    "rt-a",
+                    {**_hosting("gwa", "gwb"), "workloadIdentities": ["agent-wi"]},
+                ),
+                _workload_scoped_runtime("rt-b", _hosting("gwb")),
+            ],
+            reverse,
+        )
+
+        details = callers["rt-a"]["Finding_Details"]
+        assert callers["rt-a"]["Status"] == "Failed"
+        assert f"also admits {_gateway_arn('gwb')}, agent-wi" in details
+        assert callers["rt-b"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [
+            {"hostingEnvironments": [{"arn": _gateway_arn("*")}]},
+            {**_hosting("gwa"), "hostingEnvironments": [{"arn": _gateway_arn("gw?")}]},
+            {**_hosting("gwa"), "workloadIdentities": ["*"]},
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_allowed_workload_fails(self, mock_ac, allowed):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", allowed),
+                _workload_scoped_runtime("rt-b", _hosting("gwb")),
+            ],
+        )
+
+        assert callers["rt-a"]["Status"] == "Failed"
+        assert "wildcard" in callers["rt-a"]["Finding_Details"]
+        assert callers["rt-b"]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_no_gateway_routes_to_is_na(self, mock_ac):
+        _wire_fronting_gateways(mock_ac, {"gwa": [_runtime_target("rt-b")]})
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwa")),
+                _workload_scoped_runtime("rt-b", _hosting("gwa")),
+            ],
+        )
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert (
+            "no gateway target in this region routes to it"
+            in callers["rt-a"]["Finding_Details"]
+        )
+        assert callers["rt-b"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "operation, action",
+        [
+            ("list_gateways", "ListGateways"),
+            ("list_gateway_targets", "ListGatewayTargets"),
+            ("get_gateway_target", "GetGatewayTarget"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_gateway_leaves_the_fronting_gateway_undetermined(
+        self, mock_ac, operation, action
+    ):
+        _wire_fronting_gateways(mock_ac, {"gwa": [_runtime_target("rt-a")]})
+        getattr(mock_ac, operation).side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        callers = self._callers(
+            mock_ac, [_workload_scoped_runtime("rt-a", _hosting("gwa"))]
+        )
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert f"bedrock-agentcore:{action}" in callers["rt-a"]["Finding_Details"]
+        assert (
+            "no fronting gateway could be determined"
+            in (callers["rt-a"]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [
+            {**_hosting("gwa"), "workloadIdentities": ["gwb-wi"]},
+            {"workloadIdentities": ["gwb-wi"]},
+        ],
+        ids=["beside-the-fronting-gateway", "alone"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_extra_workload_with_a_gateway_unread_is_na(self, mock_ac, allowed):
+        # gwb routes to rt-a too, but GetGateway on it is denied, so gwb-wi may
+        # be its identity: neither a pass nor a fail can be claimed.
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-a")]},
+        )
+        read_gateway = mock_ac.get_gateway.side_effect
+
+        def get_gateway(gatewayIdentifier):
+            if gatewayIdentifier == "gwb":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return read_gateway(gatewayIdentifier)
+
+        mock_ac.get_gateway.side_effect = get_gateway
+
+        callers = self._callers(
+            mock_ac,
+            [_workload_scoped_runtime("rt-a", allowed)],
+        )
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert (
+            "bedrock-agentcore:GetGateway on gwb" in callers["rt-a"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_gateway_reads_are_made_once_per_region(self, mock_ac):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwa")),
+                _workload_scoped_runtime("rt-b", _hosting("gwb")),
+            ],
+        )
+
+        mock_ac.list_gateways.assert_called_once()
+        assert mock_ac.get_gateway.call_count == 2
 
 
 # The runtime invoke actions, written out from the bedrock-agentcore service
@@ -41527,8 +42123,14 @@ class TestAC06RecordingReaders:
         ],
         ids=["conditioned", "other-prefix", "other-action"],
     )
+    @patch("agentcore_app.organizations_client")
     @patch("agentcore_app.s3_client")
-    def test_a_grant_that_does_not_open_the_prefix_passes(self, mock_s3, statement):
+    def test_a_grant_that_does_not_open_the_prefix_passes(
+        self, mock_s3, mock_orgs, statement
+    ):
+        # o-1 is this account's organization, so the PrincipalOrgID grant stays
+        # inside it.
+        mock_orgs.describe_organization.return_value = {"Organization": {"Id": "o-1"}}
         _wire_recording_bucket(mock_s3, statements=[_plaintext_deny(), statement])
 
         finding = _record(_browser_inventory(_recorded_browser()))[0]
