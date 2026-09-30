@@ -857,7 +857,10 @@ AI_SUBJECT_ROWS = [
         "bedrock-agentcore:GatewayAuthorizerType is CUSTOM_JWT, with one statement "
         "reaching every gateway firing on AWS_IAM, AUTHENTICATE_ONLY and NONE, "
         "because none of the three carries a validated end user and AC-28's Deny on "
-        "NONE leaves the other two open. The Organizations grants are shared with "
+        "NONE leaves the other two open, and on a type the key does not list, while "
+        "not firing on CUSTOM_JWT. StringNotEquals CUSTOM_JWT passes; a deny-list of "
+        "the three fails, because it does not deny a type the key does not "
+        "enumerate. The Organizations grants are shared with "
         "GW-02's AC-28, so ID-04 costs no further permission",
         [],
         4,
