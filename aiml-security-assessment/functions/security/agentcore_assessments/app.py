@@ -16,7 +16,7 @@ import re
 import time
 from fnmatch import fnmatchcase
 from io import StringIO
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from botocore.config import Config
@@ -26885,6 +26885,192 @@ def _open_actions_text(open_actions: List[str]) -> str:
     )
 
 
+# A gateway target reaches a runtime through an http agentcoreRuntime target, or
+# through an MCP server or passthrough endpoint at the runtime's invocation URL,
+# whose path carries the URL-encoded runtime ARN.
+AGENTCORE_RUNTIME_INVOCATION_PATH = re.compile(r"/runtimes/([^/?#]+)/invocations")
+
+
+def _gateway_target_runtime_arns(detail: Dict[str, Any]) -> Set[str]:
+    """Return the runtime ARNs one gateway target routes to."""
+    configuration = detail.get("targetConfiguration") or {}
+    http = configuration.get("http") or {}
+    arns = set()
+    runtime_arn = (http.get("agentcoreRuntime") or {}).get("arn")
+    if runtime_arn:
+        arns.add(str(runtime_arn))
+    for endpoint in (
+        ((configuration.get("mcp") or {}).get("mcpServer") or {}).get("endpoint"),
+        (http.get("passthrough") or {}).get("endpoint"),
+    ):
+        match = AGENTCORE_RUNTIME_INVOCATION_PATH.search(str(endpoint or ""))
+        if match:
+            arns.add(unquote(match.group(1)))
+    return arns
+
+
+def _runtime_fronting_gateways() -> Tuple[Dict[str, List[Dict[str, str]]], List[str]]:
+    """Map each runtime ARN to the gateways with a target that routes to it.
+
+    Each gateway is its ARN, a label and the name of the workload identity
+    GetGateway reports in workloadIdentityDetails. The second list names each
+    read that failed, by action, since a gateway that was not read may front
+    any runtime.
+    """
+    fronting: Dict[str, List[Dict[str, str]]] = {}
+    unread: List[str] = []
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return {}, [
+            f"bedrock-agentcore:ListGateways ({_assessment_error_label(error)})"
+        ]
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId") or "unknown"
+        try:
+            targets = _agentcore_list_all(
+                "list_gateway_targets",
+                ["items", "targets"],
+                gatewayIdentifier=gateway_id,
+            )
+        except Exception as error:
+            unread.append(
+                f"bedrock-agentcore:ListGatewayTargets on {gateway_id} "
+                f"({_assessment_error_label(error)})"
+            )
+            continue
+        runtime_arns: Set[str] = set()
+        for target in targets:
+            target_id = target.get("targetId")
+            if not target_id:
+                continue
+            try:
+                runtime_arns |= _gateway_target_runtime_arns(
+                    agentcore_client.get_gateway_target(
+                        gatewayIdentifier=gateway_id, targetId=target_id
+                    )
+                )
+            except Exception as error:
+                unread.append(
+                    f"bedrock-agentcore:GetGatewayTarget on {gateway_id} target "
+                    f"{target_id} ({_assessment_error_label(error)})"
+                )
+        if not runtime_arns:
+            continue
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except Exception as error:
+            unread.append(
+                f"bedrock-agentcore:GetGateway on {gateway_id} "
+                f"({_assessment_error_label(error)})"
+            )
+            continue
+        identity = str(
+            (detail.get("workloadIdentityDetails") or {}).get("workloadIdentityArn")
+            or ""
+        )
+        entry = {
+            "arn": str(detail.get("gatewayArn") or gateway.get("gatewayArn") or ""),
+            "label": f"gateway '{gateway.get('name') or gateway_id}' ({gateway_id})",
+            "identity": identity.rsplit("/", 1)[-1] if identity else "",
+        }
+        for runtime_arn in runtime_arns:
+            fronting.setdefault(runtime_arn, []).append(entry)
+    return fronting, unread
+
+
+def _allowed_workload_verdict(
+    allowed: Dict[str, Any],
+    runtime_arn: str,
+    fronting: Dict[str, List[Dict[str, str]]],
+    unread: List[str],
+) -> Tuple[str, str]:
+    """Compare a runtime's allowedWorkloadConfiguration with its fronting gateways.
+
+    Returns ("passed" | "failed" | "na", text). A hosting environment names a
+    gateway by ARN and a workload identity names the identity a gateway runs
+    as. The configuration passes only when it admits a gateway with a target
+    routing to this runtime and admits nothing else: a wildcard, or a workload
+    that is no fronting gateway, can invoke the runtime without passing through
+    the gateway.
+    """
+    environments = [
+        str(entry.get("arn") or "") if isinstance(entry, dict) else str(entry)
+        for entry in allowed.get("hostingEnvironments") or []
+    ]
+    identities = [str(name) for name in allowed.get("workloadIdentities") or []]
+    wildcards = [
+        value for value in environments + identities if "*" in value or "?" in value
+    ]
+    if wildcards:
+        return "failed", (
+            "has an allowedWorkloadConfiguration naming the wildcard value(s) "
+            f"{', '.join(wildcards)}, so it admits workloads other than the "
+            "gateway in front of it"
+        )
+    gateways = fronting.get(runtime_arn) or []
+    if not gateways:
+        if unread:
+            return "na", (
+                "has an allowedWorkloadConfiguration, but no fronting gateway "
+                f"could be determined, because {'; '.join(unread)} could not be "
+                "read"
+            )
+        return "na", (
+            "has an allowedWorkloadConfiguration, but no gateway target in this "
+            "region routes to it, so no fronting gateway was determined to "
+            "compare it with"
+        )
+    labels = ", ".join(gateway["label"] for gateway in gateways)
+    admitted = [
+        gateway["label"]
+        for gateway in gateways
+        if gateway["arn"] in environments
+        or (gateway["identity"] and gateway["identity"] in identities)
+    ]
+    extras = [
+        value
+        for value in environments
+        if value not in {gateway["arn"] for gateway in gateways}
+    ] + [
+        value
+        for value in identities
+        if value not in {gateway["identity"] for gateway in gateways}
+    ]
+    if extras and unread:
+        return "na", (
+            "has an allowedWorkloadConfiguration that admits "
+            f"{', '.join(extras)}, which is none of {labels} but may be a "
+            f"gateway that was not read: {'; '.join(unread)}"
+        )
+    if not admitted:
+        return "failed", (
+            "has an allowedWorkloadConfiguration that admits none of "
+            f"{labels}, the gateway(s) in this region with a target routing "
+            "to it, so the workloads it names invoke the agent without passing "
+            "through that gateway"
+        )
+    if extras:
+        return "failed", (
+            "has an allowedWorkloadConfiguration that admits "
+            f"{', '.join(admitted)} but also admits {', '.join(extras)}, which "
+            "is no gateway in this region with a target routing to it, so that "
+            "workload invokes the agent without passing through the gateway"
+        )
+    refused = [
+        gateway["label"] for gateway in gateways if gateway["label"] not in admitted
+    ]
+    return "passed", (
+        f"an allowedWorkloadConfiguration that admits only {', '.join(admitted)}, "
+        "the gateway(s) with a target routing to it"
+        + (
+            f" ({', '.join(refused)} also routes to it and is not admitted)"
+            if refused
+            else ""
+        )
+    )
+
+
 def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
     """AC-47: Judge the network path and the caller allowed to invoke a runtime.
 
@@ -26898,7 +27084,9 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
     allowedWorkloadConfiguration is the service's own answer for the caller leg.
     The API documents it as restricting "which workloads in the request's
     identity chain are allowed to invoke the target", supported for AgentCore
-    Runtime targets, where "the allowed workloads are AgentCore Gateways".
+    Runtime targets, where "the allowed workloads are AgentCore Gateways". It
+    is credited only when it admits the gateway whose target routes to the
+    runtime and nothing else, and is N/A when no such gateway is found.
     """
     if agentcore_client is None:
         return [
@@ -26939,6 +27127,7 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
         ]
 
     findings = []
+    fronting: Optional[Tuple[Dict[str, List[Dict[str, str]]], List[str]]] = None
     for runtime in runtimes:
         runtime_id = runtime.get("agentRuntimeId", "unknown")
         runtime_name = runtime.get("agentRuntimeName", runtime_id)
@@ -27093,14 +27282,17 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
         ) or {}
         allowed_workload = jwt_authorizer.get("allowedWorkloadConfiguration") or {}
         restrictions = []
-        hosting_environments = allowed_workload.get("hostingEnvironments") or []
-        workload_identities = allowed_workload.get("workloadIdentities") or []
-        if hosting_environments or workload_identities:
-            restrictions.append(
-                "an allowedWorkloadConfiguration naming "
-                f"{len(hosting_environments)} hosting environment(s) and "
-                f"{len(workload_identities)} workload identity(ies)"
+        workload_verdict, workload_text = "", ""
+        if allowed_workload.get("hostingEnvironments") or allowed_workload.get(
+            "workloadIdentities"
+        ):
+            if fronting is None:
+                fronting = _runtime_fronting_gateways()
+            workload_verdict, workload_text = _allowed_workload_verdict(
+                allowed_workload, str(runtime_arn or ""), *fronting
             )
+            if workload_verdict == "passed":
+                restrictions.append(workload_text)
 
         caller_keys, caller_gaps, caller_open = _runtime_invoke_restriction(
             statements,
@@ -27117,14 +27309,37 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                 "every principal outside a bounded aws:PrincipalArn list"
             )
 
-        if restrictions:
+        if workload_verdict == "failed":
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Caller Unrestricted",
+                    finding_details=f"{label} {workload_text}.",
+                    resolution=(
+                        "Set allowedWorkloadConfiguration on the runtime's JWT "
+                        "authorizer to the hosting environment ARN or workload "
+                        "identity of the gateway whose target routes to this "
+                        "runtime, and to nothing else."
+                    ),
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif restrictions:
+            workload_note = (
+                f" Its allowedWorkloadConfiguration was not credited: {label} "
+                f"{workload_text}."
+                if workload_verdict == "na"
+                else ""
+            )
             findings.append(
                 create_finding(
                     check_id="AC-47",
                     finding_name="AgentCore Runtime Caller Scope",
                     finding_details=(
                         f"{label} restricts who may invoke it through "
-                        f"{' and '.join(restrictions)}."
+                        f"{' and '.join(restrictions)}.{workload_note}"
                     ),
                     resolution=(
                         "No action required. Confirm the named workloads or "
@@ -27134,6 +27349,27 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                     reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.PASSED,
+                )
+            )
+        elif workload_verdict == "na":
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Caller Scope",
+                    finding_details=(
+                        f"{label} {workload_text}, so the caller leg is not "
+                        "reported as restricted."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:ListGateways, ListGatewayTargets, "
+                        "GetGatewayTarget and GetGateway and retry."
+                        if fronting and fronting[1]
+                        else "Confirm which gateway fronts this runtime: no "
+                        "gateway target in this region routes to it."
+                    ),
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
             )
         else:

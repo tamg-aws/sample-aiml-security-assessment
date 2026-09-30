@@ -311,6 +311,18 @@ section.
   fails. An unread bucket policy stays `N/A` naming `s3:GetBucketPolicy`.
   Statements naming a service principal and object ACLs are not judged, and
   the Passed row says so. No new IAM action.
+- `AC-47` credits a runtime's `allowedWorkloadConfiguration` only when it
+  admits the gateway in front of the runtime. Any non-empty configuration
+  passed the caller leg, so one naming an unrelated workload, or a wildcard,
+  read as restricted. The check now finds the gateways in the region with a
+  target routing to the runtime (an `http.agentcoreRuntime` target, or an MCP
+  or passthrough endpoint at the runtime's invocation URL) and compares their
+  ARNs and workload identities with the configuration. It fails when the
+  configuration admits none of them, admits another workload beside them, or
+  holds a wildcard. It is `N/A`, and says why, when no gateway target routes
+  to the runtime or a gateway read is denied, naming the action. A `Deny` on
+  `aws:PrincipalArn` still passes the caller leg on its own. No new IAM
+  action.
 
 - `AC-33` adds an `AgentCore Runtime Invocation By User ID` row. ID-10
   asks for an explicit Deny on `InvokeAgentRuntimeForUser` as well as

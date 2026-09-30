@@ -25618,6 +25618,80 @@ class TestAC46CapacityProvider:
         mock_ac.get_capacity_provider.assert_called_once_with(capacityProviderId="cp-1")
 
 
+_GATEWAY_WORKLOAD_IDENTITY_PREFIX = (
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+    "workload-identity-directory/default/workload-identity/"
+)
+
+
+def _gateway_arn(gateway_id):
+    return f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{gateway_id}"
+
+
+def _runtime_target(runtime_id):
+    return {"http": {"agentcoreRuntime": {"arn": _runtime_arn(runtime_id)}}}
+
+
+def _mcp_runtime_target(runtime_id):
+    encoded = _runtime_arn(runtime_id).replace(":", "%3A").replace("/", "%2F")
+    return {
+        "mcp": {
+            "mcpServer": {
+                "endpoint": (
+                    "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/"
+                    f"{encoded}/invocations?qualifier=DEFAULT"
+                )
+            }
+        }
+    }
+
+
+def _wire_fronting_gateways(mock_ac, gateways):
+    """Stub every gateway read from {gateway id: [target configuration, ...]}.
+
+    Gateway `g` runs as workload identity `g-wi`.
+    """
+    mock_ac.list_gateways.return_value = {
+        "items": [
+            {"gatewayId": gateway_id, "name": gateway_id} for gateway_id in gateways
+        ]
+    }
+    mock_ac.list_gateway_targets.side_effect = lambda gatewayIdentifier: {
+        "items": [
+            {"targetId": f"{gatewayIdentifier}.{index}"}
+            for index in range(len(gateways[gatewayIdentifier]))
+        ]
+    }
+    mock_ac.get_gateway_target.side_effect = lambda gatewayIdentifier, targetId: {
+        "targetConfiguration": gateways[gatewayIdentifier][
+            int(targetId.rsplit(".", 1)[1])
+        ]
+    }
+    mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+        "gatewayArn": _gateway_arn(gatewayIdentifier),
+        "workloadIdentityDetails": {
+            "workloadIdentityArn": f"{_GATEWAY_WORKLOAD_IDENTITY_PREFIX}"
+            f"{gatewayIdentifier}-wi"
+        },
+    }
+
+
+def _workload_scoped_runtime(runtime_id, allowed):
+    return _vpc_runtime(
+        runtime_id,
+        authorizerConfiguration={
+            "customJWTAuthorizer": {
+                "discoveryUrl": "https://example.com/.well-known/openid-configuration",
+                "allowedWorkloadConfiguration": allowed,
+            }
+        },
+    )
+
+
+def _hosting(*gateway_ids):
+    return {"hostingEnvironments": [{"arn": _gateway_arn(g)} for g in gateway_ids]}
+
+
 class TestAC47RuntimeInvocationPath:
     """AC-47: which callers and which network paths reach a runtime."""
 
@@ -25749,8 +25823,8 @@ class TestAC47RuntimeInvocationPath:
     @pytest.mark.parametrize(
         "allowed",
         [
-            {"hostingEnvironments": ["arn:aws:bedrock-agentcore:us-east-1::gw/g"]},
-            {"workloadIdentities": ["arn:aws:bedrock-agentcore:us-east-1::wi/w"]},
+            {"hostingEnvironments": [{"arn": _gateway_arn("gw-1")}]},
+            {"workloadIdentities": ["gw-1-wi"]},
         ],
         ids=["hosting-environments", "workload-identities"],
     )
@@ -25758,6 +25832,10 @@ class TestAC47RuntimeInvocationPath:
     def test_an_allowed_workload_configuration_passes_the_caller_leg(
         self, mock_ac, allowed
     ):
+        # The API shape: hostingEnvironments is a list of {"arn": ...} and
+        # workloadIdentities a list of names. Either passes only when it names
+        # the gateway whose target routes to the runtime.
+        _wire_fronting_gateways(mock_ac, {"gw-1": [_runtime_target("rt-1")]})
         self._wire(
             mock_ac,
             authorizerConfiguration={
@@ -25920,11 +25998,12 @@ class TestAC47RuntimeInvocationPath:
             authorizerConfiguration={
                 "customJWTAuthorizer": {
                     "allowedWorkloadConfiguration": {
-                        "hostingEnvironments": ["arn:aws:bedrock-agentcore:::gw/g"]
+                        "hostingEnvironments": [{"arn": _gateway_arn("gw-1")}]
                     }
                 }
             },
         )
+        _wire_fronting_gateways(mock_ac, {"gw-1": [_runtime_target("rt-scoped")]})
         _wire_runtimes(
             mock_ac,
             [(open_summary, open_runtime), (scoped_summary, scoped_runtime)],
@@ -25958,6 +26037,223 @@ class TestAC47RuntimeInvocationPath:
         ]
         assert set(allowed.members) == {"hostingEnvironments", "workloadIdentities"}
         assert "GetResourcePolicy" in model.operation_names
+
+
+class TestAC47FrontingGateway:
+    """AC-47 credits allowedWorkloadConfiguration only when it admits the gateway
+    whose target routes to the runtime, and nothing else."""
+
+    def _callers(self, mock_ac, runtimes, reverse=False):
+        _wire_runtimes(mock_ac, runtimes[::-1] if reverse else runtimes)
+        mock_ac.get_resource_policy.return_value = {"policy": ""}
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        return {
+            finding["Finding_Details"].split("'", 2)[1]: finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime Caller")
+        }
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_passes_only_on_its_own_fronting_gateway(
+        self, mock_ac, reverse
+    ):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_mcp_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwa")),
+                _workload_scoped_runtime("rt-b", {"workloadIdentities": ["gwb-wi"]}),
+            ],
+            reverse,
+        )
+
+        assert callers["rt-a"]["Status"] == "Passed"
+        assert "admits only gateway 'gwa' (gwa)" in callers["rt-a"]["Finding_Details"]
+        assert callers["rt-b"]["Status"] == "Passed"
+        assert "admits only gateway 'gwb' (gwb)" in callers["rt-b"]["Finding_Details"]
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_that_fronts_another_runtime_fails(self, mock_ac, reverse):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwb")),
+                _workload_scoped_runtime("rt-b", {"workloadIdentities": ["gwa-wi"]}),
+            ],
+            reverse,
+        )
+
+        for runtime_id, gateway_id in (("rt-a", "gwa"), ("rt-b", "gwb")):
+            finding = callers[runtime_id]
+            assert finding["Status"] == "Failed"
+            assert finding["Severity"] == "High"
+            assert (
+                f"admits none of gateway '{gateway_id}' ({gateway_id})"
+                in finding["Finding_Details"]
+            )
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_workload_beside_the_fronting_gateway_fails(self, mock_ac, reverse):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime(
+                    "rt-a",
+                    {**_hosting("gwa", "gwb"), "workloadIdentities": ["agent-wi"]},
+                ),
+                _workload_scoped_runtime("rt-b", _hosting("gwb")),
+            ],
+            reverse,
+        )
+
+        details = callers["rt-a"]["Finding_Details"]
+        assert callers["rt-a"]["Status"] == "Failed"
+        assert f"also admits {_gateway_arn('gwb')}, agent-wi" in details
+        assert callers["rt-b"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [
+            {"hostingEnvironments": [{"arn": _gateway_arn("*")}]},
+            {**_hosting("gwa"), "hostingEnvironments": [{"arn": _gateway_arn("gw?")}]},
+            {**_hosting("gwa"), "workloadIdentities": ["*"]},
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_allowed_workload_fails(self, mock_ac, allowed):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", allowed),
+                _workload_scoped_runtime("rt-b", _hosting("gwb")),
+            ],
+        )
+
+        assert callers["rt-a"]["Status"] == "Failed"
+        assert "wildcard" in callers["rt-a"]["Finding_Details"]
+        assert callers["rt-b"]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_no_gateway_routes_to_is_na(self, mock_ac):
+        _wire_fronting_gateways(mock_ac, {"gwa": [_runtime_target("rt-b")]})
+
+        callers = self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwa")),
+                _workload_scoped_runtime("rt-b", _hosting("gwa")),
+            ],
+        )
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert (
+            "no gateway target in this region routes to it"
+            in callers["rt-a"]["Finding_Details"]
+        )
+        assert callers["rt-b"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "operation, action",
+        [
+            ("list_gateways", "ListGateways"),
+            ("list_gateway_targets", "ListGatewayTargets"),
+            ("get_gateway_target", "GetGatewayTarget"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_gateway_leaves_the_fronting_gateway_undetermined(
+        self, mock_ac, operation, action
+    ):
+        _wire_fronting_gateways(mock_ac, {"gwa": [_runtime_target("rt-a")]})
+        getattr(mock_ac, operation).side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        callers = self._callers(
+            mock_ac, [_workload_scoped_runtime("rt-a", _hosting("gwa"))]
+        )
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert f"bedrock-agentcore:{action}" in callers["rt-a"]["Finding_Details"]
+        assert (
+            "no fronting gateway could be determined"
+            in (callers["rt-a"]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [
+            {**_hosting("gwa"), "workloadIdentities": ["gwb-wi"]},
+            {"workloadIdentities": ["gwb-wi"]},
+        ],
+        ids=["beside-the-fronting-gateway", "alone"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_extra_workload_with_a_gateway_unread_is_na(self, mock_ac, allowed):
+        # gwb routes to rt-a too, but GetGateway on it is denied, so gwb-wi may
+        # be its identity: neither a pass nor a fail can be claimed.
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-a")]},
+        )
+        read_gateway = mock_ac.get_gateway.side_effect
+
+        def get_gateway(gatewayIdentifier):
+            if gatewayIdentifier == "gwb":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return read_gateway(gatewayIdentifier)
+
+        mock_ac.get_gateway.side_effect = get_gateway
+
+        callers = self._callers(
+            mock_ac,
+            [_workload_scoped_runtime("rt-a", allowed)],
+        )
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert (
+            "bedrock-agentcore:GetGateway on gwb" in callers["rt-a"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_gateway_reads_are_made_once_per_region(self, mock_ac):
+        _wire_fronting_gateways(
+            mock_ac,
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        self._callers(
+            mock_ac,
+            [
+                _workload_scoped_runtime("rt-a", _hosting("gwa")),
+                _workload_scoped_runtime("rt-b", _hosting("gwb")),
+            ],
+        )
+
+        mock_ac.list_gateways.assert_called_once()
+        assert mock_ac.get_gateway.call_count == 2
 
 
 # The runtime invoke actions, written out from the bedrock-agentcore service
