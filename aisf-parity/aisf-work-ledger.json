@@ -1416,7 +1416,7 @@
       "incumbent_names": [
         "AgentCore Runtime Authorizer Guardrail"
       ],
-      "gap": "AC-29 requires a service control policy that denies both CreateAgentRuntime and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode that authenticates the hosting application's shared role instead of the end user. IfExists operators read as their plain form. The policy counts only when it is attached to the assessed account, to an organizational unit above it or to the root, read with organizations:ListParents and organizations:ListTargetsForPolicy: a guard attached elsewhere fails as Unattached, the management account fails as Not Enforced because no SCP restricts it, and an unreadable parent chain or attachment list is N/A. A policy written the other way round, denying CUSTOM_JWT, is reported separately when it is attached, because it reads as configured to anyone counting policies. The Organizations grants are shared with GW-02's AC-28, so ID-04 costs no further permission",
+      "gap": "AC-29 requires a service control policy that denies both CreateAgentRuntime and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode that authenticates the hosting application's shared role instead of the end user. IfExists operators read as their plain form. The policy counts only when it is attached to the assessed account, to an organizational unit above it or to the root, read with organizations:ListParents and organizations:ListTargetsForPolicy: a guard attached elsewhere fails as Unattached, the management account fails as Not Enforced because no SCP restricts it, and an unreadable parent chain or attachment list is N/A. A policy written the other way round, denying CUSTOM_JWT, is reported separately when it is attached, because it reads as configured to anyone counting policies. A gateway leg on AC-29 requires an attached SCP that denies CreateGateway and UpdateGateway unless bedrock-agentcore:GatewayAuthorizerType is CUSTOM_JWT, with one statement reaching every gateway firing on AWS_IAM, AUTHENTICATE_ONLY and NONE, because none of the three carries a validated end user and AC-28's Deny on NONE leaves the other two open. The Organizations grants are shared with GW-02's AC-28, so ID-04 costs no further permission",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1434,12 +1434,14 @@
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-30"
+        "AC-30",
+        "AC-31"
       ],
       "incumbent_names": [
-        "AgentCore Runtime Inbound Authorization"
+        "AgentCore Runtime Inbound Authorization",
+        "AgentCore Gateway Inbound Allow Lists"
       ],
-      "gap": "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that pins neither allowedAudience nor allowedClients accepts every token its issuer minted for every application registered there, so the claims are validated but not against this agent. A list holding a blank or * value names no single application and does not count, and a discoveryUrl that is not https fails as Issuer Not HTTPS whatever the lists hold. allowedScopes and customClaims are credited in the detail and cannot substitute, because a scope bounds what a token may ask for and not who it was minted for. AC-30 reads the runtime version GetAgentRuntime returns by default, and its Passed text says so",
+      "gap": "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that pins neither allowedAudience nor allowedClients accepts every token its issuer minted for every application registered there, so the claims are validated but not against this agent. A list holding a blank or * value names no single application and does not count, and a discoveryUrl that is not https fails as Issuer Not HTTPS whatever the lists hold. allowedScopes and customClaims are credited in the detail and cannot substitute, because a scope bounds what a token may ask for and not who it was minted for. AC-30 reads the version GetAgentRuntime returns by default and each other version an endpoint serves, on its own row. AC-31 asks the same of each gateway CUSTOM_JWT authorizer's allow-lists",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1464,7 +1466,7 @@
         "AgentCore Gateway Inbound Allow Lists",
         "AgentCore Inbound JWT Issuer Conditions"
       ],
-      "gap": "AC-31 reads each gateway JWT authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor allowedClients, because it then honours any token its issuer minted for any application registered there; a list holding a blank or * value does not count, and a discoveryUrl that is not https fails. allowedScopes and customClaims bound what a token may ask for and not who minted it for whom, so they are credited but do not substitute. AC-32 covers the second door, where the token-exchange APIs take an end user's JWT without passing a gateway authorizer at all, and fails a cached principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth unless every InboundJwtClaim/iss value is a literal or a pattern narrower than *. A bare Action \"*\" and group policies count, a grant the principal's own Deny or boundary removes does not, and a principal the IAM cache could not read is N/A",
+      "gap": "AC-31 reads each gateway JWT authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor allowedClients, because it then honours any token its issuer minted for any application registered there; a list holding a blank or * value does not count, and a discoveryUrl that is not https fails. allowedScopes and customClaims bound what a token may ask for and not who minted it for whom, so they are credited but do not substitute. AC-32 covers the second door, where the token-exchange APIs take an end user's JWT without passing a gateway authorizer at all, and fails a cached principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth unless every InboundJwtClaim/iss value is a literal or a pattern narrower than *. A bare Action \"*\" and group policies count, a grant the principal's own Deny or boundary removes does not, and a principal the IAM cache could not read is N/A. The gateway's third, preventive layer, an SCP denying CreateGateway and UpdateGateway with StringNotEquals on bedrock-agentcore:DiscoveryUrl, is not judged",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",

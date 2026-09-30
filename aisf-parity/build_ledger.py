@@ -846,8 +846,13 @@ AI_SUBJECT_ROWS = [
         "restricts it, and an unreadable parent chain or attachment list is N/A. A "
         "policy written the other way round, denying CUSTOM_JWT, is reported "
         "separately when it is attached, because it reads as configured to anyone "
-        "counting policies. The Organizations grants are shared with GW-02's AC-28, so "
-        "ID-04 costs no further permission",
+        "counting policies. A gateway leg on AC-29 requires an attached SCP that "
+        "denies CreateGateway and UpdateGateway unless "
+        "bedrock-agentcore:GatewayAuthorizerType is CUSTOM_JWT, with one statement "
+        "reaching every gateway firing on AWS_IAM, AUTHENTICATE_ONLY and NONE, "
+        "because none of the three carries a validated end user and AC-28's Deny on "
+        "NONE leaves the other two open. The Organizations grants are shared with "
+        "GW-02's AC-28, so ID-04 costs no further permission",
         [],
         4,
     ),
@@ -856,7 +861,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-30"],
+        ["AC-30", "AC-31"],
         "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent "
         "configuration means every invoke is SigV4-signed, and a customJWTAuthorizer "
         "that pins neither allowedAudience nor allowedClients accepts every token its "
@@ -866,8 +871,9 @@ AI_SUBJECT_ROWS = [
         "https fails as Issuer Not HTTPS whatever the lists hold. allowedScopes and "
         "customClaims are credited in the detail and cannot substitute, because a "
         "scope bounds what a token may ask for and not who it was minted for. AC-30 "
-        "reads the runtime version GetAgentRuntime returns by default, and its Passed "
-        "text says so",
+        "reads the version GetAgentRuntime returns by default and each other version "
+        "an endpoint serves, on its own row. AC-31 asks the same of each gateway "
+        "CUSTOM_JWT authorizer's allow-lists",
         [],
         4,
     ),
@@ -889,7 +895,9 @@ AI_SUBJECT_ROWS = [
         "unless every InboundJwtClaim/iss value is a literal or a pattern narrower "
         'than *. A bare Action "*" and group policies count, a grant the principal\'s '
         "own Deny or boundary removes does not, and a principal the IAM cache could "
-        "not read is N/A",
+        "not read is N/A. The gateway's third, preventive layer, an SCP denying "
+        "CreateGateway and UpdateGateway with StringNotEquals on "
+        "bedrock-agentcore:DiscoveryUrl, is not judged",
         [],
         4,
     ),
