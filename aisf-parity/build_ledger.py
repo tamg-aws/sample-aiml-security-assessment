@@ -357,7 +357,10 @@ AI_SUBJECT_ROWS = [
         "either reaches every identity the directory holds or authorizes nothing. The "
         "role of each runtime with a custom JWT authorizer fails when it can still call "
         "GetWorkloadAccessTokenForUserId after its own Deny and boundary, and an uncached "
-        "role or an unread runtime is N/A. InvokeAgentRuntimeForUser is not judged",
+        "role or an unread runtime is N/A. Every cached role and user fails when an "
+        "Allow of InvokeAgentRuntimeForUser or InvokeAgentRuntimeWithWebSocketStreamForUser "
+        "reaches such a runtime or one of its endpoints and survives its own Deny and "
+        "boundary; conditions on that Allow are not read",
         [],
         4,
     ),
