@@ -21960,6 +21960,89 @@ def _guardrail_join_value(expression: str, fixed: Dict[str, Optional[bool]]) -> 
     return "unread" if "BedrockGuardrails::" in expression else "plain"
 
 
+def _guardrail_check_scp_verdict() -> Tuple[str, str]:
+    """Return how the SCPs binding the assessed account treat InvokeGuardrailChecks.
+
+    The first value is `unread` when the organization's policies could not be
+    listed, `management` in the management account, `denied` when an attached
+    policy has an unconditioned Deny reaching the action on Resource "*",
+    `conditioned` when an attached Deny reaches it only under a condition,
+    `incomplete` when a policy or its attachment could not be read, and `none`
+    otherwise. The second names the policies, or the error, behind it. The
+    action has no resource type, so a Deny naming only resource ARNs does not
+    reach it.
+    """
+    if organizations_client is None:
+        return "unread", "Organizations client not available"
+    try:
+        policies = _paginate_aws_list(
+            organizations_client,
+            "list_policies",
+            "Policies",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            Filter="SERVICE_CONTROL_POLICY",
+        )
+        account = str(
+            boto3.client("sts", config=boto3_config).get_caller_identity()["Account"]
+        )
+    except Exception as error:
+        return "unread", _assessment_error_label(error)
+    if account in {_arn_account(policy.get("Arn")) for policy in policies}:
+        return "management", account
+
+    denied: Dict[str, str] = {}
+    conditioned: Dict[str, str] = {}
+    unread: List[str] = []
+    for policy in policies:
+        name = policy.get("Name", policy.get("Id", "unknown"))
+        try:
+            detail = organizations_client.describe_policy(PolicyId=policy["Id"])
+        except Exception as error:
+            unread.append(f"{name} ({_assessment_error_label(error)})")
+            continue
+        content = (detail.get("Policy") or {}).get("Content", "")
+        for statement in _document_statements(content, effect="Deny"):
+            if not _statement_matches_action(
+                statement, GUARDRAIL_CHECK_ACTION_LOOKUP
+            ) or not _statement_resource_covers(statement, ["*"]):
+                continue
+            if statement.get("Condition"):
+                conditioned[policy["Id"]] = name
+            else:
+                denied[policy["Id"]] = name
+
+    attachment = _scp_attachment(policies, set(denied) | set(conditioned), account)
+    if attachment["chain_error"] is not None:
+        return "incomplete", (
+            "the organizational units and root above the account could not be "
+            f"read: {_assessment_error_label(attachment['chain_error'])}"
+        )
+    attached = attachment["attached"]
+    blocking = sorted(
+        f"{denied[policy_id]} (attached to {target})"
+        for policy_id, target in attached.items()
+        if policy_id in denied
+    )
+    if blocking:
+        return "denied", ", ".join(blocking)
+    limiting = sorted(
+        f"{conditioned[policy_id]} (attached to {target})"
+        for policy_id, target in attached.items()
+        if policy_id in conditioned
+    )
+    if limiting:
+        return "conditioned", ", ".join(limiting)
+    unread.extend(
+        f"the attachment targets of {denied.get(policy_id) or conditioned[policy_id]} "
+        f"({_assessment_error_label(error)})"
+        for policy_id, error in sorted(attachment["unread"].items())
+    )
+    if unread:
+        return "incomplete", "these could not be read: " + ", ".join(sorted(unread))
+    return "none", ""
+
+
 def check_agentcore_policy_guardrail_wiring(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -21981,7 +22064,11 @@ def check_agentcore_policy_guardrail_wiring(
     can make act fails, and one whose threshold cannot be read is named without
     a Passed. The role's grant counts only after its own Deny statements and
     permissions boundary, and a role the IAM cache could not read, or one with
-    an unparseable policy, is never reported as wired.
+    an unparseable policy, is never reported as wired. A granted role then
+    fails when a service control policy binding the account denies the action
+    with no condition, and is N/A when an attached Deny is conditioned or a
+    policy could not be read. When the organization's policies cannot be
+    listed, the Passed row says SCPs were not evaluated.
     """
     if agentcore_client is None:
         return [
@@ -22049,6 +22136,7 @@ def check_agentcore_policy_guardrail_wiring(
     v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
 
     policy_cache: Dict[str, List[Dict[str, Any]]] = {}
+    scp_verdict: Optional[Tuple[str, str]] = None
     findings = []
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId", "unknown")
@@ -22299,6 +22387,85 @@ def check_agentcore_policy_guardrail_wiring(
         if granted and (inert_policies or unread_policies or default_band_policies):
             continue
         if granted:
+            if scp_verdict is None:
+                scp_verdict = _guardrail_check_scp_verdict()
+            scp_state, scp_label = scp_verdict
+        if granted and scp_state == "denied":
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, and its "
+                        f"execution role '{role_name}' grants "
+                        f'{GUARDRAIL_CHECK_ACTION} on Resource "*", but service '
+                        f"control policy {scp_label} denies that action with no "
+                        "condition, so the guardrail call the Policy data plane "
+                        "makes with credentials derived from that role is denied."
+                    ),
+                    resolution=(
+                        "Exempt the gateway execution role from that service "
+                        f"control policy's Deny on {GUARDRAIL_CHECK_ACTION}, then "
+                        "invoke the gateway once and confirm the decision record "
+                        "in the gateway's application logs shows the guardrail "
+                        "policy among its determining policies."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif granted and scp_state in ("conditioned", "incomplete"):
+            scp_reason = (
+                f"service control policy {scp_label} denies that action under a "
+                "condition this check does not evaluate"
+                if scp_state == "conditioned"
+                else "the service control policies binding this account were not "
+                f"all read, and {scp_label}"
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring Incomplete",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, and its "
+                        f"execution role '{role_name}' grants "
+                        f'{GUARDRAIL_CHECK_ACTION} on Resource "*", but '
+                        f"{scp_reason}, so whether the guardrail call is allowed "
+                        "is unknown."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Grant organizations:DescribePolicy, "
+                        "organizations:ListParents and "
+                        "organizations:ListTargetsForPolicy, or invoke the gateway "
+                        "once and confirm the decision record in the gateway's "
+                        "application logs shows the guardrail policy among its "
+                        "determining policies."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        elif granted:
+            scp_note = {
+                "none": (
+                    "No service control policy binding this account denies "
+                    "this action, and conditioned Deny statements on the role "
+                    "are not evaluated."
+                ),
+                "management": (
+                    "This is the organization's management account, where "
+                    "service control policies do not restrict roles, and "
+                    "conditioned Deny statements on the role are not evaluated."
+                ),
+            }.get(
+                scp_state,
+                "Service control policies and conditioned Deny statements are "
+                "not evaluated, and one that denies this action to the role "
+                "would stop the guardrail call while this row reads Passed.",
+            )
             findings.append(
                 create_finding(
                     check_id="AC-37",
@@ -22309,11 +22476,8 @@ def check_agentcore_policy_guardrail_wiring(
                         f'{GUARDRAIL_CHECK_ACTION} on Resource "*" with no '
                         "condition, so the policy engine can "
                         "score the content the policy names: "
-                        f"{'; '.join(sorted(scored_policies))}. Service control "
-                        "policies and conditioned Deny statements are not "
-                        "evaluated, and one that denies this action to the role "
-                        f"would stop the guardrail call while this row reads "
-                        f"Passed.{v1_note}"
+                        f"{'; '.join(sorted(scored_policies))}. "
+                        f"{scp_note}{v1_note}"
                     ),
                     resolution=(
                         "No action required. Confirm the safeguard categories and "

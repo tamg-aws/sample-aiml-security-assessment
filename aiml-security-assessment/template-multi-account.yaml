@@ -1346,7 +1346,7 @@ Resources:
                 - oam:ListSinks # AC-22
                 # Formerly OrganizationsInventoryPermissions
                 # ListPolicies takes no resource.
-                - organizations:ListPolicies # AC-26, AC-28, AC-29
+                - organizations:ListPolicies # AC-26, AC-28, AC-29, AC-37
                 # Formerly AgentCoreCompositeAlarmRead
                 # AC-36, AC-40, AC-45, AC-46 and AC-53 credit an alarm actioned
                 # through a composite alarm. The CloudWatch API reference page
@@ -1565,12 +1565,12 @@ Resources:
             - Sid: OrganizationsPolicyAttachmentRead
               Effect: Allow
               Action:
-                - organizations:ListTargetsForPolicy # AC-28, AC-29
+                - organizations:ListTargetsForPolicy # AC-28, AC-29, AC-37
               Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
             - Sid: OrganizationsParentRead
               Effect: Allow
               Action:
-                - organizations:ListParents # AC-28, AC-29
+                - organizations:ListParents # AC-28, AC-29, AC-37
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
                 - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'

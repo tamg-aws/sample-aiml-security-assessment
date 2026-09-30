@@ -20175,6 +20175,245 @@ class TestAC37PolicyGuardrailWiring:
         assert findings[0]["Check_ID"] == "AC-37"
 
 
+@pytest.mark.usefixtures("_member_account")
+class TestAC37GuardrailCheckSCP:
+    """AC-37: an SCP that denies InvokeGuardrailChecks stops the guardrail call."""
+
+    _ACTION = "bedrock:InvokeGuardrailChecks"
+
+    @staticmethod
+    def _role(action="bedrock:InvokeGuardrailChecks"):
+        return {
+            "attached_policies": [
+                {
+                    "policy_name": "GuardrailChecks",
+                    "document": {
+                        "Statement": [
+                            {"Effect": "Allow", "Action": action, "Resource": "*"}
+                        ]
+                    },
+                }
+            ]
+        }
+
+    def _run(self, mock_orgs, documents, targets=None, order=("gw-1", "gw-2")):
+        _attach(mock_orgs, targets)
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {"Id": f"p-{index}", "Name": name}
+                for index, name in enumerate(documents)
+            ]
+        }
+        by_id = {
+            f"p-{index}": _scp(statements)
+            for index, statements in enumerate(documents.values())
+            if not isinstance(statements, Exception)
+        }
+
+        def describe_policy(PolicyId):
+            if isinstance(documents[mock_names[PolicyId]], Exception):
+                raise documents[mock_names[PolicyId]]
+            return by_id[PolicyId]
+
+        mock_names = {f"p-{index}": name for index, name in enumerate(documents)}
+        mock_orgs.describe_policy.side_effect = describe_policy
+        roles = {"gw-1": "RoleOne", "gw-2": "RoleTwo"}
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            mock_ac.list_gateways.return_value = {
+                "items": [{"gatewayId": gw, "name": gw.upper()} for gw in order]
+            }
+            mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: (
+                _policy_engine_gateway(
+                    roleArn=f"arn:aws:iam::{_MEMBER_ACCOUNT}:role/"
+                    f"{roles[gatewayIdentifier]}"
+                )
+            )
+            mock_ac.list_policies.return_value = {
+                "policies": [_cedar_policy("block_injection", _GUARDRAIL_FORBID)]
+            }
+            findings = agentcore_app.check_agentcore_policy_guardrail_wiring(
+                {"role_permissions": {"RoleOne": self._role(), "RoleTwo": self._role()}}
+            )
+        return {
+            gw: [f for f in findings if f"({gw})" in f["Finding_Details"]]
+            for gw in ("gw-1", "gw-2")
+        }
+
+    def _deny(self, action=None, resource="*", condition=None):
+        statement = {
+            "Effect": "Deny",
+            "Action": action or self._ACTION,
+            "Resource": resource,
+        }
+        if condition:
+            statement["Condition"] = condition
+        return statement
+
+    @pytest.mark.parametrize("order", [("gw-1", "gw-2"), ("gw-2", "gw-1")])
+    @patch("agentcore_app.organizations_client")
+    def test_an_attached_unconditioned_deny_fails_every_granted_gateway(
+        self, mock_orgs, order
+    ):
+        rows = self._run(
+            mock_orgs,
+            {
+                "AllowAll": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                "NoGuardrails": [self._deny()],
+            },
+            order=order,
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["Failed"]
+            assert (
+                "NoGuardrails (attached to root r-a1b2)"
+                in rows[gw][0]["Finding_Details"]
+            )
+            assert "AllowAll" not in rows[gw][0]["Finding_Details"]
+        assert mock_orgs.list_policies.call_count == 1
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_service_wildcard_deny_reaches_the_action(self, mock_orgs):
+        rows = self._run(mock_orgs, {"NoBedrock": [self._deny("bedrock:*")]})
+
+        assert [f["Status"] for f in rows["gw-1"]] == ["Failed"]
+        assert "NoBedrock" in rows["gw-1"][0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_attached_elsewhere_passes_and_says_scps_were_read(self, mock_orgs):
+        rows = self._run(
+            mock_orgs,
+            {"NoGuardrails": [self._deny()]},
+            targets={
+                "p-0": [
+                    {"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT", "Name": "x"}
+                ]
+            },
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["Passed"]
+            details = rows[gw][0]["Finding_Details"]
+            assert "No service control policy binding this account denies" in details
+            assert "Service control policies and conditioned Deny" not in details
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            {"Effect": "Deny", "Action": "bedrock:InvokeModel", "Resource": "*"},
+            {
+                "Effect": "Deny",
+                "Action": "bedrock:InvokeGuardrailChecks",
+                "Resource": "arn:aws:bedrock:us-east-1:111122223333:guardrail/g-1",
+            },
+        ],
+        ids=["other-action", "resource-arn"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_that_does_not_reach_the_call_passes(self, mock_orgs, deny):
+        rows = self._run(mock_orgs, {"Other": [deny]})
+
+        assert [f["Status"] for f in rows["gw-1"]] == ["Passed"]
+        assert (
+            "No service control policy binding this account denies"
+            in rows["gw-1"][0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_conditioned_deny_is_na_and_names_the_policy(self, mock_orgs):
+        rows = self._run(
+            mock_orgs,
+            {
+                "RegionDeny": [
+                    self._deny(
+                        "bedrock:*",
+                        condition={
+                            "StringNotEquals": {"aws:RequestedRegion": "us-east-1"}
+                        },
+                    )
+                ]
+            },
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["N/A"]
+            assert (
+                "RegionDeny (attached to root r-a1b2)" in rows[gw][0]["Finding_Details"]
+            )
+            assert "under a condition" in rows[gw][0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unreadable_policy_withholds_passed(self, mock_orgs):
+        rows = self._run(
+            mock_orgs,
+            {
+                "Readable": [self._deny("bedrock:InvokeModel")],
+                "Hidden": _make_client_error("AccessDeniedException", "denied"),
+            },
+        )
+
+        for gw in ("gw-1", "gw-2"):
+            assert [f["Status"] for f in rows[gw]] == ["N/A"]
+            assert "Hidden (AccessDeniedException)" in rows[gw][0]["Finding_Details"]
+            assert "Readable" not in rows[gw][0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unlistable_organization_keeps_the_unevaluated_wording(self, mock_orgs):
+        _attach(mock_orgs)
+        mock_orgs.list_policies.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            mock_ac.list_gateways.return_value = {
+                "items": [{"gatewayId": "gw-1", "name": "GW-1"}]
+            }
+            mock_ac.get_gateway.return_value = _policy_engine_gateway(
+                roleArn=f"arn:aws:iam::{_MEMBER_ACCOUNT}:role/RoleOne"
+            )
+            mock_ac.list_policies.return_value = {
+                "policies": [_cedar_policy("block_injection", _GUARDRAIL_FORBID)]
+            }
+            findings = agentcore_app.check_agentcore_policy_guardrail_wiring(
+                {"role_permissions": {"RoleOne": self._role()}}
+            )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "Service control policies and conditioned Deny statements are not evaluated"
+        ) in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_management_account_passes_and_says_scps_do_not_apply(self, mock_orgs):
+        _attach(mock_orgs)
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {
+                    "Id": "p-0",
+                    "Name": "NoGuardrails",
+                    "Arn": f"arn:aws:organizations::{_MEMBER_ACCOUNT}:policy/o-1/"
+                    "service_control_policy/p-0",
+                }
+            ]
+        }
+        mock_orgs.describe_policy.return_value = _scp([self._deny()])
+        with patch("agentcore_app.agentcore_client") as mock_ac:
+            mock_ac.list_gateways.return_value = {
+                "items": [{"gatewayId": "gw-1", "name": "GW-1"}]
+            }
+            mock_ac.get_gateway.return_value = _policy_engine_gateway(
+                roleArn=f"arn:aws:iam::{_MEMBER_ACCOUNT}:role/RoleOne"
+            )
+            mock_ac.list_policies.return_value = {
+                "policies": [_cedar_policy("block_injection", _GUARDRAIL_FORBID)]
+            }
+            findings = agentcore_app.check_agentcore_policy_guardrail_wiring(
+                {"role_permissions": {"RoleOne": self._role()}}
+            )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "management account" in findings[0]["Finding_Details"]
+
+
 class TestAC37CheckRegistration:
     """AC-37 reads regional gateways, and takes the handler's IAM cache."""
 

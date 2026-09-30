@@ -298,6 +298,15 @@ section.
 
 ### Fixed
 
+- `AC-37` reads the service control policies binding the account before it
+  reports a gateway's guardrail wiring as `Passed`. POL-06 asks whether the
+  guardrail call can succeed, and an attached Deny on
+  `bedrock:InvokeGuardrailChecks` stops it even when the execution role grants
+  the action, yet the row read `Passed` with a note that SCPs were not
+  evaluated. An unconditioned attached Deny on `Resource: "*"` now fails at
+  High and names the policy and its attachment target, a conditioned one or an
+  unreadable policy is `N/A`, and the management account is named as outside
+  SCP scope.
 - `AC-33` adds an `AgentCore Runtime Invocation By User ID` row. ID-10
   asks for an explicit Deny on `InvokeAgentRuntimeForUser` as well as
   `GetWorkloadAccessTokenForUserId`, but AC-33 judged only the token action,
