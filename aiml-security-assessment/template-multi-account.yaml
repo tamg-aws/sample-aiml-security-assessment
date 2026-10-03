@@ -871,6 +871,7 @@ Resources:
               - sagemaker:ListMonitoringExecutions # SM-23
               - ec2:DescribeVpcs # SM-37
               - ec2:DescribeDhcpOptions # SM-37
+              - bedrock-agentcore:ListAgentRuntimes # SM-37
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a
@@ -912,6 +913,13 @@ Resources:
             Action:
               - eks:ListFargateProfiles # SM-38
             Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+          - Sid: AgentCoreRuntimeNetworkRead
+            # SM-37 reads each AgentCore runtime's network mode and subnets to
+            # find the flow logs that cover it.
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:GetAgentRuntime # SM-37
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

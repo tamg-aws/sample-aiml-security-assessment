@@ -2279,7 +2279,7 @@
         "GuardDuty Check Error",
         "GuardDuty Lambda Protection"
       ],
-      "gap": "SM-04 ('GuardDuty Enabled') reads that a detector exists and is enabled, which does not say whether network behavior is analysed. SM-37 reads the detector's Features and passes when LAMBDA_NETWORK_LOGS is ENABLED, and fails otherwise. A Region with no detector is Not Applicable to SM-37, since SM-04 already fails it. SM-37 also fails a SageMaker endpoint whose subnets no ACTIVE flow log into CloudWatch Logs covers, or whose flow log group has no metric filter feeding an actioned alarm that can fire, and fails a VPC whose DHCP option set names a domain name server other than the Amazon DNS server, whose queries GuardDuty does not analyze",
+      "gap": "SM-04 ('GuardDuty Enabled') reads that a detector exists and is enabled, which does not say whether network behavior is analysed. SM-37 reads the detector's Features and passes when LAMBDA_NETWORK_LOGS is ENABLED, and fails otherwise. A Region with no detector is Not Applicable to SM-37, since SM-04 already fails it. SM-37 also fails a SageMaker endpoint or AgentCore runtime that runs outside a customer VPC, or whose subnets no ACTIVE flow log into CloudWatch Logs covers, or whose flow log group has no metric filter feeding an actioned alarm that can fire, and fails a VPC whose DHCP option set names a domain name server other than the Amazon DNS server, whose queries GuardDuty does not analyze",
       "extra_iam": [],
       "phase": 6,
       "tier": "foundation",

@@ -317,6 +317,8 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListMonitoringExecutions",
         "ec2:DescribeVpcs",
         "ec2:DescribeDhcpOptions",
+        "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:GetAgentRuntime",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -983,6 +985,17 @@ _SAGEMAKER_MANAGED_GRANTS = [
         "eks:ListFargateProfiles",
         json.dumps(
             {"Fn::Sub": "arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*"}
+        ),
+    ),
+    ("Allow", "bedrock-agentcore:ListAgentRuntimes", '"*"'),
+    (
+        "Allow",
+        "bedrock-agentcore:GetAgentRuntime",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:runtime/*"
+            }
         ),
     ),
 ]

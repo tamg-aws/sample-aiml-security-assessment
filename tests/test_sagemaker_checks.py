@@ -8440,8 +8440,11 @@ class TestSM37EndpointFlowLogAlerting:
         errors=None,
         composites=None,
         history=None,
+        runtimes=None,
     ):
+        """runtimes: {name: subnets, None for PUBLIC mode, or an exception}."""
         errors = errors or {}
+        runtimes = runtimes or {}
         composites = composites or []
         history = history or {}
         self.history_calls = []
@@ -8579,7 +8582,42 @@ class TestSM37EndpointFlowLogAlerting:
                 "describe_alarm_history": describe_alarm_history,
             }
         )
+
+        def list_agent_runtimes():
+            if "list_agent_runtimes" in errors:
+                raise errors["list_agent_runtimes"]
+            # One runtime per page, so a reader of only the first page misses
+            # every later runtime.
+            return [
+                {
+                    "agentRuntimes": [
+                        {"agentRuntimeId": f"id-{n}", "agentRuntimeName": n}
+                    ]
+                }
+                for n in runtimes
+            ]
+
+        agentcore = MagicMock()
+        agentcore.get_paginator.side_effect = _pager(
+            {"list_agent_runtimes": list_agent_runtimes}
+        )
+
+        def get_agent_runtime(agentRuntimeId):
+            spec = runtimes[agentRuntimeId[len("id-") :]]
+            if isinstance(spec, Exception):
+                raise spec
+            if spec is None:
+                return {"networkConfiguration": {"networkMode": "PUBLIC"}}
+            return {
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {"subnets": spec, "securityGroups": ["sg-1"]},
+                }
+            }
+
+        agentcore.get_agent_runtime.side_effect = get_agent_runtime
         clients = {
+            "bedrock-agentcore-control": agentcore,
             "sagemaker": sagemaker,
             "ec2": ec2,
             "logs": logs,
@@ -8594,7 +8632,74 @@ class TestSM37EndpointFlowLogAlerting:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert rows[0]["Check_ID"] == "SM-37"
         assert "All 2 endpoint(s)" in rows[0]["Finding_Details"]
-        assert "AgentCore Runtime is not read" in rows[0]["Finding_Details"]
+        assert (
+            "each runtime in VPC network mode is judged like an endpoint"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize("runtime_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_an_agentcore_runtime_without_a_flow_log_fails(
+        self, mock_client, runtime_first
+    ):
+        runtimes = {"rt-covered": ["subnet-1"], "rt-bare": ["subnet-2"]}
+        if runtime_first:
+            runtimes = dict(reversed(list(runtimes.items())))
+        rows = self._run(
+            mock_client,
+            endpoints={},
+            runtimes=runtimes,
+            flow_logs=[self._flow_log("vpc-1")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "AgentCore runtime 'rt-bare': no ACTIVE flow log" in details
+        assert "covers subnet-2" in details
+        assert "rt-covered" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_public_agentcore_runtime_fails(self, mock_client):
+        rows = self._run(
+            mock_client, runtimes={"rt-vpc": ["subnet-1"], "rt-public": None}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "AgentCore runtime 'rt-public' runs outside any customer VPC" in details
+        assert "rt-vpc" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_covered_endpoints_and_runtimes_pass(self, mock_client):
+        rows = self._run(mock_client, runtimes={"rt-1": ["subnet-3"]})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "All 3 endpoint(s) and AgentCore runtime(s)" in details
+        assert "AgentCore runtime 'rt-1' (log group /flow/a" in details
+
+    @pytest.mark.parametrize(
+        "errors, runtimes, named",
+        [
+            (
+                {"list_agent_runtimes": _make_client_error("AccessDeniedException")},
+                {},
+                "bedrock-agentcore:ListAgentRuntimes",
+            ),
+            (
+                {},
+                {
+                    "rt-1": ["subnet-1"],
+                    "rt-2": _make_client_error("AccessDeniedException"),
+                },
+                "AgentCore runtime 'rt-2' (bedrock-agentcore:GetAgentRuntime",
+            ),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unread_runtime_withholds_the_pass(
+        self, mock_client, errors, runtimes, named
+    ):
+        rows = self._run(mock_client, errors=errors, runtimes=runtimes)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert named in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_one_endpoint_vpc_without_a_flow_log_fails(self, mock_client):
@@ -8901,7 +9006,7 @@ class TestSM37EndpointFlowLogAlerting:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         assert (
-            "2 endpoint(s) have no network anomaly alerting"
+            "2 endpoint(s) and AgentCore runtime(s) have no network anomaly alerting"
             in (rows[0]["Finding_Details"])
         )
 
@@ -8954,7 +9059,10 @@ class TestSM37EndpointFlowLogAlerting:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         details = rows[0]["Finding_Details"]
-        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert (
+            "1 endpoint(s) and AgentCore runtime(s) have no network anomaly alerting"
+            in details
+        )
         assert "endpoint 'ep-2': flow log group(s) /flow/b" in details
         assert "endpoint 'ep-1'" not in details
 
@@ -9214,7 +9322,10 @@ class TestSM37EndpointFlowLogAlerting:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         details = rows[0]["Finding_Details"]
-        assert "2 endpoint(s) have no network anomaly alerting" in details
+        assert (
+            "2 endpoint(s) and AgentCore runtime(s) have no network anomaly alerting"
+            in details
+        )
         assert self.history_calls == []
 
     def _split_groups(self, a_filters, b_filters, b_alarms=None):
@@ -9268,7 +9379,10 @@ class TestSM37EndpointFlowLogAlerting:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         details = rows[0]["Finding_Details"]
-        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert (
+            "1 endpoint(s) and AgentCore runtime(s) have no network anomaly alerting"
+            in details
+        )
         assert "endpoint 'ep-2'" in details
         assert "endpoint 'ep-1'" not in details
         assert "pattern matches no flow-log record" in details
@@ -9396,7 +9510,10 @@ class TestSM37EndpointFlowLogAlerting:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         details = rows[0]["Finding_Details"]
-        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert (
+            "1 endpoint(s) and AgentCore runtime(s) have no network anomaly alerting"
+            in details
+        )
         assert "endpoint 'ep-2'" in details
         assert "endpoint 'ep-1'" not in details
         assert "alarm 'dead' on Flow/Dead can never fire" in details

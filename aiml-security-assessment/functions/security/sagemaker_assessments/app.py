@@ -14299,7 +14299,9 @@ ENDPOINT_FLOW_LOG_ALERTING_RESOLUTION = (
 ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "GuardDuty foundational flow-log analysis covers EC2 network interfaces, not "
     "SageMaker endpoints, so the customer flow log is the only network telemetry "
-    "for an endpoint. AgentCore Runtime is not read by this module. The state "
+    "for an endpoint, and AgentCore Runtime yields none either, so each runtime in "
+    "VPC network mode is judged like an endpoint and one in PUBLIC mode fails. The "
+    "state "
     "named for each alarm is its current StateValue, and its last entry into "
     "ALARM comes from the metric alarm's own StateUpdate history. An alarm with "
     "no action of its own is credited when an OR of ALARM() terms carries it to "
@@ -14553,11 +14555,47 @@ def _alarm_cannot_fire(
     return None
 
 
+def _agentcore_runtime_subnets(
+    region: str,
+) -> Tuple[Dict[str, List[str]], List[str]]:
+    """The subnets of each AgentCore runtime; an empty list for PUBLIC mode."""
+    try:
+        client = boto3.client(
+            "bedrock-agentcore-control", config=boto3_config, region_name=region
+        )
+        runtimes = []
+        for page in client.get_paginator("list_agent_runtimes").paginate():
+            runtimes.extend(page.get("agentRuntimes", []))
+    except Exception as error:
+        return {}, [
+            f"bedrock-agentcore:ListAgentRuntimes ({get_assessment_error_label(error)})"
+        ]
+    subnets, unread = {}, []
+    for runtime in runtimes:
+        name = runtime.get("agentRuntimeName") or runtime.get("agentRuntimeId")
+        try:
+            detail = client.get_agent_runtime(agentRuntimeId=runtime["agentRuntimeId"])
+        except Exception as error:
+            unread.append(
+                f"AgentCore runtime '{name}' "
+                f"(bedrock-agentcore:GetAgentRuntime: {get_assessment_error_label(error)})"
+            )
+            continue
+        network = detail.get("networkConfiguration") or {}
+        subnets[name] = (
+            sorted((network.get("networkModeConfig") or {}).get("subnets") or [])
+            if network.get("networkMode") == "VPC"
+            else []
+        )
+    return subnets, unread
+
+
 def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, Any]:
     """
-    SM-37: Verify every SageMaker endpoint's network carries alerting telemetry.
+    SM-37: Verify every SageMaker endpoint's and AgentCore runtime's network
+    carries alerting telemetry.
 
-    An endpoint passes only when each subnet it runs in is covered by an ACTIVE
+    An endpoint or runtime passes only when each subnet it runs in is covered by an ACTIVE
     VPC or subnet flow log that captures accepted traffic into CloudWatch Logs,
     and that log group has a metric filter whose pattern can match a flow-log
     record and whose metric an alarm with an action evaluates on the series the
@@ -14617,12 +14655,17 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             else:
                 subnets.update(model_subnets[model_name])
         if not model_unread:
-            endpoint_subnets[endpoint["name"]] = sorted(subnets)
+            endpoint_subnets[f"endpoint '{endpoint['name']}'"] = sorted(subnets)
+    runtime_subnets, runtime_unread = _agentcore_runtime_subnets(region)
+    unread.extend(runtime_unread)
+    for name, subnets in runtime_subnets.items():
+        endpoint_subnets[f"AgentCore runtime '{name}'"] = subnets
 
-    if not inventory["endpoints"] and not unread:
+    if not inventory["endpoints"] and not runtime_subnets and not unread:
         findings["csv_data"].append(
             _row(
-                "No SageMaker endpoints were found in this region.",
+                "No SageMaker endpoints or AgentCore runtimes were found in this "
+                "region.",
                 "No action required",
                 "Informational",
                 "N/A",
@@ -14736,25 +14779,19 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
 
     failed = []
     passed = []
-    for endpoint in inventory["endpoints"]:
-        name = endpoint["name"]
-        if name not in endpoint_subnets:
-            continue
-        subnets = endpoint_subnets[name]
+    for name, subnets in endpoint_subnets.items():
         if not subnets:
             failed.append(
-                f"endpoint '{name}' runs outside any customer VPC, so no flow log "
+                f"{name} runs outside any customer VPC, so no flow log "
                 "can capture its traffic"
             )
             continue
         if subnet_error and any(s not in subnet_vpc for s in subnets):
-            unread.append(
-                f"subnets of endpoint '{name}' (ec2:DescribeSubnets: {subnet_error})"
-            )
+            unread.append(f"subnets of {name} (ec2:DescribeSubnets: {subnet_error})")
             continue
         if flow_log_error:
             unread.append(
-                f"flow logs of endpoint '{name}' (ec2:DescribeFlowLogs: {flow_log_error})"
+                f"flow logs of {name} (ec2:DescribeFlowLogs: {flow_log_error})"
             )
             continue
         uncovered = []
@@ -14791,7 +14828,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 dead_alarms.extend(d for d in dead if d not in dead_alarms)
         if uncovered:
             failed.append(
-                f"endpoint '{name}': no ACTIVE flow log capturing accepted traffic "
+                f"{name}: no ACTIVE flow log capturing accepted traffic "
                 f"into CloudWatch Logs covers {', '.join(uncovered)}"
             )
             continue
@@ -14801,12 +14838,12 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             passed.append((name, sorted(set(alarmed))))
         elif unread_groups:
             unread.append(
-                f"metric filters of {', '.join(unread_groups)} for endpoint '{name}' "
+                f"metric filters of {', '.join(unread_groups)} for {name} "
                 f"(logs:DescribeMetricFilters: {group_errors[unread_groups[0]]})"
             )
         elif alarm_error:
             unread.append(
-                f"alarms for endpoint '{name}' (cloudwatch:DescribeAlarms: {alarm_error})"
+                f"alarms for {name} (cloudwatch:DescribeAlarms: {alarm_error})"
             )
         else:
             unmatched = [
@@ -14815,7 +14852,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 if g in unmatched_filters
             ]
             failed.append(
-                f"endpoint '{name}': flow log group(s) {', '.join(sorted(groups))} "
+                f"{name}: flow log group(s) {', '.join(sorted(groups))} "
                 f"covering {', '.join(sorted(unalarmed))} have no metric filter "
                 "whose metric an alarm with an action evaluates"
                 + (
@@ -14838,7 +14875,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
         )
     }
     passed = [
-        f"endpoint '{name}' ("
+        f"{name} ("
         + "; ".join(
             f"log group {group}, {label}, {history[alarm]}"
             + (
@@ -14858,8 +14895,8 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             shown += f"; and {len(failed) - 10} more"
         findings["csv_data"].append(
             _row(
-                f"{len(failed)} endpoint(s) have no network anomaly alerting: {shown}. "
-                + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
+                f"{len(failed)} endpoint(s) and AgentCore runtime(s) have no network "
+                f"anomaly alerting: {shown}. " + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
                 ENDPOINT_FLOW_LOG_ALERTING_RESOLUTION,
                 "Medium",
                 "Failed",
@@ -14871,8 +14908,8 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 "SM-37",
                 ENDPOINT_FLOW_LOG_ALERTING_FINDING,
                 unread,
-                f"{len(passed)} endpoint(s) passed and {len(failed)} failed. "
-                + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
+                f"{len(passed)} endpoint(s) and AgentCore runtime(s) passed and "
+                f"{len(failed)} failed. " + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
                 ENDPOINT_FLOW_LOG_ALERTING_REFERENCE,
                 region,
             )
@@ -14880,7 +14917,8 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
     if not failed and not unread:
         findings["csv_data"].append(
             _row(
-                f"All {len(passed)} endpoint(s) run in subnets covered by an ACTIVE "
+                f"All {len(passed)} endpoint(s) and AgentCore runtime(s) run in "
+                "subnets covered by an ACTIVE "
                 "flow log in CloudWatch Logs whose metric filter feeds an alarm with "
                 f"an action: {'; '.join(passed[:10])}. " + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
                 "No action required",

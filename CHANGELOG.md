@@ -362,6 +362,11 @@ section.
   model and fails a credential-named plaintext variable, as it already did
   for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
   or `sagemaker:DescribeModel` holds back the propagation `Passed`.
+- `SM-37` network anomaly alerting judges every AgentCore runtime beside the
+  SageMaker endpoints: a runtime in `PUBLIC` network mode fails, and one in
+  `VPC` mode must have its subnets covered by a flow log whose metric
+  filter feeds an actioned alarm. AgentCore runtimes were not read before.
+  An unread runtime list or runtime holds back `Passed`.
 - `SM-37` adds a `VPC DNS Resolver Visible to GuardDuty` row. It reads every
   VPC's DHCP option set and fails a VPC whose `domain-name-servers` names a
   server other than the Amazon DNS server (`AmazonProvidedDNS`,
@@ -1597,6 +1602,13 @@ schedule whose latest execution is still running.
 gains `ec2:DescribeVpcs` and `ec2:DescribeDhcpOptions` on `'*'` (`SM-37`);
 neither action has a resource type in the service authorization reference.
 Until the stack is updated, the new `SM-37` row reads as incomplete.
+
+**SageMaker AgentCore runtime reads.** `SageMakerAssessmentReadsPolicy`
+gains `bedrock-agentcore:ListAgentRuntimes` on `'*'` (no resource type)
+and `bedrock-agentcore:GetAgentRuntime` on
+`arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*`
+(`SM-37`). Until the stack is updated, `SM-37` network anomaly alerting
+reads as incomplete.
 
 **SageMaker EKS Fargate profile read.** `SageMakerAssessmentReadsPolicy`
 gains `eks:ListFargateProfiles` on
