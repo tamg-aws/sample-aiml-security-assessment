@@ -1285,6 +1285,13 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "s3:GetBucketObjectLockConfiguration",
 }
 
+# AC-06 names s3:PutObject in the fix text of its recording write SCP row.
+# validate-policy on 2026-10-03 reported nothing at Action index 0 and
+# INVALID_ACTION for the negative control s3:PutObjectz at index 1 of the same
+# statement. It is in the s3 service reference JSON with the object resource
+# type.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3:PutObject"}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

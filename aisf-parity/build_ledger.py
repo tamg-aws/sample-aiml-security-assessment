@@ -337,9 +337,16 @@ AI_SUBJECT_ROWS = [
         "such key for kms:GenerateDataKey: granted by the key policy to the role, to * bound "
         "only by kms:CallerAccount and kms:ViaService naming the account and S3, or to the "
         "account root with the role's identity policy granting it, allowed by the boundary, "
-        "and reached by no Deny; any other condition is N/A. SCPs are not evaluated for the "
-        "write and the multipart kms:Decrypt is not judged, so a Passed write can still be "
-        "refused. The AWS managed browser has no recording configuration and is "
+        "and reached by no Deny; any other condition is N/A. A separate Browser Recording "
+        "Write SCP row per recording browser fails when a service control policy attached to "
+        "the account, an OU above it or the root denies the role s3:PutObject on the prefix "
+        "or kms:GenerateDataKey on the bucket's key, or when a level of that chain has no "
+        "attached SCP allowing either; aws:PrincipalArn, aws:PrincipalAccount and "
+        "aws:SecureTransport are evaluated with IfExists suffixes and ForAllValues:/"
+        "ForAnyValue: prefixes stripped, any other key is N/A, and the management account "
+        "and an account in no organization are not bound. The multipart kms:Decrypt and "
+        "resource control policies are not judged, so a Passed write can still be refused. "
+        "The AWS managed browser has no recording configuration and is "
         "outside the population",
         [],
         4,

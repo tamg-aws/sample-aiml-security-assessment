@@ -122,6 +122,12 @@ INCUMBENTS = {
             "noargs",
             "check_browser_tool_recording",
         ),
+        (
+            "agentcore_assessments",
+            "check_browser_recording_write_scp",
+            "noargs",
+            "check_browser_recording_write_scp",
+        ),
     ),
     "AG-24": (
         (

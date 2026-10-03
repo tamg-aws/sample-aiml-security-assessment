@@ -50238,3 +50238,365 @@ class TestAC06RecordingKeyUse:
         passed = self._run([], [self._WRITE], other_key=False)
         assert passed["Status"] == "Passed"
         assert "use key" not in passed["Finding_Details"]
+
+
+class TestAC06RecordingWriteScp:
+    """AIR-ACR-RT-09: an attached service control policy can refuse the
+    execution role the recording write that its identity and key policies
+    allow, so a Deny reaching the role, or a level whose SCPs allow nothing,
+    fails the browser."""
+
+    _ACCOUNT = "123456789012"
+    _OU = "ou-a1b2-11111111"
+    _ROOT = "r-a1b2"
+    _FULL = {"Effect": "Allow", "Action": "*", "Resource": "*"}
+    _KEY = "arn:aws:kms:us-east-1:123456789012:key/good"
+
+    def _run(self, policies, targets=None, chain_error=None, keyed=("recordings",)):
+        """`policies` maps a policy id to its statements; p-full is attached
+        to every level and each other policy to the root, unless `targets`
+        names its target ids or an exception. Bucket
+        `recordings` encrypts with a customer managed key, `other` with S3
+        managed keys unless named in `keyed`."""
+        mock_orgs = MagicMock()
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {
+                    "Id": policy_id,
+                    "Name": f"scp-{policy_id}",
+                    "Arn": (
+                        "arn:aws:organizations::999988887777:policy/o-a1b2/"
+                        f"service_control_policy/{policy_id}"
+                    ),
+                }
+                for policy_id in policies
+            ]
+        }
+        mock_orgs.describe_policy.side_effect = lambda PolicyId: _scp(
+            policies[PolicyId]
+        )
+        parents = {
+            self._ACCOUNT: {"Id": self._OU, "Type": "ORGANIZATIONAL_UNIT"},
+            self._OU: {"Id": self._ROOT, "Type": "ROOT"},
+        }
+
+        def list_parents(ChildId, **_):
+            if chain_error is not None:
+                raise chain_error
+            return {"Parents": [parents[ChildId]]}
+
+        mock_orgs.list_parents.side_effect = list_parents
+
+        def list_targets_for_policy(PolicyId, **_):
+            full = [self._ROOT, self._OU, self._ACCOUNT]
+            value = (targets or {}).get(
+                PolicyId, full if PolicyId == "p-full" else [self._ROOT]
+            )
+            if isinstance(value, Exception):
+                raise value
+            return {"Targets": [{"TargetId": target} for target in value]}
+
+        mock_orgs.list_targets_for_policy.side_effect = list_targets_for_policy
+
+        mock_s3 = MagicMock()
+
+        def encryption(Bucket, ExpectedBucketOwner):
+            assert ExpectedBucketOwner == self._ACCOUNT
+            if Bucket not in keyed:
+                raise _make_client_error(
+                    "ServerSideEncryptionConfigurationNotFoundError", "none"
+                )
+            return {
+                "ServerSideEncryptionConfiguration": {
+                    "Rules": [
+                        {
+                            "ApplyServerSideEncryptionByDefault": {
+                                "SSEAlgorithm": "aws:kms",
+                                "KMSMasterKeyID": self._KEY,
+                            }
+                        }
+                    ]
+                }
+            }
+
+        mock_s3.get_bucket_encryption.side_effect = encryption
+        mock_kms = MagicMock()
+        mock_kms.describe_key.side_effect = lambda KeyId: {
+            "KeyMetadata": {"Arn": KeyId}
+        }
+        with (
+            patch("agentcore_app.agentcore_client", MagicMock()),
+            patch("agentcore_app.organizations_client", mock_orgs),
+            patch("agentcore_app.s3_client", mock_s3),
+            patch("agentcore_app.kms_client", mock_kms),
+        ):
+            findings = agentcore_app.check_browser_recording_write_scp(
+                _browser_inventory(
+                    _recorded_browser("br-1"),
+                    _recorded_browser("br-2", bucket="other"),
+                )
+            )
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-06"
+            assert finding["Finding"] == "AgentCore Browser Recording Write SCP"
+        return {f["Finding_Details"].split("(", 2)[1][:4]: f for f in findings}
+
+    def _deny(self, **overrides):
+        statement = {
+            "Effect": "Deny",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::other/*",
+        }
+        statement.update(overrides)
+        return statement
+
+    def test_full_access_alone_passes_both_browsers(self):
+        rows = self._run({"p-full": [self._FULL]})
+        assert {row["Status"] for row in rows.values()} == {"Passed"}
+        assert (
+            "kms:GenerateDataKey on key arn:aws:kms:us-east-1:123456789012:key/good"
+            in rows["br-1"]["Finding_Details"]
+        )
+        assert "kms:GenerateDataKey" not in rows["br-2"]["Finding_Details"]
+        assert "all 3 levels" in rows["br-1"]["Finding_Details"]
+        assert (
+            "Resource control policies are not judged"
+            in (rows["br-1"]["Finding_Details"])
+        )
+
+    def test_an_attached_deny_on_one_bucket_fails_only_that_browser(self):
+        rows = self._run({"p-full": [self._FULL], "p-deny": [self._deny()]})
+        assert rows["br-1"]["Status"] == "Passed"
+        assert rows["br-2"]["Status"] == "Failed"
+        assert (
+            "service control policy 'scp-p-deny', attached to root r-a1b2"
+            in (rows["br-2"]["Finding_Details"])
+        )
+        assert (
+            "denies s3:PutObject on arn:aws:s3:::other/rec/*"
+            in (rows["br-2"]["Finding_Details"])
+        )
+
+    def test_an_unattached_deny_binds_nothing(self):
+        rows = self._run(
+            {"p-full": [self._FULL], "p-deny": [self._deny()]},
+            targets={"p-deny": ["ou-a1b2-22222222"]},
+        )
+        assert {row["Status"] for row in rows.values()} == {"Passed"}
+
+    def test_a_deny_attached_to_the_account_itself_binds(self):
+        rows = self._run(
+            {"p-full": [self._FULL], "p-deny": [self._deny()]},
+            targets={"p-deny": [self._ACCOUNT]},
+        )
+        assert rows["br-2"]["Status"] == "Failed"
+        assert "attached to account 123456789012" in rows["br-2"]["Finding_Details"]
+
+    def test_a_deny_on_the_recording_key_fails_only_the_keyed_browser(self):
+        rows = self._run(
+            {
+                "p-full": [self._FULL],
+                "p-deny": [
+                    {
+                        "Effect": "Deny",
+                        "Action": "kms:GenerateDataKey*",
+                        "Resource": "arn:aws:kms:*:*:key/*",
+                    }
+                ],
+            }
+        )
+        assert rows["br-1"]["Status"] == "Failed"
+        assert (
+            "denies kms:GenerateDataKey on " + self._KEY
+            in (rows["br-1"]["Finding_Details"])
+        )
+        assert rows["br-2"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            (
+                {"ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/admin"}},
+                "Failed",
+            ),
+            (
+                {
+                    "ArnNotLikeIfExists": {
+                        "aws:PrincipalArn": "arn:aws:iam::*:role/admin"
+                    }
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "ForAnyValue:StringNotLike": {
+                        "aws:PrincipalArn": "arn:aws:iam::*:role/admin"
+                    }
+                },
+                "Failed",
+            ),
+            (
+                {"ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/browser-*"}},
+                "Passed",
+            ),
+            ({"StringEquals": {"aws:PrincipalAccount": "123456789012"}}, "Failed"),
+            ({"StringEquals": {"aws:PrincipalAccount": "444455556666"}}, "Passed"),
+            ({"Bool": {"aws:SecureTransport": "false"}}, "Passed"),
+            ({"BoolIfExists": {"aws:SecureTransport": "true"}}, "Failed"),
+            ({"Null": {"aws:PrincipalArn": "true"}}, "Passed"),
+            ({"StringNotEquals": {"aws:RequestedRegion": "us-east-1"}}, "N/A"),
+        ],
+    )
+    def test_the_deny_condition_is_evaluated_for_the_role(self, condition, status):
+        rows = self._run(
+            {"p-full": [self._FULL], "p-deny": [self._deny(Condition=condition)]}
+        )
+        assert rows["br-1"]["Status"] == "Passed"
+        assert rows["br-2"]["Status"] == status
+        if status == "N/A":
+            assert "aws:RequestedRegion" in rows["br-2"]["Finding_Details"]
+
+    def test_a_level_with_no_allow_denies_below_it(self):
+        rows = self._run(
+            {
+                "p-full": [self._FULL],
+                "p-narrow": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:*",
+                        "Resource": "arn:aws:s3:::recordings/*",
+                    },
+                    {"Effect": "Allow", "Action": "kms:*", "Resource": "*"},
+                ],
+            },
+            targets={"p-full": [self._ROOT, self._ACCOUNT], "p-narrow": [self._OU]},
+        )
+        assert rows["br-1"]["Status"] == "Passed"
+        assert rows["br-2"]["Status"] == "Failed"
+        assert (
+            "no service control policy attached to organizational unit "
+            "ou-a1b2-11111111 allows s3:PutObject on arn:aws:s3:::other/rec/*, so it "
+            "is implicitly denied"
+        ) in rows["br-2"]["Finding_Details"]
+
+    def test_a_conditioned_allow_is_not_judged(self):
+        rows = self._run(
+            {
+                "p-full": [self._FULL],
+                "p-ou": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "*",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {"aws:RequestedRegion": "us-east-1"}
+                        },
+                    }
+                ],
+            },
+            targets={"p-full": [self._ROOT, self._ACCOUNT], "p-ou": [self._OU]},
+        )
+        assert {row["Status"] for row in rows.values()} == {"N/A"}
+        assert "allows s3:PutObject" in rows["br-2"]["Finding_Details"]
+
+    def test_unread_targets_never_pass(self):
+        rows = self._run(
+            {
+                "p-full": [self._FULL],
+                "p-other": [self._deny(Resource="arn:aws:s3:::x/*")],
+            },
+            targets={"p-other": _make_client_error("AccessDeniedException", "no")},
+        )
+        assert {row["Status"] for row in rows.values()} == {"N/A"}
+        assert (
+            "attachment targets of service control policy 'scp-p-other'"
+            in (rows["br-1"]["Finding_Details"])
+        )
+        rows = self._run(
+            {"p-full": [self._FULL], "p-deny": [self._deny()]},
+            targets={"p-full": _make_client_error("AccessDeniedException", "no")},
+        )
+        assert rows["br-1"]["Status"] == "N/A"
+        assert rows["br-2"]["Status"] == "Failed"
+
+    def test_an_unread_parent_chain_never_passes(self):
+        rows = self._run(
+            {"p-full": [self._FULL]},
+            chain_error=_make_client_error("AccessDeniedException", "no"),
+        )
+        assert {row["Status"] for row in rows.values()} == {"N/A"}
+        assert "organizations:ListParents" in rows["br-1"]["Finding_Details"]
+
+    def test_an_unread_key_never_passes(self):
+        mock_orgs = MagicMock()
+        mock_orgs.list_policies.return_value = {"Policies": []}
+        mock_s3 = MagicMock()
+        mock_s3.get_bucket_encryption.side_effect = _make_client_error(
+            "AccessDenied", "no"
+        )
+        with (
+            patch("agentcore_app.agentcore_client", MagicMock()),
+            patch("agentcore_app.organizations_client", mock_orgs),
+            patch("agentcore_app.s3_client", mock_s3),
+        ):
+            findings = agentcore_app.check_browser_recording_write_scp(
+                _browser_inventory(_recorded_browser("br-1"))
+            )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "s3:GetEncryptionConfiguration" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "code, status",
+        [
+            ("AWSOrganizationsNotInUseException", "Passed"),
+            ("AccessDeniedException", "N/A"),
+            ("TooManyRequestsException", "N/A"),
+        ],
+    )
+    def test_the_policy_list_read(self, code, status):
+        mock_orgs = MagicMock()
+        mock_orgs.list_policies.side_effect = _make_client_error(code, "x")
+        with (
+            patch("agentcore_app.agentcore_client", MagicMock()),
+            patch("agentcore_app.organizations_client", mock_orgs),
+        ):
+            findings = agentcore_app.check_browser_recording_write_scp(
+                _browser_inventory(
+                    _recorded_browser("br-1"), _recorded_browser("br-2", bucket="o")
+                )
+            )
+        assert [f["Status"] for f in findings] == [status, status]
+
+    def test_the_management_account_is_not_bound(self):
+        mock_orgs = MagicMock()
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {
+                    "Id": "p-deny",
+                    "Name": "deny",
+                    "Arn": (
+                        "arn:aws:organizations::123456789012:policy/o-a1b2/"
+                        "service_control_policy/p-deny"
+                    ),
+                }
+            ]
+        }
+        with (
+            patch("agentcore_app.agentcore_client", MagicMock()),
+            patch("agentcore_app.organizations_client", mock_orgs),
+        ):
+            findings = agentcore_app.check_browser_recording_write_scp(
+                _browser_inventory(_recorded_browser("br-1"))
+            )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "management account" in findings[0]["Finding_Details"]
+        mock_orgs.describe_policy.assert_not_called()
+
+    def test_browsers_outside_the_population_get_no_row(self):
+        with patch("agentcore_app.agentcore_client", MagicMock()):
+            assert (
+                agentcore_app.check_browser_recording_write_scp(
+                    _browser_inventory(_recorded_browser("br-1", role=None))
+                )
+                == []
+            )

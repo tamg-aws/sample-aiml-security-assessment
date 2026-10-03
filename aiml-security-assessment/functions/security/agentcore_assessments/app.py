@@ -6421,9 +6421,10 @@ BROWSER_RECORDING_BUCKET_READS = (
 BROWSER_RECORDING_WRITE_ACTION = "s3:putobject"
 BROWSER_RECORDING_READ_ACTION = "s3:getobject"
 BROWSER_RECORDING_WRITE_CEILING = (
-    "Service control policies are not evaluated for this write, so one may "
-    "still refuse it, and the kms:Decrypt a multipart upload also needs is not "
-    "judged: this leg can report a write the account would block."
+    "Service control policies on this write are judged in the separate "
+    "AgentCore Browser Recording Write SCP row. The kms:Decrypt a multipart "
+    "upload also needs is not judged, so this leg can report a write the "
+    "account would block."
 )
 
 
@@ -7731,6 +7732,482 @@ def check_browser_tool_recording(
             )
         )
 
+    return findings
+
+
+AGENTCORE_BROWSER_RECORDING_SCP_FINDING = "AgentCore Browser Recording Write SCP"
+RECORDING_SCP_STRING_OPERATORS = {
+    "stringequals",
+    "stringnotequals",
+    "stringequalsignorecase",
+    "stringnotequalsignorecase",
+    "stringlike",
+    "stringnotlike",
+    "arnequals",
+    "arnnotequals",
+    "arnlike",
+    "arnnotlike",
+}
+
+
+def _recording_write_condition_holds(
+    statement: Dict[str, Any], role_arn: str, account: str
+) -> Tuple[Optional[bool], List[str]]:
+    """Return whether an SCP statement's condition holds for a recording write.
+
+    The request is the execution role's s3:PutObject, or the kms:GenerateDataKey
+    S3 makes for it, over TLS. Only aws:PrincipalArn, aws:PrincipalAccount and
+    aws:SecureTransport have a value known here; an entry on any other key
+    leaves the statement conditional and is named. IfExists suffixes and
+    ForAllValues:/ForAnyValue: prefixes are stripped, which is exact for these
+    single-valued keys, all present on the request. Returns True, False or
+    None, with the entries that were not evaluated.
+    """
+    condition = statement.get("Condition")
+    if not condition:
+        return True, []
+    if not isinstance(condition, dict):
+        return None, ["a malformed Condition"]
+    request = {
+        "aws:principalarn": role_arn,
+        "aws:principalaccount": account,
+        "aws:securetransport": "true",
+    }
+    failed = False
+    unevaluated: List[str] = []
+    for operator, entries in condition.items():
+        name = str(operator).strip().lower()
+        for prefix in ("forallvalues:", "foranyvalue:"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+        if name.endswith("ifexists"):
+            name = name[: -len("ifexists")]
+        if not isinstance(entries, dict):
+            unevaluated.append(str(operator))
+            continue
+        for key, raw in entries.items():
+            key_name = str(key).strip().lower()
+            values = [value.strip() for value in _condition_values(raw)]
+            value = request.get(key_name)
+            holds: Optional[bool] = None
+            if value is None:
+                pass
+            elif name == "null":
+                holds = [entry.lower() for entry in values] == ["false"]
+            elif name == "bool" and key_name == "aws:securetransport":
+                holds = value in [entry.lower() for entry in values]
+            elif name in RECORDING_SCP_STRING_OPERATORS:
+                like = name.endswith("like") or name.startswith("arn")
+                matched = any(
+                    _condition_string_matches(
+                        pattern, value, like, name.endswith("ignorecase")
+                    )
+                    for pattern in values
+                )
+                holds = not matched if "not" in name else matched
+            if holds is None:
+                unevaluated.append(f"{operator} {key}")
+            elif not holds:
+                failed = True
+    if failed:
+        return False, []
+    return (None, unevaluated) if unevaluated else (True, [])
+
+
+def _recording_bucket_key_arns(
+    bucket: str, account: str, key_cache: Dict[str, Any]
+) -> Tuple[List[str], List[str]]:
+    """Return the ARN of each KMS key a recording bucket's default encryption
+    uses, and what could not be read.
+
+    A KMS rule naming no KMSMasterKeyID uses the AWS managed aws/s3 key, which
+    DescribeKey resolves by its alias. A bucket with no default encryption
+    configuration encrypts with S3 managed keys and calls no KMS key.
+    """
+    try:
+        response = s3_client.get_bucket_encryption(
+            Bucket=bucket, ExpectedBucketOwner=account
+        )
+    except Exception as error:
+        if _s3_error_code(error) == "ServerSideEncryptionConfigurationNotFoundError":
+            return [], []
+        return [], [
+            f"the default encryption of bucket '{bucket}' "
+            f"(s3:GetEncryptionConfiguration {_assessment_error_label(error)})"
+        ]
+    references = sorted(
+        {
+            str(default.get("KMSMasterKeyID") or "alias/aws/s3")
+            for rule in (
+                (response or {}).get("ServerSideEncryptionConfiguration") or {}
+            ).get("Rules")
+            or []
+            if isinstance(rule, dict)
+            for default in [rule.get("ApplyServerSideEncryptionByDefault") or {}]
+            if default.get("SSEAlgorithm") in BROWSER_RECORDING_KMS_ALGORITHMS
+        }
+    )
+    arns: List[str] = []
+    unread: List[str] = []
+    for reference in references:
+        if reference not in key_cache:
+            try:
+                key_cache[reference] = kms_client.describe_key(KeyId=reference)[
+                    "KeyMetadata"
+                ]["Arn"]
+            except Exception as error:
+                key_cache[reference] = error
+        if isinstance(key_cache[reference], Exception):
+            unread.append(
+                f"key {reference} of bucket '{bucket}' (kms:DescribeKey "
+                f"{_assessment_error_label(key_cache[reference])})"
+            )
+        else:
+            arns.append(str(key_cache[reference]))
+    return arns, unread
+
+
+def check_browser_recording_write_scp(
+    browser_inventory: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """AC-06: no attached SCP refuses a recording browser's write to its bucket.
+
+    The population is every custom browser that records to a bucket under a
+    named execution role; the Browser Session Recording row reports the rest.
+    A browser fails when a service control policy attached to its account, an
+    organizational unit above it or the root denies the role s3:PutObject on
+    the recording prefix or kms:GenerateDataKey on the bucket's key, or when
+    some level of that chain has no attached SCP allowing either, since an
+    action no SCP at a level allows is denied below it. The management account
+    and an account in no organization are bound by no SCP. A policy, an
+    attachment or a condition that could not be judged is N/A, never Passed.
+    """
+    if agentcore_client is None:
+        return []
+    try:
+        inventory = browser_inventory or get_custom_browser_inventory()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                "AC-06",
+                AGENTCORE_BROWSER_RECORDING_SCP_FINDING,
+                error,
+                SERVICE_CONTROL_POLICY_REFERENCE_URL,
+            )
+        ]
+    if inventory.get("list_error"):
+        return []
+
+    recorders = []
+    for item in inventory.get("items", []):
+        summary = item["summary"]
+        detail = item["detail"]
+        browser_id = summary.get("browserId", "unknown")
+        recording = detail.get("recording") or {}
+        s3_location = recording.get("s3Location") or {}
+        bucket = s3_location.get("bucket")
+        role_arn = detail.get("executionRoleArn")
+        arn_parts = str(
+            detail.get("browserArn") or summary.get("browserArn") or ""
+        ).split(":")
+        if not (
+            recording.get("enabled") is True
+            and bucket
+            and role_arn
+            and len(arn_parts) >= 6
+            and arn_parts[1]
+            and arn_parts[4]
+        ):
+            continue
+        key_prefix = _browser_recording_key_prefix(s3_location.get("prefix"))
+        recorders.append(
+            {
+                "label": (
+                    f"Custom browser '{summary.get('name', browser_id)}' ({browser_id})"
+                ),
+                "role": str(role_arn),
+                "account": arn_parts[4],
+                "bucket": bucket,
+                "destination": f"s3://{bucket}/{key_prefix}",
+                "object_arn": f"arn:{arn_parts[1]}:s3:::{bucket}/{key_prefix}*",
+            }
+        )
+    if not recorders:
+        return []
+
+    def rows(status: str, text: str, resolution: str) -> List[Dict[str, Any]]:
+        return [
+            create_finding(
+                check_id="AC-06",
+                finding_name=AGENTCORE_BROWSER_RECORDING_SCP_FINDING,
+                finding_details=f"{recorder['label']} records to "
+                f"{recorder['destination']} as execution role {recorder['role']}. "
+                f"{text}",
+                resolution=resolution,
+                reference=SERVICE_CONTROL_POLICY_REFERENCE_URL,
+                severity=(
+                    SeverityEnum.INFORMATIONAL
+                    if status == StatusEnum.NA
+                    else SeverityEnum.MEDIUM
+                ),
+                status=status,
+            )
+            for recorder in recorders
+        ]
+
+    if organizations_client is None:
+        return rows(
+            StatusEnum.NA,
+            "Whether a service control policy refuses its write was not judged: "
+            "no Organizations client was available.",
+            "Retry where the Organizations client can be created.",
+        )
+    try:
+        policies = _paginate_aws_list(
+            organizations_client,
+            "list_policies",
+            "Policies",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            Filter="SERVICE_CONTROL_POLICY",
+        )
+    except Exception as error:
+        label = _assessment_error_label(error)
+        if label == "AWSOrganizationsNotInUseException":
+            return rows(
+                StatusEnum.PASSED,
+                "The account is in no organization, so no service control "
+                "policy applies to the write.",
+                "No action required",
+            )
+        return rows(
+            StatusEnum.NA,
+            "Whether a service control policy refuses its write was not judged: "
+            f"organizations:ListPolicies failed with {label}. A member account "
+            "cannot read the organization's policies.",
+            "Run the assessment from the management account or an Organizations "
+            "delegated administrator, with organizations:ListPolicies, "
+            "organizations:DescribePolicy, organizations:ListTargetsForPolicy and "
+            "organizations:ListParents.",
+        )
+
+    accounts = {recorder["account"] for recorder in recorders}
+    # A customer managed SCP's ARN carries the management account, which no
+    # SCP restricts.
+    if accounts <= {_arn_account(policy.get("Arn")) for policy in policies}:
+        return rows(
+            StatusEnum.PASSED,
+            "Its account is the organization's management account, which no "
+            "service control policy restricts.",
+            "No action required",
+        )
+
+    unread_policies: List[str] = []
+    documents: List[Tuple[str, List[Dict[str, Any]], Optional[Set[str]]]] = []
+    for policy in policies:
+        name = str(policy.get("Name", policy.get("Id", "unknown")))
+        try:
+            detail = organizations_client.describe_policy(PolicyId=policy["Id"])
+        except Exception as error:
+            unread_policies.append(
+                f"service control policy '{name}' (organizations:DescribePolicy "
+                f"{_assessment_error_label(error)})"
+            )
+            continue
+        statements = _document_statements(
+            (detail.get("Policy") or {}).get("Content", "")
+        )
+        try:
+            targets: Optional[Set[str]] = {
+                str(target.get("TargetId", ""))
+                for target in _paginate_aws_list(
+                    organizations_client,
+                    "list_targets_for_policy",
+                    "Targets",
+                    token_request_key="NextToken",
+                    token_response_key="NextToken",
+                    PolicyId=policy["Id"],
+                )
+            }
+        except Exception as error:
+            targets = None
+            unread_policies.append(
+                f"the attachment targets of service control policy '{name}' "
+                f"(organizations:ListTargetsForPolicy "
+                f"{_assessment_error_label(error)})"
+            )
+        documents.append((name, statements, targets))
+
+    chains: Dict[str, Any] = {}
+    key_cache: Dict[str, Any] = {}
+    bucket_keys: Dict[Tuple[str, str], Tuple[List[str], List[str]]] = {}
+    findings: List[Dict[str, Any]] = []
+    for recorder in recorders:
+        account = recorder["account"]
+        if account not in chains:
+            try:
+                chains[account] = _assessed_account_parent_chain(account)
+            except Exception as error:
+                chains[account] = error
+        chain = chains[account]
+        bucket_key = (recorder["bucket"], account)
+        if bucket_key not in bucket_keys:
+            bucket_keys[bucket_key] = _recording_bucket_key_arns(
+                recorder["bucket"], account, key_cache
+            )
+        key_arns, unread = bucket_keys[bucket_key]
+        unread = list(unread)
+        problems: List[str] = []
+        conditional: List[str] = []
+        if isinstance(chain, Exception):
+            unread.append(
+                "the organizational units and root above account "
+                f"{account} (organizations:ListParents "
+                f"{_assessment_error_label(chain)})"
+            )
+        else:
+            labels = {
+                node: f"{ORGANIZATIONS_TARGET_TYPE_LABELS.get(kind, kind)} {node}"
+                for node, kind in chain
+            }
+            legs = [
+                ("s3:PutObject", BROWSER_RECORDING_WRITE_ACTION, recorder["object_arn"])
+            ]
+            legs += [
+                ("kms:GenerateDataKey", RECORDING_KEY_USE_ACTION, arn)
+                for arn in key_arns
+            ]
+            for spelling, action, resource in legs:
+                allowed: Dict[str, Tuple[str, ...]] = {
+                    node: ("none",) for node in labels
+                }
+                for name, statements, targets in documents:
+                    bound = (
+                        [node for node in labels if node in targets]
+                        if targets is not None
+                        else []
+                    )
+                    where = ", ".join(labels[node] for node in bound)
+                    for statement in statements:
+                        effect = statement.get("Effect")
+                        if effect == "Deny":
+                            reaches = (
+                                _statement_reaches_object(statement, action, resource)
+                                if action == BROWSER_RECORDING_WRITE_ACTION
+                                else _statement_matches_action(statement, action)
+                                and _statement_resource_covers(statement, [resource])
+                            )
+                        elif effect == "Allow":
+                            reaches = _statement_matches_action(
+                                statement, action
+                            ) and _statement_resource_covers(statement, [resource])
+                        else:
+                            continue
+                        if not reaches or not bound:
+                            continue
+                        holds, keys = _recording_write_condition_holds(
+                            statement, recorder["role"], account
+                        )
+                        if holds is False:
+                            continue
+                        if effect == "Deny" and holds:
+                            problems.append(
+                                f"service control policy '{name}', attached to "
+                                f"{where}, denies {spelling} on {resource}"
+                            )
+                        elif effect == "Deny":
+                            conditional.append(
+                                f"whether service control policy '{name}', attached "
+                                f"to {where}, denies {spelling} on {resource} under "
+                                f"{', '.join(keys)}"
+                            )
+                        for node in bound if effect == "Allow" else []:
+                            if holds:
+                                allowed[node] = ("allowed",)
+                            elif allowed[node] == ("none",):
+                                allowed[node] = ("conditional", name, ", ".join(keys))
+                for node, state in allowed.items():
+                    if state == ("none",) and not unread_policies:
+                        problems.append(
+                            f"no service control policy attached to {labels[node]} "
+                            f"allows {spelling} on {resource}, so it is "
+                            "implicitly denied"
+                        )
+                    elif state[0] == "conditional":
+                        _, name, keys = state
+                        conditional.append(
+                            f"whether service control policy '{name}' allows "
+                            f"{spelling} on {resource} at {labels[node]} under {keys}"
+                        )
+        unread.extend(unread_policies)
+        not_judged = conditional + [f"{entry} was not read" for entry in unread]
+        not_read = f" Not judged: {'; '.join(not_judged)}." if not_judged else ""
+        base = (
+            f"{recorder['label']} records to {recorder['destination']} as execution "
+            f"role {recorder['role']}"
+        )
+        if problems:
+            findings.append(
+                create_finding(
+                    check_id="AC-06",
+                    finding_name=AGENTCORE_BROWSER_RECORDING_SCP_FINDING,
+                    finding_details=(
+                        f"{base}, but {'; '.join(problems)}, so the role cannot "
+                        f"write its recordings.{not_read}"
+                    ),
+                    resolution=(
+                        "Exempt the browser execution role by aws:PrincipalArn from "
+                        "the service control policy Deny, or attach a policy that "
+                        "allows s3:PutObject and kms:GenerateDataKey at each level "
+                        "named."
+                    ),
+                    reference=SERVICE_CONTROL_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif not_judged:
+            findings.append(
+                create_finding(
+                    check_id="AC-06",
+                    finding_name=AGENTCORE_BROWSER_RECORDING_SCP_FINDING,
+                    finding_details=(
+                        f"{base}. Whether a service control policy refuses the "
+                        f"write was not judged.{not_read}"
+                    ),
+                    resolution=(
+                        "Grant the Organizations reads named, or remove the "
+                        "condition, and retry."
+                    ),
+                    reference=SERVICE_CONTROL_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            keys_text = (
+                f" or kms:GenerateDataKey on key {', '.join(key_arns)}"
+                if key_arns
+                else ""
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-06",
+                    finding_name=AGENTCORE_BROWSER_RECORDING_SCP_FINDING,
+                    finding_details=(
+                        f"{base}. No service control policy attached to account "
+                        f"{account}, an organizational unit above it or the root "
+                        f"denies the role s3:PutObject on {recorder['object_arn']}"
+                        f"{keys_text}, and an attached policy allows each at all "
+                        f"{len(chain)} levels from the account to the root. "
+                        "Resource control policies are not judged."
+                    ),
+                    resolution="No action required",
+                    reference=SERVICE_CONTROL_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
     return findings
 
 
@@ -36493,6 +36970,11 @@ def lambda_handler(event, context):
                 lambda: check_browser_tool_recording(
                     browser_inventory, permission_cache
                 ),
+            ),
+            (
+                ["AC-06"],
+                "Browser Recording Write SCP",
+                lambda: check_browser_recording_write_scp(browser_inventory),
             ),
             (["AC-07"], "Memory Configuration", check_agentcore_memory_configuration),
             (["AC-13"], "Gateway Configuration", check_agentcore_gateway_configuration),
