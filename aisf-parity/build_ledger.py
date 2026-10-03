@@ -1700,7 +1700,28 @@ FOUNDATION_ROWS = [
         "reads the detector's Features and passes when RUNTIME_MONITORING is "
         "ENABLED, reporting the ECS_FARGATE_AGENT_MANAGEMENT, "
         "EC2_AGENT_MANAGEMENT and EKS_ADDON_MANAGEMENT states without failing on "
-        "them. EKS_RUNTIME_MONITORING alone fails, because it covers EKS only",
+        "them. EKS_RUNTIME_MONITORING alone fails, because it covers EKS only. "
+        "SM-38's coverage row pages ListCoverage and fails a covered resource that "
+        "is not HEALTHY, an EKS cluster reporting 0 compatible nodes or fewer "
+        "covered than compatible nodes, and every EKS cluster, ECS cluster and "
+        "running non-Windows EC2 instance missing from coverage. It counts the running "
+        "EC2 instances tagged with each cluster's name (eks:cluster-name, "
+        "eks:eks-cluster-name or kubernetes.io/cluster/<name>) and fails a "
+        "cluster with more of them than CompatibleNodes. Every running instance "
+        "is judged once, by its cluster's count or as a plain EC2 instance when "
+        "it carries no cluster tag or names a cluster that is not listed, so a "
+        "node from any node group, self-managed group or Karpenter is in the "
+        "population without eks:ListNodegroups. It fails a cluster with a "
+        "Fargate profile, or whose DescribeCluster remoteNetworkConfig names "
+        "remote node networks for EKS Hybrid Nodes, which Runtime Monitoring "
+        "does not support. The Lambda tier row reads LAMBDA_NETWORK_LOGS and "
+        "Inspector Lambda standard and code scanning per function. The "
+        "recommendation's routing step (findings to Security Hub or EventBridge) "
+        "is SM-04's GuardDuty Findings Routed to Security Hub and GuardDuty "
+        "Findings Routed to Alerting rows. No row reads GuardDuty findings "
+        "themselves: a finding exists only after an attack, so its absence "
+        "cannot tell a monitored workload from an unmonitored one, and the "
+        "control's evidence is the configuration plus an example alert",
         [],
         6,
     ),

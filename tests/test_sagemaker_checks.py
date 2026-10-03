@@ -10662,11 +10662,14 @@ class TestSM38RuntimeCoverageAndLambdaTier:
         errors=None,
         instances=None,
         fargate=None,
+        clusters=None,
     ):
         """fargate maps an EKS cluster to its Fargate profile names or an
-        exception; an unnamed cluster has none."""
+        exception; an unnamed cluster has none. clusters maps an EKS cluster
+        to its DescribeCluster fields or an exception."""
         errors = errors or {}
         fargate = fargate or {}
+        clusters = clusters or {}
         self.ec2_calls = []
         coverage = coverage or []
         functions = functions if functions is not None else [{"FunctionName": "fn"}]
@@ -10715,6 +10718,14 @@ class TestSM38RuntimeCoverageAndLambdaTier:
                         "list_fargate_profiles": fargate_profiles,
                     }
                 )
+
+                def describe_cluster(name):
+                    value = clusters.get(name, {})
+                    if isinstance(value, Exception):
+                        raise value
+                    return {"cluster": dict(value, name=name)}
+
+                client.describe_cluster.side_effect = describe_cluster
             elif service == "ecs":
                 arns = [
                     f"arn:aws:ecs:us-east-1:111122223333:cluster/{n}" for n in ecs or []
@@ -11026,6 +11037,97 @@ class TestSM38RuntimeCoverageAndLambdaTier:
         )
         assert [r["Status"] for r in cov] == ["Passed"]
         assert "1 EKS node instance(s)" in cov[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            ("eks:cluster-name", "prod"),
+            ("eks:eks-cluster-name", "prod"),
+            ("kubernetes.io/cluster/prod", "owned"),
+        ],
+        ids=["managed-node-group", "auto-mode", "self-managed-or-karpenter"],
+    )
+    def test_more_running_nodes_than_compatible_ones_fails_that_cluster(self, tag):
+        # GuardDuty counts 2 compatible nodes in prod, and 3 running instances
+        # carry prod's tag, so one node runs outside agent coverage. dev's two
+        # nodes match its count.
+        key, value = tag
+        prod = [self._instance(f"i-p{n}", tags={key: value}) for n in range(3)]
+        dev = [
+            self._instance(f"i-d{n}", tags={"eks:cluster-name": "dev"})
+            for n in range(2)
+        ]
+        cov = self._coverage_rows(
+            coverage=[
+                self._eks("dev", covered=2, compatible=2),
+                self._eks("prod", covered=2, compatible=2),
+            ],
+            eks=["dev", "prod"],
+            instances=dev + prod,
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        details = cov[0]["Finding_Details"]
+        assert (
+            "EKS cluster prod has 3 running EC2 node instance(s) but GuardDuty "
+            "counts 2 compatible node(s), so 1 node(s) run outside agent coverage"
+        ) in details
+        assert "dev" not in details
+
+    def test_as_many_running_nodes_as_compatible_ones_passes(self):
+        cov = self._coverage_rows(
+            coverage=[self._eks("prod", covered=2, compatible=2)],
+            eks=["prod"],
+            instances=[
+                self._instance("i-1", tags={"eks:cluster-name": "prod"}),
+                self._instance("i-2", tags={"kubernetes.io/cluster/prod": "owned"}),
+            ],
+        )
+        assert [r["Status"] for r in cov] == ["Passed"]
+
+    def test_a_node_tagged_for_an_unlisted_cluster_is_judged_as_an_instance(self):
+        cov = self._coverage_rows(
+            coverage=[self._eks("prod")],
+            eks=["prod"],
+            instances=[self._instance("i-orphan", tags={"eks:cluster-name": "gone"})],
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert (
+            "EC2 instance i-orphan has no Runtime Monitoring coverage"
+            in (cov[0]["Finding_Details"])
+        )
+
+    def test_a_cluster_configured_for_hybrid_nodes_fails(self):
+        cov = self._coverage_rows(
+            coverage=[self._eks("edge"), self._eks("prod")],
+            eks=["edge", "prod"],
+            clusters={
+                "edge": {
+                    "remoteNetworkConfig": {
+                        "remoteNodeNetworks": [{"cidrs": ["10.80.0.0/16"]}]
+                    }
+                },
+                "prod": {"remoteNetworkConfig": {"remoteNodeNetworks": []}},
+            },
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        details = cov[0]["Finding_Details"]
+        assert (
+            "EKS cluster edge has remote node network(s) 10.80.0.0/16, so it can "
+            "run EKS Hybrid Nodes, which Runtime Monitoring does not support"
+        ) in details
+        assert "prod" not in details
+
+    def test_an_unread_cluster_description_withholds_the_pass(self):
+        cov = self._coverage_rows(
+            coverage=[self._eks("prod")],
+            eks=["prod"],
+            clusters={"prod": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert (
+            "eks:DescribeCluster prod (AccessDeniedException)"
+            in (cov[0]["Finding_Details"])
+        )
 
     def test_windows_instance_is_not_compared_and_is_named(self):
         cov = self._named(

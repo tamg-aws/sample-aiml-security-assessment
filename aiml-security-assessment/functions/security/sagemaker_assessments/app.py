@@ -16786,11 +16786,14 @@ def _runtime_coverage_findings(
         ]
 
     eks_clusters = []
+    eks_listed = False
     fargate_profiles = {}
+    hybrid = {}
     try:
         eks_client = boto3.client("eks", config=boto3_config, region_name=region)
         for page in eks_client.get_paginator("list_clusters").paginate():
             eks_clusters.extend(page.get("clusters", []))
+        eks_listed = True
     except Exception as error:
         unread.append(f"eks:ListClusters ({get_assessment_error_label(error)})")
     # AIR-SLF-RT-04: Runtime Monitoring does not cover pods on Fargate, and a
@@ -16808,6 +16811,24 @@ def _runtime_coverage_findings(
                 f"eks:ListFargateProfiles {cluster} "
                 f"({get_assessment_error_label(error)})"
             )
+        # Hybrid Nodes join through the cluster's remote node networks and are
+        # not EC2 instances, so no node count below can see them.
+        try:
+            detail = eks_client.describe_cluster(name=cluster).get("cluster") or {}
+            cidrs = [
+                cidr
+                for network in (detail.get("remoteNetworkConfig") or {}).get(
+                    "remoteNodeNetworks"
+                )
+                or []
+                for cidr in network.get("cidrs") or []
+            ]
+            if cidrs:
+                hybrid[cluster] = cidrs
+        except Exception as error:
+            unread.append(
+                f"eks:DescribeCluster {cluster} ({get_assessment_error_label(error)})"
+            )
     ecs_clusters = []
     try:
         ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
@@ -16819,6 +16840,7 @@ def _runtime_coverage_findings(
         unread.append(f"ecs:ListClusters ({get_assessment_error_label(error)})")
     instances = []
     eks_nodes = 0
+    node_counts = {}
     windows = 0
     try:
         ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
@@ -16827,13 +16849,35 @@ def _runtime_coverage_findings(
         ):
             for reservation in page.get("Reservations", []):
                 for instance in reservation.get("Instances", []):
-                    tag_keys = [
-                        tag.get("Key") or "" for tag in instance.get("Tags") or []
-                    ]
-                    if "eks:cluster-name" in tag_keys or any(
-                        key.startswith("kubernetes.io/cluster/") for key in tag_keys
+                    tags = {
+                        tag.get("Key") or "": tag.get("Value")
+                        for tag in instance.get("Tags") or []
+                    }
+                    node_cluster = (
+                        tags.get("eks:cluster-name")
+                        or tags.get("eks:eks-cluster-name")
+                        or next(
+                            (
+                                key[len("kubernetes.io/cluster/") :]
+                                for key in tags
+                                if key.startswith("kubernetes.io/cluster/")
+                            ),
+                            None,
+                        )
+                    )
+                    if (
+                        node_cluster
+                        and eks_listed
+                        and node_cluster not in eks_clusters
+                        and instance.get("Platform") != "windows"
+                        and instance.get("InstanceId")
                     ):
+                        # The cluster this node names is not in this Region's
+                        # list, so no cluster count covers it.
+                        instances.append(instance["InstanceId"])
+                    elif node_cluster:
                         eks_nodes += 1
+                        node_counts[node_cluster] = node_counts.get(node_cluster, 0) + 1
                     elif instance.get("Platform") == "windows":
                         windows += 1
                     elif instance.get("InstanceId"):
@@ -16887,6 +16931,14 @@ def _runtime_coverage_findings(
                     f"{label} covers {covered_nodes} of {compatible} compatible nodes"
                 )
                 continue
+            running = node_counts.get(name, 0)
+            if running > compatible:
+                problems.append(
+                    f"EKS cluster {name} has {running} running EC2 node instance(s) "
+                    f"but GuardDuty counts {compatible} compatible node(s), so "
+                    f"{running - compatible} node(s) run outside agent coverage"
+                )
+                continue
         healthy.append(label)
     for cluster in eks_clusters:
         if cluster not in covered["EKS"]:
@@ -16896,6 +16948,12 @@ def _runtime_coverage_findings(
                 f"EKS cluster {cluster} has Fargate profile(s) "
                 f"{', '.join(sorted(fargate_profiles[cluster])[:5])}, whose pods "
                 "Runtime Monitoring does not cover"
+            )
+        if hybrid.get(cluster):
+            problems.append(
+                f"EKS cluster {cluster} has remote node network(s) "
+                f"{', '.join(hybrid[cluster][:5])}, so it can run EKS Hybrid "
+                "Nodes, which Runtime Monitoring does not support"
             )
     for cluster in ecs_clusters:
         if cluster not in covered["ECS"]:
@@ -16999,7 +17057,9 @@ def _runtime_coverage_findings(
                 finding_details=(
                     f"All {len(healthy)} resource(s) in Runtime Monitoring coverage "
                     "are HEALTHY, including every EKS cluster listed, each with "
-                    "every compatible node covered and no Fargate profile, every "
+                    "every compatible node covered, no more running EC2 nodes "
+                    "than compatible ones, no Fargate profile and no remote node "
+                    "network, every "
                     "ECS cluster listed, and "
                     f"every running EC2 instance ({len(instances)}): "
                     f"{', '.join(healthy[:10])}. {excluded}."

@@ -370,6 +370,15 @@ section.
   is not SSE-KMS under a customer managed key, even when the bucket default
   is. An unread object holds back `Passed`. Earlier the check only tested
   that an expected value was recorded.
+- `SM-38` counts the running EC2 instances tagged with each EKS cluster's
+  name (`eks:cluster-name`, `eks:eks-cluster-name` or
+  `kubernetes.io/cluster/<name>`) and fails a cluster with more of them than
+  the `CompatibleNodes` GuardDuty reports, so a node outside agent coverage
+  no longer hides behind a HEALTHY cluster. An instance tagged for a cluster
+  that is not listed is judged as a plain EC2 instance. A cluster whose
+  `DescribeCluster` `remoteNetworkConfig` names remote node networks fails,
+  because Runtime Monitoring does not support EKS Hybrid Nodes, and an
+  unread cluster description holds back `Passed`.
 - `SM-43` lists each object under an `S3Prefix` source or a multi-model
   `ModelDataUrl` prefix with `ListObjectsV2` and reads each one with
   `HeadObject`, failing an object that is not SSE-KMS under a customer
