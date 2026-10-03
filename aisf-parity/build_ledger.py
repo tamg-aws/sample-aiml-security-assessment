@@ -159,7 +159,24 @@ AI_SUBJECT_ROWS = [
         3,
     ),
     ("AIR-BDR-MDL-01", COVERED, None, "bedrock_assessments", ["BR-42"], "", [], 3),
-    ("AIR-BDR-MDL-03", COVERED, None, "bedrock_assessments", ["BR-43"], "", [], 3),
+    (
+        "AIR-BDR-MDL-03",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-43", "BR-42"],
+        "BR-43 reads the attached Region-deny SCPs and every inference profile in "
+        "each assessed Region. It fails an allow-list that admits unspecified while "
+        "global profiles exist, and one that omits a destination Region of any "
+        "available geographic profile; the row names which of those profiles a "
+        "call named as requestParameters.modelId in the last 24 hours of event "
+        "history, without narrowing the test, since a profile not called in the "
+        "window is still callable. BR-42 carries the IAM step, failing an "
+        "identity policy that grants invocation on an unscoped foundation-model "
+        "or inference-profile ARN",
+        [],
+        3,
+    ),
     ("AIR-BDR-MDL-04", COVERED, None, "bedrock_assessments", ["BR-44"], "", [], 3),
     ("AIR-BDR-MDL-09", COVERED, None, "bedrock_assessments", ["BR-45"], "", [], 3),
     (

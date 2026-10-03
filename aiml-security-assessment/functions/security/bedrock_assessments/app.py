@@ -22379,6 +22379,64 @@ def _inference_profile_routing(api_region: str = "") -> Dict[str, Any]:
     return routing
 
 
+def _event_model_id(event: Dict[str, Any]) -> str:
+    """Return the profile or model ID a LookupEvents record's modelId names, or ''.
+
+    An inference profile ARN is reduced to the ID after its last '/', which is
+    the inferenceProfileId ListInferenceProfiles returns for system-defined and
+    application profiles alike.
+    """
+    try:
+        record = json.loads(event.get("CloudTrailEvent") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    parameters = record.get("requestParameters") or {}
+    if not isinstance(parameters, dict):
+        return ""
+    model_id = str(parameters.get("modelId") or "")
+    if model_id.startswith("arn:") and "inference-profile/" in model_id:
+        return model_id.rsplit("/", 1)[-1]
+    return model_id
+
+
+def _inference_profiles_called(api_region: str = "") -> Dict[str, Any]:
+    """Count the modelId values named by model calls in recent event history.
+
+    Reads the four inference management events in every assessed Region over
+    the BR-56 lookback, to the same page cap. Returns {"called": {id: count},
+    "gaps": [what was not read in full]}.
+    """
+    called: Dict[str, int] = {}
+    gaps = []
+    start_time = datetime.now(timezone.utc) - LLM_JACKING_LOOKBACK
+    for source_region in _assessed_regions(api_region):
+        for event_name in INFERENCE_REGION_EVENTS:
+            try:
+                result = _llm_jacking_lookup(
+                    boto3.client(
+                        "cloudtrail", config=boto3_config, region_name=source_region
+                    ),
+                    event_name,
+                    start_time,
+                )
+            except Exception as error:
+                gaps.append(
+                    f"{event_name} in {source_region} "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            if result["truncated"]:
+                gaps.append(
+                    f"{event_name} in {source_region} past the "
+                    f"{LLM_JACKING_MAX_PAGES_PER_ACTION}-page cap"
+                )
+            for event in result["events"]:
+                model_id = _event_model_id(event)
+                if model_id:
+                    called[model_id] = called.get(model_id, 0) + 1
+    return {"called": called, "gaps": gaps}
+
+
 def _describe_inference_profile_routing(
     routing: Dict[str, Any], api_region: str = ""
 ) -> str:
@@ -22763,9 +22821,10 @@ def check_bedrock_region_invocation_control(
 
         outside_profiles = 0
         outside_regions = set()
+        outside_ids = set()
         if summary["allow_lists"]:
             for routing in routings.values():
-                for destinations in routing["destinations"].values():
+                for profile_id, destinations in routing["destinations"].items():
                     blocked = [
                         name
                         for name in destinations
@@ -22774,12 +22833,39 @@ def check_bedrock_region_invocation_control(
                     if blocked:
                         outside_profiles += 1
                         outside_regions.update(blocked)
+                        outside_ids.add(profile_id)
+        # The verdict stays on every available profile: a profile no call named
+        # in the lookback can still be called tomorrow, so use is reported
+        # beside the destination test and never narrows it.
+        use_text = ""
+        if outside_ids:
+            use = _inference_profiles_called(api_region)
+            in_use = sorted(name for name in outside_ids if name in use["called"])
+            use_text = (
+                " Of those, {} named as modelId by a model call in the last {} hours "
+                "of CloudTrail event history: {}; a profile no call named in that "
+                "window is still callable, so the test covers every available "
+                "profile.{}".format(
+                    f"{len(in_use)} were" if in_use else "none was",
+                    int(LLM_JACKING_LOOKBACK.total_seconds() // 3600),
+                    ", ".join(
+                        f"{name} ({use['called'][name]} call(s))" for name in in_use
+                    )
+                    or "no profile",
+                    " Event history was not read in full ({}), so a profile called "
+                    "in the unread events is not named.".format(
+                        "; ".join(use["gaps"][:8])
+                    )
+                    if use["gaps"]
+                    else "",
+                )
+            )
         destination_text = (
             " {} geographic profile(s) route to a Region the allow-list does not "
             "name ({}); a request routed to a blocked destination Region fails, so "
             "extend the allow-list to every destination of a profile in use or "
-            "stop using it.".format(
-                outside_profiles, ", ".join(sorted(outside_regions))
+            "stop using it.{}".format(
+                outside_profiles, ", ".join(sorted(outside_regions)), use_text
             )
             if outside_profiles
             else ""
@@ -22819,8 +22905,8 @@ def check_bedrock_region_invocation_control(
                     "{} service control policy statement(s) condition Bedrock "
                     "invocation on the request Region: {}, but the allowed set "
                     "does not include every destination Region of the inference "
-                    "profiles available in the assessed Regions.{} Which profiles "
-                    "are in use is not read. Observed routing: {}.{}".format(
+                    "profiles available in the assessed Regions.{} Observed "
+                    "routing: {}.{}".format(
                         len(described),
                         "; ".join(described[:5]),
                         destination_text,

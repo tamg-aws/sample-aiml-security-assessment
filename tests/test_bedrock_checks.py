@@ -11135,11 +11135,31 @@ class TestBR43RegionInvocationControl:
         profiles=None,
         profile_pages=None,
         profile_error=None,
+        events=None,
+        events_error=None,
     ):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": "123456789012"}
         }
+        cloudtrail_client = MagicMock()
+        if events_error is not None:
+            cloudtrail_client.lookup_events.side_effect = events_error
+        else:
+            # events is {event name: [modelId, ...]}.
+            cloudtrail_client.lookup_events.side_effect = lambda **kwargs: {
+                "Events": [
+                    {
+                        "CloudTrailEvent": json.dumps(
+                            {"requestParameters": {"modelId": model_id}}
+                        )
+                    }
+                    for model_id in (events or {}).get(
+                        kwargs["LookupAttributes"][0]["AttributeValue"], []
+                    )
+                ]
+            }
+        self.cloudtrail = cloudtrail_client
         if account != "123456789012":
             # A member account that is not a delegated administrator is refused
             # ListPolicies, which is what decides the organization view.
@@ -11171,6 +11191,7 @@ class TestBR43RegionInvocationControl:
                 "organizations": org_client,
                 "sts": sts_client,
                 "bedrock": bedrock_client,
+                "cloudtrail": cloudtrail_client,
             }[service],
         ):
             return extract_csv_data(
@@ -12008,6 +12029,97 @@ class TestBR43RegionInvocationControl:
             in detail
         )
         assert "a request routed to a blocked destination Region fails" in detail
+
+    EAST_ONLY = (
+        "EastOnly",
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Action": ALL_REGION_ACTIONS,
+                    "Resource": "*",
+                    "Condition": {
+                        "StringNotEquals": {
+                            "aws:RequestedRegion": ["us-east-1", "unspecified"]
+                        }
+                    },
+                }
+            ],
+        },
+    )
+
+    def test_br43_names_the_outside_profiles_in_use_and_still_fails(self):
+        """MDL-03: the destination test ran over every available profile and its
+        text said use is not read. It now names the profiles that calls in event
+        history named, by ID or by profile ARN, and keeps the Failed."""
+        profile_arn = (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+            + self.BOUNDED_PROFILE["inferenceProfileId"]
+        )
+        findings = self._run(
+            self._inventory([self.EAST_ONLY]),
+            profiles=[self.IN_REGION_PROFILE, self.BOUNDED_PROFILE],
+            events={
+                "InvokeModel": [profile_arn],
+                "Converse": [
+                    self.BOUNDED_PROFILE["inferenceProfileId"],
+                    self.IN_REGION_PROFILE["inferenceProfileId"],
+                ],
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert (
+            "Of those, 1 were named as modelId by a model call in the last 24 hours "
+            "of CloudTrail event history: "
+            "us.anthropic.claude-3-sonnet-20240229-v1:0 (2 call(s))" in detail
+        )
+        assert "us.amazon.nova-lite-v1:0 (" not in detail
+        assert "Which profiles are in use is not read" not in detail
+        assert "not read in full" not in detail
+        looked_up = {
+            c.kwargs["LookupAttributes"][0]["AttributeValue"]
+            for c in self.cloudtrail.lookup_events.call_args_list
+        }
+        assert looked_up == {
+            "InvokeModel",
+            "InvokeModelWithResponseStream",
+            "Converse",
+            "ConverseStream",
+        }
+
+    def test_br43_an_outside_profile_no_call_named_still_fails(self):
+        findings = self._run(
+            self._inventory([self.EAST_ONLY]),
+            profiles=[self.BOUNDED_PROFILE],
+            events={"InvokeModel": ["anthropic.claude-3-sonnet-20240229-v1:0"]},
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "Of those, none was named as modelId" in detail
+        assert "a profile no call named in that window is still callable" in detail
+
+    def test_br43_unread_event_history_is_named_and_the_failure_stands(self):
+        findings = self._run(
+            self._inventory([self.EAST_ONLY]),
+            profiles=[self.BOUNDED_PROFILE],
+            events_error=_client_error(
+                "AccessDeniedException", operation="LookupEvents"
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "Event history was not read in full (InvokeModel in us-east-1 "
+            "(AccessDeniedException)" in findings[0]["Finding_Details"]
+        )
+
+    def test_br43_reads_no_event_history_without_an_outside_profile(self):
+        findings = self._run(
+            self._inventory([self.EAST_ONLY]), profiles=[self.IN_REGION_PROFILE]
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        self.cloudtrail.lookup_events.assert_not_called()
 
     def test_br43_allow_list_missing_a_profile_destination_fails(self):
         # MDL-03: the allowed set must include every destination Region of a
