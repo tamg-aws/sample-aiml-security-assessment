@@ -1037,6 +1037,27 @@ MUTATIONS = [
         "find": '                if action.startswith("bedrock:invokemodel") or not _grant_survives(\n                    permissions, action\n                ):\n',
         "replace": '                if action.startswith("bedrock:invokemodel"):\n',
     },
+    {
+        "name": "AC-27 does not read consent portal execution roles",
+        "file": AGENTCORE,
+        "defect": "the setup guide creates the portal role with no Condition and nothing re-checks it, so a role any AgentCore resource could assume for another account kept access to the gateway's OAuth client secrets",
+        "find": "    findings.extend(_consent_portal_role_trust_findings(trust_cache))\n",
+        "replace": "",
+    },
+    {
+        "name": "AC-27 accepts any resource type in a portal role's aws:SourceArn",
+        "file": AGENTCORE,
+        "defect": "an aws:SourceArn naming gateway/* lets the service assume the portal role for a gateway, not only for the portal",
+        "find": '        unscoped = _statements_without_scoped_source_arn(\n            statements, account_id, resource_types=("consent-portal",)\n        )\n',
+        "replace": "        unscoped = _statements_without_scoped_source_arn(\n            statements, account_id, resource_types=None\n        )\n",
+    },
+    {
+        "name": "AC-27 passes a consent portal it could not read",
+        "file": AGENTCORE,
+        "defect": "a denied GetConsentPortal says nothing about the role's trust, so a Passed from it is a clean result from a failed read",
+        "find": '                    "Grant bedrock-agentcore:GetConsentPortal and retry.",\n                    SeverityEnum.INFORMATIONAL,\n                    StatusEnum.NA,\n',
+        "replace": '                    "Grant bedrock-agentcore:GetConsentPortal and retry.",\n                    SeverityEnum.INFORMATIONAL,\n                    StatusEnum.PASSED,\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1296,6 +1317,9 @@ GROUPS: dict[str, str] = {
     "AC-44 credits a log-group pattern open in the account segment": "in the AgentCore verdict legs",
     "AC-44 credits PutIndexPolicy on any log group": "in the AgentCore verdict legs",
     "AC-44 counts an extra grant the role's own Deny removes": "in the AgentCore verdict legs",
+    "AC-27 does not read consent portal execution roles": "in the AgentCore verdict legs",
+    "AC-27 accepts any resource type in a portal role's aws:SourceArn": "in the AgentCore verdict legs",
+    "AC-27 passes a consent portal it could not read": "in the AgentCore verdict legs",
 }
 
 

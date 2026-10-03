@@ -16130,6 +16130,172 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
             )
         )
 
+    findings.extend(_consent_portal_role_trust_findings(trust_cache))
+    return findings
+
+
+def _consent_portal_role_trust_findings(
+    trust_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Judge each consent portal's execution role trust for a confused-deputy guard.
+
+    identity-consent-portal-execution-role.html lets the role be created with no
+    Condition, because the portal ARN does not exist yet, and asks for
+    aws:SourceAccount and an aws:SourceArn naming the portal to be added once it
+    does; nothing in the service re-checks it. ListConsentPortals omits the role,
+    so each portal is read with GetConsentPortal.
+    """
+    finding_name = "AgentCore Consent Portal Role Trust"
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-27",
+            finding_name=finding_name,
+            finding_details=details,
+            resolution=resolution,
+            reference=CONFUSED_DEPUTY_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    try:
+        portals = _agentcore_list_all("list_consent_portals", ["consentPortals"])
+    except (BotoCoreError, ClientError) as error:
+        return [
+            row(
+                "Consent portals could not be listed: ListConsentPortals failed "
+                f"with {_assessment_error_label(error)}, so their execution roles' "
+                "trust is not judged.",
+                "Grant bedrock-agentcore:ListConsentPortals and retry.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+
+    findings: List[Dict[str, Any]] = []
+    for portal in portals:
+        portal_id = portal.get("consentPortalId") or "unknown"
+        label = f"Consent portal '{portal.get('name') or portal_id}' ({portal_id})"
+        try:
+            detail = agentcore_client.get_consent_portal(
+                consentPortalIdentifier=portal_id
+            )
+        except (BotoCoreError, ClientError) as error:
+            findings.append(
+                row(
+                    f"{label} could not be read: GetConsentPortal failed with "
+                    f"{_assessment_error_label(error)}, so its execution role's "
+                    "trust is not judged.",
+                    "Grant bedrock-agentcore:GetConsentPortal and retry.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        role_arn = detail.get("executionRoleArn")
+        if not role_arn:
+            findings.append(
+                row(
+                    f"{label} names no execution role, so there is no trust policy "
+                    "to guard.",
+                    "No action required.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        role_name = str(role_arn).rsplit("/", 1)[-1]
+        if role_name not in trust_cache:
+            try:
+                trust_cache[role_name] = iam_client.get_role(RoleName=role_name)[
+                    "Role"
+                ]["AssumeRolePolicyDocument"]
+            except (BotoCoreError, ClientError) as error:
+                trust_cache[role_name] = error
+        document = trust_cache[role_name]
+        if isinstance(document, Exception):
+            findings.append(
+                row(
+                    f"{label} runs as {role_name}, whose trust policy could not be "
+                    f"read: {_assessment_error_label(document)}.",
+                    "Grant iam:GetRole on the role and retry.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        statements = _document_statements(document, effect="Allow")
+        account_id = _arn_account(role_arn)
+        exposed = [
+            statement
+            for statement in statements
+            if _statement_is_confused_deputy_exposed(statement, account_id)
+        ]
+        unscoped = _statements_without_scoped_source_arn(
+            statements, account_id, resource_types=("consent-portal",)
+        )
+        if exposed:
+            findings.append(
+                create_finding(
+                    check_id="AC-27",
+                    finding_name="AgentCore Consent Portal Role Trust Guard Missing",
+                    finding_details=(
+                        f"{label} runs as {role_name}, which has {len(exposed)} of "
+                        f"{len(statements)} Allow statement(s) trusting an AWS service "
+                        "principal or every principal with no aws:SourceAccount or "
+                        "aws:SourceArn condition whose every value names account "
+                        f"{account_id}. The setup guide lets the role be created "
+                        "without its Condition before the portal exists, and the role "
+                        "can read the gateway's credential providers and retrieve "
+                        "their OAuth client secrets."
+                    ),
+                    resolution=(
+                        "Add aws:SourceAccount for this account and an aws:SourceArn "
+                        "naming this consent portal's ARN to every statement of the "
+                        "trust policy."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unscoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-27",
+                    finding_name="AgentCore Consent Portal Role Trust Source ARN Not Scoped",
+                    finding_details=(
+                        f"{label} runs as {role_name}, which has {len(unscoped)} of "
+                        f"{len(statements)} Allow statement(s) trusting an AWS service "
+                        f"principal or every principal whose guard names account "
+                        f"{account_id} but carries no aws:SourceArn condition whose "
+                        "every value names that account, a Region and a "
+                        "consent-portal resource with no wildcard in the type, so the "
+                        "service can assume the role for another AgentCore resource "
+                        "in the account."
+                    ),
+                    resolution=(
+                        "Add an ArnLike aws:SourceArn condition naming this consent "
+                        "portal's ARN to every statement of the trust policy."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                row(
+                    f"{label} runs as {role_name}, whose {len(statements)} Allow "
+                    "statement(s) each carry an aws:SourceArn condition whose every "
+                    f"value names account {account_id}, a Region and a "
+                    "consent-portal resource, or name no service or wildcard "
+                    "principal.",
+                    "No action required.",
+                    SeverityEnum.HIGH,
+                    StatusEnum.PASSED,
+                )
+            )
     return findings
 
 

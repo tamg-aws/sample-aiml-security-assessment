@@ -956,9 +956,12 @@
       ],
       "incumbent_names": [
         "AgentCore Resource-Based Policies Check",
-        "AgentCore Gateway Policy Conditions"
+        "AgentCore Gateway Policy Conditions",
+        "AgentCore Consent Portal Role Trust",
+        "AgentCore Consent Portal Role Trust Guard Missing",
+        "AgentCore Consent Portal Role Trust Source ARN Not Scoped"
       ],
-      "gap": "AC-10 fails an Allow statement on a gateway or runtime resource policy that opens it to any principal without binding the caller's account or organization, and an unreadable gateway or runtime list is N/A. AC-27 judges whether the gateway's Allow statements and its execution role's trust policy carry aws:SourceAccount or aws:SourceArn naming the assessed account in every value, fails an unconditioned statement even when a guarded sibling sits beside it in the same document, and fails a gateway role that trusts a second principal. A gateway resource-policy statement that names a service or wildcard principal also fails unless it carries both aws:SourceAccount naming the account and aws:SourceArn equal to the gateway's own ARN. IfExists, ForAllValues and wildcard values do not count",
+      "gap": "AC-10 fails an Allow statement on a gateway or runtime resource policy that opens it to any principal without binding the caller's account or organization, and an unreadable gateway or runtime list is N/A. AC-27 judges whether the gateway's Allow statements and its execution role's trust policy carry aws:SourceAccount or aws:SourceArn naming the assessed account in every value, fails an unconditioned statement even when a guarded sibling sits beside it in the same document, and fails a gateway role that trusts a second principal. A gateway resource-policy statement that names a service or wildcard principal also fails unless it carries both aws:SourceAccount naming the account and aws:SourceArn equal to the gateway's own ARN. AC-27 also reads each consent portal's executionRoleArn with GetConsentPortal and fails a trust statement with no guard naming the account, or whose aws:SourceArn does not name a consent-portal resource, because the setup guide lets the role be created without its Condition. IfExists, ForAllValues and wildcard values do not count",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1008,7 +1011,10 @@
       ],
       "incumbent_names": [
         "AgentCore VPC Endpoints Check",
-        "AgentCore Gateway Policy Conditions"
+        "AgentCore Gateway Policy Conditions",
+        "AgentCore Consent Portal Role Trust",
+        "AgentCore Consent Portal Role Trust Guard Missing",
+        "AgentCore Consent Portal Role Trust Source ARN Not Scoped"
       ],
       "gap": "AC-08 judges a region holding gateways and no runtime, and requires an available bedrock-agentcore.gateway endpoint when gateways exist, where any endpoint whose name carried agentcore counted. It judges each endpoint's policy against the default allow-everything document and fails a security group set whose inbound ranges together cover 0.0.0.0/0 or ::/0. AC-27 passes the gateway network leg only on a resource policy Deny outside a bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or aws:SourceIp value. Which VPC a gateway's callers run in has no API field, so an endpoint in any VPC of the region counts",
       "extra_iam": [],

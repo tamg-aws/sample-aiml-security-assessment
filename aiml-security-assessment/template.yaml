@@ -1430,6 +1430,9 @@ Resources:
                 # AC-46 reads the capacity provider a runtime names. The service
                 # authorization reference lists the capacity-provider type.
                 - bedrock-agentcore:GetCapacityProvider
+                # AC-27 reads each consent portal's executionRoleArn. The service
+                # authorization reference lists the consent-portal type.
+                - bedrock-agentcore:GetConsentPortal
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -1443,6 +1446,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:capacity-provider/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:consent-portal/*'
             # AC-18 counts workload identities and credential providers to decide
             # which identity data-event types are in use, and AC-14 reads the
             # token vault each provider ARN names. The service authorization

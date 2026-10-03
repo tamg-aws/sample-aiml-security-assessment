@@ -12715,6 +12715,130 @@ class TestAC26LogRetentionAndKeyScope:
         assert findings[0]["Status"] == "N/A"
 
 
+_PORTAL_PREFIX = "arn:aws:bedrock-agentcore:us-east-1:123456789012:consent-portal/"
+
+
+def _portal_trust(source_arn=None, source_account="123456789012"):
+    condition = {}
+    if source_account:
+        condition["StringEquals"] = {"aws:SourceAccount": source_account}
+    if source_arn:
+        condition["ArnLike"] = {"aws:SourceArn": source_arn}
+    statement = {
+        "Effect": "Allow",
+        "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+        "Action": "sts:AssumeRole",
+    }
+    if condition:
+        statement["Condition"] = condition
+    return {"Statement": [statement]}
+
+
+class TestAC27ConsentPortalRoleTrust:
+    """AC-27: each consent portal's execution role trust names the portal."""
+
+    _NAME = "AgentCore Consent Portal Role Trust"
+
+    def _run(self, mock_ac, mock_iam, trusts, portals=None):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+        }
+        if isinstance(portals, Exception):
+            mock_ac.list_consent_portals.side_effect = portals
+        else:
+            mock_ac.list_consent_portals.return_value = {
+                "consentPortals": [
+                    {"consentPortalId": portal_id, "name": portal_id}
+                    for portal_id in trusts
+                ]
+            }
+
+        def get_portal(consentPortalIdentifier):
+            found = trusts[consentPortalIdentifier]
+            if isinstance(found, Exception):
+                raise found
+            return {
+                "consentPortalArn": _PORTAL_PREFIX + consentPortalIdentifier,
+                "executionRoleArn": (
+                    f"arn:aws:iam::123456789012:role/{consentPortalIdentifier}-role"
+                ),
+            }
+
+        mock_ac.get_consent_portal.side_effect = get_portal
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": trusts[RoleName.removesuffix("-role")]}
+        }
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        return [f for f in findings if f["Finding"].startswith(self._NAME)]
+
+    @pytest.mark.parametrize(
+        "trust, name",
+        [
+            (_portal_trust(source_account=None), "Guard Missing"),
+            (_portal_trust(source_account="999999999999"), "Guard Missing"),
+            (_portal_trust(), "Source ARN Not Scoped"),
+            (
+                _portal_trust(
+                    "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*"
+                ),
+                "Source ARN Not Scoped",
+            ),
+        ],
+        ids=["no-condition", "other-account", "account-only", "other-type"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unguarded_portal_role_fails_beside_a_guarded_one(
+        self, mock_ac, mock_iam, trust, name
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_iam,
+            {"cp-good": _portal_trust(_PORTAL_PREFIX + "cp-good"), "cp-open": trust},
+        )
+
+        assert [(row["Status"], row["Finding"]) for row in rows] == [
+            ("Passed", self._NAME),
+            ("Failed", f"{self._NAME} {name}"),
+        ]
+        assert "Consent portal 'cp-open' (cp-open)" in rows[1]["Finding_Details"]
+        assert "runs as cp-open-role" in rows[1]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_portal_is_na_naming_the_action(self, mock_ac, mock_iam):
+        rows = self._run(
+            mock_ac,
+            mock_iam,
+            {
+                "cp-good": _portal_trust(_PORTAL_PREFIX + "cp-good"),
+                "cp-denied": _make_client_error("AccessDeniedException", "no"),
+            },
+        )
+
+        assert sorted(row["Status"] for row in rows) == ["N/A", "Passed"]
+        denied = [row for row in rows if row["Status"] == "N/A"][0]
+        assert denied["Resolution"] == (
+            "Grant bedrock-agentcore:GetConsentPortal and retry."
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_portal_listing_is_na(self, mock_ac, mock_iam):
+        rows = self._run(
+            mock_ac,
+            mock_iam,
+            {},
+            portals=_make_client_error("AccessDeniedException", "no"),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "ListConsentPortals failed" in rows[0]["Finding_Details"]
+
+
 class TestAC27GatewayPolicyConditions:
     """AC-27: confused-deputy and network-path conditions on gateway policies."""
 

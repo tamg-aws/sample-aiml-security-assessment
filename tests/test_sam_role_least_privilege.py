@@ -433,6 +433,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:GetCapacityProvider",
         "bedrock-agentcore:GetCodeInterpreter",
+        "bedrock-agentcore:GetConsentPortal",
         "bedrock-agentcore:GetGateway",
         "bedrock-agentcore:GetGatewayTarget",
         "bedrock-agentcore:GetHarness",

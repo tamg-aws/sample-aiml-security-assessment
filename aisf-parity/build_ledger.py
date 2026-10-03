@@ -496,7 +496,11 @@ AI_SUBJECT_ROWS = [
         "beside it in the same document, and fails a gateway role that trusts a second "
         "principal. A gateway resource-policy statement that names a service or "
         "wildcard principal also fails unless it carries both aws:SourceAccount naming "
-        "the account and aws:SourceArn equal to the gateway's own ARN. IfExists, "
+        "the account and aws:SourceArn equal to the gateway's own ARN. AC-27 also "
+        "reads each consent portal's executionRoleArn with GetConsentPortal and fails "
+        "a trust statement with no guard naming the account, or whose aws:SourceArn "
+        "does not name a consent-portal resource, because the setup guide lets the "
+        "role be created without its Condition. IfExists, "
         "ForAllValues and wildcard values do not count",
         [],
         4,
@@ -2218,7 +2222,12 @@ INCUMBENT_NAMES = {
         "AgentCore Log Retention and Key Scope",
         "AgentCore Span Log Deletion Protection",
     ),
-    "AC-27": "AgentCore Gateway Policy Conditions",
+    "AC-27": (
+        "AgentCore Gateway Policy Conditions",
+        "AgentCore Consent Portal Role Trust",
+        "AgentCore Consent Portal Role Trust Guard Missing",
+        "AgentCore Consent Portal Role Trust Source ARN Not Scoped",
+    ),
     "AC-28": "AgentCore Gateway Authorizer Guardrail",
     "AC-29": "AgentCore Runtime Authorizer Guardrail",
     "AC-30": "AgentCore Runtime Inbound Authorization",
