@@ -1319,6 +1319,14 @@ Resources:
               - shield:GetSubscriptionState # AC-51
               - shield:ListProtections # AC-51
             Resource: '*'
+          - Sid: RuntimeImageDigestRead
+            # AC-50 resolves the tag in each runtime's image URI to the digest
+            # Inspector's image coverage is keyed by. Only this account's
+            # registry is read.
+            Effect: Allow
+            Action:
+              - ecr:DescribeImages # AC-50
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

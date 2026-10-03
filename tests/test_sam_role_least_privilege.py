@@ -304,6 +304,7 @@ _EXPECTED_ACTIONS = {
     },
     "AgentCoreAssessmentReadsPolicy": {
         "cloudfront:ListDistributions",
+        "ecr:DescribeImages",
         "firehose:DescribeDeliveryStream",
         "logs:DescribeSubscriptionFilters",
         "s3:GetBucketObjectLockConfiguration",
@@ -1092,6 +1093,13 @@ _AGENTCORE_MANAGED_GRANTS = [
     ("Allow", "cloudfront:ListDistributions", json.dumps("*")),
     ("Allow", "shield:GetSubscriptionState", json.dumps("*")),
     ("Allow", "shield:ListProtections", json.dumps("*")),
+    (
+        "Allow",
+        "ecr:DescribeImages",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
+        ),
+    ),
 ]
 
 

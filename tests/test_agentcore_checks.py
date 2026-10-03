@@ -47956,6 +47956,307 @@ class TestAC50ImageScanGateRuntimeReads:
         ]
 
 
+_DIGEST_A = "sha256:" + "a" * 64
+_DIGEST_B = "sha256:" + "b" * 64
+_DIGEST_C = "sha256:" + "c" * 64
+_DIGEST_D = "sha256:" + "d" * 64
+
+
+def _image_coverage(
+    repo, digest, code="ACTIVE", reason="SUCCESSFUL", account_id="123456789012"
+):
+    return {
+        "resourceType": "AWS_ECR_CONTAINER_IMAGE",
+        "resourceId": (
+            f"arn:aws:ecr:us-east-1:{account_id}:repository/{repo}/{digest}"
+        ),
+        "accountId": account_id,
+        "scanStatus": {"statusCode": code, "reason": reason},
+        "resourceMetadata": {
+            "ecrRepository": {"name": repo, "scanFrequency": "CONTINUOUS_SCAN"},
+            "ecrImage": {"tags": []},
+        },
+    }
+
+
+class TestAC50RuntimeImageCoverage:
+    """CMP-01: each runtime's image is judged by its own Inspector scan, found
+    by digest, under a repository Inspector reports as ACTIVE."""
+
+    _NAME = "AgentCore Runtime Image Inspector Coverage"
+
+    def _run(self, mock_ac, images, repos, coverage, tags=None):
+        """coverage maps a repository name to its covered resources, or is the
+        error ListCoverage raises. tags maps an image tag to the digest
+        DescribeImages returns, or to the error it raises."""
+        _runtimes_with_images(mock_ac, images)
+        with (
+            patch("agentcore_app.ecr_client") as mock_ecr,
+            patch("agentcore_app.inspector2_client") as mock_insp,
+        ):
+            mock_ecr.meta.region_name = "us-east-1"
+            mock_ecr.describe_repositories.return_value = {
+                "repositories": [_owned_repo(name) for name in repos]
+            }
+
+            def describe_images(repositoryName, registryId, imageIds):
+                answer = (tags or {})[imageIds[0]["imageTag"]]
+                if isinstance(answer, Exception):
+                    raise answer
+                return {"imageDetails": [{"imageDigest": answer}]}
+
+            mock_ecr.describe_images.side_effect = describe_images
+            if isinstance(coverage, Exception):
+                mock_insp.list_coverage.side_effect = coverage
+            else:
+                mock_insp.list_coverage.side_effect = lambda **kwargs: {
+                    "coveredResources": coverage.get(
+                        kwargs["filterCriteria"]["ecrRepositoryName"][0]["value"], []
+                    )
+                }
+            self.mock_ecr = mock_ecr
+            self.mock_insp = mock_insp
+            findings = agentcore_app.check_agentcore_runtime_image_coverage()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-50"
+            assert finding["Finding"] == self._NAME
+            assert_finding_schema(finding)
+        return findings
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_image_is_judged_by_its_own_digest(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "rt-1": _image_uri("agentcore-a", ref=":v1"),
+                "rt-2": _image_uri("agentcore-a", ref=f"@{_DIGEST_B}"),
+                "rt-3": _image_uri("agentcore-a", ref=":v3"),
+                "rt-4": None,
+            },
+            ["agentcore-a"],
+            {
+                "agentcore-a": [
+                    _coverage("agentcore-a"),
+                    _image_coverage("agentcore-a", _DIGEST_A),
+                    _image_coverage(
+                        "agentcore-a", _DIGEST_B, "INACTIVE", "SCAN_ELIGIBILITY_EXPIRED"
+                    ),
+                    _image_coverage("agentcore-a", _DIGEST_D),
+                ]
+            },
+            tags={"v1": _DIGEST_A, "v3": _DIGEST_C},
+        )
+
+        assert [(f["Status"], f["Severity"]) for f in findings] == [
+            ("Passed", "Medium"),
+            ("Failed", "Medium"),
+            ("Failed", "Medium"),
+        ]
+        assert "(rt-1)" in findings[0]["Finding_Details"]
+        assert (
+            f"digest {_DIGEST_A}, which tag 'v1' resolves to now"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "the runtime runs an earlier image" in findings[0]["Finding_Details"]
+        assert "(rt-2)" in findings[1]["Finding_Details"]
+        assert (
+            f"digest {_DIGEST_B} named in its image URI"
+            in (findings[1]["Finding_Details"])
+        )
+        assert "INACTIVE (SCAN_ELIGIBILITY_EXPIRED)" in findings[1]["Finding_Details"]
+        assert "(rt-3)" in findings[2]["Finding_Details"]
+        assert "lists no scan of that image" in findings[2]["Finding_Details"]
+        self.mock_ecr.describe_images.assert_any_call(
+            repositoryName="agentcore-a",
+            registryId="123456789012",
+            imageIds=[{"imageTag": "v1"}],
+        )
+        assert self.mock_ecr.describe_images.call_count == 2
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_scan_in_another_account_is_not_credited(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "rt-1": _image_uri("agentcore-a", ref=f"@{_DIGEST_A}"),
+                "rt-2": _image_uri("agentcore-a", ref=f"@{_DIGEST_B}"),
+            },
+            ["agentcore-a"],
+            {
+                "agentcore-a": [
+                    _coverage("agentcore-a"),
+                    _image_coverage("agentcore-a", _DIGEST_A),
+                    _image_coverage(
+                        "agentcore-a", _DIGEST_B, account_id="444455556666"
+                    ),
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_scan_in_another_repository_is_not_credited(self, mock_ac):
+        # One digest pushed to two repositories is two Inspector resources.
+        findings = self._run(
+            mock_ac,
+            {
+                "rt-1": _image_uri("agentcore-a", ref=f"@{_DIGEST_A}"),
+                "rt-2": _image_uri("agentcore-a", ref=f"@{_DIGEST_B}"),
+            },
+            ["agentcore-a"],
+            {
+                "agentcore-a": [
+                    _coverage("agentcore-a"),
+                    _image_coverage("agentcore-a-old", _DIGEST_A),
+                    _image_coverage("agentcore-a", _DIGEST_B),
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_cross_account_image_is_na_and_never_resolved(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "rt-1": _image_uri("agentcore-a", account="444455556666", ref=":v1"),
+                "rt-2": _image_uri("agentcore-a", ref=":v1"),
+            },
+            ["agentcore-a"],
+            {
+                "agentcore-a": [
+                    _coverage("agentcore-a"),
+                    _image_coverage("agentcore-a", _DIGEST_A),
+                ]
+            },
+            tags={"v1": _DIGEST_A},
+        )
+
+        assert [(f["Status"], f["Severity"]) for f in findings] == [
+            ("Passed", "Medium"),
+            ("N/A", "Informational"),
+        ]
+        assert "(rt-2)" in findings[0]["Finding_Details"]
+        assert "(rt-1)" in findings[1]["Finding_Details"]
+        assert "registry 444455556666" in findings[1]["Finding_Details"]
+        assert self.mock_ecr.describe_images.call_count == 1
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unresolvable_tag_is_na(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "rt-1": _image_uri("agentcore-a", ref=":gone"),
+                "rt-2": _image_uri("agentcore-a", ref=":v1"),
+            },
+            ["agentcore-a"],
+            {
+                "agentcore-a": [
+                    _coverage("agentcore-a"),
+                    _image_coverage("agentcore-a", _DIGEST_A),
+                ]
+            },
+            tags={
+                "gone": _make_client_error("ImageNotFoundException", "no image"),
+                "v1": _DIGEST_A,
+            },
+        )
+
+        assert [(f["Status"], f["Severity"]) for f in findings] == [
+            ("N/A", "Informational"),
+            ("Passed", "Medium"),
+        ]
+        assert "tagged 'gone'" in findings[0]["Finding_Details"]
+        assert "ImageNotFoundException" in findings[0]["Finding_Details"]
+        assert "ecr:DescribeImages" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_untagged_uri_resolves_latest(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {"rt-1": _image_uri("agentcore-a", ref="")},
+            ["agentcore-a"],
+            {
+                "agentcore-a": [
+                    _coverage("agentcore-a"),
+                    _image_coverage("agentcore-a", _DIGEST_A),
+                ]
+            },
+            tags={"latest": _DIGEST_A},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "tag 'latest'" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_under_an_inactive_repository_is_na(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "rt-1": _image_uri("agentcore-a", ref=f"@{_DIGEST_A}"),
+                "rt-2": _image_uri("agentcore-b", ref=f"@{_DIGEST_B}"),
+                "rt-3": _image_uri("agentcore-c", ref=f"@{_DIGEST_C}"),
+            },
+            ["agentcore-a", "agentcore-b", "agentcore-c"],
+            {
+                "agentcore-a": [
+                    _coverage("agentcore-a", "INACTIVE", "SCAN_ELIGIBILITY_EXPIRED"),
+                    _image_coverage("agentcore-a", _DIGEST_A),
+                ],
+                "agentcore-b": [
+                    _coverage("agentcore-b"),
+                    _image_coverage("agentcore-b", _DIGEST_B),
+                ],
+                "agentcore-c": [_image_coverage("agentcore-c", _DIGEST_C)],
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed", "N/A"]
+        assert "repository as INACTIVE" in findings[0]["Finding_Details"]
+        assert "repository as not covered" in findings[2]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_failed_coverage_read_never_passes(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "rt-1": _image_uri("agentcore-a", ref=f"@{_DIGEST_A}"),
+                "rt-2": _image_uri("agentcore-a", ref=f"@{_DIGEST_B}"),
+            },
+            ["agentcore-a"],
+            _make_client_error("AccessDeniedException", "no"),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert {f["Resolution"] for f in findings} == {
+            "Grant inspector2:ListCoverage and retry."
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_coverage_is_read_per_repository_for_both_resource_types(self, mock_ac):
+        self._run(
+            mock_ac,
+            {"rt-1": _image_uri("agentcore-a", ref=f"@{_DIGEST_A}")},
+            ["agentcore-a"],
+            {"agentcore-a": [_coverage("agentcore-a")]},
+        )
+
+        assert self.mock_insp.list_coverage.call_args.kwargs["filterCriteria"] == {
+            "resourceType": [
+                {"comparison": "EQUALS", "value": "AWS_ECR_REPOSITORY"},
+                {"comparison": "EQUALS", "value": "AWS_ECR_CONTAINER_IMAGE"},
+            ],
+            "ecrRepositoryName": [{"comparison": "EQUALS", "value": "agentcore-a"}],
+            "accountId": [{"comparison": "EQUALS", "value": "123456789012"}],
+        }
+
+    def test_the_handler_registers_the_check_once(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_runtime_image_coverage") == 1
+
+
 class TestAC53CoordinationAnomalyAlarms:
     """AC-53: every AgentCore caller and callee pair needs an anomaly band alarm."""
 

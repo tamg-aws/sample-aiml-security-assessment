@@ -5692,12 +5692,16 @@ def _agentcore_ecr_repositories(
     return repositories, used_by
 
 
-def _agentcore_runtime_images() -> Tuple[Dict[str, List[str]], List[str]]:
+def _agentcore_runtime_images(
+    references: Optional[Dict[str, List[Tuple[str, str]]]] = None,
+) -> Tuple[Dict[str, List[str]], List[str]]:
     """Map each ECR repository a runtime's container image comes from to its runtimes.
 
     Returns the map, keyed "registry/region/repository", and one note per
     runtime whose image could not be read. A runtime deployed from code has no
-    container image and is not in the map.
+    container image and is not in the map. When `references` is given, it is
+    filled with each runtime label and the tag or digest part of its image URI,
+    under the same key.
     """
     images: Dict[str, List[str]] = {}
     unread: List[str] = []
@@ -5724,6 +5728,10 @@ def _agentcore_runtime_images() -> Tuple[Dict[str, List[str]], List[str]]:
             )
             continue
         images.setdefault("/".join(match.groups()), []).append(label)
+        if references is not None:
+            references.setdefault("/".join(match.groups()), []).append(
+                (label, uri[match.end() :])
+            )
     return images, unread
 
 
@@ -6377,6 +6385,239 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                 status=StatusEnum.FAILED,
             )
         )
+    return findings
+
+
+def check_agentcore_runtime_image_coverage() -> List[Dict[str, Any]]:
+    """AC-50: Judge Inspector's scan of the image each runtime runs.
+
+    A repository Inspector reports as ACTIVE can still hold an image whose own
+    scan has lapsed or never ran, so each runtime's image is matched to
+    Inspector's AWS_ECR_CONTAINER_IMAGE coverage by digest. A tag is resolved
+    to a digest with ecr:DescribeImages. An image in another account's
+    registry or another Region, and a tag that does not resolve, are
+    informational N/A. A repository that is not ACTIVE is failed by the
+    repository coverage row, so its images are N/A here.
+    """
+    finding_name = "AgentCore Runtime Image Inspector Coverage"
+    reference = ECR_ENHANCED_SCANNING_REFERENCE_URL
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-50",
+            finding_name=finding_name,
+            finding_details=details,
+            resolution=resolution,
+            reference=reference,
+            severity=severity,
+            status=status,
+        )
+
+    if ecr_client is None:
+        return []
+    references: Dict[str, List[Tuple[str, str]]] = {}
+    try:
+        runtime_images, _ = _agentcore_runtime_images(references)
+        _agentcore_ecr_repositories(runtime_images)
+    except (BotoCoreError, ClientError) as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-50",
+                finding_name=finding_name,
+                error=error,
+                reference=reference,
+            )
+        ]
+
+    findings: List[Dict[str, Any]] = []
+    for key in sorted(references):
+        registry, region, repo_name = key.split("/", 2)
+        images = references[key]
+        if key in runtime_images:
+            findings.extend(
+                finding(
+                    f"AgentCore runtime {label} runs an image from repository "
+                    f"'{repo_name}' in registry {registry} in {region}, which is "
+                    "not a repository this assessment listed in this account and "
+                    "region, so the image's Inspector scan was not judged.",
+                    "Assess the registry that holds the repository, or move the "
+                    "image into this account's registry in this region.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+                for label, _ in images
+            )
+            continue
+
+        if inspector2_client is None:
+            coverage_error = "the Inspector client is not available in this region"
+        else:
+            try:
+                resources = _paginate_aws_list(
+                    inspector2_client,
+                    "list_coverage",
+                    "coveredResources",
+                    token_request_key="nextToken",
+                    token_response_key="nextToken",
+                    filterCriteria={
+                        "resourceType": [
+                            {"comparison": "EQUALS", "value": "AWS_ECR_REPOSITORY"},
+                            {
+                                "comparison": "EQUALS",
+                                "value": "AWS_ECR_CONTAINER_IMAGE",
+                            },
+                        ],
+                        "ecrRepositoryName": [
+                            {"comparison": "EQUALS", "value": repo_name}
+                        ],
+                        "accountId": [{"comparison": "EQUALS", "value": registry}],
+                    },
+                )
+                coverage_error = None
+            except (BotoCoreError, ClientError) as error:
+                coverage_error = (
+                    f"ListCoverage failed ({_assessment_error_label(error)})"
+                )
+        if coverage_error:
+            findings.extend(
+                finding(
+                    f"Whether Inspector scans the image AgentCore runtime {label} "
+                    f"runs from repository '{repo_name}' is unknown: "
+                    f"{coverage_error}.",
+                    "Grant inspector2:ListCoverage and retry.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+                for label, _ in images
+            )
+            continue
+
+        repository_status = None
+        scanned: Dict[str, Dict[str, Any]] = {}
+        for resource in resources:
+            if str(resource.get("accountId") or "") != registry:
+                continue
+            resource_type = resource.get("resourceType")
+            metadata = resource.get("resourceMetadata") or {}
+            if resource_type == "AWS_ECR_REPOSITORY":
+                if (metadata.get("ecrRepository") or {}).get("name") == repo_name:
+                    repository_status = (resource.get("scanStatus") or {}).get(
+                        "statusCode"
+                    )
+            elif resource_type == "AWS_ECR_CONTAINER_IMAGE":
+                # The resourceId is the repository ARN followed by /<digest>.
+                path = str(resource.get("resourceId") or "").split(":repository/", 1)
+                if len(path) == 2:
+                    image_repo, _, digest = path[1].rpartition("/")
+                    if image_repo == repo_name:
+                        scanned[digest] = resource
+
+        for label, image_ref in images:
+            subject = f"The image AgentCore runtime {label} runs from repository '{repo_name}'"
+            if repository_status != "ACTIVE":
+                findings.append(
+                    finding(
+                        f"{subject} was not judged on its own scan, because "
+                        f"Inspector reports the repository as "
+                        f"{repository_status or 'not covered'}; the AgentCore ECR "
+                        "Inspector Coverage row reports it.",
+                        "Return the repository to ACTIVE Inspector coverage, then "
+                        "rerun the assessment.",
+                        SeverityEnum.INFORMATIONAL,
+                        StatusEnum.NA,
+                    )
+                )
+                continue
+            tag = None
+            if "@" in image_ref:
+                digest = image_ref.split("@", 1)[1]
+                source = f"digest {digest} named in its image URI"
+            else:
+                tag = image_ref[1:] if image_ref.startswith(":") else "latest"
+                try:
+                    details = (
+                        ecr_client.describe_images(
+                            repositoryName=repo_name,
+                            registryId=registry,
+                            imageIds=[{"imageTag": tag}],
+                        ).get("imageDetails")
+                        or []
+                    )
+                except (BotoCoreError, ClientError) as error:
+                    findings.append(
+                        finding(
+                            f"{subject} is tagged '{tag}', which could not be "
+                            "resolved to an image digest "
+                            f"({_assessment_error_label(error)}), so the image's "
+                            "Inspector scan was not judged.",
+                            "Grant ecr:DescribeImages on the repository, or deploy "
+                            "the runtime from an image digest, then rerun the "
+                            "assessment.",
+                            SeverityEnum.INFORMATIONAL,
+                            StatusEnum.NA,
+                        )
+                    )
+                    continue
+                digest = (details[0].get("imageDigest") if details else None) or ""
+                if not digest:
+                    findings.append(
+                        finding(
+                            f"{subject} is tagged '{tag}', which DescribeImages "
+                            "resolves to no image digest, so the image's Inspector "
+                            "scan was not judged.",
+                            "Deploy the runtime from an image digest, then rerun "
+                            "the assessment.",
+                            SeverityEnum.INFORMATIONAL,
+                            StatusEnum.NA,
+                        )
+                    )
+                    continue
+                source = (
+                    f"digest {digest}, which tag '{tag}' resolves to now; if the "
+                    "tag moved since the runtime was deployed, the runtime runs an "
+                    "earlier image"
+                )
+            resource = scanned.get(digest)
+            if resource is None:
+                findings.append(
+                    finding(
+                        f"{subject} is {source}. The repository is ACTIVE, but "
+                        "Inspector's coverage lists no scan of that image, so its "
+                        "vulnerabilities are not reported.",
+                        "Push or re-pull the image so Inspector scans it, or deploy "
+                        "the runtime from an image Inspector covers.",
+                        SeverityEnum.MEDIUM,
+                        StatusEnum.FAILED,
+                    )
+                )
+                continue
+            status = resource.get("scanStatus") or {}
+            code = status.get("statusCode")
+            reason = status.get("reason") or "no reason reported"
+            if code == "ACTIVE":
+                findings.append(
+                    finding(
+                        f"{subject} is {source}. Inspector reports the image's "
+                        f"scan as ACTIVE ({reason}).",
+                        "No action required.",
+                        SeverityEnum.MEDIUM,
+                        StatusEnum.PASSED,
+                    )
+                )
+            else:
+                findings.append(
+                    finding(
+                        f"{subject} is {source}. The repository is ACTIVE, but "
+                        f"Inspector reports the image's scan as {code or 'no status'} "
+                        f"({reason}), so new vulnerabilities in it are not "
+                        "reported.",
+                        "Resolve the reason Inspector reports, for example by "
+                        "re-pulling or rebuilding the image, so its scan returns "
+                        "to ACTIVE.",
+                        SeverityEnum.MEDIUM,
+                        StatusEnum.FAILED,
+                    )
+                )
     return findings
 
 
@@ -37791,6 +38032,11 @@ def lambda_handler(event, context):
                 ["AC-50"],
                 "Image Scan Coverage And Gate",
                 check_agentcore_image_scan_gate,
+            ),
+            (
+                ["AC-50"],
+                "Runtime Image Inspector Coverage",
+                check_agentcore_runtime_image_coverage,
             ),
             (
                 ["AC-51"],

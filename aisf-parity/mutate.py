@@ -1765,6 +1765,55 @@ MUTATIONS = [
         "find": '            if key == "aws:sourcearn" and all(\n                _arn_account(value.strip()) == account_id for value in values\n            ):\n',
         "replace": '            if key == "aws:sourcearn" and all(\n                account_id.startswith(_arn_account(value.strip()).rstrip("*")) and _arn_account(value.strip()) for value in values\n            ):\n',
     },
+    {
+        "name": "AC-50 image: a cross-account image is judged",
+        "file": AGENTCORE,
+        "defect": "an image in another account's registry was resolved and judged",
+        "find": "        if key in runtime_images:\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "AC-50 image: another account's scan credited",
+        "file": AGENTCORE,
+        "defect": "an image scan in another account credited this account's image",
+        "find": '            if str(resource.get("accountId") or "") != registry:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "AC-50 image: another repository's scan credited",
+        "file": AGENTCORE,
+        "defect": "an image scan was keyed without its repository",
+        "find": "                    if image_repo == repo_name:\n",
+        "replace": "                    if True:\n",
+    },
+    {
+        "name": "AC-50 image: an inactive repository's images judged",
+        "file": AGENTCORE,
+        "defect": "an image under an INACTIVE repository was judged on its own scan",
+        "find": '            if repository_status != "ACTIVE":\n',
+        "replace": "            if repository_status is None:\n",
+    },
+    {
+        "name": "AC-50 image: an untagged URI resolved without latest",
+        "file": AGENTCORE,
+        "defect": "an image URI with no tag was not resolved as latest",
+        "find": '                tag = image_ref[1:] if image_ref.startswith(":") else "latest"\n',
+        "replace": '                tag = image_ref[1:] if image_ref.startswith(":") else ""\n',
+    },
+    {
+        "name": "AC-50 image: any scanned image credits the runtime",
+        "file": AGENTCORE,
+        "defect": "a scan of another image in the repository credited the runtime",
+        "find": "            resource = scanned.get(digest)\n",
+        "replace": "            resource = next(iter(scanned.values()), None)\n",
+    },
+    {
+        "name": "AC-50 image: a lapsed image scan passes",
+        "file": AGENTCORE,
+        "defect": "an image whose scan lapsed passed",
+        "find": '            if code == "ACTIVE":\n',
+        "replace": '            if code in ("ACTIVE", "INACTIVE"):\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -2128,6 +2177,13 @@ GROUPS: dict[str, str] = {
     "AC-48 credits an IfExists deputy guard": "in the AgentCore verdict legs",
     "AC-48 credits a ForAllValues deputy guard": "in the AgentCore verdict legs",
     "AC-48 credits a partial wildcard account segment": "in the AgentCore verdict legs",
+    "AC-50 image: a cross-account image is judged": "in the AgentCore verdict legs",
+    "AC-50 image: another account's scan credited": "in the AgentCore verdict legs",
+    "AC-50 image: another repository's scan credited": "in the AgentCore verdict legs",
+    "AC-50 image: an inactive repository's images judged": "in the AgentCore verdict legs",
+    "AC-50 image: an untagged URI resolved without latest": "in the AgentCore verdict legs",
+    "AC-50 image: any scanned image credits the runtime": "in the AgentCore verdict legs",
+    "AC-50 image: a lapsed image scan passes": "in the AgentCore verdict legs",
 }
 
 
