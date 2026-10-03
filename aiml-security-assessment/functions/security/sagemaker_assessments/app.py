@@ -15773,15 +15773,21 @@ MODEL_ARTIFACT_INTEGRITY_RESOLUTION = (
     "create the component from a model (ModelName) whose container loads its "
     "data through ModelDataSource with the ETag recorded."
 )
+SM43_PREFIX_OBJECT_CAP = 1000
 MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "A recorded ETag, ManifestEtag or ModelDataETag means an expected value is "
     "recorded; whether SageMaker or the container compared it to the object at "
     "load time is not returned by any API this check reads. Model data named "
     "as one S3 object (a ModelDataUrl, an S3Object source or a manifest) is read "
     "with HeadObject: its current ETag is compared to the recorded value and its "
-    "own server-side encryption is judged. The objects under an S3Prefix source "
-    "are not read one by one, and no SageMaker field records a SHA256 digest to "
-    "compare. Weights fetched by "
+    "own server-side encryption is judged. Each object under an S3Prefix source "
+    "or a multi-model prefix is listed and read with HeadObject for its "
+    "server-side encryption, up to "
+    f"{SM43_PREFIX_OBJECT_CAP} objects per run. No SageMaker field records a "
+    "SHA256 digest to compare. The execution role's s3:GetObject reach is judged "
+    "per bucket from its Allow statements and permissions boundary, not against "
+    "the artifact prefix; a Deny narrower than every resource, and SCPs, are not "
+    "subtracted. Weights fetched by "
     "container startup code, and models loaded by workloads on ECS, EKS or EC2, "
     "are not read. Of each container's environment only the keys are read."
 )
@@ -15829,7 +15835,42 @@ def _signing_rule_covers(rule: Dict[str, Any], repository_name: str) -> bool:
     )
 
 
-def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]:
+def _s3_object_reach_beyond(
+    statements: List[Tuple[str, Dict[str, Any]]], buckets: set
+) -> List[Tuple[str, str, bool]]:
+    """
+    Each Allow that grants s3:GetObject on an object outside ``buckets``, as
+    (resource, "policy P statement S", conditioned). A wildcard or policy
+    variable in the bucket segment reaches other buckets; a bucket ARN with no
+    object path reaches no object.
+    """
+    reach = []
+    for policy_name, statement in statements:
+        if not _statement_allows_action(statement, "s3:GetObject"):
+            continue
+        where = (
+            f"policy {policy_name} statement {statement.get('Sid') or 'without a Sid'}"
+        )
+        conditioned = bool(statement.get("Condition"))
+        if "NotResource" in statement:
+            excluded = ", ".join(_policy_values(statement["NotResource"])[:3])
+            reach.append(
+                (f"every resource but NotResource {excluded}", where, conditioned)
+            )
+            continue
+        for resource in _policy_values(statement.get("Resource")):
+            pattern = re.sub(r"\$\{[^}]*\}", "*", resource.strip()).lower()
+            if not _globs_overlap(pattern, "arn:*:s3:::*/*"):
+                continue
+            bucket = pattern.split(":::", 1)[-1].split("/", 1)[0]
+            if _s3_bucket_pattern_is_wildcard(pattern) or bucket not in buckets:
+                reach.append((resource, where, conditioned))
+    return reach
+
+
+def check_sagemaker_model_artifact_integrity(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     SM-43: Verify every InService endpoint serves pinned images and model data
     with a recorded expected value, from an SSE-KMS artifact bucket.
@@ -15839,7 +15880,9 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
     managed signing rule covers the repository; its S3 model data records an
     ETag, ManifestEtag or ModelDataETag, or comes from SageMaker hub content;
     it does not name an HF_MODEL_ID with no model data; and each artifact
-    bucket defaults to SSE-KMS with a named customer managed key. A denied
+    bucket defaults to SSE-KMS with a named customer managed key. Each object
+    named or listed under a prefix is read with HeadObject, and each execution
+    role's s3:GetObject grants must stay inside the artifact buckets. A denied
     read leaves that endpoint N/A, never Failed.
     """
     findings = {"csv_data": []}
@@ -15892,6 +15935,10 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
     models = {}
     packages = {}
     heads = {}
+    listings = {}
+    model_roles = {}
+    role_reach = {}
+    prefix_budget = [SM43_PREFIX_OBJECT_CAP]
     s3_client = boto3.client("s3", config=boto3_config, region_name=region)
 
     def _ecr(image_region):
@@ -16130,9 +16177,138 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
             )
         return problems, unreads
 
+    def _prefix_keys(uri):
+        """The keys under a prefix up to the run's remaining HeadObject budget,
+        with whether more were left, or the error label of a failed listing."""
+        if uri not in listings:
+            bucket, _, prefix = uri[len("s3://") :].partition("/")
+            keys, more = [], False
+            try:
+                for page in s3_client.get_paginator("list_objects_v2").paginate(
+                    Bucket=bucket, Prefix=prefix
+                ):
+                    for item in page.get("Contents") or []:
+                        if len(keys) >= prefix_budget[0]:
+                            more = True
+                            break
+                        keys.append(item["Key"])
+                    if more:
+                        break
+                prefix_budget[0] -= len(keys)
+                listings[uri] = (bucket, keys, more)
+            except Exception as error:
+                listings[uri] = get_assessment_error_label(error)
+        return listings[uri]
+
+    def _judge_prefix(where, uri):
+        problems, unreads = [], []
+        listing = _prefix_keys(uri)
+        if isinstance(listing, str):
+            unreads.append(
+                f"{where} {uri} objects were not listed (s3:ListBucket: {listing})"
+            )
+            return problems, unreads
+        bucket, keys, more = listing
+        if not keys and not more:
+            problems.append(
+                f"{where} {uri} lists no objects, so no object holds the model data"
+            )
+        for key in keys:
+            object_problems, object_unreads = _judge_object(
+                where, f"s3://{bucket}/{key}", None
+            )
+            problems += object_problems
+            unreads += object_unreads
+        if more:
+            unreads.append(
+                f"{where} {uri} holds more objects than the "
+                f"{SM43_PREFIX_OBJECT_CAP} this run reads with HeadObject, so the "
+                f"objects after the first {len(keys)} listed were not read"
+            )
+        return problems, unreads
+
+    def _judge_role(role_arn, buckets):
+        """Whether one execution role's s3:GetObject grants reach objects
+        outside the artifact buckets, as (problems, unreads)."""
+        key = (role_arn, frozenset(buckets))
+        if key in role_reach:
+            return role_reach[key]
+        name = _role_name_from_arn(role_arn)
+        cached = (permission_cache or {}).get("role_permissions") or {}
+        unread_principals = (
+            _principal_read_errors(permission_cache) or [] if permission_cache else []
+        )
+        reason = None
+        if permission_cache is None:
+            reason = "the IAM permissions cache was not available"
+        elif name not in cached:
+            reason = "not in the IAM cache"
+        elif any(
+            p.lower().startswith(f"role '{name.lower()}' ")
+            and p.lower() != f"role '{name.lower()}' (permissions_boundary)"
+            for p in unread_principals
+        ):
+            reason = "IAM cache read error"
+        if reason:
+            role_reach[key] = (
+                [],
+                [f"execution role {role_arn} read scope was not judged ({reason})"],
+            )
+            return role_reach[key]
+        permissions = cached[name]
+        statements = [
+            (policy.get("name") or "inline policy", statement)
+            for policy in (permissions.get("attached_policies") or [])
+            + (permissions.get("inline_policies") or [])
+            for statement in _sm_policy_statements(policy.get("document"))
+        ]
+        reach = []
+        if not any(
+            _merged_account_wide_deny(statement, "s3:getobject")
+            for _, statement in statements
+        ):
+            reach = _s3_object_reach_beyond(statements, buckets)
+        boundary = permissions.get("permissions_boundary")
+        if boundary is not None:
+            boundary_statements = [
+                ("boundary", statement) for statement in _sm_policy_statements(boundary)
+            ]
+            if any(
+                _merged_account_wide_deny(statement, "s3:getobject")
+                for _, statement in boundary_statements
+            ) or not _s3_object_reach_beyond(boundary_statements, buckets):
+                reach = []
+        problems, unreads = [], []
+        plain = [r for r in reach if not r[2]]
+        listed = ", ".join(sorted(buckets))
+        if plain:
+            resource, where, _ = plain[0]
+            if boundary is None and ("role", name) in _boundary_unread(
+                permission_cache
+            ):
+                unreads.append(
+                    f"execution role '{name}' is allowed s3:GetObject on {resource} "
+                    f"by {where}, and its permissions boundary was not read"
+                )
+            else:
+                problems.append(
+                    f"execution role '{name}' is allowed s3:GetObject on {resource} "
+                    f"by {where}, which reaches objects outside its artifact "
+                    f"bucket(s) {listed}"
+                )
+        elif reach:
+            resource, where, _ = reach[0]
+            unreads.append(
+                f"execution role '{name}' is allowed s3:GetObject on {resource} by "
+                f"{where} under a Condition this check does not evaluate"
+            )
+        role_reach[key] = (problems, unreads)
+        return role_reach[key]
+
     def _judge_data(label, unit, env_keys):
         problems, unreads, uris = [], [], []
         objects = []
+        prefixes = []
         url = unit.get("ModelDataUrl")
         source = (unit.get("ModelDataSource") or {}).get("S3DataSource")
         if url:
@@ -16149,6 +16325,8 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                 objects.append(
                     (f"{label} ModelDataUrl", url, unit.get("ModelDataETag"))
                 )
+            elif _s3_uri_bucket(url):
+                prefixes.append((f"{label} ModelDataUrl", url))
         sources = [("ModelDataSource", source)] if source else []
         for extra in unit.get("AdditionalModelDataSources") or []:
             if extra.get("S3DataSource"):
@@ -16173,6 +16351,10 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                 objects.append(
                     (f"{label} {name}", s3_source["S3Uri"], s3_source.get("ETag"))
                 )
+            elif s3_source.get("S3DataType") == "S3Prefix" and _s3_uri_bucket(
+                s3_source.get("S3Uri")
+            ):
+                prefixes.append((f"{label} {name}", s3_source["S3Uri"]))
             if s3_source.get("ManifestEtag") and _s3_uri_bucket(
                 s3_source.get("ManifestS3Uri")
             ):
@@ -16205,7 +16387,12 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
             object_problems, object_unreads = _judge_object(where, uri, recorded)
             problems += object_problems
             unreads += object_unreads
-        return problems, unreads
+        for where, uri in prefixes:
+            prefix_problems, prefix_unreads = _judge_prefix(where, uri)
+            problems += prefix_problems
+            unreads += prefix_unreads
+        buckets_read = {_s3_uri_bucket(uri) for uri in uris} - {None}
+        return problems, unreads, buckets_read
 
     def _package_containers(package_name):
         if package_name not in packages:
@@ -16240,6 +16427,7 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                     f"({get_assessment_error_label(error)})"
                 )
                 return models[model_name]
+            model_roles[model_name] = model.get("ExecutionRoleArn")
             containers = (
                 [model["PrimaryContainer"]]
                 if model.get("PrimaryContainer")
@@ -16351,6 +16539,7 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                         container,
                         set(container.get("Environment") or {}),
                         container.get("ResolvedImage"),
+                        endpoint["config"].get("ExecutionRoleArn"),
                     )
                 )
                 continue
@@ -16369,18 +16558,30 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                         unit,
                         env_keys,
                         endpoint["deployed_images"].get(unit.get("Image")),
+                        model_roles.get(name),
                     )
                 )
-        for label, unit, env_keys, resolved in judged:
+        role_buckets = {}
+        for label, unit, env_keys, resolved, role_arn in judged:
             if unit.get("Image"):
                 image_problems, image_unreads = _judge_image(
                     label, unit["Image"], resolved
                 )
                 problems += image_problems
                 unreads += image_unreads
-            data_problems, data_unreads = _judge_data(label, unit, env_keys)
+            data_problems, data_unreads, data_buckets = _judge_data(
+                label, unit, env_keys
+            )
             problems += data_problems
             unreads += data_unreads
+            if data_buckets and not role_arn:
+                unreads.append(f"{label} returned no ExecutionRoleArn to judge")
+            elif data_buckets:
+                role_buckets.setdefault(role_arn, set()).update(data_buckets)
+        for role_arn, artifact_buckets in role_buckets.items():
+            role_problems, role_unreads = _judge_role(role_arn, artifact_buckets)
+            problems += role_problems
+            unreads += role_unreads
         problems = list(dict.fromkeys(problems))
         unread += [
             f"endpoint '{endpoint['name']}': {u}" for u in dict.fromkeys(unreads)
@@ -16402,7 +16603,8 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
         )
     read_details = (
         f"{len(compliant)} InService endpoint(s) serve only pinned images and "
-        f"model data with a recorded expected value from SSE-KMS buckets: "
+        f"model data with a recorded expected value from SSE-KMS buckets, through "
+        f"an execution role whose s3:GetObject grants stay inside those buckets: "
         f"{', '.join(compliant[:10]) or 'none'}."
     )
     if unread:
@@ -19924,7 +20126,11 @@ def lambda_handler(event, context):
         all_findings.append(check_vpc_dns_resolver_visibility(region=region))
 
         logger.info("Running SageMaker model artifact integrity check (SM-43)")
-        all_findings.append(check_sagemaker_model_artifact_integrity(region=region))
+        all_findings.append(
+            check_sagemaker_model_artifact_integrity(
+                region=region, permission_cache=permission_cache
+            )
+        )
 
         logger.info("Running GuardDuty Runtime Monitoring check (SM-38)")
         all_findings.append(

@@ -370,6 +370,22 @@ section.
   is not SSE-KMS under a customer managed key, even when the bucket default
   is. An unread object holds back `Passed`. Earlier the check only tested
   that an expected value was recorded.
+- `SM-43` lists each object under an `S3Prefix` source or a multi-model
+  `ModelDataUrl` prefix with `ListObjectsV2` and reads each one with
+  `HeadObject`, failing an object that is not SSE-KMS under a customer
+  managed key and a prefix that lists no objects. A run reads at most 1,000
+  prefix objects; a prefix with objects past that cap reports N/A by name,
+  never `Passed`. Earlier the objects under a prefix were not read.
+- `SM-43` joins each model's `ExecutionRoleArn` (or the endpoint config's
+  role for an inference component container) to the IAM permissions cache
+  and fails an Allow that grants `s3:GetObject` on objects in a bucket other
+  than the model's artifact buckets, unless the permissions boundary stops
+  it. A conditioned grant, an unread boundary, a role missing from the cache
+  and a run without the cache report N/A. `AmazonSageMakerFullAccess` fails
+  this test, because it grants `s3:GetObject` on `arn:aws:s3:::*sagemaker*`.
+- `SM-43` reads tag mutability from the image's ECR repository in any
+  account, so a tag-pinned image from an AWS Deep Learning Containers
+  registry is judged. Earlier it read N/A.
 - `SM-02` adds an `AI API Method Authorization` row. It reads every REST
   API method and HTTP API route whose integration reaches a Bedrock,
   AgentCore or SageMaker runtime, or a Lambda function an agent or gateway
@@ -1662,6 +1678,16 @@ the inline policy under its 9,000-character budget,
 moves unchanged into `SageMakerAssessmentReadsPolicy`. Until the stack is
 updated, `SM-43` endpoints with single-object model data read as
 incomplete.
+
+**SageMaker model artifact prefix and cross-account repository reads.**
+`SageMakerAssessmentReadsPolicy` gains `ModelArtifactPrefixList` with
+`s3:ListBucket` on `arn:${AWS::Partition}:s3:::*` and
+`ModelImageRepositoryAnyAccountRead` with `ecr:DescribeRepositories` on
+`arn:${AWS::Partition}:ecr:*:*:repository/*` (both `SM-43`).
+`ecr:DescribeRepositories` leaves the inline `ModelImageRepositoryRead`
+statement, which keeps `ecr:DescribeImageSigningStatus` on this account's
+repositories. Until the stack is updated, `SM-43` endpoints with prefix
+model data or a tag-pinned image in another account's registry report N/A.
 
 **SageMaker API Gateway method reads.** `SageMakerAssessmentReadsPolicy`
 gains `apigateway:GET` on

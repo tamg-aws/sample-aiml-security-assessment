@@ -19727,6 +19727,38 @@ def _sm43_container(image=None, uri="s3://artifacts/m/", etag="e-1", **overrides
     return container
 
 
+_SM43_ROLE = f"arn:aws:iam::{_SM43_ACCOUNT}:role/sm-role"
+
+
+def _sm43_role_cache(*statements, boundary=None, name="sm-role", errors=None):
+    """An IAM cache holding one role whose inline policy has these statements."""
+    return {
+        "role_permissions": {
+            name: {
+                "attached_policies": [],
+                "inline_policies": [
+                    {
+                        "name": "model-access",
+                        "document": {
+                            "Version": "2012-10-17",
+                            "Statement": list(statements),
+                        },
+                    }
+                ],
+                "permissions_boundary": boundary,
+            }
+        },
+        "user_permissions": {},
+        "principal_errors": errors or [],
+    }
+
+
+# The default role reads no S3 object, so it reaches no other bucket.
+_SM43_DEFAULT_CACHE = _sm43_role_cache(
+    {"Effect": "Allow", "Action": "sagemaker:DescribeModel", "Resource": "*"}
+)
+
+
 def _sm43_rows(
     endpoints=None,
     models=None,
@@ -19739,13 +19771,17 @@ def _sm43_rows(
     deployed=None,
     keys=None,
     objects=None,
+    listings=None,
+    permission_cache=_SM43_DEFAULT_CACHE,
 ):
     """
     Run SM-43 over mocked SageMaker, ECR, S3 and KMS clients.
 
     endpoints maps a name to {"models": [...], "status": ..., "components":
     [variant names]}. Every other map is keyed by resource name, and an
-    Exception value is raised by the matching call.
+    Exception value is raised by the matching call. listings maps a prefix URI
+    to its pages of keys; an unlisted prefix holds one object. Models and
+    endpoint configs run as _SM43_ROLE unless they name another role.
     """
     endpoints = (
         endpoints
@@ -19825,10 +19861,11 @@ def _sm43_rows(
     def describe_endpoint_config(EndpointConfigName):
         spec = endpoints[EndpointConfigName[len("cfg-") :]]
         return {
+            "ExecutionRoleArn": spec.get("role", _SM43_ROLE),
             "ProductionVariants": [
                 {"VariantName": f"v-{m}", "ModelName": m} for m in spec["models"]
             ]
-            + [{"VariantName": v} for v in spec.get("components", [])]
+            + [{"VariantName": v} for v in spec.get("components", [])],
         }
 
     sagemaker.describe_endpoint_config.side_effect = describe_endpoint_config
@@ -19842,7 +19879,11 @@ def _sm43_rows(
 
         return call
 
-    sagemaker.describe_model.side_effect = describe(models, "ModelName")
+    def describe_model(ModelName):
+        value = describe(models, "ModelName")(ModelName=ModelName)
+        return dict({"ExecutionRoleArn": _SM43_ROLE}, **value)
+
+    sagemaker.describe_model.side_effect = describe_model
     sagemaker.describe_model_package.side_effect = describe(
         packages, "ModelPackageName"
     )
@@ -19923,6 +19964,21 @@ def _sm43_rows(
         return value
 
     s3.head_object.side_effect = head_object
+    listings = listings or {}
+    _sm43_rows.list_calls = []
+
+    def list_objects(Bucket, Prefix):
+        uri = f"s3://{Bucket}/{Prefix}"
+        _sm43_rows.list_calls.append(uri)
+        pages = listings.get(
+            uri,
+            [[Prefix + "model.safetensors" if Prefix.endswith("/") else Prefix]],
+        )
+        if isinstance(pages, Exception):
+            raise pages
+        return [{"Contents": [{"Key": key} for key in page]} for page in pages]
+
+    s3.get_paginator.side_effect = _pager({"list_objects_v2": list_objects})
     keys = keys or {}
     kms = MagicMock()
 
@@ -19937,7 +19993,9 @@ def _sm43_rows(
     with patch("sagemaker_app.boto3.client") as mock_client:
         mock_client.side_effect = lambda service, **_: clients[service]
         return _rows(
-            sagemaker_app.check_sagemaker_model_artifact_integrity("us-east-1")
+            sagemaker_app.check_sagemaker_model_artifact_integrity(
+                "us-east-1", permission_cache=permission_cache
+            )
         )
 
 
@@ -20316,15 +20374,19 @@ class TestSM43ModelArtifactIntegrity:
             "manifest s3://artifacts/m/manifest.csv now has ETag m-x, not the "
             "recorded m-e"
         ) in rows[0]["Finding_Details"]
-        assert _sm43_rows.head_calls == ["s3://artifacts/m/manifest.csv"]
+        assert _sm43_rows.head_calls == [
+            "s3://artifacts/m/manifest.csv",
+            "s3://artifacts/m/model.tar.gz",
+        ]
 
-    def test_a_prefix_source_reads_no_object(self):
+    def test_a_prefix_source_reads_each_listed_object(self):
         rows = _sm43_rows()
         assert _sm43_statuses(rows) == ["Passed"]
-        assert _sm43_rows.head_calls == []
+        assert _sm43_rows.list_calls == ["s3://artifacts/m/"]
+        assert _sm43_rows.head_calls == ["s3://artifacts/m/model.safetensors"]
         assert (
             "objects under an S3Prefix source are not read"
-            in (rows[0]["Finding_Details"])
+            not in (rows[0]["Finding_Details"])
         )
 
     @pytest.mark.parametrize(
@@ -20394,7 +20456,7 @@ class TestSM43ModelArtifactIntegrity:
             details
         )
 
-    def test_a_multi_model_url_is_a_prefix_and_is_not_read(self):
+    def test_a_multi_model_url_is_a_prefix_whose_objects_are_listed(self):
         rows = _sm43_rows(
             endpoints={"ep-1": {"models": ["m-1"]}},
             models={"m-1": {"PrimaryContainer": {"ModelPackageName": "pkg"}}},
@@ -20414,7 +20476,7 @@ class TestSM43ModelArtifactIntegrity:
             objects={"s3://artifacts/many/": _sm43_error("404")},
         )
         assert _sm43_statuses(rows) == ["Passed"]
-        assert _sm43_rows.head_calls == []
+        assert _sm43_rows.head_calls == ["s3://artifacts/many/model.safetensors"]
 
     def test_a_missing_object_fails(self):
         rows = _sm43_rows(
@@ -21028,4 +21090,378 @@ class TestSM43ModelArtifactIntegrity:
     def test_the_handler_runs_sm43(self):
         source = open(os.path.join(_sm_dir, "app.py")).read()
         handler = source[source.index("def lambda_handler") :]
-        assert "check_sagemaker_model_artifact_integrity(region=region)" in handler
+        assert (
+            "check_sagemaker_model_artifact_integrity(\n"
+            "                region=region, permission_cache=permission_cache\n"
+            "            )"
+        ) in handler
+
+
+def _sm43_prefix_model(uri="s3://artifacts/m/", etag="e-1", channel=None):
+    container = _sm43_container(uri=uri, etag=etag)
+    if channel:
+        source = container.pop("ModelDataSource")["S3DataSource"]
+        container["ModelDataSource"] = {
+            "S3DataSource": {"S3Uri": "s3://artifacts/base.tar.gz", "ETag": "b"}
+        }
+        container["AdditionalModelDataSources"] = [
+            {"ChannelName": channel, "S3DataSource": source}
+        ]
+    return {"PrimaryContainer": container}
+
+
+class TestSM43PrefixObjects:
+    """AIR-SLF-CMP-08: each object under an S3Prefix source is read."""
+
+    _AES = {"ETag": '"x"', "ServerSideEncryption": "AES256"}
+
+    def test_one_unencrypted_object_among_two_fails_and_names_only_it(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": _sm43_prefix_model()},
+            listings={"s3://artifacts/m/": [["m/a.bin", "m/b.bin"]]},
+            objects={"s3://artifacts/m/b.bin": self._AES},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "model 'm-1' container 1 ModelDataSource object s3://artifacts/m/b.bin "
+            "is encrypted with AES256, not SSE-KMS"
+        ) in details
+        assert "s3://artifacts/m/a.bin" not in details
+        assert _sm43_rows.head_calls == [
+            "s3://artifacts/m/a.bin",
+            "s3://artifacts/m/b.bin",
+        ]
+
+    def test_an_object_on_the_second_listing_page_is_read(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": _sm43_prefix_model()},
+            listings={"s3://artifacts/m/": [["m/a.bin"], ["m/late.bin"]]},
+            objects={"s3://artifacts/m/late.bin": self._AES},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "s3://artifacts/m/late.bin is encrypted with AES256"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_additional_prefix_source_is_listed(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": _sm43_prefix_model(uri="s3://artifacts/lora/", channel="lora")
+            },
+            listings={"s3://artifacts/lora/": [["lora/adapter.bin"]]},
+            objects={"s3://artifacts/lora/adapter.bin": self._AES},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "additional source lora object s3://artifacts/lora/adapter.bin is "
+            "encrypted with AES256"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_empty_prefix_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": _sm43_prefix_model()},
+            listings={"s3://artifacts/m/": [[]]},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "model 'm-1' container 1 ModelDataSource s3://artifacts/m/ lists no "
+            "objects, so no object holds the model data"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_denied_listing_is_na_and_names_the_prefix(self):
+        rows = _sm43_rows(
+            models={
+                "m-1": _sm43_prefix_model(),
+                "m-2": _sm43_prefix_model(uri="s3://artifacts/two/"),
+            },
+            listings={"s3://artifacts/two/": _sm43_error("AccessDenied")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "endpoint 'ep-2': model 'm-2' container 1 ModelDataSource "
+            "s3://artifacts/two/ objects were not listed (s3:ListBucket: "
+            "AccessDenied)"
+        ) in details
+        assert "1 InService endpoint(s)" in details
+        assert "ep-1" in details
+
+    def test_objects_past_the_run_cap_are_na_and_never_passed(self):
+        with patch.object(sagemaker_app, "SM43_PREFIX_OBJECT_CAP", 2):
+            rows = _sm43_rows(
+                endpoints={"ep-1": {"models": ["m-1"]}},
+                models={"m-1": _sm43_prefix_model()},
+                listings={"s3://artifacts/m/": [["m/a", "m/b"], ["m/c"]]},
+            )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert _sm43_rows.head_calls == ["s3://artifacts/m/a", "s3://artifacts/m/b"]
+        assert (
+            "model 'm-1' container 1 ModelDataSource s3://artifacts/m/ holds more "
+            "objects than the 2 this run reads with HeadObject, so the objects "
+            "after the first 2 listed were not read"
+        ) in rows[0]["Finding_Details"]
+
+    def test_the_cap_is_shared_across_prefixes_in_one_run(self):
+        with patch.object(sagemaker_app, "SM43_PREFIX_OBJECT_CAP", 2):
+            rows = _sm43_rows(
+                models={
+                    "m-1": _sm43_prefix_model(),
+                    "m-2": _sm43_prefix_model(uri="s3://artifacts/two/"),
+                },
+                listings={
+                    "s3://artifacts/m/": [["m/a", "m/b"]],
+                    "s3://artifacts/two/": [["two/a"]],
+                },
+            )
+        assert _sm43_statuses(rows) == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert "s3://artifacts/two/ holds more objects than the 2" in details
+        assert "after the first 0 listed were not read" in details
+        assert "s3://artifacts/two/a" not in _sm43_rows.head_calls
+
+    def test_an_exactly_full_cap_with_nothing_left_passes(self):
+        with patch.object(sagemaker_app, "SM43_PREFIX_OBJECT_CAP", 2):
+            rows = _sm43_rows(
+                endpoints={"ep-1": {"models": ["m-1"]}},
+                models={"m-1": _sm43_prefix_model()},
+                listings={"s3://artifacts/m/": [["m/a", "m/b"]]},
+            )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+
+class TestSM43ExecutionRoleScope:
+    """AIR-SLF-CMP-08: the execution role reads only its artifact buckets."""
+
+    @staticmethod
+    def _get(resource, **extra):
+        return dict(
+            {
+                "Sid": "Read",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": resource,
+            },
+            **extra,
+        )
+
+    def _run(self, cache, **kwargs):
+        kwargs.setdefault("endpoints", {"ep-1": {"models": ["m-1"]}})
+        kwargs.setdefault("models", {"m-1": _sm43_prefix_model()})
+        return _sm43_rows(permission_cache=cache, **kwargs)
+
+    def test_a_grant_on_the_artifact_bucket_objects_passes(self):
+        rows = self._run(_sm43_role_cache(self._get("arn:aws:s3:::artifacts/*")))
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert "execution role" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "*",
+            "arn:aws:s3:::*",
+            "arn:aws:s3:::*/*",
+            "arn:aws:s3:::artifacts*/*",
+            "arn:aws:s3:::other-bucket/*",
+            "arn:aws:s3:::${aws:PrincipalTag/team}/*",
+            "arn:*:s3:::art?facts/*",
+        ],
+    )
+    def test_a_grant_that_reaches_another_bucket_fails(self, resource):
+        rows = self._run(_sm43_role_cache(self._get(resource)))
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            f"execution role 'sm-role' is allowed s3:GetObject on {resource} by "
+            "policy model-access statement Read, which reaches objects outside "
+            "its artifact bucket(s) artifacts"
+        ) in rows[0]["Finding_Details"]
+
+    def test_only_the_endpoint_whose_role_reads_wider_fails(self):
+        cache = _sm43_role_cache(self._get("arn:aws:s3:::artifacts/*"))
+        cache["role_permissions"]["wide-role"] = _sm43_role_cache(
+            self._get("arn:aws:s3:::*/*")
+        )["role_permissions"]["sm-role"]
+        rows = self._run(
+            cache,
+            endpoints={"ep-1": {"models": ["m-1"]}, "ep-2": {"models": ["m-2"]}},
+            models={
+                "m-1": _sm43_prefix_model(),
+                "m-2": dict(
+                    _sm43_prefix_model(),
+                    ExecutionRoleArn=f"arn:aws:iam::{_SM43_ACCOUNT}:role/wide-role",
+                ),
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith("Endpoint 'ep-2'")
+        assert "execution role 'wide-role'" in rows[0]["Finding_Details"]
+
+    def test_a_bucket_arn_without_objects_does_not_reach_objects(self):
+        rows = self._run(
+            _sm43_role_cache(
+                self._get("arn:aws:s3:::other-bucket"),
+                self._get("arn:aws:s3:::artifacts/*"),
+            )
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+            {"Effect": "Allow", "Action": ["kms:Decrypt", "S3:Get*"], "Resource": "*"},
+            {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"},
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "NotResource": "arn:aws:s3:::artifacts/*",
+            },
+        ],
+    )
+    def test_wildcard_actions_and_not_forms_reach_other_buckets(self, statement):
+        rows = self._run(_sm43_role_cache(statement))
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "execution role 'sm-role' is allowed s3:GetObject on"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_not_action_that_excludes_get_object_does_not_reach(self):
+        rows = self._run(
+            _sm43_role_cache({"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"})
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_conditioned_wide_grant_is_na(self):
+        rows = self._run(
+            _sm43_role_cache(
+                self._get("*", Condition={"StringEquals": {"aws:ResourceAccount": "1"}})
+            )
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "execution role 'sm-role' is allowed s3:GetObject on * by policy "
+            "model-access statement Read under a Condition this check does not "
+            "evaluate"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_account_wide_deny_removes_the_grant(self):
+        rows = self._run(
+            _sm43_role_cache(
+                self._get("*"),
+                {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*"},
+            )
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_narrower_deny_is_not_subtracted(self):
+        rows = self._run(
+            _sm43_role_cache(
+                self._get("*"),
+                {
+                    "Effect": "Deny",
+                    "Action": "s3:GetObject",
+                    "NotResource": "arn:aws:s3:::artifacts/*",
+                },
+            )
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+
+    def test_a_boundary_scoped_to_the_artifacts_bounds_the_grant(self):
+        boundary = {"Statement": [self._get("arn:aws:s3:::artifacts/*")]}
+        rows = self._run(_sm43_role_cache(self._get("*"), boundary=boundary))
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_boundary_that_also_reaches_wider_keeps_the_failure(self):
+        boundary = {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+        rows = self._run(_sm43_role_cache(self._get("*"), boundary=boundary))
+        assert _sm43_statuses(rows) == ["Failed"]
+
+    def test_an_unread_boundary_is_na(self):
+        rows = self._run(
+            _sm43_role_cache(
+                self._get("*"),
+                errors=[
+                    {"type": "role", "name": "sm-role", "stage": "permissions_boundary"}
+                ],
+            )
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert "its permissions boundary was not read" in rows[0]["Finding_Details"]
+
+    def test_no_cache_is_na_never_passed(self):
+        rows = self._run(None)
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            f"execution role {_SM43_ROLE} read scope was not judged (the IAM "
+            "permissions cache was not available)"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_role_missing_from_the_cache_is_na(self):
+        rows = self._run(_sm43_role_cache(self._get("*"), name="someone-else"))
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            f"execution role {_SM43_ROLE} read scope was not judged (not in the IAM cache)"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_inference_component_container_is_judged_with_the_config_role(self):
+        cache = _sm43_role_cache(self._get("arn:aws:s3:::artifacts/*"))
+        cache["role_permissions"]["ic-role"] = _sm43_role_cache(self._get("*"))[
+            "role_permissions"
+        ]["sm-role"]
+        rows = self._run(
+            cache,
+            endpoints={
+                "ep-1": {
+                    "models": [],
+                    "components": ["ic-variant"],
+                    "role": f"arn:aws:iam::{_SM43_ACCOUNT}:role/ic-role",
+                }
+            },
+            models={},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": {
+                    "Container": {
+                        "DeployedImage": {
+                            "SpecifiedImage": _sm43_image(tag=None, digest=_SM43_DIGEST)
+                        },
+                        "ArtifactUrl": "s3://artifacts/ic/model.tar.gz",
+                    }
+                },
+            },
+        )
+        assert (
+            "execution role 'ic-role' is allowed s3:GetObject on *"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_model_with_no_s3_data_has_no_role_judged(self):
+        rows = self._run(
+            _sm43_role_cache(self._get("*")),
+            models={
+                "m-1": {"PrimaryContainer": {"Image": _sm43_image(digest=_SM43_DIGEST)}}
+            },
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_policy_read_error_on_the_role_is_na(self):
+        rows = self._run(
+            _sm43_role_cache(
+                self._get("arn:aws:s3:::artifacts/*"),
+                errors=[
+                    {"type": "role", "name": "sm-role", "stage": "inline_policies"}
+                ],
+            )
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "read scope was not judged (IAM cache read error)"
+            in (rows[0]["Finding_Details"])
+        )

@@ -909,6 +909,22 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-quality-job-definition/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-bias-job-definition/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-explainability-job-definition/*'
+          - Sid: ModelImageRepositoryAnyAccountRead
+            # SM-43 reads the tag mutability of the repository each endpoint
+            # image names, in any account, AWS Deep Learning Containers
+            # included. Signing status stays scoped to this account inline.
+            Effect: Allow
+            Action:
+              - ecr:DescribeRepositories # SM-43
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:*:*:repository/*'
+          - Sid: ModelArtifactPrefixList
+            # SM-43 lists the objects under each S3Prefix and multi-model
+            # ModelDataUrl prefix an endpoint loads, to read each one's
+            # encryption with HeadObject.
+            Effect: Allow
+            Action:
+              - s3:ListBucket # SM-43
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
           - Sid: EKSFargateProfileList
             # SM-38 lists each EKS cluster's Fargate profiles, whose pods
             # Runtime Monitoring does not cover.
@@ -1193,11 +1209,10 @@ Resources:
                 - cloudwatch:DescribeAlarmHistory # SM-37
               Resource: '*'
             - Sid: ModelImageRepositoryRead
-              # SM-43 reads tag mutability and image signing status of the ECR
-              # repositories endpoint containers run from.
+              # SM-43 reads the signing status of images in this account's
+              # registry, the only registry its signing rules cover.
               Effect: Allow
               Action:
-                - ecr:DescribeRepositories # SM-43
                 - ecr:DescribeImageSigningStatus # SM-43
               Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
             - Sid: TrainingFileSystemRead

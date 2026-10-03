@@ -328,6 +328,8 @@ _EXPECTED_ACTIONS = {
         "bedrock:GetAgentActionGroup",
         "bedrock-agentcore:ListGateways",
         "bedrock-agentcore:ListGatewayTargets",
+        "ecr:DescribeRepositories",
+        "s3:ListBucket",
         "organizations:DescribePolicy",
         "bedrock-agentcore:GetGatewayTarget",
         "lambda:GetFunctionConfiguration",
@@ -441,7 +443,6 @@ _EXPECTED_ACTIONS = {
         "ram:ListResources",
         "securityhub:GetConfigurationPolicyAssociation",
         "cloudwatch:DescribeAlarmHistory",
-        "ecr:DescribeRepositories",
         "ecr:DescribeImageSigningStatus",
         "ecr:GetSigningConfiguration",
         "elasticfilesystem:DescribeFileSystems",
@@ -1079,6 +1080,16 @@ _SAGEMAKER_MANAGED_GRANTS = [
                 "${AWS::AccountId}:hub/default"
             }
         ),
+    ),
+    (
+        "Allow",
+        "s3:ListBucket",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
+    ),
+    (
+        "Allow",
+        "ecr:DescribeRepositories",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:ecr:*:*:repository/*"}),
     ),
     (
         "Allow",
