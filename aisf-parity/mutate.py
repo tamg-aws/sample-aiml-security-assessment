@@ -1135,6 +1135,20 @@ MUTATIONS = [
         "find": '    "The agent\'s code and container image were not scanned: GetAgentRuntime "\n',
         "replace": '    "The agent\'s code and container image are not readable through any "\n',
     },
+    {
+        "name": "AC-26 accepts several exempt principals on the tamper SCP",
+        "file": AGENTCORE,
+        "defect": "DET-09 exempts a single provisioning role, and each further exempt principal can delete the agent logs or turn protection off",
+        "find": "    return len(exempted) <= 1 and not any(\n",
+        "replace": "    return len(exempted) <= 9 and not any(\n",
+    },
+    {
+        "name": "AC-26 accepts a wildcard name as the tamper SCP exemption",
+        "file": AGENTCORE,
+        "defect": "role/LogAdmin* exempts every role whose name starts that way, not one named role",
+        "find": '        "*" in value.split(":", 5)[5] or "?" in value.split(":", 5)[5]\n',
+        "replace": "        False\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1408,6 +1422,8 @@ GROUPS: dict[str, str] = {
     "AC-18 ignores an event data store's memory ARN scope": "in the AgentCore verdict legs",
     "AC-50 matches Inspector coverage on repository name alone": "in the AgentCore verdict legs",
     "AC-34 claims the agent code is unreadable through any API": "in the AgentCore verdict legs",
+    "AC-26 accepts several exempt principals on the tamper SCP": "in the AgentCore verdict legs",
+    "AC-26 accepts a wildcard name as the tamper SCP exemption": "in the AgentCore verdict legs",
 }
 
 

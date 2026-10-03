@@ -15220,6 +15220,39 @@ class TestAC26LogTamperSCP:
     @pytest.mark.parametrize(
         "condition",
         [
+            {
+                "ArnNotLike": {
+                    "aws:PrincipalArn": [
+                        "arn:aws:iam::*:role/LogAdmin",
+                        "arn:aws:iam::*:role/PlatformAdmin",
+                    ]
+                }
+            },
+            {
+                "ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/LogAdmin"},
+                "ArnNotEquals": {"aws:PrincipalArn": "arn:aws:iam::*:role/Ops"},
+            },
+            {"ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/LogAdmin*"}},
+        ],
+        ids=["two-in-one-list", "two-operators", "wildcard-name"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_an_exemption_beyond_one_named_role_does_not_count(
+        self, mock_orgs, condition
+    ):
+        # DET-09 asks for the Deny "except a single named provisioning role".
+        # Each further principal, or a name pattern, is a caller that can still
+        # delete the agent logs or turn their protection off.
+        findings = self._findings(
+            mock_orgs, {"DenyLogTamper": _log_tamper_guard(condition=condition)}
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Missing"
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
             {"ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/*"}},
             {"StringEquals": {"aws:PrincipalTag/team": "untrusted"}},
             {"StringNotEquals": {"aws:RequestedRegion": "us-east-1"}},

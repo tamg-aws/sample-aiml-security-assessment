@@ -1638,10 +1638,13 @@ FOUNDATION_ROWS = [
         "since CloudWatch Logs leaves deletion protection off by default and an "
         "administrator can otherwise delete the audit trail with the group. AC-26 also "
         "requires an attached SCP that denies logs:DeleteLogGroup, "
-        "logs:PutRetentionPolicy, logs:PutLogGroupDeletionProtection and "
-        "logs:DeleteSubscriptionFilter on those groups in every Region, exempting at "
-        "most principals named by aws:PrincipalArn, and fails a trail that records the "
-        "Region with log file validation off. An unreadable trail is N/A",
+        "logs:DeleteLogStream on the :log-stream:* ARN, logs:PutRetentionPolicy, "
+        "logs:PutLogGroupDeletionProtection and logs:DeleteSubscriptionFilter on "
+        "those groups in every Region, exempting at most one principal, named by "
+        "aws:PrincipalArn with no wildcard in its name, and fails a trail that "
+        "records the Region with log file validation off. An unreadable trail is "
+        "N/A. The subscription filter that forwards the groups to an archive, and "
+        "Object Lock on that archive bucket, are not read",
         [],
         6,
     ),

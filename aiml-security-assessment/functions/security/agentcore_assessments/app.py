@@ -18565,16 +18565,19 @@ def _scp_exemption_is_bounded(values: List[str]) -> bool:
 
 
 def _deny_binds_every_caller(statement: Dict[str, Any]) -> bool:
-    """Return whether a Deny fires for every caller but named exemptions.
+    """Return whether a Deny fires for every caller but one named exemption.
 
     The Deny may carry no condition, or only negated operators on
-    aws:PrincipalArn with bounded values.
+    aws:PrincipalArn with bounded values. AISF DET-09 exempts "a single named
+    provisioning role", so the operators together may name one principal, and
+    its name may hold no wildcard.
     """
     condition = statement.get("Condition")
     if not condition:
         return True
     if not isinstance(condition, dict):
         return False
+    exempted: Set[str] = set()
     for operator, entries in condition.items():
         name = str(operator).strip().lower()
         if name.endswith("ifexists"):
@@ -18584,11 +18587,14 @@ def _deny_binds_every_caller(statement: Dict[str, Any]) -> bool:
         for key, raw in entries.items():
             if str(key).strip().lower() not in SCP_EXEMPTION_CONDITION_KEYS:
                 return False
-            if not _scp_exemption_is_bounded(
-                [value.strip() for value in _condition_values(raw)]
-            ):
+            values = [value.strip() for value in _condition_values(raw)]
+            if not _scp_exemption_is_bounded(values):
                 return False
-    return True
+            exempted.update(values)
+    return len(exempted) <= 1 and not any(
+        "*" in value.split(":", 5)[5] or "?" in value.split(":", 5)[5]
+        for value in exempted
+    )
 
 
 AGENTCORE_LOG_TAMPER_ACTIONS = {
@@ -18776,7 +18782,9 @@ def check_agentcore_log_tamper_scp(
                 "guard_text": (
                     "on the AgentCore log groups and aws/spans in every Region, "
                     "and on the Bedrock model invocation log group each assessed "
-                    "Region's logging configuration names, if any"
+                    "Region's logging configuration names, if any, to every "
+                    "caller but at most one principal named by aws:PrincipalArn "
+                    "without a wildcard"
                 ),
                 "remediation": (
                     "Attach a service control policy that denies "
