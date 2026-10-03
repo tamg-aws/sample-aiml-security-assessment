@@ -1357,6 +1357,9 @@ Resources:
                 # Formerly CloudTrailTrailInventory
                 # ListTrails takes no resource.
                 - cloudtrail:ListTrails # AC-18, AC-26
+                # AC-18 lists the CloudTrail Lake event data stores. The service
+                # authorization reference lists no resource type for it.
+                - cloudtrail:ListEventDataStores # AC-18
                 # Formerly LogsDeliveryInventory
                 # AC-19 pairs each AgentCore delivery source with its delivery.
                 - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-26, AC-46
@@ -1543,7 +1546,12 @@ Resources:
                 - cloudtrail:GetEventSelectors
                 - cloudtrail:GetTrail # AC-26 log file validation, AC-18 trail region
                 - cloudtrail:GetTrailStatus # AC-18 IsLogging
-              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+                # AC-18 reads each CloudTrail Lake event data store's Status and
+                # selectors on the eventdatastore resource type.
+                - cloudtrail:GetEventDataStore # AC-18
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+                - !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
             # AC-20 reads masking configuration at both scopes: an account-wide
             # data-protection policy and a per-log-group one.
             - Sid: LogsDataProtectionPolicyRead

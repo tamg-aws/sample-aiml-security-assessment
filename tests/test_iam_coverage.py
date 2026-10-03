@@ -184,6 +184,9 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListApiKeyCredentialProviders",
     "cloudtrail:GetTrail",
     "cloudtrail:GetTrailStatus",
+    # AC-18 reads the CloudTrail Lake event data stores beside the trails.
+    "cloudtrail:ListEventDataStores",
+    "cloudtrail:GetEventDataStore",
     # AC-50 reads the registry scanning configuration.
     "ecr:GetRegistryScanningConfiguration",
     # AC-52 reads the Cognito user pools AgentCore JWT authorizers name.
@@ -1221,6 +1224,15 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:ListTrainingJobs"}
 # lambda:ListTagz as INVALID_ACTION at Action index 1 of one statement and
 # nothing at index 0.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"lambda:ListTags"}
+
+# AC-18 reads CloudTrail Lake event data stores. validate-policy on 2026-10-03
+# reported the negative control cloudtrail:GetEventDataStorez as INVALID_ACTION
+# at Action index 2 and nothing at indexes 0 and 1. Both names are also in the
+# cloudtrail service reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "cloudtrail:ListEventDataStores",
+    "cloudtrail:GetEventDataStore",
+}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

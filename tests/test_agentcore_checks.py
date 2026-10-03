@@ -7612,6 +7612,133 @@ def _trail(name, region="us-east-1"):
     }
 
 
+_EDS_ARN = "arn:aws:cloudtrail:us-east-1:123456789012:eventdatastore/"
+
+
+class TestAC18EventDataStores:
+    """AIR-ACR-MEM-12: a CloudTrail Lake event data store can record the Memory
+    data events in place of a trail, so an ENABLED store counts as a trail does."""
+
+    @staticmethod
+    def _run(mock_ct, mock_ac, stores, list_error=None, get_error_for=()):
+        mock_ct.meta.region_name = "us-east-1"
+        mock_ct.list_trails.return_value = {"Trails": []}
+        if list_error is not None:
+            mock_ct.list_event_data_stores.side_effect = list_error
+        else:
+            mock_ct.list_event_data_stores.return_value = {
+                "EventDataStores": [
+                    {"EventDataStoreArn": f"{_EDS_ARN}{name}", "Name": name}
+                    for name in stores
+                ]
+            }
+
+        def get_event_data_store(EventDataStore):
+            name = EventDataStore.rsplit("/", 1)[-1]
+            if name in get_error_for:
+                raise _make_client_error("AccessDeniedException", "denied")
+            status, selectors = stores[name]
+            return {
+                "EventDataStoreArn": EventDataStore,
+                "Name": name,
+                "Status": status,
+                "AdvancedEventSelectors": selectors,
+            }
+
+        mock_ct.get_event_data_store.side_effect = get_event_data_store
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-1", "arn": f"{_MEMORY_ARN}mem-1"},
+                {"id": "mem-2", "arn": f"{_MEMORY_ARN}mem-2"},
+            ]
+        }
+        finding = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+        assert_finding_schema(finding)
+        return finding
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_an_enabled_store_selecting_memory_passes(self, mock_ct, mock_ac):
+        memory_selector = [_data_event_selector("AWS::BedrockAgentCore::Memory")]
+        memory = self._run(
+            mock_ct,
+            mock_ac,
+            {
+                "stopped": ("STOPPED_INGESTION", memory_selector),
+                "lake": ("ENABLED", memory_selector),
+            },
+        )
+
+        assert memory["Status"] == "Passed"
+        assert "event data store lake" in memory["Finding_Details"]
+        assert "event data store stopped" not in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_store_that_is_not_ingesting_does_not_count(self, mock_ct, mock_ac):
+        memory = self._run(
+            mock_ct,
+            mock_ac,
+            {
+                "stopped": (
+                    "STOPPED_INGESTION",
+                    [_data_event_selector("AWS::BedrockAgentCore::Memory")],
+                ),
+                "other": ("ENABLED", [_data_event_selector("AWS::S3::Object")]),
+            },
+        )
+
+        assert memory["Status"] == "Failed"
+        assert "event data store stopped" in memory["Finding_Details"]
+        assert "STOPPED_INGESTION" in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_store_scoped_to_every_memory_arn_passes(self, mock_ct, mock_ac):
+        selector = _data_event_selector("AWS::BedrockAgentCore::Memory")
+        selector["FieldSelectors"].append(
+            {"Field": "resources.ARN", "StartsWith": [f"{_MEMORY_ARN}mem-"]}
+        )
+        memory = self._run(mock_ct, mock_ac, {"lake": ("ENABLED", [selector])})
+
+        assert memory["Status"] == "Passed"
+        assert "event data store lake" in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_unlisted_stores_turn_a_gap_into_na(self, mock_ct, mock_ac):
+        memory = self._run(
+            mock_ct,
+            mock_ac,
+            {},
+            list_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert memory["Status"] == "N/A"
+        assert "ListEventDataStores" in memory["Finding_Details"]
+        assert "cloudtrail:ListEventDataStores" in memory["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_an_unreadable_store_turns_a_gap_into_na(self, mock_ct, mock_ac):
+        memory = self._run(
+            mock_ct,
+            mock_ac,
+            {
+                "other": ("ENABLED", [_data_event_selector("AWS::S3::Object")]),
+                "hidden": ("ENABLED", []),
+            },
+            get_error_for=("hidden",),
+        )
+
+        assert memory["Status"] == "N/A"
+        assert "event data store hidden" in memory["Finding_Details"]
+        assert "cloudtrail:GetEventDataStore" in memory["Resolution"]
+
+
 class TestAC18FieldsThatKeepEveryEvent:
     """AC-18 reads an extra field as narrowing only when it drops an event."""
 

@@ -1052,8 +1052,11 @@ AI_SUBJECT_ROWS = [
         "recorded only once named. A selector narrowed by readOnly, eventName or any "
         "other field does not count, nor does a trail that is not logging or that "
         "neither spans all Regions nor is homed in the scanned one. An unreadable "
-        "trail status is N/A. CloudTrail Lake event data stores are not read, so "
-        "Memory data events captured only in Lake read as absent. AC-19 requires "
+        "trail status is N/A. A CloudTrail Lake event data store homed in the "
+        "region counts as a trail does when GetEventDataStore reports Status "
+        "ENABLED, judged by the same selector rules; an unlisted or unreadable "
+        "store turns a gap into N/A. A multi-Region store homed in another region "
+        "is not listed there, so its events read as absent. AC-19 requires "
         "each memory's APPLICATION_LOGS delivery, which carries "
         "the extraction and consolidation logs of long-term memory processing",
         [],

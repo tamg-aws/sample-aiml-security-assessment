@@ -11471,6 +11471,31 @@ def _selector_arn_scope(
     return operator, values
 
 
+def _agentcore_selector_coverage(
+    advanced_selectors: List[Any], region: str
+) -> Tuple[Set[str], Dict[str, Set[str]], Dict[str, List[Tuple[str, List[str]]]]]:
+    """Return the AgentCore types one trail's or store's selectors keep whole,
+    the narrowing fields per narrowed type, and the resources.ARN scopes."""
+    whole: Set[str] = set()
+    narrowed: Dict[str, Set[str]] = {}
+    scoped: Dict[str, List[Tuple[str, List[str]]]] = {}
+    for selector in advanced_selectors:
+        if not isinstance(selector, dict):
+            continue
+        types, narrowing = _advanced_selector_data_resource_types(selector, region)
+        scope = _selector_arn_scope(selector, region) if narrowing else None
+        for resource_type in types:
+            if not resource_type.startswith("AWS::BedrockAgentCore::"):
+                continue
+            if narrowing:
+                narrowed.setdefault(resource_type, set()).update(narrowing)
+                if scope:
+                    scoped.setdefault(resource_type, []).append(scope)
+            else:
+                whole.add(resource_type)
+    return whole, narrowed, scoped
+
+
 def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
     """Collect the AgentCore resource types each logging trail selects whole.
 
@@ -11524,23 +11549,9 @@ def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
         if not isinstance(advanced_selectors, list):
             continue
 
-        trail_whole: Set[str] = set()
-        trail_narrowed: Dict[str, Set[str]] = {}
-        trail_scoped: Dict[str, List[Tuple[str, List[str]]]] = {}
-        for selector in advanced_selectors:
-            if not isinstance(selector, dict):
-                continue
-            types, narrowing = _advanced_selector_data_resource_types(selector, region)
-            scope = _selector_arn_scope(selector, region) if narrowing else None
-            for resource_type in types:
-                if not resource_type.startswith("AWS::BedrockAgentCore::"):
-                    continue
-                if narrowing:
-                    trail_narrowed.setdefault(resource_type, set()).update(narrowing)
-                    if scope:
-                        trail_scoped.setdefault(resource_type, []).append(scope)
-                else:
-                    trail_whole.add(resource_type)
+        trail_whole, trail_narrowed, trail_scoped = _agentcore_selector_coverage(
+            advanced_selectors, region
+        )
         if not trail_whole and not trail_narrowed:
             continue
 
@@ -11582,6 +11593,59 @@ def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
         for resource_type, scopes in trail_scoped.items():
             arn_scoped.setdefault(resource_type, []).extend(
                 (trail_identifier, operator, values) for operator, values in scopes
+            )
+
+    # A CloudTrail Lake event data store records data events in place of a
+    # trail. ListEventDataStores returns the stores homed in this region, and
+    # GetEventDataStore returns the Status and selectors, which are judged with
+    # the trail rules. Only an ENABLED store is ingesting.
+    try:
+        stores = _paginate_aws_list(
+            cloudtrail_client,
+            "list_event_data_stores",
+            "EventDataStores",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except Exception as error:
+        logger.warning(f"Could not list event data stores: {type(error).__name__}")
+        stores = []
+        unreadable.append(
+            "the CloudTrail Lake event data stores (ListEventDataStores failed "
+            f"with {type(error).__name__})"
+        )
+    for store in stores:
+        store_arn = store.get("EventDataStoreArn")
+        store_label = f"event data store {store.get('Name') or store_arn or 'unnamed'}"
+        try:
+            if not store_arn:
+                raise TypeError("ListEventDataStores returned no ARN")
+            detail = cloudtrail_client.get_event_data_store(EventDataStore=store_arn)
+        except Exception as error:
+            logger.warning(f"Could not read {store_label}: {type(error).__name__}")
+            unreadable.append(store_label)
+            continue
+        store_whole, store_narrowed, store_scoped = _agentcore_selector_coverage(
+            detail.get("AdvancedEventSelectors") or [], region
+        )
+        if not store_whole and not store_narrowed:
+            continue
+        if detail.get("Status") != "ENABLED":
+            excluded.append(
+                f"{store_label} is not ingesting (Status "
+                f"{detail.get('Status') or 'absent'})"
+            )
+            continue
+        for resource_type in store_whole:
+            whole.setdefault(resource_type, []).append(store_label)
+        for resource_type, fields in store_narrowed.items():
+            narrowed.setdefault(resource_type, []).append(
+                f"{store_label} selects {resource_type} only where "
+                f"{', '.join(sorted(fields))} match"
+            )
+        for resource_type, scopes in store_scoped.items():
+            arn_scoped.setdefault(resource_type, []).extend(
+                (store_label, operator, values) for operator, values in scopes
             )
 
     return {
@@ -11645,8 +11709,8 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
     invocations and the memory record reads and writes that follow. A family
     passes only when every one of its types that has a resource in this region
     is selected, with no narrowing field, by a trail that is logging and records
-    this region. CloudTrail Lake event data stores are not read, so data events
-    collected only there read as uncovered.
+    this region, or by an ENABLED CloudTrail Lake event data store homed here.
+    A multi-region store homed in another region is not listed here.
     """
     if cloudtrail_client is None:
         return [
@@ -11787,14 +11851,15 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
                         f"{resource_count} AgentCore {label} resource(s) are "
                         f"covered: every type in use here, {', '.join(present)}, "
                         "is selected for data events by a trail that is logging "
-                        f"and records this region: {', '.join(trails)}."
+                        "and records this region, or an ENABLED event data store "
+                        f"homed here: {', '.join(trails)}."
                         f"{arn_text}"
                         if by_arn
                         else f"{resource_count} AgentCore {label} resource(s) are "
                         f"covered: every type in use here, {', '.join(present)}, "
                         "is selected for data events with no narrowing field by "
-                        "a trail that is logging and records this region: "
-                        f"{', '.join(trails)}."
+                        "a trail that is logging and records this region, or an "
+                        f"ENABLED event data store homed here: {', '.join(trails)}."
                     ),
                     resolution="No action required.",
                     reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
@@ -11811,15 +11876,18 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
                     finding_name="AgentCore CloudTrail Data Event Coverage",
                     finding_details=(
                         f"{resource_count} AgentCore {label} resource(s) found, and "
-                        "no readable, logging trail recording this region selects "
-                        f"{', '.join(missing)} whole for data events, but "
-                        f"{len(unreadable_trails)} trail(s) could not be read: "
+                        "no readable, logging trail or ENABLED event data store "
+                        f"recording this region selects {', '.join(missing)} whole "
+                        f"for data events, but {len(unreadable_trails)} trail(s) "
+                        "or event data store(s) could not be read: "
                         f"{', '.join(unreadable_trails)}."
                     ),
                     resolution=(
                         "Grant cloudtrail:GetEventSelectors, cloudtrail:GetTrail "
-                        "and cloudtrail:GetTrailStatus on every trail and retry so "
-                        "the coverage verdict is decided on all trails."
+                        "and cloudtrail:GetTrailStatus on every trail, and "
+                        "cloudtrail:ListEventDataStores and "
+                        "cloudtrail:GetEventDataStore, and retry so the coverage "
+                        "verdict is decided on every trail and event data store."
                     ),
                     reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
@@ -11844,9 +11912,11 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
                 finding_name="AgentCore CloudTrail Data Event Coverage",
                 finding_details=(
                     f"{resource_count} AgentCore {label} resource(s) found, and no "
-                    "logging trail recording this region selects "
-                    f"{', '.join(missing)} whole for data events, so those "
-                    f"{label.lower()} calls are not all in the audit trail."
+                    "logging trail recording this region, and no ENABLED event "
+                    f"data store homed here, selects {', '.join(missing)} whole "
+                    f"for data events, so those {label.lower()} calls are not all "
+                    "in the audit trail. A multi-region event data store homed in "
+                    "another region is not listed here."
                     f"{covered_text}{note_text}"
                 ),
                 resolution=(

@@ -1086,6 +1086,41 @@ MUTATIONS = [
         "find": '                            "Grant bedrock-agentcore:GetAgentRuntime on this "\n                            "runtime and retry."\n                        ),\n                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,\n                        severity=SeverityEnum.INFORMATIONAL,\n                        status=StatusEnum.NA,\n',
         "replace": '                            "Grant bedrock-agentcore:GetAgentRuntime on this "\n                            "runtime and retry."\n                        ),\n                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,\n                        severity=SeverityEnum.INFORMATIONAL,\n                        status=StatusEnum.PASSED,\n',
     },
+    {
+        "name": "AC-18 does not read CloudTrail Lake event data stores",
+        "file": AGENTCORE,
+        "defect": "Memory data events recorded only in an ENABLED event data store read as absent, so a compliant account fails",
+        "find": '    for store in stores:\n        store_arn = store.get("EventDataStoreArn")\n',
+        "replace": '    for store in []:\n        store_arn = store.get("EventDataStoreArn")\n',
+    },
+    {
+        "name": "AC-18 credits an event data store that is not ingesting",
+        "file": AGENTCORE,
+        "defect": "a store with ingestion stopped records nothing, so crediting its selectors passes memory calls no store records",
+        "find": '        if detail.get("Status") != "ENABLED":\n            excluded.append(\n                f"{store_label} is not ingesting (Status "\n',
+        "replace": '        if False:\n            excluded.append(\n                f"{store_label} is not ingesting (Status "\n',
+    },
+    {
+        "name": "AC-18 fails a gap when the event data stores were not listed",
+        "file": AGENTCORE,
+        "defect": "a denied ListEventDataStores hides any store that records the events, so the Failed is a verdict from a failed read",
+        "find": "        stores = []\n        unreadable.append(\n",
+        "replace": "        stores = []\n        (lambda *_: None)(\n",
+    },
+    {
+        "name": "AC-18 fails a gap when an event data store was not read",
+        "file": AGENTCORE,
+        "defect": "a denied GetEventDataStore hides that store's selectors, so the Failed is a verdict from a failed read",
+        "find": '            logger.warning(f"Could not read {store_label}: {type(error).__name__}")\n            unreadable.append(store_label)\n',
+        "replace": '            logger.warning(f"Could not read {store_label}: {type(error).__name__}")\n',
+    },
+    {
+        "name": "AC-18 ignores an event data store's memory ARN scope",
+        "file": AGENTCORE,
+        "defect": "a store scoped to every memory ARN, the scoping the control recommends, fails as uncovered",
+        "find": "        for resource_type, scopes in store_scoped.items():\n",
+        "replace": "        for resource_type, scopes in {}.items():\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1352,6 +1387,11 @@ GROUPS: dict[str, str] = {
     "AC-47 ignores the version an endpoint rolls toward": "in the AgentCore verdict legs",
     "AC-47 passes the caller leg when the endpoints are unlisted": "in the AgentCore verdict legs",
     "AC-47 passes a served version it could not read": "in the AgentCore verdict legs",
+    "AC-18 does not read CloudTrail Lake event data stores": "in the AgentCore verdict legs",
+    "AC-18 credits an event data store that is not ingesting": "in the AgentCore verdict legs",
+    "AC-18 fails a gap when the event data stores were not listed": "in the AgentCore verdict legs",
+    "AC-18 fails a gap when an event data store was not read": "in the AgentCore verdict legs",
+    "AC-18 ignores an event data store's memory ARN scope": "in the AgentCore verdict legs",
 }
 
 
