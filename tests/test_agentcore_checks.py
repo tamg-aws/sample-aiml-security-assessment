@@ -12412,7 +12412,15 @@ class TestAC27GatewayPolicyConditions:
                         "StringEquals": {
                             "aws:SourceAccount": "123456789012",
                             "aws:SourceVpce": "vpce-1",
-                        }
+                        },
+                        # The deputy guard needs both keys, the ARN naming this
+                        # gateway.
+                        "ArnEquals": {
+                            "aws:SourceArn": (
+                                "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                                "gateway/gw-guarded"
+                            )
+                        },
                     },
                 },
                 # The Allow's aws:SourceVpce binds only the callers it admits,
@@ -12479,6 +12487,53 @@ class TestAC27GatewayPolicyConditions:
             return {"Role": {"AssumeRolePolicyDocument": document}}
 
         mock_iam.get_role.side_effect = get_role
+
+    @pytest.mark.parametrize(
+        "source_arn, status",
+        [
+            (None, "Failed"),
+            ("arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*", "Failed"),
+            ("arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1", "Passed"),
+        ],
+        ids=["account-only", "gateway-wildcard", "this-gateway"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_resource_policy_guard_needs_a_source_arn_naming_the_gateway(
+        self, mock_ac, source_arn, status
+    ):
+        # aws:SourceAccount alone was read as a guard, which admits any
+        # resource in the account.
+        condition = {"StringEquals": {"aws:SourceAccount": "123456789012"}}
+        if source_arn:
+            condition["ArnLike"] = {"aws:SourceArn": source_arn}
+        policy = {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                    "Condition": condition,
+                }
+            ]
+        }
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+        }
+        mock_ac.get_resource_policy.return_value = {"policy": json.dumps(policy)}
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        deputy = [
+            f
+            for f in findings
+            if f["Finding"].startswith("AgentCore Gateway Resource Policy")
+            and "Network" not in f["Finding"]
+        ]
+        assert [f["Status"] for f in deputy] == [status]
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.iam_client")
@@ -18640,8 +18695,11 @@ def _engine_service_use(
     via_service=None,
     source_account=None,
     engine_context="arn:aws*:bedrock-agentcore:*:*:policy-engine/*",
+    source_arn=True,
 ):
-    """The policy encryption guide's key policy statements for the service."""
+    """The policy encryption guide's key policy statements for the service,
+    with the source-context statement's aws:SourceArn unless `source_arn` is
+    False."""
     via = via_service or f"bedrock-agentcore.{region}.amazonaws.com"
     grant_condition = {
         "StringEquals": {"kms:GrantConstraintType": "EncryptionContextSubset"},
@@ -18652,6 +18710,11 @@ def _engine_service_use(
         "StringEquals": {"aws:SourceAccount": source_account or account},
         "StringLike": {_ENGINE_CONTEXT_KEY: engine_context},
     }
+    if source_arn:
+        use_condition["StringLike"]["aws:SourceArn"] = (
+            f"arn:aws:bedrock-agentcore:{region}:{source_account or account}"
+            ":policy-engine/*"
+        )
     use_condition.setdefault(via_operator, {})["kms:ViaService"] = via
     principal = {"AWS": f"arn:aws:iam::{account}:role/PolicyAdministrator"}
     return [
@@ -19583,9 +19646,33 @@ class TestAC36PolicyEngineServiceScope:
 
         assert [finding["Status"] for finding in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
-        assert "aws:SourceAccount or aws:SourceArn condition naming account " in details
+        assert (
+            "both an aws:SourceAccount and an aws:SourceArn condition naming account "
+            in details
+        )
         assert "123456789012" in details
         assert "kms:CreateGrant only" not in details
+
+    @pytest.mark.parametrize(
+        "source_arn, status", [(False, "Failed"), (True, "Passed")]
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_account_without_a_source_arn_fails(
+        self, mock_ac, mock_kms, source_arn, status
+    ):
+        # SourceAccount alone admits any AgentCore resource in the account, and
+        # the guide's source-context statement pins both keys.
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use(source_arn=source_arn)],
+            _engine_grants("pe-1"),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == [status]
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
@@ -20081,9 +20168,11 @@ class TestAC36KeyLossAlarmAndServiceBounds:
     ):
         grant_statement, use_statement = _engine_service_use()
         for statement in (grant_statement, use_statement):
-            del statement["Condition"]["StringLike"]
+            # The context key alone changes; the use statement keeps its
+            # aws:SourceArn.
+            del statement["Condition"]["StringLike"][_ENGINE_CONTEXT_KEY]
             if context is not None:
-                statement["Condition"]["StringLike"] = {_ENGINE_CONTEXT_KEY: context}
+                statement["Condition"]["StringLike"][_ENGINE_CONTEXT_KEY] = context
         findings = self._run(
             mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
         )
@@ -20103,9 +20192,11 @@ class TestAC36KeyLossAlarmAndServiceBounds:
         self, mock_ac, mock_kms
     ):
         grant_statement, use_statement = _engine_service_use()
-        use_statement["Condition"]["StringLikeIfExists"] = use_statement[
-            "Condition"
-        ].pop("StringLike")
+        use_statement["Condition"]["StringLikeIfExists"] = {
+            _ENGINE_CONTEXT_KEY: use_statement["Condition"]["StringLike"].pop(
+                _ENGINE_CONTEXT_KEY
+            )
+        }
         findings = self._run(
             mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
         )

@@ -482,7 +482,10 @@ AI_SUBJECT_ROWS = [
         "carry aws:SourceAccount or aws:SourceArn naming the assessed account in every "
         "value, fails an unconditioned statement even when a guarded sibling sits "
         "beside it in the same document, and fails a gateway role that trusts a second "
-        "principal. IfExists, ForAllValues and wildcard values do not count",
+        "principal. A gateway resource-policy statement that names a service or "
+        "wildcard principal also fails unless it carries both aws:SourceAccount naming "
+        "the account and aws:SourceArn equal to the gateway's own ARN. IfExists, "
+        "ForAllValues and wildcard values do not count",
         [],
         4,
     ),
@@ -602,11 +605,15 @@ AI_SUBJECT_ROWS = [
         "as customer managed and Enabled, AC-36 asserts the key policy names who may "
         "decrypt with it and who may disable it or schedule it for deletion, scopes "
         "CreateGrant, Decrypt and GenerateDataKey by ViaService, grant constraint and "
-        "source account as the policy encryption guide shows, and that the key carries "
-        "the engine's management and evaluation grants; the key cannot be added to or "
-        "changed on an existing engine, so the key policy is the whole guard. The "
-        "disable/delete alarm and the break-glass runbook are not readable from the "
-        "key, and AC-36's passing resolution says so",
+        "source context as the policy encryption guide shows, with Decrypt and "
+        "GenerateDataKey needing both aws:SourceAccount and aws:SourceArn naming the "
+        "account (DescribeKey is scoped by ViaService alone, as the guide's complete "
+        "policy shows), and that the key carries the engine's management and "
+        "evaluation grants; the key cannot be added to or changed on an existing "
+        "engine, so the key policy is the whole guard. AC-36 reads an EventBridge rule "
+        "or a metric-filter alarm on DisableKey and ScheduleKeyDeletion, but not which "
+        "trail feeds the filtered log group, and the break-glass runbook is not "
+        "readable, which AC-36's passing resolution says",
         [],
         4,
     ),

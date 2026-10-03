@@ -15625,6 +15625,33 @@ def _confused_deputy_guard_account(
     return False
 
 
+def _statement_pins_source_arn(statement: Dict[str, Any], resource_arn: str) -> bool:
+    """Return whether an aws:SourceArn condition names `resource_arn` in every
+    value, under a binding operator.
+
+    A pattern value matches more than the one resource, so only the literal
+    ARN counts.
+    """
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return False
+    for operator, entries in conditions.items():
+        if not isinstance(entries, dict):
+            continue
+        name = str(operator).strip().lower()
+        if name.startswith("foranyvalue:"):
+            name = name[len("foranyvalue:") :]
+        if name not in CONFUSED_DEPUTY_GUARD_OPERATORS:
+            continue
+        for key, raw in entries.items():
+            if str(key).strip().lower() != "aws:sourcearn":
+                continue
+            values = _condition_values(raw)
+            if values and all(value.strip() == resource_arn for value in values):
+                return True
+    return False
+
+
 def _source_arn_names_resource_type(
     value: str, account_id: str, resource_types: Optional[Tuple[str, ...]] = None
 ) -> bool:
@@ -16041,6 +16068,49 @@ def _gateway_resource_policy_findings(
             for statement in statements
             if _statement_is_confused_deputy_exposed(statement, account_id)
         ]
+        # The control asks for both keys: SourceAccount alone admits any
+        # resource in the account, and SourceArn must name this gateway.
+        half_guarded = [
+            statement
+            for statement in statements
+            if statement not in exposed
+            and any(
+                principal == "*" or principal.endswith(".amazonaws.com")
+                for principal in _statement_principals(statement)
+            )
+            and not (
+                _confused_deputy_guard_account(
+                    statement, account_id, keys=("aws:sourceaccount",)
+                )
+                and _statement_pins_source_arn(statement, str(gateway_arn))
+            )
+        ]
+        if half_guarded:
+            findings.append(
+                create_finding(
+                    check_id="AC-27",
+                    finding_name=(
+                        "AgentCore Gateway Resource Policy Source ARN Missing"
+                    ),
+                    finding_details=(
+                        f"{label} has {len(half_guarded)} of {len(statements)} "
+                        "Allow statement(s) that trust an AWS service principal or "
+                        "every principal without both an aws:SourceAccount "
+                        f"condition naming account {account_id} and an "
+                        f"aws:SourceArn condition naming {gateway_arn} in every "
+                        "value, so another resource in the account can make the "
+                        "service call this gateway on its behalf."
+                    ),
+                    resolution=(
+                        "Add aws:SourceAccount for this account and aws:SourceArn "
+                        "for this gateway's ARN to every statement whose principal "
+                        "is an AWS service or a wildcard."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
         if exposed:
             findings.append(
                 create_finding(
@@ -16067,16 +16137,17 @@ def _gateway_resource_policy_findings(
                     status=StatusEnum.FAILED,
                 )
             )
-        else:
+        elif not half_guarded:
             findings.append(
                 create_finding(
                     check_id="AC-27",
                     finding_name="AgentCore Gateway Resource Policy Confused Deputy Guard",
                     finding_details=(
                         f"{label} guards all {len(statements)} Allow statement(s) "
-                        "in its resource policy with an aws:SourceAccount or "
-                        "aws:SourceArn condition whose every value names account "
-                        f"{account_id}, or names no service or wildcard principal."
+                        "in its resource policy with an aws:SourceAccount "
+                        f"condition naming account {account_id} and an "
+                        f"aws:SourceArn condition naming {gateway_arn}, or names "
+                        "no service or wildcard principal."
                     ),
                     resolution=(
                         "No action required. Confirm the aws:SourceArn pattern "
@@ -21631,7 +21702,14 @@ def _policy_engine_key_policy_gaps(
             for statement in statements
             if _statement_matches_action(statement, action.lower())
             and via_agentcore(statement)
-            and _confused_deputy_guard_account(statement, account_id)
+            # The guide's source-context statement pins both keys: SourceAccount
+            # alone admits any AgentCore resource in the account.
+            and _confused_deputy_guard_account(
+                statement, account_id, keys=("aws:sourceaccount",)
+            )
+            and _confused_deputy_guard_account(
+                statement, account_id, keys=("aws:sourcearn",)
+            )
         ]
         for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS
     }
@@ -21639,7 +21717,7 @@ def _policy_engine_key_policy_gaps(
     if unguarded:
         gaps.append(
             f"has no statement allowing {', '.join(unguarded)} only with "
-            f"kms:ViaService {via_service} and an aws:SourceAccount or "
+            f"kms:ViaService {via_service} and both an aws:SourceAccount and an "
             f"aws:SourceArn condition naming account {account_id}"
         )
     unbound = [

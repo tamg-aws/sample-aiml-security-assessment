@@ -701,6 +701,20 @@ MUTATIONS = [
         "find": "                if network.prefixlen > AGENTCORE_BROAD_EGRESS_PREFIX[network.version]:\n",
         "replace": "                if True:\n",
     },
+    {
+        "name": "AC-27 passes a gateway policy statement with no source ARN",
+        "file": AGENTCORE,
+        "defect": "aws:SourceAccount alone admits any resource of the service in the account, so a service principal statement without aws:SourceArn naming the gateway lets another resource in the account invoke it as a deputy",
+        "find": "                and _statement_pins_source_arn(statement, str(gateway_arn))\n",
+        "replace": "",
+    },
+    {
+        "name": "AC-36 credits a source-context statement with only SourceAccount",
+        "file": AGENTCORE,
+        "defect": "the guide's source-context statement pins aws:SourceAccount and aws:SourceArn together; SourceAccount alone lets any AgentCore resource in the account decrypt with the policy engine's key",
+        "find": '            and _confused_deputy_guard_account(\n                statement, account_id, keys=("aws:sourcearn",)\n            )\n        ]\n        for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS\n',
+        "replace": "        ]\n        for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -912,6 +926,8 @@ GROUPS: dict[str, str] = {
     "AC-48 passes a trust that names another service": "in the AgentCore verdict legs",
     "AC-53 credits an alarm on another Environment": "in the AgentCore verdict legs",
     "AC-01 passes a broad public egress range": "in the AgentCore verdict legs",
+    "AC-27 passes a gateway policy statement with no source ARN": "in the AgentCore verdict legs",
+    "AC-36 credits a source-context statement with only SourceAccount": "in the AgentCore verdict legs",
 }
 
 
