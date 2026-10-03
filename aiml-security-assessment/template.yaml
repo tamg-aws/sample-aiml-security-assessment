@@ -1587,7 +1587,12 @@ Resources:
               Effect: Allow
               Action:
                 - organizations:ListTargetsForPolicy # AC-28, AC-29, AC-37
-              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+              # AC-37 also reads where AWS managed FullAWSAccess is attached, to
+              # find a level whose policies allow no part of an action. That
+              # policy's ARN carries the account segment aws.
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/service_control_policy/*'
             - Sid: OrganizationsParentRead
               Effect: Allow
               Action:

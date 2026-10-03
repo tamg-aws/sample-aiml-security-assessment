@@ -431,8 +431,13 @@ AI_SUBJECT_ROWS = [
         "than ENABLED, no sampling percentage above zero, no input log group or service, no "
         "output log group, or no evaluator attached. AC-17 judges every runtime whatever "
         "REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to, and fails one that no running "
-        "configuration reads by its log group and service name. The rule filters are counted "
-        "and not judged, because which sessions an operator means to score has no API field",
+        "configuration reads by its log group and service name, matching a "
+        "logGroupNamePrefixes input as well as logGroupNames; the pinned botocore is "
+        "1.43.108, which models that member. With no runtime, a configuration that "
+        "exists and is not running fails, and REQUIRE_AGENTCORE_ONLINE_EVALUATION only "
+        "adds a requirement where no configuration and no runtime-prefix log group "
+        "exists. The rule filters are counted and not judged, because which sessions an "
+        "operator means to score has no API field",
         [],
         4,
     ),
@@ -447,9 +452,14 @@ AI_SUBJECT_ROWS = [
         "fails a configuration that attaches no safety evaluator, attaches neither "
         "Builtin.ToolSelectionAccuracy nor Builtin.ToolParameterAccuracy, or has no CloudWatch "
         "alarm with actions on a metric in the namespace its scores are published to. "
-        "Evaluators written in this account are named for the owner to classify, because "
-        "their descriptions are prose no check can verify. The dimensions an alarm narrows on "
-        "are not judged, because the dimension names the service emits are not API fields",
+        "A configuration that is not ACTIVE and ENABLED fails, because it scores nothing. "
+        "The namespace is the configuration's metricsNamespace when set, read through the "
+        "pinned botocore 1.43.108, and the two documented default spellings otherwise. An "
+        "alarm counts only on a metric ListMetrics lists, and when no listed metric names "
+        "an attached evaluator the configuration is N/A, because an alarm on another "
+        "score in the namespace would otherwise read as watching safety. Evaluators "
+        "written in this account are named for the owner to classify, because their "
+        "descriptions are prose no check can verify",
         [],
         4,
     ),
@@ -705,7 +715,9 @@ AI_SUBJECT_ROWS = [
         "whose PassRole grant does not name its roles or does not pin "
         "iam:PassedToService to bedrock-agentcore.amazonaws.com. A grant the "
         "principal's own Deny or boundary removes does not count, and a principal the "
-        "IAM cache could not read is named in an N/A row that withholds Passed",
+        "IAM cache could not read is named in an N/A row that withholds Passed. A "
+        "configuration GetOnlineEvaluationConfig could not read may name a role no "
+        "read configuration names, so it withholds the population-wide Passed",
         [],
         4,
     ),
@@ -740,8 +752,13 @@ AI_SUBJECT_ROWS = [
         "one attacker-influenced text can be sent to. A region wildcard on a named "
         'model passes. A bare Action "*" counts, a grant the role\'s own Deny or '
         "boundary removes does not, and a role the IAM cache could not read is N/A. "
-        "Which models a workload's judges may use is the workload owner's decision, so "
-        "the check names the patterns it found and asserts only that they are bounded",
+        "A bounded pattern then has to reach a model one of the role's custom "
+        "evaluators calls, as GetEvaluator reports it: a pattern no judge uses fails, "
+        "whether the configurations attach only built-in evaluators or custom ones "
+        "that name no Bedrock judge model, such as code-based evaluators, and a "
+        "configuration that returns no evaluator list is N/A. Which models a "
+        "workload's judges may use is the workload owner's decision, so the check "
+        "asserts only that each grant is bounded and used",
         [],
         4,
     ),
@@ -1052,7 +1069,10 @@ AI_SUBJECT_ROWS = [
         "forward access session, and the grant counts after the role's own Deny and "
         "boundary, then fails when a service control policy attached to the account "
         "or an OU or root above it denies the action on Resource * with no condition, "
-        "and withholds Passed for a conditioned Deny or an SCP it could not read. "
+        "or when a level from the account to the root has no attached policy allowing "
+        "the action, which an allow-list SCP leaves implicitly denied. It withholds "
+        "Passed for a conditioned Deny, a level whose only Allow is conditioned, an SCP "
+        "it could not read, and an organization whose policies could not be listed. "
         "AC-37 reads each BedrockGuardrails call by value and fails a "
         "guardrail policy that no returned score (0, 0.2, 0.4, 0.6, 0.8, 1.0) can make "
         "act, or whose call names no category or data path. A suppressOutput policy in "

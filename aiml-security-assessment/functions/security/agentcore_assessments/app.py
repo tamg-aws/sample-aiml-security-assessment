@@ -7969,12 +7969,15 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
     are counted and not judged, because which sessions an operator means to
     score has no API field.
 
-    With no runtime in the region, REQUIRE_AGENTCORE_ONLINE_EVALUATION set to
-    true still requires one running configuration, for agents hosted outside
-    AgentCore Runtime whose traces reach CloudWatch. Unset, a log group under
-    the runtime prefix requires one as well, because the AgentCore guide has
-    such an agent write there; with no such group, that case is N/A. A group
-    outside the prefix, such as a customer-named traces group, is not detected.
+    With no runtime in the region, a configuration that exists but is not
+    running fails, because it names agent traffic, such as a customer-named
+    traces group, that nothing scores. REQUIRE_AGENTCORE_ONLINE_EVALUATION set
+    to true requires one running configuration even when none exists, for
+    agents hosted outside AgentCore Runtime whose traces reach CloudWatch.
+    Unset, a log group under the runtime prefix requires one as well, because
+    the AgentCore guide has such an agent write there; with no such group and
+    no configuration, that case is N/A, since a customer-named group with no
+    configuration over it carries no field marking it as agent traffic.
     """
     finding_name = "AgentCore Online Evaluation Coverage"
     if agentcore_client is None:
@@ -8061,6 +8064,25 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                 f"online evaluation configuration is running. {unreadable_text}"
             )
             resolution = unreadable_resolution
+        elif judged:
+            # A configuration names the agent traffic it was written to score,
+            # so one that exists says an agent runs here whatever the
+            # environment sets, and none of them is scoring it.
+            status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
+            details_text = (
+                "No AgentCore runtimes found in this region, and "
+                f"{len(judged)} online evaluation configuration(s) name agent "
+                "traffic to score, but none is running: "
+                + "; ".join(
+                    f"{label} {'; '.join(problems)}" for label, _, problems in judged
+                )
+                + "."
+            )
+            resolution = (
+                "Set the configuration that reads the agent's log groups ACTIVE "
+                "and ENABLED with a sampling percentage above zero, or delete it "
+                "if no agent writes there."
+            )
         elif required:
             status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
             details_text = (
@@ -18128,7 +18150,7 @@ def _runtime_inbound_authorization_finding(
                 f"{label} carries an inbound authorizer this assessment "
                 "cannot read: authorizerConfiguration holds "
                 f"{', '.join(sorted(authorizer_configuration))} and not "
-                "customJWTAuthorizer, the only member botocore 1.43.85 "
+                "customJWTAuthorizer, the only member botocore 1.43.108 "
                 "defines."
             ),
             resolution=(
@@ -22331,13 +22353,15 @@ def _guardrail_check_scp_verdict() -> Tuple[str, str]:
     """Return how the SCPs binding the assessed account treat InvokeGuardrailChecks.
 
     The first value is `unread` when the organization's policies could not be
-    listed, `management` in the management account, `denied` when an attached
-    policy has an unconditioned Deny reaching the action on Resource "*",
-    `conditioned` when an attached Deny reaches it only under a condition,
-    `incomplete` when a policy or its attachment could not be read, and `none`
-    otherwise. The second names the policies, or the error, behind it. The
-    action has no resource type, so a Deny naming only resource ARNs does not
-    reach it.
+    listed, `standalone` when the account is in no organization, `management`
+    in the management account, `denied` when an attached policy has an
+    unconditioned Deny reaching the action on Resource "*" or when some level
+    from the account to the root has no attached policy allowing it,
+    `conditioned` when an attached Deny or the only Allow at a level reaches it
+    under a condition, `incomplete` when a policy or its attachment could not be
+    read, and `none` otherwise. The second names the policies, or the error,
+    behind it. The action has no resource type, so a Deny or Allow naming only
+    resource ARNs does not reach it.
     """
     if organizations_client is None:
         return "unread", "Organizations client not available"
@@ -22354,12 +22378,16 @@ def _guardrail_check_scp_verdict() -> Tuple[str, str]:
             boto3.client("sts", config=boto3_config).get_caller_identity()["Account"]
         )
     except Exception as error:
+        if _assessment_error_label(error) == "AWSOrganizationsNotInUseException":
+            return "standalone", ""
         return "unread", _assessment_error_label(error)
     if account in {_arn_account(policy.get("Arn")) for policy in policies}:
         return "management", account
 
     denied: Dict[str, str] = {}
     conditioned: Dict[str, str] = {}
+    allowing: Dict[str, str] = {}
+    allowing_conditioned: Dict[str, str] = {}
     unread: List[str] = []
     for policy in policies:
         name = policy.get("Name", policy.get("Id", "unknown"))
@@ -22369,15 +22397,20 @@ def _guardrail_check_scp_verdict() -> Tuple[str, str]:
             unread.append(f"{name} ({_assessment_error_label(error)})")
             continue
         content = (detail.get("Policy") or {}).get("Content", "")
-        for statement in _document_statements(content, effect="Deny"):
+        for statement in _document_statements(content):
             if not _statement_matches_action(
                 statement, GUARDRAIL_CHECK_ACTION_LOOKUP
             ) or not _statement_resource_covers(statement, ["*"]):
                 continue
-            if statement.get("Condition"):
-                conditioned[policy["Id"]] = name
+            if statement.get("Effect") == "Deny":
+                target = conditioned if statement.get("Condition") else denied
+            elif statement.get("Effect") == "Allow":
+                target = (
+                    allowing_conditioned if statement.get("Condition") else allowing
+                )
             else:
-                denied[policy["Id"]] = name
+                continue
+            target[policy["Id"]] = name
 
     attachment = _scp_attachment(policies, set(denied) | set(conditioned), account)
     if attachment["chain_error"] is not None:
@@ -22392,12 +22425,71 @@ def _guardrail_check_scp_verdict() -> Tuple[str, str]:
         if policy_id in denied
     )
     if blocking:
-        return "denied", ", ".join(blocking)
+        return "denied", (
+            "service control policy "
+            + ", ".join(blocking)
+            + " denies that action with no condition"
+        )
+    # An SCP grants nothing, but an action no attached SCP allows is denied: an
+    # account, organizational unit or root whose attached policies leave the
+    # action out of every Allow denies it to every role below it.
+    try:
+        chain = _assessed_account_parent_chain(account)
+    except Exception as error:
+        return "incomplete", (
+            "the organizational units and root above the account could not be "
+            f"read: {_assessment_error_label(error)}"
+        )
+    allowed_at: Dict[str, Set[str]] = {node: set() for node, _ in chain}
+    for policy_id in sorted(set(allowing) | set(allowing_conditioned)):
+        try:
+            targets = _paginate_aws_list(
+                organizations_client,
+                "list_targets_for_policy",
+                "Targets",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                PolicyId=policy_id,
+            )
+        except Exception as error:
+            name = allowing.get(policy_id) or allowing_conditioned[policy_id]
+            unread.append(
+                f"the attachment targets of {name} ({_assessment_error_label(error)})"
+            )
+            continue
+        for target in targets:
+            if str(target.get("TargetId", "")) in allowed_at:
+                allowed_at[str(target["TargetId"])].add(policy_id)
+    unallowed = []
+    conditionally_allowed = []
+    for node, node_type in chain:
+        label = f"{ORGANIZATIONS_TARGET_TYPE_LABELS.get(node_type, node_type)} {node}"
+        if any(policy_id in allowing for policy_id in allowed_at[node]):
+            continue
+        if allowed_at[node]:
+            conditionally_allowed.append(
+                f"{label}, whose only Allow is conditioned in "
+                + ", ".join(
+                    sorted(
+                        allowing_conditioned[policy_id]
+                        for policy_id in allowed_at[node]
+                    )
+                )
+            )
+        else:
+            unallowed.append(label)
+    if unallowed and not unread:
+        return "denied", (
+            "the policies attached to "
+            + ", ".join(unallowed)
+            + " allow no part of it, so it is implicitly denied"
+        )
     limiting = sorted(
         f"{conditioned[policy_id]} (attached to {target})"
         for policy_id, target in attached.items()
         if policy_id in conditioned
     )
+    limiting.extend(conditionally_allowed)
     if limiting:
         return "conditioned", ", ".join(limiting)
     unread.extend(
@@ -22433,9 +22525,10 @@ def check_agentcore_policy_guardrail_wiring(
     permissions boundary, and a role the IAM cache could not read, or one with
     an unparseable policy, is never reported as wired. A granted role then
     fails when a service control policy binding the account denies the action
-    with no condition, and is N/A when an attached Deny is conditioned or a
-    policy could not be read. When the organization's policies cannot be
-    listed, the Passed row says SCPs were not evaluated.
+    with no condition, or when some level from the account to the root has no
+    attached policy allowing it. It is N/A when an attached Deny or a level's
+    only Allow is conditioned, when a policy could not be read, and when the
+    organization's policies cannot be listed.
     """
     if agentcore_client is None:
         return [
@@ -22765,14 +22858,15 @@ def check_agentcore_policy_guardrail_wiring(
                     finding_details=(
                         f"{label} enforces guardrail policy {named}, and its "
                         f"execution role '{role_name}' grants "
-                        f'{GUARDRAIL_CHECK_ACTION} on Resource "*", but service '
-                        f"control policy {scp_label} denies that action with no "
-                        "condition, so the guardrail call the Policy data plane "
+                        f'{GUARDRAIL_CHECK_ACTION} on Resource "*", but '
+                        f"{scp_label}, so the guardrail call the Policy data plane "
                         "makes with credentials derived from that role is denied."
                     ),
                     resolution=(
                         "Exempt the gateway execution role from that service "
-                        f"control policy's Deny on {GUARDRAIL_CHECK_ACTION}, then "
+                        f"control policy's Deny on {GUARDRAIL_CHECK_ACTION}, or "
+                        "allow the action in a policy attached at every level the "
+                        "row names, then "
                         "invoke the gateway once and confirm the decision record "
                         "in the gateway's application logs shows the guardrail "
                         "policy among its determining policies."
@@ -22782,14 +22876,22 @@ def check_agentcore_policy_guardrail_wiring(
                     status=StatusEnum.FAILED,
                 )
             )
-        elif granted and scp_state in ("conditioned", "incomplete"):
-            scp_reason = (
-                f"service control policy {scp_label} denies that action under a "
-                "condition this check does not evaluate"
-                if scp_state == "conditioned"
-                else "the service control policies binding this account were not "
-                f"all read, and {scp_label}"
-            )
+        elif granted and scp_state in ("conditioned", "incomplete", "unread"):
+            scp_reason = {
+                "conditioned": (
+                    "a service control policy decides that action under a "
+                    f"condition this check does not evaluate: {scp_label}"
+                ),
+                "incomplete": (
+                    "the service control policies binding this account were not "
+                    f"all read, and {scp_label}"
+                ),
+                "unread": (
+                    "the organization's service control policies could not be "
+                    f"listed ({scp_label}), so neither an explicit Deny nor an "
+                    "allow-list that leaves the action out was ruled out"
+                ),
+            }[scp_state]
             findings.append(
                 create_finding(
                     check_id="AC-37",
@@ -22803,8 +22905,8 @@ def check_agentcore_policy_guardrail_wiring(
                     ),
                     resolution=(
                         "No action is required on the assessed workload based on "
-                        "this result. Grant organizations:DescribePolicy, "
-                        "organizations:ListParents and "
+                        "this result. Grant organizations:ListPolicies, "
+                        "organizations:DescribePolicy, organizations:ListParents and "
                         "organizations:ListTargetsForPolicy, or invoke the gateway "
                         "once and confirm the decision record in the gateway's "
                         "application logs shows the guardrail policy among its "
@@ -22827,12 +22929,12 @@ def check_agentcore_policy_guardrail_wiring(
                     "service control policies do not restrict roles, and "
                     "conditioned Deny statements on the role are not evaluated."
                 ),
-            }.get(
-                scp_state,
-                "Service control policies and conditioned Deny statements are "
-                "not evaluated, and one that denies this action to the role "
-                "would stop the guardrail call while this row reads Passed.",
-            )
+                "standalone": (
+                    "This account is in no organization, so no service control "
+                    "policy applies, and conditioned Deny statements on the role "
+                    "are not evaluated."
+                ),
+            }[scp_state]
             findings.append(
                 create_finding(
                     check_id="AC-37",
@@ -23774,6 +23876,10 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     configuration by its id or name, an alarm reading only another
     configuration's scores does not count, and when one names an attached
     safety or tool-choice evaluator, an alarm has to read that evaluator's score.
+    When no listed metric names an attached evaluator, no alarm is tied to a
+    safety score and the configuration is N/A. A configuration that is not
+    ACTIVE and ENABLED, or that AC-39 finds scoring no traffic, fails, because
+    the evaluators it attaches score nothing.
     """
     if agentcore_client is None:
         return [
@@ -23998,6 +24104,20 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         tie_missing: List[str] = []
         tie_notes: List[str] = []
         elsewhere_note = ""
+        # An alarm is tied to a score only through a listed metric that names
+        # an attached evaluator. Without one, an alarm on any metric in the
+        # namespace, such as an answer-quality score, would read as watching
+        # safety, so no Passed is reported.
+        untied = bool(
+            watching_alarms
+            and not metric_error
+            and not (
+                set().union(
+                    set(), *(_metric_identifying_values(key) for key in published)
+                )
+                & set(attached)
+            )
+        )
         if published and not metric_error and watching_alarms:
             listed_values = set().union(
                 *(_metric_identifying_values(key) for key in published)
@@ -24045,8 +24165,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
             if not listed_values & set(attached):
                 tie_notes.append(
                     f"no listed metric in {namespace_text} names an attached "
-                    "evaluator, so each alarm is counted for the namespace and not "
-                    "tied to a score"
+                    "evaluator, so no alarm is tied to a score"
                 )
             elif watching_alarms:
                 for category, ids in (
@@ -24093,6 +24212,9 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         )
 
         missing: List[str] = []
+        not_running = _online_evaluation_problems(detail)
+        if not_running:
+            missing.append("scores no traffic, because it " + "; ".join(not_running))
         if not safety_attached:
             missing.append(
                 "attaches no evaluator the catalogue marks as a safety metric, so "
@@ -24161,7 +24283,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     status=StatusEnum.NA,
                 )
             )
-        elif metric_error:
+        elif metric_error or untied:
             findings.append(
                 create_finding(
                     check_id="AC-40",
@@ -24170,11 +24292,25 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                         f"{label} scores safety with {', '.join(safety_attached)} and "
                         f"tool choice with {', '.join(tool_call_attached)}, and "
                         f"alarm(s) {', '.join(watching)} with actions read "
-                        f"{namespace_text}.{owner_note}{metric_note}"
+                        f"{namespace_text}.{owner_note}{metric_note}{tie_note}"
+                        + (
+                            ""
+                            if metric_error
+                            else " No metric ListMetrics lists there names an "
+                            "attached evaluator, so whether any of these alarms "
+                            "reads the safety or tool-choice score, and not "
+                            "another score in the namespace, is not confirmed."
+                        )
                     ),
                     resolution=(
-                        "Grant cloudwatch:ListMetrics and retry. "
-                        f"{EVALUATION_SCORE_ALARM_NOTE}"
+                        (
+                            "Grant cloudwatch:ListMetrics and retry. "
+                            if metric_error
+                            else "Confirm each alarm reads the score metric of a "
+                            "safety and a tool-choice evaluator, and rerun once the "
+                            "configuration has published scores. "
+                        )
+                        + EVALUATION_SCORE_ALARM_NOTE
                     ),
                     reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
@@ -25005,9 +25141,18 @@ def check_agentcore_evaluation_pass_role_scope(
                 check_id="AC-42",
                 finding_name="AgentCore Evaluation Pass Role Scope",
                 finding_details=(
-                    "No AgentCore online evaluation configuration in this region "
-                    "names an execution role, so no role is passed to the evaluation "
-                    "service."
+                    (
+                        f"{len(errors)} online evaluation configuration(s) could "
+                        "not be read, and no configuration that was read names an "
+                        "execution role, so the roles passed to the evaluation "
+                        "service in this region were not all read."
+                    )
+                    if errors
+                    else (
+                        "No AgentCore online evaluation configuration in this "
+                        "region names an execution role, so no role is passed to "
+                        "the evaluation service."
+                    )
                 ),
                 resolution="No action required for this check.",
                 reference=IAM_PASS_ROLE_REFERENCE_URL,
@@ -25095,7 +25240,17 @@ def check_agentcore_evaluation_pass_role_scope(
             )
         )
 
-    if not grants and not gap_rows and not role_unreadable and not user_unreadable:
+    # A configuration that could not be read may name a role no read
+    # configuration names, so a principal able to pass only that role is unseen
+    # and the population-wide Passed is withheld; the read errors are reported
+    # above.
+    if (
+        not grants
+        and not errors
+        and not gap_rows
+        and not role_unreadable
+        and not user_unreadable
+    ):
         findings.append(
             create_finding(
                 check_id="AC-42",
@@ -25812,10 +25967,13 @@ def check_agentcore_evaluation_judge_model_scope(
                     for model in _evaluator_judge_models(evaluator)
                 }
             )
+            # Custom evaluators that name no Bedrock judge model, such as
+            # code-based ones, use no model grant, the same unused-grant case as
+            # a role whose configurations attach only built-ins.
             unused = [
                 pattern
                 for pattern in bounded
-                if called
+                if (called or evaluators)
                 and not any(_model_pattern_reaches(pattern, model) for model in called)
             ]
             by_wildcard = [
@@ -25858,8 +26016,14 @@ def check_agentcore_evaluation_judge_model_scope(
                             f"Evaluation execution role {role_name} can invoke "
                             f"{len(unused)} model pattern(s) that none of its "
                             f"{len(evaluators)} custom evaluator(s) call: "
-                            f"{', '.join(unused)}. Its judges call "
-                            f"{', '.join(called)}. The judge prompt carries the "
+                            f"{', '.join(unused)}. "
+                            + (
+                                f"Its judges call {', '.join(called)}. "
+                                if called
+                                else "None of those evaluators names a Bedrock "
+                                "judge model, so no judge uses the grant. "
+                            )
+                            + "The judge prompt carries the "
                             "agent output being scored, so each extra model is one "
                             "that text can be sent to by a changed evaluator."
                             f"{v1_note}"
@@ -25881,11 +26045,31 @@ def check_agentcore_evaluation_judge_model_scope(
                     f" Each pattern reaches a model its {len(evaluators)} custom "
                     f"evaluator(s) call: {', '.join(called)}."
                 )
-            elif evaluators:
-                judge_note = (
-                    f" Its {len(evaluators)} custom evaluator(s) name no Bedrock "
-                    "judge model, so the patterns are not compared to one."
+            elif not all(
+                isinstance(detail.get("evaluators"), list) for _, detail in role_details
+            ):
+                findings.append(
+                    create_finding(
+                        check_id="AC-44",
+                        finding_name="AgentCore Evaluation Judge Model Scope",
+                        finding_details=(
+                            f"Evaluation execution role {role_name} can invoke a "
+                            f"model only through {len(bounded)} Resource "
+                            f"pattern(s) that name a model: {', '.join(bounded)}. "
+                            "A configuration it runs returned no evaluator list, "
+                            "so the judges the patterns serve are unknown."
+                            f"{v1_note}"
+                        ),
+                        resolution=(
+                            "Confirm GetOnlineEvaluationConfig returns the "
+                            "configuration's evaluators and rerun the assessment."
+                        ),
+                        reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
                 )
+                continue
             else:
                 judge_note = (
                     " Its configurations attach no custom evaluator, so no judge "
