@@ -2835,6 +2835,128 @@ class TestBR04LoggingConfiguration:
         assert len(passed) == 1
         assert "expires events after 365 day(s)" in passed[0]["Finding_Details"]
 
+    ENTRY_FINDING = "Bedrock Invocation Log Retained Entry"
+
+    def _entry_rows(self, mock_client, streams=None, objects=None, errors=None):
+        mock_client.side_effect, clients = self._retention_clients(
+            {
+                "s3Config": {"bucketName": "log-bucket", "keyPrefix": "/logs/"},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+            },
+            log_group_pages=[
+                {"logGroups": [{"logGroupName": "/aws/bedrock/invocations"}]}
+            ],
+            lifecycle={"Rules": []},
+        )
+        errors = errors or {}
+        if "logs" in errors:
+            clients["logs"].describe_log_streams.side_effect = errors["logs"]
+        else:
+            clients["logs"].describe_log_streams.return_value = {
+                "logStreams": streams or []
+            }
+        listing = MagicMock()
+        if "s3" in errors:
+            listing.paginate.side_effect = errors["s3"]
+        else:
+            listing.paginate.return_value = [
+                {"Contents": objects} if objects else {"KeyCount": 0}
+            ]
+        other_paginators = clients["s3"].get_paginator.side_effect
+        clients["s3"].get_paginator.side_effect = lambda name: (
+            listing
+            if name == "list_objects_v2"
+            else (other_paginators(name) if other_paginators else MagicMock())
+        )
+        clients["s3_listing"] = listing
+        rows = [
+            f
+            for f in extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+            if f["Finding"] == self.ENTRY_FINDING
+        ]
+        return rows, clients
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_a_retained_entry_is_found_on_each_destination(
+        self, mock_footprint, mock_client
+    ):
+        """AIR-FND-DET-01's evidence is a sample retained log entry, which no
+        BR-04 row read before. Both destinations are read by metadata alone."""
+        rows, clients = self._entry_rows(
+            mock_client,
+            streams=[{"logStreamName": "s-1", "lastEventTimestamp": 1759449600000}],
+            objects=[
+                {
+                    "Key": "logs/AWSLogs/111122223333/BedrockModelInvocationLogs/x.json.gz",
+                    "LastModified": "2025-10-03T00:00:00+00:00",
+                }
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+        clients["logs"].describe_log_streams.assert_called_once_with(
+            logGroupName="/aws/bedrock/invocations",
+            orderBy="LastEventTime",
+            descending=True,
+            limit=1,
+        )
+        clients["s3_listing"].paginate.assert_called_once_with(
+            Bucket="log-bucket",
+            Prefix="logs/AWSLogs/",
+            PaginationConfig={"MaxItems": 1, "PageSize": 1},
+        )
+        assert (
+            "'s-1' last received an event at 2025-10-03T00:00:00+00:00"
+            in rows[0]["Finding_Details"]
+        )
+        assert "content is not read" in rows[0]["Finding_Details"]
+        assert "BedrockModelInvocationLogs/x.json.gz" in rows[1]["Finding_Details"]
+        assert "object is not read" in rows[1]["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_a_destination_with_no_entry_is_na_beside_one_with_an_entry(
+        self, mock_footprint, mock_client
+    ):
+        rows, _ = self._entry_rows(
+            mock_client,
+            streams=[{"logStreamName": "empty"}],
+            objects=[{"Key": "logs/AWSLogs/a", "LastModified": "2025-10-03"}],
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert "holds no log stream with an event" in rows[0]["Finding_Details"]
+        assert "does not tell the two apart" in rows[0]["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_an_empty_bucket_is_na_never_failed(self, mock_footprint, mock_client):
+        rows, _ = self._entry_rows(
+            mock_client,
+            streams=[{"logStreamName": "s-1", "lastEventTimestamp": 1759449600000}],
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "holds no object under 'logs/AWSLogs/'" in rows[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "service, action",
+        [("logs", "logs:DescribeLogStreams"), ("s3", "s3:ListBucket")],
+    )
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_an_unread_destination_entry_is_na(
+        self, mock_footprint, mock_client, service, action
+    ):
+        rows, _ = self._entry_rows(
+            mock_client,
+            streams=[{"logStreamName": "s-1", "lastEventTimestamp": 1759449600000}],
+            objects=[{"Key": "logs/AWSLogs/a", "LastModified": "2025-10-03"}],
+            errors={service: _client_error("AccessDenied", "denied", "Read")},
+        )
+        statuses = {r["Status"] for r in rows}
+        assert statuses == {"Passed", "N/A"}
+        unread = [r for r in rows if r["Status"] == "N/A"]
+        assert len(unread) == 1 and action in unread[0]["Finding_Details"]
+
     @patch("boto3.client")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
     def test_br04_disabled_lifecycle_rule_is_not_a_retention_period(

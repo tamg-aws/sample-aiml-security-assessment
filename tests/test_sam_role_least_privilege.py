@@ -164,6 +164,7 @@ _EXPECTED_ACTIONS = {
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
         "kendra:DescribeIndex",
+        "logs:DescribeLogStreams",
         "rds:DescribeDBInstances",
         "redshift-serverless:GetNamespace",
         "redshift-serverless:ListWorkgroups",
@@ -824,6 +825,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
             scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
             scoped("kendra:DescribeIndex", "kendra:*:${AWS::AccountId}:index/*"),
+            scoped("logs:DescribeLogStreams", "logs:*:${AWS::AccountId}:log-group:*"),
             scoped(
                 "redshift:DescribeClusters", "redshift:*:${AWS::AccountId}:cluster:*"
             ),

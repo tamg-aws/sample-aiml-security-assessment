@@ -1234,7 +1234,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "bedrock_assessments",
-        ["BR-04", "BR-12"],
+        ["BR-04", "BR-12", "BR-06"],
         "BR-04 reads loggingConfig for a destination, the log group's retention, the five "
         "modality flags (textDataDeliveryEnabled, imageDataDeliveryEnabled, "
         "embeddingDataDeliveryEnabled, videoDataDeliveryEnabled, audioDataDeliveryEnabled) "
@@ -1246,7 +1246,15 @@ AI_SUBJECT_ROWS = [
         "customer-managed key, judged by DescribeKey, on the S3 destination bucket, fails a "
         "bucket with no default encryption, and judges the CloudWatch Logs group the "
         "same way: a group with no kmsKeyId, or whose key is not an enabled customer "
-        "managed key, fails. A key that cannot be described is Not Applicable",
+        "managed key, fails. A key that cannot be described is Not Applicable. BR-06 "
+        "carries the CloudTrail pairing: it reads every trail's and ENABLED event data "
+        "store's selectors and fails a Region where Bedrock management events, the "
+        "bedrock-mantle.amazonaws.com event source or the Bedrock and "
+        "AWS::BedrockMantle:: data event types go unrecorded; an unread trail or store "
+        "is Not Applicable. For the sample retained entry, BR-04 reads the log group's "
+        "most recently written stream (DescribeLogStreams lastEventTimestamp) and the "
+        "first object under the bucket's AWSLogs/ root (ListObjectsV2, one item), with "
+        "no content read; a destination with no entry is Not Applicable",
         [],
         5,
     ),

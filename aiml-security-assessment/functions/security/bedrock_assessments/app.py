@@ -4652,6 +4652,141 @@ def _invocation_log_retention_findings(
     return retention_findings
 
 
+INVOCATION_LOG_ENTRY_FINDING = "Bedrock Invocation Log Retained Entry"
+
+
+def _invocation_log_entry_findings(
+    s3_bucket_name: Optional[str],
+    log_group_name: Optional[str],
+    region: str,
+    s3_key_prefix: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Look for one retained entry on each invocation log destination, by metadata.
+
+    AIR-FND-DET-01's evidence is a sample retained log entry. The log group's
+    most recently written stream (DescribeLogStreams) and the first object
+    under the bucket's AWSLogs/ root (ListObjectsV2, one item) show an entry
+    is held without reading any prompt or response. No entry is not Failed:
+    a Region where no model was invoked since logging was set has none either.
+    """
+
+    def row(details: str, status: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="BR-04",
+            finding_name=INVOCATION_LOG_ENTRY_FINDING,
+            finding_details=details,
+            resolution=(
+                "No action required"
+                if status == "Passed"
+                else "Invoke a model in this Region and confirm an entry reaches the "
+                "destination, or grant the action named above and re-run the "
+                "assessment."
+            ),
+            reference=INVOCATION_LOG_RETENTION_REFERENCE,
+            severity="Informational",
+            status=status,
+            region=region,
+        )
+
+    rows = []
+    if log_group_name:
+        label = f"CloudWatch Logs group '{log_group_name}'"
+        try:
+            streams = (
+                boto3.client("logs", config=boto3_config, region_name=region)
+                .describe_log_streams(
+                    logGroupName=log_group_name,
+                    orderBy="LastEventTime",
+                    descending=True,
+                    limit=1,
+                )
+                .get("logStreams")
+                or []
+            )
+        except Exception as error:
+            rows.append(
+                row(
+                    f"Whether {label} holds a retained entry was not read: "
+                    f"{describe_api_error(error, 'logs:DescribeLogStreams', region)}.",
+                    "N/A",
+                )
+            )
+        else:
+            latest = streams[0] if streams else {}
+            if latest.get("lastEventTimestamp"):
+                written = datetime.fromtimestamp(
+                    latest["lastEventTimestamp"] / 1000, tz=timezone.utc
+                ).isoformat()
+                rows.append(
+                    row(
+                        f"{label} holds a retained entry: its most recently written "
+                        f"log stream '{latest.get('logStreamName')}' last received an "
+                        f"event at {written} (DescribeLogStreams lastEventTimestamp, "
+                        "which CloudWatch Logs updates eventually). The entry's "
+                        "content is not read, and whether it records a given "
+                        "invocation is not judged.",
+                        "Passed",
+                    )
+                )
+            else:
+                rows.append(
+                    row(
+                        f"{label} holds no log stream with an event, so no retained "
+                        "entry was found. Either no model was invoked here since "
+                        "logging was set, or delivery to the group is failing; this "
+                        "check does not tell the two apart.",
+                        "N/A",
+                    )
+                )
+    if s3_bucket_name:
+        stripped_prefix = (s3_key_prefix or "").strip("/")
+        log_root = f"{stripped_prefix}/AWSLogs/" if stripped_prefix else "AWSLogs/"
+        label = f"S3 bucket '{s3_bucket_name}'"
+        try:
+            contents = [
+                item
+                for page in boto3.client("s3", config=boto3_config, region_name=region)
+                .get_paginator("list_objects_v2")
+                .paginate(
+                    Bucket=s3_bucket_name,
+                    Prefix=log_root,
+                    PaginationConfig={"MaxItems": 1, "PageSize": 1},
+                )
+                for item in page.get("Contents") or []
+            ][:1]
+        except Exception as error:
+            rows.append(
+                row(
+                    f"Whether {label} holds a retained entry under '{log_root}' was "
+                    f"not read: {describe_api_error(error, 's3:ListBucket', region)}.",
+                    "N/A",
+                )
+            )
+        else:
+            if contents:
+                rows.append(
+                    row(
+                        f"{label} holds a retained entry under '{log_root}': object "
+                        f"'{contents[0].get('Key')}', last modified "
+                        f"{contents[0].get('LastModified')} (ListObjectsV2). The "
+                        "object is not read, and whether it records a given "
+                        "invocation is not judged.",
+                        "Passed",
+                    )
+                )
+            else:
+                rows.append(
+                    row(
+                        f"{label} holds no object under '{log_root}', so no retained "
+                        "entry was found. Either no model was invoked here since "
+                        "logging was set, or delivery to the bucket is failing; this "
+                        "check does not tell the two apart.",
+                        "N/A",
+                    )
+                )
+    return rows
+
+
 AGENTCORE_MEMORY_EXPIRY_FINDING = "AgentCore Memory Event Retention"
 
 
@@ -5118,6 +5253,14 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                     (
                         (cloudwatch_config or {}).get("largeDataDeliveryS3Config") or {}
                     ).get("keyPrefix"),
+                )
+            )
+            findings["csv_data"].extend(
+                _invocation_log_entry_findings(
+                    s3_bucket_name,
+                    log_group_name,
+                    region,
+                    (s3_config or {}).get("keyPrefix"),
                 )
             )
 

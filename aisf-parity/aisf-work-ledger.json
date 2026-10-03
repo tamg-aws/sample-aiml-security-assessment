@@ -1773,7 +1773,8 @@
       ],
       "incumbents": [
         "BR-04",
-        "BR-12"
+        "BR-12",
+        "BR-06"
       ],
       "incumbent_names": [
         "Bedrock Model Invocation Logging Check",
@@ -1782,9 +1783,10 @@
         "AgentCore Memory Event Retention",
         "Bedrock Invocation Log Encryption",
         "Bedrock Invocation Log Group Encryption",
-        "Bedrock Invocation Log Group Deletion Protection"
+        "Bedrock Invocation Log Group Deletion Protection",
+        "Bedrock CloudTrail Logging Check"
       ],
-      "gap": "BR-04 reads loggingConfig for a destination, the log group's retention, the five modality flags (textDataDeliveryEnabled, imageDataDeliveryEnabled, embeddingDataDeliveryEnabled, videoDataDeliveryEnabled, audioDataDeliveryEnabled) and, for a CloudWatch destination, cloudWatchConfig.largeDataDeliveryS3Config, without which CloudWatch drops the largest payloads. Any modality flag set false fails, since that modality's prompts and completions go unlogged, and an absent flag is Not Applicable. An S3-only configuration is not failed on the large-payload field, which sits on CloudWatchConfig. BR-12 asserts a customer-managed key, judged by DescribeKey, on the S3 destination bucket, fails a bucket with no default encryption, and judges the CloudWatch Logs group the same way: a group with no kmsKeyId, or whose key is not an enabled customer managed key, fails. A key that cannot be described is Not Applicable",
+      "gap": "BR-04 reads loggingConfig for a destination, the log group's retention, the five modality flags (textDataDeliveryEnabled, imageDataDeliveryEnabled, embeddingDataDeliveryEnabled, videoDataDeliveryEnabled, audioDataDeliveryEnabled) and, for a CloudWatch destination, cloudWatchConfig.largeDataDeliveryS3Config, without which CloudWatch drops the largest payloads. Any modality flag set false fails, since that modality's prompts and completions go unlogged, and an absent flag is Not Applicable. An S3-only configuration is not failed on the large-payload field, which sits on CloudWatchConfig. BR-12 asserts a customer-managed key, judged by DescribeKey, on the S3 destination bucket, fails a bucket with no default encryption, and judges the CloudWatch Logs group the same way: a group with no kmsKeyId, or whose key is not an enabled customer managed key, fails. A key that cannot be described is Not Applicable. BR-06 carries the CloudTrail pairing: it reads every trail's and ENABLED event data store's selectors and fails a Region where Bedrock management events, the bedrock-mantle.amazonaws.com event source or the Bedrock and AWS::BedrockMantle:: data event types go unrecorded; an unread trail or store is Not Applicable. For the sample retained entry, BR-04 reads the log group's most recently written stream (DescribeLogStreams lastEventTimestamp) and the first object under the bucket's AWSLogs/ root (ListObjectsV2, one item), with no content read; a destination with no entry is Not Applicable",
       "extra_iam": [],
       "phase": 5,
       "tier": "ai_subject",

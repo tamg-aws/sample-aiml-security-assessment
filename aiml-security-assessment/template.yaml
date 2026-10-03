@@ -469,6 +469,14 @@ Resources:
             Action:
               - kendra:DescribeIndex # BR-20
             Resource: !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
+          - Sid: InvocationLogStreamRead
+            # BR-04 reads the most recently written stream of the invocation log
+            # group, with no event content. The service authorization reference
+            # gives DescribeLogStreams the log-group resource type.
+            Effect: Allow
+            Action:
+              - logs:DescribeLogStreams # BR-04
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
           - Sid: RedshiftQueryEngineRead
             # BR-20 reads the key and public access of the Redshift engine
             # behind a SQL knowledge base. The service authorization reference
@@ -500,12 +508,14 @@ Resources:
             Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:memory/*'
           - Sid: KnowledgeBaseSourceList
             # BR-26 lists the objects an S3 knowledge base source ingests to
-            # compare each LastModified with its Comprehend redaction job. The
+            # compare each LastModified with its Comprehend redaction job, and
+            # BR-04 lists one object under an invocation log bucket's AWSLogs/
+            # root. The
             # service authorization reference gives ListBucket the bucket
             # resource type; the source buckets are not known in advance.
             Effect: Allow
             Action:
-              - s3:ListBucket # BR-26
+              - s3:ListBucket # BR-04, BR-26
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
           - Sid: GuardrailOutputProbe
             # BR-26 applies each deployed guardrail version that passes its
