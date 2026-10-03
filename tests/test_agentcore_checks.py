@@ -7852,6 +7852,147 @@ class TestAC18EventDataStores:
         assert "ListEventDataStores" in memory["Finding_Details"]
         assert "cloudtrail:ListEventDataStores" in memory["Resolution"]
 
+    @staticmethod
+    def _other_region(stores, list_error=None):
+        """A cloudtrail client for us-west-2 listing `stores`, name to
+        (Status, MultiRegionEnabled, selectors)."""
+        client = MagicMock()
+        if list_error is not None:
+            client.list_event_data_stores.side_effect = list_error
+        else:
+            client.list_event_data_stores.return_value = {
+                "EventDataStores": [
+                    {
+                        "EventDataStoreArn": (
+                            f"arn:aws:cloudtrail:us-west-2:123456789012:"
+                            f"eventdatastore/{name}"
+                        ),
+                        "Name": name,
+                    }
+                    for name in stores
+                ]
+            }
+
+        def get_event_data_store(EventDataStore):
+            name = EventDataStore.rsplit("/", 1)[-1]
+            status, multi_region, selectors = stores[name]
+            return {
+                "EventDataStoreArn": EventDataStore,
+                "Name": name,
+                "Status": status,
+                "MultiRegionEnabled": multi_region,
+                "AdvancedEventSelectors": selectors,
+            }
+
+        client.get_event_data_store.side_effect = get_event_data_store
+        return client
+
+    def _run_regions(self, mock_ct, mock_ac, other):
+        mock_ct.meta.region_name = "us-east-1"
+        mock_ct.list_trails.return_value = {"Trails": []}
+        mock_ct.list_event_data_stores.return_value = {"EventDataStores": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": "mem-1", "arn": f"{_MEMORY_ARN}mem-1"}]
+        }
+        with patch(
+            "agentcore_app.boto3.client",
+            side_effect=lambda service, **kwargs: {("cloudtrail", "us-west-2"): other}[
+                (service, kwargs["region_name"])
+            ],
+        ):
+            finding = _family_finding(
+                agentcore_app.check_agentcore_cloudtrail_data_events(
+                    ["us-east-1", "us-west-2"]
+                ),
+                "Memory",
+            )
+        assert_finding_schema(finding)
+        return finding
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_multi_region_store_homed_elsewhere_counts(self, mock_ct, mock_ac):
+        memory_selector = [_data_event_selector("AWS::BedrockAgentCore::Memory")]
+        memory = self._run_regions(
+            mock_ct,
+            mock_ac,
+            self._other_region(
+                {
+                    "single": ("ENABLED", False, memory_selector),
+                    "global": ("ENABLED", True, memory_selector),
+                }
+            ),
+        )
+
+        assert memory["Status"] == "Passed"
+        assert "event data store global" in memory["Finding_Details"]
+        assert "event data store single" not in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_single_region_store_homed_elsewhere_does_not_count(
+        self, mock_ct, mock_ac
+    ):
+        memory = self._run_regions(
+            mock_ct,
+            mock_ac,
+            self._other_region(
+                {
+                    "single": (
+                        "ENABLED",
+                        False,
+                        [_data_event_selector("AWS::BedrockAgentCore::Memory")],
+                    )
+                }
+            ),
+        )
+
+        assert memory["Status"] == "Failed"
+        assert "event data store single" in memory["Finding_Details"]
+        assert "us-west-2" in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_an_unlisted_region_turns_a_gap_into_na(self, mock_ct, mock_ac):
+        memory = self._run_regions(
+            mock_ct,
+            mock_ac,
+            self._other_region(
+                {}, list_error=_make_client_error("AccessDeniedException", "denied")
+            ),
+        )
+
+        assert memory["Status"] == "N/A"
+        assert "us-west-2" in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_store_listed_in_two_regions_is_read_once(self, mock_ct, mock_ac):
+        selector = [_data_event_selector("AWS::BedrockAgentCore::Memory")]
+        other = self._other_region({"global": ("ENABLED", True, selector)})
+        home = other.list_event_data_stores.return_value
+        mock_ct.get_event_data_store.side_effect = other.get_event_data_store
+        mock_ct.meta.region_name = "us-east-1"
+        mock_ct.list_trails.return_value = {"Trails": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": "mem-1", "arn": f"{_MEMORY_ARN}mem-1"}]
+        }
+        mock_ct.list_event_data_stores.return_value = home
+        with patch("agentcore_app.boto3.client", return_value=other):
+            memory = _family_finding(
+                agentcore_app.check_agentcore_cloudtrail_data_events(
+                    ["us-east-1", "us-west-2"]
+                ),
+                "Memory",
+            )
+
+        assert memory["Status"] == "Passed"
+        assert memory["Finding_Details"].count("event data store global") == 1
+        # mock_ct delegates to other's mock, so its count is every read.
+        assert other.get_event_data_store.call_count == 1
+
     @patch("agentcore_app.agentcore_client")
     @patch("agentcore_app.cloudtrail_client")
     def test_an_unreadable_store_turns_a_gap_into_na(self, mock_ct, mock_ac):

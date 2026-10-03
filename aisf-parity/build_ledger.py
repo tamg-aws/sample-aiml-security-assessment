@@ -1061,8 +1061,10 @@ AI_SUBJECT_ROWS = [
         "trail status is N/A. A CloudTrail Lake event data store homed in the "
         "region counts as a trail does when GetEventDataStore reports Status "
         "ENABLED, judged by the same selector rules; an unlisted or unreadable "
-        "store turns a gap into N/A. A multi-Region store homed in another region "
-        "is not listed there, so its events read as absent. AC-19 requires "
+        "store turns a gap into N/A. Each assessed Region's stores are listed and "
+        "deduped by ARN, and a store homed in another assessed Region counts only "
+        "when MultiRegionEnabled is true; a store homed in a Region that was not "
+        "assessed is not listed. AC-19 requires "
         "each memory's APPLICATION_LOGS delivery, which carries "
         "the extraction and consolidation logs of long-term memory processing",
         [],

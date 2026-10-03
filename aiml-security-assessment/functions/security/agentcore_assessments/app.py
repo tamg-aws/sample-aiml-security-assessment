@@ -11582,7 +11582,9 @@ def _agentcore_selector_coverage(
     return whole, narrowed, scoped
 
 
-def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
+def _cloudtrail_data_event_resource_types(
+    target_regions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Collect the AgentCore resource types each logging trail selects whole.
 
     A trail counts only when it records this region (multi-region, or homed
@@ -11682,57 +11684,112 @@ def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
             )
 
     # A CloudTrail Lake event data store records data events in place of a
-    # trail. ListEventDataStores returns the stores homed in this region, and
-    # GetEventDataStore returns the Status and selectors, which are judged with
-    # the trail rules. Only an ENABLED store is ingesting.
-    try:
-        stores = _paginate_aws_list(
-            cloudtrail_client,
-            "list_event_data_stores",
-            "EventDataStores",
-            token_request_key="NextToken",
-            token_response_key="NextToken",
-        )
-    except Exception as error:
-        logger.warning(f"Could not list event data stores: {type(error).__name__}")
-        stores = []
-        unreadable.append(
-            "the CloudTrail Lake event data stores (ListEventDataStores failed "
-            f"with {type(error).__name__})"
-        )
-    for store in stores:
-        store_arn = store.get("EventDataStoreArn")
-        store_label = f"event data store {store.get('Name') or store_arn or 'unnamed'}"
+    # trail. ListEventDataStores returns the stores homed in the Region it is
+    # called in, so each assessed Region is listed and the stores are deduped by
+    # ARN. GetEventDataStore returns the Status, MultiRegionEnabled and the
+    # selectors, which are judged with the trail rules. Only an ENABLED store is
+    # ingesting, and a store homed in another Region records this one only when
+    # it is multi-Region.
+    store_clients = [(region, cloudtrail_client)]
+    for other_region in target_regions or []:
+        if other_region and other_region != region:
+            try:
+                store_clients.append(
+                    (
+                        other_region,
+                        boto3.client(
+                            "cloudtrail", config=boto3_config, region_name=other_region
+                        ),
+                    )
+                )
+            except Exception as error:
+                unreadable.append(
+                    f"the CloudTrail Lake event data stores in {other_region} "
+                    f"({type(error).__name__})"
+                )
+    seen_stores: Set[str] = set()
+    for store_region, store_client in store_clients:
         try:
-            if not store_arn:
-                raise TypeError("ListEventDataStores returned no ARN")
-            detail = cloudtrail_client.get_event_data_store(EventDataStore=store_arn)
+            stores = _paginate_aws_list(
+                store_client,
+                "list_event_data_stores",
+                "EventDataStores",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+            )
+        except EndpointConnectionError:
+            continue
+        except ClientError as error:
+            if (
+                store_region != region
+                and error.response.get("Error", {}).get("Code", "")
+                in REGION_UNAVAILABLE_ERROR_CODES
+            ):
+                continue
+            logger.warning(
+                f"Could not list event data stores in {store_region}: "
+                f"{type(error).__name__}"
+            )
+            stores = []
+            unreadable.append(
+                "the CloudTrail Lake event data stores (ListEventDataStores "
+                f"failed in {store_region} with {type(error).__name__})"
+            )
         except Exception as error:
-            logger.warning(f"Could not read {store_label}: {type(error).__name__}")
-            unreadable.append(store_label)
-            continue
-        store_whole, store_narrowed, store_scoped = _agentcore_selector_coverage(
-            detail.get("AdvancedEventSelectors") or [], region
-        )
-        if not store_whole and not store_narrowed:
-            continue
-        if detail.get("Status") != "ENABLED":
-            excluded.append(
-                f"{store_label} is not ingesting (Status "
-                f"{detail.get('Status') or 'absent'})"
+            logger.warning(
+                f"Could not list event data stores in {store_region}: "
+                f"{type(error).__name__}"
             )
-            continue
-        for resource_type in store_whole:
-            whole.setdefault(resource_type, []).append(store_label)
-        for resource_type, fields in store_narrowed.items():
-            narrowed.setdefault(resource_type, []).append(
-                f"{store_label} selects {resource_type} only where "
-                f"{', '.join(sorted(fields))} match"
+            stores = []
+            unreadable.append(
+                "the CloudTrail Lake event data stores (ListEventDataStores "
+                f"failed in {store_region} with {type(error).__name__})"
             )
-        for resource_type, scopes in store_scoped.items():
-            arn_scoped.setdefault(resource_type, []).extend(
-                (store_label, operator, values) for operator, values in scopes
+        for store in stores:
+            store_arn = store.get("EventDataStoreArn")
+            if store_arn in seen_stores:
+                continue
+            if store_arn:
+                seen_stores.add(store_arn)
+            store_label = (
+                f"event data store {store.get('Name') or store_arn or 'unnamed'}"
             )
+            try:
+                if not store_arn:
+                    raise TypeError("ListEventDataStores returned no ARN")
+                detail = store_client.get_event_data_store(EventDataStore=store_arn)
+            except Exception as error:
+                logger.warning(f"Could not read {store_label}: {type(error).__name__}")
+                unreadable.append(store_label)
+                continue
+            store_whole, store_narrowed, store_scoped = _agentcore_selector_coverage(
+                detail.get("AdvancedEventSelectors") or [], region
+            )
+            if not store_whole and not store_narrowed:
+                continue
+            if detail.get("Status") != "ENABLED":
+                excluded.append(
+                    f"{store_label} is not ingesting (Status "
+                    f"{detail.get('Status') or 'absent'})"
+                )
+                continue
+            if store_region != region and detail.get("MultiRegionEnabled") is not True:
+                excluded.append(
+                    f"{store_label} is homed in {store_region} and is not "
+                    "multi-region, so it records nothing here"
+                )
+                continue
+            for resource_type in store_whole:
+                whole.setdefault(resource_type, []).append(store_label)
+            for resource_type, fields in store_narrowed.items():
+                narrowed.setdefault(resource_type, []).append(
+                    f"{store_label} selects {resource_type} only where "
+                    f"{', '.join(sorted(fields))} match"
+                )
+            for resource_type, scopes in store_scoped.items():
+                arn_scoped.setdefault(resource_type, []).extend(
+                    (store_label, operator, values) for operator, values in scopes
+                )
 
     return {
         "whole": whole,
@@ -11787,7 +11844,9 @@ def _agentcore_family_inventory(family: Dict[str, Any]) -> Tuple[Dict[str, int],
     return type_counts, sum(len(items) for items in listed.values())
 
 
-def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
+def check_agentcore_cloudtrail_data_events(
+    target_regions: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """AC-18: Report CloudTrail data-event coverage per AgentCore service family.
 
     Management events record that a runtime or memory was created. Only a
@@ -11795,8 +11854,8 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
     invocations and the memory record reads and writes that follow. A family
     passes only when every one of its types that has a resource in this region
     is selected, with no narrowing field, by a trail that is logging and records
-    this region, or by an ENABLED CloudTrail Lake event data store homed here.
-    A multi-region store homed in another region is not listed here.
+    this region, or by an ENABLED CloudTrail Lake event data store homed here
+    or, when multi-region, homed in another of `target_regions`.
     """
     if cloudtrail_client is None:
         return [
@@ -11812,7 +11871,7 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
         ]
 
     try:
-        coverage = _cloudtrail_data_event_resource_types()
+        coverage = _cloudtrail_data_event_resource_types(target_regions)
     except Exception as error:
         return [
             create_finding(
@@ -11999,10 +12058,11 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
                 finding_details=(
                     f"{resource_count} AgentCore {label} resource(s) found, and no "
                     "logging trail recording this region, and no ENABLED event "
-                    f"data store homed here, selects {', '.join(missing)} whole "
+                    "data store homed here or multi-region in an assessed region, "
+                    f"selects {', '.join(missing)} whole "
                     f"for data events, so those {label.lower()} calls are not all "
                     "in the audit trail. A multi-region event data store homed in "
-                    "another region is not listed here."
+                    "a region that was not assessed is not listed."
                     f"{covered_text}{note_text}"
                 ),
                 resolution=(
@@ -35714,7 +35774,7 @@ def lambda_handler(event, context):
             (
                 ["AC-18"],
                 "CloudTrail Data Event Coverage",
-                check_agentcore_cloudtrail_data_events,
+                lambda: check_agentcore_cloudtrail_data_events(target_regions),
             ),
             (
                 ["AC-19"],

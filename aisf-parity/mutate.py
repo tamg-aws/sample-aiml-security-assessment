@@ -1226,6 +1226,34 @@ MUTATIONS = [
         "find": '        "bedrock-mantle:callwithbearertoken",\n',
         "replace": "",
     },
+    {
+        "name": "AC-18 lists event data stores in this region only",
+        "file": AGENTCORE,
+        "defect": "a multi-Region event data store homed in another assessed Region records this Region's Memory events and was read as absent",
+        "find": "    store_clients = [(region, cloudtrail_client)]\n    for other_region in target_regions or []:\n",
+        "replace": "    store_clients = [(region, cloudtrail_client)]\n    for other_region in []:\n",
+    },
+    {
+        "name": "AC-18 counts a single-region store homed elsewhere",
+        "file": AGENTCORE,
+        "defect": "a single-Region store in another Region records nothing here and was credited",
+        "find": '            if store_region != region and detail.get("MultiRegionEnabled") is not True:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "AC-18 drops an unlisted region's stores silently",
+        "file": AGENTCORE,
+        "defect": "a denied ListEventDataStores in another Region turned a gap into a Failed verdict instead of N/A",
+        "find": '            stores = []\n            unreadable.append(\n                "the CloudTrail Lake event data stores (ListEventDataStores "\n                f"failed in {store_region} with {type(error).__name__})"\n            )\n        except Exception',
+        "replace": "            stores = []\n        except Exception",
+    },
+    {
+        "name": "AC-18 reads a store listed in two regions twice",
+        "file": AGENTCORE,
+        "defect": "a store returned by two Regions' lists was counted twice",
+        "find": "            if store_arn in seen_stores:\n                continue\n",
+        "replace": "",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1512,6 +1540,10 @@ GROUPS: dict[str, str] = {
     "AC-45 judges a foreign service role by a local namesake": "in the AgentCore verdict legs",
     "AC-45 hides a failed memory or payment manager read": "in the AgentCore verdict legs",
     "AC-45 reads CallWithBearerToken on * as every resource": "in the AgentCore verdict legs",
+    "AC-18 lists event data stores in this region only": "in the AgentCore verdict legs",
+    "AC-18 counts a single-region store homed elsewhere": "in the AgentCore verdict legs",
+    "AC-18 drops an unlisted region's stores silently": "in the AgentCore verdict legs",
+    "AC-18 reads a store listed in two regions twice": "in the AgentCore verdict legs",
 }
 
 
