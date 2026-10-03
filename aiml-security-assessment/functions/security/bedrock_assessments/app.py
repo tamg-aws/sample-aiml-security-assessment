@@ -14764,7 +14764,13 @@ def _knowledge_base_screening_findings(
     source_unread: str,
     resolution: str,
     severity: str,
-    fronts_screen_chunks: bool = True,
+    fronts_screen_chunks: bool = False,
+    unscreened_front_text: str = (
+        "through an agent or flow, whose guardrail AWS documents as evaluating "
+        "user messages and model responses, not the retrieved chunks, so it is "
+        "not credited as screening them"
+    ),
+    source_note: Optional[Callable[[Dict[str, Any]], str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fail each knowledge base that has a data source with no screening step
@@ -14776,10 +14782,12 @@ def _knowledge_base_screening_findings(
     credit that could not be read for S3 sources; while it is set, an
     unscreened S3 source cannot be failed.
 
-    ``fronts_screen_chunks`` is False for a filter that evaluates only content
-    the caller tags as guard content (PROMPT_ATTACK). An agent or flow node
-    retrieves through managed retrieval, which builds the prompt itself and
-    cannot tag the retrieved chunks, so its guardrail is not credited.
+    ``fronts_screen_chunks`` defaults to False: the agent guardrail guide
+    describes a guardrail evaluating user messages and model responses, and
+    says nothing of the chunks a knowledge base returns, so an agent or flow
+    guardrail is not credited as screening them. ``unscreened_front_text``
+    says why on the Failed row. ``source_note`` adds to the name of an
+    unscreened source why a source-side credit did not hold.
     """
 
     def row(details: str, status: str, action: str) -> Dict[str, Any]:
@@ -14875,11 +14883,7 @@ def _knowledge_base_screening_findings(
             open_fronts = sorted({s for s, _ in fronts})
             screened_fronts = []
             unread_fronts = []
-            front_text = (
-                "through managed retrieval, which builds the prompt itself and "
-                "cannot wrap the retrieved chunks in guardContent tags, so a "
-                "guardrail on that path does not evaluate them"
-            )
+            front_text = unscreened_front_text
         not_failed = "Bedrock {} is not failed: {}. {}".format(
             entry["label"],
             "; ".join(credited + screened_fronts + enforced_screen)
@@ -14902,7 +14906,10 @@ def _knowledge_base_screening_findings(
         if enforced_screen:
             rows.append(row(not_failed, "N/A", not_failed_action))
             continue
-        names = ", ".join(f"{s['label']} ({s['type']})" for s in unscreened)
+        names = ", ".join(
+            f"{s['label']} ({s['type']}){source_note(s) if source_note else ''}"
+            for s in unscreened
+        )
         blocked = (
             [source_unread]
             if source_unread and any(s["type"] == "S3" for s in unscreened)
@@ -15060,7 +15067,11 @@ def check_bedrock_guardrail_prompt_attack_filter(
             "in guardContent tags before a model call whose guardrail blocks "
             "PROMPT_ATTACK at HIGH strength.",
             "High",
-            fronts_screen_chunks=False,
+            unscreened_front_text=(
+                "through managed retrieval, which builds the prompt itself and "
+                "cannot wrap the retrieved chunks in guardContent tags, so a "
+                "guardrail on that path does not evaluate them"
+            ),
         )
     )
     if inventory.get("list_error"):
@@ -16098,6 +16109,56 @@ def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
     return _sensitive_information_verdict(detail)[0] == "Passed"
 
 
+# ListObjectsV2 returns 1,000 keys a page, so a source is listed up to 100,000
+# objects; a longer listing is reported as not read, never as clean.
+REDACTION_SOURCE_LIST_PAGE_CAP = 100
+
+
+def _objects_written_after(
+    region: str, bucket: str, prefixes: List[str], after: Any
+) -> Dict[str, Any]:
+    """
+    List every object an S3 source ingests and return the ones whose
+    LastModified falls after ``after``, with the count listed or the reason the
+    listing did not finish.
+    """
+    client = boto3.client("s3", config=boto3_config, region_name=region)
+    listed, later, pages = 0, [], 0
+    try:
+        for prefix in prefixes or [""]:
+            for page in client.get_paginator("list_objects_v2").paginate(
+                Bucket=bucket, Prefix=prefix
+            ):
+                pages += 1
+                if pages > REDACTION_SOURCE_LIST_PAGE_CAP:
+                    return {
+                        "listed": listed,
+                        "later": later,
+                        "error": (
+                            f"s3://{bucket} holds more objects than the "
+                            f"{REDACTION_SOURCE_LIST_PAGE_CAP * 1000:,} this check "
+                            "lists, so not every object was read"
+                        ),
+                    }
+                for item in page.get("Contents") or []:
+                    listed += 1
+                    gap = _days_between(after, item.get("LastModified"))
+                    if gap is None:
+                        raise TypeError(f"object {item.get('Key')} has no LastModified")
+                    if gap > 0:
+                        later.append(str(item.get("Key")))
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "listed": listed,
+            "later": later,
+            "error": (
+                f"the objects of s3://{bucket} were not listed with s3:ListBucket "
+                f"({get_assessment_error_label(error)})"
+            ),
+        }
+    return {"listed": listed, "later": later, "error": ""}
+
+
 def _redaction_job_covers(job: Dict[str, Any], source: Dict[str, Any]) -> bool:
     """True when every prefix an S3 source ingests lies under a job's output."""
     return job["bucket"] == source["bucket"] and (
@@ -16181,12 +16242,12 @@ def check_bedrock_guardrail_pii_filters(
             for error in ingestion_errors
         ]
 
-        def redaction_credit(source: Dict[str, Any]) -> str:
+        def credited_job(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             window = ingestion_windows.get(
                 (source.get("knowledge_base_id"), source.get("data_source_id"))
             )
             if not window or window["error"]:
-                return ""
+                return None
             latest = window["latest"]
             for job in redaction_outputs:
                 if not _redaction_job_covers(job, source) or "ALL" not in job["types"]:
@@ -16195,19 +16256,77 @@ def check_bedrock_guardrail_pii_filters(
                     lead = _days_between(job["end"], latest)
                     if lead is None or lead < 0:
                         continue
-                return (
-                    f"ingests only the output of Comprehend PII redaction job "
-                    f"'{job['name']}' ({job['uri']}), which redacts ALL PII entity "
-                    f"types with MaskMode {job['mask_mode']} and completed "
-                    + (
-                        "before the latest ingestion job started"
-                        if latest is not None
-                        else "with no ingestion job recorded for the source"
+                return job
+            return None
+
+        # An object under the job's output written after the job completed was
+        # not redacted by it, so every object the source ingests is listed.
+        listings = {}
+        for entry in knowledge_base_inventory.get("knowledge_bases") or []:
+            for source in entry["sources"]:
+                job = credited_job(source)
+                key = (source.get("knowledge_base_id"), source.get("data_source_id"))
+                if job and key not in listings:
+                    listings[key] = (
+                        _objects_written_after(
+                            region, source["bucket"], source["prefixes"], job["end"]
+                        )
+                        if job["end"]
+                        else {
+                            "listed": 0,
+                            "later": [],
+                            "error": f"redaction job '{job['name']}' reports no "
+                            "EndTime",
+                        }
                     )
-                    + "; objects written under that output location after the job "
-                    "are not read, so whether they were redacted is not judged"
+        source_unread += [
+            f"a data source a redaction job's output covers: {listing['error']}, so "
+            "whether an object was written after the job is unknown"
+            for listing in listings.values()
+            if listing["error"]
+        ]
+
+        def redaction_listing(source: Dict[str, Any]) -> Dict[str, Any]:
+            return listings.get(
+                (source.get("knowledge_base_id"), source.get("data_source_id"))
+            ) or {"listed": 0, "later": [], "error": ""}
+
+        def redaction_note(source: Dict[str, Any]) -> str:
+            job, later = credited_job(source), redaction_listing(source)["later"]
+            if not job or not later:
+                return ""
+            return (
+                f", whose Comprehend PII redaction job '{job['name']}' completed at "
+                f"{job['end']}, but {len(later)} object(s) it ingests were last "
+                f"modified after that, such as {', '.join(later[:3])}, so they were "
+                "not redacted by the job"
+            )
+
+        def redaction_credit(source: Dict[str, Any]) -> str:
+            job = credited_job(source)
+            if not job:
+                return ""
+            listing = redaction_listing(source)
+            if listing["error"] or listing["later"]:
+                return ""
+            latest = ingestion_windows[
+                (source.get("knowledge_base_id"), source.get("data_source_id"))
+            ]["latest"]
+            return (
+                f"ingests only the output of Comprehend PII redaction job "
+                f"'{job['name']}' ({job['uri']}), which redacts ALL PII entity "
+                f"types with MaskMode {job['mask_mode']} and completed "
+                + (
+                    "before the latest ingestion job started"
+                    if latest is not None
+                    else "with no ingestion job recorded for the source"
                 )
-            return ""
+                + "; s3:ListBucket lists {} object(s) the source ingests, none "
+                "last modified after the job completed, and whether each was "
+                "written by the job is not recorded by any API".format(
+                    listing["listed"]
+                )
+            )
 
         deployed.extend(
             _knowledge_base_screening_findings(
@@ -16223,12 +16342,14 @@ def check_bedrock_guardrail_pii_filters(
                 "; ".join(source_unread),
                 "Redact PII before ingestion with a Comprehend PII redaction job that "
                 "redacts ALL entity types, whose output the data source ingests and "
-                "that completes before the next ingestion job, or a POST_CHUNKING "
-                "transformation Lambda, and retrieve through an agent or flow node "
-                "whose guardrail sets AWS_ACCESS_KEY, AWS_SECRET_KEY, PASSWORD and "
-                "the other required PII entity types to BLOCK or ANONYMIZE on both "
-                "sides, with a custom regex on the output.",
+                "that completes after every object it covers is written and before "
+                "the next ingestion job, or a POST_CHUNKING transformation Lambda. "
+                "An agent or flow guardrail that sets AWS_ACCESS_KEY, AWS_SECRET_KEY "
+                "and PASSWORD to BLOCK or ANONYMIZE screens user messages and model "
+                "responses as defense in depth, but is not credited for the "
+                "retrieved chunks.",
                 "High",
+                source_note=redaction_note,
             )
         )
 

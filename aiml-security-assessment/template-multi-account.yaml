@@ -478,6 +478,15 @@ Resources:
             Action:
               - bedrock-agentcore:GetMemory # BR-04
             Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:memory/*'
+          - Sid: KnowledgeBaseSourceList
+            # BR-26 lists the objects an S3 knowledge base source ingests to
+            # compare each LastModified with its Comprehend redaction job. The
+            # service authorization reference gives ListBucket the bucket
+            # resource type; the source buckets are not known in advance.
+            Effect: Allow
+            Action:
+              - s3:ListBucket # BR-26
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

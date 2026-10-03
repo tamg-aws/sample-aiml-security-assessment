@@ -467,10 +467,10 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 43/43 find-strings validated`, aborting and naming each entry whose
+   `entries 45/45 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 43 ways and requires a ledger gate or a test to go red for
+   breaks the code 45 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
    in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names
    the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown
@@ -480,7 +480,7 @@ timestamp and `--csv-dir` says it cannot.
    the Bedrock condition parsers, 1 in the Bedrock endpoint collector, 1 in
    the Bedrock cross-Region agent roles, 1 in the Bedrock CloudTrail Lake
    reader, 1 in the Bedrock training bucket policies, 1 in the Bedrock
-   AI user population, 1 in the Bedrock knowledge base stores, 1 in the Bedrock data path TLS exemptions and 1 in the Bedrock AgentCore memory retention. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
+   AI user population, 1 in the Bedrock knowledge base stores, 1 in the Bedrock data path TLS exemptions, 1 in the Bedrock AgentCore memory retention and 2 in the Bedrock knowledge base redaction. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
    fails if this paragraph disagrees with it, because the earlier copy of this
    sentence went stale at 17 while the battery grew to 22 and nothing read the
    two together. The last of those entries is what keeps gate 20 itself honest:

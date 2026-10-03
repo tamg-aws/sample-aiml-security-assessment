@@ -17693,10 +17693,30 @@ class TestKnowledgeBaseScreening:
             if f["Finding"] == "Knowledge Base Ingestion Prompt Attack Screening"
         ]
 
-    def _br26(self, inventory, jobs=None, jobs_error=None, ingestions=None):
+    def _br26(
+        self, inventory, jobs=None, jobs_error=None, ingestions=None, objects=None
+    ):
         client = MagicMock()
         client.list_guardrails.return_value = {"guardrails": []}
         ingestions = ingestions or {}
+        objects = objects or {}
+        self.listed_prefixes = []
+
+        def list_objects(Bucket, Prefix):
+            self.listed_prefixes.append((Bucket, Prefix))
+            pages = objects.get((Bucket, Prefix), [])
+            if isinstance(pages, Exception):
+                raise pages
+            for page in pages:
+                yield {"Contents": [{"Key": k, "LastModified": m} for k, m in page]}
+
+        def get_paginator(name):
+            paginator = MagicMock()
+            if name == "list_objects_v2":
+                paginator.paginate.side_effect = list_objects
+            return paginator
+
+        client.get_paginator.side_effect = get_paginator
 
         def list_ingestion_jobs(knowledgeBaseId, dataSourceId, **_):
             started = ingestions.get(dataSourceId, [])
@@ -18008,6 +18028,13 @@ class TestKnowledgeBaseScreening:
         assert [r["Status"] for r in empty] == ["N/A"]
 
     def test_br26_pii_masking_front_is_credited_and_regex_only_is_not(self):
+        """An agent guardrail is not credited as screening retrieved chunks.
+
+        Changed to the stricter Failed under the KB-08 team-lead correction:
+        the agent guardrail guide describes evaluating "model responses or user
+        messages" and says nothing of knowledge base chunks, so a front that
+        masks every credential type no longer turns this row into N/A.
+        """
         rows = self._br26(
             self._inventory(
                 [
@@ -18028,12 +18055,14 @@ class TestKnowledgeBaseScreening:
                 },
             )
         )
-        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
-        assert "is not failed: agent 'm' 1" in rows[0]["Finding_Details"]
-        assert (
-            "agent 'r' 1 retrieves from it with no guardrail that blocks or masks "
-            "AWS_ACCESS_KEY, AWS_SECRET_KEY and PASSWORD" in rows[1]["Finding_Details"]
-        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        for row, agent in zip(rows, ("agent 'm' 1", "agent 'r' 1")):
+            assert (
+                f"{agent} retrieves from it through an agent or flow, whose "
+                "guardrail AWS documents as evaluating user messages and model "
+                "responses, not the retrieved chunks" in row["Finding_Details"]
+            )
+        assert "is not failed" not in rows[0]["Finding_Details"]
 
     def test_br26_one_masked_pii_entity_on_a_front_is_not_credited(self):
         # KB-08: EMAIL masked on the output alone leaves credentials and the
@@ -18058,8 +18087,11 @@ class TestKnowledgeBaseScreening:
                 },
             )
         )
-        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
-        assert "is not failed: agent 'f' 1" in rows[0]["Finding_Details"]
+        # Changed to the stricter Failed under the KB-08 correction: the full
+        # credential front on kb-full is no longer credited either.
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert "knowledge base 'kb-full'" in rows[0]["Finding_Details"]
+        assert "agent 'f' 1 retrieves from it" in rows[0]["Finding_Details"]
         assert "knowledge base 'kb-one'" in rows[1]["Finding_Details"]
         assert "agent 'o' 1 retrieves from it" in rows[1]["Finding_Details"]
 
@@ -18092,6 +18124,93 @@ class TestKnowledgeBaseScreening:
             in rows[0]["Finding_Details"]
         )
         assert "data source 'whole' (S3)" in rows[1]["Finding_Details"]
+
+    def _redacted_estate(self, objects):
+        return self._br26(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb-a", [self._source("a", prefixes=["redacted/a/"], kb="A")]
+                    ),
+                    self._kb(
+                        "kb-b", [self._source("b", prefixes=["redacted/b/"], kb="B")]
+                    ),
+                ]
+            ),
+            jobs=[self.REDACT_ALL],
+            ingestions={"a": ["2026-09-02T00:00:00Z"], "b": ["2026-09-02T00:00:00Z"]},
+            objects=objects,
+        )
+
+    def test_br26_an_object_written_after_the_redaction_job_fails_the_source(self):
+        early = "2026-08-31T00:00:00Z"
+        late = "2026-09-01T06:00:00Z"
+        rows = self._redacted_estate(
+            {
+                ("docs", "redacted/a/"): [[("redacted/a/1.out", early)]],
+                ("docs", "redacted/b/"): [
+                    [("redacted/b/1.out", early)],
+                    [("redacted/b/raw.txt", late)],
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "knowledge base 'kb-a'" in rows[0]["Finding_Details"]
+        assert (
+            "s3:ListBucket lists 1 object(s) the source ingests, none last "
+            "modified after the job completed" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "whether each was written by the job is not recorded"
+            in (rows[0]["Finding_Details"])
+        )
+        details = rows[1]["Finding_Details"]
+        assert "knowledge base 'kb-b'" in details
+        assert (
+            "whose Comprehend PII redaction job 'redact-docs' completed at "
+            "2026-09-01T00:00:00Z, but 1 object(s) it ingests were last modified "
+            "after that, such as redacted/b/raw.txt" in details
+        )
+        assert "redacted/b/1.out" not in details
+        assert self.listed_prefixes == [
+            ("docs", "redacted/a/"),
+            ("docs", "redacted/b/"),
+        ]
+
+    def test_br26_an_unlisted_redaction_source_is_not_failed(self):
+        rows = self._redacted_estate(
+            {
+                ("docs", "redacted/a/"): _make_client_error("AccessDenied"),
+                ("docs", "redacted/b/"): [
+                    [("redacted/b/raw.txt", "2026-09-05T00:00:00Z")]
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        for row in rows:
+            assert (
+                "the objects of s3://docs were not listed with s3:ListBucket"
+                in row["Finding_Details"]
+            )
+            assert "is not failed" not in row["Finding_Details"]
+
+    def test_br26_a_listing_past_the_page_cap_is_not_read(self):
+        early = "2026-08-31T00:00:00Z"
+        with patch.object(bedrock_app, "REDACTION_SOURCE_LIST_PAGE_CAP", 1):
+            rows = self._redacted_estate(
+                {
+                    ("docs", "redacted/a/"): [[("redacted/a/1.out", early)]],
+                    ("docs", "redacted/b/"): [
+                        [("redacted/b/1.out", early)],
+                        [("redacted/b/2.out", early)],
+                    ],
+                }
+            )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert (
+            "holds more objects than the 1,000 this check lists"
+            in (rows[1]["Finding_Details"])
+        )
 
     def test_br26_redaction_job_naming_some_entity_types_is_not_credited(self):
         # KB-08: a job that redacts only NAME leaves every other entity type

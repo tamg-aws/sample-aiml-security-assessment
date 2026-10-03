@@ -164,6 +164,7 @@ _EXPECTED_ACTIONS = {
         "iam:GetPolicyVersion",
         "kendra:DescribeIndex",
         "rds:DescribeDBInstances",
+        "s3:ListBucket",
         "sagemaker:DescribeEndpoint",
         "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeInferenceComponent",
@@ -822,6 +823,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "bedrock-agentcore:GetMemory",
                 "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
             ),
+            scoped("s3:ListBucket", "s3:::*"),
             scoped(
                 "bedrock-agentcore:GetBrowser",
                 "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
