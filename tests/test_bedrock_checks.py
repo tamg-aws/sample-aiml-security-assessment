@@ -23913,23 +23913,154 @@ class TestBR47DataPathBucketTLS:
             f["Finding_Details"] for f in findings if f["Status"] == "N/A"
         )
 
+    INGEST_ROLE = "arn:aws:iam::123456789012:role/ingest"
+
+    def _exempting(self, bucket, operator, key, value):
+        statement = _tls_deny_statement([bucket])
+        statement["Condition"].setdefault(operator, {})[key] = value
+        return _bucket_policy(statement)
+
     def test_br47_a_principal_arn_exemption_is_not_credited(self):
-        """An exempted role can still send plaintext requests to the bucket."""
-        exempted = _tls_deny_statement(["hr-bucket"])
-        exempted["Condition"]["ArnNotLike"] = {
-            "aws:PrincipalArn": "arn:aws:iam::123456789012:role/ingest"
-        }
+        """An exact aws:PrincipalArn exclusion is credited and named.
+
+        Changed under the 2026-10-03 user ruling on AIR-FND-DAT-02, whose
+        recommendation says to "exclude the specific role with aws:PrincipalArn
+        or aws:ViaAWSService rather than deleting the TLS Deny". This fixture
+        used to pin Failed; the exempted role now passes and is named as keeping
+        plaintext access. The wildcard, set-operator and other-key forms below
+        still fail.
+        """
         findings = self._two_bucket_estate(
             bucket_policies={
                 **self._enforced("support-bucket"),
-                "hr-bucket": _bucket_policy(exempted),
+                **self._exempting_hr(
+                    "ArnNotLike", "aws:PrincipalArn", self.INGEST_ROLE
+                ),
             }
         )
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        assert len(failed) == 1
-        assert "Bucket hr-bucket" in failed[0]["Finding_Details"]
-        assert "arnnotlike aws:principalarn" in failed[0]["Finding_Details"].lower()
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert (
+            f"exempts principal {self.INGEST_ROLE} (arnnotlike aws:PrincipalArn), "
+            "which keep plaintext access to the bucket" in details
+        )
+        assert "deny every plaintext request" not in details
+        assert "plaintext requests from every principal they do not exempt" in details
+
+    def _exempting_hr(self, operator, key, value):
+        return {"hr-bucket": self._exempting("hr-bucket", operator, key, value)}
+
+    @pytest.mark.parametrize(
+        "operator,value",
+        [
+            ("ArnNotLike", "arn:aws:iam::123456789012:role/ingest*"),
+            ("ArnNotEquals", "arn:aws:iam::*:role/ingest"),
+            ("StringNotLike", "arn:aws:iam::123456789012:role/ing?st"),
+            ("ArnNotLike", "arn:aws:iam::123456789012:role/${aws:username}"),
+            ("ArnNotLike", "ingest"),
+            ("ForAnyValue:ArnNotLike", "arn:aws:iam::123456789012:role/ingest"),
+            ("ForAllValues:StringNotEquals", "arn:aws:iam::123456789012:role/ingest"),
+            ("ArnLike", "arn:aws:iam::123456789012:role/ingest"),
+        ],
+    )
+    def test_br47_an_inexact_principal_arn_exemption_still_fails(self, operator, value):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                **self._enforced("support-bucket"),
+                **self._exempting_hr(operator, "aws:PrincipalArn", value),
+            }
+        )
         assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "Bucket hr-bucket" in findings[0]["Finding_Details"]
+        assert (
+            f"{operator.lower()} aws:principalarn"
+            in findings[0]["Finding_Details"].lower()
+        )
+        assert "exempts" not in findings[1]["Finding_Details"]
+        assert "deny every plaintext request" in findings[1]["Finding_Details"]
+
+    def test_br47_exact_and_wildcard_exemptions_split_two_buckets(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": self._exempting(
+                    "support-bucket",
+                    "ArnNotEquals",
+                    "aws:PrincipalArn",
+                    self.INGEST_ROLE,
+                ),
+                **self._exempting_hr(
+                    "ArnNotLike", "aws:PrincipalArn", "arn:aws:iam::123456789012:role/*"
+                ),
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "Bucket hr-bucket" in findings[0]["Finding_Details"]
+        assert "support-bucket" in findings[1]["Finding_Details"]
+        assert self.INGEST_ROLE in findings[1]["Finding_Details"]
+        assert "hr-bucket" not in findings[1]["Finding_Details"]
+
+    def test_br47_every_exempted_arn_is_named(self):
+        second = "arn:aws:iam::123456789012:role/tuning"
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                **self._enforced("support-bucket"),
+                **self._exempting_hr(
+                    "StringNotEqualsIfExists",
+                    "aws:PrincipalArn",
+                    [self.INGEST_ROLE, second],
+                ),
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert f"principal {self.INGEST_ROLE} " in findings[0]["Finding_Details"]
+        assert f"principal {second} " in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("operator", ["Bool", "BoolIfExists"])
+    def test_br47_a_via_aws_service_false_exemption_passes(self, operator):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                **self._enforced("support-bucket"),
+                **self._exempting_hr(operator, "aws:ViaAWSService", "false"),
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert (
+            "exempts requests an AWS service makes on a principal's behalf "
+            f"({operator.lower()} aws:ViaAWSService false), which keep plaintext "
+            "access to the bucket" in details
+        )
+        assert "deny every plaintext request" not in details
+
+    @pytest.mark.parametrize(
+        "operator,value",
+        [("Bool", "true"), ("ForAnyValue:Bool", "false")],
+    )
+    def test_br47_a_via_aws_service_test_other_than_false_still_fails(
+        self, operator, value
+    ):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                **self._enforced("support-bucket"),
+                **self._exempting_hr(operator, "aws:ViaAWSService", value),
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "aws:viaawsservice" in findings[0]["Finding_Details"].lower()
+
+    def test_br47_an_exemption_beside_another_narrowing_key_still_fails(self):
+        statement = _tls_deny_statement(["hr-bucket"])
+        statement["Condition"]["ArnNotLike"] = {"aws:PrincipalArn": self.INGEST_ROLE}
+        statement["Condition"]["StringEquals"] = {"aws:SourceVpce": "vpce-1"}
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                **self._enforced("support-bucket"),
+                "hr-bucket": _bucket_policy(statement),
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "stringequals aws:sourcevpce" in findings[0]["Finding_Details"].lower()
+        assert "aws:principalarn" not in findings[0]["Finding_Details"].lower()
 
     def test_br47_customization_job_list_error_is_an_incomplete_inventory(self):
         findings = self._run(

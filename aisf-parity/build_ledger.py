@@ -1146,7 +1146,12 @@ AI_SUBJECT_ROWS = [
         "principals, resources or actions it misses, since a Deny scoped to some "
         "principals leaves the rest able to use HTTP. The aws:PrincipalIsAWSService "
         "false exception of the S3 example policy is credited, since the Deny still "
-        "reaches every identity. Every data source and job is read "
+        "reaches every identity. The exact exclusion the recommendation prescribes for "
+        "broken ingestion is credited too: a negated aws:PrincipalArn test with no "
+        "set-operator prefix whose every value is an ARN with no wildcard or policy "
+        "variable, or Bool aws:ViaAWSService false. The Passed text names each exempted "
+        "ARN as keeping plaintext access, and a wildcard value, a set-operator prefix or "
+        "another narrowing key still fails. Every data source and job is read "
         "with no cap, and a failed read withholds the Passed row, since an unread bucket "
         "may accept plaintext",
         [],

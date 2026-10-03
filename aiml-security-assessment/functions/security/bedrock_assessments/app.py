@@ -27461,6 +27461,28 @@ SECURE_TRANSPORT_OPERATORS = ("bool", "boolifexists")
 # matched: a true test turns the Deny into one that reaches only services.
 PRINCIPAL_IS_AWS_SERVICE_CONDITION_KEY = "aws:principalisawsservice"
 
+# AIR-FND-DAT-02 tells a builder whose ingestion breaks under the TLS Deny to
+# exclude the specific role with aws:PrincipalArn or aws:ViaAWSService. Only an
+# exact exclusion is credited: a negated PrincipalArn test with no set-operator
+# prefix whose every value is an ARN with no wildcard or policy variable, or
+# Bool aws:ViaAWSService false. A negated operator is true on an absent key, so
+# the Deny still reaches a caller with no PrincipalArn. The exempted principals
+# keep plaintext access, and the finding names each one.
+PRINCIPAL_ARN_CONDITION_KEY = "aws:principalarn"
+
+PRINCIPAL_ARN_EXEMPTION_OPERATORS = (
+    "arnnotequals",
+    "arnnotlike",
+    "stringnotequals",
+    "stringnotlike",
+    "arnnotequalsifexists",
+    "arnnotlikeifexists",
+    "stringnotequalsifexists",
+    "stringnotlikeifexists",
+)
+
+VIA_AWS_SERVICE_CONDITION_KEY = "aws:viaawsservice"
+
 # The documented TLS-only bucket policy denies s3:* so that a future object or
 # bucket action is covered without editing the policy. A Deny naming individual
 # actions leaves every unnamed action reachable over HTTP, so the action entry
@@ -27514,6 +27536,37 @@ def _exempts_only_aws_services(operator: Any, key: str, values: List[Any]) -> bo
         and bool(values)
         and all(str(value).strip().lower() == "false" for value in values)
     )
+
+
+def _exact_tls_exemptions(operator: str, key: str, values: List[Any]) -> List[str]:
+    """
+    Name what an exact aws:PrincipalArn or aws:ViaAWSService exclusion exempts
+    from a TLS Deny, or return an empty list when the test is not one.
+    """
+    if not values:
+        return []
+    if key == PRINCIPAL_ARN_CONDITION_KEY and operator in (
+        PRINCIPAL_ARN_EXEMPTION_OPERATORS
+    ):
+        arns = [str(value).strip() for value in values]
+        if all(
+            arn.startswith("arn:")
+            and arn.count(":") >= 5
+            and not any(character in arn for character in "*?$")
+            for arn in arns
+        ):
+            return [f"principal {arn} ({operator} aws:PrincipalArn)" for arn in arns]
+        return []
+    if (
+        key == VIA_AWS_SERVICE_CONDITION_KEY
+        and operator in SECURE_TRANSPORT_OPERATORS
+        and all(str(value).strip().lower() == "false" for value in values)
+    ):
+        return [
+            "requests an AWS service makes on a principal's behalf "
+            f"({operator} aws:ViaAWSService false)"
+        ]
+    return []
 
 
 def _deny_principal_reach(statement: Dict[str, Any]) -> Dict[str, Any]:
@@ -27637,12 +27690,18 @@ def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]
                 "unnamed action stays reachable over HTTP"
             )
 
+        exemptions = [
+            exemption
+            for operator, key, values in _condition_keys_by_operator(statement)
+            for exemption in _exact_tls_exemptions(operator, key, values)
+        ]
         narrowing_keys = sorted(
             {
                 f"{operator} {key}"
                 for operator, key, values in _condition_keys_by_operator(statement)
                 if key != SECURE_TRANSPORT_CONDITION_KEY
                 and not _exempts_only_aws_services(operator, key, values)
+                and not _exact_tls_exemptions(operator, key, values)
             }
         )
         service_exception = any(
@@ -27658,6 +27717,7 @@ def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]
         if not gaps:
             return {
                 "enforced": True,
+                "exempted": bool(exemptions),
                 "detail": (
                     f"'{statement_id}' denies s3:* to every principal over both "
                     f"arn:aws:s3:::{bucket} and its objects when "
@@ -27666,6 +27726,12 @@ def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]
                         ", exempting only AWS service principals through "
                         "aws:PrincipalIsAWSService false"
                         if service_exception
+                        else ""
+                    )
+                    + (
+                        "; it exempts {}, which keep plaintext access to the "
+                        "bucket".format(", ".join(exemptions))
+                        if exemptions
                         else ""
                     )
                 ),
@@ -28124,6 +28190,7 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
         s3_client = boto3.client("s3", config=boto3_config, region_name=region)
         enforced = []
         plaintext = []
+        exempted = False
         indeterminate = []
 
         for bucket in sorted(inventory["buckets"]):
@@ -28168,6 +28235,7 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
 
             if assessment["enforced"]:
                 enforced.append(f"{bucket} ({labels}): {assessment['detail']}")
+                exempted = exempted or assessment["exempted"]
             else:
                 plaintext.append(
                     {
@@ -28232,17 +28300,23 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
             )
 
         incomplete = bool(inventory["errors"])
+        denied = (
+            "plaintext requests from every principal they do not exempt"
+            if exempted
+            else "every plaintext request"
+        )
         if enforced and incomplete:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-47",
                     finding_name=check_name,
                     finding_details=(
-                        "{} of the {} Bedrock data path bucket(s) read deny every "
-                        "plaintext request, but the bucket list is incomplete, so "
-                        "this is not a verdict on the whole data path: {}.".format(
+                        "{} of the {} Bedrock data path bucket(s) read deny {}, "
+                        "but the bucket list is incomplete, so this is not a "
+                        "verdict on the whole data path: {}.".format(
                             len(enforced),
                             len(inventory["buckets"]),
+                            denied,
                             "; ".join(enforced[:5]),
                         )
                     ),
@@ -28262,10 +28336,10 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                     check_id="BR-47",
                     finding_name=check_name,
                     finding_details=(
-                        "{} of {} Bedrock data path bucket(s) deny every plaintext "
-                        "request: {}.".format(
+                        "{} of {} Bedrock data path bucket(s) deny {}: {}.".format(
                             len(enforced),
                             len(inventory["buckets"]),
+                            denied,
                             "; ".join(enforced[:5]),
                         )
                     ),
