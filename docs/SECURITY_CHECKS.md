@@ -666,6 +666,8 @@ inventory is never treated as evidence of compliance.
 ---
 
 ## Amazon Bedrock AgentCore Security Checks (53)
+- **Workload identity rows:** `Bedrock Agent Role Confused Deputy Condition` reads each Bedrock agent role (the `agentResourceRoleArn` of every DRAFT and alias-routed version) with `iam:GetRole`. A `bedrock.amazonaws.com` trust statement fails unless it carries a positive `aws:SourceAccount` test and a positive `aws:SourceArn` test, neither an `IfExists` form nor `ForAllValues:`, whose every value names the role's own account (a `SourceArn` with a wildcard before the resource ID fails). `Bedrock Agent Action Group Function Role` reads the Lambda function of every action group of those versions (`ListAgentActionGroups`, `GetAgentActionGroup`, `lambda:GetFunction`) and fails an execution role two or more of them run as. Any unread agent, role or function makes the row `N/A`, never `Passed`.
+
 
 ### AC-01: Runtime Amazon VPC Configuration
 

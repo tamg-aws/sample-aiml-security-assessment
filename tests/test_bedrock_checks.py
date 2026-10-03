@@ -7949,6 +7949,7 @@ class TestBedrockHandlerMultiRegion:
         "check_kms_enclave_key_binding": "BR-55",
         "check_bedrock_llm_jacking_activity": "BR-56",
         "check_agent_handoff_source_identity": "BR-57",
+        "check_bedrock_agent_workload_identity": "BR-57",
     }
 
     # Checks that read a global surface (the IAM permissions cache or the
@@ -35563,6 +35564,312 @@ class TestBR11ValueDepth:
         na = self._rows(findings, self.DATA_ROW, "N/A")
         assert len(na) == 1 and "kms:DescribeKey" in na[0]["Finding_Details"]
         assert not self._rows(findings, self.DATA_ROW, "Passed")
+
+
+class TestBR57AgentRoleConfusedDeputy:
+    """AIR-FND-IAM-05: a Bedrock agent role's trust must bind the calling agent
+    with aws:SourceAccount and aws:SourceArn, and each action group function
+    needs its own execution role. No check read either before."""
+
+    DEPUTY = "Bedrock Agent Role Confused Deputy Condition"
+    FUNCTION = "Bedrock Agent Action Group Function Role"
+
+    ACCOUNT = "123456789012"
+    AGENT_ARN = "arn:aws:bedrock:us-east-1:123456789012:agent/*"
+
+    @classmethod
+    def _role(cls, name):
+        return f"arn:aws:iam::{cls.ACCOUNT}:role/service-role/{name}"
+
+    @classmethod
+    def _statement(cls, condition=None, sid="bedrock"):
+        statement = {
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": {"Service": "bedrock.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    @classmethod
+    def _bound(cls):
+        return {
+            "StringEquals": {"aws:SourceAccount": cls.ACCOUNT},
+            "ArnLike": {"aws:SourceArn": cls.AGENT_ARN},
+        }
+
+    def _run(self, roles, trusts, errors=(), agents=None, function_roles=None):
+        """`agents` is {agent id: {"aliases": [versions], version: [function
+        ARNs]}}; `function_roles` maps a function ARN to its role or an error."""
+        agents = agents or {}
+        function_roles = function_roles or {}
+        agent_client = MagicMock()
+        agent_client.list_agents.return_value = {
+            "agentSummaries": [
+                {"agentId": agent_id, "agentName": agent_id} for agent_id in agents
+            ]
+        }
+        agent_client.list_agent_aliases.side_effect = lambda agentId, **_: {
+            "agentAliasSummaries": [
+                {"routingConfiguration": [{"agentVersion": version}]}
+                for version in agents[agentId].get("aliases", [])
+            ]
+        }
+        agent_client.list_agent_action_groups.side_effect = (
+            lambda agentId, agentVersion, **_: {
+                "actionGroupSummaries": [
+                    {"actionGroupId": f"{agentVersion}-{index}"}
+                    for index, _ in enumerate(agents[agentId].get(agentVersion, []))
+                ]
+            }
+        )
+        agent_client.get_agent_action_group.side_effect = (
+            lambda agentId, agentVersion, actionGroupId: {
+                "agentActionGroup": {
+                    "actionGroupExecutor": {
+                        "lambda": agents[agentId][agentVersion][
+                            int(actionGroupId.rsplit("-", 1)[1])
+                        ]
+                    }
+                }
+            }
+        )
+        lambda_client = MagicMock()
+
+        def get_function(FunctionName):
+            outcome = function_roles[FunctionName]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"Configuration": {"Role": outcome}}
+
+        lambda_client.get_function.side_effect = get_function
+        self.agent_client = agent_client
+        inventory = {
+            "roles": {self._role(name): labels for name, labels in roles.items()},
+            "collaborations": [],
+            "errors": list(errors),
+            "runtime_error": None,
+            "agent_count": len(roles),
+            "runtime_count": 0,
+        }
+        iam = MagicMock()
+
+        def get_role(RoleName):
+            outcome = trusts[RoleName]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {
+                "Role": {
+                    "Arn": self._role(RoleName),
+                    "AssumeRolePolicyDocument": _policy(*outcome),
+                }
+            }
+
+        iam.get_role.side_effect = get_role
+        clients = {"iam": iam, "bedrock-agent": agent_client, "lambda": lambda_client}
+        with patch("boto3.client", side_effect=lambda service, **_: clients[service]):
+            result = bedrock_app.check_bedrock_agent_workload_identity(
+                region="us-east-1", agent_inventory=inventory
+            )
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-57"
+        self.function_rows = [r for r in rows if r["Finding"] == self.FUNCTION]
+        rows = [r for r in rows if r["Finding"] == self.DEPUTY]
+        assert len(rows) + len(self.function_rows) == len(extract_csv_data(result))
+        return result, rows, iam
+
+    def test_one_bound_role_and_one_without_source_arn(self):
+        result, rows, iam = self._run(
+            {
+                "bound": ["Bedrock agent 'a' version DRAFT"],
+                "half": ["Bedrock agent 'b' version 1"],
+                "runtime": ["AgentCore runtime 'r' version 1"],
+            },
+            {
+                "bound": [self._statement(self._bound())],
+                "half": [
+                    self._statement(
+                        {"StringEquals": {"aws:SourceAccount": self.ACCOUNT}}
+                    )
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert self._role("half") in detail
+        assert "no positive aws:SourceArn test naming account 123456789012" in detail
+        assert "aws:SourceAccount test" not in detail
+        assert self._role("bound") not in detail
+        assert result["status"] == "WARN"
+        assert sorted(c.kwargs["RoleName"] for c in iam.get_role.call_args_list) == [
+            "bound",
+            "half",
+        ]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {
+                "StringEquals": {"aws:SourceAccount": "999999999999"},
+                "ArnLike": {"aws:SourceArn": AGENT_ARN},
+            },
+            {
+                "StringEqualsIfExists": {"aws:SourceAccount": ACCOUNT},
+                "ArnLike": {"aws:SourceArn": AGENT_ARN},
+            },
+            {
+                "ForAllValues:StringEquals": {"aws:SourceAccount": ACCOUNT},
+                "ArnLike": {"aws:SourceArn": AGENT_ARN},
+            },
+            {
+                "StringEquals": {"aws:SourceAccount": ACCOUNT},
+                "ArnLike": {"aws:SourceArn": "arn:aws:bedrock:us-east-1:*:agent/*"},
+            },
+            {
+                "StringEquals": {"aws:SourceAccount": ACCOUNT},
+                "ArnLike": {
+                    "aws:SourceArn": "arn:aws:bedrock:us-east-1:999999999999:agent/*"
+                },
+            },
+            {
+                "StringEquals": {"aws:SourceAccount": ACCOUNT},
+                "ArnNotLike": {"aws:SourceArn": AGENT_ARN},
+            },
+            {
+                "StringEquals": {"aws:SourceAccount": [ACCOUNT, "999999999999"]},
+                "ArnLike": {"aws:SourceArn": AGENT_ARN},
+            },
+            None,
+        ],
+    )
+    def test_a_present_but_open_condition_fails(self, condition):
+        _, rows, _ = self._run(
+            {"r": ["Bedrock agent 'a' version DRAFT"]},
+            {"r": [self._statement(condition)]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_every_role_bound_passes_and_names_each_statement(self):
+        _, rows, _ = self._run(
+            {
+                "a": ["Bedrock agent 'a' version DRAFT"],
+                "b": ["Bedrock agent 'b' version DRAFT"],
+            },
+            {
+                "a": [self._statement(self._bound())],
+                "b": [
+                    self._statement(
+                        {
+                            "StringEquals": {
+                                "aws:SourceAccount": self.ACCOUNT,
+                                "aws:SourceArn": (
+                                    "arn:aws:bedrock:us-east-1:123456789012:agent/AG1"
+                                ),
+                            }
+                        },
+                        sid="exact",
+                    )
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "on the 2 Bedrock agent role(s)" in rows[0]["Finding_Details"]
+        assert "trust statement 'exact'" in rows[0]["Finding_Details"]
+
+    def test_an_unread_trust_or_agent_keeps_the_row_from_passing(self):
+        _, rows, _ = self._run(
+            {
+                "a": ["Bedrock agent 'a' version DRAFT"],
+                "b": ["Bedrock agent 'b' version DRAFT"],
+            },
+            {
+                "a": [self._statement(self._bound())],
+                "b": _client_error("AccessDenied", "denied", "GetRole"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "iam:GetRole (AccessDenied)" in rows[0]["Finding_Details"]
+        _, rows, _ = self._run(
+            {"a": ["Bedrock agent 'a' version DRAFT"]},
+            {"a": [self._statement(self._bound())]},
+            errors=["Bedrock agent 'c' was not read with bedrock:GetAgent (x)"],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    FN = "arn:aws:lambda:us-east-1:123456789012:function:{}"
+    ROLE_A = "arn:aws:iam::123456789012:role/fn-a"
+    ROLE_SHARED = "arn:aws:iam::123456789012:role/fn-shared"
+
+    def test_two_action_group_functions_on_one_role_fail_beside_a_distinct_one(
+        self,
+    ):
+        """The routed version 2 carries the second function sharing the role;
+        a DRAFT-only read would miss it."""
+        _, _, _ = self._run(
+            {"a": ["Bedrock agent 'a' version DRAFT"]},
+            {"a": [self._statement(self._bound())]},
+            agents={
+                "ag1": {
+                    "aliases": ["2"],
+                    "DRAFT": [self.FN.format("one"), self.FN.format("solo")],
+                    "2": [self.FN.format("two")],
+                }
+            },
+            function_roles={
+                self.FN.format("one"): self.ROLE_SHARED,
+                self.FN.format("two"): self.ROLE_SHARED,
+                self.FN.format("solo"): self.ROLE_A,
+            },
+        )
+        assert [r["Status"] for r in self.function_rows] == ["Failed"]
+        detail = self.function_rows[0]["Finding_Details"]
+        assert self.ROLE_SHARED in detail and "2 action group Lambda" in detail
+        assert self.ROLE_A not in detail
+        self.agent_client.list_agent_action_groups.assert_any_call(
+            agentId="ag1", agentVersion="2", maxResults=100
+        )
+
+    def test_distinct_function_roles_pass_and_an_unread_function_does_not(self):
+        agents = {"ag1": {"DRAFT": [self.FN.format("one"), self.FN.format("solo")]}}
+        self._run(
+            {},
+            {},
+            agents=agents,
+            function_roles={
+                self.FN.format("one"): self.ROLE_SHARED,
+                self.FN.format("solo"): self.ROLE_A,
+            },
+        )
+        assert [r["Status"] for r in self.function_rows] == ["Passed"]
+        assert "Each of the 2 action group" in self.function_rows[0]["Finding_Details"]
+        self._run(
+            {},
+            {},
+            agents=agents,
+            function_roles={
+                self.FN.format("one"): self.ROLE_SHARED,
+                self.FN.format("solo"): _client_error(
+                    "AccessDenied", "d", "GetFunction"
+                ),
+            },
+        )
+        assert [r["Status"] for r in self.function_rows] == ["N/A"]
+        assert (
+            "lambda:GetFunction (AccessDenied)"
+            in self.function_rows[0]["Finding_Details"]
+        )
+
+    def test_no_bedrock_agent_is_na(self):
+        result, rows, iam = self._run(
+            {"runtime": ["AgentCore runtime 'r' version 1"]}, {}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert result["status"] == "N/A"
+        iam.get_role.assert_not_called()
 
 
 class TestBR57AgentHandoffSourceIdentity:

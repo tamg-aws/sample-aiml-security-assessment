@@ -31729,6 +31729,55 @@ def _trust_policy_document(role: Dict[str, Any]) -> Any:
     return document
 
 
+AGENT_ROLE_DEPUTY_FINDING = "Bedrock Agent Role Confused Deputy Condition"
+
+AGENT_ROLE_DEPUTY_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/agents-permissions.html\n"
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html"
+)
+
+
+def _confused_deputy_gaps(statement: Dict[str, Any], account: str) -> List[str]:
+    """
+    Name what a bedrock.amazonaws.com trust statement lacks to bind the calling
+    agent to the role's own account, or return [] when it binds it.
+
+    Both aws:SourceAccount and aws:SourceArn are required, as the control asks.
+    Each needs a positive test with no IfExists form and no ForAllValues:
+    prefix, because those are true when the key is absent. Every SourceAccount
+    value must be the role's account, and every SourceArn value must name that
+    account with no wildcard before the resource ID.
+    """
+    bound = {"aws:sourceaccount": False, "aws:sourcearn": False}
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key not in bound or not values or operator.startswith("forallvalues:"):
+            continue
+        base = _strip_condition_set_operator(operator)
+        texts = [str(value) for value in values]
+        if key == "aws:sourceaccount":
+            bound[key] = bound[key] or (
+                base in ("stringequals", "stringlike")
+                and all(text == account for text in texts)
+            )
+        else:
+            bound[key] = bound[key] or (
+                base in ("arnequals", "arnlike", "stringequals", "stringlike")
+                and all(
+                    _lambda_source_arn_is_bounded(text)
+                    and text.split(":")[4] == account
+                    for text in texts
+                )
+            )
+    return [
+        f"no positive {name} test naming account {account}"
+        for name, key in (
+            ("aws:SourceAccount", "aws:sourceaccount"),
+            ("aws:SourceArn", "aws:sourcearn"),
+        )
+        if not bound[key]
+    ]
+
+
 def _identity_allows_assume_role(permissions: Dict[str, Any], role_arn: str) -> bool:
     """
     Return True when a cached identity's policies allow sts:AssumeRole on a role.
@@ -32239,6 +32288,322 @@ def check_agent_handoff_source_identity(
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=AGENT_HANDOFF_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+ACTION_GROUP_ROLE_FINDING = "Bedrock Agent Action Group Function Role"
+
+
+def _action_group_function_roles(region: str) -> Dict[str, Any]:
+    """
+    Read the Lambda function behind every action group of every agent's DRAFT
+    and alias-routed versions, and the execution role each runs as.
+
+    Returns {"roles": {role ARN: [function ARN]}, "functions": count,
+    "errors": [what was not read]}. GetFunction is called with the ARN as the
+    action group names it, so a qualified ARN reads that version's or alias's
+    configuration.
+    """
+    found = {"roles": {}, "functions": 0, "errors": []}
+    agent_client = boto3.client(
+        "bedrock-agent", config=boto3_config, region_name=region
+    )
+    lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+    try:
+        agents = _list_all_items(agent_client, "list_agents", "agentSummaries")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        found["errors"].append(
+            f"Bedrock agents were not listed ({get_assessment_error_label(error)})"
+        )
+        return found
+    function_arns = set()
+    for agent in agents:
+        agent_id = agent.get("agentId")
+        name = agent.get("agentName") or agent_id
+        try:
+            versions = {GUARDRAIL_DRAFT_VERSION} | {
+                str(route.get("agentVersion"))
+                for alias in _list_all_items(
+                    agent_client,
+                    "list_agent_aliases",
+                    "agentAliasSummaries",
+                    agentId=agent_id,
+                )
+                for route in alias.get("routingConfiguration") or []
+                if route.get("agentVersion")
+            }
+            for version in sorted(versions):
+                for group in _list_all_items(
+                    agent_client,
+                    "list_agent_action_groups",
+                    "actionGroupSummaries",
+                    agentId=agent_id,
+                    agentVersion=version,
+                ):
+                    detail = agent_client.get_agent_action_group(
+                        agentId=agent_id,
+                        agentVersion=version,
+                        actionGroupId=group.get("actionGroupId"),
+                    ).get("agentActionGroup", {})
+                    function_arn = (detail.get("actionGroupExecutor") or {}).get(
+                        "lambda"
+                    )
+                    if function_arn:
+                        function_arns.add(function_arn)
+        except (ClientError, BotoCoreError, TypeError) as error:
+            found["errors"].append(
+                f"action groups of Bedrock agent '{name}' were not read with "
+                "bedrock:ListAgentAliases, bedrock:ListAgentActionGroups and "
+                f"bedrock:GetAgentActionGroup ({get_assessment_error_label(error)})"
+            )
+    for function_arn in sorted(function_arns):
+        try:
+            role_arn = (
+                lambda_client.get_function(FunctionName=function_arn)
+                .get("Configuration", {})
+                .get("Role")
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            found["errors"].append(
+                f"function {function_arn} was not read with lambda:GetFunction "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        found["functions"] += 1
+        if role_arn:
+            found["roles"].setdefault(role_arn, []).append(function_arn)
+    return found
+
+
+def check_bedrock_agent_workload_identity(
+    region: str = "", agent_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-57 IAM-05 legs. Fail each Bedrock agent role whose bedrock.amazonaws.com
+    trust statement does not bind the caller with aws:SourceAccount and
+    aws:SourceArn naming the role's own account; the roles are the
+    agentResourceRoleArn of every agent's DRAFT and alias-routed versions, and
+    each trust policy is read with iam:GetRole. Fail each execution role that
+    two or more action group Lambda functions run as. Distinct roles per agent
+    are judged by BR-57's handoff rows.
+    """
+    check_name = AGENT_ROLE_DEPUTY_FINDING
+    findings = {"check_name": check_name, "status": "PASS", "csv_data": []}
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-57",
+            finding_name=check_name,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENT_ROLE_DEPUTY_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        inventory = (
+            agent_inventory
+            if agent_inventory is not None
+            else get_agent_role_inventory(region)
+        )
+        agent_roles = {
+            role_arn: labels
+            for role_arn, labels in inventory["roles"].items()
+            if any(label.startswith("Bedrock agent ") for label in labels)
+        }
+        unread = [error for error in inventory["errors"] if error.startswith("Bedrock")]
+        gaps, bound, without_bedrock = [], [], []
+        iam_client = boto3.client("iam", config=boto3_config)
+        for role_arn, labels in sorted(agent_roles.items()):
+            try:
+                role = iam_client.get_role(RoleName=role_arn.rsplit("/", 1)[-1]).get(
+                    "Role", {}
+                )
+                document = _trust_policy_document(role)
+            except (ClientError, BotoCoreError, ValueError, TypeError) as error:
+                unread.append(
+                    f"agent role {role_arn} trust policy was not read with "
+                    f"iam:GetRole ({get_assessment_error_label(error)})"
+                )
+                continue
+            account = role_arn.split(":")[4]
+            trusted = False
+            for statement in _policy_statements(document or {}):
+                if str(statement.get("Effect", "")).upper() != "ALLOW":
+                    continue
+                if not _statement_matches_action(statement, "sts:assumerole"):
+                    continue
+                principal = statement.get("Principal")
+                services = _principal_entries(
+                    principal.get("Service") if isinstance(principal, dict) else None
+                )
+                if "bedrock.amazonaws.com" not in services:
+                    continue
+                trusted = True
+                label = "agent role {} (runs {}) trust statement '{}'".format(
+                    role_arn,
+                    ", ".join(labels[:3]),
+                    statement.get("Sid") or "unnamed statement",
+                )
+                missing = _confused_deputy_gaps(statement, account)
+                if missing:
+                    gaps.append(f"{label} has {' and '.join(missing)}")
+                else:
+                    bound.append(label)
+            if not trusted:
+                without_bedrock.append(role_arn)
+
+        for gap in gaps[:MAX_REPORTED_UNOWNED_RESOURCES]:
+            findings["csv_data"].append(
+                row(
+                    f"{gap}, so Bedrock acting for another account or another "
+                    "resource can assume the role (the confused deputy problem).",
+                    "Add StringEquals aws:SourceAccount with this account and "
+                    "ArnLike aws:SourceArn with this account's agent ARN to the "
+                    "bedrock.amazonaws.com trust statement.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        if len(gaps) > MAX_REPORTED_UNOWNED_RESOURCES:
+            findings["csv_data"].append(
+                row(
+                    "{} further Bedrock agent role trust statement(s) lack the "
+                    "confused deputy conditions.".format(
+                        len(gaps) - MAX_REPORTED_UNOWNED_RESOURCES
+                    ),
+                    "Add aws:SourceAccount and aws:SourceArn conditions to each.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        if unread:
+            findings["csv_data"].append(
+                row(
+                    "{} part(s) of the Bedrock agent role population were not "
+                    "read: {}.".format(len(unread), "; ".join(unread[:10])),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if not agent_roles and not unread:
+            findings["csv_data"].append(
+                row(
+                    f"No Bedrock agent with a role exists in {region or 'this Region'}.",
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif agent_roles and not gaps and not unread:
+            findings["csv_data"].append(
+                row(
+                    "Every bedrock.amazonaws.com trust statement on the {} Bedrock "
+                    "agent role(s) binds the caller with aws:SourceAccount and "
+                    "aws:SourceArn naming the role's own account{}.{}".format(
+                        len(agent_roles),
+                        ": " + "; ".join(bound[:5]) if bound else "",
+                        " {} of them trust no bedrock.amazonaws.com statement, so "
+                        "Bedrock cannot assume them: {}.".format(
+                            len(without_bedrock), ", ".join(without_bedrock[:5])
+                        )
+                        if without_bedrock
+                        else "",
+                    ),
+                    "No action required",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        functions = _action_group_function_roles(region)
+        shared = {
+            role_arn: arns
+            for role_arn, arns in sorted(functions["roles"].items())
+            if len(arns) > 1
+        }
+
+        def function_row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-57",
+                finding_name=ACTION_GROUP_ROLE_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=AGENT_ROLE_DEPUTY_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        for role_arn, arns in shared.items():
+            findings["csv_data"].append(
+                function_row(
+                    "Execution role {} is run by {} action group Lambda functions: "
+                    "{}, so their calls carry one identity in CloudTrail and cannot "
+                    "be revoked apart.".format(role_arn, len(arns), ", ".join(arns)),
+                    "Give each action group function its own execution role scoped "
+                    "to what that function calls.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        if functions["errors"]:
+            findings["csv_data"].append(
+                function_row(
+                    "{} part(s) of the action group function population were not "
+                    "read: {}.".format(
+                        len(functions["errors"]), "; ".join(functions["errors"][:10])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif not shared and functions["functions"]:
+            findings["csv_data"].append(
+                function_row(
+                    "Each of the {} action group Lambda function(s) runs as an "
+                    "execution role no other action group function runs as. "
+                    "Whether a role is shared with a function outside an action "
+                    "group, and what each role may do, are not judged here.".format(
+                        functions["functions"]
+                    ),
+                    "No action required",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        findings["status"] = (
+            "WARN"
+            if gaps or shared
+            else "N/A"
+            if unread or functions["errors"] or not agent_roles
+            else "PASS"
+        )
+        return findings
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_agent_workload_identity: {str(e)}",
+            exc_info=True,
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-57",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AGENT_ROLE_DEPUTY_REFERENCE,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -34198,10 +34563,24 @@ def lambda_handler(event, context):
         all_findings.append(check_bedrock_llm_jacking_activity(region=region))
 
         logger.info("Running agent handoff source identity check (BR-57)")
+        # Read once for both BR-57 checks; on a failure each reads its own
+        # and reports the error on its own row.
+        try:
+            agent_inventory = get_agent_role_inventory(region)
+        except Exception as error:
+            logger.warning(f"Agent role inventory failed in {region}: {error}")
+            agent_inventory = None
         all_findings.append(
             _permission_cache_unavailable_result("BR-57", AGENT_HANDOFF_FINDING, region)
             if permission_cache is None
-            else check_agent_handoff_source_identity(permission_cache, region=region)
+            else check_agent_handoff_source_identity(
+                permission_cache, region=region, agent_inventory=agent_inventory
+            )
+        )
+        all_findings.append(
+            check_bedrock_agent_workload_identity(
+                region=region, agent_inventory=agent_inventory
+            )
         )
         assessed_regions = _assessed_regions(region)
         if is_primary_region and len(assessed_regions) > 1:

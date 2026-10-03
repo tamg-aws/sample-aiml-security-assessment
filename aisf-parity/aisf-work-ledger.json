@@ -1835,21 +1835,24 @@
       "verdict": "covered",
       "disposition": null,
       "target_modules": [
-        "agentcore_assessments"
+        "agentcore_assessments",
+        "bedrock_assessments"
       ],
       "incumbents": [
         "AC-43",
         "AC-45",
         "AC-02",
-        "AC-48"
+        "AC-48",
+        "BR-57"
       ],
       "incumbent_names": [
         "AgentCore Evaluation Role Trust",
         "AgentCore Tool Execution Role Scope",
         "AgentCore IAM Full Access Check",
-        "AgentCore Execution Role Trust"
+        "AgentCore Execution Role Trust",
+        "Agent Handoff Source Identity"
       ],
-      "gap": "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or allow-except AgentCore grants on all resources across every cached role and user. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 reads the trust policy of every runtime, gateway, browser, code interpreter, memory, payment manager and harness execution role: it fails a service principal or * unless an aws:SourceAccount or aws:SourceArn condition names the assessed account in every value, fails an account-root or bare account-id principal unless its condition names the calling principal, and fails a role that more than one AgentCore resource names, since the shared role carries the union of what each needs. The sharing leg runs at the primary Region and compares the roles of every assessed Region, and an unread Region is N/A. The sharing Passed is withheld while any family could not be listed, so it reads N/A until bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are granted. AC-27 also reads the gateway roles",
+      "gap": "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or allow-except AgentCore grants on all resources across every cached role and user. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 reads the trust policy of every runtime, gateway, browser, code interpreter, memory, payment manager and harness execution role: it fails a service principal or * unless an aws:SourceAccount or aws:SourceArn condition names the assessed account in every value, fails an account-root or bare account-id principal unless its condition names the calling principal, and fails a role that more than one AgentCore resource names, since the shared role carries the union of what each needs. The sharing leg runs at the primary Region and compares the roles of every assessed Region, and an unread Region is N/A. The sharing Passed is withheld while any family could not be listed, so it reads N/A until bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are granted. AC-27 also reads the gateway roles. BR-57 carries the Bedrock Agents leg: it reads the trust policy of every agent role (the agentResourceRoleArn of each DRAFT and alias-routed version) and fails a bedrock.amazonaws.com statement without both a positive aws:SourceAccount and aws:SourceArn test naming the role's own account, fails a role two agents share, and fails an execution role that two action group Lambda functions of those versions run as",
       "extra_iam": [],
       "phase": 5,
       "tier": "ai_subject",

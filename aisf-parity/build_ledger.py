@@ -1313,8 +1313,8 @@ AI_SUBJECT_ROWS = [
         "AIR-FND-IAM-05",
         COVERED,
         None,
-        "agentcore_assessments",
-        ["AC-43", "AC-45", "AC-02", "AC-48"],
+        ["agentcore_assessments", "bedrock_assessments"],
+        ["AC-43", "AC-45", "AC-02", "AC-48", "BR-57"],
         "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or "
         "allow-except AgentCore grants on all resources across every cached role and "
         "user. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 "
@@ -1329,7 +1329,13 @@ AI_SUBJECT_ROWS = [
         "The sharing Passed is withheld while any family "
         "could not be listed, so it reads N/A until "
         "bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are "
-        "granted. AC-27 also reads the gateway roles",
+        "granted. AC-27 also reads the gateway roles. BR-57 carries the Bedrock "
+        "Agents leg: it reads the trust policy of every agent role (the "
+        "agentResourceRoleArn of each DRAFT and alias-routed version) and fails a "
+        "bedrock.amazonaws.com statement without both a positive aws:SourceAccount "
+        "and aws:SourceArn test naming the role's own account, fails a role two "
+        "agents share, and fails an execution role that two action group Lambda "
+        "functions of those versions run as",
         [],
         5,
     ),
