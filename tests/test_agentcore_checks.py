@@ -1326,21 +1326,78 @@ class TestAC02FullAccessRoles:
             finding["Finding"] for finding in findings
         ]
 
+    _PROCESS_PAYMENT_DENY = {
+        "Effect": "Deny",
+        "Action": "bedrock-agentcore:ProcessPayment",
+        "Resource": "*",
+    }
+
     @pytest.mark.parametrize(
-        "action",
+        "statements",
         [
-            "bedrock-agentcore:CreatePaymentSession",
-            "bedrock-agentcore:ProcessPayment",
+            # Tightened: a writer alone passes only beside the explicit Deny the
+            # devguide's ManagementRole carries.
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:CreatePaymentSession",
+                    "Resource": "*",
+                },
+                _PROCESS_PAYMENT_DENY,
+            ],
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:ProcessPayment",
+                    "Resource": "*",
+                }
+            ],
         ],
-        ids=["writes-only", "executes-only"],
+        ids=["writes-only-denied", "executes-only"],
     )
-    def test_one_authority_alone_passes(self, action):
-        permission_cache = self._payments_cache(self._allow(action))
+    def test_one_authority_alone_passes(self, statements):
+        permission_cache = self._payments_cache(statements)
 
         findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            None,
+            {
+                "Effect": "Deny",
+                "Action": "bedrock-agentcore:ProcessPayment",
+                "Resource": _PAYMENT_MANAGER_ARN,
+            },
+            {
+                "Effect": "Deny",
+                "Action": "bedrock-agentcore:ProcessPayment",
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}},
+            },
+        ],
+        ids=["no-deny", "scoped-to-one-manager", "conditioned"],
+    )
+    def test_a_budget_writer_without_an_account_wide_deny_fails(self, deny):
+        # A writer that does not hold ProcessPayment today passed, though the
+        # role model asks for the Deny that keeps a later Allow from joining
+        # the two authorities.
+        statements = [self._allow("bedrock-agentcore:CreatePaymentInstrument")]
+        if deny:
+            statements.append(deny)
+        permission_cache = self._payments_cache(statements)
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        rows = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Payments Management Deny Missing"
+        ]
+        assert [f["Status"] for f in rows] == ["Failed"]
 
     def test_an_iam_user_holding_both_authorities_is_reported(self):
         permission_cache = self._payments_cache(
@@ -25185,7 +25242,40 @@ class TestAC01EgressFiltering:
         assert by_runtime["rt-split"]["Status"] == "Failed"
         assert by_runtime["rt-split"]["Finding"] == "AgentCore Egress Unrestricted"
         assert "0.0.0.0/0" in by_runtime["rt-split"]["Finding_Details"]
-        assert by_runtime["rt-half"]["Status"] == "Passed"
+        # Tightened from Passed: half the IPv4 internet is a broad range.
+        assert by_runtime["rt-half"]["Status"] == "Failed"
+        assert by_runtime["rt-half"]["Finding"] == "AgentCore Egress Broad"
+        assert "0.0.0.0/1 in sg-low" in by_runtime["rt-half"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "cidr, status",
+        [
+            ("52.0.0.0/16", "Failed"),
+            ("2600:1f00::/40", "Failed"),
+            ("52.94.0.0/22", "Passed"),
+            ("10.0.0.0/8", "Passed"),
+            ("100.64.0.0/10", "Passed"),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_broad_public_range_fails_and_a_private_or_narrow_one_passes(
+        self, mock_ac, mock_ec2, cidr, status
+    ):
+        field, key = (
+            ("Ipv6Ranges", "CidrIpv6") if ":" in cidr else ("IpRanges", "CidrIp")
+        )
+        _wire_runtimes(mock_ac, [_vpc_runtime("rt-1", security_groups=["sg-1"])])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                _security_group("sg-1", [{"IpProtocol": "tcp", field: [{key: cidr}]}])
+            ]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert [f["Status"] for f in egress] == [status]
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
@@ -28068,7 +28158,10 @@ class TestAC48ExecutionRoleTrustAndSharing:
             if role:
                 documents.setdefault(role, _GUARDED_TRUST)
         mock_iam.get_role.side_effect = lambda RoleName: {
-            "Role": {"AssumeRolePolicyDocument": documents[RoleName]}
+            "Role": {
+                "Arn": self._arn(RoleName),
+                "AssumeRolePolicyDocument": documents[RoleName],
+            }
         }
         return inventory
 
@@ -28128,6 +28221,61 @@ class TestAC48ExecutionRoleTrustAndSharing:
         assert len(self._named(findings, "AgentCore Execution Role Sharing")) == 1
         for finding in findings:
             assert_finding_schema(finding)
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_trust_naming_another_service_fails(self, mock_ac, mock_iam):
+        # Any guarded service principal passed, so a role AgentCore shares with
+        # Lambda read as an AgentCore-only role.
+        lent = json.loads(json.dumps(_GUARDED_TRUST))
+        lent["Statement"][0]["Principal"]["Service"] = [
+            "bedrock-agentcore.amazonaws.com",
+            "lambda.amazonaws.com",
+        ]
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["LentRole", "OwnRole"],
+            trust={"LentRole": lent},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        lent_rows = self._named(
+            findings, "AgentCore Execution Role Trusts Another Service"
+        )
+        assert [f["Status"] for f in lent_rows] == ["Failed"]
+        assert "LentRole" in lent_rows[0]["Finding_Details"]
+        assert "lambda.amazonaws.com" in lent_rows[0]["Finding_Details"]
+        passed = self._named(findings, "AgentCore Execution Role Trust")
+        assert [f["Status"] for f in passed] == ["Passed"]
+        assert "OwnRole" in passed[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_in_another_account_is_not_judged_by_a_namesake(
+        self, mock_ac, mock_iam
+    ):
+        # GetRole reads by name in this account, so a foreign role ARN was
+        # judged by a local role that only shares its name.
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["SharedName", "Local"])
+        foreign = "arn:aws:iam::999999999999:role/SharedName"
+        detail = mock_ac.get_agent_runtime.side_effect
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: (
+            {"roleArn": foreign} if agentRuntimeId == "rt-0" else detail(agentRuntimeId)
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        trust_rows = self._named(findings, "AgentCore Execution Role Trust")
+        by_status = {f["Status"]: f["Finding_Details"] for f in trust_rows}
+        assert set(by_status) == {"N/A", "Passed"}
+        assert foreign in by_status["N/A"]
+        assert "Local" in by_status["Passed"]
 
     @pytest.mark.parametrize(
         ("family", "wiring"),
@@ -33874,7 +34022,8 @@ class TestAC48WidenedPopulation:
         documents = dict(trust or {})
         mock_iam.get_role.side_effect = lambda RoleName: {
             "Role": {
-                "AssumeRolePolicyDocument": documents.get(RoleName, _GUARDED_TRUST)
+                "Arn": f"arn:aws:iam::{_ACCOUNT}:role/{RoleName}",
+                "AssumeRolePolicyDocument": documents.get(RoleName, _GUARDED_TRUST),
             }
         }
         return {"items": [], "errors": [], "list_error": None}
@@ -44506,7 +44655,9 @@ class TestAC53CoordinationAnomalyAlarms:
         findings, _ = self._run([edge], [self._band_alarm("wrong", elsewhere)])
         assert [f["Status"] for f in findings] == ["Failed"]
 
-    def test_a_band_without_the_environment_dimension_still_counts(self):
+    def test_a_band_without_the_environment_dimension_does_not_count(self):
+        # Tightened from Passed: an alarm with no Environment watches no
+        # Environment the pair publishes.
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
         no_env = dict(edge)
         no_env["Dimensions"] = [
@@ -44519,10 +44670,28 @@ class TestAC53CoordinationAnomalyAlarms:
                 self._latency_band("no-env-lat", no_env),
             ],
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
-        assert "no-env on Fault" in findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed"]
 
-    def test_a_band_with_an_operation_dimension_still_counts(self):
+    def test_a_band_on_another_environment_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        other = json.loads(json.dumps(edge))
+        for dimension in other["Dimensions"]:
+            if dimension["Name"] == "Environment":
+                dimension["Value"] += "-staging"
+        findings, _ = self._run(
+            [edge],
+            [self._band_alarm("other", other), self._latency_band("other-lat", other)],
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        findings, _ = self._run(
+            [edge],
+            [self._band_alarm("same", edge), self._latency_band("same-lat", edge)],
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_a_band_with_an_operation_dimension_does_not_count(self):
+        # Tightened from Passed: an alarm on one operation watches part of the
+        # pair, and the Passed text claimed the pair's own metrics.
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
         one_op = self._metric(
             "Fault", "alpha.DEFAULT", "beta.DEFAULT", Operation="POST /invocations"
@@ -44534,7 +44703,7 @@ class TestAC53CoordinationAnomalyAlarms:
                 self._latency_band("one-op-lat", one_op),
             ],
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
 
     def test_a_band_without_the_remote_service_dimension_does_not_count(self):
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")

@@ -2361,6 +2361,9 @@ def _agentcore_egress_findings(
         open_ranges = _security_groups_open_ranges(
             read_groups, "IpPermissionsEgress", prefix_list_cidrs
         )
+        broad_ranges = _security_groups_broad_public_ranges(
+            read_groups, "IpPermissionsEgress"
+        )
 
         if open_ranges:
             findings.append(
@@ -2376,6 +2379,29 @@ def _agentcore_egress_findings(
                     ),
                     resolution=(
                         "Replace the open outbound rule with rules that name the "
+                        "prefix lists, security groups or CIDR ranges this workload "
+                        "has to reach."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif broad_ranges:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name="AgentCore Egress Broad",
+                    finding_details=(
+                        f"{label} permits outbound traffic to public ranges of "
+                        f"/{AGENTCORE_BROAD_EGRESS_PREFIX[4]} (IPv6 "
+                        f"/{AGENTCORE_BROAD_EGRESS_PREFIX[6]}) or wider: "
+                        f"{', '.join(broad_ranges)}. Together they do not cover "
+                        "the whole internet, but each reaches more addresses than "
+                        "a workload names."
+                    ),
+                    resolution=(
+                        "Replace the broad outbound rule with rules that name the "
                         "prefix lists, security groups or CIDR ranges this workload "
                         "has to reach."
                     ),
@@ -2425,7 +2451,10 @@ def _agentcore_egress_findings(
                         f"The outbound ranges of {label}'s "
                         f"{len(target_groups)} security group(s), prefix list "
                         "entries included, together cover neither 0.0.0.0/0 nor "
-                        "::/0."
+                        "::/0, and no rule names a public range of "
+                        f"/{AGENTCORE_BROAD_EGRESS_PREFIX[4]} (IPv6 "
+                        f"/{AGENTCORE_BROAD_EGRESS_PREFIX[6]}) or wider. Ports are "
+                        "not judged."
                     ),
                     resolution=(
                         "No action required. Confirm the outbound rules name only "
@@ -3541,6 +3570,50 @@ def _payment_duty_collisions(
     return sorted(labels)
 
 
+def _payment_managers_without_deny(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+) -> List[str]:
+    """Return each budget writer that carries no explicit Deny on ProcessPayment.
+
+    The devguide's ManagementRole holds the session and instrument writes under
+    an explicit Deny on ProcessPayment, so a later Allow cannot join the two
+    authorities. A principal holding both today is a collision, reported by
+    `_payment_duty_collisions`; this reads the rest. Only an unconditioned Deny
+    on `Resource: "*"` in the principal's own policies counts, read with
+    `_deny_removes_pattern`, and a boundary that leaves the action out is not
+    the Deny the role model names.
+    """
+    labels: List[str] = []
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        budget_writes = [
+            action
+            for action in PAYMENT_BUDGET_WRITE_ACTIONS
+            if _principal_holds_action(permissions, action)
+        ]
+        if not budget_writes or _principal_holds_action(
+            permissions, PAYMENT_EXECUTION_ACTION
+        ):
+            continue
+        denied = False
+        for policy in _principal_policies(permissions):
+            try:
+                document = _policy_document(policy)
+            except (TypeError, ValueError):
+                continue
+            if any(
+                _deny_removes_pattern(statement, PAYMENT_EXECUTION_ACTION)
+                for statement in _document_statements(document, effect="Deny")
+            ):
+                denied = True
+                break
+        if not denied:
+            labels.append(f"{principal_kind} {principal_name}")
+    return sorted(labels)
+
+
 def _writer_pass_role_gaps(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
@@ -4611,6 +4684,37 @@ def check_agentcore_full_access_roles(
                 )
             )
 
+        # Who manages a payment budget with no Deny keeping ProcessPayment off it.
+        undenied_managers = [
+            *_payment_managers_without_deny(role_permissions, "role"),
+            *_payment_managers_without_deny(user_permissions, "user"),
+        ]
+        if undenied_managers:
+            findings.append(
+                create_finding(
+                    check_id="AC-02",
+                    finding_name="AgentCore Payments Management Deny Missing",
+                    finding_details=(
+                        "The following principals can write an AgentCore payment "
+                        "session or instrument and carry no explicit Deny on "
+                        f'{PAYMENT_EXECUTION_ACTION} for Resource "*" in their '
+                        f"own policies: {', '.join(undenied_managers)}. They do "
+                        "not hold the action today, but any later Allow, from a "
+                        "new policy or a group, joins setting the budget with "
+                        f"spending against it. {IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        "Add an explicit Deny on "
+                        f'{PAYMENT_EXECUTION_ACTION} for Resource "*", with no '
+                        "condition, to each management identity, as the "
+                        "devguide's ManagementRole carries."
+                    ),
+                    reference=AGENTCORE_PAYMENTS_IAM_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
         # Who can hand a role to a payment manager. The ControlPlaneRole passes
         # the ResourceRetrievalRole when it writes the manager, so its PassRole
         # is the one grant that decides which role the service retrieves as.
@@ -4715,7 +4819,9 @@ def check_agentcore_full_access_roles(
                         "holds an AgentCore full-access policy, a wildcard, bare "
                         '"*" or allow-except AgentCore grant on an unbounded '
                         "resource, a wildcard reaching an evaluation write, both "
-                        "payment authorities, an unscoped iam:PassRole beside a "
+                        "payment authorities, a payment session or instrument "
+                        "write without an explicit Deny on ProcessPayment, an "
+                        "unscoped iam:PassRole beside a "
                         "payment-manager write, or a grant that merges AgentCore "
                         "read and write actions on one resource type, after each "
                         "principal's own Deny statements and permissions boundary."
@@ -9032,6 +9138,54 @@ def _security_groups_open_ranges(
         if everything in ipaddress.collapse_addresses(family):
             open_ranges.append(str(everything))
     return open_ranges
+
+
+# AC-01 fails a single outbound range this wide that reaches public address
+# space, as SM-39 does for SageMaker hosts: 0.0.0.0/1 alone reaches half the
+# IPv4 internet without covering 0.0.0.0/0. Prefix lists are left out, because
+# an AWS managed list names one service's published ranges, which are this wide.
+AGENTCORE_BROAD_EGRESS_PREFIX = {4: 16, 6: 48}
+NON_PUBLIC_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "fc00::/7",
+    )
+)
+
+
+def _security_groups_broad_public_ranges(
+    security_groups: List[Dict[str, Any]], permissions_key: str
+) -> List[str]:
+    """Return each CIDR range, written on a rule, that is at least as wide as
+    AGENTCORE_BROAD_EGRESS_PREFIX and is not inside private address space."""
+    broad: List[str] = []
+    for security_group in security_groups:
+        for permission in security_group.get(permissions_key) or []:
+            if not isinstance(permission, dict):
+                continue
+            for network in _permission_networks(
+                {
+                    key: permission.get(key)
+                    for key in ("IpRanges", "Ipv6Ranges")
+                    if permission.get(key)
+                },
+                None,
+            ):
+                if network.prefixlen > AGENTCORE_BROAD_EGRESS_PREFIX[network.version]:
+                    continue
+                if any(
+                    network.version == private.version and network.subnet_of(private)
+                    for private in NON_PUBLIC_NETWORKS
+                ):
+                    continue
+                label = f"{network} in {security_group.get('GroupId', 'unknown')}"
+                if label not in broad:
+                    broad.append(label)
+    return broad
 
 
 def _security_groups_inbound_permissions(
@@ -28530,9 +28684,8 @@ def check_agentcore_execution_role_trust_and_sharing(
         used_by = ", ".join(f"{label} [{family} family]" for family, label in users)
 
         try:
-            document = iam_client.get_role(RoleName=role_name)["Role"][
-                "AssumeRolePolicyDocument"
-            ]
+            role = iam_client.get_role(RoleName=role_name)["Role"]
+            document = role["AssumeRolePolicyDocument"]
         except Exception as error:
             logger.warning(f"Could not read trust policy for {role_name}: {error}")
             findings.append(
@@ -28551,6 +28704,31 @@ def check_agentcore_execution_role_trust_and_sharing(
             )
             continue
 
+        # GetRole reads by name in this account, so a role ARN in another
+        # account, or under another path, would be judged by a local role that
+        # only shares its name.
+        if str(role.get("Arn") or "") != str(role_arn):
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trust",
+                    finding_details=(
+                        f"{used_by} runs as {role_arn}, but iam:GetRole on the "
+                        f"name {role_name} returned "
+                        f"{role.get('Arn') or 'no ARN'}, so the trust policy read "
+                        "is not the named role's and was not judged."
+                    ),
+                    resolution=(
+                        "Assess the account that owns the role, or name a role in "
+                        "this account, and rerun the assessment."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
         statements = _document_statements(document, effect="Allow")
         account_id = _arn_account(role_arn)
         exposed = [
@@ -28558,6 +28736,17 @@ def check_agentcore_execution_role_trust_and_sharing(
             for statement in statements
             if _statement_is_confused_deputy_exposed(statement, account_id)
         ]
+        # An AgentCore execution role is assumed by the AgentCore service, so a
+        # statement trusting another service lends the role beyond AgentCore.
+        foreign_services = sorted(
+            {
+                principal
+                for statement in statements
+                for principal in _statement_principals(statement)
+                if principal.endswith(".amazonaws.com")
+                and principal != AGENTCORE_SERVICE_PRINCIPAL
+            }
+        )
         account_wide = [
             statement
             for statement in statements
@@ -28650,7 +28839,33 @@ def check_agentcore_execution_role_trust_and_sharing(
                     status=StatusEnum.FAILED,
                 )
             )
-        if not exposed and not account_wide and not source_arn_missing:
+        if foreign_services:
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trusts Another Service",
+                    finding_details=(
+                        f"{used_by} runs as {role_name}, whose trust policy "
+                        f"names {', '.join(foreign_services)} beside or instead of "
+                        f"{AGENTCORE_SERVICE_PRINCIPAL}, so a resource of that "
+                        "service can act with this AgentCore resource's "
+                        "permissions."
+                    ),
+                    resolution=(
+                        f"Trust only {AGENTCORE_SERVICE_PRINCIPAL} in this role, "
+                        "and give the other service its own role."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if (
+            not exposed
+            and not account_wide
+            and not source_arn_missing
+            and not foreign_services
+        ):
             findings.append(
                 create_finding(
                     check_id="AC-48",
@@ -28658,9 +28873,10 @@ def check_agentcore_execution_role_trust_and_sharing(
                     finding_details=(
                         f"{used_by} runs as {role_name}, whose {len(statements)} "
                         "Allow statement(s) name no account root without a "
-                        "condition naming the caller, and no service or wildcard "
-                        "principal without an aws:SourceArn condition naming "
-                        f"account {account_id}."
+                        "condition naming the caller, no service but "
+                        f"{AGENTCORE_SERVICE_PRINCIPAL}, and no service or "
+                        "wildcard principal without an aws:SourceArn condition "
+                        f"naming account {account_id}."
                     ),
                     resolution=(
                         "No action required. Confirm the aws:SourceArn pattern "
@@ -31859,6 +32075,9 @@ APPLICATION_SIGNALS_EDGE_METRIC_NAMES = ("Error", "Fault", "Latency")
 # The RemoteService value Application Signals records when it cannot name the
 # callee, so the call may or may not reach another agent.
 APPLICATION_SIGNALS_UNKNOWN_REMOTE_SERVICE = "UnknownRemoteService"
+# Dimensions that narrow a pair's metric to one operation of the caller or the
+# callee, so an alarm carrying one watches part of the pair.
+APPLICATION_SIGNALS_NARROWING_DIMENSIONS = {"Operation", "RemoteOperation"}
 ANOMALY_DETECTION_BAND_PATTERN = re.compile(
     r"^\s*ANOMALY_DETECTION_BAND\s*\(\s*([A-Za-z0-9_]+)"
 )
@@ -31935,8 +32154,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
 
     Each edge needs metric alarms with actions whose threshold is an
     ANOMALY_DETECTION_BAND over the edge's Latency metric and over its Error or
-    Fault metric, with the edge's Service and RemoteService, whatever other
-    dimensions they carry. One band watches either how long the pair takes or
+    Fault metric, with the edge's Service and RemoteService and an Environment
+    the edge publishes, and no Operation or RemoteOperation dimension that
+    narrows it to part of the pair. One band watches either how long the pair takes or
     how often it fails, and DET-10 asks for both.
     A pair whose RemoteService is UnknownRemoteService is N/A by name, never
     Passed. A runtime not instrumented with Application Signals publishes no
@@ -32012,6 +32232,7 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
         return unread("bedrock-agentcore:ListPolicyEngines", error)
 
     edges: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    edge_environments: Dict[Tuple[str, str], Set[str]] = {}
     unknown: set = set()
     try:
         for metric_name in APPLICATION_SIGNALS_EDGE_METRIC_NAMES:
@@ -32051,6 +32272,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                 ):
                     continue
                 edges[(service, remote)] = (callee[0], callee[1])
+                edge_environments.setdefault((service, remote), set()).add(
+                    str(dimensions.get("Environment"))
+                )
     except (BotoCoreError, ClientError) as error:
         return unread("cloudwatch:ListMetrics", error)
 
@@ -32098,7 +32322,13 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                 continue
             dimensions = dict(dimension_set)
             edge = (dimensions.get("Service"), dimensions.get("RemoteService"))
-            if edge in edges:
+            # An alarm on another Environment watches another deployment's
+            # calls, and one narrowed to an operation watches part of the pair.
+            if (
+                edge in edges
+                and dimensions.get("Environment") in edge_environments[edge]
+                and not set(dimensions) & APPLICATION_SIGNALS_NARROWING_DIMENSIONS
+            ):
                 alarmed.setdefault(edge, []).append(
                     f"{_actioned_alarm_label(alarm, composite)} on {metric_name}"
                 )

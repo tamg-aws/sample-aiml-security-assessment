@@ -666,6 +666,41 @@ MUTATIONS = [
         "find": "        has_cmk = bool(key_id) and not key_gap\n",
         "replace": '        has_cmk = bool(key_id)\n        key_gap = ""\n',
     },
+    {
+        "name": "AC-02 passes a budget writer with no ProcessPayment Deny",
+        "file": AGENTCORE,
+        "defect": "the ManagementRole carries an explicit Deny on ProcessPayment so a later Allow cannot join setting a budget with spending it; a writer that lacks it passed because it does not hold the action today",
+        "find": '        if not denied:\n            labels.append(f"{principal_kind} {principal_name}")\n',
+        "replace": '        if False:\n            labels.append(f"{principal_kind} {principal_name}")\n',
+    },
+    {
+        "name": "AC-48 judges a foreign role by a same-named local role",
+        "file": AGENTCORE,
+        "defect": "GetRole reads by name in this account, so a role ARN in another account was judged by the trust policy of a local role that only shares its name",
+        "find": '        if str(role.get("Arn") or "") != str(role_arn):\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "AC-48 passes a trust that names another service",
+        "file": AGENTCORE,
+        "defect": "an execution role whose trust names lambda.amazonaws.com beside the AgentCore principal lends the resource's permissions to that service",
+        "find": "                and principal != AGENTCORE_SERVICE_PRINCIPAL\n",
+        "replace": "                and False\n",
+    },
+    {
+        "name": "AC-53 credits an alarm on another Environment",
+        "file": AGENTCORE,
+        "defect": "an alarm with the pair's Service and RemoteService on another Environment watches another deployment's calls, and the Passed text claimed the pair's own metrics were alarmed",
+        "find": '                and dimensions.get("Environment") in edge_environments[edge]\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-01 passes a broad public egress range",
+        "file": AGENTCORE,
+        "defect": "a single public range such as 0.0.0.0/1 reaches half the IPv4 internet without covering 0.0.0.0/0, and passed because only the union to /0 was tested",
+        "find": "                if network.prefixlen > AGENTCORE_BROAD_EGRESS_PREFIX[network.version]:\n",
+        "replace": "                if True:\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -872,6 +907,11 @@ GROUPS: dict[str, str] = {
     "AC-23 passes a read bound by a fixed literal partition": "in the AgentCore verdict legs",
     "AC-21 bounds an APPLICATION_LOGS-wide unmask": "in the AgentCore verdict legs",
     "AC-20 reads a key id as customer managed encryption": "in the AgentCore verdict legs",
+    "AC-02 passes a budget writer with no ProcessPayment Deny": "in the AgentCore verdict legs",
+    "AC-48 judges a foreign role by a same-named local role": "in the AgentCore verdict legs",
+    "AC-48 passes a trust that names another service": "in the AgentCore verdict legs",
+    "AC-53 credits an alarm on another Environment": "in the AgentCore verdict legs",
+    "AC-01 passes a broad public egress range": "in the AgentCore verdict legs",
 }
 
 
