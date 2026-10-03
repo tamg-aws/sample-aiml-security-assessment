@@ -29736,23 +29736,77 @@ def _gateway_target_runtime_arns(detail: Dict[str, Any]) -> Set[str]:
     return arns
 
 
-def _runtime_fronting_gateways() -> Tuple[Dict[str, List[Dict[str, str]]], List[str]]:
+def _runtime_fronting_gateways(
+    other_regions: Optional[List[str]] = None,
+) -> Tuple[Dict[str, List[Dict[str, str]]], List[str], str]:
     """Map each runtime ARN to the gateways with a target that routes to it.
 
-    Each gateway is its ARN, a label, the name of the workload identity
-    GetGateway reports in workloadIdentityDetails, and the execution role it
-    reports as roleArn. The second list names each
-    read that failed, by action, since a gateway that was not read may front
-    any runtime.
+    A gateway target can name a runtime in another Region, so the gateways of
+    this Region and of each of `other_regions` are read, each with its own
+    client. The third value names that scope for the finding text. A Region
+    where AgentCore has no endpoint, or that the account has not opted into,
+    holds no gateway and is skipped as the handler skips it.
+    """
+    global agentcore_client
+    fronting, unread = _region_fronting_gateways("")
+    held = agentcore_client
+    try:
+        for region in other_regions or []:
+            try:
+                agentcore_client = boto3.client(
+                    "bedrock-agentcore-control", config=boto3_config, region_name=region
+                )
+                gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+            except EndpointConnectionError:
+                continue
+            except ClientError as error:
+                if (
+                    error.response.get("Error", {}).get("Code", "")
+                    in REGION_UNAVAILABLE_ERROR_CODES
+                ):
+                    continue
+                unread.append(
+                    f"bedrock-agentcore:ListGateways in {region} "
+                    f"({_assessment_error_label(error)})"
+                )
+                continue
+            except Exception as error:
+                unread.append(
+                    f"bedrock-agentcore:ListGateways in {region} "
+                    f"({_assessment_error_label(error)})"
+                )
+                continue
+            region_fronting, region_unread = _region_fronting_gateways(
+                f" in {region}", gateways
+            )
+            for runtime_arn, entries in region_fronting.items():
+                fronting.setdefault(runtime_arn, []).extend(entries)
+            unread.extend(region_unread)
+    finally:
+        agentcore_client = held
+    return fronting, unread, "any assessed region" if other_regions else "this region"
+
+
+def _region_fronting_gateways(
+    suffix: str, gateways: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[Dict[str, List[Dict[str, str]]], List[str]]:
+    """Map each runtime ARN to the gateways of one Region routing to it.
+
+    Each gateway is its ARN, a label ending with `suffix`, the name of the
+    workload identity GetGateway reports in workloadIdentityDetails, and the
+    execution role it reports as roleArn. The second list names each read
+    that failed, by action, since a gateway that was not read may front any
+    runtime.
     """
     fronting: Dict[str, List[Dict[str, str]]] = {}
     unread: List[str] = []
-    try:
-        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
-    except Exception as error:
-        return {}, [
-            f"bedrock-agentcore:ListGateways ({_assessment_error_label(error)})"
-        ]
+    if gateways is None:
+        try:
+            gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+        except Exception as error:
+            return {}, [
+                f"bedrock-agentcore:ListGateways ({_assessment_error_label(error)})"
+            ]
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId") or "unknown"
         try:
@@ -29799,7 +29853,9 @@ def _runtime_fronting_gateways() -> Tuple[Dict[str, List[Dict[str, str]]], List[
         )
         entry = {
             "arn": str(detail.get("gatewayArn") or gateway.get("gatewayArn") or ""),
-            "label": f"gateway '{gateway.get('name') or gateway_id}' ({gateway_id})",
+            "label": (
+                f"gateway '{gateway.get('name') or gateway_id}' ({gateway_id}){suffix}"
+            ),
             "identity": identity.rsplit("/", 1)[-1] if identity else "",
             "role": str(detail.get("roleArn") or ""),
         }
@@ -29813,6 +29869,7 @@ def _allowed_workload_verdict(
     runtime_arn: str,
     fronting: Dict[str, List[Dict[str, str]]],
     unread: List[str],
+    scope: str = "this region",
 ) -> Tuple[str, str]:
     """Compare a runtime's allowedWorkloadConfiguration with its fronting gateways.
 
@@ -29846,8 +29903,8 @@ def _allowed_workload_verdict(
                 "read"
             )
         return "na", (
-            "has an allowedWorkloadConfiguration, but no gateway target in this "
-            "region routes to it, so no fronting gateway was determined to "
+            f"has an allowedWorkloadConfiguration, but no gateway target in {scope} "
+            "routes to it, so no fronting gateway was determined to "
             "compare it with"
         )
     labels = ", ".join(gateway["label"] for gateway in gateways)
@@ -29875,7 +29932,7 @@ def _allowed_workload_verdict(
     if not admitted:
         return "failed", (
             "has an allowedWorkloadConfiguration that admits none of "
-            f"{labels}, the gateway(s) in this region with a target routing "
+            f"{labels}, the gateway(s) in {scope} with a target routing "
             "to it, so the workloads it names invoke the agent without passing "
             "through that gateway"
         )
@@ -29883,7 +29940,7 @@ def _allowed_workload_verdict(
         return "failed", (
             "has an allowedWorkloadConfiguration that admits "
             f"{', '.join(admitted)} but also admits {', '.join(extras)}, which "
-            "is no gateway in this region with a target routing to it, so that "
+            f"is no gateway in {scope} with a target routing to it, so that "
             "workload invokes the agent without passing through the gateway"
         )
     refused = [
@@ -29906,6 +29963,7 @@ def _principal_arn_verdict(
     bounded: Callable[[str, List[str]], bool],
     fronting: Dict[str, List[Dict[str, str]]],
     unread: List[str],
+    scope: str = "this region",
 ) -> Tuple[str, str]:
     """Compare a runtime's aws:PrincipalArn Deny lists with its fronting gateways.
 
@@ -29935,7 +29993,7 @@ def _principal_arn_verdict(
         reason = (
             f"because {'; '.join(unread)} could not be read"
             if unread
-            else "because no gateway target in this region routes to it"
+            else f"because no gateway target in {scope} routes to it"
         )
         return "na", (
             "has a resource policy Deny that admits only the aws:PrincipalArn "
@@ -29957,7 +30015,7 @@ def _principal_arn_verdict(
         return "failed", (
             "has a resource policy Deny that admits only the aws:PrincipalArn "
             f"value(s) {', '.join(values)}, none of which is the execution role "
-            f"of {labels}, the gateway(s) in this region with a target routing "
+            f"of {labels}, the gateway(s) in {scope} with a target routing "
             "to it, so the principals it names invoke the agent without passing "
             "through that gateway"
         )
@@ -29966,7 +30024,7 @@ def _principal_arn_verdict(
             "has a resource policy Deny that admits the execution role of "
             f"{', '.join(admitted)} but also the aws:PrincipalArn value(s) "
             f"{', '.join(extras)}, which is the execution role of no gateway in "
-            "this region with a target routing to it, so that principal invokes "
+            f"{scope} with a target routing to it, so that principal invokes "
             "the agent without passing through the gateway"
         )
     return "passed", (
@@ -29976,7 +30034,9 @@ def _principal_arn_verdict(
     )
 
 
-def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
+def check_agentcore_runtime_invocation_path(
+    other_regions: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """AC-47: Judge the network path and the caller allowed to invoke a runtime.
 
     A gateway in front of an agent enforces the tool policy, the rate limits and
@@ -30032,7 +30092,7 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
         ]
 
     findings = []
-    fronting: Optional[Tuple[Dict[str, List[Dict[str, str]]], List[str]]] = None
+    fronting: Optional[Tuple[Dict[str, List[Dict[str, str]]], List[str], str]] = None
     for runtime in runtimes:
         runtime_id = runtime.get("agentRuntimeId", "unknown")
         runtime_name = runtime.get("agentRuntimeName", runtime_id)
@@ -30249,7 +30309,7 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                 "workloadIdentities"
             ):
                 if fronting is None:
-                    fronting = _runtime_fronting_gateways()
+                    fronting = _runtime_fronting_gateways(other_regions)
                 workload_verdict, workload_text = _allowed_workload_verdict(
                     allowed_workload, str(runtime_arn or ""), *fronting
                 )
@@ -30270,7 +30330,7 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
             principal_verdict, principal_text = "", ""
             if caller_keys:
                 if fronting is None:
-                    fronting = _runtime_fronting_gateways()
+                    fronting = _runtime_fronting_gateways(other_regions)
                 principal_verdict, principal_text = _principal_arn_verdict(
                     statements, str(runtime_arn or ""), principal_bounded, *fronting
                 )
@@ -30348,7 +30408,8 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                             "GetGatewayTarget and GetGateway and retry."
                             if fronting and fronting[1]
                             else "Confirm which gateway fronts this runtime: no "
-                            "gateway target in this region routes to it."
+                            f"gateway target in {fronting[2] if fronting else 'this region'} "
+                            "routes to it."
                         ),
                         reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
                         severity=SeverityEnum.INFORMATIONAL,
@@ -35920,7 +35981,9 @@ def lambda_handler(event, context):
             (
                 ["AC-47"],
                 "Runtime Invocation Path",
-                check_agentcore_runtime_invocation_path,
+                lambda: check_agentcore_runtime_invocation_path(
+                    [r for r in target_regions or [] if r and r != region]
+                ),
             ),
             (
                 ["AC-48"],

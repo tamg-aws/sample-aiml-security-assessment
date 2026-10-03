@@ -29814,6 +29814,81 @@ class TestAC47PrincipalArnGateway:
         assert "ListGatewayTargets on gwz" in caller[0]["Finding_Details"]
 
 
+class TestAC47FrontingGatewaysEveryRegion:
+    """AIR-ACR-RT-13: a gateway in another assessed Region can route to a
+    runtime here, so its execution role is a fronting gateway's role."""
+
+    def _callers(self, mock_ac, policies, other, regions=("us-west-2",)):
+        _wire_fronting_gateways(mock_ac, {})
+        _wire_runtimes(mock_ac, [_vpc_runtime(runtime_id) for runtime_id in policies])
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(
+                {"Statement": policies[resourceArn.rsplit("/", 1)[-1]]}
+            )
+        }
+        with patch(
+            "agentcore_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                ("bedrock-agentcore-control", "us-west-2"): other
+            }[(service, kwargs["region_name"])],
+        ):
+            findings = agentcore_app.check_agentcore_runtime_invocation_path(
+                list(regions)
+            )
+        for finding in findings:
+            assert_finding_schema(finding)
+        return {
+            finding["Finding_Details"].split("'", 2)[1]: finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime Caller")
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_in_another_region_fronts_the_runtime(self, mock_ac):
+        other = MagicMock()
+        _wire_fronting_gateways(
+            other,
+            {"gww": [_runtime_target("rt-a"), _runtime_target("rt-b")]},
+        )
+
+        callers = self._callers(
+            mock_ac,
+            {"rt-a": [_principal_deny("gww")], "rt-b": [_principal_deny("Developer")]},
+            other,
+        )
+
+        assert callers["rt-a"]["Status"] == "Passed"
+        assert "in us-west-2" in callers["rt-a"]["Finding_Details"]
+        assert callers["rt-b"]["Status"] == "Failed"
+        assert "any assessed region" in callers["rt-b"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlisted_region_is_na(self, mock_ac):
+        other = MagicMock()
+        other.list_gateways.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        callers = self._callers(mock_ac, {"rt-a": [_principal_deny("gww")]}, other)
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert "ListGateways in us-west-2" in callers["rt-a"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_region_not_opted_into_is_skipped(self, mock_ac):
+        other = MagicMock()
+        other.list_gateways.side_effect = _make_client_error(
+            "UnrecognizedClientException", "not opted in"
+        )
+
+        callers = self._callers(mock_ac, {"rt-a": [_principal_deny("gww")]}, other)
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        details = callers["rt-a"]["Finding_Details"]
+        assert "no gateway target in any assessed region routes to it" in details
+        assert "us-west-2" not in details
+
+
 class TestAC47EveryInvokeAction:
     """AC-47 credits a Deny only when it restricts every runtime invoke action."""
 

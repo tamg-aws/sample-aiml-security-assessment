@@ -1254,6 +1254,41 @@ MUTATIONS = [
         "find": "            if store_arn in seen_stores:\n                continue\n",
         "replace": "",
     },
+    {
+        "name": "AC-47 reads fronting gateways in its own region only",
+        "file": AGENTCORE,
+        "defect": "a gateway in another assessed Region routing to the runtime was not read, so its execution role read as an extra principal",
+        "find": '        for region in other_regions or []:\n            try:\n                agentcore_client = boto3.client(\n                    "bedrock-agentcore-control", config=boto3_config, region_name=region\n',
+        "replace": '        for region in []:\n            try:\n                agentcore_client = boto3.client(\n                    "bedrock-agentcore-control", config=boto3_config, region_name=region\n',
+    },
+    {
+        "name": "AC-47 drops a denied region's gateways silently",
+        "file": AGENTCORE,
+        "defect": "a denied ListGateways in another Region left a caller Passed that an unread gateway there could contradict",
+        "find": '                unread.append(\n                    f"bedrock-agentcore:ListGateways in {region} "\n                    f"({_assessment_error_label(error)})"\n                )\n                continue\n            except Exception',
+        "replace": "                continue\n            except Exception",
+    },
+    {
+        "name": "AC-47 reads a region not opted into as unread",
+        "file": AGENTCORE,
+        "defect": "a Region the account has not opted into, which holds no gateway, turned the verdict into N/A",
+        "find": '                    in REGION_UNAVAILABLE_ERROR_CODES\n                ):\n                    continue\n                unread.append(\n                    f"bedrock-agentcore:ListGateways in {region} "\n',
+        "replace": '                    in ()\n                ):\n                    continue\n                unread.append(\n                    f"bedrock-agentcore:ListGateways in {region} "\n',
+    },
+    {
+        "name": "AC-47 claims this region after reading every region",
+        "file": AGENTCORE,
+        "defect": "the finding said 'this region' after reading the gateways of every assessed Region",
+        "find": '    return fronting, unread, "any assessed region" if other_regions else "this region"\n',
+        "replace": '    return fronting, unread, "this region"\n',
+    },
+    {
+        "name": "AC-47 leaves the agentcore client on another region",
+        "file": AGENTCORE,
+        "defect": "the runtime reads after the gateway sweep went to the last assessed Region's client",
+        "find": "    finally:\n        agentcore_client = held\n    return fronting, unread,",
+        "replace": "    finally:\n        pass\n    return fronting, unread,",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1544,6 +1579,11 @@ GROUPS: dict[str, str] = {
     "AC-18 counts a single-region store homed elsewhere": "in the AgentCore verdict legs",
     "AC-18 drops an unlisted region's stores silently": "in the AgentCore verdict legs",
     "AC-18 reads a store listed in two regions twice": "in the AgentCore verdict legs",
+    "AC-47 reads fronting gateways in its own region only": "in the AgentCore verdict legs",
+    "AC-47 drops a denied region's gateways silently": "in the AgentCore verdict legs",
+    "AC-47 reads a region not opted into as unread": "in the AgentCore verdict legs",
+    "AC-47 claims this region after reading every region": "in the AgentCore verdict legs",
+    "AC-47 leaves the agentcore client on another region": "in the AgentCore verdict legs",
 }
 
 
