@@ -2383,10 +2383,25 @@ AGENTCORE_ENDPOINT_SURFACES = (
 
 WORKLOAD_ENDPOINT_SURFACES = BEDROCK_ENDPOINT_SURFACES + AGENTCORE_ENDPOINT_SURFACES
 
+# The data paths a Bedrock or AgentCore workload also reaches. Each is required
+# only of a workload already granted a Bedrock or AgentCore surface. S3 and
+# DynamoDB are covered by a gateway endpoint or a private-DNS interface endpoint.
+DATA_PATH_ENDPOINT_SURFACES = ("sagemaker.api", "sagemaker.runtime", "s3", "dynamodb")
+GATEWAY_ENDPOINT_SURFACES = ("s3", "dynamodb")
+
+# The S3 object and listing actions a workload uses to move data. S3 IAM action
+# names do not follow its operation names, so they are listed here.
+S3_DATA_PATH_ACTIONS = (
+    "s3:getobject",
+    "s3:putobject",
+    "s3:listbucket",
+    "s3:deleteobject",
+)
+
 
 def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
     """
-    List every VPC and every Bedrock interface endpoint in the region.
+    List every VPC and every available Bedrock interface endpoint in the region.
 
     A read failure raises, so a caller never reads a failed listing as an
     account with no endpoints.
@@ -2400,6 +2415,9 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
     agentcore_endpoints = [
         f"com.amazonaws.{region}.{surface}" for surface in AGENTCORE_ENDPOINT_SURFACES
     ]
+    data_path_endpoints = [
+        f"com.amazonaws.{region}.{surface}" for surface in DATA_PATH_ENDPOINT_SURFACES
+    ]
 
     vpc_ids = []
     for page in ec2_client.get_paginator("describe_vpcs").paginate():
@@ -2408,6 +2426,7 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
 
     found_endpoints = []
     found_agentcore = []
+    found_data_path = []
     for page in ec2_client.get_paginator("describe_vpc_endpoints").paginate():
         for endpoint in page["VpcEndpoints"]:
             service_name = endpoint["ServiceName"]
@@ -2416,7 +2435,13 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
                 target = found_agentcore
             elif service_name in bedrock_endpoints:
                 target = found_endpoints
+            elif service_name in data_path_endpoints:
+                target = found_data_path
             else:
+                continue
+            # Only an available endpoint carries traffic. A pendingAcceptance,
+            # rejected, failed or unreported state is not coverage.
+            if str(endpoint.get("State", "")).lower() != "available":
                 continue
             logger.info(
                 f"Found matching Bedrock endpoint: {service_name} in VPC: {vpc_id}"
@@ -2431,6 +2456,7 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
                     # a disabled setting or an absent policy.
                     "private_dns": endpoint.get("PrivateDnsEnabled"),
                     "policy": endpoint.get("PolicyDocument"),
+                    "type": endpoint.get("VpcEndpointType"),
                 }
             )
 
@@ -2440,6 +2466,8 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
         # AgentCore endpoints feed only the workload leg. AC-08 judges their
         # private DNS and policies.
         "agentcore_endpoints": found_agentcore,
+        # SageMaker, S3 and DynamoDB endpoints feed only the workload leg.
+        "data_path_endpoints": found_data_path,
         "all_vpcs": vpc_ids,
     }
 
@@ -2502,10 +2530,22 @@ def _bedrock_surface_actions() -> Dict[str, tuple]:
     on every surface whose model defines an operation of that name. Converse and
     ConverseStream authorize as InvokeModel and InvokeModelWithResponseStream,
     which are already bedrock-runtime operations. The bedrock-agentcore prefix
-    covers the data plane and control plane models.
+    covers the data plane and control plane models. The SageMaker surfaces follow
+    the sagemaker and sagemaker-runtime models, DynamoDB its model, and S3 the
+    listed data actions.
     """
     if not _BEDROCK_SURFACE_ACTIONS:
         session = botocore.session.get_session()
+        for surface, model in (
+            ("sagemaker.api", "sagemaker"),
+            ("sagemaker.runtime", "sagemaker-runtime"),
+            ("dynamodb", "dynamodb"),
+        ):
+            _BEDROCK_SURFACE_ACTIONS[surface] = tuple(
+                model.split("-")[0] + ":" + name.lower()
+                for name in session.get_service_model(model).operation_names
+            )
+        _BEDROCK_SURFACE_ACTIONS["s3"] = S3_DATA_PATH_ACTIONS
         for surface in WORKLOAD_ENDPOINT_SURFACES:
             if surface == "bedrock-mantle":
                 _BEDROCK_SURFACE_ACTIONS[surface] = BEDROCK_MANTLE_ACTIONS
@@ -3242,9 +3282,11 @@ def _workload_connectivity_findings(
     Judge, per workload, whether each Bedrock surface its role is granted has an
     interface endpoint with private DNS in the workload's own VPC.
 
-    An endpoint without private DNS does not count, because an unmodified SDK
-    client still resolves the public hostname. A workload outside any VPC cannot
-    use an interface endpoint at all.
+    A workload granted a Bedrock or AgentCore surface must also have an endpoint
+    for each SageMaker, S3 and DynamoDB surface its role is granted. For S3 and
+    DynamoDB a gateway endpoint counts. An interface endpoint without private
+    DNS does not count, because an unmodified SDK client still resolves the
+    public hostname. A workload outside any VPC cannot use an endpoint at all.
     """
     rows = []
     covered_by_vpc: Dict[str, set] = {}
@@ -3255,8 +3297,13 @@ def _workload_connectivity_findings(
         if not surface.startswith(prefix):
             continue
         surface = surface[len(prefix) :]
+        gateway = (
+            surface in GATEWAY_ENDPOINT_SURFACES and endpoint.get("type") == "Gateway"
+        )
         target = (
-            covered_by_vpc if endpoint.get("private_dns") is True else no_dns_by_vpc
+            covered_by_vpc
+            if gateway or endpoint.get("private_dns") is True
+            else no_dns_by_vpc
         )
         target.setdefault(endpoint.get("vpc_id"), set()).add(surface)
 
@@ -3285,6 +3332,15 @@ def _workload_connectivity_findings(
             continue
         if not surfaces:
             continue
+        try:
+            surfaces |= _granted_bedrock_surfaces(
+                roles[role], DATA_PATH_ENDPOINT_SURFACES
+            )
+        except (ValueError, TypeError, AttributeError):
+            unread.append(
+                f"{label} runs as role '{role}', whose policies could not be parsed"
+            )
+            continue
         vpc_id = workload.get("vpc_id")
         if not vpc_id:
             gaps.append(
@@ -3299,7 +3355,7 @@ def _workload_connectivity_findings(
             no_dns = sorted(set(missing) & no_dns_by_vpc.get(vpc_id, set()))
             gaps.append(
                 "{} in {} (role '{}') is granted {} with no private-DNS endpoint "
-                "in that VPC{}".format(
+                "(and, for S3 and DynamoDB, no gateway endpoint) in that VPC{}".format(
                     label,
                     vpc_id,
                     role,
@@ -3320,26 +3376,34 @@ def _workload_connectivity_findings(
 
     scope = (
         "Surfaces are taken from the grants of each workload's role, including a "
-        "permissions boundary that removes an action. "
-        f"{SCP_NOT_EVALUATED_NOTE} {WORKLOAD_CONNECTIVITY_CEILING}"
+        "permissions boundary that removes an action. SageMaker, S3 and "
+        "DynamoDB surfaces are required only of a workload granted a Bedrock or "
+        "AgentCore surface. A gateway endpoint is credited for its whole VPC, "
+        "because the route tables of each workload's subnets are not compared "
+        "with the endpoint's route tables. Only endpoints in the available "
+        f"state are counted. {SCP_NOT_EVALUATED_NOTE} {WORKLOAD_CONNECTIVITY_CEILING}"
     )
     if gaps:
         rows.append(
             create_finding(
                 check_id="BR-02",
                 finding_name=WORKLOAD_CONNECTIVITY_FINDING,
-                finding_details="{} workload(s) can call a Bedrock or AgentCore "
-                "surface outside PrivateLink: {}. {}".format(
-                    len(gaps), "; ".join(gaps[:10]), scope
-                ),
+                finding_details="{} workload(s) can call a Bedrock, AgentCore, "
+                "SageMaker, S3 or DynamoDB surface outside a VPC endpoint: {}. "
+                "{}".format(len(gaps), "; ".join(gaps[:10]), scope),
                 resolution=(
                     "Create one interface endpoint with private DNS for each "
                     "Bedrock surface (com.amazonaws.{0}.bedrock, bedrock-runtime, "
                     "bedrock-agent, bedrock-agent-runtime or bedrock-mantle) and "
                     "each AgentCore surface (com.amazonaws.{0}.bedrock-agentcore, "
                     "bedrock-agentcore-control or bedrock-agentcore.gateway) in "
-                    "each VPC whose workloads call it, and attach Lambda functions "
-                    "that call Bedrock or AgentCore to a VPC.".format(region)
+                    "each VPC whose workloads call it. In the same VPCs, create "
+                    "interface endpoints with private DNS for "
+                    "com.amazonaws.{0}.sagemaker.api and sagemaker.runtime, and "
+                    "gateway endpoints for com.amazonaws.{0}.s3 and dynamodb, for "
+                    "each of those services the workloads are granted. Attach "
+                    "Lambda functions that call Bedrock or AgentCore to a "
+                    "VPC.".format(region)
                 ),
                 reference=VPC_ENDPOINT_REFERENCE,
                 severity="Medium",
@@ -3353,8 +3417,8 @@ def _workload_connectivity_findings(
                 check_id="BR-02",
                 finding_name=WORKLOAD_CONNECTIVITY_FINDING,
                 finding_details="{} workload(s) have a private-DNS endpoint in "
-                "their VPC for every Bedrock and AgentCore surface their role is "
-                "granted: {}. "
+                "their VPC for every Bedrock, AgentCore, SageMaker, S3 and "
+                "DynamoDB surface their role is granted: {}. "
                 "{}{}".format(
                     len(covered),
                     "; ".join(covered[:10]),
@@ -3990,7 +4054,8 @@ def check_bedrock_access_and_vpc_endpoints(
                 "csv_data": _workload_connectivity_findings(
                     permission_cache,
                     vpc_endpoint_check["found_endpoints"]
-                    + vpc_endpoint_check.get("agentcore_endpoints", []),
+                    + vpc_endpoint_check.get("agentcore_endpoints", [])
+                    + vpc_endpoint_check.get("data_path_endpoints", []),
                     workload_inventory,
                     region,
                 )

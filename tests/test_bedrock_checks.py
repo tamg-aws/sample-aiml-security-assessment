@@ -877,6 +877,7 @@ class TestBR02VPCEndpointHardening:
                         "VpcEndpointId": "vpce-1",
                         "VpcId": "vpc-1",
                         "ServiceName": "com.amazonaws.us-east-1.bedrock-runtime",
+                        "State": "available",
                         "PrivateDnsEnabled": False,
                         "PolicyDocument": self._OPEN_POLICY,
                     },
@@ -899,6 +900,41 @@ class TestBR02VPCEndpointHardening:
         assert endpoint["endpoint_id"] == "vpce-1"
         assert endpoint["private_dns"] is False
         assert endpoint["policy"] == self._OPEN_POLICY
+
+    def test_br02_collector_counts_only_available_endpoints(self):
+        """A pending, rejected or failed endpoint carries no traffic."""
+        ec2_client = MagicMock()
+        ec2_client.get_paginator.return_value.paginate.return_value = [
+            {
+                "VpcEndpoints": [
+                    {
+                        "VpcEndpointId": f"vpce-{state}",
+                        "VpcId": "vpc-1",
+                        "ServiceName": f"com.amazonaws.us-east-1.{service}",
+                        "PrivateDnsEnabled": True,
+                        **({"State": state} if state else {}),
+                    }
+                    for service in ("bedrock-runtime", "bedrock-agentcore")
+                    for state in (
+                        "available",
+                        "pendingAcceptance",
+                        "rejected",
+                        "failed",
+                        None,
+                    )
+                ]
+            }
+        ]
+
+        with patch("bedrock_app.boto3.client", return_value=ec2_client):
+            result = bedrock_app.check_bedrock_vpc_endpoints(region="us-east-1")
+
+        assert [e["endpoint_id"] for e in result["found_endpoints"]] == [
+            "vpce-available"
+        ]
+        assert [e["endpoint_id"] for e in result["agentcore_endpoints"]] == [
+            "vpce-available"
+        ]
 
 
 def _empty_ecs_and_sagemaker():
@@ -1175,6 +1211,120 @@ class TestBR02WorkloadConnectivity:
         detail = rows[0]["Finding_Details"]
         for surface in ("bedrock, ", "bedrock-agent, ", "bedrock-mantle"):
             assert surface in detail
+
+    @classmethod
+    def _data_endpoint(cls, surface, endpoint_type, private_dns=False):
+        endpoint = cls._endpoint(surface, private_dns=private_dns)
+        endpoint["type"] = endpoint_type
+        return endpoint
+
+    @pytest.mark.parametrize(
+        "action, surface",
+        [
+            ("sagemaker:InvokeEndpoint", "sagemaker.runtime"),
+            ("sagemaker:CreateTrainingJob", "sagemaker.api"),
+            ("s3:GetObject", "s3"),
+            ("dynamodb:PutItem", "dynamodb"),
+        ],
+    )
+    def test_br02_a_bedrock_workload_needs_its_data_path_endpoints(
+        self, action, surface
+    ):
+        cache = self._cache({"Role": self._role(["bedrock:InvokeModel", action])})
+        rows = self._run(
+            cache,
+            [self._endpoint("bedrock-runtime")],
+            [self._function("app", "Role")],
+        )
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            f"is granted {surface} with no private-DNS endpoint"
+            in (rows[0]["Finding_Details"])
+        )
+
+        covered = self._run(
+            cache,
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint(surface, "Interface", private_dns=True),
+            ],
+            [self._function("app", "Role")],
+        )
+        assert [row["Status"] for row in covered] == ["Passed"]
+
+    @pytest.mark.parametrize("surface", ["s3", "dynamodb"])
+    def test_br02_a_gateway_endpoint_covers_s3_and_dynamodb(self, surface):
+        action = "s3:GetObject" if surface == "s3" else "dynamodb:GetItem"
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", action])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint(surface, "Gateway"),
+            ],
+            [self._function("app", "Role")],
+        )
+        assert [row["Status"] for row in rows] == ["Passed"]
+
+    def test_br02_a_no_dns_sagemaker_interface_endpoint_is_not_coverage(self):
+        rows = self._run(
+            self._cache(
+                {
+                    "Role": self._role(
+                        ["bedrock:InvokeModel", "sagemaker:InvokeEndpoint"]
+                    )
+                }
+            ),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("sagemaker.runtime", "Gateway"),
+            ],
+            [self._function("app", "Role")],
+        )
+        assert [row["Status"] for row in rows] == ["Failed"]
+
+    def test_br02_a_data_path_grant_alone_does_not_bring_a_workload_in(self):
+        rows = self._run(
+            self._cache({"Role": self._role(["s3:GetObject", "dynamodb:GetItem"])}),
+            [],
+            [self._function("app", "Role")],
+        )
+        assert [row["Status"] for row in rows] == ["N/A"]
+
+    def test_br02_collector_keeps_data_path_endpoints_with_their_type(self):
+        ec2_client = MagicMock()
+        ec2_client.get_paginator.return_value.paginate.return_value = [
+            {
+                "VpcEndpoints": [
+                    {
+                        "VpcEndpointId": f"vpce-{service}",
+                        "VpcId": "vpc-1",
+                        "ServiceName": f"com.amazonaws.us-east-1.{service}",
+                        "VpcEndpointType": endpoint_type,
+                        "State": "available",
+                    }
+                    for service, endpoint_type in (
+                        ("sagemaker.api", "Interface"),
+                        ("sagemaker.runtime", "Interface"),
+                        ("s3", "Gateway"),
+                        ("dynamodb", "Gateway"),
+                        ("sqs", "Interface"),
+                    )
+                ]
+            }
+        ]
+        with patch("bedrock_app.boto3.client", return_value=ec2_client):
+            result = bedrock_app.check_bedrock_vpc_endpoints(region=self.REGION)
+
+        assert result["found_endpoints"] == []
+        assert [
+            (endpoint["endpoint_id"], endpoint["type"])
+            for endpoint in result["data_path_endpoints"]
+        ] == [
+            ("vpce-sagemaker.api", "Interface"),
+            ("vpce-sagemaker.runtime", "Interface"),
+            ("vpce-s3", "Gateway"),
+            ("vpce-dynamodb", "Gateway"),
+        ]
 
     def test_br02_boundary_that_denies_bedrock_removes_the_surface(self):
         boundary = {
@@ -2304,6 +2454,7 @@ class TestBR02WorkloadConnectivity:
                             "VpcEndpointId": "vpce-m",
                             "VpcId": "vpc-2",
                             "ServiceName": "com.amazonaws.us-east-1.bedrock-mantle",
+                            "State": "available",
                             "PrivateDnsEnabled": True,
                         }
                     ]
@@ -2328,6 +2479,7 @@ class TestBR02WorkloadConnectivity:
                 "VpcEndpointId": f"vpce-{index}",
                 "VpcId": "vpc-1",
                 "ServiceName": f"com.amazonaws.us-east-1.{service}",
+                "State": "available",
                 "PrivateDnsEnabled": True,
             }
             for index, service in enumerate(
