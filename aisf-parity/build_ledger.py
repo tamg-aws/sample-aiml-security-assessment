@@ -85,7 +85,9 @@ AI_SUBJECT_ROWS = [
         "bedrock_assessments",
         ["BR-06"],
         "BR-06 credits retrieval traceability only when a trail or event data store "
-        "records AWS::Bedrock::KnowledgeBase data events, invocation logging records "
+        "records AWS::Bedrock::KnowledgeBase data events, read from multi-Region "
+        "trails and from single-Region trails homed in the knowledge base's Region, "
+        "invocation logging records "
         "text, and every S3 source bucket has versioning Enabled "
         "(s3:GetBucketVersioning); an unread data source or bucket is N/A. The "
         "RetrieveAndGenerate citations are not read, and sources outside S3 are not "
@@ -99,9 +101,12 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-06"],
-        "BR-06 credits Bedrock management and data events from multi-region trails and "
-        "from each ENABLED CloudTrail Lake event data store, whose advanced selectors "
-        "it reads with cloudtrail:GetEventDataStore and judges as a trail's. A management "
+        "BR-06 credits Bedrock management and data events from multi-region trails, "
+        "from single-Region trails homed in the assessed Region, and from each ENABLED "
+        "CloudTrail Lake event data store homed there or, with MultiRegionEnabled, "
+        "in another assessed Region. A store homed in an unassessed Region is not "
+        "read. Each store's advanced selectors are read with "
+        "cloudtrail:GetEventDataStore and judged as a trail's. A management "
         "selector must admit both bedrock.amazonaws.com and bedrock-mantle.amazonaws.com, "
         "and a data-event row needs all six AWS::BedrockMantle:: resource types. "
         "An unread "

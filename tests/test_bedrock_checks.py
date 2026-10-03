@@ -3519,12 +3519,15 @@ class TestBR06SelectorValues:
         knowledge_bases=({"knowledgeBaseId": "kb-1"},),
         event_data_stores=({"EventDataStores": []},),
         store_details=None,
+        remote_clients=None,
     ):
         """
-        trails: {name: {"advanced": [...], "basic": [...], "error": code}}.
+        trails: {name: {"advanced": [...], "basic": [...], "error": code,
+        "home": Region}}; a trail with a home is a single-Region trail there.
         event_data_stores: ListEventDataStores pages, or an exception to raise.
         store_details: {store ARN: GetEventDataStore response, or an exception};
         an ARN left out answers ENABLED with no selectors.
+        remote_clients: {Region: client} answering for another assessed Region.
         """
 
         def name_of(arn):
@@ -3550,7 +3553,14 @@ class TestBR06SelectorValues:
             ]
         }
         client.get_trail.side_effect = lambda Name: {
-            "Trail": {"IsMultiRegionTrail": True}
+            "Trail": (
+                {
+                    "IsMultiRegionTrail": False,
+                    "HomeRegion": trails[name_of(Name)]["home"],
+                }
+                if trails[name_of(Name)].get("home")
+                else {"IsMultiRegionTrail": True}
+            )
         }
         client.get_trail_status.side_effect = lambda Name: {"IsLogging": True}
         client.get_event_selectors.side_effect = selectors
@@ -3574,8 +3584,14 @@ class TestBR06SelectorValues:
 
         client.get_event_data_store.side_effect = get_store
         TestBR06SelectorValues.store_client = client
+        remote_clients = remote_clients or {}
         with (
-            patch("boto3.client", return_value=client),
+            patch(
+                "boto3.client",
+                side_effect=lambda *args, region_name=None, **kwargs: (
+                    remote_clients.get(region_name, client)
+                ),
+            ),
             patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
             patch(
                 "bedrock_app._invocation_record_state",
@@ -3914,7 +3930,121 @@ class TestBR06SelectorValues:
         )
         assert rows[MANTLE_ROW]["Status"] == "Passed"
 
+    # --- Single-Region trails ------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "home, expected", [("us-east-1", "Passed"), ("eu-west-1", "Failed")]
+    )
+    def test_a_single_region_trail_homed_here_is_coverage(self, home, expected):
+        """A single-Region trail records its home Region's events, so it covers
+        this Region's row when it is homed here. Before the fix only multi-Region
+        trails were read, so a trail homed here read as a false Failed."""
+        rows = self._run(
+            {
+                "local": {
+                    "home": home,
+                    "advanced": [_management(), _data([KB_DATA_TYPE])],
+                }
+            }
+        )
+        assert rows["Bedrock CloudTrail Logging Check"]["Status"] == expected
+        kb = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert kb["Status"] == expected
+        if expected == "Passed":
+            assert "local" in kb["Finding_Details"]
+
     # --- CloudTrail Lake event data stores ------------------------------------
+
+    REMOTE_ARN = "arn:aws:cloudtrail:eu-west-1:123:eventdatastore/remote"
+
+    def _remote(self, pages=None, detail=None):
+        remote = MagicMock()
+        remote.list_event_data_stores.side_effect = (
+            pages
+            if isinstance(pages, Exception)
+            else list(
+                pages
+                or (
+                    {
+                        "EventDataStores": [
+                            {"EventDataStoreArn": self.REMOTE_ARN, "Name": "org-lake"}
+                        ]
+                    },
+                )
+            )
+        )
+        remote.get_event_data_store.return_value = {
+            "EventDataStoreArn": self.REMOTE_ARN,
+            **(detail or {}),
+        }
+        return remote
+
+    STORE_SELECTORS = [_management(), _data([KB_DATA_TYPE, *INFERENCE_TYPES])]
+
+    def test_a_multi_region_store_homed_in_another_assessed_region_is_coverage(
+        self, monkeypatch
+    ):
+        """MDL-07: a multi-Region event data store records every Region's events
+        but is listed only in its home Region. Before the fix it read as Failed."""
+        monkeypatch.setenv("TARGET_REGIONS", "us-east-1,eu-west-1")
+        remote = self._remote(
+            detail={
+                "Status": "ENABLED",
+                "MultiRegionEnabled": True,
+                "AdvancedEventSelectors": self.STORE_SELECTORS,
+            }
+        )
+        rows = self._run({}, remote_clients={"eu-west-1": remote})
+        assert remote.list_event_data_stores.call_count == 1
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Passed"
+        assert (
+            "event data store org-lake (multi-Region, homed in eu-west-1)"
+            in (row["Finding_Details"])
+        )
+        kb = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert kb["Status"] == "Passed"
+
+    def test_a_single_region_store_in_another_region_is_not_coverage(self, monkeypatch):
+        monkeypatch.setenv("TARGET_REGIONS", "us-east-1,eu-west-1")
+        remote = self._remote(
+            detail={
+                "Status": "ENABLED",
+                "MultiRegionEnabled": False,
+                "AdvancedEventSelectors": self.STORE_SELECTORS,
+            }
+        )
+        rows = self._run({}, remote_clients={"eu-west-1": remote})
+        assert rows["Bedrock CloudTrail Logging Check"]["Status"] == "Failed"
+        assert (
+            rows["Bedrock Knowledge Base Retrieval Data Event Logging"]["Status"]
+            == "Failed"
+        )
+
+    def test_an_unlisted_store_in_another_region_withholds_failed(self, monkeypatch):
+        monkeypatch.setenv("TARGET_REGIONS", "us-east-1,eu-west-1")
+        remote = self._remote(
+            pages=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                "ListEventDataStores",
+            )
+        )
+        rows = self._run({}, remote_clients={"eu-west-1": remote})
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "N/A"
+        assert "eu-west-1" in row["Finding_Details"]
+        assert "cloudtrail:ListEventDataStores" in row["Finding_Details"]
+
+    def test_an_unassessed_home_region_is_named_in_the_gap(self):
+        rows = self._run({"a": {"advanced": [_management()]}})
+        details = rows["Bedrock Knowledge Base Retrieval Data Event Logging"][
+            "Finding_Details"
+        ]
+        assert (
+            "Stores homed in the other assessed Regions are read too; a "
+            "multi-Region event data store homed in a Region this assessment "
+            "does not scan is not read." in details
+        )
 
     def test_no_event_data_store_keeps_the_trail_gap_failed(self):
         rows = self._run({"a": {"advanced": [_management()]}})

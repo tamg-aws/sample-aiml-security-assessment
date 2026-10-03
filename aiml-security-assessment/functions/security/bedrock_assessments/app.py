@@ -5168,22 +5168,34 @@ EVENT_DATA_STORE_REFERENCE = (
     "API_GetEventDataStore.html"
 )
 
+# ListEventDataStores answers with the stores homed in the Region it is called
+# in, and a multi-Region store records every Region's events, so the other
+# assessed Regions are listed as well.
+EVENT_DATA_STORE_OTHER_REGIONS_NOTE = (
+    "Stores homed in the other assessed Regions are read too; a multi-Region "
+    "event data store homed in a Region this assessment does not scan is not read."
+)
+
 EVENT_DATA_STORE_ELSEWHERE_NOTE = (
-    "No CloudTrail Lake event data store is homed in this Region. A multi-Region "
-    "event data store homed in another Region would also record these calls and "
-    "is named in that Region's row."
+    "No CloudTrail Lake event data store is homed in this Region. "
+    + EVENT_DATA_STORE_OTHER_REGIONS_NOTE
 )
 
 
-def _event_data_store_coverage(cloudtrail_client) -> Dict[str, Any]:
+def _event_data_store_coverage(
+    cloudtrail_client, home_region: str = ""
+) -> Dict[str, Any]:
     """
     List the Region's CloudTrail Lake event data stores and read each one's
     Status and AdvancedEventSelectors (GetEventDataStore).
 
     A store is credited only while its Status is ENABLED, and its selectors are
     judged with the same rules as a trail's. A store whose read fails is
-    unread, so no trail gap in the Region becomes a verdict.
+    unread, so no trail gap in the Region becomes a verdict. ``home_region``
+    names another assessed Region being read, where only a MultiRegionEnabled
+    store records this Region's events.
     """
+    where = f" in {home_region}" if home_region else ""
     coverage: Dict[str, Any] = {
         "names": [],
         "error": None,
@@ -5205,16 +5217,19 @@ def _event_data_store_coverage(cloudtrail_client) -> Dict[str, Any]:
         )
     except (ClientError, BotoCoreError, TypeError) as error:
         coverage["error"] = (
-            "CloudTrail Lake event data stores were not listed with "
+            f"CloudTrail Lake event data stores{where} were not listed with "
             f"cloudtrail:ListEventDataStores ({get_assessment_error_label(error)})"
         )
         return coverage
     for store in stores:
         name = str(store.get("Name") or store.get("EventDataStoreArn") or "unnamed")
-        coverage["names"].append(name)
+        if not home_region:
+            coverage["names"].append(name)
         arn = store.get("EventDataStoreArn")
         if not arn:
-            coverage["unread"].append(f"{name} (ListEventDataStores returned no ARN)")
+            coverage["unread"].append(
+                f"{name}{where} (ListEventDataStores returned no ARN)"
+            )
             continue
         try:
             detail = cloudtrail_client.get_event_data_store(EventDataStore=arn)
@@ -5222,15 +5237,19 @@ def _event_data_store_coverage(cloudtrail_client) -> Dict[str, Any]:
                 raise TypeError("GetEventDataStore returned no document")
         except (ClientError, BotoCoreError, TypeError) as error:
             coverage["unread"].append(
-                f"{name} (cloudtrail:GetEventDataStore: "
+                f"{name}{where} (cloudtrail:GetEventDataStore: "
                 f"{get_assessment_error_label(error)})"
             )
             continue
         status = detail.get("Status")
+        if home_region and detail.get("MultiRegionEnabled") is not True:
+            continue
         if status != "ENABLED":
-            coverage["inactive"].append(f"{name} (Status {status or 'absent'})")
+            coverage["inactive"].append(f"{name}{where} (Status {status or 'absent'})")
             continue
         label = f"event data store {name}"
+        if home_region:
+            label += f" (multi-Region, homed in {home_region})"
         selectors = detail.get("AdvancedEventSelectors") or []
         covered, _ = _trail_bedrock_management_coverage(
             {"AdvancedEventSelectors": selectors}
@@ -5246,6 +5265,30 @@ def _event_data_store_coverage(cloudtrail_client) -> Dict[str, Any]:
     return coverage
 
 
+def _assessed_event_data_store_coverage(
+    cloudtrail_client, region: str
+) -> Dict[str, Any]:
+    """Read this Region's event data stores and the multi-Region stores homed in
+    every other assessed Region."""
+    coverage = _event_data_store_coverage(cloudtrail_client)
+    for other in _assessed_regions(region) if region else []:
+        if other == region:
+            continue
+        remote = _event_data_store_coverage(
+            boto3.client("cloudtrail", config=boto3_config, region_name=other),
+            home_region=other,
+        )
+        if remote["error"]:
+            coverage["unread"].append(remote["error"])
+        coverage["unread"].extend(remote["unread"])
+        coverage["inactive"].extend(remote["inactive"])
+        coverage["management"].extend(remote["management"])
+        for key in ("credited", "narrowed"):
+            for resource_type, values in remote[key].items():
+                coverage[key].setdefault(resource_type, []).extend(values)
+    return coverage
+
+
 def _event_data_store_unread(event_data_stores: Dict[str, Any]) -> str:
     """Name what keeps a trail gap from being a verdict, or return ''."""
     if event_data_stores["error"]:
@@ -5255,7 +5298,7 @@ def _event_data_store_unread(event_data_stores: Dict[str, Any]) -> str:
         )
     if event_data_stores["unread"]:
         return (
-            "event data store(s) in this Region were not read, and each could "
+            "event data store(s) were not read, and each could "
             "record these calls: {} ({}).".format(
                 "; ".join(event_data_stores["unread"]), EVENT_DATA_STORE_REFERENCE
             )
@@ -5276,9 +5319,11 @@ def _event_data_store_note(event_data_stores: Dict[str, Any]) -> str:
     )
     return (
         "Event data store(s) {} in this Region were read with "
-        "GetEventDataStore and are counted with the trails.{} A multi-Region "
-        "event data store homed in another Region is named in that Region's "
-        "row.".format(", ".join(event_data_stores["names"]), inactive)
+        "GetEventDataStore and are counted with the trails.{} {}".format(
+            ", ".join(event_data_stores["names"]),
+            inactive,
+            EVENT_DATA_STORE_OTHER_REGIONS_NOTE,
+        )
     )
 
 
@@ -5728,7 +5773,7 @@ def _bedrock_data_event_findings(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Model Invocation Data Event Logging",
-                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field (observed data-event resource types: {observed}), but {store_unread}{narrowed_note}",
+                finding_details=f"No logging multi-Region trail, or single-Region trail based in this Region, names {', '.join(missing)} in a resources.type field selector with no narrowing field (observed data-event resource types: {observed}), but {store_unread}{narrowed_note}",
                 resolution=COULD_NOT_ASSESS_RESOLUTION,
                 reference=EVENT_DATA_STORE_REFERENCE,
                 severity="Informational",
@@ -5741,7 +5786,7 @@ def _bedrock_data_event_findings(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Model Invocation Data Event Logging",
-                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field, so an inference on those paths cannot be traced from the invoking identity to the model or agent that answered it (observed data-event resource types: {observed}). {store_note}{narrowed_note}",
+                finding_details=f"No logging multi-Region trail, or single-Region trail based in this Region, names {', '.join(missing)} in a resources.type field selector with no narrowing field, so an inference on those paths cannot be traced from the invoking identity to the model or agent that answered it (observed data-event resource types: {observed}). {store_note}{narrowed_note}",
                 resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(", ".join(missing)),
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
@@ -5775,14 +5820,14 @@ def _bedrock_data_event_findings(
         )
     elif store_unread:
         mantle_row = (
-            f"No logging multi-region trail names {', '.join(mantle_missing)} in a resources.type field selector with no narrowing field (observed data-event resource types: {observed}), but {store_unread}{narrowed_note}",
+            f"No logging multi-Region trail, or single-Region trail based in this Region, names {', '.join(mantle_missing)} in a resources.type field selector with no narrowing field (observed data-event resource types: {observed}), but {store_unread}{narrowed_note}",
             COULD_NOT_ASSESS_RESOLUTION,
             "Informational",
             "N/A",
         )
     else:
         mantle_row = (
-            f"No logging multi-region trail names {', '.join(mantle_missing)} in a resources.type field selector with no narrowing field, so inference and file calls on the bedrock-mantle endpoint that reference those types are not recorded: bedrock-mantle logs CreateInference as a data event, not a management event (observed data-event resource types: {observed}). AWS's example selector names only AWS::BedrockMantle::Project, CustomizedModel and Reservation. {store_note}{narrowed_note}",
+            f"No logging multi-Region trail, or single-Region trail based in this Region, names {', '.join(mantle_missing)} in a resources.type field selector with no narrowing field, so inference and file calls on the bedrock-mantle endpoint that reference those types are not recorded: bedrock-mantle logs CreateInference as a data event, not a management event (observed data-event resource types: {observed}). AWS's example selector names only AWS::BedrockMantle::Project, CustomizedModel and Reservation. {store_note}{narrowed_note}",
             CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(", ".join(mantle_missing)),
             "Medium",
             "Failed",
@@ -5916,10 +5961,11 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                     trail_config = cloudtrail_client.get_trail(Name=trail_arn)
                     # IsLogging is only in get_trail_status
                     trail_status = cloudtrail_client.get_trail_status(Name=trail_arn)
-                    if not (
-                        trail_config["Trail"].get("IsMultiRegionTrail")
-                        and trail_status.get("IsLogging", False)
-                    ):
+                    # A single-Region trail records its home Region's events.
+                    records_region = trail_config["Trail"].get(
+                        "IsMultiRegionTrail"
+                    ) or (region and trail_config["Trail"].get("HomeRegion") == region)
+                    if not (records_region and trail_status.get("IsLogging", False)):
                         continue
                     event_selectors = cloudtrail_client.get_event_selectors(
                         TrailName=trail_arn
@@ -5944,7 +5990,9 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                 for resource_type, fields in narrowed.items():
                     narrowed_types.setdefault(resource_type, []).extend(fields)
 
-            event_data_stores = _event_data_store_coverage(cloudtrail_client)
+            event_data_stores = _assessed_event_data_store_coverage(
+                cloudtrail_client, region
+            )
             logging_trails.extend(event_data_stores["management"])
             store_unread = _event_data_store_unread(event_data_stores)
 
@@ -6003,7 +6051,7 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                     create_finding(
                         check_id="BR-06",
                         finding_name="Bedrock CloudTrail Logging Check",
-                        finding_details=f"No logging multi-region trail records every Bedrock management event, read and write. This limits your ability to audit and monitor Bedrock usage.{gap_note}",
+                        finding_details=f"No logging multi-Region trail, or single-Region trail based in this Region, records every Bedrock management event, read and write. This limits your ability to audit and monitor Bedrock usage.{gap_note}",
                         resolution="Enable CloudTrail logging for Bedrock on a multi-region trail with either:\n"
                         + "1. A basic event selector with IncludeManagementEvents true and ReadWriteType All \n"
                         + "2. An advanced event selector with eventCategory Equals Management and no readOnly field",
