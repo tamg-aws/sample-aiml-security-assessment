@@ -26409,8 +26409,8 @@ def _classification_order(
 
     A reader that started before the job was created read objects the job had
     not classified, so that is Failed. A latest ingestion after the last run
-    read any object written between the two unclassified; object write times
-    are not read, so that is stated and not judged.
+    read any object written between the two unclassified, and object write
+    times are not read, so that is N/A.
     """
     if not first_read:
         return {"status": "Passed", "detail": ""}
@@ -26451,11 +26451,14 @@ def _classification_order(
     latest = first_read.get("latest")
     gap = _days_between(detail.get("lastRunTime"), latest) if latest else None
     if gap is not None and gap > 0:
-        note += (
-            f"; the latest ingestion job started at {latest}, after the last run, "
-            "so an object written between the two was ingested before this job "
-            "classified it, and object write times are not read"
-        )
+        return {
+            "status": "N/A",
+            "detail": (
+                note[2:] + f"; the latest ingestion job started at {latest}, after "
+                "the last run, so an object written between the two was ingested "
+                "before this job classified it, and object write times are not read"
+            ),
+        }
     return {"status": "Passed", "detail": note}
 
 
@@ -26572,9 +26575,10 @@ def check_bedrock_knowledge_base_source_classification(
     region: str = "",
 ) -> Dict[str, Any]:
     """
-    BR-46: Verify every S3 source a knowledge base ingests from, and every
+    BR-46: Verify every S3 source a knowledge base ingests from, every
     training, validation and invocation log source a model customization job
-    reads, is classified object by object by a recurring Macie job.
+    reads, and every batch inference input, is classified object by object by a
+    recurring Macie job.
 
     Automated sensitive data discovery selects representative objects by
     sampling, so a MONITORED status gives estate-wide visibility and is not
@@ -26684,17 +26688,55 @@ def check_bedrock_knowledge_base_source_classification(
                 }
             )
 
+        try:
+            batch_jobs = []
+            paginator = boto3.client(
+                "bedrock", config=boto3_config, region_name=region
+            ).get_paginator("list_model_invocation_jobs")
+            for page in paginator.paginate():
+                batch_jobs.extend(page.get("invocationJobSummaries") or [])
+        except (ClientError, BotoCoreError, TypeError) as error:
+            read_errors.append(
+                "batch inference jobs were not read with "
+                f"bedrock:ListModelInvocationJobs ({get_assessment_error_label(error)})"
+            )
+            batch_jobs = []
+        for job in batch_jobs:
+            uri = (
+                (job.get("inputDataConfig") or {}).get("s3InputDataConfig") or {}
+            ).get("s3Uri")
+            if not _s3_uri_bucket(uri):
+                continue
+            name = job.get("jobName") or job.get("jobArn") or "unnamed"
+            key = str(uri).split("://", 1)[-1].partition("/")[2]
+            sources.append(
+                {
+                    "label": f"the input of batch inference job '{name}'",
+                    "bucket": _s3_uri_bucket(uri),
+                    "owner_account": "",
+                    "prefixes": [key] if key else [],
+                    "first_read": {
+                        "label": f"batch inference job '{name}'",
+                        "first": job.get("submitTime"),
+                        "latest": None,
+                        "error": "",
+                    },
+                }
+            )
+
         if read_errors:
             na(
                 "{} data source read(s) failed across knowledge bases, model "
-                "customization jobs and SageMaker training jobs, so the source list "
+                "customization jobs, batch inference jobs and SageMaker training "
+                "jobs, so the source list "
                 "is incomplete: {}.".format(
                     len(read_errors), "; ".join(read_errors[:5])
                 ),
                 "Grant bedrock:ListKnowledgeBases, bedrock:ListDataSources, "
                 "bedrock:GetDataSource, bedrock:ListModelCustomizationJobs, "
-                "bedrock:GetModelCustomizationJob, sagemaker:ListTrainingJobs and "
-                "sagemaker:DescribeTrainingJob, then retry.",
+                "bedrock:GetModelCustomizationJob, bedrock:ListModelInvocationJobs, "
+                "sagemaker:ListTrainingJobs and sagemaker:DescribeTrainingJob, then "
+                "retry.",
             )
 
         if other_sources:
@@ -26949,16 +26991,28 @@ def check_bedrock_knowledge_base_source_classification(
                         "full-depth Macie job: {}. Each job's createdAt is compared "
                         "with when its source was first read. Object write times are "
                         "not read, so whether each object was classified before the "
-                        "ingestion or training job that read it is not judged, and "
-                        "whether the classification is carried into per-document "
-                        "metadata is not recorded by any API and is not judged.".format(
-                            len(passed), len(sources), "; ".join(passed)
+                        "ingestion or training job that read it is not judged. "
+                        "Whether the classification is carried into per-document "
+                        "metadata is held in the .metadata.json objects beside each "
+                        "source document, which are not read, and is not "
+                        "judged.{}".format(
+                            len(passed),
+                            len(sources),
+                            "; ".join(passed),
+                            " This is not reported as Passed because the source "
+                            "list is incomplete."
+                            if read_errors
+                            else "",
                         )
                     ),
-                    resolution="No action required for classification coverage.",
+                    resolution=(
+                        COULD_NOT_ASSESS_RESOLUTION
+                        if read_errors
+                        else "No action required for classification coverage."
+                    ),
                     reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
                     severity="Medium",
-                    status="Passed",
+                    status="N/A" if read_errors else "Passed",
                     region=region,
                 )
             )

@@ -511,7 +511,7 @@ Resources:
                 - bedrock:ListEvaluationJobs # BR-18, BR-25
                 - bedrock:ListImportedModels # BR-30, BR-53
                 - bedrock:ListProvisionedModelThroughputs # BR-53
-                - bedrock:ListModelInvocationJobs # BR-31, BR-42, BR-47, BR-52
+                - bedrock:ListModelInvocationJobs # BR-31, BR-42, BR-46, BR-47, BR-52
                 - bedrock:ListModelCustomizationJobs # BR-42, BR-46, BR-47, BR-52
                 - bedrock:ListInferenceProfiles # BR-36, BR-43, BR-53
                 - bedrock:GetAccountDataRetention # BR-37

@@ -13739,6 +13739,8 @@ class TestBR46KnowledgeBaseSourceClassification:
         ingestion_pages=None,
         pii_jobs=(),
         pii_jobs_error=None,
+        batch_jobs=(),
+        batch_error=None,
     ):
         agent_client = MagicMock()
         ingestion_jobs = ingestion_jobs or {}
@@ -13806,6 +13808,16 @@ class TestBR46KnowledgeBaseSourceClassification:
         bedrock_client.get_model_customization_job.side_effect = lambda jobIdentifier: (
             customization_jobs[jobIdentifier.split("/")[-1]]
         )
+        batch_paginator = MagicMock()
+        if batch_error:
+            batch_paginator.paginate.side_effect = batch_error
+        else:
+            batch_paginator.paginate.return_value = [
+                {"invocationJobSummaries": list(batch_jobs)}
+            ]
+        bedrock_client.get_paginator.side_effect = lambda operation: {
+            "list_model_invocation_jobs": batch_paginator
+        }[operation]
 
         macie_client = MagicMock()
         if session_error:
@@ -14554,15 +14566,18 @@ class TestBR46ClassificationJobCoverage:
             "job was created at 2026-08-15T00:00:00Z",
         )
 
-    def test_br46_ingestion_after_the_job_was_created_passes_and_says_so(self):
+    def test_br46_ingestion_after_the_last_run_is_na_and_says_so(self):
+        """The latest ingestion started after the job's last run, so an object
+        written between the two may have been ingested unclassified."""
         findings = self._run(
             [self._job("nightly-hr")],
             {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
             ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
         )
-        assert not [f for f in findings if f["Status"] in ("Failed", "N/A")]
-        details = findings[0]["Finding_Details"]
-        assert "2 of 2 AI data source(s)" in details
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        details = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
         assert (
             "the first ingestion job started at 2026-08-20T00:00:00Z, after the job "
             "was created" in details
@@ -14572,6 +14587,78 @@ class TestBR46ClassificationJobCoverage:
             "last run" in details
         )
         assert "object write times are not read" in details
+
+    def test_br46_an_incomplete_source_list_withholds_passed(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            training_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "ListTrainingJobs",
+            ),
+        )
+        assert "Passed" not in [f["Status"] for f in findings]
+        classified = [
+            f
+            for f in findings
+            if f["Finding"] == bedrock_app.CLASSIFICATION_JOB_FINDING
+        ]
+        assert [f["Status"] for f in classified] == ["N/A"]
+        assert (
+            "This is not reported as Passed because the source list is incomplete"
+            in classified[0]["Finding_Details"]
+        )
+
+    @staticmethod
+    def _batch_job(name, uri, submitted="2026-08-20T00:00:00Z"):
+        return {
+            "jobName": name,
+            "jobArn": f"arn:batch/{name}",
+            "submitTime": submitted,
+            "inputDataConfig": {"s3InputDataConfig": {"s3Uri": uri}},
+            "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://out-bucket/"}},
+        }
+
+    def test_br46_batch_inference_input_is_a_source(self):
+        """batch-a reads support-bucket, which is classified; batch-b reads
+        batch-bucket, which no job names."""
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {
+                "job-nightly-hr": self._detail(createdAt=self.CREATED),
+                "job-support": self._detail(createdAt=self.CREATED),
+            },
+            macie_buckets=self._BUCKETS + [{"bucketName": "batch-bucket"}],
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            batch_jobs=[
+                self._batch_job("batch-a", "s3://support-bucket/in/"),
+                self._batch_job("batch-b", "s3://batch-bucket/in/"),
+            ],
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert (
+            "the input of batch inference job 'batch-b' (bucket batch-bucket)"
+            in failed[0]["Finding_Details"]
+        )
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "3 of 4 AI data source(s)" in passed[0]["Finding_Details"]
+        assert (
+            "the input of batch inference job 'batch-a'"
+            in (passed[0]["Finding_Details"])
+        )
+        assert "out-bucket" not in " ".join(f["Finding_Details"] for f in findings)
+
+    def test_br46_unread_batch_inference_jobs_withhold_passed(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            batch_error=_make_client_error("AccessDeniedException"),
+        )
+        assert "Passed" not in [f["Status"] for f in findings]
+        assert "bedrock:ListModelInvocationJobs" in findings[0]["Finding_Details"]
 
     def test_br46_ingestion_without_a_job_creation_time_is_na(self):
         findings = self._run(
@@ -14937,9 +15024,11 @@ class TestBR46ClassificationJobCoverage:
             customization_error=_make_client_error("AccessDeniedException"),
         )
         na = [f for f in findings if f["Status"] == "N/A"]
-        assert len(na) == 1
+        assert len(na) == 2
         assert "model customization jobs" in na[0]["Finding_Details"]
         assert "bedrock:ListModelCustomizationJobs" in na[0]["Resolution"]
+        assert na[1]["Finding"] == bedrock_app.CLASSIFICATION_JOB_FINDING
+        assert "Passed" not in [f["Status"] for f in findings]
 
     def test_br46_job_rows_pass_the_finding_schema(self):
         rows = (
