@@ -34724,13 +34724,16 @@ class TestAC51GatewayAntiDdos:
 
         assert len(findings) == 3
         for finding in findings:
-            # The row says what was not read. It used to say no API identifies
-            # these front doors, which an API Gateway integration URI refutes.
+            # The row says what was not read and why. It used to say no API
+            # identifies these front doors, which an API Gateway integration
+            # URI refutes; the missing piece is the declined WAF sweep grant.
             assert finding["Finding_Details"].endswith(
-                "Front doors other than AgentCore gateways (API Gateway, ALB, "
-                "CloudFront) are not judged: an API Gateway integration or an "
-                "origin can name a Bedrock endpoint or a function that calls one, "
-                "but this check reads neither them nor their web ACL associations."
+                "API Gateway APIs and Application Load Balancers that front an AI "
+                "workload are not read: finding them takes the AWS WAF association "
+                "reads wafv2:ListWebACLs and wafv2:ListResourcesForWebACL, whose "
+                "grant was declined for this assessment. CloudFront distributions "
+                "are judged only where an origin is an AgentCore gateway, in the "
+                "AgentCore Front Door Shield Protection row."
             )
             assert "not identifiable" not in finding["Finding_Details"]
 
@@ -34909,7 +34912,7 @@ class TestAC51AntiDdosSettings:
         assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
         for finding in findings:
             assert (
-                "Shield Advanced enrollment is not judged"
+                "Shield Advanced enrollment of the gateway itself is not judged"
                 in (finding["Finding_Details"])
             )
 
@@ -35118,6 +35121,304 @@ class TestAC51TransportErrors:
         assert "(gw-1)" in findings[0]["Finding_Details"]
         assert "bedrock-agentcore:GetGateway" in findings[0]["Resolution"]
         assert "wafv2:GetWebACL" in findings[2]["Resolution"]
+
+
+def _gateway_host(gateway_id, region="us-east-1"):
+    return f"{gateway_id}.gateway.bedrock-agentcore.{region}.amazonaws.com"
+
+
+def _distribution(dist_id, *origins):
+    return {
+        "Id": dist_id,
+        "ARN": f"arn:aws:cloudfront::123456789012:distribution/{dist_id}",
+        "DomainName": f"{dist_id.lower()}.cloudfront.net",
+        "Origins": {
+            "Quantity": len(origins),
+            "Items": [
+                {"Id": f"o{index}", "DomainName": domain}
+                for index, domain in enumerate(origins)
+            ],
+        },
+    }
+
+
+def _paginator(pages):
+    paginator = MagicMock()
+    if isinstance(pages, Exception):
+        paginator.paginate.side_effect = pages
+    else:
+        paginator.paginate.return_value = pages
+    return paginator
+
+
+def _front_door_stub(
+    mock_ac,
+    mock_cf,
+    mock_sh,
+    gateways,
+    distribution_pages,
+    state="ACTIVE",
+    protection_pages=None,
+):
+    """gateways maps a gateway id to the ClientError GetGateway raises, or None.
+
+    distribution_pages lists the ListDistributions pages as lists of
+    distributions, or is the error the paginator raises. protection_pages
+    lists the ListProtections pages as lists of protected ARNs.
+    """
+    mock_ac.list_gateways.return_value = {
+        "items": [
+            {"gatewayId": gateway_id, "name": f"name-{gateway_id}"}
+            for gateway_id in gateways
+        ]
+    }
+
+    def get_gateway(gatewayIdentifier):
+        answer = gateways[gatewayIdentifier]
+        if isinstance(answer, Exception):
+            raise answer
+        return {
+            "gatewayId": gatewayIdentifier,
+            "gatewayUrl": f"https://{_gateway_host(gatewayIdentifier)}/mcp",
+        }
+
+    mock_ac.get_gateway.side_effect = get_gateway
+    mock_cf.get_paginator.return_value = _paginator(
+        distribution_pages
+        if isinstance(distribution_pages, Exception)
+        else [{"DistributionList": {"Items": page}} for page in distribution_pages]
+    )
+    if isinstance(state, Exception):
+        mock_sh.get_subscription_state.side_effect = state
+    else:
+        mock_sh.get_subscription_state.return_value = {"SubscriptionState": state}
+    pages = protection_pages if protection_pages is not None else [[]]
+    mock_sh.get_paginator.return_value = _paginator(
+        pages
+        if isinstance(pages, Exception)
+        else [
+            {
+                "Protections": [
+                    {"Name": f"protect-{arn.split('/')[-1]}", "ResourceArn": arn}
+                    for arn in page
+                ]
+            }
+            for page in pages
+        ]
+    )
+
+
+def _distribution_arn(dist_id):
+    return f"arn:aws:cloudfront::123456789012:distribution/{dist_id}"
+
+
+@patch("agentcore_app.shield_client")
+@patch("agentcore_app.cloudfront_client")
+@patch("agentcore_app.agentcore_client")
+class TestAC51FrontDoorShield:
+    """AC-51: Shield Advanced on CloudFront distributions that front a gateway."""
+
+    def test_an_unprotected_distribution_fronting_a_gateway_fails(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None, "gw-2": None},
+            [
+                [
+                    _distribution(
+                        "EPROT", "bucket.s3.amazonaws.com", _gateway_host("gw-1")
+                    ),
+                    _distribution("EOPEN", _gateway_host("gw-2").upper()),
+                    _distribution("ES3", "site.s3.us-east-1.amazonaws.com"),
+                    _distribution("EWEST", _gateway_host("gw-1", "us-west-2")),
+                ]
+            ],
+            protection_pages=[
+                [_distribution_arn("EPROT"), _distribution_arn("EOPEN") + "X"]
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert [f["Severity"] for f in findings] == ["Medium", "Medium"]
+        assert {f["Check_ID"] for f in findings} == {"AC-51"}
+        assert {f["Finding"] for f in findings} == {
+            "AgentCore Front Door Shield Protection"
+        }
+        assert "CloudFront distribution EPROT" in findings[0]["Finding_Details"]
+        assert "protection 'protect-EPROT'" in findings[0]["Finding_Details"]
+        assert "(gw-1) through origin" in findings[0]["Finding_Details"]
+        assert "CloudFront distribution EOPEN" in findings[1]["Finding_Details"]
+        assert "(gw-2) through origin" in findings[1]["Finding_Details"]
+        assert "no Shield protection names" in findings[1]["Finding_Details"]
+
+    def test_an_inactive_subscription_is_na_and_reads_no_protection(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None, "gw-2": None},
+            [
+                [
+                    _distribution("EONE", _gateway_host("gw-1")),
+                    _distribution("ETWO", _gateway_host("gw-2")),
+                ]
+            ],
+            state="INACTIVE",
+        )
+
+        findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert [(f["Status"], f["Severity"]) for f in findings] == [
+            ("N/A", "Informational"),
+            ("N/A", "Informational"),
+        ]
+        for finding in findings:
+            assert "subscription state INACTIVE" in finding["Finding_Details"]
+            assert "business-critical" in finding["Finding_Details"]
+        mock_sh.get_paginator.assert_not_called()
+
+    def test_no_distribution_fronting_a_gateway_gives_no_row(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None, "gw-2": None},
+            [[_distribution("ES3", "site.s3.amazonaws.com")]],
+        )
+
+        assert agentcore_app.check_agentcore_front_door_shield() == []
+        mock_sh.get_subscription_state.assert_not_called()
+
+    def test_no_gateway_reads_no_distribution(self, mock_ac, mock_cf, mock_sh):
+        _front_door_stub(mock_ac, mock_cf, mock_sh, {}, [[]])
+
+        assert agentcore_app.check_agentcore_front_door_shield() == []
+        mock_cf.get_paginator.assert_not_called()
+
+    def test_a_failed_distribution_list_is_na(self, mock_ac, mock_cf, mock_sh):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None, "gw-2": None},
+            _make_client_error("AccessDenied", "no"),
+        )
+
+        findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "cloudfront:ListDistributions" in findings[0]["Resolution"]
+
+    def test_an_unread_gateway_is_na_beside_the_judged_one(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": _make_client_error("AccessDeniedException", "no"), "gw-2": None},
+            [[_distribution("ETWO", _gateway_host("gw-2"))]],
+            protection_pages=[[_distribution_arn("ETWO")]],
+        )
+
+        findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "(gw-1)" in findings[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetGateway" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize("failing", ["state", "protections"])
+    def test_a_failed_shield_read_never_passes(
+        self, mock_ac, mock_cf, mock_sh, failing
+    ):
+        error = _make_client_error("AccessDeniedException", "no")
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None, "gw-2": None},
+            [
+                [
+                    _distribution("EONE", _gateway_host("gw-1")),
+                    _distribution("ETWO", _gateway_host("gw-2")),
+                ]
+            ],
+            state=error if failing == "state" else "ACTIVE",
+            protection_pages=error if failing == "protections" else None,
+        )
+
+        findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        action = (
+            "shield:GetSubscriptionState"
+            if failing == "state"
+            else "shield:ListProtections"
+        )
+        assert {f["Resolution"] for f in findings} == {
+            f"Grant {action}, then rerun the assessment."
+        }
+        assert "EONE" in findings[0]["Finding_Details"]
+        assert "ETWO" in findings[1]["Finding_Details"]
+
+    def test_every_page_of_distributions_and_protections_is_read(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None, "gw-2": None},
+            [
+                [_distribution("EONE", _gateway_host("gw-1"))],
+                [_distribution("ETWO", _gateway_host("gw-2"))],
+            ],
+            protection_pages=[[_distribution_arn("EONE")], [_distribution_arn("ETWO")]],
+        )
+
+        findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+        mock_cf.get_paginator.assert_called_once_with("list_distributions")
+        mock_sh.get_paginator.assert_called_once_with("list_protections")
+
+    def test_every_row_names_the_front_doors_it_does_not_read(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": _make_client_error("AccessDeniedException", "no"), "gw-2": None},
+            [[_distribution("ETWO", _gateway_host("gw-2"))]],
+        )
+
+        findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        for finding in findings:
+            assert finding["Finding_Details"].endswith(
+                agentcore_app.AC51_OUT_OF_SCOPE_FRONT_DOORS
+            )
+            assert (
+                "API Gateway APIs and Application Load Balancers"
+                in finding["Finding_Details"]
+            )
+            assert "whose grant was declined" in finding["Finding_Details"]
+            assert "ceiling" not in finding["Finding_Details"].lower()
+
+    def test_the_handler_registers_the_check_once(self, mock_ac, mock_cf, mock_sh):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_front_door_shield") == 1
 
 
 class TestEcrScanningAndAntiDdosCheckRegistration:

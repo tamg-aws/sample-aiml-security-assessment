@@ -56,6 +56,8 @@ s3control_client = None
 agentcore_data_client = None
 network_firewall_client = None
 inspector2_client = None
+cloudfront_client = None
+shield_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -299,6 +301,9 @@ WAF_BODY_INSPECTION_LIMIT_REFERENCE_URL = (
 WAF_ANTI_DDOS_REFERENCE_URL = (
     "https://docs.aws.amazon.com/waf/latest/developerguide/"
     "aws-managed-rule-groups-anti-ddos.html"
+)
+SHIELD_PROTECTED_RESOURCES_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/waf/latest/developerguide/ddos-choose-resources.html"
 )
 ECR_ENHANCED_SCANNING_REFERENCE_URL = (
     "https://docs.aws.amazon.com/AmazonECR/latest/userguide/"
@@ -35118,15 +35123,17 @@ def _web_acl_with_firewall_manager_rules(web_acl: Dict[str, Any]) -> Dict[str, A
 
 
 AC51_OUT_OF_SCOPE_FRONT_DOORS = (
-    "Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are "
-    "not judged: an API Gateway integration or an origin can name a Bedrock "
-    "endpoint or a function that calls one, but this check reads neither them nor "
-    "their web ACL associations."
+    "API Gateway APIs and Application Load Balancers that front an AI workload are "
+    "not read: finding them takes the AWS WAF association reads wafv2:ListWebACLs "
+    "and wafv2:ListResourcesForWebACL, whose grant was declined for this "
+    "assessment. CloudFront distributions are judged only where an origin is an "
+    "AgentCore gateway, in the AgentCore Front Door Shield Protection row."
 )
 AC51_SHIELD_NOT_JUDGED = (
-    "Shield Advanced enrollment is not judged, because shield:CreateProtection "
-    "accepts no AgentCore gateway ARN."
+    "Shield Advanced enrollment of the gateway itself is not judged, because "
+    "shield:CreateProtection accepts no AgentCore gateway ARN."
 )
+AGENTCORE_FRONT_DOOR_SHIELD_FINDING = "AgentCore Front Door Shield Protection"
 
 
 def _anti_ddos_settings_text(config: Optional[Dict[str, Any]]) -> str:
@@ -35417,6 +35424,200 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             )
         )
 
+    return findings
+
+
+def check_agentcore_front_door_shield() -> List[Dict[str, Any]]:
+    """AC-51: Require Shield Advanced on CloudFront distributions fronting a gateway.
+
+    A distribution is an AI entry point when an origin's DomainName is the host
+    of an AgentCore gateway's gatewayUrl in this Region. Distributions fronting
+    no gateway give no row. The control makes Shield Advanced conditional on
+    availability being business-critical, so an account whose subscription is
+    not ACTIVE is informational N/A. With the subscription ACTIVE, a fronting
+    distribution that no Shield protection names fails.
+    """
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-51",
+            finding_name=AGENTCORE_FRONT_DOOR_SHIELD_FINDING,
+            finding_details=f"{details} {AC51_OUT_OF_SCOPE_FRONT_DOORS}",
+            resolution=resolution,
+            reference=SHIELD_PROTECTED_RESOURCES_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    if agentcore_client is None:
+        return []
+    if cloudfront_client is None or shield_client is None:
+        return [
+            finding(
+                "The CloudFront or Shield client is not available, so whether a "
+                "CloudFront distribution fronts an AgentCore gateway was not read.",
+                "Rerun the assessment where both clients can be created.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except (AttributeError, BotoCoreError, ClientError) as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-51",
+                finding_name=AGENTCORE_FRONT_DOOR_SHIELD_FINDING,
+                error=error,
+                reference=SHIELD_PROTECTED_RESOURCES_REFERENCE_URL,
+            )
+        ]
+
+    hosts: Dict[str, List[str]] = {}
+    unread: List[str] = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        label = f"gateway '{gateway.get('name', gateway_id)}' ({gateway_id})"
+        try:
+            gateway_url = agentcore_client.get_gateway(
+                gatewayIdentifier=gateway_id
+            ).get("gatewayUrl")
+        except (BotoCoreError, ClientError) as error:
+            unread.append(f"{label}: {_assessment_error_label(error)}")
+            continue
+        host = urlsplit(str(gateway_url or "")).hostname
+        if not host:
+            unread.append(f"{label}: GetGateway returned no gatewayUrl")
+            continue
+        hosts.setdefault(host.lower(), []).append(label)
+    if not hosts and not unread:
+        return []
+
+    try:
+        distributions = [
+            distribution
+            for page in cloudfront_client.get_paginator("list_distributions").paginate()
+            for distribution in (page.get("DistributionList") or {}).get("Items") or []
+        ]
+    except (BotoCoreError, ClientError) as error:
+        return [
+            finding(
+                "Could not list CloudFront distributions, so whether one fronts an "
+                f"AgentCore gateway was not read: {_assessment_error_label(error)}.",
+                "Grant cloudfront:ListDistributions, then rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+
+    findings: List[Dict[str, Any]] = []
+    if unread and distributions:
+        findings.append(
+            finding(
+                "Could not read the URL of "
+                f"{'; '.join(unread)}, so whether one of the account's "
+                f"{len(distributions)} CloudFront distribution(s) fronts it was not "
+                "read.",
+                "Grant bedrock-agentcore:GetGateway, then rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        )
+
+    fronting = []
+    for distribution in distributions:
+        origins = sorted(
+            {
+                str(origin.get("DomainName") or "").lower()
+                for origin in (distribution.get("Origins") or {}).get("Items") or []
+            }
+            & set(hosts)
+        )
+        if origins:
+            label = (
+                f"CloudFront distribution {distribution.get('Id', 'unknown')} "
+                f"({distribution.get('DomainName', 'unknown')}) fronts "
+                + "; ".join(
+                    f"{gateway} through origin {origin}"
+                    for origin in origins
+                    for gateway in hosts[origin]
+                )
+            )
+            fronting.append((distribution.get("ARN"), label))
+    if not fronting:
+        return findings
+
+    try:
+        state = shield_client.get_subscription_state().get("SubscriptionState")
+    except (BotoCoreError, ClientError) as error:
+        return findings + [
+            finding(
+                f"{label}. The Shield Advanced subscription state could not be "
+                f"read: {_assessment_error_label(error)}.",
+                "Grant shield:GetSubscriptionState, then rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+            for _, label in fronting
+        ]
+    if state != "ACTIVE":
+        return findings + [
+            finding(
+                f"{label}. Shield Advanced is not active in this account "
+                f"(subscription state {state or 'not reported'}). The control asks "
+                "for Shield Advanced where availability is business-critical, so "
+                "the distribution's enrollment was not judged.",
+                "If the gateway's availability is business-critical, subscribe to "
+                "Shield Advanced and add a protection for the distribution.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+            for _, label in fronting
+        ]
+
+    try:
+        protected = {
+            protection.get("ResourceArn"): protection.get("Name") or "unnamed"
+            for page in shield_client.get_paginator("list_protections").paginate()
+            for protection in page.get("Protections") or []
+        }
+    except (BotoCoreError, ClientError) as error:
+        return findings + [
+            finding(
+                f"{label}. Shield Advanced is active, but its protections could not "
+                f"be read: {_assessment_error_label(error)}.",
+                "Grant shield:ListProtections, then rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+            for _, label in fronting
+        ]
+
+    for arn, label in fronting:
+        if arn and arn in protected:
+            findings.append(
+                finding(
+                    f"{label}. Shield Advanced is active, and protection "
+                    f"'{protected[arn]}' names the distribution. The protection's "
+                    "health checks and application layer automatic response are "
+                    "not judged.",
+                    "No action required.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    f"{label}. Shield Advanced is active in this account, but no "
+                    "Shield protection names the distribution, so a DDoS event "
+                    "against this AI entry point gets no Shield Advanced response.",
+                    "Add a Shield Advanced protection for the CloudFront distribution.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
     return findings
 
 
@@ -36892,6 +37093,7 @@ def lambda_handler(event, context):
     global wafv2_client, route53resolver_client, cognito_client, events_client
     global bedrock_client, xray_client, ce_client, s3control_client
     global agentcore_data_client, network_firewall_client, inspector2_client
+    global cloudfront_client, shield_client
     start_time = time.time()
 
     try:
@@ -36967,6 +37169,13 @@ def lambda_handler(event, context):
         inspector2_client = boto3.client(
             "inspector2", config=boto3_config, region_name=region
         )
+        # AC-51 reads the CloudFront distributions that front a gateway and
+        # their Shield Advanced enrollment. Both are global services, which
+        # botocore routes to their global endpoint from any Region.
+        cloudfront_client = boto3.client(
+            "cloudfront", config=boto3_config, region_name=region
+        )
+        shield_client = boto3.client("shield", config=boto3_config, region_name=region)
 
         # Collect all findings
         all_findings = []
@@ -37582,6 +37791,11 @@ def lambda_handler(event, context):
                 ["AC-51"],
                 "Web ACL Anti-DDoS",
                 check_agentcore_web_acl_anti_ddos,
+            ),
+            (
+                ["AC-51"],
+                "Front Door Shield Protection",
+                check_agentcore_front_door_shield,
             ),
             (
                 ["AC-52"],

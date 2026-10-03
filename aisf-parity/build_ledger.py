@@ -1998,17 +1998,26 @@ FOUNDATION_ROWS = [
         "agentcore_assessments",
         ["AC-51", "AG-39"],
         "AC-51 judges the web ACL on each AgentCore gateway for the AWS "
-        "Anti-DDoS managed rule group. Front doors other than AgentCore gateways "
-        "(API Gateway, ALB, CloudFront) are not judged: an API Gateway integration "
-        "or an origin can name a Bedrock endpoint, but neither they nor their web "
-        "ACL associations are read. The gateway's web ACL comes from the "
+        "Anti-DDoS managed rule group. API Gateway APIs and Application Load "
+        "Balancers that front an AI workload are not read, and every AC-51 row "
+        "says so: finding them takes wafv2:ListWebACLs and "
+        "wafv2:ListResourcesForWebACL, whose grant was declined for this "
+        "assessment. The gateway's web ACL comes from the "
         "lookup AG-27 and AG-39 already make, and the ACL passes when its rules "
         "include AWSManagedRulesAntiDDoSRuleSet with an override action other than "
         "Count. A passing finding names the Block and Challenge sensitivities the "
         "group runs with, API defaults filled in, and does not grade them, since "
         "the control asks for a deliberate choice and names no value. Shield "
-        "Advanced enrollment is not judged, because shield:CreateProtection "
-        "accepts no AgentCore gateway ARN. AG-39 is the request-rate leg: it fails "
+        "Advanced enrollment of the gateway itself is not judged, because "
+        "shield:CreateProtection accepts no AgentCore gateway ARN. AC-51's "
+        "AgentCore Front Door Shield Protection row lists CloudFront "
+        "distributions and treats one whose origin DomainName is a gateway's "
+        "gatewayUrl host as an AI entry point: with the Shield Advanced "
+        "subscription state ACTIVE, a distribution no protection names fails "
+        "Medium; with no active subscription the row is Not Applicable, because "
+        "the control asks for Shield Advanced where availability is "
+        "business-critical. A distribution fronting no gateway gives no row. "
+        "AG-39 is the request-rate leg: it fails "
         "a gateway web ACL with no rate-based rule whose action is Block",
         [],
         6,

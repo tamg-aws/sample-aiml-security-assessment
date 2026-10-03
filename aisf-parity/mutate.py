@@ -1695,6 +1695,55 @@ MUTATIONS = [
         "find": '                            "fails. "\n                            if aws_managed\n',
         "replace": '                            "fails. "\n                            if False\n',
     },
+    {
+        "name": "AC-51 shield: origin host compared case-sensitively",
+        "file": AGENTCORE,
+        "defect": "an origin spelled in upper case escaped the gateway match",
+        "find": '                str(origin.get("DomainName") or "").lower()\n',
+        "replace": '                str(origin.get("DomainName") or "")\n',
+    },
+    {
+        "name": "AC-51 shield: any distribution read as a front door",
+        "file": AGENTCORE,
+        "defect": "a distribution fronting no gateway was judged",
+        "find": "            & set(hosts)\n",
+        "replace": "            | set(hosts)\n",
+    },
+    {
+        "name": "AC-51 shield: an inactive subscription is judged",
+        "file": AGENTCORE,
+        "defect": "an account with no Shield Advanced subscription was failed",
+        "find": '    if state != "ACTIVE":\n',
+        "replace": '    if state not in ("ACTIVE", "INACTIVE"):\n',
+    },
+    {
+        "name": "AC-51 shield: any protection credits every distribution",
+        "file": AGENTCORE,
+        "defect": "a protection on another resource credited the distribution",
+        "find": "        if arn and arn in protected:\n",
+        "replace": "        if arn and protected:\n",
+    },
+    {
+        "name": "AC-51 shield: unread gateways dropped",
+        "file": AGENTCORE,
+        "defect": "a gateway whose URL could not be read vanished from the report",
+        "find": "    if unread and distributions:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "AC-51 shield: only the first distribution page read",
+        "file": AGENTCORE,
+        "defect": "distributions past the first page were not read",
+        "find": '            for page in cloudfront_client.get_paginator("list_distributions").paginate()\n',
+        "replace": '            for page in cloudfront_client.get_paginator("list_distributions").paginate()[:1]\n',
+    },
+    {
+        "name": "AC-51 shield: only the first protection page read",
+        "file": AGENTCORE,
+        "defect": "protections past the first page were not read",
+        "find": '            for page in shield_client.get_paginator("list_protections").paginate()\n',
+        "replace": '            for page in shield_client.get_paginator("list_protections").paginate()[:1]\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -2048,6 +2097,13 @@ GROUPS: dict[str, str] = {
     "AG-39 omits the unread front doors": "in the AgentCore verdict legs",
     "AC-45 names a customer policy as the AWS default": "in the AgentCore verdict legs",
     "AC-45 hides the AWS managed policy": "in the AgentCore verdict legs",
+    "AC-51 shield: origin host compared case-sensitively": "in the AgentCore verdict legs",
+    "AC-51 shield: any distribution read as a front door": "in the AgentCore verdict legs",
+    "AC-51 shield: an inactive subscription is judged": "in the AgentCore verdict legs",
+    "AC-51 shield: any protection credits every distribution": "in the AgentCore verdict legs",
+    "AC-51 shield: unread gateways dropped": "in the AgentCore verdict legs",
+    "AC-51 shield: only the first distribution page read": "in the AgentCore verdict legs",
+    "AC-51 shield: only the first protection page read": "in the AgentCore verdict legs",
 }
 
 

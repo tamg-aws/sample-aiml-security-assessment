@@ -1307,6 +1307,17 @@ Resources:
             Action:
               - s3:GetBucketOwnershipControls # AC-06
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+          - Sid: FrontDoorShieldRead
+            # AC-51 lists the CloudFront distributions whose origin is an
+            # AgentCore gateway and reads their Shield Advanced enrollment.
+            # None of the three actions has a resource type in the service
+            # authorization reference, so each takes '*'.
+            Effect: Allow
+            Action:
+              - cloudfront:ListDistributions # AC-51
+              - shield:GetSubscriptionState # AC-51
+              - shield:ListProtections # AC-51
+            Resource: '*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

@@ -303,10 +303,13 @@ _EXPECTED_ACTIONS = {
         "tag:GetResources",
     },
     "AgentCoreAssessmentReadsPolicy": {
+        "cloudfront:ListDistributions",
         "firehose:DescribeDeliveryStream",
         "logs:DescribeSubscriptionFilters",
         "s3:GetBucketObjectLockConfiguration",
         "s3:GetBucketOwnershipControls",
+        "shield:GetSubscriptionState",
+        "shield:ListProtections",
     },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
@@ -1085,6 +1088,10 @@ _AGENTCORE_MANAGED_GRANTS = [
         "s3:GetBucketOwnershipControls",
         json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
     ),
+    # No resource type in the service authorization reference (2026-10-03).
+    ("Allow", "cloudfront:ListDistributions", json.dumps("*")),
+    ("Allow", "shield:GetSubscriptionState", json.dumps("*")),
+    ("Allow", "shield:ListProtections", json.dumps("*")),
 ]
 
 
