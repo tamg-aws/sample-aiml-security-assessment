@@ -315,13 +315,46 @@ _EXPECTED_ACTIONS = {
     },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
+        "eks:ListFargateProfiles",
         "ec2:GetManagedPrefixListEntries",
+        "iot:DescribeAuditTask",
+        "iot:ListAuditTasks",
         "iot:ListThingPrincipals",
         "iot:ListThingsInThingGroup",
         "organizations:ListAWSServiceAccessForOrganization",
         "sagemaker:DescribeModelBiasJobDefinition",
         "sagemaker:DescribeModelExplainabilityJobDefinition",
         "sagemaker:DescribeModelQualityJobDefinition",
+        "sagemaker:ListMonitoringExecutions",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeDhcpOptions",
+        "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:GetAgentRuntime",
+        "guardduty:GetAdministratorAccount",
+        "inspector2:GetDelegatedAdminAccount",
+        "securityhub:GetAdministratorAccount",
+        "bedrock:ListAgents",
+        "bedrock:ListAgentVersions",
+        "bedrock:ListAgentActionGroups",
+        "bedrock:GetAgentActionGroup",
+        "bedrock-agentcore:ListGateways",
+        "bedrock-agentcore:ListGatewayTargets",
+        "ecr:DescribeRepositories",
+        "s3:ListBucket",
+        "route53resolver:ListFirewallRuleGroupAssociations",
+        "route53resolver:ListFirewallDomainLists",
+        "route53resolver:ListFirewallRules",
+        "route53resolver:ListFirewallDomains",
+        "route53resolver:GetFirewallConfig",
+        "ec2:DescribeNatGateways",
+        "network-firewall:ListFirewalls",
+        "network-firewall:DescribeFirewall",
+        "network-firewall:DescribeFirewallPolicy",
+        "network-firewall:DescribeRuleGroup",
+        "organizations:DescribePolicy",
+        "bedrock-agentcore:GetGatewayTarget",
+        "lambda:GetFunctionConfiguration",
+        "apigateway:GET",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -345,7 +378,6 @@ _EXPECTED_ACTIONS = {
         "iot:ListPolicies",
         "iot:ListTargetsForPolicy",
         "organizations:DescribeOrganization",
-        "organizations:DescribePolicy",
         "organizations:ListDelegatedAdministrators",
         "organizations:ListParents",
         "organizations:ListPolicies",
@@ -432,7 +464,6 @@ _EXPECTED_ACTIONS = {
         "ram:ListResources",
         "securityhub:GetConfigurationPolicyAssociation",
         "cloudwatch:DescribeAlarmHistory",
-        "ecr:DescribeRepositories",
         "ecr:DescribeImageSigningStatus",
         "ecr:GetSigningConfiguration",
         "elasticfilesystem:DescribeFileSystems",
@@ -988,6 +1019,11 @@ _SAGEMAKER_MONITORING_JOB_DEFINITIONS = json.dumps(
 _SAGEMAKER_MANAGED_GRANTS = [
     ("Allow", "organizations:ListAWSServiceAccessForOrganization", '"*"'),
     ("Allow", "ec2:DescribeManagedPrefixLists", '"*"'),
+    ("Allow", "iot:ListAuditTasks", '"*"'),
+    ("Allow", "iot:DescribeAuditTask", '"*"'),
+    ("Allow", "sagemaker:ListMonitoringExecutions", '"*"'),
+    ("Allow", "ec2:DescribeVpcs", '"*"'),
+    ("Allow", "ec2:DescribeDhcpOptions", '"*"'),
     (
         "Allow",
         "ec2:GetManagedPrefixListEntries",
@@ -1014,6 +1050,195 @@ _SAGEMAKER_MANAGED_GRANTS = [
             "sagemaker:DescribeModelBiasJobDefinition",
             "sagemaker:DescribeModelExplainabilityJobDefinition",
         )
+    ),
+    (
+        "Allow",
+        "eks:ListFargateProfiles",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*"}
+        ),
+    ),
+    ("Allow", "bedrock-agentcore:ListAgentRuntimes", '"*"'),
+    ("Allow", "guardduty:GetAdministratorAccount", '"*"'),
+    ("Allow", "inspector2:GetDelegatedAdminAccount", '"*"'),
+    ("Allow", "bedrock:ListAgents", '"*"'),
+    ("Allow", "bedrock-agentcore:ListGateways", '"*"'),
+    (
+        "Allow",
+        "bedrock:ListAgentVersions",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock:ListAgentActionGroups",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock:GetAgentActionGroup",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock-agentcore:ListGatewayTargets",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:gateway/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock-agentcore:GetGatewayTarget",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:gateway/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "apigateway:GET",
+        json.dumps(
+            [
+                {"Fn::Sub": f"arn:${{AWS::Partition}}:apigateway:*::{path}"}
+                for path in (
+                    "/restapis",
+                    "/restapis/*/resources",
+                    "/restapis/*/resources/*/methods/*",
+                    "/apis",
+                    "/apis/*/routes",
+                    "/apis/*/integrations",
+                )
+            ],
+            sort_keys=True,
+        ),
+    ),
+    (
+        "Allow",
+        "lambda:GetFunctionConfiguration",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*"}
+        ),
+    ),
+    (
+        "Allow",
+        "securityhub:GetAdministratorAccount",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:securityhub:*:"
+                "${AWS::AccountId}:hub/default"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "s3:ListBucket",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
+    ),
+    (
+        "Allow",
+        "ecr:DescribeRepositories",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:ecr:*:*:repository/*"}),
+    ),
+    # SM-39: the DNS Firewall and Network Firewall reads AC-49 holds for the
+    # AgentCore role, over the ECS and Lambda workload VPCs.
+    ("Allow", "route53resolver:ListFirewallRuleGroupAssociations", '"*"'),
+    ("Allow", "route53resolver:ListFirewallDomainLists", '"*"'),
+    ("Allow", "ec2:DescribeNatGateways", '"*"'),
+    ("Allow", "network-firewall:ListFirewalls", '"*"'),
+    (
+        "Allow",
+        "route53resolver:ListFirewallRules",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:route53resolver:*:*:"
+                "firewall-rule-group/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "route53resolver:ListFirewallDomains",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:route53resolver:*:*:"
+                "firewall-domain-list/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "route53resolver:GetFirewallConfig",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:route53resolver:*:"
+                "${AWS::AccountId}:firewall-config/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "network-firewall:DescribeFirewall",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:"
+                "${AWS::AccountId}:firewall/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "network-firewall:DescribeFirewallPolicy",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:*:firewall-policy/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "network-firewall:DescribeRuleGroup",
+        json.dumps(
+            [
+                {
+                    "Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:*:"
+                    "stateful-rulegroup/*"
+                },
+                {
+                    "Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:*:"
+                    "stateless-rulegroup/*"
+                },
+            ],
+            sort_keys=True,
+        ),
+    ),
+    (
+        "Allow",
+        "organizations:DescribePolicy",
+        json.dumps(
+            [
+                {"Fn::Sub": "arn:${AWS::Partition}:organizations::*:policy/*/*/*"},
+                {"Fn::Sub": "arn:${AWS::Partition}:organizations::aws:policy/*/*"},
+            ],
+            sort_keys=True,
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock-agentcore:GetAgentRuntime",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:runtime/*"
+            }
+        ),
     ),
 ]
 

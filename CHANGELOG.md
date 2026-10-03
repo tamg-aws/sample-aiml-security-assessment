@@ -298,6 +298,173 @@ section.
 
 ### Fixed
 
+- SageMaker checks that passed on a partial read now fail or hold back
+  `Passed`:
+  - `SM-10` fails a VPC notebook whose `DirectInternetAccess` is not
+    `Disabled`, an absent value included, because the notebook keeps a
+    SageMaker-managed internet path beside its VPC.
+  - `SM-11` judges the endpoint config of an inference-component endpoint.
+    A config without both `Subnets` and `SecurityGroupIds` fails, and its
+    subnets are resolved through their route tables under a new
+    `SageMaker Endpoint Config Subnet Internet Exposure` row.
+  - `SM-18` fails a transform job with no
+    `TransformResources.VolumeKmsKeyId`. An S3 endpoint policy statement
+    on every bucket fails whatever its principal, and one open to any
+    principal fails on a bucket pattern with a wildcard.
+  - `SM-23` credits an alarm only when its namespace matches the
+    schedule's monitoring type, its dimensions are exactly the endpoint and
+    schedule pair, and, for data quality, it reads a
+    `feature_baseline_drift_` metric with a rising threshold below 1. An
+    alarm on another schedule of the same endpoint no longer credits it,
+    and neither does an alarm on one of the two dimensions.
+  - `SM-41` bounds a policy variable only when nothing before it in the
+    resource path is a wildcard. Every Allow statement of a role alias's
+    role must be bounded by a `credentials-iot` variable, so one fleet-wide
+    statement beside a scoped one fails. The audit leg reads the scheduled
+    audit runs of the last 31 days and judges findings of the newest
+    completed run, so a schedule that never completed the
+    `DEVICE_CERTIFICATE_SHARED_CHECK` check fails.
+  - `SM-33` credits a VPC endpoint only when a gateway endpoint is on the
+    job subnet's route table or an interface endpoint has a subnet in the
+    job subnet's Availability Zone. An unread endpoint subnet or route
+    table holds back `Passed`.
+  - `SM-34` and the `SM-09` guardrail rows fail a requirement enforced by
+    identity policies alone, because the account root user is bound by no
+    identity policy. Only an attached SCP clears the root user.
+  - `SM-09` treats a partial-wildcard SageMaker action on every resource
+    as broad, and fails a trail that reports a CloudWatch Logs delivery
+    error or has never delivered.
+  - `SM-03` reads every endpoint config. An instance-backed config with no
+    `KmsKeyId`, a config that captures data with no
+    `DataCaptureConfig.KmsKeyId`, and an asynchronous config with no
+    `AsyncInferenceConfig.OutputConfig.KmsKeyId` fail, an AWS managed key
+    on any of them fails, and an unread endpoint holds back `Passed`.
+- `SM-23` judges a schedule whose latest execution is `Pending` or
+  `InProgress` by the newest finished execution, read with
+  `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
+  with no finished execution, or whose newest finished one failed or is
+  older than twice its cadence, fails.
+- `SM-38` fails an EKS cluster that GuardDuty reports `HEALTHY` with 0
+  compatible nodes, and a cluster with a Fargate profile, whose pods
+  Runtime Monitoring does not cover. A cluster whose node counts are not
+  returned, or whose Fargate profiles were not read, holds back `Passed`.
+- `SM-40` matches an ECS secret injected by partial ARN, which omits the
+  six-character suffix, to its secret, so a rotating secret injected that
+  way is judged. A secret ARN that is not among the account's secrets in
+  the Region, such as another account's, holds back `Passed` and is named.
+- `SM-39` workload segmentation reads the security groups on every network
+  interface of each pending, running, stopping or stopped EC2 instance,
+  beside ECS services and Lambda functions. The instances of one Auto Scaling group count as one
+  workload. An open rule or a group shared with another workload fails, and
+  an unread `ec2:DescribeInstances` holds back `Passed`. EC2 instances were
+  not read before.
+- `SM-40` reads the `Environment` of every container of every SageMaker
+  model and fails a credential-named plaintext variable, as it already did
+  for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
+  or `sagemaker:DescribeModel` holds back the propagation `Passed`.
+- `SM-43` reads each model artifact named as one S3 object (a
+  `ModelDataUrl` that is not a multi-model prefix, an `S3Object` source, or
+  a `ManifestS3Uri`) with `HeadObject`. It fails an object whose ETag
+  differs from the recorded `ETag`, `ManifestEtag` or `ModelDataETag`, an
+  object that returns 404, and an object whose own server-side encryption
+  is not SSE-KMS under a customer managed key, even when the bucket default
+  is. An unread object holds back `Passed`. Earlier the check only tested
+  that an expected value was recorded.
+- `SM-38` counts the running EC2 instances tagged with each EKS cluster's
+  name (`eks:cluster-name`, `eks:eks-cluster-name` or
+  `kubernetes.io/cluster/<name>`) and fails a cluster with more of them than
+  the `CompatibleNodes` GuardDuty reports, so a node outside agent coverage
+  no longer hides behind a HEALTHY cluster. An instance tagged for a cluster
+  that is not listed is judged as a plain EC2 instance. A cluster whose
+  `DescribeCluster` `remoteNetworkConfig` names remote node networks fails,
+  because Runtime Monitoring does not support EKS Hybrid Nodes, and an
+  unread cluster description holds back `Passed`.
+- `SM-39` judges egress for each VPC an ECS `awsvpc` service or a
+  VPC-attached Lambda function runs in, with the semantics `AC-49` applies
+  to AgentCore. `Agent Workload DNS Egress Control` fails a VPC with no DNS
+  Firewall association, one whose first rule in force over every name (a
+  customer domain list holding `*`, for every query type) is an `ALLOW` or
+  `ALERT` or never comes, and one whose `FirewallFailOpen` is `ENABLED`.
+  `Agent Workload Network Firewall Egress` follows each hosting subnet's
+  internet routes, through a NAT gateway to its subnet's onward route, and
+  fails a route to an internet gateway that passes no Network Firewall, and a
+  firewall policy with no `ALLOWLIST` domain group over `TLS_SNI` and
+  `HTTP_HOST`, a stateless `aws:pass` default or rule on port 80 or 443, a
+  stateful pass rule on those ports that is not scoped by a host name, or a
+  `HOME_NET` that leaves out a hosting subnet. A new Global row, `Lambda VPC
+  Creation Guardrail`, passes only on an attached SCP that denies
+  `lambda:CreateFunction` and `lambda:UpdateFunctionConfiguration` outside
+  approved `lambda:VpcIds`, `lambda:SubnetIds` or `lambda:SecurityGroupIds`
+  values, `IfExists` variants included. A failed read holds back `Passed` in
+  all three. Earlier the AIR-SLF-RT-02 ledger row put these hosts outside its
+  population.
+- `SM-43` lists each object under an `S3Prefix` source or a multi-model
+  `ModelDataUrl` prefix with `ListObjectsV2` and reads each one with
+  `HeadObject`, failing an object that is not SSE-KMS under a customer
+  managed key and a prefix that lists no objects. A run reads at most 1,000
+  prefix objects; a prefix with objects past that cap reports N/A by name,
+  never `Passed`. Earlier the objects under a prefix were not read.
+- `SM-43` joins each model's `ExecutionRoleArn` (or the endpoint config's
+  role for an inference component container) to the IAM permissions cache
+  and fails an Allow that grants `s3:GetObject` on objects in a bucket other
+  than the model's artifact buckets, unless the permissions boundary stops
+  it. A conditioned grant, an unread boundary, a role missing from the cache
+  and a run without the cache report N/A. `AmazonSageMakerFullAccess` fails
+  this test, because it grants `s3:GetObject` on `arn:aws:s3:::*sagemaker*`.
+- `SM-43` reads tag mutability from the image's ECR repository in any
+  account, so a tag-pinned image from an AWS Deep Learning Containers
+  registry is judged. Earlier it read N/A.
+- `SM-02` adds an `AI API Method Authorization` row. It reads every REST
+  API method and HTTP API route whose integration reaches a Bedrock,
+  AgentCore or SageMaker runtime, or a Lambda function an agent or gateway
+  names. It fails such a method with no authorization, and read and write
+  methods (an `ANY` or `$default` route counts as both) that share one token
+  authorizer and its scopes. IAM and Lambda authorizers are reported as not
+  judged.
+- `SM-11` adds an `AI Lambda Function Network Boundary` row. It reads the
+  Lambda function every Bedrock agent action group (every agent version) and
+  every AgentCore gateway Lambda target names, fails one outside a VPC, and
+  fails one whose subnet routes to an internet gateway. These functions were
+  outside every network check before, although the agent and target name
+  them.
+- `SM-35` adds a `Security Service Regional Delegated Administrator` row in
+  every scanned Region. GuardDuty, Security Hub and Amazon Inspector name
+  their administrator per Region, so the organization-wide delegated
+  administrator list missed a Region with none. The row fails a Region where
+  a service has no administrator with an Enabled relationship, where it is
+  the management account, or where the three services name different
+  accounts.
+- `SM-37` network anomaly alerting judges every AgentCore runtime beside the
+  SageMaker endpoints: a runtime in `PUBLIC` network mode fails, and one in
+  `VPC` mode must have its subnets covered by a flow log whose metric
+  filter feeds an actioned alarm. AgentCore runtimes were not read before.
+  An unread runtime list or runtime holds back `Passed`.
+- `SM-37` adds a `VPC DNS Resolver Visible to GuardDuty` row. It reads every
+  VPC's DHCP option set and fails a VPC whose `domain-name-servers` names a
+  server other than the Amazon DNS server (`AmazonProvidedDNS`,
+  `169.254.169.253`, `fd00:ec2::253` or the VPC base plus two), because
+  GuardDuty analyzes only DNS queries that reach the AWS-provided resolver.
+  An option set that names no server is not judged, and an unread VPC or
+  option set holds back `Passed`.
+- SageMaker rows that claimed more than they read now state what they read:
+  - `SM-22` no longer says approval workflows "appear to be properly
+    configured". It names the counts it read and says they do not show
+    that approval is required.
+  - `SM-32` no longer says training jobs are covered by periodic Config
+    rules. AWS Config has no resource type for a SageMaker training,
+    processing or transform job.
+  - `SM-04` no longer says no API records whether findings are reviewed.
+    Security Hub records review in `Workflow.Status`, which `SM-04` does
+    not read, and the row says so.
+  - `SM-14` judges only the models an endpoint or inference component
+    serves, and every container of a multi-container model, which it
+    failed as `Platform` before. Its `Failed` row no longer says
+    `Platform` images come from public or external registries: `Platform`
+    means the image is hosted in Amazon ECR.
+- The AISF ledger maps `SM-34` to `AIR-SGM-TRN-02`, because its
+  `sagemaker:VolumeKmsKeyArn` creation guardrail is the preventive leg of
+  that control.
+
 - `BR-47` and `BR-52` read custom AgentCore browsers. The Bedrock function
   calls `bedrock-agentcore:GetBrowser` to find each browser's recording
   bucket, but only the AgentCore function held that grant, so every browser
@@ -1494,6 +1661,96 @@ section.
     now be `Failed` or `N/A`.
 
 ### Deployment impact
+
+**SageMaker IoT audit and monitoring execution reads.**
+`SageMakerAssessmentReadsPolicy` gains `iot:ListAuditTasks` and
+`iot:DescribeAuditTask` (`SM-41`) and `sagemaker:ListMonitoringExecutions`
+(`SM-23`), all on `'*'`. None of the three has a resource type in the
+service authorization reference, and all are read-only. Until the stack is
+updated, the `SM-41` audit row reads as incomplete, and so does an `SM-23`
+schedule whose latest execution is still running.
+
+**SageMaker VPC and DHCP option reads.** `SageMakerAssessmentReadsPolicy`
+gains `ec2:DescribeVpcs` and `ec2:DescribeDhcpOptions` on `'*'` (`SM-37`);
+neither action has a resource type in the service authorization reference.
+Until the stack is updated, the new `SM-37` row reads as incomplete.
+
+**SageMaker regional administrator reads.** `SageMakerAssessmentReadsPolicy`
+gains `guardduty:GetAdministratorAccount` and
+`inspector2:GetDelegatedAdminAccount` on `'*'` (no resource type) and
+`securityhub:GetAdministratorAccount` on
+`arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default`
+(`SM-35`). Until the stack is updated, the new `SM-35` row reads as
+incomplete.
+
+**SageMaker AI Lambda executor reads.** `SageMakerAssessmentReadsPolicy`
+gains `bedrock:ListAgents` and `bedrock-agentcore:ListGateways` on `'*'`
+(no resource type); `bedrock:ListAgentVersions`,
+`bedrock:ListAgentActionGroups` and `bedrock:GetAgentActionGroup` on
+`arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*`;
+`bedrock-agentcore:ListGatewayTargets` and
+`bedrock-agentcore:GetGatewayTarget` on
+`arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:gateway/*`;
+and `lambda:GetFunctionConfiguration` on
+`arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*` (`SM-11`).
+A function in another account is reported as not read. Until the stack is
+updated, the new `SM-11` row reads as incomplete.
+
+**SageMaker model artifact object reads.** The SageMaker function gains an
+inline `ModelArtifactObjectRead` statement with `s3:GetObject` on
+`arn:${AWS::Partition}:s3:::*/*` (`SM-43`). The check calls only
+`HeadObject`, which `s3:GetObject` authorizes; the grant also permits
+reading object contents in any bucket whose policy admits the role. To keep
+the inline policy under its 9,000-character budget,
+`OrganizationsPolicyDocumentRead` (`organizations:DescribePolicy`, `SM-34`)
+moves unchanged into `SageMakerAssessmentReadsPolicy`. Until the stack is
+updated, `SM-43` endpoints with single-object model data read as
+incomplete.
+
+**SageMaker model artifact prefix and cross-account repository reads.**
+`SageMakerAssessmentReadsPolicy` gains `ModelArtifactPrefixList` with
+`s3:ListBucket` on `arn:${AWS::Partition}:s3:::*` and
+`ModelImageRepositoryAnyAccountRead` with `ecr:DescribeRepositories` on
+`arn:${AWS::Partition}:ecr:*:*:repository/*` (both `SM-43`).
+`ecr:DescribeRepositories` leaves the inline `ModelImageRepositoryRead`
+statement, which keeps `ecr:DescribeImageSigningStatus` on this account's
+repositories. Until the stack is updated, `SM-43` endpoints with prefix
+model data or a tag-pinned image in another account's registry report N/A.
+
+**SageMaker workload egress reads.** `SageMakerAssessmentReadsPolicy`
+gains, for `SM-39`: `route53resolver:ListFirewallRuleGroupAssociations`,
+`route53resolver:ListFirewallDomainLists` and `ec2:DescribeNatGateways` on
+`'*'` (no resource type); `network-firewall:ListFirewalls` on `'*'`, as the
+AgentCore role holds it; `route53resolver:ListFirewallRules` on
+`firewall-rule-group/*` and `route53resolver:ListFirewallDomains` on
+`firewall-domain-list/*`, both in any account;
+`route53resolver:GetFirewallConfig` on this account's `firewall-config/*`;
+`network-firewall:DescribeFirewall` on this account's `firewall/*`; and
+`network-firewall:DescribeFirewallPolicy` and
+`network-firewall:DescribeRuleGroup` on `firewall-policy/*`,
+`stateful-rulegroup/*` and `stateless-rulegroup/*` in any account. Until
+the stack is updated, the `SM-39` egress rows report N/A.
+
+**SageMaker API Gateway method reads.** `SageMakerAssessmentReadsPolicy`
+gains `apigateway:GET` on
+`arn:${AWS::Partition}:apigateway:*::/restapis`, `/restapis/*/resources`,
+`/restapis/*/resources/*/methods/*`, `/apis`, `/apis/*/routes` and
+`/apis/*/integrations` (`SM-02`). Until the stack is updated, the new
+`SM-02` row reads as incomplete.
+
+**SageMaker AgentCore runtime reads.** `SageMakerAssessmentReadsPolicy`
+gains `bedrock-agentcore:ListAgentRuntimes` on `'*'` (no resource type)
+and `bedrock-agentcore:GetAgentRuntime` on
+`arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*`
+(`SM-37`). Until the stack is updated, `SM-37` network anomaly alerting
+reads as incomplete.
+
+**SageMaker EKS Fargate profile read.** `SageMakerAssessmentReadsPolicy`
+gains `eks:ListFargateProfiles` on
+`arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*` (`SM-38`), its
+resource type in the service authorization reference. It is read-only.
+Until the stack is updated, an account with an EKS cluster reads the
+`SM-38` coverage row as incomplete.
 
 **Bedrock and SageMaker read grants.** `BedrockAssessmentReadsPolicy`
 gains `bedrock-agentcore:GetBrowser` on `browser-custom/*` (`BR-47`,

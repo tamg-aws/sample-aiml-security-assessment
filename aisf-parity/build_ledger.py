@@ -309,7 +309,19 @@ AI_SUBJECT_ROWS = [
     ("AIR-SGM-EP-01", COVERED, None, "sagemaker_assessments", ["SM-11"], "", [], 3),
     ("AIR-SGM-EP-02", COVERED, None, "sagemaker_assessments", ["SM-02"], "", [], 3),
     ("AIR-SGM-GOV-01", COVERED, None, "sagemaker_assessments", ["SM-22"], "", [], 3),
-    ("AIR-SGM-TRN-02", COVERED, None, "sagemaker_assessments", ["SM-03"], "", [], 3),
+    (
+        "AIR-SGM-TRN-02",
+        COVERED,
+        None,
+        "sagemaker_assessments",
+        ["SM-03", "SM-34"],
+        "SM-34 is the preventive leg: it requires sagemaker:CreateTrainingJob to "
+        "be bound on sagemaker:VolumeKmsKeyArn by a Deny in an attached service "
+        "control policy, and fails a binding held only in identity policies "
+        "because the account root user is bound by none",
+        [],
+        3,
+    ),
     (
         "AIR-SGM-EP-06",
         COVERED,
@@ -332,8 +344,9 @@ AI_SUBJECT_ROWS = [
         "SM-34 is the approved-exception leg: its approved network and no direct "
         "internet access verdicts require sagemaker:CreateTrainingJob to be bound "
         "on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on "
-        "sagemaker:NetworkIsolation, by a Deny in an attached service control "
-        "policy or by a condition in every identity policy that grants the action",
+        "sagemaker:NetworkIsolation by a Deny in an attached service control "
+        "policy. A condition held only in identity policies fails, because the "
+        "account root user is bound by none",
         [],
         3,
     ),
@@ -346,8 +359,8 @@ AI_SUBJECT_ROWS = [
         ["SM-11", "SM-14"],
         "SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint "
         "serves and reads the endpoint config KmsKeyId of each instance-backed "
-        "endpoint, and SM-14 requires RepositoryAccessMode Vpc on each model's image "
-        "config. The one field not read is inter-container traffic encryption, "
+        "endpoint, and SM-14 requires RepositoryAccessMode Vpc on every container "
+        "of each model an endpoint or inference component serves. The one field not read is inter-container traffic encryption, "
         "because no endpoint API returns it: EnableInterContainerTrafficEncryption "
         "is a member of DescribeTrainingJob, DescribeProcessingJob and "
         "DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, "
@@ -1392,9 +1405,13 @@ AI_SUBJECT_ROWS = [
         "job's NetworkConfig and every training job with no item cap; BR-39 resolves "
         "every subnet, and also fails every Bedrock model customization job and batch "
         "inference job whose vpcConfig is absent or names a subnet routed to an igw- "
-        "gateway. Ceiling: Lambda GetFunctionConfiguration and ECS DescribeServices "
-        "return no field that marks a function or service as AI inference, so general "
-        "Lambda and ECS compute is not in the population",
+        "gateway. SM-11 also reads every Lambda function a Bedrock agent action "
+        "group (actionGroupExecutor.lambda, every agent version) or an AgentCore "
+        "gateway target (mcp.lambda.lambdaArn) names, fails one outside a VPC and "
+        "resolves the subnets of one inside. Ceiling: Lambda GetFunctionConfiguration "
+        "and ECS DescribeServices return no field that marks a function or service as "
+        "AI inference, so a Lambda function no agent or gateway names, and ECS "
+        "compute, are not in the population",
         [],
         5,
     ),
@@ -1577,12 +1594,22 @@ FOUNDATION_ROWS = [
         "AIR-SLF-RT-02",
         COVERED,
         None,
-        "agentcore_assessments",
-        ["AC-01"],
+        ["agentcore_assessments", "sagemaker_assessments"],
+        ["AC-01", "SM-39"],
         "The population is the account's AgentCore runtimes, code interpreters and "
-        "browsers, where AgentCore runs the customer's own agent container and tools. "
-        "Agents hosted on ECS, EKS, Lambda or EC2 are outside it, because no API field "
-        "marks a task, function or instance as agent code. AC-01 unions the outbound "
+        "browsers, where AgentCore runs the customer's own agent container and tools, "
+        "plus every ECS service and Lambda function, since no API field marks a task "
+        "or function as agent code. SM-39 fails an ECS service or Lambda function "
+        "whose security groups together allow egress to any destination. For each "
+        "VPC an ECS awsvpc service or a VPC-attached Lambda function runs in, it "
+        "fails a DNS Firewall whose first rule in force over every name is not a "
+        "BLOCK, or that fails open, and fails an internet route that reaches an "
+        "internet gateway, on its own or through a NAT gateway, without passing a "
+        "Network Firewall whose policy holds an ALLOWLIST domain rule group over "
+        "TLS_SNI and HTTP_HOST. Its Global leg requires an attached SCP that denies "
+        "lambda:CreateFunction and lambda:UpdateFunctionConfiguration outside "
+        "approved lambda:VpcIds, lambda:SubnetIds or lambda:SecurityGroupIds. "
+        "Agents hosted on EKS or EC2 get no DNS or Network Firewall leg. AC-01 unions the outbound "
         "ranges of every security group on each resource and fails one whose groups "
         "together allow 0.0.0.0/0 or ::/0, fails a tool in PUBLIC or SANDBOX network "
         "mode, fails a runtime, custom code interpreter or custom browser subnet whose "
@@ -1695,9 +1722,15 @@ FOUNDATION_ROWS = [
         "the Resource entries drop only the resource types they cannot name. A "
         "Passed is held as N/A while principal_errors names an unread "
         "principal. Service control policies are not evaluated per principal "
-        "and can only make a row a false Failed. API Gateway method authorizers "
-        "and Verified Permissions policy stores are not read: no field ties one "
-        "to an AI workload",
+        "and can only make a row a false Failed. At the request layer, SM-02 "
+        "reads every REST API method and HTTP API route whose integration URI "
+        "names a Bedrock, AgentCore or SageMaker runtime, or a Lambda function an "
+        "agent action group or AgentCore gateway target names. It fails such a "
+        "method with no authorization, and read and write methods of one API that "
+        "share a token authorizer and its scopes; an IAM or Lambda authorizer is "
+        "not judged, because the split sits in execute-api:Invoke grants or "
+        "authorizer code. Verified Permissions policy stores are not read: no "
+        "field ties a policy store to an AI workload",
         [],
         6,
     ),
@@ -1751,7 +1784,12 @@ FOUNDATION_ROWS = [
         "which does not say whether network behavior is analysed. SM-37 reads the "
         "detector's Features and passes when LAMBDA_NETWORK_LOGS is ENABLED, and "
         "fails otherwise. A Region with no detector is Not Applicable to SM-37, "
-        "since SM-04 already fails it",
+        "since SM-04 already fails it. SM-37 also fails a SageMaker endpoint or "
+        "AgentCore runtime that runs outside a customer VPC, or whose subnets no "
+        "ACTIVE flow log into CloudWatch Logs covers, or whose flow log "
+        "group has no metric filter feeding an actioned alarm that can fire, and "
+        "fails a VPC whose DHCP option set names a domain name server other than "
+        "the Amazon DNS server, whose queries GuardDuty does not analyze",
         [],
         6,
     ),
@@ -1814,7 +1852,28 @@ FOUNDATION_ROWS = [
         "reads the detector's Features and passes when RUNTIME_MONITORING is "
         "ENABLED, reporting the ECS_FARGATE_AGENT_MANAGEMENT, "
         "EC2_AGENT_MANAGEMENT and EKS_ADDON_MANAGEMENT states without failing on "
-        "them. EKS_RUNTIME_MONITORING alone fails, because it covers EKS only",
+        "them. EKS_RUNTIME_MONITORING alone fails, because it covers EKS only. "
+        "SM-38's coverage row pages ListCoverage and fails a covered resource that "
+        "is not HEALTHY, an EKS cluster reporting 0 compatible nodes or fewer "
+        "covered than compatible nodes, and every EKS cluster, ECS cluster and "
+        "running non-Windows EC2 instance missing from coverage. It counts the running "
+        "EC2 instances tagged with each cluster's name (eks:cluster-name, "
+        "eks:eks-cluster-name or kubernetes.io/cluster/<name>) and fails a "
+        "cluster with more of them than CompatibleNodes. Every running instance "
+        "is judged once, by its cluster's count or as a plain EC2 instance when "
+        "it carries no cluster tag or names a cluster that is not listed, so a "
+        "node from any node group, self-managed group or Karpenter is in the "
+        "population without eks:ListNodegroups. It fails a cluster with a "
+        "Fargate profile, or whose DescribeCluster remoteNetworkConfig names "
+        "remote node networks for EKS Hybrid Nodes, which Runtime Monitoring "
+        "does not support. The Lambda tier row reads LAMBDA_NETWORK_LOGS and "
+        "Inspector Lambda standard and code scanning per function. The "
+        "recommendation's routing step (findings to Security Hub or EventBridge) "
+        "is SM-04's GuardDuty Findings Routed to Security Hub and GuardDuty "
+        "Findings Routed to Alerting rows. No row reads GuardDuty findings "
+        "themselves: a finding exists only after an attack, so its absence "
+        "cannot tell a monitored workload from an unmonitored one, and the "
+        "control's evidence is the configuration plus an example alert",
         [],
         6,
     ),
@@ -1837,7 +1896,13 @@ FOUNDATION_ROWS = [
         "when it is the management account, or when trusted access for the "
         "principal is not enabled; an unread trusted-access list makes each "
         "administered service Not Applicable. A member account that cannot call "
-        "the API is Not Applicable with the reason",
+        "the API is Not Applicable with the reason. In every scanned Region a "
+        "second SM-35 row reads the administrator of GuardDuty, Security Hub and "
+        "Inspector for this account, from GetAdministratorAccount or "
+        "GetDelegatedAdminAccount, or this account itself when it can read the "
+        "organization configuration. It fails a Region where a service has no "
+        "administrator with an Enabled relationship, where the administrator is "
+        "the management account, or where the three differ",
         [],
         6,
     ),
@@ -2030,7 +2095,14 @@ FOUNDATION_ROWS = [
         "returns. Absent or false fails. A cluster with no managed vpc-cni add-on "
         "is Not Applicable, because a self-managed CNI's configuration is not "
         "readable through the EKS API, and so is an EKS Auto Mode cluster, which "
-        "sets network policy on its NodeClass and runs no managed vpc-cni add-on",
+        "sets network policy on its NodeClass and runs no managed vpc-cni add-on. "
+        "SM-39 also fails a cluster that enforces network policy in standard "
+        "mode, where a pod accepts all traffic until a NetworkPolicy selects it, "
+        "and reads the security groups of every ECS service, Lambda function and "
+        "EC2 instance (the instances of one Auto Scaling group count as one "
+        "workload). It fails a group shared between workloads, a rule to the VPC "
+        "default group, and a CIDR of /16 (IPv6 /48) or wider, named directly or "
+        "in a customer-managed prefix list",
         [],
         6,
     ),
@@ -2045,7 +2117,12 @@ FOUNDATION_ROWS = [
         "falls within its schedule plus one day. It fails a secret with rotation "
         "off, one that has never rotated, and one whose schedule allows a gap "
         "longer than 90 days, the default of Security Hub control "
-        "SecretsManager.4",
+        "SecretsManager.4. It fails an ECS secret that rotates while no "
+        "EventBridge rotation rule has a target, an ECS secret injected from "
+        "Parameter Store, and a credential-named plaintext environment variable "
+        "in an ECS container, a Lambda function or a SageMaker model container. "
+        "A Lambda function is not graded on propagation, because no API shows "
+        "whether it re-fetches a secret per invocation",
         [],
         6,
     ),
@@ -2123,12 +2200,31 @@ FOUNDATION_ROWS = [
         "additional model data source fails without an ETag or ManifestEtag unless it "
         "is SageMaker hub content. A container with an HF_MODEL_ID environment key and no model "
         "data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse "
-        "with a named key whose kms:DescribeKey KeyManager is CUSTOMER. An endpoint with an unread repository, signing status, "
-        "model or bucket reports N/A, never Passed. Partial, ceiling reached: a "
+        "with a named key whose kms:DescribeKey KeyManager is CUSTOMER. Model data "
+        "named as one S3 object (a ModelDataUrl that is not a multi-model prefix, an "
+        "S3Object source, or a ManifestS3Uri) is read with HeadObject: an ETag that "
+        "differs from the recorded value fails, a 404 fails, and the object's own "
+        "ServerSideEncryption must be aws:kms or aws:kms:dsse under a CUSTOMER key. "
+        "Each object under an S3Prefix source or a multi-model ModelDataUrl prefix "
+        "is listed with ListObjectsV2 and read with HeadObject for the same "
+        "encryption test, and an empty prefix fails; a prefix with objects past "
+        "a run-wide cap of 1000 reports N/A by name. Each model's ExecutionRoleArn, or the "
+        "endpoint config's role for an inference component container, is joined "
+        "to the IAM permissions cache: an Allow that grants s3:GetObject on an "
+        "object in a bucket other than the model's artifact buckets fails unless "
+        "the permissions boundary stops it, and a conditioned grant reports N/A. "
+        "The role is judged per bucket, not per artifact prefix. Tag mutability "
+        "is read from the image's ECR repository in any account, so a tag-pinned "
+        "image from an AWS Deep Learning Containers registry is judged. "
+        "An endpoint with an unread repository, signing status, "
+        "model, bucket, object, listing or execution role reports N/A, never "
+        "Passed. Partial, ceiling reached: a "
         "recorded ETag says an expected value is recorded, and no AWS API returns "
         "whether SageMaker or the container compared it with the object at load "
-        "time. Weights fetched by container startup code, and models loaded on "
-        "ECS, EKS or EC2, are not read",
+        "time; no SageMaker container or S3ModelDataSource member records a SHA256 "
+        "digest, and ProductionVariant has no instance metadata option, so IMDSv2 "
+        "is not readable on endpoint instances. Weights fetched by container "
+        "startup code, and models loaded on ECS, EKS or EC2, are not read",
         [],
         6,
     ),

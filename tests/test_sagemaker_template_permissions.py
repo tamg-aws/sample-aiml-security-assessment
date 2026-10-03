@@ -60,7 +60,7 @@ SCOPED_SAGEMAKER_GRANTS = {
     "cloudtrail:GetEventSelectors": ":cloudtrail:*:*:trail/*'",
     "config:DescribeConfigurationRecorderStatus": ":configuration-recorder/*/*'",
     "config:DescribeConformancePackCompliance": ":conformance-pack/*/*'",
-    "ecr:DescribeRepositories": ":ecr:*:${AWS::AccountId}:repository/*'",
+    "ecr:DescribeRepositories": ":ecr:*:*:repository/*'",
     "ecr:DescribeImageSigningStatus": ":ecr:*:${AWS::AccountId}:repository/*'",
     "elasticfilesystem:DescribeFileSystems": (
         ":elasticfilesystem:*:${AWS::AccountId}:file-system/*'"
@@ -78,11 +78,23 @@ def _sagemaker_function_statements(template_text):
     return block.split("- Sid:")[1:]
 
 
+def _sagemaker_managed_statements(template_text):
+    start = re.search(
+        r"^  SageMakerAssessmentReadsPolicy:\n", template_text, re.MULTILINE
+    )
+    rest = template_text[start.end() :]
+    match = re.search(r"\n  [A-Za-z0-9]+:\n", rest)
+    return rest[: match.start()].split("- Sid:")[1:]
+
+
 def test_new_sagemaker_grants_are_resource_scoped_on_the_sagemaker_function():
+    # The function's inline statements and its managed policy together, so an
+    # action held once in each fails as held twice.
     for template_path in TEMPLATE_PATHS:
+        text = template_path.read_text(encoding="utf-8")
         statements = _sagemaker_function_statements(
-            template_path.read_text(encoding="utf-8")
-        )
+            text
+        ) + _sagemaker_managed_statements(text)
         for action, resource in SCOPED_SAGEMAKER_GRANTS.items():
             holding = [s for s in statements if re.search(rf"- {action}\b", s)]
             assert len(holding) == 1, f"{template_path.name}: {action} not granted once"
@@ -124,9 +136,6 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
 # Reads the SageMaker legs call that are not approved. Each leg reports "not
 # read" on AccessDenied, so none may be granted.
 UNAPPROVED_SAGEMAKER_READS = [
-    "ec2:DescribeVpcs",
-    "ec2:DescribeDhcpOptions",
-    "sagemaker:ListMonitoringExecutions",
     "guardduty:ListMembers",
     "organizations:ListAccounts",
     "s3:GetObjectAttributes",
@@ -154,3 +163,74 @@ def test_unapproved_reads_are_not_granted_to_the_sagemaker_function():
             assert not [s for s in statements if re.search(rf"- {action}\b", s)], (
                 f"{template_path.name}: {action} is granted without approval"
             )
+
+
+def test_model_artifact_object_read_is_get_object_on_objects_only():
+    # SM-43 calls only HeadObject, which s3:GetObject authorizes. The grant
+    # names the object resource type and sits apart from the report bucket's
+    # permissions-cache read, so neither widens the other.
+    for template_path in TEMPLATE_PATHS:
+        statements = _sagemaker_function_statements(
+            template_path.read_text(encoding="utf-8")
+        )
+        holding = [s for s in statements if re.search(r"- s3:GetObject\b", s)]
+        assert sorted(s.split()[0] for s in holding) == [
+            "ModelArtifactObjectRead",
+            "PermissionCacheRead",
+        ], template_path.name
+        artifact = next(s for s in holding if s.split()[0] == "ModelArtifactObjectRead")
+        assert re.findall(r"- ([a-z0-9-]+:[A-Za-z*]+)", artifact) == ["s3:GetObject"]
+        assert "Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'" in artifact
+        cache = next(s for s in holding if s.split()[0] == "PermissionCacheRead")
+        assert "permissions_cache_*.json" in cache
+
+
+def test_model_image_repository_read_reaches_other_accounts_for_describe_only():
+    # SM-43 reads the tag mutability of repositories in any registry an
+    # endpoint image names, AWS Deep Learning Containers included. Signing
+    # status is read only for this account's registry, so it stays scoped.
+    for template_path in TEMPLATE_PATHS:
+        text = template_path.read_text(encoding="utf-8")
+        by_sid = {
+            s.split()[0]: s
+            for s in _sagemaker_function_statements(text)
+            + _sagemaker_managed_statements(text)
+        }
+        assert not any(
+            s.split()[0] == "ModelImageRepositoryAnyAccountRead"
+            for s in _sagemaker_function_statements(text)
+        )
+        any_account = by_sid["ModelImageRepositoryAnyAccountRead"]
+        assert re.findall(r"- ([a-z0-9-]+:[A-Za-z*]+)", any_account) == [
+            "ecr:DescribeRepositories"
+        ], template_path.name
+        assert (
+            "Resource: !Sub 'arn:${AWS::Partition}:ecr:*:*:repository/*'" in any_account
+        )
+        own = by_sid["ModelImageRepositoryRead"]
+        assert re.findall(r"- ([a-z0-9-]+:[A-Za-z*]+)", own) == [
+            "ecr:DescribeImageSigningStatus"
+        ], template_path.name
+        assert (
+            "Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'"
+            in own
+        )
+
+
+def test_model_artifact_prefix_list_is_list_bucket_on_buckets_only():
+    # SM-43 calls ListObjectsV2, which s3:ListBucket authorizes on the bucket
+    # resource type. The grant sits in the managed policy and nowhere inline.
+    for template_path in TEMPLATE_PATHS:
+        text = template_path.read_text(encoding="utf-8")
+        assert not any(
+            re.search(r"- s3:ListBucket\b", s)
+            for s in _sagemaker_function_statements(text)
+        ), template_path.name
+        holding = [
+            s
+            for s in _sagemaker_managed_statements(text)
+            if re.search(r"- s3:ListBucket\b", s)
+        ]
+        assert [s.split()[0] for s in holding] == ["ModelArtifactPrefixList"]
+        assert re.findall(r"- ([a-z0-9-]+:[A-Za-z*]+)", holding[0]) == ["s3:ListBucket"]
+        assert "Resource: !Sub 'arn:${AWS::Partition}:s3:::*'\n" in holding[0]

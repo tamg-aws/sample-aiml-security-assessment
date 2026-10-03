@@ -720,6 +720,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "bedrock-agentcore:GetWorkloadAccessTokenForUserId"
 }
 
+# Verified on 2026-10-03 with an Access Analyzer validate-policy run for the
+# SM-02 API method authorization leg. Its negative control was one invented
+# action (execute-api:InvokeThatDoesNotExist), which was reported as
+# INVALID_ACTION, and the action below was not.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"execute-api:Invoke"}
+
 # Verified on 2026-09-25 with a third Access Analyzer validate-policy run for the
 # gateway controls AC-24 through AC-27. Its negative controls were four invented
 # actions (ec2:DescribeVpcEndpointsThatDoNotExist,
@@ -1212,6 +1218,23 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:ListTrainingJobs"}
 # lambda:ListTagz as INVALID_ACTION at Action index 1 of one statement and
 # nothing at index 0.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"lambda:ListTags"}
+
+# Verified on 2026-10-03 for SM-39's Lambda VPC guardrail with one
+# SERVICE_CONTROL_POLICY ValidatePolicy run. It reported INVALID_ACTION for the
+# negative controls lambda:CreateFunctionNotReal and the plausible
+# lambda:UpdateFunctionVpcConfig, and INVALID_SERVICE_CONDITION_KEY for
+# lambda:VpcIdsNotReal and lambda:SubnetIdNotReal, and none of the names below.
+# The lambda service-reference JSON lists the three keys as ActionConditionKeys
+# of both actions, lambda:VpcIds as String and the other two as ArrayOfString.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "lambda:CreateFunction",
+    "lambda:UpdateFunctionConfiguration",
+}
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "lambda:VpcIds",
+    "lambda:SubnetIds",
+    "lambda:SecurityGroupIds",
+}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
