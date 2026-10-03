@@ -126,7 +126,6 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
 UNAPPROVED_SAGEMAKER_READS = [
     "ec2:DescribeVpcs",
     "ec2:DescribeDhcpOptions",
-    "sagemaker:ListMonitoringExecutions",
     "guardduty:ListMembers",
     "organizations:ListAccounts",
     "s3:GetObjectAttributes",

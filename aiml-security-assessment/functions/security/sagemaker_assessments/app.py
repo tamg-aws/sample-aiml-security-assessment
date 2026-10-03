@@ -8961,6 +8961,23 @@ def _schedule_baseline_constraints(
     return "missing", f"schedule '{name}': {where} names no baseline constraints file"
 
 
+def _latest_finished_monitoring_execution(
+    sagemaker_client: Any, schedule_name: str
+) -> Dict[str, Any]:
+    """The newest execution of a schedule that is not Pending or InProgress."""
+    for page in sagemaker_client.get_paginator("list_monitoring_executions").paginate(
+        MonitoringScheduleName=schedule_name,
+        SortBy="ScheduledTime",
+        SortOrder="Descending",
+    ):
+        for execution in page.get("MonitoringExecutionSummaries", []):
+            if execution.get("MonitoringExecutionStatus") not in (
+                MONITOR_RUNNING_STATUSES
+            ):
+                return execution
+    return {}
+
+
 def _monitor_report_and_alarm_findings(
     sagemaker_client: Any, schedules: List[Dict[str, Any]], region: str
 ) -> List[Dict[str, Any]]:
@@ -9003,20 +9020,38 @@ def _monitor_report_and_alarm_findings(
         max_age = 2 * _schedule_cadence(expression) + timedelta(hours=1)
         last = detail.get("LastMonitoringExecutionSummary") or {}
         status = last.get("MonitoringExecutionStatus")
+        running = None
+        if status in MONITOR_RUNNING_STATUSES:
+            # AIR-SGM-EP-06: DescribeMonitoringSchedule returns only the running
+            # execution, so the newest finished one is listed.
+            running = status
+            try:
+                last = _latest_finished_monitoring_execution(sagemaker_client, name)
+            except Exception as error:
+                unread.append(
+                    f"schedule '{name}': its latest execution is {status}, and "
+                    "the execution before it was not read "
+                    f"(sagemaker:ListMonitoringExecutions: "
+                    f"{get_assessment_error_label(error)})"
+                )
+                continue
+            status = last.get("MonitoringExecutionStatus")
         scheduled = last.get("ScheduledTime")
         if isinstance(scheduled, datetime) and scheduled.tzinfo is None:
             scheduled = scheduled.replace(tzinfo=timezone.utc)
-        if not last:
-            stale.append(f"schedule '{name}' has never run")
-        elif status in MONITOR_RUNNING_STATUSES:
-            unread.append(
-                f"schedule '{name}': its latest execution is {status}, and the "
-                "report before it is not returned by DescribeMonitoringSchedule"
+        if not last and running:
+            stale.append(
+                f"schedule '{name}': its latest execution is {running}, and no "
+                "execution before it has finished"
             )
+        elif not last:
+            stale.append(f"schedule '{name}' has never run")
         elif status not in MONITOR_REPORT_STATUSES:
             reason = last.get("FailureReason")
             stale.append(
-                f"schedule '{name}': its latest execution is {status or 'without a status'}"
+                f"schedule '{name}': its latest "
+                f"{'finished ' if running else ''}execution is "
+                f"{status or 'without a status'}"
                 + (f" ({reason[:120]})" if reason else "")
             )
         elif not isinstance(scheduled, datetime) or now - scheduled > max_age:

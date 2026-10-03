@@ -313,6 +313,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeModelBiasJobDefinition",
         "sagemaker:DescribeModelExplainabilityJobDefinition",
         "sagemaker:DescribeModelQualityJobDefinition",
+        "sagemaker:ListMonitoringExecutions",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -944,6 +945,7 @@ _SAGEMAKER_MANAGED_GRANTS = [
     ("Allow", "ec2:DescribeManagedPrefixLists", '"*"'),
     ("Allow", "iot:ListAuditTasks", '"*"'),
     ("Allow", "iot:DescribeAuditTask", '"*"'),
+    ("Allow", "sagemaker:ListMonitoringExecutions", '"*"'),
     (
         "Allow",
         "ec2:GetManagedPrefixListEntries",

@@ -339,6 +339,11 @@ section.
     `DataCaptureConfig.KmsKeyId`, and an asynchronous config with no
     `AsyncInferenceConfig.OutputConfig.KmsKeyId` fail, an AWS managed key
     on any of them fails, and an unread endpoint holds back `Passed`.
+- `SM-23` judges a schedule whose latest execution is `Pending` or
+  `InProgress` by the newest finished execution, read with
+  `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
+  with no finished execution, or whose newest finished one failed or is
+  older than twice its cadence, fails.
 - SageMaker rows that claimed more than they read now state what they read:
   - `SM-22` no longer says approval workflows "appear to be properly
     configured". It names the counts it read and says they do not show
@@ -1552,11 +1557,13 @@ section.
 
 ### Deployment impact
 
-**SageMaker IoT audit run reads.** `SageMakerAssessmentReadsPolicy` gains
-`iot:ListAuditTasks` and `iot:DescribeAuditTask` on `'*'` (`SM-41`). Neither
-action has a resource type in the service authorization reference. Both are
-read-only. Until the stack is updated, the `SM-41` audit row reads as
-incomplete.
+**SageMaker IoT audit and monitoring execution reads.**
+`SageMakerAssessmentReadsPolicy` gains `iot:ListAuditTasks` and
+`iot:DescribeAuditTask` (`SM-41`) and `sagemaker:ListMonitoringExecutions`
+(`SM-23`), all on `'*'`. None of the three has a resource type in the
+service authorization reference, and all are read-only. Until the stack is
+updated, the `SM-41` audit row reads as incomplete, and so does an `SM-23`
+schedule whose latest execution is still running.
 
 **Bedrock and SageMaker read grants.** `BedrockAssessmentReadsPolicy`
 gains `bedrock-agentcore:GetBrowser` on `browser-custom/*` (`BR-47`,

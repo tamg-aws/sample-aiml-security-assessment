@@ -4547,9 +4547,13 @@ class TestSM23MonitorReportAndAlarm:
         errors=None,
         endpoints=("ep",),
         job_definitions=None,
+        executions=None,
     ):
+        """executions maps a schedule to its ListMonitoringExecutions summaries,
+        newest first, or to an error code; an unnamed schedule is denied."""
         errors = errors or {}
         job_definitions = job_definitions or {}
+        executions = executions or {}
         mock_sm = MagicMock()
         mock_client.return_value = mock_sm
 
@@ -4559,6 +4563,18 @@ class TestSM23MonitorReportAndAlarm:
             def paginate(**kwargs):
                 if name in errors:
                     raise _make_client_error(errors[name], name)
+                if name == "list_monitoring_executions":
+                    assert kwargs["SortBy"] == "ScheduledTime"
+                    assert kwargs["SortOrder"] == "Descending"
+                    value = executions.get(
+                        kwargs["MonitoringScheduleName"], "AccessDeniedException"
+                    )
+                    if isinstance(value, str):
+                        raise _make_client_error(value, name)
+                    return [
+                        {"MonitoringExecutionSummaries": value[:1]},
+                        {"MonitoringExecutionSummaries": value[1:]},
+                    ]
                 if name == "list_endpoints":
                     return [
                         {
@@ -4726,6 +4742,59 @@ class TestSM23MonitorReportAndAlarm:
             details={"dq": self._detail(1), "mq": self._detail(0, "InProgress")},
         )
         assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sagemaker:ListMonitoringExecutions" in rows[0]["Finding_Details"]
+
+    @staticmethod
+    def _execution(age_hours, status="Completed"):
+        return {
+            "MonitoringExecutionStatus": status,
+            "ScheduledTime": datetime.now(timezone.utc) - timedelta(hours=age_hours),
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_running_execution_is_judged_by_the_one_before_it(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(0, "InProgress")},
+            executions={
+                "mq": [
+                    self._execution(0, "InProgress"),
+                    self._execution(1, "CompletedWithViolations"),
+                    self._execution(2, "Failed"),
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "earlier, text",
+        [
+            ([], "no execution before it has finished"),
+            ([(0, "Pending")], "no execution before it has finished"),
+            ([(1, "Failed")], "its latest finished execution is Failed"),
+            ([(9, "Completed")], "older than twice its cadence"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_running_execution_after_no_current_report_fails(
+        self, mock_client, earlier, text
+    ):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(0, "InProgress")},
+            executions={
+                "mq": [self._execution(0, "InProgress")]
+                + [self._execution(age, status) for age, status in earlier]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "'dq'" not in rows[0]["Finding_Details"]
+        assert text in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_describe_denied_is_not_read(self, mock_client):
