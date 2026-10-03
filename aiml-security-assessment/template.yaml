@@ -469,6 +469,14 @@ Resources:
             Action:
               - kendra:DescribeIndex # BR-20
             Resource: !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
+          - Sid: AgentCoreMemoryRead
+            # BR-04 reads eventExpiryDuration on each AgentCore memory. The
+            # service authorization reference gives GetMemory the memory
+            # resource type.
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:GetMemory # BR-04
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:memory/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -541,7 +549,7 @@ Resources:
                 - sso:ListInstances # BR-51
                 - bedrock-agentcore:ListAgentRuntimes # BR-42, BR-47, BR-52, BR-53, BR-57
                 - bedrock-agentcore:ListAgentRuntimeEndpoints # BR-57
-                - bedrock-agentcore:ListMemories # BR-53
+                - bedrock-agentcore:ListMemories # BR-04, BR-53
                 - bedrock-agentcore:ListGateways # BR-53
                 - bedrock-agentcore:ListBrowsers # BR-42, BR-47, BR-52, BR-53
                 - sagemaker:ListEndpoints # BR-02, BR-53

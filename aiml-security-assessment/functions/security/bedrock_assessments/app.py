@@ -4654,37 +4654,104 @@ def _invocation_log_retention_findings(
 AGENTCORE_MEMORY_EXPIRY_FINDING = "AgentCore Memory Event Retention"
 
 
-def _agentcore_memory_expiry_finding(region: str) -> Dict[str, Any]:
-    """Report the AgentCore Memory retention leg of AIR-FND-DAT-08 as a ceiling.
+AGENTCORE_MEMORY_EXPIRY_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
+    "API_GetMemory.html"
+)
 
-    Each memory's eventExpiryDuration sets how long its events are kept, but
-    neither AIR-ACR-MEM-07 nor AIR-FND-DAT-08 sets a maximum retention period,
-    so there is no bound to judge the value against. No threshold is assumed.
+
+def _agentcore_memory_expiry_findings(region: str) -> List[Dict[str, Any]]:
+    """Report the AgentCore Memory retention leg of AIR-FND-DAT-08, one row per memory.
+
+    Every page of ListMemories is read and each memory's eventExpiryDuration is
+    read with GetMemory. The without_decryption view is asked for because the
+    period is a plain field and only the strategies need the memory's key.
     """
-    return create_finding(
-        check_id="BR-04",
-        finding_name=AGENTCORE_MEMORY_EXPIRY_FINDING,
-        finding_details=(
-            "AgentCore Memory event retention is Partial, ceiling reached: each "
-            "memory's eventExpiryDuration sets how many days it keeps session "
-            "events, but AIR-ACR-MEM-07 and AIR-FND-DAT-08 set no maximum "
-            "retention period, so there is no bound to judge the value against. "
-            "No memory in this account was judged, and no retention threshold is "
-            "assumed. What is missing is a numeric retention bound in the "
-            "framework, not a permission."
-        ),
-        resolution=(
-            "Set each memory's eventExpiryDuration to the retention period your "
-            "data retention policy requires."
-        ),
-        reference=(
-            "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
-            "API_GetMemory.html"
-        ),
-        severity="Informational",
-        status="N/A",
-        region=region,
+
+    def row(details: str, resolution: str, severity: str, status: str):
+        return create_finding(
+            check_id="BR-04",
+            finding_name=AGENTCORE_MEMORY_EXPIRY_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENTCORE_MEMORY_EXPIRY_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    client = boto3.client(
+        "bedrock-agentcore-control", config=boto3_config, region_name=region
     )
+    summaries, rows = [], []
+    try:
+        for page in client.get_paginator("list_memories").paginate():
+            summaries.extend(page.get("memories") or [])
+    except Exception as error:
+        rows.append(
+            row(
+                "The AgentCore memories in {} were not listed with "
+                "bedrock-agentcore:ListMemories ({}), so the event retention of a "
+                "memory beyond the {} listed was not read.".format(
+                    region, get_assessment_error_label(error), len(summaries)
+                ),
+                "Grant bedrock-agentcore:ListMemories and re-run the assessment.",
+                "Informational",
+                "N/A",
+            )
+        )
+
+    for summary in summaries:
+        memory_id = summary.get("id") or str(summary.get("arn", "")).split("/")[-1]
+        try:
+            memory = client.get_memory(memoryId=memory_id, view="without_decryption")[
+                "memory"
+            ]
+        except Exception as error:
+            rows.append(
+                row(
+                    "The event retention of AgentCore memory {} was not read with "
+                    "bedrock-agentcore:GetMemory ({}).".format(
+                        memory_id, get_assessment_error_label(error)
+                    ),
+                    "Grant bedrock-agentcore:GetMemory on this memory and re-run "
+                    "the assessment.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            continue
+        # botocore's Memory shape makes eventExpiryDuration required, bounded 1
+        # to 365 days (MemoryEventExpiryDurationInteger), so every readable
+        # memory has a service-enforced expiry and there is no Failed branch.
+        rows.append(
+            row(
+                "AgentCore memory '{}' ({}) keeps session events for {} days "
+                "(eventExpiryDuration), after which AgentCore deletes them. This "
+                "is a service-enforced expiry; whether deletion has run is not "
+                "read by this check. Confirm the period meets your own "
+                "record-retention policy.".format(
+                    memory.get("name") or memory_id,
+                    memory_id,
+                    memory.get("eventExpiryDuration"),
+                ),
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        )
+
+    if not summaries and not rows:
+        rows.append(
+            row(
+                f"No AgentCore memory is listed in {region}, so there is no "
+                "memory event retention to judge.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+    return rows
 
 
 INVOCATION_LOG_COVERAGE_FINDING = "Bedrock Invocation Log Data Coverage"
@@ -33081,10 +33148,10 @@ def lambda_handler(event, context):
 
         logger.info("Running Bedrock logging findings check")
         bedrock_logging_findings = check_bedrock_logging_configuration(region=region)
-        # AIR-FND-DAT-08 also covers AgentCore Memory retention, which this
-        # role cannot read, so BR-04 carries that leg as its own N/A row.
-        bedrock_logging_findings["csv_data"].append(
-            _agentcore_memory_expiry_finding(region)
+        # AIR-FND-DAT-08 also covers AgentCore Memory retention, so BR-04
+        # carries one row per memory for that leg.
+        bedrock_logging_findings["csv_data"].extend(
+            _agentcore_memory_expiry_findings(region)
         )
         all_findings.append(bedrock_logging_findings)
 

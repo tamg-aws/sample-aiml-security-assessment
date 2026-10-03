@@ -32092,8 +32092,55 @@ def test_handler_reports_guardrail_condition_pins_unread_without_a_cache():
     assert "IAM permissions cache was unavailable" in received["errors"][0]
 
 
+def _memory_client(pages, memories, list_error=None):
+    """A control-plane client: ListMemories pages, then GetMemory per id."""
+    client = MagicMock()
+
+    def paginate():
+        for page in pages:
+            yield page
+        if list_error is not None:
+            raise list_error
+
+    def get_paginator(name):
+        paginator = MagicMock()
+        if name == "list_memories":
+            paginator.paginate.side_effect = lambda **_: paginate()
+        return paginator
+
+    def get_memory(memoryId, view):
+        assert view == "without_decryption"
+        value = memories[memoryId]
+        if isinstance(value, Exception):
+            raise value
+        return {"memory": value}
+
+    client.get_paginator.side_effect = get_paginator
+    client.get_memory.side_effect = get_memory
+    return client
+
+
+def _memory(memory_id, name, days):
+    return {"id": memory_id, "name": name, "eventExpiryDuration": days}
+
+
+def _memory_rows(client):
+    with patch.object(bedrock_app.boto3, "client", return_value=client):
+        return bedrock_app._agentcore_memory_expiry_findings("us-east-1")
+
+
 def test_handler_reports_agentcore_memory_retention_as_a_ceiling():
-    test_client = MagicMock()
+    """The handler reads each memory's eventExpiryDuration for BR-04.
+
+    Changed under the DAT-08 team-lead ruling: this test pinned a "Partial,
+    ceiling reached" row that judged no memory, but GetMemory returns
+    eventExpiryDuration, so COMMON.md allows no ceiling. It now pins one Passed
+    row naming the memory and its period.
+    """
+    test_client = _memory_client(
+        [{"memories": [{"id": "support_mem-0123456789"}]}],
+        {"support_mem-0123456789": _memory("support_mem-0123456789", "support", 30)},
+    )
     test_client.get_model_invocation_logging_configuration.side_effect = (
         _make_client_error("ValidationException")
     )
@@ -32118,19 +32165,99 @@ def test_handler_reports_agentcore_memory_retention_as_a_ceiling():
         for r in f.get("csv_data", [])
         if r["Finding"] == "AgentCore Memory Event Retention"
     ]
-    assert [(r["Check_ID"], r["Status"]) for r in rows] == [("BR-04", "N/A")]
+    assert [(r["Check_ID"], r["Status"]) for r in rows] == [("BR-04", "Passed")]
     details = rows[0]["Finding_Details"]
-    assert "eventExpiryDuration" in details
-    # No framework bound exists, so the row is a ceiling and names no grant.
-    assert "Partial, ceiling reached" in details
-    assert "AIR-ACR-MEM-07 and AIR-FND-DAT-08 set no maximum" in details
-    assert "no retention threshold is assumed" in details
-    assert "GetMemory" not in details
-    assert "GetMemory" not in rows[0]["Resolution"]
-    assert "Grant" not in rows[0]["Resolution"]
-    # ListMemories is granted for BR-53, so the row must not call it missing.
-    assert "ListMemories" not in rows[0]["Finding_Details"]
-    assert "ListMemories" not in rows[0]["Resolution"]
+    assert "'support' (support_mem-0123456789) keeps session events for 30 days" in (
+        details
+    )
+    assert "after which AgentCore deletes them" in details
+    assert "service-enforced expiry; whether deletion has run is not read" in details
+    assert "ceiling reached" not in details
+
+
+def test_br04_two_memories_are_each_named_with_their_own_period():
+    rows = _memory_rows(
+        _memory_client(
+            [{"memories": [{"id": "a-0123456789"}, {"id": "b-0123456789"}]}],
+            {
+                "a-0123456789": _memory("a-0123456789", "short", 7),
+                "b-0123456789": _memory("b-0123456789", "long", 365),
+            },
+        )
+    )
+    assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+    assert (
+        "'short' (a-0123456789) keeps session events for 7 days"
+        in (rows[0]["Finding_Details"])
+    )
+    assert (
+        "'long' (b-0123456789) keeps session events for 365 days"
+        in (rows[1]["Finding_Details"])
+    )
+    assert "365" not in rows[0]["Finding_Details"]
+
+
+def test_br04_an_unreadable_memory_does_not_hide_the_readable_one():
+    rows = _memory_rows(
+        _memory_client(
+            [{"memories": [{"id": "a-0123456789"}, {"id": "b-0123456789"}]}],
+            {
+                "a-0123456789": _make_client_error("AccessDeniedException"),
+                "b-0123456789": _memory("b-0123456789", "kept", 90),
+            },
+        )
+    )
+    assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+    assert "AgentCore memory a-0123456789" in rows[0]["Finding_Details"]
+    assert "bedrock-agentcore:GetMemory" in rows[0]["Finding_Details"]
+    assert "AccessDenied" in rows[0]["Finding_Details"]
+    assert (
+        "'kept' (b-0123456789) keeps session events for 90 days"
+        in (rows[1]["Finding_Details"])
+    )
+
+
+@pytest.mark.parametrize("listed_first", [0, 1])
+def test_br04_a_list_memories_error_is_na(listed_first):
+    pages = [{"memories": [{"id": "a-0123456789"}]}][:listed_first]
+    rows = _memory_rows(
+        _memory_client(
+            pages,
+            {"a-0123456789": _memory("a-0123456789", "kept", 90)},
+            list_error=_make_client_error("AccessDeniedException"),
+        )
+    )
+    statuses = [r["Status"] for r in rows]
+    assert statuses[0] == "N/A"
+    assert "bedrock-agentcore:ListMemories" in rows[0]["Finding_Details"]
+    assert statuses[1:] == ["Passed"] * listed_first
+    assert len(rows) == 1 + listed_first
+
+
+def test_br04_every_list_memories_page_is_read():
+    rows = _memory_rows(
+        _memory_client(
+            [
+                {"memories": [{"id": "a-0123456789"}], "nextToken": "t"},
+                {"memories": [{"id": "b-0123456789"}]},
+            ],
+            {
+                "a-0123456789": _memory("a-0123456789", "first", 30),
+                "b-0123456789": _memory("b-0123456789", "second", 60),
+            },
+        )
+    )
+    assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+    assert (
+        "'second' (b-0123456789) keeps session events for 60 days"
+        in (rows[1]["Finding_Details"])
+    )
+
+
+def test_br04_no_memory_is_na_and_not_passed():
+    rows = _memory_rows(_memory_client([{"memories": []}], {}))
+    assert [r["Status"] for r in rows] == ["N/A"]
+    assert "No AgentCore memory is listed in us-east-1" in rows[0]["Finding_Details"]
 
 
 _cache_spec = importlib.util.spec_from_file_location(

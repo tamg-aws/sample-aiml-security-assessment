@@ -1556,9 +1556,13 @@ FOUNDATION_ROWS = [
         "never versioned, and the Expiration rule alone decides it. An Object Lock "
         "default retention beside the rule fails, since Lifecycle does not delete a "
         "retained version. A replicated log bucket is N/A, because per-object "
-        "ReplicationStatus needs s3:GetObject, which is not granted, and AgentCore "
-        "Memory eventExpiryDuration is N/A as a ceiling: MEM-07 and DAT-08 set no "
-        "maximum retention period, so no threshold is assumed",
+        "ReplicationStatus needs s3:GetObject, which is not granted. Every page of "
+        "ListMemories is read and each AgentCore memory's eventExpiryDuration is read "
+        "with GetMemory: a read memory is Passed and its period in days is named as a "
+        "service-enforced expiry, with no claim that deletion ran, and an unread list "
+        "or memory is N/A naming the action. The field is required and bounded 1 to "
+        "365 days, so a readable memory has no Failed outcome, and no retention "
+        "threshold is assumed",
         [],
         6,
     ),

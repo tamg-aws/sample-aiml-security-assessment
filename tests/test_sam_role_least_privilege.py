@@ -146,6 +146,7 @@ _EXPECTED_ACTIONS = {
         "aoss:GetAccessPolicy",
         "aoss:ListAccessPolicies",
         "bedrock-agentcore:GetBrowser",
+        "bedrock-agentcore:GetMemory",
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
@@ -817,6 +818,10 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
             scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
             scoped("kendra:DescribeIndex", "kendra:*:${AWS::AccountId}:index/*"),
+            scoped(
+                "bedrock-agentcore:GetMemory",
+                "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
+            ),
             scoped(
                 "bedrock-agentcore:GetBrowser",
                 "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
