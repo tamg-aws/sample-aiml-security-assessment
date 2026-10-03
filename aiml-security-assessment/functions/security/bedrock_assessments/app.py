@@ -17017,6 +17017,424 @@ CONTEXTUAL_GROUNDING_CEILING = (
 )
 
 
+# FilterLogEvents reads at most this many invocation log events per page, and
+# this many pages per pattern. A record holds a request and response body of up
+# to 100 KB each, so the page size bounds the memory one page takes.
+INVOCATION_LOG_SCAN_PAGE_SIZE = 25
+
+INVOCATION_LOG_SCAN_MAX_PAGES = 10
+
+INVOCATION_LOG_SCAN_LOOKBACK = timedelta(hours=24)
+
+# Prompt attacks are filtered on InvokeModel and InvokeModelWithResponseStream
+# input only inside this tag, suffixed by amazon-bedrock-guardrailConfig
+# tagSuffix: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html
+GUARDRAIL_INPUT_TAG = "amazon-bedrock-guardrails-guardContent"
+
+# A guarded InvokeModel response body carries this field, per the InvokeModel
+# API reference example response.
+GUARDRAIL_ACTION_FIELD = "amazon-bedrock-guardrailAction"
+
+PROMPT_ATTACK_EVIDENCE_FINDING = "Guardrail Prompt Attack Invocation Evidence"
+
+GROUNDING_EVIDENCE_FINDING = "Guardrail Contextual Grounding Score Evidence"
+
+
+def _scan_invocation_log(
+    region: str, log_group: str, pattern: str, visit: Callable[[Dict[str, Any]], None]
+) -> Dict[str, Any]:
+    """
+    Pass each invocation log record of the last 24 hours that matches
+    ``pattern`` to ``visit``, one page at a time, so no page is kept. Returns
+    the count read, whether the page cap stopped the read, and the error label
+    of a failed read.
+    """
+    client = boto3.client("logs", config=boto3_config, region_name=region)
+    start = int(
+        (datetime.now(timezone.utc) - INVOCATION_LOG_SCAN_LOOKBACK).timestamp() * 1000
+    )
+    request = {
+        "logGroupName": log_group,
+        "startTime": start,
+        "filterPattern": pattern,
+        "limit": INVOCATION_LOG_SCAN_PAGE_SIZE,
+    }
+    read = 0
+    try:
+        for _ in range(INVOCATION_LOG_SCAN_MAX_PAGES):
+            response = client.filter_log_events(**request)
+            for event in response.get("events") or []:
+                try:
+                    record = json.loads(event.get("message") or "")
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    read += 1
+                    visit(record)
+            token = response.get("nextToken")
+            if not token:
+                return {"read": read, "capped": False, "error": None}
+            request["nextToken"] = token
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "read": read,
+            "capped": False,
+            "error": get_assessment_error_label(error),
+        }
+    return {"read": read, "capped": True, "error": None}
+
+
+def _nested_dicts(value: Any):
+    """Yield every dict nested in a decoded JSON value."""
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _nested_dicts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _nested_dicts(item)
+
+
+def _invocation_log_source(region: str) -> Dict[str, Any]:
+    """
+    Return the invocation log group whose records carry request and response
+    text, or the reason none can be read.
+    """
+    try:
+        log_group, text_delivery = _get_invocation_log_group_name(region)
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "log_group": None,
+            "logging": None,
+            "reason": "the invocation logging configuration was not read "
+            "(bedrock:GetModelInvocationLoggingConfiguration, "
+            f"{get_assessment_error_label(error)})",
+        }
+    if text_delivery is not True:
+        return {
+            "log_group": None,
+            "logging": False,
+            "reason": "invocation logging does not deliver text "
+            f"(textDataDeliveryEnabled is {text_delivery}), so no request or "
+            "response body is logged",
+        }
+    if not log_group:
+        return {
+            "log_group": None,
+            "logging": True,
+            "reason": "invocation logs are delivered to Amazon S3 only, which "
+            "this check does not read",
+        }
+    return {"log_group": log_group, "logging": True, "reason": None}
+
+
+def check_guardrail_prompt_attack_invocation_evidence(
+    region: str = "",
+) -> Dict[str, Any]:
+    """
+    BR-34: Read the last 24 hours of invocation log records for a prompt attack
+    the guardrail blocked, and for guarded InvokeModel calls whose input carries
+    no guardrail input tag, which the prompt attack filter does not evaluate.
+    Only request IDs, operations and model IDs are reported, never a body.
+    """
+    reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html"
+    findings = {
+        "check_name": PROMPT_ATTACK_EVIDENCE_FINDING,
+        "status": "PASS",
+        "details": "",
+        "csv_data": [],
+    }
+
+    def row(details, resolution, severity, status):
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-34",
+                finding_name=PROMPT_ATTACK_EVIDENCE_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
+
+    try:
+        source = _invocation_log_source(region)
+        if not source["log_group"]:
+            findings["status"] = "N/A"
+            row(
+                f"No invocation log record in {region} was read for a prompt "
+                f"attack catch or input tagging: {source['reason']}.",
+                "Deliver invocation logs with text to a CloudWatch Logs group, "
+                "or review the S3 records for a PROMPT_ATTACK block.",
+                "Informational",
+                "N/A",
+            )
+            return findings
+        catches = []
+        guarded = []
+        untagged = []
+        unread = []
+
+        def visit_catch(record):
+            output = (record.get("output") or {}).get("outputBodyJson")
+            if any(
+                item.get("type") == "PROMPT_ATTACK" and item.get("action") == "BLOCKED"
+                for item in _nested_dicts(output)
+            ):
+                catches.append(str(record.get("requestId") or "no request ID"))
+
+        def visit_guarded(record):
+            if record.get("operation") not in (
+                "InvokeModel",
+                "InvokeModelWithResponseStream",
+            ):
+                return
+            output = (record.get("output") or {}).get("outputBodyJson")
+            if not any(
+                GUARDRAIL_ACTION_FIELD in item for item in _nested_dicts(output)
+            ):
+                return
+            label = "{} ({} {})".format(
+                record.get("requestId") or "no request ID",
+                record.get("operation"),
+                record.get("modelId") or "no model ID",
+            )
+            guarded.append(label)
+            body = (record.get("input") or {}).get("inputBodyJson")
+            if body is None:
+                unread.append(f"{label}, whose request body is not inline")
+            elif GUARDRAIL_INPUT_TAG not in json.dumps(body):
+                untagged.append(label)
+
+        log_group = source["log_group"]
+        catch_scan = _scan_invocation_log(
+            region, log_group, '"PROMPT_ATTACK"', visit_catch
+        )
+        tag_scan = _scan_invocation_log(
+            region, log_group, f'"{GUARDRAIL_ACTION_FIELD}"', visit_guarded
+        )
+        for scan, what in (
+            (catch_scan, "PROMPT_ATTACK"),
+            (tag_scan, GUARDRAIL_ACTION_FIELD),
+        ):
+            if scan["error"]:
+                unread.append(
+                    f"records matching {what} in {log_group} (logs:FilterLogEvents, "
+                    f"{scan['error']})"
+                )
+            elif scan["capped"]:
+                unread.append(
+                    f"records matching {what} in {log_group} past the first "
+                    f"{scan['read']} (page cap)"
+                )
+        unread_note = " Not read: {}.".format("; ".join(unread[:5])) if unread else ""
+        catch_note = (
+            "{} prompt attack block(s) were logged in the last 24 hours: {}.".format(
+                len(catches), ", ".join(catches[:5])
+            )
+            if catches
+            else "No PROMPT_ATTACK block was logged in the last 24 hours."
+        )
+        if untagged:
+            findings["status"] = "FAIL"
+            row(
+                "{} of the {} guarded InvokeModel call(s) logged in {} in the last "
+                "24 hours sent no {} input tag, so the prompt attack filter did not "
+                "evaluate their input: {}. {}{}".format(
+                    len(untagged),
+                    len(guarded),
+                    log_group,
+                    GUARDRAIL_INPUT_TAG,
+                    "; ".join(untagged[:5]),
+                    catch_note,
+                    unread_note,
+                ),
+                "Wrap the user-supplied part of each InvokeModel prompt in "
+                "amazon-bedrock-guardrails-guardContent_<tagSuffix> tags, or move "
+                "the caller to Converse with guardContent blocks.",
+                "High",
+                "Failed",
+            )
+        elif unread:
+            findings["status"] = "N/A"
+            row(
+                "No guarded InvokeModel call read in {} sent untagged input, but "
+                "the records were not all read. {}{}".format(
+                    log_group, catch_note, unread_note
+                ),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        elif not catches:
+            findings["status"] = "N/A"
+            row(
+                "{} Every one of the {} guarded InvokeModel call(s) logged in {} "
+                "in the last 24 hours tagged its input. No example catch was read, "
+                "which does not show the filter is off.".format(
+                    catch_note, len(guarded), log_group
+                ),
+                "No action required.",
+                "Informational",
+                "N/A",
+            )
+        else:
+            row(
+                "{} Every one of the {} guarded InvokeModel call(s) logged in {} "
+                "in the last 24 hours tagged its input with {}. Converse calls are "
+                "not judged for guardContent blocks.".format(
+                    catch_note, len(guarded), log_group, GUARDRAIL_INPUT_TAG
+                ),
+                "No action required.",
+                "High",
+                "Passed",
+            )
+        return findings
+    except Exception as e:
+        logger.error(
+            f"Error in check_guardrail_prompt_attack_invocation_evidence: {str(e)}",
+            exc_info=True,
+        )
+        findings["status"] = "ERROR"
+        findings["csv_data"] = []
+        row(
+            build_could_not_assess_detail(e, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+        return findings
+
+
+def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]:
+    """
+    BR-27: Confirm invocation logging captures response bodies, where a traced
+    guardrail response carries its contextual grounding scores, and read the
+    last 24 hours of records for a scored GROUNDING or RELEVANCE assessment.
+    """
+    reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-contextual-grounding-check.html"
+    findings = {
+        "check_name": GROUNDING_EVIDENCE_FINDING,
+        "status": "PASS",
+        "details": "",
+        "csv_data": [],
+    }
+
+    def row(details, resolution, severity, status):
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-27",
+                finding_name=GROUNDING_EVIDENCE_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
+
+    try:
+        source = _invocation_log_source(region)
+        if source["logging"] is False:
+            findings["status"] = "FAIL"
+            row(
+                f"Grounding scores are not captured in {region}: {source['reason']}.",
+                "Enable model invocation logging with text delivery so traced "
+                "guardrail responses, with their grounding scores, are logged.",
+                "Medium",
+                "Failed",
+            )
+            return findings
+        if not source["log_group"]:
+            findings["status"] = "N/A"
+            row(
+                f"No scored grounding assessment in {region} was read: "
+                f"{source['reason']}.",
+                COULD_NOT_ASSESS_RESOLUTION
+                if source["logging"] is None
+                else "Review the S3 invocation log records for a "
+                "contextualGroundingPolicy score.",
+                "Informational",
+                "N/A",
+            )
+            return findings
+        scored = []
+
+        def visit(record):
+            output = (record.get("output") or {}).get("outputBodyJson")
+            for item in _nested_dicts(output):
+                score = item.get("score")
+                if item.get("type") in ("GROUNDING", "RELEVANCE") and isinstance(
+                    score, (int, float)
+                ):
+                    scored.append(
+                        "{} {} score {} threshold {} action {}".format(
+                            record.get("requestId") or "no request ID",
+                            item["type"],
+                            score,
+                            item.get("threshold"),
+                            item.get("action"),
+                        )
+                    )
+
+        log_group = source["log_group"]
+        scan = _scan_invocation_log(
+            region, log_group, '"contextualGroundingPolicy"', visit
+        )
+        if scored:
+            row(
+                "Invocation logging delivers text to {}, and {} scored "
+                "contextual grounding assessment(s) were logged in the last 24 "
+                "hours: {}.".format(log_group, len(scored), "; ".join(scored[:5])),
+                "No action required.",
+                "Medium",
+                "Passed",
+            )
+        elif scan["error"]:
+            findings["status"] = "N/A"
+            row(
+                f"The invocation log records in {log_group} were not read "
+                f"(logs:FilterLogEvents, {scan['error']}), so no scored grounding "
+                "assessment was read.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        else:
+            findings["status"] = "N/A"
+            row(
+                "Invocation logging delivers text to {}, but no scored "
+                "GROUNDING or RELEVANCE assessment was read in {} matching "
+                "record(s) of the last 24 hours{}. A score is logged only when "
+                "the caller enables the guardrail trace.".format(
+                    log_group,
+                    scan["read"],
+                    " (page cap reached)" if scan["capped"] else "",
+                ),
+                "No action required.",
+                "Informational",
+                "N/A",
+            )
+        return findings
+    except Exception as e:
+        logger.error(
+            f"Error in check_guardrail_grounding_score_evidence: {str(e)}",
+            exc_info=True,
+        )
+        findings["status"] = "ERROR"
+        findings["csv_data"] = []
+        row(
+            build_could_not_assess_detail(e, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+        return findings
+
+
 def check_bedrock_guardrail_contextual_grounding(
     region: str = "", attachment_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
@@ -28696,7 +29114,9 @@ PRINCIPAL_IS_AWS_SERVICE_CONDITION_KEY = "aws:principalisawsservice"
 # prefix whose every value is an ARN with no wildcard or policy variable, or
 # Bool aws:ViaAWSService false. A negated operator is true on an absent key, so
 # the Deny still reaches a caller with no PrincipalArn. The exempted principals
-# keep plaintext access, and the finding names each one.
+# keep plaintext access, and the finding names each one. aws:ViaAWSService "is
+# always included in the request context", so Bool false never meets an absent
+# key: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html
 PRINCIPAL_ARN_CONDITION_KEY = "aws:principalarn"
 
 PRINCIPAL_ARN_EXEMPTION_OPERATORS = (
@@ -34931,6 +35351,7 @@ def lambda_handler(event, context):
             region=region, attachment_inventory=guardrail_attachments
         )
         all_findings.append(guardrail_grounding_findings)
+        all_findings.append(check_guardrail_grounding_score_evidence(region=region))
 
         logger.info("Running agent guardrail association check (BR-28)")
         agent_guardrail_findings = check_bedrock_agent_guardrail_association(
@@ -34983,6 +35404,9 @@ def lambda_handler(event, context):
             )
         )
         all_findings.append(check_guardrail_intervention_logging(region=region))
+        all_findings.append(
+            check_guardrail_prompt_attack_invocation_evidence(region=region)
+        )
 
         logger.info("Running guardrail image content filter advisory (BR-35)")
         all_findings.append(

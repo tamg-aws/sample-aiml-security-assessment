@@ -92,9 +92,38 @@ AI_SUBJECT_ROWS = [
         [],
         3,
     ),
-    ("AIR-BDR-GRD-02", COVERED, None, "bedrock_assessments", ["BR-34"], "", [], 3),
+    (
+        "AIR-BDR-GRD-02",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-34"],
+        "BR-34 requires a PROMPT_ATTACK filter with inputEnabled, BLOCK and HIGH "
+        "on the STANDARD tier for every reached guardrail version. Its 'Guardrail "
+        "Prompt Attack Invocation Evidence' row reads the last 24 hours of "
+        "CloudWatch invocation log records with logs:FilterLogEvents, fails a "
+        "guarded InvokeModel call whose input carries no guardContent tag, and "
+        "passes on a logged PROMPT_ATTACK block with every guarded call tagged. "
+        "Converse guardContent blocks and S3-only log destinations are not read",
+        [],
+        3,
+    ),
     ("AIR-BDR-GRD-04", COVERED, None, "bedrock_assessments", ["BR-32"], "", [], 3),
-    ("AIR-BDR-GRD-09", COVERED, None, "bedrock_assessments", ["BR-27"], "", [], 3),
+    (
+        "AIR-BDR-GRD-09",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-27"],
+        "BR-27 requires active GROUNDING and RELEVANCE filters with BLOCK and a "
+        "threshold above 0 and at most 0.99. Its 'Guardrail Contextual Grounding "
+        "Score Evidence' row fails when invocation logging delivers no text, so "
+        "no score is logged, and passes on a scored GROUNDING or RELEVANCE entry "
+        "read from the last 24 hours of CloudWatch invocation log records. Whether "
+        "callers supply the grounding qualifiers is not recorded by any API",
+        [],
+        3,
+    ),
     ("AIR-BDR-GRD-10", COVERED, None, "bedrock_assessments", ["BR-41"], "", [], 3),
     (
         "AIR-BDR-KB-06",

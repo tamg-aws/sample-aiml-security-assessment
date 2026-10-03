@@ -7936,6 +7936,8 @@ class TestBedrockHandlerMultiRegion:
     NEW_REGIONAL_CHECKS = {
         "check_bedrock_guardrail_pii_filters": "BR-26",
         "check_bedrock_guardrail_contextual_grounding": "BR-27",
+        "check_guardrail_grounding_score_evidence": "BR-27",
+        "check_guardrail_prompt_attack_invocation_evidence": "BR-34",
         "check_bedrock_agent_guardrail_association": "BR-28",
         "check_bedrock_agent_idle_session_ttl": "BR-29",
         "check_bedrock_imported_model_kms_encryption": "BR-30",
@@ -37831,3 +37833,362 @@ class TestBR33ContainerWorkloadImageScanning:
             "image returned)" in detail
         )
         assert "'ic-1'" not in detail
+
+
+class TestInvocationLogGuardrailEvidence:
+    """BR-34 and BR-27 read invocation log records for guardrail evidence."""
+
+    LOG_GROUP = "/aws/bedrock/model-invocation-logs"
+    TAG = "amazon-bedrock-guardrails-guardContent"
+    BODY_TEXT = "SECRET-PROMPT-TEXT"
+
+    def _record(self, request_id, operation="InvokeModel", inp=None, out=None):
+        record = {
+            "schemaType": "ModelInvocationLog",
+            "requestId": request_id,
+            "operation": operation,
+            "modelId": "anthropic.test",
+            "input": {},
+            "output": {"outputBodyJson": out if out is not None else {}},
+        }
+        if inp is not ...:
+            record["input"]["inputBodyJson"] = (
+                inp if inp is not None else {"prompt": self.BODY_TEXT}
+            )
+        return record
+
+    def _guarded(self, request_id, tagged, operation="InvokeModel"):
+        prompt = (
+            f"<{self.TAG}_xyz>{self.BODY_TEXT}</{self.TAG}_xyz>"
+            if tagged
+            else self.BODY_TEXT
+        )
+        return self._record(
+            request_id,
+            operation,
+            inp={"prompt": prompt},
+            out={"amazon-bedrock-guardrailAction": "NONE", "completion": "x"},
+        )
+
+    def _catch(self, request_id, action="BLOCKED"):
+        return self._record(
+            request_id,
+            "Converse",
+            out={
+                "stopReason": "guardrail_intervened",
+                "trace": {
+                    "guardrail": {
+                        "inputAssessment": {
+                            "g1": {
+                                "contentPolicy": {
+                                    "filters": [
+                                        {
+                                            "type": "PROMPT_ATTACK",
+                                            "confidence": "HIGH",
+                                            "action": action,
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                },
+            },
+        )
+
+    def _scored(self, request_id, score=0.31, filter_type="GROUNDING"):
+        item = {"type": filter_type, "threshold": 0.75, "action": "BLOCKED"}
+        if score is not None:
+            item["score"] = score
+        return self._record(
+            request_id,
+            "Converse",
+            out={
+                "trace": {
+                    "guardrail": {
+                        "outputAssessments": {
+                            "g1": [{"contextualGroundingPolicy": {"filters": [item]}}]
+                        }
+                    }
+                }
+            },
+        )
+
+    def _run(
+        self,
+        check,
+        pages,
+        *,
+        config=None,
+        config_error=None,
+        logs_error=None,
+        endless=False,
+    ):
+        """``pages`` maps a filter pattern to a list of pages of records."""
+        bedrock = MagicMock()
+        if config_error is not None:
+            bedrock.get_model_invocation_logging_configuration.side_effect = (
+                config_error
+            )
+        else:
+            bedrock.get_model_invocation_logging_configuration.return_value = (
+                config
+                if config is not None
+                else {
+                    "loggingConfig": {
+                        "textDataDeliveryEnabled": True,
+                        "cloudWatchConfig": {"logGroupName": self.LOG_GROUP},
+                    }
+                }
+            )
+        logs = MagicMock()
+
+        def filter_log_events(filterPattern, nextToken=None, **kwargs):
+            if logs_error is not None:
+                raise logs_error
+            assert kwargs["logGroupName"] == self.LOG_GROUP
+            assert kwargs["limit"] == bedrock_app.INVOCATION_LOG_SCAN_PAGE_SIZE
+            if endless:
+                return {"events": [], "nextToken": "again"}
+            listed = pages.get(filterPattern, [[]])
+            index = int(nextToken or 0)
+            response = {
+                "events": [
+                    {"message": json.dumps(record), "logStreamName": "s"}
+                    for record in listed[index]
+                ]
+            }
+            if index + 1 < len(listed):
+                response["nextToken"] = str(index + 1)
+            return response
+
+        logs.filter_log_events.side_effect = filter_log_events
+        self.logs = logs
+        clients = {"bedrock": bedrock, "logs": logs}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
+        ):
+            rows = extract_csv_data(check(region="us-east-1"))
+        for row in rows:
+            assert self.BODY_TEXT not in row["Finding_Details"]
+        return rows
+
+    PROMPT = '"PROMPT_ATTACK"'
+    GUARDED = '"amazon-bedrock-guardrailAction"'
+    GROUNDING = '"contextualGroundingPolicy"'
+
+    def _prompt(self, pages, **kwargs):
+        return self._run(
+            bedrock_app.check_guardrail_prompt_attack_invocation_evidence,
+            pages,
+            **kwargs,
+        )
+
+    def _grounding(self, pages, **kwargs):
+        return self._run(
+            bedrock_app.check_guardrail_grounding_score_evidence, pages, **kwargs
+        )
+
+    def test_an_untagged_guarded_invoke_call_fails_and_only_it_is_named(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [
+                    [
+                        self._guarded("req-tagged", True),
+                        self._guarded("req-untagged", False),
+                        self._guarded("req-converse", False, operation="Converse"),
+                        self._record("req-unguarded"),
+                    ]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 2 guarded InvokeModel call(s)" in detail
+        assert "req-untagged (InvokeModel anthropic.test)" in detail
+        for other in ("req-tagged", "req-converse", "req-unguarded"):
+            assert other not in detail
+
+    def test_the_untagged_call_on_a_later_page_is_read(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [
+                    [self._guarded("req-1", True)],
+                    [self._guarded("req-2", False, "InvokeModelWithResponseStream")],
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "req-2 (InvokeModelWithResponseStream" in rows[0]["Finding_Details"]
+
+    def test_a_catch_and_every_guarded_call_tagged_passes(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [
+                    [self._catch("req-catch"), self._catch("req-none", "NONE")]
+                ],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "1 prompt attack block(s) were logged in the last 24 hours: req-catch."
+            in detail
+        )
+        assert "Every one of the 1 guarded InvokeModel call(s)" in detail
+        assert "req-none" not in detail
+
+    def test_no_blocked_prompt_attack_is_na_not_passed(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-none", "NONE")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "No PROMPT_ATTACK block was logged" in rows[0]["Finding_Details"]
+
+    def test_a_body_that_is_not_inline_is_not_credited_as_tagged(self):
+        guarded = self._guarded("req-big", True)
+        del guarded["input"]["inputBodyJson"]
+        rows = self._prompt(
+            {self.PROMPT: [[self._catch("req-catch")]], self.GUARDED: [[guarded]]}
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "req-big (InvokeModel anthropic.test), whose request body is not inline"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "wiring, phrase",
+        [
+            (
+                {"logs_error": _make_client_error("AccessDeniedException")},
+                "(logs:FilterLogEvents, AccessDeniedException)",
+            ),
+            ({"endless": True}, "(page cap)"),
+            (
+                {
+                    "config": {
+                        "loggingConfig": {
+                            "textDataDeliveryEnabled": False,
+                            "cloudWatchConfig": {"logGroupName": LOG_GROUP},
+                        }
+                    }
+                },
+                "textDataDeliveryEnabled is False",
+            ),
+            (
+                {
+                    "config": {
+                        "loggingConfig": {
+                            "textDataDeliveryEnabled": True,
+                            "s3Config": {"bucketName": "logs"},
+                        }
+                    }
+                },
+                "delivered to Amazon S3 only",
+            ),
+            (
+                {"config_error": _make_client_error("AccessDeniedException")},
+                "bedrock:GetModelInvocationLoggingConfiguration, AccessDeniedException",
+            ),
+        ],
+    )
+    def test_an_unread_log_is_na_not_passed(self, wiring, phrase):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+            },
+            **wiring,
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
+
+    def test_a_scored_grounding_assessment_passes_and_names_the_score(self):
+        rows = self._grounding(
+            {
+                self.GROUNDING: [
+                    [self._scored("req-g", 0.31), self._scored("req-x", None)],
+                    [self._scored("req-r", 0.9, "RELEVANCE")],
+                ]
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "2 scored contextual grounding assessment(s)" in detail
+        assert "req-g GROUNDING score 0.31 threshold 0.75 action BLOCKED" in detail
+        assert "req-r RELEVANCE score 0.9" in detail
+        assert "req-x" not in detail
+
+    def test_no_scored_assessment_is_na(self):
+        rows = self._grounding({self.GROUNDING: [[self._scored("req-x", None)]]})
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "no scored GROUNDING or RELEVANCE assessment was read in 1"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},
+            {
+                "loggingConfig": {
+                    "textDataDeliveryEnabled": False,
+                    "cloudWatchConfig": {"logGroupName": LOG_GROUP},
+                }
+            },
+        ],
+    )
+    def test_logging_without_text_fails_grounding_capture(self, config):
+        rows = self._grounding(
+            {self.GROUNDING: [[self._scored("req-g")]]}, config=config
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "Grounding scores are not captured" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "wiring, phrase",
+        [
+            (
+                {"logs_error": _make_client_error("AccessDeniedException")},
+                "(logs:FilterLogEvents, AccessDeniedException)",
+            ),
+            (
+                {
+                    "config": {
+                        "loggingConfig": {
+                            "textDataDeliveryEnabled": True,
+                            "s3Config": {"bucketName": "logs"},
+                        }
+                    }
+                },
+                "delivered to Amazon S3 only",
+            ),
+            (
+                {"config_error": _make_client_error("AccessDeniedException")},
+                "bedrock:GetModelInvocationLoggingConfiguration",
+            ),
+        ],
+    )
+    def test_an_unread_grounding_source_is_na(self, wiring, phrase):
+        rows = self._grounding({self.GROUNDING: [[self._scored("req-g")]]}, **wiring)
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]

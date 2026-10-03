@@ -477,6 +477,15 @@ Resources:
             Action:
               - logs:DescribeLogStreams # BR-04
             Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+          - Sid: InvocationLogEventRead
+            # BR-27 and BR-34 read the last 24 hours of invocation log records
+            # that match a guardrail field, and report request IDs and scores,
+            # never a body. The service authorization reference gives
+            # FilterLogEvents the log-group resource type.
+            Effect: Allow
+            Action:
+              - logs:FilterLogEvents # BR-27, BR-34
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
           - Sid: RedshiftQueryEngineRead
             # BR-20 reads the key and public access of the Redshift engine
             # behind a SQL knowledge base. The service authorization reference
