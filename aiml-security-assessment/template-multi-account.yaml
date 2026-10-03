@@ -803,7 +803,7 @@ Resources:
               Action:
                 - s3:GetEncryptionConfiguration
                 - s3:GetLifecycleConfiguration # BR-04
-                - s3:GetBucketPolicy # BR-47
+                - s3:GetBucketPolicy # BR-47, BR-42
                 - s3:GetBucketVersioning # BR-04, BR-52
                 - s3:GetBucketObjectLockConfiguration # BR-52, BR-04
                 - s3:GetReplicationConfiguration # BR-04

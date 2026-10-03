@@ -9828,14 +9828,164 @@ class TestBR42ModelAllowList:
         "regions": ["us-east-1"],
     }
 
-    def _run(self, cache, training_data=None):
+    def _run(self, cache, training_data=None, bucket_policies=None):
         return extract_csv_data(
             bedrock_app.check_bedrock_model_allow_list(
                 cache,
                 region="Global",
                 training_data=training_data or self.NO_TRAINING_DATA,
+                bucket_policies=bucket_policies or {"policies": {}, "errors": []},
             )
         )
+
+    # --- Training bucket policies (AIR-FND-IAM-01) ---------------------------
+
+    ONE_TRAINING_BUCKET = {
+        "buckets": {"train-a": ["the training data of customization job 'j1'"]},
+        "errors": [],
+        "truncated": [],
+        "regions": ["us-east-1"],
+    }
+
+    def _scoped_cache(self):
+        return _identity_cache(
+            roles={
+                "ScopedRole": [
+                    ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                ]
+            }
+        )
+
+    @staticmethod
+    def _policy(**statement):
+        return json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "Read",
+                        "Effect": "Allow",
+                        "Action": "s3:GetObject",
+                        "Resource": "arn:aws:s3:::train-a/*",
+                        **statement,
+                    }
+                ],
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Principal": "*"},
+            {"Principal": {"AWS": "*"}, "Action": "s3:*"},
+            {"Principal": {"AWS": ["*"]}, "Resource": "arn:aws:s3:::train-*/*"},
+            {"NotPrincipal": {"AWS": "arn:aws:iam::123456789012:role/Other"}},
+        ],
+    )
+    def test_br42_a_bucket_policy_open_to_every_principal_fails(self, statement):
+        """BR-42 read only identity-policy grants, so a training bucket whose own
+        policy lets every principal read it passed. Before the fix no row named it."""
+        findings = self._run(
+            self._scoped_cache(),
+            training_data=self.ONE_TRAINING_BUCKET,
+            bucket_policies={
+                "policies": {"train-a": self._policy(**statement)},
+                "errors": [],
+            },
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert failed[0]["Severity"] == "High"
+        assert (
+            "Training data bucket 'train-a' (the training data of customization job "
+            "'j1') has a bucket policy statement 'Read' that allows s3:GetObject to "
+            "every principal with no condition"
+        ) in failed[0]["Finding_Details"]
+        assert [f["Status"] for f in findings].count("Passed") == 1
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Principal": {"AWS": "arn:aws:iam::123456789012:role/Trainer"}},
+            {"Principal": "*", "Effect": "Deny"},
+            {"Principal": "*", "Action": "s3:PutObject"},
+            {"Principal": "*", "Resource": "arn:aws:s3:::other-bucket/*"},
+            {"Principal": {"Service": "bedrock.amazonaws.com"}},
+        ],
+    )
+    def test_br42_a_bucket_policy_naming_its_readers_passes(self, statement):
+        findings = self._run(
+            self._scoped_cache(),
+            training_data=self.ONE_TRAINING_BUCKET,
+            bucket_policies={
+                "policies": {"train-a": self._policy(**statement)},
+                "errors": [],
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "The bucket policies of the 1 training data bucket(s) were read; "
+            "none allows s3:GetObject to every principal with no condition."
+        ) in findings[0]["Finding_Details"]
+
+    def test_br42_a_conditioned_open_bucket_grant_is_named_not_judged(self):
+        findings = self._run(
+            self._scoped_cache(),
+            training_data=self.ONE_TRAINING_BUCKET,
+            bucket_policies={
+                "policies": {
+                    "train-a": self._policy(
+                        Principal="*",
+                        Condition={"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+                    )
+                },
+                "errors": [],
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "Statement 'Read' on bucket 'train-a' allows s3:GetObject to every "
+            "principal under a StringEquals aws:SourceVpce condition, which is "
+            "not evaluated."
+        ) in findings[0]["Finding_Details"]
+
+    def test_br42_an_unread_training_bucket_policy_withholds_passed(self):
+        findings = self._run(
+            self._scoped_cache(),
+            training_data=self.ONE_TRAINING_BUCKET,
+            bucket_policies={
+                "policies": {},
+                "errors": [
+                    "bucket 'train-a' policy was not read with s3:GetBucketPolicy "
+                    "(AccessDenied)"
+                ],
+            },
+        )
+        assert "Passed" not in [f["Status"] for f in findings]
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "bucket 'train-a' policy was not read with s3:GetBucketPolicy" in (
+            details
+        )
+
+    def test_br42_training_bucket_policies_are_read_per_bucket(self):
+        s3 = MagicMock()
+
+        def get_policy(Bucket):
+            if Bucket == "no-policy":
+                raise _client_error("NoSuchBucketPolicy", operation="GetBucketPolicy")
+            if Bucket == "denied":
+                raise _client_error("AccessDenied", operation="GetBucketPolicy")
+            return {"Policy": '{"Statement": []}'}
+
+        s3.get_bucket_policy.side_effect = get_policy
+        with patch.object(bedrock_app.boto3, "client", return_value=s3):
+            result = bedrock_app._training_bucket_policies(
+                {"read": [], "no-policy": [], "denied": []}
+            )
+        assert result["policies"] == {"read": '{"Statement": []}', "no-policy": None}
+        assert result["errors"] == [
+            "bucket 'denied' policy was not read with s3:GetBucketPolicy (AccessDenied)"
+        ]
 
     def test_br42_named_arn_passes_while_wildcard_fails(self):
         findings = self._run(

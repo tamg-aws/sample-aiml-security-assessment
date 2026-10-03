@@ -1454,6 +1454,11 @@ FOUNDATION_ROWS = [
         ["BR-42", "SM-02"],
         "BR-42 fails each cached role or user whose Bedrock invocation grant reaches "
         "every model instead of naming foundation-model or inference-profile ARNs. "
+        "On the training data buckets of customization and SageMaker training jobs "
+        "it fails an identity s3:GetObject grant that reaches the bucket through a "
+        "wildcard, and reads each bucket policy with s3:GetBucketPolicy: an Allow "
+        "of s3:GetObject to every principal with no condition fails, a conditioned "
+        "one is named and not evaluated, and an unread policy withholds Passed. "
         "SM-02 fails each cached role or user whose sagemaker:InvokeEndpoint grant "
         "reaches every endpoint with no aws:ResourceTag condition that narrows "
         "it; a Like value made only of wildcards narrows nothing. Together they "

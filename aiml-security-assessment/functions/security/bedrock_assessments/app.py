@@ -21151,6 +21151,73 @@ def _training_data_buckets() -> Dict[str, Any]:
     }
 
 
+def _training_bucket_policies(training_buckets: Dict[str, List[str]]) -> Dict[str, Any]:
+    """
+    Read the bucket policy of each training data bucket. A bucket with no
+    policy maps to None; a read that fails is an error, never an empty policy.
+    """
+    policies: Dict[str, Optional[str]] = {}
+    errors = []
+    s3_client = boto3.client("s3", config=boto3_config)
+    for bucket in sorted(training_buckets):
+        try:
+            policies[bucket] = s3_client.get_bucket_policy(Bucket=bucket).get("Policy")
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") == "NoSuchBucketPolicy":
+                policies[bucket] = None
+                continue
+            errors.append(
+                f"bucket '{bucket}' policy was not read with s3:GetBucketPolicy "
+                f"({get_assessment_error_label(error)})"
+            )
+        except BotoCoreError as error:
+            errors.append(
+                f"bucket '{bucket}' policy was not read with s3:GetBucketPolicy "
+                f"({get_assessment_error_label(error)})"
+            )
+    return {"policies": policies, "errors": errors}
+
+
+def _open_training_bucket_grants(bucket: str, document: Any) -> Dict[str, List[str]]:
+    """
+    Name the Allow statements of a bucket policy that let every principal
+    s3:GetObject the bucket's objects, split by whether a Condition limits them.
+    """
+    grants: Dict[str, List[str]] = {"open": [], "conditioned": []}
+    for index, statement in enumerate(_policy_statements(document), start=1):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if not _deny_principal_reach(statement)["all_principals"] and (
+            "NotPrincipal" not in statement
+        ):
+            continue
+        reach = _training_data_reach([statement], bucket)
+        if not (reach["open"] or reach["named"]):
+            continue
+        sid = str(statement.get("Sid") or f"statement {index}")
+        condition = statement.get("Condition")
+        keys = sorted(
+            {
+                f"{operator} {key}"
+                for operator, block in (
+                    condition.items() if isinstance(condition, dict) else []
+                )
+                for key in (block if isinstance(block, dict) else {"": None})
+            }
+        )
+        if condition and not keys:
+            keys = ["unreadable"]
+        if keys:
+            grants["conditioned"].append(
+                f"Statement '{sid}' on bucket '{bucket}' allows s3:GetObject to "
+                f"every principal under a {', '.join(keys)} condition, which is "
+                "not evaluated."
+            )
+        else:
+            grants["open"].append(sid)
+    return grants
+
+
 def _identity_model_access(
     permissions: Dict[str, Any], training_buckets: Dict[str, List[str]]
 ) -> Dict[str, Any]:
@@ -21288,7 +21355,10 @@ def _identity_model_access(
 
 
 def check_bedrock_model_allow_list(
-    permission_cache, region: str = "", training_data: Optional[Dict[str, Any]] = None
+    permission_cache,
+    region: str = "",
+    training_data: Optional[Dict[str, Any]] = None,
+    bucket_policies: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-42: Verify identity policies restrict Bedrock model invocation, including
@@ -21313,6 +21383,11 @@ def check_bedrock_model_allow_list(
         if training_data is None:
             training_data = _training_data_buckets()
         training_buckets = training_data.get("buckets") or {}
+        if bucket_policies is None:
+            bucket_policies = _training_bucket_policies(training_buckets)
+        training_errors = list(training_data.get("errors") or []) + list(
+            bucket_policies["errors"]
+        )
 
         unrestricted = []
         scoped = []
@@ -21390,8 +21465,49 @@ def check_bedrock_model_allow_list(
                 )
             )
 
+        conditioned_grants = []
+        for bucket, document in sorted(bucket_policies["policies"].items()):
+            if document is None or bucket not in training_buckets:
+                continue
+            try:
+                grants = _open_training_bucket_grants(bucket, document)
+            except (ValueError, TypeError) as error:
+                training_errors.append(
+                    f"bucket '{bucket}' policy could not be parsed ({error})"
+                )
+                continue
+            conditioned_grants.extend(grants["conditioned"])
+            if not grants["open"]:
+                continue
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-42",
+                    finding_name=check_name,
+                    finding_details=(
+                        "Training data bucket '{}' ({}) has a bucket policy "
+                        "statement {} that allows s3:GetObject to every principal "
+                        "with no condition, so any AWS identity, in any account, "
+                        "can read the training data without an identity-policy "
+                        "grant.".format(
+                            bucket,
+                            "; ".join(training_buckets[bucket][:2]),
+                            ", ".join(f"'{sid}'" for sid in grants["open"]),
+                        )
+                    ),
+                    resolution=(
+                        "Name the principals that may read the training data in "
+                        "the bucket policy, and keep S3 Block Public Access on."
+                    ),
+                    reference=MODEL_ALLOW_LIST_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
         training_note = ""
-        if training_data.get("errors"):
+        if training_errors:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-42",
@@ -21399,9 +21515,8 @@ def check_bedrock_model_allow_list(
                     finding_details=(
                         "Access to model training data was not fully assessed "
                         "because the model customization and SageMaker training "
-                        "jobs could not all be read: {}.".format(
-                            "; ".join(training_data.get("errors") or [])[:1500]
-                        )
+                        "jobs, or the policies of their buckets, could not all be "
+                        "read: {}.".format("; ".join(training_errors)[:1500])
                     ),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=MODEL_ALLOW_LIST_REFERENCE,
@@ -21415,8 +21530,13 @@ def check_bedrock_model_allow_list(
                 " s3:GetObject grants were tested against {} training data "
                 "bucket(s) of model customization and SageMaker training jobs in "
                 "{} assessed Region(s); "
-                "statement conditions on those grants are not evaluated.".format(
-                    len(training_buckets), len(training_data.get("regions") or [])
+                "statement conditions on those grants are not evaluated. The bucket "
+                "policies of the {} training data bucket(s) were read; none allows "
+                "s3:GetObject to every principal with no condition.{}".format(
+                    len(training_buckets),
+                    len(training_data.get("regions") or []),
+                    len(training_buckets),
+                    "".join(f" {grant}" for grant in conditioned_grants[:5]),
                 )
             )
         else:
@@ -21448,7 +21568,7 @@ def check_bedrock_model_allow_list(
                     region=region,
                 )
             )
-            if training_data.get("errors"):
+            if training_errors:
                 # The training data leg was not fully read, so an unscoped
                 # s3:GetObject grant on an unread job's bucket may be missed.
                 row = findings["csv_data"][-1]
