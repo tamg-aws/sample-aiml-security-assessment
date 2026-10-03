@@ -13106,6 +13106,132 @@ def _assess_kendra_index_encryption(
     return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
 
 
+def _redshift_serverless_engine(arn: str, store_region: str) -> Tuple[str, str]:
+    """Judge a Redshift Serverless workgroup and its namespace key: (status, text)."""
+    client = boto3.client(
+        "redshift-serverless", config=boto3_config, region_name=store_region
+    )
+    located = f"Redshift Serverless workgroup '{arn}'"
+    try:
+        workgroup = next(
+            (
+                item
+                for page in client.get_paginator("list_workgroups").paginate()
+                for item in page.get("workgroups") or []
+                if item.get("workgroupArn") == arn
+            ),
+            None,
+        )
+    except (ClientError, BotoCoreError) as error:
+        return "N/A", (
+            f"queries {located}, which was not read: "
+            f"{_store_read_error(error, 'redshift-serverless:ListWorkgroups', store_region)}"
+        )
+    if workgroup is None:
+        return "N/A", (
+            f"queries {located}, which ListWorkgroups does not return in "
+            f"{store_region}, so it was not judged"
+        )
+    if workgroup.get("publiclyAccessible") is True:
+        return "Failed", f"queries {located}, which is publiclyAccessible"
+    namespace = str(workgroup.get("namespaceName") or "")
+    try:
+        detail = client.get_namespace(namespaceName=namespace).get("namespace") or {}
+    except (ClientError, BotoCoreError) as error:
+        return "N/A", (
+            f"queries {located}, whose namespace '{namespace}' key was not read: "
+            f"{_store_read_error(error, 'redshift-serverless:GetNamespace', store_region)}"
+        )
+    key = str(detail.get("kmsKeyId") or "")
+    if not key or key == "AWS_OWNED_KMS_KEY":
+        return "Failed", (
+            f"queries {located}, whose namespace '{namespace}' reports kmsKeyId "
+            f"{key or 'absent'}, so it names no customer managed KMS key"
+        )
+    status, observed = _kms_key_verdict(key, store_region)
+    return status, (
+        f"queries {located}, not publicly accessible, whose namespace "
+        f"'{namespace}' is encrypted with {observed}"
+    )
+
+
+def _redshift_provisioned_engine(identifier: str, store_region: str) -> Tuple[str, str]:
+    """Judge a provisioned Redshift cluster's key and public access: (status, text)."""
+    located = f"Redshift cluster '{identifier}'"
+    try:
+        clusters = (
+            boto3.client("redshift", config=boto3_config, region_name=store_region)
+            .describe_clusters(ClusterIdentifier=identifier)
+            .get("Clusters")
+            or []
+        )
+    except (ClientError, BotoCoreError) as error:
+        return "N/A", (
+            f"queries {located}, which was not read: "
+            f"{_store_read_error(error, 'redshift:DescribeClusters', store_region)}"
+        )
+    if not clusters:
+        return "N/A", f"queries {located}, which DescribeClusters does not return"
+    cluster = clusters[0]
+    if cluster.get("PubliclyAccessible") is True:
+        return "Failed", f"queries {located}, which is PubliclyAccessible"
+    if cluster.get("Encrypted") is not True or not cluster.get("KmsKeyId"):
+        return "Failed", (
+            f"queries {located}, which reports Encrypted "
+            f"{cluster.get('Encrypted')} and no KmsKeyId"
+        )
+    status, observed = _kms_key_verdict(str(cluster["KmsKeyId"]), store_region)
+    return status, (
+        f"queries {located}, not publicly accessible, encrypted with {observed}"
+    )
+
+
+def _assess_redshift_query_engine(
+    kb_configuration: Dict[str, Any], region: str
+) -> Dict[str, str]:
+    """
+    Judge the Redshift query engine behind a SQL knowledge base: the cluster or
+    Serverless namespace key and whether it is publicly accessible. Tables a
+    storage configuration reads from the AWS Glue Data Catalog keep their data
+    in S3, which is not read, so such a store is not Passed.
+    """
+    redshift = (kb_configuration.get("sqlKnowledgeBaseConfiguration") or {}).get(
+        "redshiftConfiguration"
+    ) or {}
+    engine = redshift.get("queryEngineConfiguration") or {}
+    engine_type = engine.get("type")
+    if engine_type == "SERVERLESS":
+        arn = str(
+            (engine.get("serverlessConfiguration") or {}).get("workgroupArn") or ""
+        )
+        status, text = _redshift_serverless_engine(arn, _arn_region(arn) or region)
+    elif engine_type == "PROVISIONED":
+        identifier = str(
+            (engine.get("provisionedConfiguration") or {}).get("clusterIdentifier")
+            or ""
+        )
+        status, text = _redshift_provisioned_engine(identifier, region)
+    else:
+        return _store_verdict(
+            "N/A",
+            f"is a SQL knowledge base with query engine type {engine_type or 'absent'}, "
+            "which this check does not read.",
+        )
+    catalogs = [
+        storage
+        for storage in redshift.get("storageConfigurations") or []
+        if storage.get("type") == "AWS_DATA_CATALOG"
+    ]
+    if catalogs and status == "Passed":
+        return _store_verdict(
+            "N/A",
+            f"is a SQL knowledge base that {text}, but {len(catalogs)} storage "
+            "configuration(s) read tables from the AWS Glue Data Catalog, whose data "
+            "sits in S3 and is not judged.",
+        )
+    return _store_verdict(status, f"is a SQL knowledge base that {text}.")
+
+
 KB_DATA_SOURCE_ENCRYPTION_FINDING = "Knowledge Base Data Source Bucket Encryption"
 
 KB_DATA_SOURCE_ENCRYPTION_RESOLUTION = (
@@ -13580,6 +13706,12 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                         kbs_store_assessments.append(assessment)
                     elif kb_type == "KENDRA":
                         assessment = _assess_kendra_index_encryption(
+                            kb_configuration, region
+                        )
+                        assessment.update({"name": kb_name, "id": kb_id})
+                        kbs_store_assessments.append(assessment)
+                    elif kb_type == "SQL":
+                        assessment = _assess_redshift_query_engine(
                             kb_configuration, region
                         )
                         assessment.update({"name": kb_name, "id": kb_id})

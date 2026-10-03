@@ -70,7 +70,10 @@ AI_SUBJECT_ROWS = [
         "publicConnectivity true; an absent field is N/A. For Aurora it fails a "
         "cluster with a PubliclyAccessible member instance (rds:DescribeDBInstances "
         "per DBClusterMembers entry), and an unread instance is N/A; database "
-        "credentials themselves are not judged. A MANAGED store is judged on its key "
+        "credentials themselves are not judged. For a SQL knowledge base it fails a "
+        "Redshift cluster with PubliclyAccessible true or a Serverless workgroup with "
+        "publiclyAccessible true, and holds an AWS_DATA_CATALOG store at N/A. A "
+        "MANAGED store is judged on its key "
         "alone, and whether access matches the source data's is not compared",
         [],
         3,
@@ -1128,7 +1131,9 @@ AI_SUBJECT_ROWS = [
         "store, an S3 Vectors store, and the OpenSearch Serverless, Aurora, OpenSearch "
         "domain and Neptune Analytics store each knowledge base names, and the Kendra "
         "index of a KENDRA knowledge base (kendra:DescribeIndex KmsKeyId; none named "
-        "fails), each judged by "
+        "fails), and the Redshift engine of a SQL knowledge base (a provisioned "
+        "cluster's KmsKeyId, failing when Encrypted is false, or a Serverless "
+        "namespace's kmsKeyId, failing on AWS_OWNED_KMS_KEY), each judged by "
         "DescribeKey as customer managed and Enabled, plus the default encryption of each "
         "data source bucket, which is where the ingested objects sit before any index "
         "exists, and each data source's transient data key; BR-11 the custom model's "

@@ -34409,6 +34409,225 @@ class TestBR20ValueDepth:
         assert "no readable kendraIndexArn" in rows[0]["Finding_Details"]
         kendra.describe_index.assert_not_called()
 
+    WORKGROUP = f"arn:aws:redshift-serverless:us-west-2:{ACCOUNT}:workgroup/wg-1"
+
+    @classmethod
+    def _sql_body(cls, engine, storage=("REDSHIFT",)):
+        return {
+            "knowledgeBaseConfiguration": {
+                "type": "SQL",
+                "sqlKnowledgeBaseConfiguration": {
+                    "type": "REDSHIFT",
+                    "redshiftConfiguration": {
+                        "storageConfigurations": [{"type": s} for s in storage],
+                        "queryEngineConfiguration": engine,
+                    },
+                },
+            }
+        }
+
+    @classmethod
+    def _serverless_engine(cls, arn=None):
+        return {
+            "type": "SERVERLESS",
+            "serverlessConfiguration": {"workgroupArn": arn or cls.WORKGROUP},
+        }
+
+    @staticmethod
+    def _provisioned_engine(identifier="c1"):
+        return {
+            "type": "PROVISIONED",
+            "provisionedConfiguration": {"clusterIdentifier": identifier},
+        }
+
+    def _serverless(self, pages, namespace=None, list_error=None, get_error=None):
+        client = MagicMock()
+        paginator = client.get_paginator.return_value
+        if list_error is not None:
+            paginator.paginate.side_effect = list_error
+        else:
+            paginator.paginate.return_value = [{"workgroups": page} for page in pages]
+        if get_error is not None:
+            client.get_namespace.side_effect = get_error
+        else:
+            client.get_namespace.return_value = {"namespace": namespace or {}}
+        return client
+
+    def _workgroup(self, public=False, arn=None):
+        return {
+            "workgroupArn": arn or self.WORKGROUP,
+            "namespaceName": "ns-1",
+            "publiclyAccessible": public,
+        }
+
+    def _cluster(self, clusters=None, error=None):
+        client = MagicMock()
+        if error is not None:
+            client.describe_clusters.side_effect = error
+        else:
+            client.describe_clusters.return_value = {"Clusters": clusters or []}
+        return client
+
+    def test_sql_serverless_on_a_second_page_with_a_customer_key_passes(self):
+        """KB-03/DAT-01: a SQL knowledge base queries Redshift, whose key and
+        public access were never read; before the fix it fell into the vector
+        store branch. The workgroup sits on the second ListWorkgroups page."""
+        other = self._workgroup(arn=self.WORKGROUP.replace("wg-1", "wg-0"), public=True)
+        client = self._serverless(
+            [[other], [self._workgroup()]], {"kmsKeyId": self.CMK}
+        )
+        rows = self._run(
+            {"kb1": self._sql_body(self._serverless_engine())},
+            clients={"redshift-serverless": client},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        client.get_namespace.assert_called_once_with(namespaceName="ns-1")
+        assert ("redshift-serverless", "us-west-2") in self.built
+        assert (
+            f"Redshift Serverless workgroup '{self.WORKGROUP}'"
+            in rows[0]["Finding_Details"]
+        )
+        assert "not publicly accessible" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "workgroup_public, namespace, phrase",
+        [
+            (True, {"kmsKeyId": CMK}, "which is publiclyAccessible"),
+            (False, {"kmsKeyId": "AWS_OWNED_KMS_KEY"}, "kmsKeyId AWS_OWNED_KMS_KEY"),
+            (False, {}, "kmsKeyId absent"),
+            (False, {"kmsKeyId": AWS_KEY}, "not a customer managed key"),
+        ],
+    )
+    def test_sql_serverless_public_or_without_a_customer_key_fails(
+        self, workgroup_public, namespace, phrase
+    ):
+        client = self._serverless(
+            [[self._workgroup(public=workgroup_public)]], namespace
+        )
+        rows = self._run(
+            {"kb1": self._sql_body(self._serverless_engine())},
+            clients={"redshift-serverless": client},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert phrase in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kwargs, action",
+        [
+            (
+                {
+                    "list_error": _client_error(
+                        "AccessDeniedException", "d", "ListWorkgroups"
+                    )
+                },
+                "redshift-serverless:ListWorkgroups",
+            ),
+            (
+                {
+                    "get_error": _client_error(
+                        "AccessDeniedException", "d", "GetNamespace"
+                    )
+                },
+                "redshift-serverless:GetNamespace",
+            ),
+        ],
+    )
+    def test_sql_serverless_unread_is_na(self, kwargs, action):
+        client = self._serverless([[self._workgroup()]], **kwargs)
+        rows = self._run(
+            {"kb1": self._sql_body(self._serverless_engine())},
+            clients={"redshift-serverless": client},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert action in rows[0]["Finding_Details"]
+
+    def test_sql_serverless_workgroup_not_listed_is_na(self):
+        other = self._workgroup(arn=self.WORKGROUP.replace("wg-1", "wg-0"))
+        client = self._serverless([[other]], {"kmsKeyId": self.CMK})
+        rows = self._run(
+            {"kb1": self._sql_body(self._serverless_engine())},
+            clients={"redshift-serverless": client},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        client.get_namespace.assert_not_called()
+
+    def test_sql_provisioned_private_cluster_with_a_customer_key_passes(self):
+        client = self._cluster(
+            [{"PubliclyAccessible": False, "Encrypted": True, "KmsKeyId": self.CMK}]
+        )
+        rows = self._run(
+            {"kb1": self._sql_body(self._provisioned_engine())},
+            clients={"redshift": client},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        client.describe_clusters.assert_called_once_with(ClusterIdentifier="c1")
+        assert "Redshift cluster 'c1'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "cluster, phrase",
+        [
+            (
+                {"PubliclyAccessible": True, "Encrypted": True, "KmsKeyId": CMK},
+                "which is PubliclyAccessible",
+            ),
+            ({"PubliclyAccessible": False, "Encrypted": False}, "Encrypted False"),
+            (
+                {"PubliclyAccessible": False, "Encrypted": True, "KmsKeyId": OFF_KEY},
+                "state Disabled",
+            ),
+        ],
+    )
+    def test_sql_provisioned_public_or_unencrypted_fails(self, cluster, phrase):
+        rows = self._run(
+            {"kb1": self._sql_body(self._provisioned_engine())},
+            clients={"redshift": self._cluster([cluster])},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert phrase in rows[0]["Finding_Details"]
+
+    def test_sql_provisioned_unread_is_na(self):
+        rows = self._run(
+            {"kb1": self._sql_body(self._provisioned_engine())},
+            clients={
+                "redshift": self._cluster(
+                    error=_client_error("AccessDenied", "d", "DescribeClusters")
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "redshift:DescribeClusters" in rows[0]["Finding_Details"]
+
+    def test_sql_data_catalog_storage_holds_a_passing_engine_at_na(self):
+        client = self._cluster(
+            [{"PubliclyAccessible": False, "Encrypted": True, "KmsKeyId": self.CMK}]
+        )
+        rows = self._run(
+            {
+                "kb1": self._sql_body(
+                    self._provisioned_engine(),
+                    storage=("REDSHIFT", "AWS_DATA_CATALOG"),
+                ),
+                "kb2": self._sql_body(self._provisioned_engine()),
+            },
+            clients={"redshift": client},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert "AWS Glue Data Catalog" in rows[0]["Finding_Details"]
+
+    def test_sql_data_catalog_storage_does_not_soften_a_failure(self):
+        client = self._cluster(
+            [{"PubliclyAccessible": True, "Encrypted": True, "KmsKeyId": self.CMK}]
+        )
+        rows = self._run(
+            {
+                "kb1": self._sql_body(
+                    self._provisioned_engine(), storage=("AWS_DATA_CATALOG",)
+                )
+            },
+            clients={"redshift": client},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
     def test_neptune_without_a_key_fails(self):
         graph = MagicMock()
         graph.get_graph.return_value = {}

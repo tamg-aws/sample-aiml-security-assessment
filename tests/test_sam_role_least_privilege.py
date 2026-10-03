@@ -165,6 +165,9 @@ _EXPECTED_ACTIONS = {
         "iam:GetPolicyVersion",
         "kendra:DescribeIndex",
         "rds:DescribeDBInstances",
+        "redshift-serverless:GetNamespace",
+        "redshift-serverless:ListWorkgroups",
+        "redshift:DescribeClusters",
         "s3:ListBucket",
         "sagemaker:DescribeEndpoint",
         "sagemaker:DescribeEndpointConfig",
@@ -821,6 +824,14 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
             scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
             scoped("kendra:DescribeIndex", "kendra:*:${AWS::AccountId}:index/*"),
+            scoped(
+                "redshift:DescribeClusters", "redshift:*:${AWS::AccountId}:cluster:*"
+            ),
+            scoped(
+                "redshift-serverless:GetNamespace",
+                "redshift-serverless:*:${AWS::AccountId}:namespace/*",
+            ),
+            ("Allow", "redshift-serverless:ListWorkgroups", '"*"'),
             scoped(
                 "bedrock-agentcore:GetMemory",
                 "bedrock-agentcore:*:${AWS::AccountId}:memory/*",

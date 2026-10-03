@@ -469,6 +469,27 @@ Resources:
             Action:
               - kendra:DescribeIndex # BR-20
             Resource: !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
+          - Sid: RedshiftQueryEngineRead
+            # BR-20 reads the key and public access of the Redshift engine
+            # behind a SQL knowledge base. The service authorization reference
+            # gives DescribeClusters the cluster resource type and GetNamespace
+            # the namespace resource type.
+            Effect: Allow
+            Action:
+              - redshift:DescribeClusters # BR-20
+            Resource: !Sub 'arn:${AWS::Partition}:redshift:*:${AWS::AccountId}:cluster:*'
+          - Sid: RedshiftServerlessNamespaceRead
+            Effect: Allow
+            Action:
+              - redshift-serverless:GetNamespace # BR-20
+            Resource: !Sub 'arn:${AWS::Partition}:redshift-serverless:*:${AWS::AccountId}:namespace/*'
+          - Sid: RedshiftServerlessWorkgroupList
+            # The service authorization reference lists no resource type for
+            # ListWorkgroups.
+            Effect: Allow
+            Action:
+              - redshift-serverless:ListWorkgroups # BR-20
+            Resource: '*'
           - Sid: AgentCoreMemoryRead
             # BR-04 reads eventExpiryDuration on each AgentCore memory. The
             # service authorization reference gives GetMemory the memory
