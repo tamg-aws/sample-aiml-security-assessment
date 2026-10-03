@@ -3633,13 +3633,14 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
         label = statement.get("Sid") or f"#{index + 1}"
         # A scope key bounds the Allow only when a positive test pins it to
         # exact values: a negated test admits everyone it does not name, an
-        # IfExists test admits a request without the key, and a wildcard value
-        # admits every principal or network it matches.
+        # IfExists test or a ForAllValues: prefix admits a request without the
+        # key, and a wildcard value admits every principal or network it matches.
         scope_keys = sorted(
             {
                 key
                 for operator, key, values in _condition_keys_by_operator(statement)
                 if _is_endpoint_scope_condition_key(key)
+                and not operator.startswith("forallvalues:")
                 and "not" not in _strip_condition_set_operator(operator)
                 and not _strip_condition_set_operator(operator).endswith("ifexists")
                 and _strip_condition_set_operator(operator) != "null"
@@ -11714,6 +11715,7 @@ def _deny_restricts_reads(statement: Dict[str, Any], index_resource: str) -> boo
         base = _strip_condition_set_operator(operator)
         if (
             key not in PRINCIPAL_CONDITION_KEYS
+            or operator.startswith("foranyvalue:")
             or base.endswith("ifexists")
             or base
             not in ("stringnotequals", "stringnotlike", "arnnotequals", "arnnotlike")
@@ -22450,6 +22452,8 @@ def _mantle_model_list_control(statement: Dict[str, Any]) -> Optional[Dict[str, 
     operator, values = list_test
     named = [str(value) for value in values]
     gaps = []
+    if operator.startswith("foranyvalue:"):
+        gaps.append(_for_any_value_deny_gap(operator, MANTLE_MODEL_CONDITION_KEY))
     open_values = [value for value in named if any(char in value for char in "*?")]
     if open_values:
         gaps.append(
@@ -22492,6 +22496,18 @@ def _mantle_model_list_control(statement: Dict[str, Any]) -> Optional[Dict[str, 
     }
 
 
+def _for_any_value_deny_gap(operator: str, key: str) -> str:
+    """
+    Name the gap in a negated Deny list carried by a ForAnyValue: operator.
+    ForAnyValue: is false when the key is absent from the request, so the Deny
+    does not fire on a request that sends no such key.
+    """
+    return (
+        f"its operator {operator} is false when {key} is absent from the "
+        "request, so the Deny does not fire on a request without that key"
+    )
+
+
 def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
     """
     Describe every Deny statement that denies model invocation outside a list of
@@ -22507,8 +22523,11 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
 
     ``gaps`` names what keeps a control from denying every unlisted model: a
     list value with a wildcard in its resource type or ID, which exempts every
-    model it matches, or a condition key besides the list, which denies only
-    the requests that also meet it. A control with gaps is not credited.
+    model it matches, a condition key besides the list, which denies only
+    the requests that also meet it, or a ForAnyValue: list operator, which does
+    not fire on a request without the key. bedrock:InvokeModelWithResponseStream
+    defines no bedrock:ModelArn and a direct foundation-model call sends no
+    bedrock:InferenceProfileArn. A control with gaps is not credited.
     """
     controls = []
     for statement in _policy_statements(document):
@@ -22559,6 +22578,8 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
         if not named:
             continue
         gaps = []
+        if list_key is not None and list_key[0].startswith("foranyvalue:"):
+            gaps.append(_for_any_value_deny_gap(*list_key))
         open_values = [
             str(value)
             for value in listed
@@ -23424,8 +23445,8 @@ def _deny_applies_to_every_resource(statement: Dict[str, Any]) -> bool:
 def _age_cap_test(operator: str, values: List[Any]) -> Dict[str, Any]:
     """Judge one test on iam:ServiceSpecificCredentialAgeDays in a Deny."""
     base = _strip_condition_set_operator(operator)
-    if_exists = base.endswith("ifexists")
-    if if_exists:
+    if_exists = base.endswith("ifexists") and not operator.startswith("foranyvalue:")
+    if base.endswith("ifexists"):
         base = base[: -len("ifexists")]
     limits = {"numericgreaterthan": 0, "numericgreaterthanequals": 1}
     if base not in limits:
@@ -25038,6 +25059,8 @@ def _mfa_deny_statement_services(
     if {key for _, key, _ in conditions} != {MFA_PRESENT_CONDITION_KEY}:
         return []
     for operator, _, values in conditions:
+        if operator.startswith("foranyvalue:"):
+            return []
         base = _strip_condition_set_operator(operator)
         wanted = {"boolifexists": "false", "null": "true"}.get(base)
         if console and base == "null":
@@ -29271,8 +29294,10 @@ def _exact_attestation_keys(statement: Dict[str, Any], negated: bool) -> set:
     Return the attestation keys a statement tests against exact values.
 
     ``negated`` selects negated tests (a Deny that refuses a wrong value) over
-    positive ones (an Allow that requires the value). A Null, an IfExists or a
-    wildcard value is never exact.
+    positive ones (an Allow that requires the value). A Null, an IfExists, a
+    wildcard value, or a set operator that holds on an absent key (ForAllValues:
+    on a positive test) or misses it (ForAnyValue: on a negated test) is never
+    exact.
     """
     keys = set()
     for operator, key, values in _condition_keys_by_operator(statement):
@@ -29280,6 +29305,8 @@ def _exact_attestation_keys(statement: Dict[str, Any], negated: bool) -> set:
             continue
         test = _strip_condition_set_operator(operator)
         if "null" in test or test.endswith("ifexists") or ("not" in test) != negated:
+            continue
+        if operator.startswith("foranyvalue:" if negated else "forallvalues:"):
             continue
         if values and not any(
             "*" in str(value) or "?" in str(value) for value in values
@@ -29318,14 +29345,17 @@ def _allow_pins_enclave_image(statement: Dict[str, Any]) -> bool:
     """
     Return True when an Allow requires an exact attestation measurement.
 
-    A negated test, a Null test, an IfExists test (which passes when the request
-    carries no attestation) or a wildcard value does not pin the image.
+    A negated test, a Null test, an IfExists or ForAllValues: test (each passes
+    when the request carries no attestation) or a wildcard value does not pin
+    the image.
     """
     for operator, key, values in _condition_keys_by_operator(statement):
         if not ATTESTATION_BINDING_KEY.match(key):
             continue
         test = _strip_condition_set_operator(operator)
         if "not" in test or "null" in test or test.endswith("ifexists"):
+            continue
+        if operator.startswith("forallvalues:"):
             continue
         if values and not any(
             "*" in str(value) or "?" in str(value) for value in values
@@ -29343,8 +29373,9 @@ def _deny_attestation_test(statement: Dict[str, Any]) -> Optional[str]:
     "missing" for Null true, or a negated test on wildcard values, which
     refuses only a request with no attestation; and None when the Deny does
     not fire on a missing attestation. A positive operator, IfExists or not,
-    passes a request that carries no attestation, so it is never credited.
-    Condition keys in one statement are ANDed, so a Deny that also tests any
+    passes a request that carries no attestation, so it is never credited, and
+    ForAnyValue: over a negated test is false on an absent key, so it is not
+    credited either. Condition keys in one statement are ANDed, so a Deny that also tests any
     other key fires only for part of the requests and is not credited, and a
     Deny with two attestation tests pins neither: a request that matches one
     measurement escapes it.
@@ -29356,7 +29387,10 @@ def _deny_attestation_test(statement: Dict[str, Any]) -> Optional[str]:
         return None
     if len(conditions) > 1:
         fires_when_missing = all(
-            "not" in _strip_condition_set_operator(operator)
+            (
+                "not" in _strip_condition_set_operator(operator)
+                and not operator.startswith("foranyvalue:")
+            )
             or (
                 _strip_condition_set_operator(operator) == "null"
                 and any(str(value).lower() == "true" for value in values)
@@ -29367,6 +29401,8 @@ def _deny_attestation_test(statement: Dict[str, Any]) -> Optional[str]:
     outcome = None
     for operator, key, values in conditions:
         test = _strip_condition_set_operator(operator)
+        if "not" in test and operator.startswith("foranyvalue:"):
+            continue
         if "not" in test:
             if values and not any(
                 "*" in str(value) or "?" in str(value) for value in values

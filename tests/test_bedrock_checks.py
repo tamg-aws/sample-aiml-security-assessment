@@ -10035,6 +10035,35 @@ class TestBR42ModelAllowList:
             f["Finding_Details"] for f in findings if f["Status"] == "Passed"
         )
 
+    def test_br42_for_any_value_condition_deny_list_does_not_scope_the_grant(self):
+        # MDL-01: a ForAnyValue: negated Deny does not fire when the key is
+        # absent, so streaming invocation stays open on the AnyValueRole.
+        def condition_deny(operator):
+            return self._deny_list_document(
+                {
+                    "Resource": "*",
+                    "Condition": {operator: {"bedrock:ModelArn": self.MODEL_ARN}},
+                }
+            )
+
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "AnyValueRole": [
+                        ("AnyValue", condition_deny("ForAnyValue:ArnNotLike"))
+                    ],
+                    "PlainRole": [("Plain", condition_deny("ArnNotLike"))],
+                }
+            )
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'AnyValueRole'" in failed[0]["Finding_Details"]
+        assert "PlainRole" not in failed[0]["Finding_Details"]
+        assert "PlainRole" in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "Passed"
+        )
+
     def test_br42_bedrock_mantle_inference_needs_a_model_condition(self):
         project = "arn:aws:bedrock-mantle:us-east-1:123456789012:project/*"
         findings = self._run(
@@ -26584,7 +26613,24 @@ class TestBR43ApprovedModelControl:
         assert "through NotResource" in rows[0]["Finding_Details"]
         assert "policy 'policy-1'" in rows[0]["Finding_Details"]
 
-    def test_br43_negated_condition_with_set_operator_passes(self):
+    # MDL-01: ForAnyValue: is false when the key is absent, and streaming
+    # invocation sends no bedrock:ModelArn while a direct foundation-model call
+    # sends no bedrock:InferenceProfileArn, so that Deny never fires on them. This
+    # test used to pin the ForAnyValue: form as Passed; it now pins Failed, and
+    # the plain and IfExists forms, which fire on an absent key, still pass.
+    @pytest.mark.parametrize(
+        "operator, key, status",
+        [
+            ("ForAnyValue:ArnNotLike", "bedrock:ModelArn", "Failed"),
+            ("ForAnyValue:StringNotLike", "bedrock:InferenceProfileArn", "Failed"),
+            ("ArnNotLike", "bedrock:ModelArn", "Passed"),
+            ("ArnNotLikeIfExists", "bedrock:InferenceProfileArn", "Passed"),
+        ],
+        ids=["anyvalue-modelarn", "anyvalue-profilearn", "plain", "ifexists"],
+    )
+    def test_br43_negated_condition_with_for_any_value_is_not_a_list(
+        self, operator, key, status
+    ):
         rows = self._run(
             self._inventory(
                 _policy(
@@ -26592,18 +26638,66 @@ class TestBR43ApprovedModelControl:
                         "Effect": "Deny",
                         "Action": "bedrock:Invoke*",
                         "Resource": "*",
-                        "Condition": {
-                            "ForAnyValue:ArnNotLike": {
-                                "bedrock:InferenceProfileArn": self.MODELS[1:]
-                            }
-                        },
+                        "Condition": {operator: {key: self.MODELS}},
                     },
                     self.MANTLE_LIST,
                 )
             )
         )
-        assert [r["Status"] for r in rows] == ["Passed"]
-        assert "foranyvalue:arnnotlike" in rows[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == [status]
+        assert operator.lower() in rows[0]["Finding_Details"]
+        absent = "is false when {} is absent".format(key.lower())
+        assert (absent in rows[0]["Finding_Details"]) == (status == "Failed")
+
+    def test_br43_mantle_list_with_for_any_value_is_not_a_list(self):
+        rows = self._run(
+            self._inventory(
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock:InvokeModel*",
+                        "NotResource": self.MODELS,
+                    },
+                    {
+                        **self.MANTLE_LIST,
+                        "Condition": {
+                            "ForAnyValue:StringNotEquals": {
+                                "bedrock-mantle:Model": ["openai.gpt-oss-120b"]
+                            }
+                        },
+                    },
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "is false when bedrock-mantle:model is absent"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_br43_scp_model_list_controls_gaps_for_both_for_any_value_forms(self):
+        for key in ("bedrock:ModelArn", "bedrock:InferenceProfileArn"):
+            controls = bedrock_app._scp_model_list_controls(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Deny",
+                            "Action": "bedrock:InvokeModel*",
+                            "Resource": "*",
+                            "Condition": {
+                                "ForAnyValue:ArnNotLike": {key: self.MODELS},
+                            },
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Action": "bedrock:InvokeModel*",
+                            "Resource": "*",
+                            "Condition": {"ArnNotLike": {key: self.MODELS}},
+                        },
+                    ]
+                }
+            )
+            assert [bool(control["gaps"]) for control in controls] == [True, False]
 
     def test_br43_not_action_deny_covers_the_actions_it_does_not_name(self):
         rows = self._run(
@@ -34381,3 +34475,150 @@ class TestBR50RootAccessKey:
         ):
             for finding in self._run(summary):
                 assert_finding_schema(finding)
+
+
+class TestSetOperatorPrefixesOnAbsentKeys:
+    """
+    Rule 5 audit: ForAllValues: is true and ForAnyValue: is false when the key
+    is absent. Each helper that strips the prefix is judged on the prefixed form
+    beside the plain form, so a fix that rejects both fails the plain case.
+    """
+
+    def test_vpc_endpoint_allow_with_for_all_values_scope_is_unbounded(self):
+        def document(operator):
+            return {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "bedrock:InvokeModel",
+                        "Resource": "*",
+                        "Condition": {
+                            operator: {"aws:PrincipalAccount": "111122223333"}
+                        },
+                    }
+                ]
+            }
+
+        assert (
+            bedrock_app._vpc_endpoint_policy_scope(
+                document("ForAllValues:StringEquals")
+            )["scoped"]
+            is False
+        )
+        assert (
+            bedrock_app._vpc_endpoint_policy_scope(document("StringEquals"))["scoped"]
+            is True
+        )
+
+    def test_vector_read_deny_carve_out_with_for_any_value_does_not_restrict(self):
+        index = "arn:aws:s3vectors:us-east-1:111122223333:bucket/b/index/i"
+
+        def deny(operator):
+            return {
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3vectors:*",
+                "Resource": index,
+                "Condition": {
+                    operator: {"aws:PrincipalOrgID": "o-exampleorgid"},
+                },
+            }
+
+        assert not bedrock_app._deny_restricts_reads(
+            deny("ForAnyValue:StringNotEquals"), index
+        )
+        assert bedrock_app._deny_restricts_reads(deny("StringNotEquals"), index)
+
+    def test_mfa_deny_with_for_any_value_is_not_credited(self):
+        def deny(operator):
+            return {
+                "Effect": "Deny",
+                "Action": "bedrock:*",
+                "Resource": "*",
+                "Condition": {operator: {"aws:MultiFactorAuthPresent": "false"}},
+            }
+
+        assert (
+            bedrock_app._mfa_deny_statement_services(deny("ForAnyValue:BoolIfExists"))
+            == []
+        )
+        assert "bedrock" in bedrock_app._mfa_deny_statement_services(
+            deny("BoolIfExists")
+        )
+
+    def test_api_key_age_cap_if_exists_under_for_any_value_needs_null(self):
+        assert (
+            bedrock_app._age_cap_test("foranyvalue:numericgreaterthanifexists", ["30"])[
+                "if_exists"
+            ]
+            is False
+        )
+        assert (
+            bedrock_app._age_cap_test("numericgreaterthanifexists", ["30"])["if_exists"]
+            is True
+        )
+
+    PCR = "kms:RecipientAttestation:PCR0"
+    DIGEST = "a" * 96
+
+    def test_attestation_allow_with_for_all_values_pins_nothing(self):
+        def allow(operator):
+            return {
+                "Effect": "Allow",
+                "Action": "kms:Decrypt",
+                "Condition": {operator: {self.PCR: self.DIGEST}},
+            }
+
+        assert not bedrock_app._allow_pins_enclave_image(
+            allow("ForAllValues:StringEqualsIgnoreCase")
+        )
+        assert bedrock_app._allow_pins_enclave_image(allow("StringEqualsIgnoreCase"))
+        assert (
+            bedrock_app._exact_attestation_keys(
+                allow("ForAllValues:StringEquals"), negated=False
+            )
+            == set()
+        )
+        assert bedrock_app._exact_attestation_keys(
+            allow("StringEquals"), negated=False
+        ) == {self.PCR.lower()}
+
+    def test_attestation_deny_with_for_any_value_does_not_fire_when_missing(self):
+        def deny(*operators):
+            return {
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "kms:Decrypt",
+                "Condition": {
+                    operator: {key: self.DIGEST}
+                    for operator, key in zip(
+                        operators, [self.PCR, "kms:RecipientAttestation:PCR8"]
+                    )
+                },
+            }
+
+        assert (
+            bedrock_app._deny_attestation_test(deny("ForAnyValue:StringNotEquals"))
+            is None
+        )
+        assert bedrock_app._deny_attestation_test(deny("StringNotEquals")) == "pins"
+        assert (
+            bedrock_app._deny_attestation_test(
+                deny("ForAnyValue:StringNotEquals", "StringNotLike")
+            )
+            is None
+        )
+        assert (
+            bedrock_app._deny_attestation_test(deny("StringNotEquals", "StringNotLike"))
+            == "missing"
+        )
+        assert (
+            bedrock_app._exact_attestation_keys(
+                deny("ForAnyValue:StringNotEquals"), negated=True
+            )
+            == set()
+        )
+        assert bedrock_app._exact_attestation_keys(
+            deny("StringNotEquals"), negated=True
+        ) == {self.PCR.lower()}
