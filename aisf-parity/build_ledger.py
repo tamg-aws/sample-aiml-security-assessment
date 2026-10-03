@@ -1664,8 +1664,17 @@ FOUNDATION_ROWS = [
         "those groups in every Region, exempting at most one principal, named by "
         "aws:PrincipalArn with no wildcard in its name, and fails a trail that "
         "records the Region with log file validation off. An unreadable trail is "
-        "N/A. The subscription filter that forwards the groups to an archive, and "
-        "Object Lock on that archive bucket, are not read",
+        "N/A. AC-26 also reads each judged group's subscription filters, aws/spans "
+        "included, and passes a group only when one filter with an empty filter "
+        "pattern, no field selection criteria and not applied on transformed logs "
+        "sends to an ACTIVE Firehose stream of this account whose S3 destination "
+        "runs no Lambda record processor and whose bucket has Object Lock default "
+        "retention in COMPLIANCE mode. No filter, a narrowed filter, a non-S3 "
+        "destination, GOVERNANCE mode or no default retention fails. A CloudWatch "
+        "Logs destination, a Kinesis or Lambda target, another account's stream or "
+        "a failed read is N/A naming it, so the cross-account Log Archive pattern "
+        "the control prescribes reads N/A from the member account. Object Lock on "
+        "the CloudTrail bucket is not read",
         [],
         6,
     ),

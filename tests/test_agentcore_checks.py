@@ -49403,3 +49403,327 @@ class TestWafRuleOrderAndScope:
                 "in rule 'common' runs after rule 'allow-first', whose Allow "
                 "statement is not judged" in details
             )
+
+
+class TestAC26LogArchiveForwarding:
+    """AIR-FND-DET-09: each AgentCore log group is forwarded by a subscription
+    filter through Firehose to an S3 bucket whose Object Lock default retention
+    is in COMPLIANCE mode."""
+
+    _ACCOUNT = "123456789012"
+    _STREAM = "arn:aws:firehose:us-east-1:123456789012:deliverystream/archive"
+
+    @classmethod
+    def _group(cls, name):
+        return {
+            "logGroupName": name,
+            "arn": f"arn:aws:logs:us-east-1:{cls._ACCOUNT}:log-group:{name}:*",
+        }
+
+    @staticmethod
+    def _filter(destination, pattern="", **extra):
+        return {
+            "filterName": "to-archive",
+            "filterPattern": pattern,
+            "destinationArn": destination,
+            **extra,
+        }
+
+    @staticmethod
+    def _stream(bucket="archive-bucket", status="ACTIVE", processors=None):
+        target = {"BucketARN": f"arn:aws:s3:::{bucket}"}
+        if processors is not None:
+            target["ProcessingConfiguration"] = {
+                "Enabled": True,
+                "Processors": processors,
+            }
+        return {
+            "DeliveryStreamDescription": {
+                "DeliveryStreamStatus": status,
+                "Destinations": [{"ExtendedS3DestinationDescription": target}],
+            }
+        }
+
+    @staticmethod
+    def _lock(mode="COMPLIANCE", days=365):
+        rule = {"DefaultRetention": {"Mode": mode, "Days": days}} if mode else {}
+        config = {"ObjectLockEnabled": "Enabled"}
+        if rule:
+            config["Rule"] = rule
+        return {"ObjectLockConfiguration": config}
+
+    def _run(self, groups, filters, stream=None, locks=None, spans=False):
+        """Run the archive leg over `groups`, each with its `filters` list or
+        an exception, one Firehose description and a lock per bucket."""
+        mock_logs = MagicMock()
+        listed = {"/aws/bedrock-agentcore/": [self._group(name) for name in groups]}
+        if spans:
+            listed["aws/spans"] = [self._group("aws/spans")]
+
+        def describe_log_groups(logGroupNamePrefix=None, **_):
+            return {"logGroups": listed.get(logGroupNamePrefix, [])}
+
+        def describe_subscription_filters(logGroupName=None, **_):
+            value = filters[logGroupName]
+            if isinstance(value, Exception):
+                raise value
+            return {"subscriptionFilters": value}
+
+        mock_logs.describe_log_groups.side_effect = describe_log_groups
+        mock_logs.describe_subscription_filters.side_effect = (
+            describe_subscription_filters
+        )
+        firehose = MagicMock()
+        if isinstance(stream, Exception):
+            firehose.describe_delivery_stream.side_effect = stream
+        else:
+            firehose.describe_delivery_stream.return_value = stream or self._stream()
+        mock_s3 = MagicMock()
+        locks = locks or {"archive-bucket": self._lock()}
+
+        def get_object_lock_configuration(Bucket=None, **_):
+            value = locks[Bucket]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        mock_s3.get_object_lock_configuration.side_effect = (
+            get_object_lock_configuration
+        )
+        with (
+            patch("agentcore_app.logs_client", mock_logs),
+            patch("agentcore_app.s3_client", mock_s3),
+            patch(
+                "agentcore_app._agentcore_delivery_log_group_names", return_value=set()
+            ),
+            patch("agentcore_app.boto3.client", return_value=firehose),
+        ):
+            findings = agentcore_app.check_agentcore_log_archive_forwarding()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-26"
+            assert finding["Finding"] == "AgentCore Log Archive Forwarding"
+            assert_finding_schema(finding)
+        self.firehose = firehose
+        self.s3 = mock_s3
+        return {f["Finding_Details"].split("'")[1]: f for f in findings}
+
+    def test_a_locked_archive_passes_and_a_group_with_no_filter_fails(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)],
+                "/aws/bedrock-agentcore/runtimes/b": [],
+            },
+        )
+        good = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert good["Status"] == "Passed"
+        assert "COMPLIANCE mode for 365 day(s)" in good["Finding_Details"]
+        assert "archive-bucket" in good["Finding_Details"]
+        bad = rows["/aws/bedrock-agentcore/runtimes/b"]
+        assert bad["Status"] == "Failed"
+        assert "no subscription filter" in bad["Finding_Details"]
+
+    def test_a_filter_pattern_forwards_a_subset_and_fails(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [
+                    self._filter(self._STREAM, pattern="ERROR")
+                ],
+                "/aws/bedrock-agentcore/runtimes/b": [self._filter(self._STREAM)],
+            },
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Failed"
+        assert "'ERROR'" in rows["/aws/bedrock-agentcore/runtimes/a"]["Finding_Details"]
+        assert rows["/aws/bedrock-agentcore/runtimes/b"]["Status"] == "Passed"
+
+    def test_field_selection_and_transformed_logs_fail(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [
+                    self._filter(
+                        self._STREAM, fieldSelectionCriteria='@aws.region = "x"'
+                    )
+                ],
+                "/aws/bedrock-agentcore/runtimes/b": [
+                    self._filter(self._STREAM, applyOnTransformedLogs=True)
+                ],
+            },
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Failed"
+        assert (
+            "field selection"
+            in rows["/aws/bedrock-agentcore/runtimes/a"]["Finding_Details"]
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/b"]["Status"] == "Failed"
+        assert (
+            "transformed"
+            in rows["/aws/bedrock-agentcore/runtimes/b"]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "lock, text",
+        [
+            ({"ObjectLockConfiguration": {"ObjectLockEnabled": ""}}, "Object Lock off"),
+            (
+                _make_client_error("ObjectLockConfigurationNotFoundError"),
+                "Object Lock off",
+            ),
+            ("GOVERNANCE", "GOVERNANCE mode"),
+            (None, "no default retention"),
+        ],
+    )
+    def test_a_bucket_without_compliance_retention_fails(self, lock, text):
+        if lock == "GOVERNANCE":
+            lock = self._lock(mode="GOVERNANCE")
+        elif lock is None:
+            lock = self._lock(mode=None)
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)],
+                "/aws/bedrock-agentcore/runtimes/b": [
+                    self._filter(self._STREAM.replace("archive", "locked"))
+                ],
+            },
+            stream=None,
+            locks={"archive-bucket": lock},
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Failed"
+        assert text in rows["/aws/bedrock-agentcore/runtimes/a"]["Finding_Details"]
+
+    def test_a_bucket_read_once_for_two_groups(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)],
+                "/aws/bedrock-agentcore/runtimes/b": [self._filter(self._STREAM)],
+            },
+        )
+        assert {row["Status"] for row in rows.values()} == {"Passed"}
+        assert self.firehose.describe_delivery_stream.call_count == 1
+        assert self.s3.get_object_lock_configuration.call_count == 1
+
+    def test_one_good_filter_of_two_passes(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [
+                    self._filter(self._STREAM, pattern="ERROR"),
+                    self._filter(self._STREAM),
+                ],
+            },
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Passed"
+
+    def test_a_lambda_processor_and_an_inactive_stream_fail(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {"/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)]},
+            stream=self._stream(processors=[{"Type": "Lambda"}]),
+        )
+        row = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert row["Status"] == "Failed"
+        assert "Lambda record processor" in row["Finding_Details"]
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {"/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)]},
+            stream=self._stream(processors=[{"Type": "Decompression"}]),
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Passed"
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {"/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)]},
+            stream=self._stream(status="CREATING"),
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Failed"
+
+    def test_a_non_s3_stream_destination_fails(self):
+        stream = {
+            "DeliveryStreamDescription": {
+                "DeliveryStreamStatus": "ACTIVE",
+                "Destinations": [{"SplunkDestinationDescription": {}}],
+            }
+        }
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {"/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)]},
+            stream=stream,
+        )
+        row = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert row["Status"] == "Failed"
+        assert "SplunkDestinationDescription" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "destination",
+        [
+            "arn:aws:logs:us-east-1:999999999999:destination:central",
+            "arn:aws:firehose:us-east-1:999999999999:deliverystream/central",
+            "arn:aws:kinesis:us-east-1:123456789012:stream/s",
+            "arn:aws:lambda:us-east-1:123456789012:function:f",
+        ],
+    )
+    def test_an_unfollowed_destination_is_na_and_never_passes(self, destination):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(destination)],
+                "/aws/bedrock-agentcore/runtimes/b": [],
+            },
+        )
+        row = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert row["Status"] == "N/A"
+        assert destination in row["Finding_Details"]
+        assert rows["/aws/bedrock-agentcore/runtimes/b"]["Status"] == "Failed"
+        self.firehose.describe_delivery_stream.assert_not_called()
+
+    def test_failed_reads_are_na_and_name_the_action(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": _make_client_error(
+                    "AccessDeniedException"
+                ),
+                "/aws/bedrock-agentcore/runtimes/b": [self._filter(self._STREAM)],
+            },
+            locks={"archive-bucket": _make_client_error("AccessDenied")},
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "N/A"
+        row = rows["/aws/bedrock-agentcore/runtimes/b"]
+        assert row["Status"] == "N/A"
+        assert "s3:GetBucketObjectLockConfiguration" in row["Finding_Details"]
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {"/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)]},
+            stream=_make_client_error("AccessDeniedException"),
+        )
+        row = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert row["Status"] == "N/A"
+        assert "firehose:DescribeDeliveryStream" in row["Finding_Details"]
+
+    def test_the_spans_group_is_judged_when_it_exists(self):
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)],
+                "aws/spans": [],
+            },
+            spans=True,
+        )
+        assert rows["aws/spans"]["Status"] == "Failed"
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Passed"
+
+    def test_a_failed_inventory_is_incomplete(self):
+        mock_logs = MagicMock()
+        mock_logs.describe_log_groups.side_effect = _make_client_error(
+            "AccessDeniedException"
+        )
+        with patch("agentcore_app.logs_client", mock_logs):
+            (finding,) = agentcore_app.check_agentcore_log_archive_forwarding()
+        assert finding["Status"] == "N/A"
+        assert "Incomplete" in finding["Finding"]
+
+    def test_the_handler_runs_the_archive_leg(self):
+        source = inspect.getsource(agentcore_app.lambda_handler)
+        assert "check_agentcore_log_archive_forwarding" in source

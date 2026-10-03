@@ -308,6 +308,11 @@ LOGS_DELETION_PROTECTION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/"
     "protecting-log-groups-from-deletion.html"
 )
+LOGS_SUBSCRIPTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/"
+    "API_PutSubscriptionFilter.html"
+)
+AGENTCORE_LOG_ARCHIVE_FINDING = "AgentCore Log Archive Forwarding"
 # The scan frequencies under which ECR enhanced scanning scans a matched
 # repository without a manual request.
 ECR_ENHANCED_SCAN_FREQUENCIES = ("SCAN_ON_PUSH", "CONTINUOUS_SCAN")
@@ -15765,6 +15770,326 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
     if span_finding:
         findings.append(span_finding)
     return findings
+
+
+def _archive_bucket_lock(
+    bucket: str, lock_cache: Dict[str, Tuple[str, Any]]
+) -> Tuple[str, str]:
+    """Judge the Object Lock default retention of one archive bucket.
+
+    Returns ("ok", text), ("bad", text) or ("unread", text). Firehose writes
+    objects with no retention of their own, so only the bucket's default
+    retention locks them, and only COMPLIANCE mode holds against a principal
+    with s3:BypassGovernanceRetention. ExpectedBucketOwner is not passed: the
+    archive bucket belongs to a separate Log Archive account by design.
+    """
+    if bucket not in lock_cache:
+        try:
+            lock_cache[bucket] = (
+                "read",
+                s3_client.get_object_lock_configuration(Bucket=bucket).get(
+                    "ObjectLockConfiguration"
+                )
+                or {},
+            )
+        except Exception as error:
+            if _s3_error_code(error) == "ObjectLockConfigurationNotFoundError":
+                lock_cache[bucket] = ("read", {})
+            else:
+                lock_cache[bucket] = ("error", _assessment_error_label(error))
+    state, value = lock_cache[bucket]
+    if state == "error":
+        return "unread", (
+            f"s3:GetBucketObjectLockConfiguration on bucket '{bucket}' ({value})"
+        )
+    if value.get("ObjectLockEnabled") != "Enabled":
+        return "bad", f"bucket '{bucket}', which has Object Lock off"
+    retention = (value.get("Rule") or {}).get("DefaultRetention") or {}
+    mode = retention.get("Mode")
+    if not mode:
+        return "bad", (
+            f"bucket '{bucket}', which has Object Lock on and no default "
+            "retention, so the objects the stream writes are not locked"
+        )
+    if mode != "COMPLIANCE":
+        return "bad", (
+            f"bucket '{bucket}', whose default retention is {mode} mode, which a "
+            "principal with s3:BypassGovernanceRetention can override"
+        )
+    period = (
+        f"{retention['Days']} day(s)"
+        if retention.get("Days")
+        else f"{retention.get('Years')} year(s)"
+    )
+    return "ok", (
+        f"bucket '{bucket}', whose default retention is COMPLIANCE mode for {period}"
+    )
+
+
+def _subscription_filter_archive(
+    subscription: Dict[str, Any],
+    account: str,
+    stream_cache: Dict[str, Any],
+    lock_cache: Dict[str, Tuple[str, Any]],
+) -> Tuple[str, str]:
+    """Follow one subscription filter to its archive and judge the copy.
+
+    Returns ("ok", text), ("bad", text) or ("unread", text). A filter pattern
+    or field selection criteria forwards a subset, and a filter applied on
+    transformed logs forwards the transformed events and not the ingested
+    ones. Only a Firehose stream of this account is followed, to its S3
+    destination; a Lambda record processor on that stream can drop or rewrite
+    records before the bucket holds them. A CloudWatch Logs destination, a
+    Kinesis stream, a Lambda function or another account's stream is not
+    followed.
+    """
+    label = f"subscription filter '{subscription.get('filterName') or '?'}'"
+    pattern = str(subscription.get("filterPattern") or "").strip()
+    if pattern:
+        return "bad", (
+            f"{label} forwards only the events its filter pattern '{pattern}' matches"
+        )
+    if str(subscription.get("fieldSelectionCriteria") or "").strip():
+        return "bad", (
+            f"{label} forwards only the events its field selection criteria "
+            f"'{subscription['fieldSelectionCriteria']}' select"
+        )
+    if subscription.get("applyOnTransformedLogs") is True:
+        return "bad", (
+            f"{label} applies to the transformed log events, so the archive holds "
+            "the transformer's output and not the events as ingested"
+        )
+    destination = str(subscription.get("destinationArn") or "")
+    parts = destination.split(":", 5)
+    if (
+        len(parts) != 6
+        or parts[2] != "firehose"
+        or not parts[5].startswith("deliverystream/")
+    ):
+        return "unread", (
+            f"{label} sends to {destination or 'no destination'}, which this "
+            "check does not follow to an archive bucket"
+        )
+    if parts[4] != account:
+        return "unread", (
+            f"{label} sends to Firehose stream {destination} in account "
+            f"{parts[4]}, whose destination this account cannot read"
+        )
+    stream_name = parts[5].split("/", 1)[1]
+    if destination not in stream_cache:
+        try:
+            stream_cache[destination] = boto3.client(
+                "firehose", config=boto3_config, region_name=parts[3]
+            ).describe_delivery_stream(DeliveryStreamName=stream_name)[
+                "DeliveryStreamDescription"
+            ]
+        except Exception as error:
+            stream_cache[destination] = error
+    stream = stream_cache[destination]
+    if isinstance(stream, Exception):
+        return "unread", (
+            f"firehose:DescribeDeliveryStream on {destination} "
+            f"({_assessment_error_label(stream)})"
+        )
+    stream_label = f"{label} to Firehose stream '{stream_name}'"
+    status = stream.get("DeliveryStreamStatus")
+    if status != "ACTIVE":
+        return "bad", f"{stream_label} is {status or 'of unknown status'}"
+    verdicts: List[Tuple[str, str]] = []
+    for target in stream.get("Destinations") or []:
+        s3_target = target.get("ExtendedS3DestinationDescription") or target.get(
+            "S3DestinationDescription"
+        )
+        if not s3_target:
+            kinds = [key for key in target if key.endswith("DestinationDescription")]
+            verdicts.append(
+                (
+                    "bad",
+                    f"{stream_label} delivers to "
+                    f"{kinds[0] if kinds else 'a destination'} and not to S3",
+                )
+            )
+            continue
+        processing = s3_target.get("ProcessingConfiguration") or {}
+        lambdas = [
+            processor
+            for processor in processing.get("Processors") or []
+            if processor.get("Type") == "Lambda"
+        ]
+        if processing.get("Enabled") is True and lambdas:
+            verdicts.append(
+                (
+                    "bad",
+                    f"{stream_label} runs a Lambda record processor, which can "
+                    "drop or rewrite records before the bucket holds them",
+                )
+            )
+            continue
+        bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
+        state, text = _archive_bucket_lock(bucket, lock_cache)
+        verdicts.append((state, f"{stream_label}, which delivers to {text}"))
+    if not verdicts:
+        return "bad", f"{stream_label} reports no destination"
+    for wanted in ("ok", "unread"):
+        for state, text in verdicts:
+            if state == wanted:
+                return state, text
+    return verdicts[0]
+
+
+def _agentcore_log_archive_finding(
+    log_group_name: str,
+    account: str,
+    stream_cache: Dict[str, Any],
+    lock_cache: Dict[str, Tuple[str, Any]],
+) -> Dict[str, Any]:
+    """AC-26 archive leg: the log group forwards every event to a locked bucket.
+
+    AIR-FND-DET-09 asks for the agent log groups to be forwarded by a
+    subscription filter through Firehose to an S3 bucket with Object Lock in
+    compliance mode, because log events in CloudWatch Logs have no WORM
+    storage of their own.
+    """
+    try:
+        subscriptions = _paginate_aws_list(
+            logs_client,
+            "describe_subscription_filters",
+            "subscriptionFilters",
+            logGroupName=log_group_name,
+        )
+    except Exception as error:
+        return create_finding(
+            check_id="AC-26",
+            finding_name=AGENTCORE_LOG_ARCHIVE_FINDING,
+            finding_details=(
+                f"The subscription filters of log group '{log_group_name}' could "
+                f"not be read: {_assessment_error_label(error)}."
+            ),
+            resolution="Grant logs:DescribeSubscriptionFilters and retry.",
+            reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    resolution = (
+        "Forward the log group with a subscription filter that has an empty "
+        "filter pattern to a Firehose stream delivering to an S3 bucket in a "
+        "separate Log Archive account, with Object Lock default retention in "
+        "COMPLIANCE mode."
+    )
+    if not subscriptions:
+        return create_finding(
+            check_id="AC-26",
+            finding_name=AGENTCORE_LOG_ARCHIVE_FINDING,
+            finding_details=(
+                f"Log group '{log_group_name}' has no subscription filter, so its "
+                "events are held only in a log group, with no WORM copy."
+            ),
+            resolution=resolution,
+            reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    verdicts = [
+        _subscription_filter_archive(subscription, account, stream_cache, lock_cache)
+        for subscription in subscriptions
+    ]
+    passed = [text for state, text in verdicts if state == "ok"]
+    if passed:
+        return create_finding(
+            check_id="AC-26",
+            finding_name=AGENTCORE_LOG_ARCHIVE_FINDING,
+            finding_details=(
+                f"Log group '{log_group_name}' forwards every event by {passed[0]}."
+            ),
+            resolution="No action required.",
+            reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+    unread = [text for state, text in verdicts if state == "unread"]
+    failed = [text for state, text in verdicts if state == "bad"]
+    if unread:
+        return create_finding(
+            check_id="AC-26",
+            finding_name=AGENTCORE_LOG_ARCHIVE_FINDING,
+            finding_details=(
+                f"No subscription filter of log group '{log_group_name}' was "
+                "established to forward every event to an Object Lock bucket in "
+                f"COMPLIANCE mode: {'; '.join(unread + failed)}."
+            ),
+            resolution=(
+                "Confirm in the account that owns the destination that it delivers "
+                "every event to an S3 bucket with Object Lock default retention in "
+                "COMPLIANCE mode."
+            ),
+            reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    return create_finding(
+        check_id="AC-26",
+        finding_name=AGENTCORE_LOG_ARCHIVE_FINDING,
+        finding_details=(
+            f"Log group '{log_group_name}' has no WORM copy: {'; '.join(failed)}."
+        ),
+        resolution=resolution,
+        reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+        severity=SeverityEnum.MEDIUM,
+        status=StatusEnum.FAILED,
+    )
+
+
+def check_agentcore_log_archive_forwarding() -> List[Dict[str, Any]]:
+    """AC-26 archive leg: every judged log group is forwarded to a locked bucket.
+
+    The population is the retention leg's, the AgentCore prefixes and the
+    groups an AgentCore delivery writes to, plus the aws/spans group when it
+    exists. A failed inventory read is incomplete as a whole, because a group
+    that was not listed may be the one with no archive.
+    """
+    if logs_client is None:
+        return []
+    try:
+        log_groups = _agentcore_log_groups()
+        known_names = {group.get("logGroupName") for group in log_groups}
+        for name in sorted(
+            (
+                _agentcore_delivery_log_group_names()
+                | {TRANSACTION_SEARCH_SPANS_LOG_GROUP}
+            )
+            - known_names
+        ):
+            log_groups.extend(
+                group
+                for group in _paginate_aws_list(
+                    logs_client,
+                    "describe_log_groups",
+                    "logGroups",
+                    logGroupNamePrefix=name,
+                )
+                if group.get("logGroupName") == name
+            )
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-26",
+                finding_name=AGENTCORE_LOG_ARCHIVE_FINDING,
+                error=error,
+                reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+            )
+        ]
+    stream_cache: Dict[str, Any] = {}
+    lock_cache: Dict[str, Tuple[str, Any]] = {}
+    return [
+        _agentcore_log_archive_finding(
+            group["logGroupName"],
+            _arn_account(group.get("arn")),
+            stream_cache,
+            lock_cache,
+        )
+        for group in log_groups
+        if group.get("logGroupName")
+    ]
 
 
 AGENTCORE_TRAIL_VALIDATION_FINDING_NAME = "AgentCore Trail Log File Validation"
@@ -35881,6 +36206,11 @@ def lambda_handler(event, context):
                 ["AC-26"],
                 "Trail Log File Validation",
                 check_agentcore_trail_log_file_validation,
+            ),
+            (
+                ["AC-26"],
+                "Log Archive Forwarding",
+                check_agentcore_log_archive_forwarding,
             ),
             (
                 ["AC-27"],

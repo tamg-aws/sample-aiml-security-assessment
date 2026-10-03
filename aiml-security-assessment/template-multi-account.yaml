@@ -1268,6 +1268,38 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
         - !Ref SageMakerAssessmentReadsPolicy
 
+  AgentCoreAssessmentReadsPolicy:
+    # Reads that do not fit the AgentCore function's 9000-byte inline policy
+    # budget. Attached only to AgentCoreSecurityAssessmentFunction through its
+    # Policies list. A managed policy document is limited to 6144 characters.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read-only grants for the AgentCore security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LogArchiveSubscriptionRead
+            # AC-26 reads the subscription filters that forward each AgentCore
+            # log group to its archive.
+            Effect: Allow
+            Action:
+              - logs:DescribeSubscriptionFilters # AC-26
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+          - Sid: LogArchiveStreamRead
+            # AC-26 follows a filter to a Firehose stream of this account only.
+            Effect: Allow
+            Action:
+              - firehose:DescribeDeliveryStream # AC-26
+            Resource: !Sub 'arn:${AWS::Partition}:firehose:*:${AWS::AccountId}:deliverystream/*'
+          - Sid: LogArchiveBucketRead
+            # AC-26 reads Object Lock on the stream's archive bucket. The bucket
+            # is customer-chosen and normally owned by a separate Log Archive
+            # account, so neither its name nor its owner is known at deploy time.
+            Effect: Allow
+            Action:
+              - s3:GetBucketObjectLockConfiguration # AC-26
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1690,6 +1722,7 @@ Resources:
                 - s3:GetLifecycleConfiguration
                 - s3:GetBucketVersioning
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+        - !Ref AgentCoreAssessmentReadsPolicy
 
 
   AgentRegistrySecurityAssessmentFunction:
