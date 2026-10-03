@@ -1,5 +1,5 @@
 {
-  "generated": "2026-09-30",
+  "generated": "2026-10-03",
   "generator": "aisf-parity/build_ledger.py",
   "aisf_repo": "/Users/tamg/WorkDocs/Builder/aws-ai-security-framework-assessment",
   "summary": {
@@ -109,7 +109,7 @@
       "incumbent_names": [
         "Bedrock Account Data Retention"
       ],
-      "gap": "BR-37 reads bedrock:GetAccountDataRetention for the control plane, and the bedrock-mantle account mode plus every mantle project's data_retention mode over SigV4-signed HTTPS; each project's effective mode is judged, and only none passes",
+      "gap": "BR-37 reads bedrock:GetAccountDataRetention for the control plane, and the bedrock-mantle account mode plus every mantle project's data_retention mode over SigV4-signed HTTPS; the mantle account mode is judged on its own row even with no project listed, each project's effective mode is judged, and only none passes. Each model's allowed_modes are not read",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
@@ -2249,7 +2249,7 @@
         "Bedrock API Key Age And Token Type Control",
         "AI User Long-Term Access Key"
       ],
-      "gap": "BR-45 ('Bedrock API Key Inventory') covers the Bedrock API keys, which are one kind of long-lived credential. BR-50 covers the other, IAM user access keys: it reads ListAccessKeys for each cached IAM user whose attached, inline or group policies grant any bedrock:, sagemaker:, bedrock-agentcore: or bedrock-mantle: action, reads included, and whose permissions boundary allows one too, fails each Active key and reports its age from CreateDate. Inactive keys do not count. A separate BR-50 row reads iam:GetAccountSummary and fails when AccountAccessKeysPresent is 1, a root user access key",
+      "gap": "BR-45 ('Bedrock API Key Inventory') covers the Bedrock API keys, which are one kind of long-lived credential, and fails every active long-term key, one inside the lifetime cap at Medium. BR-50 covers the other, IAM user access keys: it reads ListAccessKeys for each cached IAM user whose attached, inline or group policies grant any bedrock:, sagemaker:, bedrock-agentcore: or bedrock-mantle: action, reads included, and whose permissions boundary allows one too, fails each Active key and reports its age from CreateDate. Inactive keys do not count. A separate BR-50 row reads iam:GetAccountSummary and fails when AccountAccessKeysPresent is 1, a root user access key",
       "extra_iam": [],
       "phase": 6,
       "tier": "foundation",

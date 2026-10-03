@@ -18969,6 +18969,77 @@ def _mantle_account_sentence(mantle: Dict[str, Any], control_mode: Any) -> str:
     )
 
 
+MANTLE_ACCOUNT_RETENTION_FINDING = "Bedrock Mantle Account Data Retention"
+
+
+def _mantle_account_finding(mantle: Dict[str, Any], region: str) -> Dict[str, Any]:
+    """
+    One BR-37 row for the bedrock-mantle account mode, judged on its own.
+
+    The mantle endpoint does not use the control-plane mode, and a project set to
+    inherit takes this mode, so only none passes, even with no project listed.
+    """
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-37",
+            finding_name=MANTLE_ACCOUNT_RETENTION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=DATA_RETENTION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if mantle["account_error"]:
+        return row(
+            f"The bedrock-mantle account data-retention mode in {region} was not "
+            f"read ({mantle['account_error']}), so it was not judged.",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    mode = mantle["account_mode"]
+    allowed_modes = " Each model's allowed_modes are not read by this check."
+    if mode == "none":
+        return row(
+            f"The bedrock-mantle account data-retention mode in {region} is none, "
+            "which every mantle project set to inherit takes." + allowed_modes,
+            "No action required",
+            "High",
+            "Passed",
+        )
+    if mode == "inherit":
+        return row(
+            f"The bedrock-mantle account data-retention mode in {region} is "
+            "inherit, so no mode is set at the account scope and each model's own "
+            "default applies to a project that also inherits." + allowed_modes,
+            "Set the bedrock-mantle account mode to none (PUT /v1/data_retention).",
+            "High",
+            "Failed",
+        )
+    if mode not in DATA_RETENTION_MODES:
+        return row(
+            f"The bedrock-mantle account in {region} returned an unknown "
+            f"data-retention mode: {mode!r}.",
+            "Review the current Bedrock data-retention documentation and rerun with an updated scanner.",
+            "Informational",
+            "N/A",
+        )
+    return row(
+        f"The bedrock-mantle account data-retention mode in {region} is {mode}, "
+        f"{DATA_RETENTION_MODES.index(mode)} step(s) above none on the scale none "
+        "< default < aws_review < provider_data_share, and every mantle project set "
+        "to inherit takes it."
+        + (f" {DATA_RETENTION_AWS_REVIEW_NOTE}" if mode == "aws_review" else "")
+        + allowed_modes,
+        "Set the bedrock-mantle account mode to none (PUT /v1/data_retention).",
+        "High",
+        "Failed",
+    )
+
+
 def _mantle_project_findings(
     mantle: Dict[str, Any], control_mode: Any, region: str
 ) -> List[Dict[str, Any]]:
@@ -19119,7 +19190,8 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
 
     Only none passes. default applies each model's own retention and inherit
     records no decision at this scope, so both fail. The bedrock-mantle account
-    mode and each mantle project are judged on their own rows.
+    mode and each mantle project are judged on their own rows; the account mode
+    is judged even when no project is listed.
     """
     findings = {"csv_data": []}
     reference = DATA_RETENTION_REFERENCE
@@ -19200,6 +19272,7 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
                 region=region,
             )
         )
+    findings["csv_data"].append(_mantle_account_finding(mantle, region))
     findings["csv_data"].extend(_mantle_project_findings(mantle, mode, region))
     return findings
 
@@ -23783,13 +23856,59 @@ def _days_between(start: Any, end: Any) -> Optional[float]:
     return (last - first).total_seconds() / 86400
 
 
+def _allow_statement_age_cap(statement: Dict[str, Any]) -> Optional[float]:
+    """
+    Return the lifetime cap an Allow places on iam:CreateServiceSpecificCredential
+    through iam:ServiceSpecificCredentialAgeDays, or None when it places none.
+
+    Only NumericLessThan or NumericLessThanEquals with no IfExists form and no
+    set-operator prefix caps the key: those are false when the key is absent, so
+    a key created with no expiry is not allowed either. Other condition keys
+    narrow the Allow further and do not lift the cap.
+    """
+    limits = {"numericlessthanequals": 0, "numericlessthan": 1}
+    ceilings = []
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key != BEDROCK_CREDENTIAL_AGE_CONDITION_KEY or operator not in limits:
+            continue
+        try:
+            numbers = [float(str(value)) for value in values]
+        except ValueError:
+            continue
+        if numbers:
+            ceilings.append(max(numbers) - limits[operator])
+    return min(ceilings) if ceilings else None
+
+
+def _allows_cap_credential_age(statements: List[Dict[str, Any]]) -> bool:
+    """
+    True when some Allow grants iam:CreateServiceSpecificCredential and every
+    Allow that grants it caps the age at BEDROCK_API_KEY_MAX_AGE_DAYS or less.
+    Allows are ORed, so one uncapped Allow lets a key be created with any
+    lifetime.
+    """
+    granting = [
+        statement
+        for statement in statements
+        if str(statement.get("Effect", "")).upper() == "ALLOW"
+        and _merged_statement_matches(statement, BEDROCK_CREDENTIAL_CREATE_ACTION)
+    ]
+    caps = [_allow_statement_age_cap(statement) for statement in granting]
+    return bool(caps) and all(
+        cap is not None and cap <= BEDROCK_API_KEY_MAX_AGE_DAYS for cap in caps
+    )
+
+
 def _bedrock_api_key_iam_age_caps(permission_cache: Dict[str, Any]) -> Dict[str, Any]:
     """
     Judge the age cap in the identity policies of each cached principal that is
     granted iam:CreateServiceSpecificCredential. A Deny in a principal's own
     policies or permissions boundary binds that principal only, so the leg is
-    credited only when every such principal carries one. errored is None for a
-    version-1 cache, which records no read errors.
+    credited only when every such principal carries one. An Allow capped with
+    NumericLessThanEquals on the age key, the documented form, caps the
+    principal when every identity-policy Allow, or every boundary Allow, that
+    grants the action carries it. errored is None for a version-1 cache, which
+    records no read errors.
     """
     capped, uncapped = [], []
     for principal_type, key in (
@@ -23817,7 +23936,16 @@ def _bedrock_api_key_iam_age_caps(permission_cache: Dict[str, Any]) -> Dict[str,
                 uncapped.append(f"{label} (a policy could not be parsed)")
                 continue
             own = _bedrock_api_key_scp_controls(pairs)
-            if own["age"] or (own["null_age"] and own["age_needs_null"]):
+            boundary = _boundary_document(permissions)
+            if (
+                own["age"]
+                or (own["null_age"] and own["age_needs_null"])
+                or _allows_cap_credential_age(statements)
+                or (
+                    boundary is not None
+                    and _allows_cap_credential_age(_policy_statements(boundary))
+                )
+            ):
                 capped.append(label)
             else:
                 uncapped.append(label)
@@ -23985,18 +24113,20 @@ def check_bedrock_api_key_governance(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
                     finding_details=(
-                        "{} active Bedrock API key(s) expire within the {}-day cap: "
-                        "{}.{}".format(
+                        "{} active long-term Bedrock API key(s) expire within the "
+                        "{}-day cap: {}. Each is still a static credential on a "
+                        "standing IAM user, and whether this account is a "
+                        "production account is not read.{}".format(
                             len(expiring),
                             BEDROCK_API_KEY_MAX_AGE_DAYS,
                             "; ".join(expiring[:5]),
                             population_note,
                         )
                     ),
-                    resolution="No action required. Confirm the expiration matches your credential-rotation policy.",
+                    resolution="Replace each long-term key with a short-term key, which is derived from the caller's own session credentials, and delete the service-specific credential; keep long-term keys out of production accounts.",
                     reference=BEDROCK_API_KEY_REFERENCE,
                     severity="Medium",
-                    status="N/A" if inventory_errors else "Passed",
+                    status="N/A" if inventory_errors else "Failed",
                     region=region,
                 )
             )
@@ -24123,8 +24253,9 @@ def check_bedrock_api_key_governance(
         if iam_age:
             iam_age_note = (
                 " Each of the {} principal(s) the IAM permissions cache grants "
-                "iam:CreateServiceSpecificCredential carries its own Deny capping "
-                "the key age ({}); that Deny binds those principals only, so a "
+                "iam:CreateServiceSpecificCredential carries its own age cap, a "
+                "Deny or a capped Allow ({}); that cap binds those principals "
+                "only, so a "
                 "principal granted the action later without it is uncapped.{}".format(
                     len(iam_caps["capped"]),
                     ", ".join(iam_caps["capped"][:5]),
@@ -24138,7 +24269,7 @@ def check_bedrock_api_key_governance(
                 iam_age_note = (
                     " Of the {} principal(s) the IAM permissions cache grants "
                     "iam:CreateServiceSpecificCredential, {} carry no credited "
-                    "age-cap Deny in their own policies: {}.".format(
+                    "age cap, Deny or capped Allow, in their own policies: {}.".format(
                         len(iam_caps["capped"]) + len(iam_caps["uncapped"]),
                         len(iam_caps["uncapped"]),
                         ", ".join(iam_caps["uncapped"][:5]),

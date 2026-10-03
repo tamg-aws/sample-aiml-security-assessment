@@ -12659,8 +12659,18 @@ class TestBR45ApiKeyGovernance:
         )
 
         inventory_rows = self._by_name(findings, self.INVENTORY_FINDING)
-        failed = [f for f in inventory_rows if f["Status"] == "Failed"]
-        passed = [f for f in inventory_rows if f["Status"] == "Passed"]
+        # IAM-03: a long-term key within the cap is still a static credential,
+        # so its row is a Medium Failed; before round 6 it was Passed.
+        failed = [
+            f
+            for f in inventory_rows
+            if f["Status"] == "Failed" and f["Severity"] == "High"
+        ]
+        capped = [
+            f
+            for f in inventory_rows
+            if f["Status"] == "Failed" and f["Severity"] == "Medium"
+        ]
 
         assert len(failed) == 1
         assert failed[0]["Check_ID"] == "BR-45"
@@ -12668,9 +12678,12 @@ class TestBR45ApiKeyGovernance:
         assert "ACCA-standing" in failed[0]["Finding_Details"]
         assert "no expiration date" in failed[0]["Finding_Details"]
 
-        assert len(passed) == 1
-        assert "ACCA-expiring" in passed[0]["Finding_Details"]
-        assert "2026-01-01" in passed[0]["Finding_Details"]
+        assert not [f for f in inventory_rows if f["Status"] == "Passed"]
+        assert len(capped) == 1
+        assert "ACCA-expiring" in capped[0]["Finding_Details"]
+        assert "2026-01-01" in capped[0]["Finding_Details"]
+        assert "static credential" in capped[0]["Finding_Details"]
+        assert "short-term key" in capped[0]["Resolution"]
 
         iam_client.list_service_specific_credentials.assert_any_call(
             UserName="StandingKeyUser", ServiceName="bedrock.amazonaws.com"
@@ -12960,11 +12973,18 @@ class TestBR45ApiKeyGovernance:
             AllUsers=True, ServiceName="bedrock.amazonaws.com"
         )
         rows = self._by_name(findings, self.INVENTORY_FINDING)
-        failed = [f for f in rows if f["Status"] == "Failed"]
+        # IAM-03: a long-term key within the cap is still a static credential,
+        # so its row is a Medium Failed; before round 6 it was Passed.
+        failed = [
+            f for f in rows if f["Status"] == "Failed" and f["Severity"] == "High"
+        ]
         assert len(failed) == 1
         assert "UncachedUser" in failed[0]["Finding_Details"]
-        passed = [f for f in rows if f["Status"] == "Passed"]
-        assert len(passed) == 1 and "ACCA-cached" in passed[0]["Finding_Details"]
+        capped = [
+            f for f in rows if f["Status"] == "Failed" and f["Severity"] == "Medium"
+        ]
+        assert len(capped) == 1 and "ACCA-cached" in capped[0]["Finding_Details"]
+        assert not [f for f in rows if f["Status"] == "Passed"]
 
     def test_br45_expiry_beyond_the_cap_is_a_standing_key(self):
         # The live shape: a console key created with a 100-year expiry.
@@ -12999,13 +13019,20 @@ class TestBR45ApiKeyGovernance:
         )
 
         rows = self._by_name(findings, self.INVENTORY_FINDING)
-        failed = [f for f in rows if f["Status"] == "Failed"]
+        # IAM-03: a long-term key within the cap is still a static credential,
+        # so its row is a Medium Failed; before round 6 it was Passed.
+        failed = [
+            f for f in rows if f["Status"] == "Failed" and f["Severity"] == "High"
+        ]
         assert len(failed) == 2
         details = " ".join(f["Finding_Details"] for f in failed)
         assert "ACCA-century" in details and "ACCA-year" in details
         assert "above the 90-day cap" in details
-        passed = [f for f in rows if f["Status"] == "Passed"]
-        assert len(passed) == 1 and "ACCA-month" in passed[0]["Finding_Details"]
+        capped = [
+            f for f in rows if f["Status"] == "Failed" and f["Severity"] == "Medium"
+        ]
+        assert len(capped) == 1 and "ACCA-month" in capped[0]["Finding_Details"]
+        assert not [f for f in rows if f["Status"] == "Passed"]
 
     def test_br45_expiry_without_a_create_date_is_not_passed(self):
         _, findings = self._run(
@@ -13316,6 +13343,88 @@ class TestBR45ApiKeyGovernance:
         prevention = self._prevention(inventory, cache=every)
         assert [f["Status"] for f in prevention] == ["Passed"]
         assert "binds those principals only" in prevention[0]["Finding_Details"]
+
+    @staticmethod
+    def _allow_create(condition):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "iam:CreateServiceSpecificCredential",
+                    "Resource": "arn:aws:iam::123456789012:user/*",
+                    "Condition": condition,
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "condition, capped",
+        [
+            (
+                {
+                    "NumericLessThanEquals": {
+                        "iam:ServiceSpecificCredentialAgeDays": "90"
+                    }
+                },
+                True,
+            ),
+            ({"NumericLessThan": {"iam:ServiceSpecificCredentialAgeDays": "91"}}, True),
+            (
+                {
+                    "NumericLessThanEquals": {
+                        "iam:ServiceSpecificCredentialAgeDays": "365"
+                    }
+                },
+                False,
+            ),
+            (
+                {
+                    "NumericLessThanEqualsIfExists": {
+                        "iam:ServiceSpecificCredentialAgeDays": "90"
+                    }
+                },
+                False,
+            ),
+            (
+                {"NumericGreaterThan": {"iam:ServiceSpecificCredentialAgeDays": "1"}},
+                False,
+            ),
+        ],
+        ids=["lte-90", "lt-91", "lte-365", "ifexists", "greater-than"],
+    )
+    def test_br45_capped_allow_is_an_identity_age_cap(self, condition, capped):
+        # MDL-09: the documented Allow with NumericLessThanEquals on the age key
+        # caps the principal, so long as no other Allow grants the action
+        # uncapped. A second, uncapped Allow role keeps the leg failed.
+        inventory = self._scp_items(*self._token_denies())
+
+        def cache(*roles):
+            built = _identity_cache(roles=dict(roles))
+            built["cache_schema_version"] = 2
+            built["principal_errors"] = []
+            return built
+
+        allow_only = cache(
+            ("KeyAdmin", [("CappedCreate", self._allow_create(condition))])
+        )
+        prevention = self._prevention(inventory, cache=allow_only)
+        assert [f["Status"] for f in prevention] == (
+            ["Passed"] if capped else ["Failed"]
+        )
+
+        beside_uncapped = cache(
+            (
+                "KeyAdmin",
+                [
+                    ("CappedCreate", self._allow_create(condition)),
+                    ("CreateKeys", self.CREATE_KEYS),
+                ],
+            )
+        )
+        prevention = self._prevention(inventory, cache=beside_uncapped)
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert "role 'KeyAdmin'" in prevention[0]["Finding_Details"]
 
     def test_br45_no_cached_creator_is_not_an_age_cap(self):
         prevention = self._prevention(self._scp_items(*self._token_denies()))
@@ -34184,8 +34293,9 @@ class TestBR37MantleDataRetention:
     """BR-37 bedrock-mantle leg: the mantle account mode and every project."""
 
     @staticmethod
-    def _run(control_mode, account, pages, calls=None):
-        """account is a mode string or an exception; pages a list or exception."""
+    def _run(control_mode, account, pages, calls=None, account_rows=None):
+        """account is a mode string or an exception; pages a list or exception.
+        account_rows, when a list, receives the mantle account row."""
 
         def fake_get(region, path, params=None):
             if calls is not None:
@@ -34217,9 +34327,56 @@ class TestBR37MantleDataRetention:
             )
         control = [r for r in rows if r["Finding"] == "Bedrock Account Data Retention"]
         projects = [r for r in rows if r["Finding"] == MANTLE_PROJECT_ROW]
+        mantle_account = [
+            r for r in rows if r["Finding"] == "Bedrock Mantle Account Data Retention"
+        ]
         assert len(control) == 1
-        assert len(rows) == 1 + len(projects)
+        # Round 6 adds one row for the mantle account mode beside the
+        # control-plane row and the project rows.
+        assert len(mantle_account) == 1
+        assert len(rows) == 2 + len(projects)
+        if account_rows is not None:
+            account_rows.extend(mantle_account)
         return control[0], projects
+
+    @pytest.mark.parametrize(
+        "account, status",
+        [
+            ("none", "Passed"),
+            ("provider_data_share", "Failed"),
+            ("aws_review", "Failed"),
+            ("default", "Failed"),
+            ("inherit", "Failed"),
+            ("someday", "N/A"),
+        ],
+    )
+    def test_the_mantle_account_mode_is_judged_with_no_project(self, account, status):
+        # MDL-10: a control-plane none beside a provider_data_share mantle account
+        # with zero projects used to pass on the control-plane row alone.
+        account_rows = []
+        control, projects = self._run(
+            "none", account, [_mantle_page([])], account_rows=account_rows
+        )
+        assert control["Status"] == "Passed"
+        assert [p["Status"] for p in projects] == ["N/A"]
+        [row] = account_rows
+        assert row["Status"] == status
+        assert row["Check_ID"] == "BR-37"
+        if status != "N/A":
+            assert f"mode in us-east-1 is {account}" in row["Finding_Details"]
+            assert "allowed_modes are not read" in row["Finding_Details"]
+
+    def test_an_unread_mantle_account_mode_is_na(self):
+        account_rows = []
+        self._run(
+            "none",
+            bedrock_app.MantleRequestError("HTTP 403 AccessDenied"),
+            [_mantle_page([])],
+            account_rows=account_rows,
+        )
+        [row] = account_rows
+        assert row["Status"] == "N/A"
+        assert "HTTP 403 AccessDenied" in row["Finding_Details"]
 
     def test_a_project_inherits_the_mantle_account_not_the_control_plane(self):
         control, projects = self._run(
@@ -34399,7 +34556,8 @@ class TestBR37MantleDataRetention:
             rows = extract_csv_data(
                 bedrock_app.check_bedrock_account_data_retention("us-east-1")
             )
-        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        # The control-plane row, the mantle account row (round 6) and the project.
+        assert [r["Status"] for r in rows] == ["N/A", "Passed", "Failed"]
 
 
 class TestMantleGet:

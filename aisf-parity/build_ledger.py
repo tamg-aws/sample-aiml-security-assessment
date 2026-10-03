@@ -66,8 +66,9 @@ AI_SUBJECT_ROWS = [
         ["BR-37"],
         "BR-37 reads bedrock:GetAccountDataRetention for the control plane, and the "
         "bedrock-mantle account mode plus every mantle project's data_retention mode "
-        "over SigV4-signed HTTPS; each project's effective mode is judged, and only "
-        "none passes",
+        "over SigV4-signed HTTPS; the mantle account mode is judged on its own row "
+        "even with no project listed, each project's effective mode is judged, and "
+        "only none passes. Each model's allowed_modes are not read",
         [],
         3,
     ),
@@ -1599,7 +1600,8 @@ FOUNDATION_ROWS = [
         "bedrock_assessments",
         ["BR-45", "BR-50"],
         "BR-45 ('Bedrock API Key Inventory') covers the Bedrock API keys, which "
-        "are one kind of long-lived credential. BR-50 covers the other, IAM user "
+        "are one kind of long-lived credential, and fails every active long-term "
+        "key, one inside the lifetime cap at Medium. BR-50 covers the other, IAM user "
         "access keys: it reads ListAccessKeys for each cached IAM user whose "
         "attached, inline or group policies grant any bedrock:, sagemaker:, "
         "bedrock-agentcore: or bedrock-mantle: action, reads included, and whose permissions boundary "
