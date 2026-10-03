@@ -1585,9 +1585,15 @@ FOUNDATION_ROWS = [
         "the Resource entries drop only the resource types they cannot name. A "
         "Passed is held as N/A while principal_errors names an unread "
         "principal. Service control policies are not evaluated per principal "
-        "and can only make a row a false Failed. API Gateway method authorizers "
-        "and Verified Permissions policy stores are not read: no field ties one "
-        "to an AI workload",
+        "and can only make a row a false Failed. At the request layer, SM-02 "
+        "reads every REST API method and HTTP API route whose integration URI "
+        "names a Bedrock, AgentCore or SageMaker runtime, or a Lambda function an "
+        "agent action group or AgentCore gateway target names. It fails such a "
+        "method with no authorization, and read and write methods of one API that "
+        "share a token authorizer and its scopes; an IAM or Lambda authorizer is "
+        "not judged, because the split sits in execute-api:Invoke grants or "
+        "authorizer code. Verified Permissions policy stores are not read: no "
+        "field ties a policy store to an AI workload",
         [],
         6,
     ),

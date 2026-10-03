@@ -6220,6 +6220,249 @@ def _ai_lambda_references(region: str) -> Tuple[Dict[str, List[str]], List[str]]
     return named, unread
 
 
+AI_API_AUTHORIZATION_FINDING = "AI API Method Authorization"
+AI_API_AUTHORIZATION_REFERENCE = (
+    "https://docs.aws.amazon.com/apigateway/latest/developerguide/"
+    "apigateway-control-access-to-api.html"
+)
+AI_API_AUTHORIZATION_RESOLUTION = (
+    "Require an authorizer on every method that reaches a model or agent, and "
+    "give read and write methods on one resource different OAuth scopes, or "
+    "separate execute-api:Invoke grants per method."
+)
+# The service segment of an API Gateway AWS integration URI, or the host of an
+# HTTP integration, that reaches a Bedrock, AgentCore or SageMaker runtime.
+AI_INTEGRATION_URI = re.compile(
+    r"^arn:[^:]+:apigateway:[^:]*:(bedrock|bedrock-runtime|bedrock-agent-runtime"
+    r"|bedrock-agentcore|runtime\.sagemaker|sagemaker):"
+    r"|^https://(bedrock-runtime|bedrock-agent-runtime|bedrock-agentcore"
+    r"|runtime\.sagemaker)\."
+)
+LAMBDA_IN_URI = re.compile(r"(arn:[^:]+:lambda:[^:]+:\d{12}:function:[^/:]+)")
+READ_VERBS = frozenset({"GET", "HEAD"})
+WRITE_VERBS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _method_verbs(verb: str) -> set:
+    """ANY and an HTTP API $default route serve every verb."""
+    return set(READ_VERBS | WRITE_VERBS) if verb in ("ANY", "$default") else {verb}
+
+
+def _ai_integration_target(uri: Any, ai_functions: set) -> Optional[str]:
+    """What an integration URI reaches when it is an AI runtime, else None."""
+    text = str(uri or "")
+    if AI_INTEGRATION_URI.search(text):
+        return text.split("?", 1)[0][:160]
+    match = LAMBDA_IN_URI.search(text)
+    if match and match.group(1) in ai_functions:
+        return f"Lambda function {match.group(1)}"
+    return None
+
+
+def _api_methods(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Every REST API method and HTTP API route with its integration URI."""
+    methods, unread = [], []
+    try:
+        rest = boto3.client("apigateway", config=boto3_config, region_name=region)
+        apis = []
+        for page in rest.get_paginator("get_rest_apis").paginate():
+            apis.extend(page.get("items", []))
+    except Exception as error:
+        apis = []
+        unread.append(f"apigateway:GET /restapis ({get_assessment_error_label(error)})")
+    for api in apis:
+        try:
+            for page in rest.get_paginator("get_resources").paginate(
+                restApiId=api.get("id"), embed=["methods"]
+            ):
+                for resource in page.get("items", []):
+                    for verb, method in (resource.get("resourceMethods") or {}).items():
+                        methods.append(
+                            {
+                                "api": f"REST API {api.get('name')} ({api.get('id')})",
+                                "label": f"{verb} {resource.get('path')}",
+                                "verbs": _method_verbs(verb),
+                                "type": method.get("authorizationType") or "NONE",
+                                "authorizer": method.get("authorizerId"),
+                                "scopes": frozenset(
+                                    method.get("authorizationScopes") or []
+                                ),
+                                "uri": (method.get("methodIntegration") or {}).get(
+                                    "uri"
+                                ),
+                            }
+                        )
+        except Exception as error:
+            unread.append(
+                f"resources of REST API {api.get('id')} "
+                f"({get_assessment_error_label(error)})"
+            )
+    try:
+        http = boto3.client("apigatewayv2", config=boto3_config, region_name=region)
+        http_apis = []
+        for page in http.get_paginator("get_apis").paginate():
+            http_apis.extend(page.get("Items", []))
+    except Exception as error:
+        http_apis = []
+        unread.append(f"apigateway:GET /apis ({get_assessment_error_label(error)})")
+    for api in http_apis:
+        api_id = api.get("ApiId")
+        try:
+            integrations = {}
+            for page in http.get_paginator("get_integrations").paginate(ApiId=api_id):
+                for integration in page.get("Items", []):
+                    integrations[integration.get("IntegrationId")] = integration.get(
+                        "IntegrationUri"
+                    )
+            for page in http.get_paginator("get_routes").paginate(ApiId=api_id):
+                for route in page.get("Items", []):
+                    key = str(route.get("RouteKey") or "")
+                    verb = key.split(" ", 1)[0]
+                    target = str(route.get("Target") or "")
+                    methods.append(
+                        {
+                            "api": f"HTTP API {api.get('Name')} ({api_id})",
+                            "label": f"route {key}",
+                            "verbs": _method_verbs(verb),
+                            "type": route.get("AuthorizationType") or "NONE",
+                            "authorizer": route.get("AuthorizerId"),
+                            "scopes": frozenset(route.get("AuthorizationScopes") or []),
+                            "uri": integrations.get(target.split("/", 1)[-1]),
+                        }
+                    )
+        except Exception as error:
+            unread.append(
+                f"routes of HTTP API {api_id} ({get_assessment_error_label(error)})"
+            )
+    return methods, unread
+
+
+def check_ai_api_method_authorization(region: str = "") -> Dict[str, Any]:
+    """
+    SM-02: Verify every API Gateway method that reaches a model or agent is
+    authorized, and that read and write methods are authorized separately
+    (AIR-FND-IAM-09 request layer).
+
+    A method is in the population when its integration URI names a Bedrock,
+    AgentCore or SageMaker runtime, or a Lambda function an agent action group
+    or AgentCore gateway target names. A token authorizer separates read from
+    write only by scopes; an IAM or Lambda authorizer separates them in policy
+    or code this row does not read.
+    """
+    findings = {"csv_data": []}
+    named, unread = _ai_lambda_references(region)
+    ai_functions = {
+        match.group(1)
+        for arn in named
+        for match in [LAMBDA_IN_URI.search(arn)]
+        if match
+    }
+    methods, method_unread = _api_methods(region)
+    unread.extend(method_unread)
+    ai_methods = []
+    for method in methods:
+        target = _ai_integration_target(method["uri"], ai_functions)
+        if target:
+            ai_methods.append(dict(method, target=target))
+
+    problems, unjudged, token_methods = [], [], {}
+    for method in ai_methods:
+        where = f"{method['api']} {method['label']} (reaches {method['target']})"
+        kind = method["type"].upper()
+        if kind == "NONE":
+            problems.append(f"{where} accepts requests with no authorization")
+        elif kind in ("COGNITO_USER_POOLS", "JWT"):
+            token_methods.setdefault(
+                (method["api"], method["authorizer"], method["scopes"]), []
+            ).append(method)
+        else:
+            unjudged.append(f"{where} ({kind})")
+    for (api, _, scopes), group in token_methods.items():
+        verbs = set().union(*(m["verbs"] for m in group))
+        if verbs & READ_VERBS and verbs & WRITE_VERBS:
+            shown = ", ".join(m["label"] for m in group[:4])
+            problems.append(
+                f"{api} authorizes read and write methods ({shown}) with one "
+                "authorizer and "
+                + (
+                    f"the same scopes ({', '.join(sorted(scopes))})"
+                    if scopes
+                    else "no scopes"
+                )
+                + ", so a token that may read may also write"
+            )
+
+    findings["csv_data"].extend(
+        _capped_problem_rows(
+            "SM-02",
+            AI_API_AUTHORIZATION_FINDING,
+            [f"{p}." for p in problems],
+            AI_API_AUTHORIZATION_RESOLUTION,
+            AI_API_AUTHORIZATION_REFERENCE,
+            "High",
+            region,
+            "AI API authorization gaps",
+        )
+    )
+    if unjudged:
+        shown = "; ".join(unjudged[:10])
+        if len(unjudged) > 10:
+            shown += f"; and {len(unjudged) - 10} more"
+        findings["csv_data"].append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=f"{AI_API_AUTHORIZATION_FINDING} Not Judged",
+                finding_details=(
+                    f"{len(unjudged)} AI method(s) use an IAM or Lambda authorizer: "
+                    f"{shown}. Whether read and write are authorized separately is "
+                    "held in execute-api:Invoke grants or in the authorizer's code, "
+                    "which this row does not read."
+                ),
+                resolution=AI_API_AUTHORIZATION_RESOLUTION,
+                reference=AI_API_AUTHORIZATION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    if unread:
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-02",
+                AI_API_AUTHORIZATION_FINDING,
+                unread,
+                f"{len(ai_methods)} AI method(s) were found among {len(methods)} "
+                "API method(s) and route(s).",
+                AI_API_AUTHORIZATION_REFERENCE,
+                region,
+            )
+        )
+    elif not problems and not unjudged:
+        findings["csv_data"].append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=AI_API_AUTHORIZATION_FINDING,
+                finding_details=(
+                    f"All {len(ai_methods)} API method(s) that reach a model or "
+                    "agent use a token authorizer, and no read and write methods "
+                    "of one API share an authorizer and scopes. A Lambda function "
+                    "no agent action group or gateway target names is not "
+                    "recognized as AI."
+                    if ai_methods
+                    else f"None of the {len(methods)} API method(s) and route(s) in "
+                    "this region reaches a Bedrock, AgentCore or SageMaker runtime "
+                    "or a Lambda function an agent or gateway names."
+                ),
+                resolution="No action required",
+                reference=AI_API_AUTHORIZATION_REFERENCE,
+                severity="High" if ai_methods else "Informational",
+                status="Passed" if ai_methods else "N/A",
+                region=region,
+            )
+        )
+    return findings
+
+
 def check_ai_lambda_network_boundary(region: str = "") -> Dict[str, Any]:
     """
     SM-11: Verify every Lambda function an agent action group or AgentCore
@@ -19448,6 +19691,9 @@ def lambda_handler(event, context):
 
         logger.info("Running AI Lambda function network boundary check (SM-11)")
         all_findings.append(check_ai_lambda_network_boundary(region=region))
+
+        logger.info("Running AI API method authorization check (SM-02)")
+        all_findings.append(check_ai_api_method_authorization(region=region))
 
         logger.info("Running SageMaker endpoint instance count check")
         endpoint_instance_findings = check_sagemaker_endpoint_instance_count(

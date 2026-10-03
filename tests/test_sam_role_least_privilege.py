@@ -330,6 +330,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListGatewayTargets",
         "bedrock-agentcore:GetGatewayTarget",
         "lambda:GetFunctionConfiguration",
+        "apigateway:GET",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -1042,6 +1043,24 @@ _SAGEMAKER_MANAGED_GRANTS = [
                 "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
                 "${AWS::AccountId}:gateway/*"
             }
+        ),
+    ),
+    (
+        "Allow",
+        "apigateway:GET",
+        json.dumps(
+            [
+                {"Fn::Sub": f"arn:${{AWS::Partition}}:apigateway:*::{path}"}
+                for path in (
+                    "/restapis",
+                    "/restapis/*/resources",
+                    "/restapis/*/resources/*/methods/*",
+                    "/apis",
+                    "/apis/*/routes",
+                    "/apis/*/integrations",
+                )
+            ],
+            sort_keys=True,
         ),
     ),
     (

@@ -950,6 +950,19 @@ Resources:
             Action:
               - lambda:GetFunctionConfiguration # SM-11
             Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
+          - Sid: AIApiMethodRead
+            # SM-02 reads each REST API method and HTTP API route with its
+            # integration, to find the methods that reach a model or agent.
+            Effect: Allow
+            Action:
+              - apigateway:GET # SM-02
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:apigateway:*::/restapis'
+              - !Sub 'arn:${AWS::Partition}:apigateway:*::/restapis/*/resources'
+              - !Sub 'arn:${AWS::Partition}:apigateway:*::/restapis/*/resources/*/methods/*'
+              - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis'
+              - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis/*/routes'
+              - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis/*/integrations'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

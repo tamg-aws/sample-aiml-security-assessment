@@ -720,6 +720,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "bedrock-agentcore:GetWorkloadAccessTokenForUserId"
 }
 
+# Verified on 2026-10-03 with an Access Analyzer validate-policy run for the
+# SM-02 API method authorization leg. Its negative control was one invented
+# action (execute-api:InvokeThatDoesNotExist), which was reported as
+# INVALID_ACTION, and the action below was not.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"execute-api:Invoke"}
+
 # Verified on 2026-09-25 with a third Access Analyzer validate-policy run for the
 # gateway controls AC-24 through AC-27. Its negative controls were four invented
 # actions (ec2:DescribeVpcEndpointsThatDoNotExist,

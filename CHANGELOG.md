@@ -362,6 +362,13 @@ section.
   model and fails a credential-named plaintext variable, as it already did
   for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
   or `sagemaker:DescribeModel` holds back the propagation `Passed`.
+- `SM-02` adds an `AI API Method Authorization` row. It reads every REST
+  API method and HTTP API route whose integration reaches a Bedrock,
+  AgentCore or SageMaker runtime, or a Lambda function an agent or gateway
+  names. It fails such a method with no authorization, and read and write
+  methods (an `ANY` or `$default` route counts as both) that share one token
+  authorizer and its scopes. IAM and Lambda authorizers are reported as not
+  judged.
 - `SM-11` adds an `AI Lambda Function Network Boundary` row. It reads the
   Lambda function every Bedrock agent action group (every agent version) and
   every AgentCore gateway Lambda target names, fails one outside a VPC, and
@@ -1636,6 +1643,13 @@ and `lambda:GetFunctionConfiguration` on
 `arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*` (`SM-11`).
 A function in another account is reported as not read. Until the stack is
 updated, the new `SM-11` row reads as incomplete.
+
+**SageMaker API Gateway method reads.** `SageMakerAssessmentReadsPolicy`
+gains `apigateway:GET` on
+`arn:${AWS::Partition}:apigateway:*::/restapis`, `/restapis/*/resources`,
+`/restapis/*/resources/*/methods/*`, `/apis`, `/apis/*/routes` and
+`/apis/*/integrations` (`SM-02`). Until the stack is updated, the new
+`SM-02` row reads as incomplete.
 
 **SageMaker AgentCore runtime reads.** `SageMakerAssessmentReadsPolicy`
 gains `bedrock-agentcore:ListAgentRuntimes` on `'*'` (no resource type)

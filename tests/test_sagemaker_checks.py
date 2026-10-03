@@ -3516,6 +3516,224 @@ class TestSM11AILambdaNetworkBoundary:
         assert any(named in r["Finding_Details"] for r in rows if r["Status"] == "N/A")
 
 
+class TestSM02AIApiMethodAuthorization:
+    """AIR-FND-IAM-09: request-layer authorization of AI API methods."""
+
+    check = staticmethod(sagemaker_app.check_ai_api_method_authorization)
+    BEDROCK = "arn:aws:apigateway:us-east-1:bedrock-runtime:path/model/m/invoke"
+    TOOL = "arn:aws:lambda:us-east-1:111122223333:function:tool"
+    OTHER = "arn:aws:lambda:us-east-1:111122223333:function:billing"
+
+    @staticmethod
+    def _lambda_uri(arn):
+        return (
+            "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+            f"{arn}/invocations"
+        )
+
+    @staticmethod
+    def _method(uri, kind="COGNITO_USER_POOLS", authorizer="au1", scopes=None):
+        method = {"authorizationType": kind, "methodIntegration": {"uri": uri}}
+        if authorizer:
+            method["authorizerId"] = authorizer
+        if scopes:
+            method["authorizationScopes"] = scopes
+        return method
+
+    def _run(self, rest=None, http=None, ai_functions=(), errors=None):
+        """rest: {api: {path: {verb: method}}}; http: {api: [(route key, auth
+        type, scopes, uri)]}."""
+        rest = rest or {}
+        http = http or {}
+        errors = errors or {}
+
+        def raising(key, pages):
+            def paginate(**kwargs):
+                if key in errors:
+                    raise errors[key]
+                return pages(**kwargs)
+
+            return paginate
+
+        apigateway = MagicMock()
+        apigateway.get_paginator.side_effect = _pager(
+            {
+                "get_rest_apis": raising(
+                    "rest",
+                    lambda: [{"items": [{"id": a, "name": a}]} for a in rest],
+                ),
+                "get_resources": raising(
+                    "resources",
+                    lambda restApiId, embed: [
+                        {"items": [{"path": path, "resourceMethods": methods}]}
+                        for path, methods in rest[restApiId].items()
+                    ],
+                ),
+            }
+        )
+        v2 = MagicMock()
+        v2.get_paginator.side_effect = _pager(
+            {
+                "get_apis": raising(
+                    "http", lambda: [{"Items": [{"ApiId": a, "Name": a}]} for a in http]
+                ),
+                "get_integrations": lambda ApiId: [
+                    {"Items": [{"IntegrationId": f"i{n}", "IntegrationUri": r[3]}]}
+                    for n, r in enumerate(http[ApiId])
+                ],
+                "get_routes": lambda ApiId: [
+                    {
+                        "Items": [
+                            {
+                                "RouteKey": r[0],
+                                "AuthorizationType": r[1],
+                                "AuthorizerId": "jwt1",
+                                "AuthorizationScopes": r[2],
+                                "Target": f"integrations/i{n}",
+                            }
+                        ]
+                    }
+                    for n, r in enumerate(http[ApiId])
+                ],
+            }
+        )
+        clients = {"apigateway": apigateway, "apigatewayv2": v2}
+        with (
+            patch(
+                "sagemaker_app.boto3.client", side_effect=lambda svc, **_: clients[svc]
+            ),
+            patch(
+                "sagemaker_app._ai_lambda_references",
+                return_value=(
+                    {arn: ["gateway gw target t"] for arn in ai_functions},
+                    [],
+                ),
+            ),
+        ):
+            return _rows(self.check(region="us-east-1"))
+
+    def test_an_unauthorized_ai_method_among_authorized_ones_fails(self):
+        rows = self._run(
+            rest={
+                "api": {
+                    "/invoke": {"POST": self._method(self.BEDROCK)},
+                    "/open": {
+                        "POST": self._method(self.BEDROCK, kind="NONE", authorizer=None)
+                    },
+                    "/billing": {
+                        "GET": self._method(
+                            self._lambda_uri(self.OTHER), kind="NONE", authorizer=None
+                        )
+                    },
+                }
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "REST API api (api) POST /open" in details
+        assert "accepts requests with no authorization" in details
+        assert "/billing" not in details
+        assert "POST /invoke" not in details
+
+    def test_an_ai_lambda_named_by_a_gateway_is_in_scope_even_qualified(self):
+        rows = self._run(
+            rest={
+                "api": {
+                    "/tool": {
+                        "POST": self._method(
+                            self._lambda_uri(self.TOOL + ":live"),
+                            kind="NONE",
+                            authorizer=None,
+                        )
+                    }
+                }
+            },
+            ai_functions=[self.TOOL + ":live"],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"reaches Lambda function {self.TOOL}" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "read_scopes, write_scopes, status",
+        [
+            (None, None, "Failed"),
+            (["ai/read"], ["ai/read"], "Failed"),
+            (["ai/read"], ["ai/write"], "Passed"),
+        ],
+    )
+    def test_read_and_write_need_different_scopes(
+        self, read_scopes, write_scopes, status
+    ):
+        rows = self._run(
+            rest={
+                "api": {
+                    "/models": {
+                        "GET": self._method(self.BEDROCK, scopes=read_scopes),
+                        "DELETE": self._method(self.BEDROCK, scopes=write_scopes),
+                    }
+                }
+            }
+        )
+        assert [r["Status"] for r in rows] == [status]
+        if status == "Failed":
+            assert "a token that may read may also write" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("route_key", ["ANY /chat", "$default"])
+    def test_an_any_route_with_one_scope_set_fails(self, route_key):
+        rows = self._run(
+            http={
+                "h": [
+                    (
+                        route_key,
+                        "JWT",
+                        ["chat"],
+                        "https://bedrock-runtime.us-east-1.amazonaws.com/model",
+                    )
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"HTTP API h (h) authorizes read and write methods (route {route_key})"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize("kind", ["AWS_IAM", "CUSTOM"])
+    def test_iam_and_lambda_authorizers_are_not_judged(self, kind):
+        rows = self._run(
+            rest={"api": {"/x": {"POST": self._method(self.BEDROCK, kind=kind)}}}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert f"({kind})" in rows[0]["Finding_Details"]
+
+    def test_no_ai_methods_is_not_applicable(self):
+        rows = self._run(
+            rest={"api": {"/b": {"GET": self._method(self._lambda_uri(self.OTHER))}}}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "None of the 1 API method(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "errors, named",
+        [
+            ({"rest": _make_client_error("AccessDeniedException")}, "/restapis"),
+            (
+                {"resources": _make_client_error("AccessDeniedException")},
+                "resources of REST API api",
+            ),
+            ({"http": _make_client_error("AccessDeniedException")}, "/apis"),
+        ],
+    )
+    def test_an_unread_api_withholds_the_pass(self, errors, named):
+        rows = self._run(
+            rest={"api": {"/x": {"POST": self._method(self.BEDROCK)}}},
+            http={"h": [("POST /y", "JWT", ["w"], self.BEDROCK)]},
+            errors=errors,
+        )
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert any(named in r["Finding_Details"] for r in rows if r["Status"] == "N/A")
+
+
 class TestSM11ModelVpcAttachment:
     """AIR-SGM-EP-01: SM-11 reports the VpcConfig leg per model."""
 
