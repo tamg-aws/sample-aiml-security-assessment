@@ -827,6 +827,20 @@ MUTATIONS = [
         "find": "            GATEWAY_DISCOVERY_URL_CONDITION_KEY,\n            GATEWAY_DISCOVERY_URL_UNLISTED_VALUE,\n",
         "replace": '            GATEWAY_DISCOVERY_URL_CONDITION_KEY,\n            "https://evil.example.com/.well-known/openid-configuration",\n',
     },
+    {
+        "name": "AC-47 passes a PrincipalArn Deny naming no fronting gateway role",
+        "file": AGENTCORE,
+        "defect": "a Deny outside a bounded aws:PrincipalArn list admits whoever the list names, and a list that is not the fronting gateway's execution role lets those principals invoke the agent without passing through the gateway",
+        "find": '    if not admitted:\n        return "failed", (\n            "has a resource policy Deny that admits only the aws:PrincipalArn "\n',
+        "replace": '    if False:\n        return "failed", (\n            "has a resource policy Deny that admits only the aws:PrincipalArn "\n',
+    },
+    {
+        "name": "AC-47 passes a PrincipalArn Deny naming a role beside the gateway's",
+        "file": AGENTCORE,
+        "defect": "a list naming the gateway's execution role and a developer role lets the developer role invoke the runtime directly, and the gateway's presence in the list passed it",
+        "find": "    extras = [value for value in values if value not in roles]\n",
+        "replace": "    extras = []\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1056,6 +1070,8 @@ GROUPS: dict[str, str] = {
     "AC-32 passes claim pins with no network pin": "in the AgentCore verdict legs",
     "AC-32 passes an issuer no authorizer trusts": "in the AgentCore verdict legs",
     "AC-32 credits a DiscoveryUrl deny-list of one bad issuer": "in the AgentCore verdict legs",
+    "AC-47 passes a PrincipalArn Deny naming no fronting gateway role": "in the AgentCore verdict legs",
+    "AC-47 passes a PrincipalArn Deny naming a role beside the gateway's": "in the AgentCore verdict legs",
 }
 
 

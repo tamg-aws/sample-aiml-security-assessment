@@ -27390,7 +27390,7 @@ def _mcp_runtime_target(runtime_id):
 def _wire_fronting_gateways(mock_ac, gateways):
     """Stub every gateway read from {gateway id: [target configuration, ...]}.
 
-    Gateway `g` runs as workload identity `g-wi`.
+    Gateway `g` runs as workload identity `g-wi` and execution role `role/g`.
     """
     mock_ac.list_gateways.return_value = {
         "items": [
@@ -27410,6 +27410,7 @@ def _wire_fronting_gateways(mock_ac, gateways):
     }
     mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
         "gatewayArn": _gateway_arn(gatewayIdentifier),
+        "roleArn": f"arn:aws:iam::123456789012:role/{gatewayIdentifier}",
         "workloadIdentityDetails": {
             "workloadIdentityArn": f"{_GATEWAY_WORKLOAD_IDENTITY_PREFIX}"
             f"{gatewayIdentifier}-wi"
@@ -28224,6 +28225,9 @@ class TestAC47DenyForm:
 
     @patch("agentcore_app.agentcore_client")
     def test_a_bounded_principal_arn_deny_passes_the_caller_leg(self, mock_ac):
+        # The list is now compared with the fronting gateway's execution role,
+        # so the gateway that runs as role/gw is wired in front of the runtime.
+        _wire_fronting_gateways(mock_ac, {"gw": [_runtime_target("rt-1")]})
         legs = self._judge(
             mock_ac,
             [
@@ -28296,6 +28300,9 @@ class TestAC47DenyForm:
             "Action": "bedrock-agentcore:InvokeAgentRuntime",
             "Resource": "*",
         }
+        _wire_fronting_gateways(
+            mock_ac, {"gw": [_runtime_target("rt-good"), _runtime_target("rt-bad")]}
+        )
         _wire_runtimes(mock_ac, [_vpc_runtime("rt-good"), _vpc_runtime("rt-bad")])
         mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
             "policy": json.dumps(
@@ -28384,6 +28391,122 @@ _GATEWAY_ROLE_DENY = {
     "ArnNotEquals": {"aws:PrincipalArn": "arn:aws:iam::123456789012:role/gw"}
 }
 _VIA_AWS_SERVICE_FALSE = {"Bool": {"aws:ViaAWSService": "false"}}
+
+
+def _principal_deny(*roles):
+    return _deny_invoke(
+        {
+            "ArnNotEquals": {
+                "aws:PrincipalArn": [
+                    f"arn:aws:iam::123456789012:role/{role}" for role in roles
+                ]
+            }
+        }
+    )
+
+
+class TestAC47PrincipalArnGateway:
+    """AIR-ACR-RT-13: an aws:PrincipalArn Deny restricts the caller only when the
+    list it admits is the execution role of the gateway fronting the runtime."""
+
+    def _callers(self, mock_ac, policies, gateways):
+        _wire_fronting_gateways(mock_ac, gateways)
+        _wire_runtimes(mock_ac, [_vpc_runtime(runtime_id) for runtime_id in policies])
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(
+                {"Statement": policies[resourceArn.rsplit("/", 1)[-1]]}
+            )
+        }
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        for finding in findings:
+            assert_finding_schema(finding)
+        return {
+            finding["Finding_Details"].split("'", 2)[1]: finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime Caller")
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_naming_another_role_fails_beside_a_passing_runtime(self, mock_ac):
+        callers = self._callers(
+            mock_ac,
+            {"rt-a": [_principal_deny("gwa")], "rt-b": [_principal_deny("Developer")]},
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        assert callers["rt-a"]["Status"] == "Passed"
+        assert "execution role of gateway 'gwa'" in callers["rt-a"]["Finding_Details"]
+        assert callers["rt-b"]["Status"] == "Failed"
+        assert callers["rt-b"]["Severity"] == "High"
+        assert "role/Developer" in callers["rt-b"]["Finding_Details"]
+        assert (
+            "none of which is the execution role"
+            in (callers["rt-b"]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_beside_the_gateway_role_fails(self, mock_ac):
+        callers = self._callers(
+            mock_ac,
+            {"rt-a": [_principal_deny("gwa", "Developer")]},
+            {"gwa": [_runtime_target("rt-a")]},
+        )
+
+        assert callers["rt-a"]["Status"] == "Failed"
+        assert (
+            "but also the aws:PrincipalArn value(s) "
+            in (callers["rt-a"]["Finding_Details"])
+        )
+        assert "role/Developer" in callers["rt-a"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_role_of_a_gateway_fronting_another_runtime_fails(self, mock_ac):
+        callers = self._callers(
+            mock_ac,
+            {"rt-a": [_principal_deny("gwb")]},
+            {"gwa": [_runtime_target("rt-a")], "gwb": [_runtime_target("rt-b")]},
+        )
+
+        assert callers["rt-a"]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_no_gateway_fronts_is_na(self, mock_ac):
+        callers = self._callers(
+            mock_ac, {"rt-a": [_principal_deny("gwa")]}, {"gwa": []}
+        )
+
+        assert callers["rt-a"]["Status"] == "N/A"
+        assert (
+            "no gateway target in this region routes to it"
+            in (callers["rt-a"]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_extra_role_beside_an_unread_gateway_is_na(self, mock_ac):
+        _wire_fronting_gateways(
+            mock_ac, {"gwa": [_runtime_target("rt-a")], "gwz": [_runtime_target("x")]}
+        )
+        targets = mock_ac.list_gateway_targets.side_effect
+
+        def list_targets(gatewayIdentifier):
+            if gatewayIdentifier == "gwz":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return targets(gatewayIdentifier)
+
+        callers = self._callers(
+            mock_ac,
+            {"rt-a": [_principal_deny("gwa", "other")]},
+            {"gwa": [_runtime_target("rt-a")], "gwz": [_runtime_target("x")]},
+        )
+        assert callers["rt-a"]["Status"] == "Failed"
+
+        mock_ac.list_gateway_targets.side_effect = list_targets
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        caller = [
+            f for f in findings if f["Finding"].startswith("AgentCore Runtime Caller")
+        ]
+        assert [f["Status"] for f in caller] == ["N/A"]
+        assert "ListGatewayTargets on gwz" in caller[0]["Finding_Details"]
 
 
 class TestAC47EveryInvokeAction:
@@ -28490,6 +28613,9 @@ class TestAC47EveryInvokeAction:
 
     @patch("agentcore_app.agentcore_client")
     def test_every_runtime_is_judged_on_its_own_action_coverage(self, mock_ac):
+        _wire_fronting_gateways(
+            mock_ac, {"gw": [_runtime_target("rt-full"), _runtime_target("rt-one")]}
+        )
         findings = self._judge(
             mock_ac,
             {

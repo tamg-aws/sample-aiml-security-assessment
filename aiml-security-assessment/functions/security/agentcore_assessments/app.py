@@ -28551,8 +28551,9 @@ def _gateway_target_runtime_arns(detail: Dict[str, Any]) -> Set[str]:
 def _runtime_fronting_gateways() -> Tuple[Dict[str, List[Dict[str, str]]], List[str]]:
     """Map each runtime ARN to the gateways with a target that routes to it.
 
-    Each gateway is its ARN, a label and the name of the workload identity
-    GetGateway reports in workloadIdentityDetails. The second list names each
+    Each gateway is its ARN, a label, the name of the workload identity
+    GetGateway reports in workloadIdentityDetails, and the execution role it
+    reports as roleArn. The second list names each
     read that failed, by action, since a gateway that was not read may front
     any runtime.
     """
@@ -28612,6 +28613,7 @@ def _runtime_fronting_gateways() -> Tuple[Dict[str, List[Dict[str, str]]], List[
             "arn": str(detail.get("gatewayArn") or gateway.get("gatewayArn") or ""),
             "label": f"gateway '{gateway.get('name') or gateway_id}' ({gateway_id})",
             "identity": identity.rsplit("/", 1)[-1] if identity else "",
+            "role": str(detail.get("roleArn") or ""),
         }
         for runtime_arn in runtime_arns:
             fronting.setdefault(runtime_arn, []).append(entry)
@@ -28707,6 +28709,82 @@ def _allowed_workload_verdict(
             if refused
             else ""
         )
+    )
+
+
+def _principal_arn_verdict(
+    statements: List[Dict[str, Any]],
+    runtime_arn: str,
+    bounded: Callable[[str, List[str]], bool],
+    fronting: Dict[str, List[Dict[str, str]]],
+    unread: List[str],
+) -> Tuple[str, str]:
+    """Compare a runtime's aws:PrincipalArn Deny lists with its fronting gateways.
+
+    Returns ("passed" | "failed" | "na", text). The caller restriction AWS
+    describes denies every principal whose aws:PrincipalArn is not the
+    gateway's execution role, so a bounded list passes only when it names the
+    role of a gateway with a target routing to this runtime and names nothing
+    else. Every value of every restricting Deny is read, so two Deny lists whose
+    intersection drops a principal still report that principal.
+    """
+    values: List[str] = []
+    for statement in statements:
+        if not any(
+            _restricting_deny(
+                statement, action, runtime_arn, {"aws:principalarn"}, bounded
+            )[0]
+            for action in AGENTCORE_RUNTIME_INVOKE_ACTIONS
+        ):
+            continue
+        for entries in (statement.get("Condition") or {}).values():
+            for key, raw in (entries if isinstance(entries, dict) else {}).items():
+                if str(key).strip().lower() == "aws:principalarn":
+                    values.extend(value.strip() for value in _condition_values(raw))
+    values = list(dict.fromkeys(values))
+    gateways = fronting.get(runtime_arn) or []
+    if not gateways:
+        reason = (
+            f"because {'; '.join(unread)} could not be read"
+            if unread
+            else "because no gateway target in this region routes to it"
+        )
+        return "na", (
+            "has a resource policy Deny that admits only the aws:PrincipalArn "
+            f"value(s) {', '.join(values)}, but no fronting gateway was determined "
+            f"to compare them with, {reason}"
+        )
+    roles = {gateway["role"] for gateway in gateways if gateway["role"]}
+    labels = ", ".join(gateway["label"] for gateway in gateways)
+    admitted = [gateway["label"] for gateway in gateways if gateway["role"] in values]
+    extras = [value for value in values if value not in roles]
+    if extras and unread:
+        return "na", (
+            "has a resource policy Deny that admits the aws:PrincipalArn "
+            f"value(s) {', '.join(extras)}, which is the execution role of none "
+            f"of {labels} but may be that of a gateway that was not read: "
+            f"{'; '.join(unread)}"
+        )
+    if not admitted:
+        return "failed", (
+            "has a resource policy Deny that admits only the aws:PrincipalArn "
+            f"value(s) {', '.join(values)}, none of which is the execution role "
+            f"of {labels}, the gateway(s) in this region with a target routing "
+            "to it, so the principals it names invoke the agent without passing "
+            "through that gateway"
+        )
+    if extras:
+        return "failed", (
+            "has a resource policy Deny that admits the execution role of "
+            f"{', '.join(admitted)} but also the aws:PrincipalArn value(s) "
+            f"{', '.join(extras)}, which is the execution role of no gateway in "
+            "this region with a target routing to it, so that principal invokes "
+            "the agent without passing through the gateway"
+        )
+    return "passed", (
+        "a resource policy Deny refusing every runtime invoke action to every "
+        "principal whose aws:PrincipalArn is not the execution role of "
+        f"{', '.join(admitted)}, the gateway(s) with a target routing to it"
     )
 
 
@@ -28933,32 +29011,56 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
             if workload_verdict == "passed":
                 restrictions.append(workload_text)
 
+        def principal_bounded(_key: str, values: List[str]) -> bool:
+            return bool(values) and not any(
+                _arn_pattern_is_unbounded(value) for value in values
+            )
+
         caller_keys, caller_gaps, caller_open = _runtime_invoke_restriction(
             statements,
             str(runtime_arn or ""),
             {"aws:principalarn"},
-            lambda _key, values: (
-                bool(values)
-                and not any(_arn_pattern_is_unbounded(value) for value in values)
-            ),
+            principal_bounded,
         )
+        principal_verdict, principal_text = "", ""
         if caller_keys:
-            restrictions.append(
-                "a resource policy Deny refusing every runtime invoke action to "
-                "every principal outside a bounded aws:PrincipalArn list"
+            if fronting is None:
+                fronting = _runtime_fronting_gateways()
+            principal_verdict, principal_text = _principal_arn_verdict(
+                statements, str(runtime_arn or ""), principal_bounded, *fronting
             )
+            if principal_verdict == "passed":
+                restrictions.append(principal_text)
 
-        if workload_verdict == "failed":
+        failed_texts = [
+            text
+            for verdict, text in (
+                (workload_verdict, workload_text),
+                (principal_verdict, principal_text),
+            )
+            if verdict == "failed"
+        ]
+        na_texts = [
+            text
+            for verdict, text in (
+                (workload_verdict, workload_text),
+                (principal_verdict, principal_text),
+            )
+            if verdict == "na"
+        ]
+        if failed_texts:
             findings.append(
                 create_finding(
                     check_id="AC-47",
                     finding_name="AgentCore Runtime Caller Unrestricted",
-                    finding_details=f"{label} {workload_text}.",
+                    finding_details=f"{label} {'; and '.join(failed_texts)}.",
                     resolution=(
                         "Set allowedWorkloadConfiguration on the runtime's JWT "
                         "authorizer to the hosting environment ARN or workload "
                         "identity of the gateway whose target routes to this "
-                        "runtime, and to nothing else."
+                        "runtime, and to nothing else; for SigV4 callers, name "
+                        "only that gateway's execution role in the resource "
+                        "policy Deny's aws:PrincipalArn list."
                     ),
                     reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -28966,11 +29068,8 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                 )
             )
         elif restrictions:
-            workload_note = (
-                f" Its allowedWorkloadConfiguration was not credited: {label} "
-                f"{workload_text}."
-                if workload_verdict == "na"
-                else ""
+            workload_note = "".join(
+                f" Not credited: {label} {text}." for text in na_texts
             )
             findings.append(
                 create_finding(
@@ -28990,14 +29089,14 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                     status=StatusEnum.PASSED,
                 )
             )
-        elif workload_verdict == "na":
+        elif na_texts:
             findings.append(
                 create_finding(
                     check_id="AC-47",
                     finding_name="AgentCore Runtime Caller Scope",
                     finding_details=(
-                        f"{label} {workload_text}, so the caller leg is not "
-                        "reported as restricted."
+                        f"{label} {'; and '.join(na_texts)}, so the caller leg is "
+                        "not reported as restricted."
                     ),
                     resolution=(
                         "Grant bedrock-agentcore:ListGateways, ListGatewayTargets, "
