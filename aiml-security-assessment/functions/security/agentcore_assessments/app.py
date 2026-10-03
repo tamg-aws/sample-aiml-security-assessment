@@ -901,7 +901,7 @@ MEMORY_RECORD_READ_ACTIONS = (
 # namespace. bedrock-agentcore:namespacePath and namespaceVariable/<key> are
 # published in the devguide read-path and tenant-isolation examples but appear
 # in neither the IAM service authorization reference nor the policy model as of
-# 2026-09-25, so Access Analyzer reports them as unknown keys. Counting them as
+# 2026-10-03, so Access Analyzer reports them as unknown keys. Counting them as
 # scoping intent is safe under both readings: if the key exists it scopes the
 # grant, and if it does not the condition can never match and the Allow grants
 # nothing.
@@ -8408,13 +8408,16 @@ def _memory_namespace_scope_finding(
         )
 
     unpartitioned: List[str] = []
+    unread: List[str] = []
     assessed = 0
     for strategy in strategies:
         if not isinstance(strategy, dict):
+            unread.append("unnamed")
             continue
         strategy_label = strategy.get("name") or strategy.get("strategyId") or "unnamed"
         namespaces = _memory_strategy_namespaces(strategy)
         if not namespaces:
+            unread.append(str(strategy_label))
             continue
         assessed += 1
         if any(
@@ -8441,6 +8444,12 @@ def _memory_namespace_scope_finding(
             status=StatusEnum.NA,
         )
 
+    unread_note = (
+        f" Strategies {', '.join(sorted(unread))} report no namespace, so their "
+        "partitioning was not read."
+        if unread
+        else ""
+    )
     if unpartitioned:
         return create_finding(
             check_id="AC-07",
@@ -8449,6 +8458,7 @@ def _memory_namespace_scope_finding(
                 f"Memory {memory_label} stores long-term records in a namespace "
                 "that carries no actor variable, so one retrieval returns every "
                 f"actor's records. Strategies: {', '.join(sorted(unpartitioned))}."
+                f"{unread_note}"
             ),
             resolution=(
                 "Include {actorId} in the namespace of each memory strategy so "
@@ -8458,6 +8468,23 @@ def _memory_namespace_scope_finding(
             reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
             severity=SeverityEnum.HIGH,
             status=StatusEnum.FAILED,
+        )
+
+    if unread:
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Access Scope",
+            finding_details=(
+                f"Memory {memory_label} partitions the records of {assessed} of "
+                f"its {len(strategies)} strategies by actor namespace.{unread_note}"
+            ),
+            resolution=(
+                "Review the namespace of each strategy named in the AgentCore "
+                "console and rerun the assessment."
+            ),
+            reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
         )
 
     return create_finding(
@@ -12335,12 +12362,62 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
             )
         ]
 
+    key_metadata_cache: Dict[str, Any] = {}
     for log_group in log_groups:
         log_group_name = log_group.get("logGroupName")
         if not log_group_name:
             continue
 
-        has_cmk = bool(log_group.get("kmsKeyId"))
+        key_id = log_group.get("kmsKeyId")
+        key_gap = ""
+        if key_id:
+            # A key the account does not manage, or one disabled or pending
+            # deletion, is not the customer managed encryption the row names.
+            if key_id not in key_metadata_cache:
+                try:
+                    if kms_client is None:
+                        raise ValueError("the KMS client is not available")
+                    key_metadata_cache[key_id] = (
+                        kms_client.describe_key(KeyId=key_id).get("KeyMetadata") or {}
+                    )
+                except Exception as error:
+                    key_metadata_cache[key_id] = _assessment_error_label(error)
+            metadata = key_metadata_cache[key_id]
+            if isinstance(metadata, str):
+                findings.append(
+                    create_finding(
+                        check_id="AC-20",
+                        finding_name="AgentCore Log Data Protection",
+                        finding_details=(
+                            f"Log group '{log_group_name}' is encrypted with the "
+                            f"key {key_id}, whose manager and state kms:DescribeKey "
+                            f"could not read: {metadata}, so the group was not "
+                            "judged."
+                        ),
+                        resolution=(
+                            "Grant kms:DescribeKey on this key and retry. The "
+                            "assessment role is granted kms:DescribeKey only on "
+                            "keys in this account."
+                        ),
+                        reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+            if metadata.get("KeyManager") != "CUSTOMER":
+                key_gap = (
+                    f"a key KMS reports as managed by "
+                    f"{metadata.get('KeyManager') or 'an unknown party'}, not a "
+                    "customer managed key"
+                )
+            elif metadata.get("KeyState") != "Enabled":
+                key_gap = (
+                    "a customer managed key KMS reports as "
+                    f"{metadata.get('KeyState') or 'in an unknown state'}, so it "
+                    "cannot encrypt new log events"
+                )
+        has_cmk = bool(key_id) and not key_gap
         identifiers = list(account_identifiers)
         masking_scope = "account-wide"
 
@@ -12391,8 +12468,8 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
                         "a credentials and a personal or health managed "
                         f"identifier, through a {masking_scope} data-protection "
                         "policy and is encrypted "
-                        "with a customer managed key. AC-26 judges that key's "
-                        "policy."
+                        "with a key kms:DescribeKey reports as customer managed "
+                        "and Enabled. AC-26 judges that key's policy."
                     ),
                     resolution=(
                         "No action required. Confirm the data identifiers cover "
@@ -12413,7 +12490,9 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
                 "a data-protection policy that de-identifies no "
                 f"{' and no '.join(category_gaps)} managed data identifier"
             )
-        if not has_cmk:
+        if key_gap:
+            missing.append(key_gap)
+        elif not has_cmk:
             missing.append("no customer managed encryption key")
 
         findings.append(
@@ -12451,6 +12530,10 @@ AGENTCORE_LOG_GROUP_KINDS = (
     "evaluations/results/",
     "memory/",
     "gateway/",
+    # Gateway and memory log delivery writes one group per resource under
+    # APPLICATION_LOGS/.
+    "memory/APPLICATION_LOGS/",
+    "gateway/APPLICATION_LOGS/",
     "code-interpreter/",
     "browser/",
 )
@@ -13695,8 +13778,8 @@ def check_agentcore_memory_record_access_scope(
                         "${aws:PrincipalTag/userId}."
                     ),
                     reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                     region=GLOBAL_REGION_LABEL,
                 )
             )
@@ -16276,6 +16359,10 @@ RUNTIME_AUTHORIZER_CONDITION_KEY = "bedrock-agentcore:runtimeauthorizertype"
 # RegistryAuthorizerType, spell them AWS_IAM and CUSTOM_JWT.
 RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE = "AWS_IAM"
 RUNTIME_AUTHORIZER_VERIFIED_USER_VALUE = "CUSTOM_JWT"
+# AWS publishes no list of the values RuntimeAuthorizerType takes, so a Deny
+# must also fire on a value nobody lists before it is credited, as on the
+# gateway leg.
+RUNTIME_AUTHORIZER_UNLISTED_VALUE = "AISF_UNLISTED_AUTHORIZER_TYPE"
 
 # The codes Organizations raises when this account cannot see the organization's
 # policies at all, as opposed to seeing them and finding no guardrail. Both
@@ -16419,21 +16506,30 @@ def _scp_deny_reaches_every_resource(
 
 
 def _scp_authorizer_deny_coverage(
-    document: Any, actions: Dict[str, str], key: str, value: str, resource_type: str
+    document: Any,
+    actions: Dict[str, str],
+    key: str,
+    value: str,
+    resource_type: str,
+    also_denies: Tuple[str, ...] = (),
 ) -> Tuple[Set[str], bool]:
     """Return which of `actions` one SCP denies for `key` = `value`, and whether
     the policy conditions on the key at all.
 
     The second value separates a policy that never mentions the authorizer type
     from one that mentions it in a shape that cannot deny the value, because the
-    two need different remediation.
+    two need different remediation. A statement counts only when it also denies
+    every value in `also_denies`.
     """
     covered: Set[str] = set()
     names_key = False
     for statement in _document_statements(document, effect="Deny"):
         if key in _statement_condition_keys(statement):
             names_key = True
-        if not _statement_condition_denies_value(statement, key, value):
+        if not all(
+            _statement_condition_denies_value(statement, key, denied)
+            for denied in (value, *also_denies)
+        ):
             continue
         if not _scp_deny_reaches_every_resource(statement, resource_type):
             continue
@@ -16945,7 +17041,9 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
     denies CreateAgentRuntime and UpdateAgentRuntime when
     bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM. Update matters as much
     as create: a Deny on create alone leaves a JWT runtime one
-    UpdateAgentRuntime call away from SigV4.
+    UpdateAgentRuntime call away from SigV4. AWS publishes no list of the
+    values the key takes, so the Deny must also fire on an unlisted value; a
+    StringEquals deny-list of AWS_IAM is reported, not credited.
 
     A policy written the other way round, denying the JWT mode and admitting
     SigV4, is reported separately: it is a guardrail pointed at the wrong value
@@ -17009,6 +17107,7 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
     coverage: Dict[str, Tuple[str, Set[str]]] = {}
     inverted_coverage: Dict[str, Tuple[str, Set[str]]] = {}
     attempting_policies: List[str] = []
+    deny_list_policies: List[str] = []
     read_errors: List[Tuple[str, Exception]] = []
 
     for policy in policies:
@@ -17026,6 +17125,14 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
             RUNTIME_AUTHORIZER_CONDITION_KEY,
             RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE,
             "runtime",
+            also_denies=(RUNTIME_AUTHORIZER_UNLISTED_VALUE,),
+        )
+        listed_only, _ = _scp_authorizer_deny_coverage(
+            content,
+            RUNTIME_WRITE_ACTIONS,
+            RUNTIME_AUTHORIZER_CONDITION_KEY,
+            RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE,
+            "runtime",
         )
         inverted, _ = _scp_authorizer_deny_coverage(
             content,
@@ -17036,6 +17143,8 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
         )
         if covered:
             coverage[policy["Id"]] = (policy_name, covered)
+        elif listed_only:
+            deny_list_policies.append(policy_name)
         elif inverted:
             inverted_coverage[policy["Id"]] = (policy_name, inverted)
         elif names_key:
@@ -17102,8 +17211,9 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
                 finding_name="AgentCore Runtime Authorizer Guardrail",
                 finding_details=(
                     "CreateAgentRuntime and UpdateAgentRuntime are both denied "
-                    "when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, by "
-                    f"service control policy: {guarding_label}, so a new runtime "
+                    "when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM or "
+                    "a value the statement does not list, by service control "
+                    f"policy: {guarding_label}, so a new runtime "
                     "has to carry a JWT authorizer that validates the end user's "
                     f"token. {attached_label}, which binds this account."
                 ),
@@ -17193,6 +17303,33 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
         )
         return findings
 
+    if deny_list_policies:
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail Deny-List",
+                finding_details=(
+                    "Runtime writes are denied when "
+                    "bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, but not "
+                    "when it carries a value the statement does not list, by "
+                    "service control policy: "
+                    f"{', '.join(sorted(deny_list_policies))}. AWS publishes no "
+                    "list of the values the key takes, so a SigV4 runtime write "
+                    "that carries another value is not shown to be denied. "
+                    "Whether the policy is attached here was not read."
+                ),
+                resolution=(
+                    "Deny CreateAgentRuntime and UpdateAgentRuntime with "
+                    "StringNotEquals bedrock-agentcore:RuntimeAuthorizerType "
+                    "CUSTOM_JWT, which denies every type but the JWT one."
+                ),
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
     if attempting_policies:
         findings.append(
             create_finding(
@@ -17208,8 +17345,8 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
                 ),
                 resolution=(
                     "Deny CreateAgentRuntime and UpdateAgentRuntime with "
-                    "StringEquals on AWS_IAM, or with StringNotEquals on the "
-                    "authorizer types the organization approves."
+                    "StringNotEquals on the authorizer types the organization "
+                    "approves, such as CUSTOM_JWT."
                 ),
                 reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
                 severity=SeverityEnum.HIGH,
@@ -17232,8 +17369,8 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
             resolution=(
                 "Attach a service control policy that denies "
                 "bedrock-agentcore:CreateAgentRuntime and "
-                "bedrock-agentcore:UpdateAgentRuntime with StringEquals on "
-                "bedrock-agentcore:RuntimeAuthorizerType AWS_IAM."
+                "bedrock-agentcore:UpdateAgentRuntime with StringNotEquals on "
+                "bedrock-agentcore:RuntimeAuthorizerType CUSTOM_JWT."
             ),
             reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
             severity=SeverityEnum.HIGH,

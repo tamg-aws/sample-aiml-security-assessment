@@ -631,6 +631,41 @@ MUTATIONS = [
         "find": "        elif judged:\n            # A configuration names the agent traffic",
         "replace": "        elif False:\n            # A configuration names the agent traffic",
     },
+    {
+        "name": "AC-29 credits a runtime deny-list of AWS_IAM",
+        "file": AGENTCORE,
+        "defect": "AWS publishes no list of the values RuntimeAuthorizerType takes, so a Deny that fires on AWS_IAM but not on an unlisted value is not shown to deny a SigV4 write, and dropping the probe passes it",
+        "find": "            also_denies=(RUNTIME_AUTHORIZER_UNLISTED_VALUE,),\n",
+        "replace": "",
+    },
+    {
+        "name": "AC-07 passes a memory beside a strategy with no namespace",
+        "file": AGENTCORE,
+        "defect": "a strategy that reports no namespace was skipped, so one partitioned strategy beside it passed the memory with the other's records unread",
+        "find": '    if unread:\n        return create_finding(\n            check_id="AC-07",\n',
+        "replace": '    if False:\n        return create_finding(\n            check_id="AC-07",\n',
+    },
+    {
+        "name": "AC-23 passes a read bound by a fixed literal partition",
+        "file": AGENTCORE,
+        "defect": "a literal partition with no policy variable is shared by every caller of the principal, and whether one actor or many use it is not read, so it cannot reach Passed",
+        "find": "                    severity=SeverityEnum.INFORMATIONAL,\n                    status=StatusEnum.NA,\n                    region=GLOBAL_REGION_LABEL,\n                )\n            )\n\n        if bound:\n",
+        "replace": "                    severity=SeverityEnum.HIGH,\n                    status=StatusEnum.PASSED,\n                    region=GLOBAL_REGION_LABEL,\n                )\n            )\n\n        if bound:\n",
+    },
+    {
+        "name": "AC-21 bounds an APPLICATION_LOGS-wide unmask",
+        "file": AGENTCORE,
+        "defect": "gateway and memory log delivery writes one group per resource under APPLICATION_LOGS/, so logs:Unmask on APPLICATION_LOGS/* reaches every such group and read as bounded without those kinds",
+        "find": '    "memory/APPLICATION_LOGS/",\n    "gateway/APPLICATION_LOGS/",\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-20 reads a key id as customer managed encryption",
+        "file": AGENTCORE,
+        "defect": "an AWS managed key or a disabled customer managed key on the group passed, because the key id's presence was read as customer managed encryption",
+        "find": "        has_cmk = bool(key_id) and not key_gap\n",
+        "replace": '        has_cmk = bool(key_id)\n        key_gap = ""\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -832,6 +867,11 @@ GROUPS: dict[str, str] = {
     "AC-40 counts an alarm no listed metric ties to an evaluator": "in the AgentCore verdict legs",
     "AC-40 judges a stopped configuration as scoring safety": "in the AgentCore verdict legs",
     "AC-17 reads a stopped configuration with no runtime as N/A": "in the AgentCore verdict legs",
+    "AC-29 credits a runtime deny-list of AWS_IAM": "in the AgentCore verdict legs",
+    "AC-07 passes a memory beside a strategy with no namespace": "in the AgentCore verdict legs",
+    "AC-23 passes a read bound by a fixed literal partition": "in the AgentCore verdict legs",
+    "AC-21 bounds an APPLICATION_LOGS-wide unmask": "in the AgentCore verdict legs",
+    "AC-20 reads a key id as customer managed encryption": "in the AgentCore verdict legs",
 }
 
 

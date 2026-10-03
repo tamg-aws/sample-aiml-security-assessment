@@ -571,12 +571,15 @@ AI_SUBJECT_ROWS = [
         "that is not customer managed and a key that is disabled or pending deletion "
         "fail, and a key the assessment role cannot describe, which includes every key "
         "in another account, is N/A. AC-07 also requires an {actorId} variable in "
-        "every namespace of every strategy, and fails a memory resource-based policy "
+        "every namespace of every strategy, a strategy that reports no namespace "
+        "holding the memory at N/A, and fails a memory resource-based policy "
         "whose Allow statement trusts * or an AWS service with no account or "
         "organization condition, an unread policy being N/A. AC-23 judges each memory read by the key "
         "that action carries: namespace for record reads, actorId or sessionId for "
         "event reads. A strategyId condition alone, an IfExists, ForAllValues or "
-        "negated operator and a wildcard-only value do not bound a read. A bare Action "
+        "negated operator and a wildcard-only value do not bound a read. A read bound "
+        "only by a literal partition with no policy variable is N/A, because whether "
+        "one actor or many share the principal is not read. A bare Action "
         '"*", a NotAction and group policies count, a grant the principal\'s own Deny '
         "or boundary removes does not, and a principal the IAM cache could not read is "
         "N/A",
@@ -868,7 +871,10 @@ AI_SUBJECT_ROWS = [
         "and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is "
         "AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode "
         "that authenticates the hosting application's shared role instead of the end "
-        "user. IfExists operators read as their plain form. The policy counts only "
+        "user. The same statement must also deny a type the key does not list, "
+        "because AWS publishes no list of the values it takes: StringNotEquals "
+        "CUSTOM_JWT passes, and a StringEquals deny-list of AWS_IAM fails as "
+        "Deny-List. IfExists operators read as their plain form. The policy counts only "
         "when it is attached to the assessed account, to an organizational unit above "
         "it or to the root, read with organizations:ListParents and "
         "organizations:ListTargetsForPolicy: a guard attached elsewhere fails as "
@@ -1028,14 +1034,16 @@ AI_SUBJECT_ROWS = [
         None,
         "agentcore_assessments",
         ["AC-20", "AC-21"],
-        "AC-20 asserts a Deidentify data-protection policy and a customer managed key "
-        "on the AgentCore log groups, and its Passed text says that AC-26 judges the "
-        "key policy and that delivery destination log groups outside the AgentCore "
-        "prefixes are not read. AC-21 fails a cached role or user that holds "
-        'logs:Unmask on an unbounded log group resource. A bare Action "*", any '
+        "AC-20 asserts a Deidentify data-protection policy and a key on the AgentCore "
+        "log groups that kms:DescribeKey reports as customer managed and Enabled, an "
+        "AWS managed or disabled key failing and an undescribable key being N/A, and "
+        "its Passed text says that AC-26 judges the key policy. AC-21 fails a cached "
+        "role or user that holds logs:Unmask on an unbounded log group resource. A "
+        'bare Action "*", any '
         "pattern or NotAction that reaches the action and group policies count, a "
-        "resource is unbounded when the group name is wildcard-only or a wider ARN "
-        "segment is a wildcard, a grant the principal's own Deny or boundary removes "
+        "resource is unbounded when the group name is wildcard-only, matches every "
+        "group of one AgentCore kind (the gateway and memory APPLICATION_LOGS groups "
+        "included) or a wider ARN segment is a wildcard, a grant the principal's own Deny or boundary removes "
         "does not count, and a policy that cannot be parsed or a principal the IAM "
         "cache could not read is N/A",
         [],

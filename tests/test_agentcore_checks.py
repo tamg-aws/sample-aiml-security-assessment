@@ -4631,6 +4631,48 @@ class TestAC07MemoryConfiguration:
         assert [f["Status"] for f in findings] == ["Passed", "N/A"]
         assert "reports no namespace" in findings[1]["Finding_Details"]
 
+    @pytest.mark.parametrize(
+        "second, status",
+        [
+            ({"strategyId": "strat-2", "name": "facts"}, "N/A"),
+            (
+                {
+                    "strategyId": "strat-2",
+                    "name": "facts",
+                    "namespaceTemplates": [
+                        "/strategies/{memoryStrategyId}/actors/{actorId}"
+                    ],
+                },
+                "Passed",
+            ),
+        ],
+        ids=["one-unread", "both-read"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_an_unread_strategy_beside_a_partitioned_one_withholds_passed(
+        self, mock_ac, second, status
+    ):
+        self._one_memory(
+            mock_ac,
+            strategies=[
+                {
+                    "strategyId": "strat-1",
+                    "name": "summary",
+                    "namespaceTemplates": [self._ACTOR_NAMESPACE],
+                },
+                second,
+            ],
+        )
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", status]
+        if status == "N/A":
+            assert "1 of its 2 strategies" in findings[1]["Finding_Details"]
+            assert "facts report no namespace" in findings[1]["Finding_Details"]
+
     @patch("agentcore_app.agentcore_client")
     def test_ac07_malformed_strategies_value_is_na(self, mock_ac):
         self._one_memory(mock_ac, strategies={"unexpected": "shape"})
@@ -8748,6 +8790,17 @@ def _log_group_side_effect(groups_by_prefix):
     return describe
 
 
+@pytest.fixture
+def _customer_managed_log_keys():
+    """Serve every log-group key as customer managed and Enabled."""
+    with patch("agentcore_app.kms_client") as mock_kms:
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+        }
+        yield mock_kms
+
+
+@pytest.mark.usefixtures("_customer_managed_log_keys")
 class TestAC20LogDataProtection:
     """AC-20: Masking and CMK encryption on AgentCore log groups."""
 
@@ -8788,6 +8841,75 @@ class TestAC20LogDataProtection:
         assert findings[0]["Check_ID"] == "AC-20"
         assert findings[0]["Status"] == "Passed"
         assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.logs_client")
+    def test_a_key_that_is_not_customer_managed_and_enabled_fails(
+        self, mock_logs, _customer_managed_log_keys
+    ):
+        # A key id on the group was read as customer managed encryption, so an
+        # AWS managed key or a disabled key passed.
+        mock_logs.describe_account_policies.return_value = {
+            "accountPolicies": [
+                {"policyName": "acct", "policyDocument": self._MASKING_POLICY}
+            ]
+        }
+        keys = {
+            "good": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"},
+            "aws": {"KeyManager": "AWS", "KeyState": "Enabled"},
+            "off": {"KeyManager": "CUSTOMER", "KeyState": "Disabled"},
+        }
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": f"/aws/bedrock-agentcore/runtimes/{name}",
+                        "kmsKeyId": f"arn:aws:kms:us-east-1:123456789012:key/{name}",
+                    }
+                    for name in keys
+                ]
+            }
+        )
+        _customer_managed_log_keys.describe_key.side_effect = lambda KeyId: {
+            "KeyMetadata": keys[KeyId.rsplit("/", 1)[1]]
+        }
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        by_group = {
+            f["Finding_Details"].split("'")[1].rsplit("/", 1)[1]: f for f in findings
+        }
+        assert by_group["good"]["Status"] == "Passed"
+        assert by_group["aws"]["Status"] == "Failed"
+        assert "managed by AWS" in by_group["aws"]["Finding_Details"]
+        assert by_group["off"]["Status"] == "Failed"
+        assert "Disabled" in by_group["off"]["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    def test_an_undescribable_key_is_na(self, mock_logs, _customer_managed_log_keys):
+        mock_logs.describe_account_policies.return_value = {
+            "accountPolicies": [
+                {"policyName": "acct", "policyDocument": self._MASKING_POLICY}
+            ]
+        }
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KMS_KEY,
+                    }
+                ]
+            }
+        )
+        _customer_managed_log_keys.describe_key.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "DescribeKey",
+        )
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.logs_client")
     def test_an_account_policy_covers_every_group_and_the_pass_names_its_limits(
@@ -9931,7 +10053,9 @@ class TestAC23MemoryRecordAccessScope:
 
         findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
 
-        assert {finding["Status"] for finding in findings} == {"Failed", "Passed"}
+        # Tightened from Passed: the scoped role's literal namespace is shared
+        # by every caller of the role, which the assessment cannot rule out.
+        assert {finding["Status"] for finding in findings} == {"Failed", "N/A"}
 
     @pytest.mark.parametrize(
         "namespace,status",
@@ -9944,10 +10068,13 @@ class TestAC23MemoryRecordAccessScope:
             ("/actors/a-*/*", "Failed"),
             ("/actors/alice*", "Failed"),
             ("/actors/a-?", "Failed"),
-            ("/actors/a-1/*", "Passed"),
-            ("/actors/a-1/sessions/*", "Passed"),
-            ("/users/alice/*", "Passed"),
-            ("/actors/a-1/sessions/s-1", "Passed"),
+            # Tightened from Passed: a literal partition is fixed, and whether
+            # one actor or many use the principal is not read.
+            ("/actors/a-1/*", "N/A"),
+            ("/actors/a-1/sessions/*", "N/A"),
+            ("/users/alice/*", "N/A"),
+            ("/actors/a-1/sessions/s-1", "N/A"),
+            ("/actors/${aws:userid}/*", "Passed"),
         ],
     )
     def test_a_stringlike_namespace_that_spans_callers_is_unscoped(
@@ -13377,7 +13504,10 @@ class TestAC29RuntimeAuthorizerSCP:
         mock_orgs.describe_policy.side_effect = describe_policy
 
     @patch("agentcore_app.organizations_client")
-    def test_an_equals_deny_on_both_writes_passes(self, mock_orgs):
+    def test_an_equals_deny_list_of_aws_iam_is_not_credited(self, mock_orgs):
+        # Tightened from Passed: AWS publishes no list of the values the key
+        # takes, so a Deny that names AWS_IAM alone is not shown to deny a SigV4
+        # write that carries another value. The allow-list beside it passes.
         self._wire(
             mock_orgs,
             {
@@ -13396,8 +13526,40 @@ class TestAC29RuntimeAuthorizerSCP:
 
         assert len(findings) == 1
         assert findings[0]["Check_ID"] == "AC-29"
-        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Deny-List")
         assert "DenySigV4Runtime" in findings[0]["Finding_Details"]
+        assert "attached here was not read" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_allow_list_passes_beside_a_deny_list(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "DenyListOnly": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ],
+                "OnlyJwtRuntimes": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
+                    }
+                ],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "OnlyJwtRuntimes" in findings[0]["Finding_Details"]
+        assert "DenyListOnly" not in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.organizations_client")
     def test_a_not_equals_allow_list_that_omits_aws_iam_passes(self, mock_orgs):
@@ -13431,7 +13593,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": ["bedrock-agentcore:CreateAgentRuntime"],
                         "Resource": "*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ]
             },
@@ -13491,10 +13653,9 @@ class TestAC29RuntimeAuthorizerSCP:
         assert findings[0]["Finding"].endswith("Inverted")
 
     @patch("agentcore_app.organizations_client")
-    def test_a_policy_denying_both_modes_still_passes(self, mock_orgs):
-        # A blanket prohibition on runtimes does prevent the SigV4 deployment
-        # this control is about, so it earns the pass and the detail names the
-        # policy for a reader who wants to know the JWT mode is blocked too.
+    def test_a_deny_list_of_both_modes_is_not_credited(self, mock_orgs):
+        # Tightened from Passed: a deny-list of AWS_IAM and CUSTOM_JWT still
+        # admits a write carrying a value it does not list.
         self._wire(
             mock_orgs,
             {
@@ -13513,7 +13674,8 @@ class TestAC29RuntimeAuthorizerSCP:
 
         findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
 
-        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Deny-List")
 
     @patch("agentcore_app.organizations_client")
     def test_a_null_condition_is_reported_as_ineffective(self, mock_orgs):
@@ -13594,7 +13756,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": "bedrock-agentcore:*",
                         "Resource": "*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ]
             },
@@ -13614,7 +13776,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": ["bedrock-agentcore:CreateAgentRuntime"],
                         "Resource": "*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ],
                 "DenyUpdate": [
@@ -13622,7 +13784,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": ["bedrock-agentcore:UpdateAgentRuntime"],
                         "Resource": "*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ],
             },
@@ -13640,7 +13802,11 @@ class TestAC29RuntimeAuthorizerSCP:
             # lower-cased nor a padded value denies AWS_IAM.
             ("StringEquals", " aws_iam ", "Failed"),
             ("StringEquals", "aws_iam", "Failed"),
-            ("StringEqualsIgnoreCase", "aws_iam", "Passed"),
+            # Tightened from Passed: the folded match is still a deny-list.
+            ("StringEqualsIgnoreCase", "aws_iam", "Failed"),
+            # A folded StringNotEquals on custom_jwt denies AWS_IAM and an
+            # unlisted value, so it passes.
+            ("StringNotEqualsIgnoreCase", "custom_jwt", "Passed"),
         ],
     )
     @patch("agentcore_app.organizations_client")
@@ -13684,7 +13850,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": _RUNTIME_WRITE,
                         "Resource": "*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ]
             )
@@ -13750,7 +13916,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": _RUNTIME_WRITE,
                         "Resource": "*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ]
             )
@@ -13767,14 +13933,14 @@ class TestAC29RuntimeAuthorizerSCP:
         [
             {
                 "Condition": {
-                    "StringEquals": {_RUNTIME_KEY: "AWS_IAM"},
+                    "StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"},
                     "ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Admin"},
                 }
             },
             {
                 "Condition": {
-                    "StringEquals": {
-                        _RUNTIME_KEY: "AWS_IAM",
+                    "StringNotEquals": {
+                        _RUNTIME_KEY: "CUSTOM_JWT",
                         "aws:ResourceTag/env": "prod",
                     }
                 }
@@ -13801,7 +13967,7 @@ class TestAC29RuntimeAuthorizerSCP:
             "Effect": "Deny",
             "Action": _RUNTIME_WRITE,
             "Resource": "*",
-            "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+            "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
         }
         statement.update(change)
         if "NotResource" in change:
@@ -13822,7 +13988,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": _RUNTIME_WRITE,
                         "Resource": "arn:aws:bedrock-agentcore:*:*:runtime/prod-*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ],
                 "Whole": [
@@ -13830,7 +13996,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": _RUNTIME_WRITE,
                         "Resource": "arn:aws:bedrock-agentcore:*:*:runtime/*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
                     }
                 ],
             },
@@ -13865,9 +14031,17 @@ def _runtime_guard(operator="StringEquals", value="AWS_IAM", action=None):
     ]
 
 
+def _runtime_allow_list_guard(action=None):
+    # AC-29 credits a Deny that also fires on an unlisted authorizer type, so
+    # the attachment tests use the allow-list shape.
+    return _runtime_guard("StringNotEquals", "CUSTOM_JWT", action)
+
+
 _SCP_CHECKS = [
     pytest.param("check_agentcore_gateway_authorizer_scp", _gateway_guard, id="AC-28"),
-    pytest.param("check_agentcore_runtime_authorizer_scp", _runtime_guard, id="AC-29"),
+    pytest.param(
+        "check_agentcore_runtime_authorizer_scp", _runtime_allow_list_guard, id="AC-29"
+    ),
 ]
 
 
@@ -14147,7 +14321,8 @@ class TestSCPAttachment:
     @pytest.mark.parametrize(
         "operator, value, status",
         [
-            ("StringEqualsIfExists", "AWS_IAM", "Passed"),
+            # Tightened from Passed: a deny-list of AWS_IAM is not credited.
+            ("StringEqualsIfExists", "AWS_IAM", "Failed"),
             ("StringNotEqualsIfExists", "CUSTOM_JWT", "Passed"),
             ("StringNotEqualsIfExists", "AWS_IAM", "Failed"),
         ],
@@ -34961,6 +35136,7 @@ class TestAC21WholePopulation:
         assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
 
 
+@pytest.mark.usefixtures("_customer_managed_log_keys")
 class TestAC20IdentifierCategories:
     """AC-20: masking must name a credentials and a personal or health identifier."""
 
@@ -35185,6 +35361,10 @@ class TestAC21PrefixWideUnmask:
             "/aws/bedrock-agentcore/runtimes/*-DEFAULT",
             "/aws/vendedlogs/bedrock-agentcore/memory/*",
             "*agentcore*",
+            # Gateway and memory log delivery writes one group per resource
+            # under APPLICATION_LOGS/, as the live account's groups show.
+            "/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/*",
+            "/aws/vendedlogs/bedrock-agentcore/memory/APPLICATION_LOGS/*",
         ],
     )
     def test_a_prefix_wide_grant_fails(self, name):
@@ -35202,6 +35382,7 @@ class TestAC21PrefixWideUnmask:
             "/aws/bedrock-agentcore/runtimes/myagent-*",
             "/aws/bedrock-agentcore/runtimes/rt-?-DEFAULT",
             "/aws/lambda/*",
+            "/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/gw-1abc",
         ],
     )
     def test_a_grant_short_of_a_whole_prefix_passes(self, name):
@@ -35368,7 +35549,8 @@ class TestAC23WholePopulation:
             ),
         )
 
-        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+        # Tightened from Passed: the fixed row is N/A, the bound row passes.
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
         fixed_row, bound_row = findings
         assert "role fixed" in fixed_row["Finding_Details"]
         assert "fixed literal" in fixed_row["Finding_Details"]
@@ -35394,7 +35576,8 @@ class TestAC23WholePopulation:
                 ]
             )
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
+        # Tightened from Passed: one fixed value makes the principal fixed.
+        assert [f["Status"] for f in findings] == ["N/A"]
         assert "fixed literal" in findings[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
@@ -41735,6 +41918,7 @@ class TestAC19TransactionSearch:
         assert mock_xray.get_trace_segment_destination.call_count == 0
 
 
+@pytest.mark.usefixtures("_customer_managed_log_keys")
 class TestAC20DeliveryDestinationGroups:
     """AIR-ACR-OBS-04: AC-20 judges a log group outside the AgentCore prefixes
     that a delivery from an AgentCore source writes to."""
