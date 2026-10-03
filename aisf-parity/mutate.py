@@ -715,6 +715,48 @@ MUTATIONS = [
         "find": '            and _confused_deputy_guard_account(\n                statement, account_id, keys=("aws:sourcearn",)\n            )\n        ]\n        for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS\n',
         "replace": "        ]\n        for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS\n",
     },
+    {
+        "name": "AG-24 passes a gateway with no REQUEST interceptor",
+        "file": AGENTCORE,
+        "defect": "the recommendation asks for a request interceptor on every gateway so tool access does not rest on the model, and a gateway with none passed on its authorizer alone",
+        "find": "        if not request_interceptors:\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "AG-24 counts a RESPONSE-only interceptor as a request guard",
+        "file": AGENTCORE,
+        "defect": "a RESPONSE interceptor runs after the target has executed the call, so it cannot stop the tool call it inspects",
+        "find": '            and "REQUEST" in (entry.get("interceptionPoints") or [])\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-25 passes a portal-served target with its own return URL",
+        "file": AGENTCORE,
+        "defect": "a consent portal binds consent only at <portalUrl>/connect/callback, and a target created before the portal keeps a return URL elsewhere, so the consent never binds to the session and the target passed",
+        "find": "                        elif callbacks and return_url not in callbacks:\n",
+        "replace": "                        elif False:\n",
+    },
+    {
+        "name": "AC-25 passes token exchange on a gateway with no JWT inbound",
+        "file": AGENTCORE,
+        "defect": "TOKEN_EXCHANGE exchanges an inbound user token, which only a CUSTOM_JWT gateway receives, and the target was labelled and passed without that join",
+        "find": '                        and authorizer_type != "CUSTOM_JWT"\n',
+        "replace": "                        and False\n",
+    },
+    {
+        "name": "AC-25 passes an AUTHORIZATION_CODE target beside an unread portal list",
+        "file": AGENTCORE,
+        "defect": "with ListConsentPortals unread, whether the return URL must be a portal callback is unknown, and the target passed on a failed read",
+        "find": "                        elif portal_error:\n",
+        "replace": "                        elif False:\n",
+    },
+    {
+        "name": "AG-24 passes an authorized gateway with no enforcing engine",
+        "file": AGENTCORE,
+        "defect": "an AWS_IAM or CUSTOM_JWT authorizer decides who calls the gateway, not which tool call that caller makes, and such a gateway passed with no default-deny engine in ENFORCE",
+        "find": '            if engine_status == StatusEnum.FAILED.value:\n                findings.append(\n                    create_finding(\n                        check_id="AG-24",\n                        finding_name="Agentic AI Gateway Tool Call Authorization Missing",\n',
+        "replace": '            if False:\n                findings.append(\n                    create_finding(\n                        check_id="AG-24",\n                        finding_name="Agentic AI Gateway Tool Call Authorization Missing",\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -928,6 +970,12 @@ GROUPS: dict[str, str] = {
     "AC-01 passes a broad public egress range": "in the AgentCore verdict legs",
     "AC-27 passes a gateway policy statement with no source ARN": "in the AgentCore verdict legs",
     "AC-36 credits a source-context statement with only SourceAccount": "in the AgentCore verdict legs",
+    "AG-24 passes a gateway with no REQUEST interceptor": "in the AgentCore verdict legs",
+    "AG-24 counts a RESPONSE-only interceptor as a request guard": "in the AgentCore verdict legs",
+    "AC-25 passes a portal-served target with its own return URL": "in the AgentCore verdict legs",
+    "AC-25 passes token exchange on a gateway with no JWT inbound": "in the AgentCore verdict legs",
+    "AC-25 passes an AUTHORIZATION_CODE target beside an unread portal list": "in the AgentCore verdict legs",
+    "AG-24 passes an authorized gateway with no enforcing engine": "in the AgentCore verdict legs",
 }
 
 

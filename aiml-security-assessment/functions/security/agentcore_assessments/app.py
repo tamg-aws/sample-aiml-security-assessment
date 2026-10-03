@@ -188,6 +188,10 @@ AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "gateway-inbound-auth.html"
 )
+AGENTCORE_GATEWAY_INTERCEPTORS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "gateway-interceptors.html"
+)
 SERVICE_CONTROL_POLICY_REFERENCE_URL = (
     "https://docs.aws.amazon.com/organizations/latest/userguide/"
     "orgs_manage_policies_scps.html"
@@ -14363,11 +14367,46 @@ def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
             )
         ]
 
+    # A consent portal names its gateway by id or ARN, and an AUTHORIZATION_CODE
+    # target it serves binds consent only when it returns the user to
+    # <portalUrl>/connect/callback.
+    portal_error = ""
+    portal_urls: Dict[str, List[str]] = {}
+    try:
+        portals = _agentcore_list_all("list_consent_portals", ["consentPortals"])
+    except Exception as error:
+        portals = []
+        portal_error = _assessment_error_label(error)
+    for portal in portals:
+        for source in portal.get("sources") or []:
+            if (
+                isinstance(source, dict)
+                and source.get("type") == "agentcore-gateway"
+                and source.get("identifier")
+            ):
+                portal_urls.setdefault(
+                    str(source["identifier"]).rsplit("/", 1)[-1], []
+                ).append(str(portal.get("portalUrl") or "").rstrip("/"))
+
     findings = []
     targets_seen = 0
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId", "unknown")
         gateway_name = gateway.get("name", gateway_id)
+        authorizer_type = gateway.get("authorizerType")
+        authorizer_error = ""
+        if not authorizer_type:
+            try:
+                authorizer_type = agentcore_client.get_gateway(
+                    gatewayIdentifier=gateway_id
+                ).get("authorizerType")
+            except Exception as error:
+                authorizer_error = _assessment_error_label(error)
+            if not isinstance(authorizer_type, str):
+                authorizer_type = None
+        callbacks = [
+            f"{url}/connect/callback" for url in portal_urls.get(gateway_id, [])
+        ]
 
         try:
             targets = _agentcore_list_all(
@@ -14431,6 +14470,8 @@ def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
 
             provider_types = []
             return_url_problems = []
+            exchange_problems = []
+            unread = []
             for configuration in detail.get("credentialProviderConfigurations") or []:
                 if not isinstance(configuration, dict) or not configuration.get(
                     "credentialProviderType"
@@ -14445,12 +14486,40 @@ def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
                     provider_type += f" (grantType {grant_type}"
                     if grant_type == "AUTHORIZATION_CODE":
                         problem = _oauth_return_url_problem(oauth)
+                        return_url = oauth.get("defaultReturnUrl")
                         if problem:
                             return_url_problems.append(problem)
-                        else:
-                            provider_type += (
-                                f", returning the user to {oauth['defaultReturnUrl']}"
+                        elif portal_error:
+                            unread.append(
+                                f"whether a consent portal serves the gateway, so "
+                                f"whether {return_url} must be its callback "
+                                f"(bedrock-agentcore:ListConsentPortals: "
+                                f"{portal_error})"
                             )
+                        elif callbacks and return_url not in callbacks:
+                            return_url_problems.append(
+                                f"returns the user to {return_url}, but a consent "
+                                "portal serves the gateway and binds consent only "
+                                f"at {' or '.join(callbacks)}"
+                            )
+                        else:
+                            provider_type += f", returning the user to {return_url}"
+                    elif grant_type == "TOKEN_EXCHANGE" and not authorizer_type:
+                        unread.append(
+                            "the gateway's authorizerType, which a TOKEN_EXCHANGE "
+                            "grant needs to be CUSTOM_JWT (bedrock-agentcore:"
+                            f"GetGateway: {authorizer_error or 'no value returned'})"
+                        )
+                    elif (
+                        grant_type == "TOKEN_EXCHANGE"
+                        and authorizer_type != "CUSTOM_JWT"
+                    ):
+                        exchange_problems.append(
+                            "exchanges an inbound user token (grantType "
+                            "TOKEN_EXCHANGE), but the gateway's authorizerType is "
+                            f"{authorizer_type}, so no inbound user token reaches "
+                            "it to exchange"
+                        )
                     provider_type += ")"
                 provider_types.append(provider_type)
 
@@ -14477,11 +14546,50 @@ def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
                         status=StatusEnum.FAILED,
                     )
                 )
+            if exchange_problems:
+                findings.append(
+                    create_finding(
+                        check_id="AC-25",
+                        finding_name="AgentCore Gateway Target Token Exchange Without JWT",
+                        finding_details=(f"{label} {'; it '.join(exchange_problems)}."),
+                        resolution=(
+                            "Use token exchange only on a gateway whose "
+                            "authorizerType is CUSTOM_JWT, or give this target a "
+                            "grant that does not depend on an inbound user token."
+                        ),
+                        reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            if return_url_problems or exchange_problems:
+                continue
+            if unread:
+                findings.append(
+                    create_finding(
+                        check_id="AC-25",
+                        finding_name="AgentCore Gateway Target Authorization",
+                        finding_details=(
+                            f"{label} authenticates outbound calls with "
+                            f"{', '.join(provider_types)}, but "
+                            f"{'; and '.join(unread)} could not be read."
+                        ),
+                        resolution=(
+                            "Grant the read named above and retry the assessment."
+                        ),
+                        reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
             elif provider_types:
                 portal_note = (
-                    " Whether a return URL is the consent portal's "
-                    "<portalUrl>/connect/callback is not compared, because the "
-                    "pinned botocore model has no consent portal operation."
+                    (
+                        " A consent portal serves the gateway, and the return URL "
+                        "is its callback."
+                        if callbacks
+                        else " No consent portal names the gateway."
+                    )
                     if any("AUTHORIZATION_CODE" in text for text in provider_types)
                     else ""
                 )
@@ -32729,6 +32837,36 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                 )
             )
 
+        request_interceptors = [
+            str(((entry.get("interceptor") or {}).get("lambda") or {}).get("arn"))
+            for entry in gateway_details.get("interceptorConfigurations") or []
+            if isinstance(entry, dict)
+            and "REQUEST" in (entry.get("interceptionPoints") or [])
+            and ((entry.get("interceptor") or {}).get("lambda") or {}).get("arn")
+        ]
+        if not request_interceptors:
+            findings.append(
+                create_finding(
+                    check_id="AG-24",
+                    finding_name="Agentic AI Gateway Request Interceptor Missing",
+                    finding_details=(
+                        f"Gateway '{gateway_name}' ({gateway_id}) reports no "
+                        "interceptorConfigurations entry with a REQUEST "
+                        "interception point and a Lambda function, so no code of "
+                        "the customer's checks a tool call before the target "
+                        "receives it."
+                    ),
+                    resolution=(
+                        "Add a REQUEST interceptor to the gateway's "
+                        "interceptorConfigurations whose Lambda function denies "
+                        "the call when its own checks fail or it cannot decide."
+                    ),
+                    reference=AGENTCORE_GATEWAY_INTERCEPTORS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
         if not policy_engine_config:
             findings.append(
                 create_finding(
@@ -32912,6 +33050,56 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                         finding_details=f"Gateway '{gateway_name}' ({gateway_id}) uses authorizerType AUTHENTICATE_ONLY and delegates authorization to policy engine {policy_engine_arn} in ENFORCE mode, but AG-25 could not read the engine's policies ('{engine_finding.get('Finding')}'), so whether the engine denies any tool call is unknown.",
                         resolution="Resolve the AG-25 N/A and rerun the assessment.",
                         reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+
+        elif authorizer_type in ("AWS_IAM", "CUSTOM_JWT"):
+            # The authorizer decides who may call the gateway; which tool call
+            # that caller may make is the ENFORCE engine's default-deny decision.
+            engine_finding = next(
+                finding
+                for finding in reversed(findings)
+                if finding.get("Check_ID") == "AG-25"
+            )
+            engine_status = engine_finding.get("Status")
+            if engine_status == StatusEnum.FAILED.value:
+                findings.append(
+                    create_finding(
+                        check_id="AG-24",
+                        finding_name="Agentic AI Gateway Tool Call Authorization Missing",
+                        finding_details=(
+                            f"Gateway '{gateway_name}' ({gateway_id}) authenticates "
+                            f"callers with authorizerType {authorizer_type}, but AG-25 "
+                            f"reports '{engine_finding.get('Finding')}', so no "
+                            "default-deny policy engine decides which tool call an "
+                            "authorized caller may make."
+                        ),
+                        resolution=(
+                            "Fix the AG-25 finding: attach a policy engine in ENFORCE "
+                            "mode with enforcing policies that permit only the tool "
+                            "calls each caller needs."
+                        ),
+                        reference=AGENTCORE_POLICY_ENGINE_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            elif engine_status != StatusEnum.PASSED.value:
+                findings.append(
+                    create_finding(
+                        check_id="AG-24",
+                        finding_name="Agentic AI Gateway Tool Call Authorization Incomplete",
+                        finding_details=(
+                            f"Gateway '{gateway_name}' ({gateway_id}) authenticates "
+                            f"callers with authorizerType {authorizer_type}, but AG-25 "
+                            f"could not read its policy engine ('"
+                            f"{engine_finding.get('Finding')}'), so whether a "
+                            "default-deny engine decides each tool call is unknown."
+                        ),
+                        resolution="Resolve the AG-25 N/A and rerun the assessment.",
+                        reference=AGENTCORE_POLICY_ENGINE_REFERENCE_URL,
                         severity=SeverityEnum.INFORMATIONAL,
                         status=StatusEnum.NA,
                     )

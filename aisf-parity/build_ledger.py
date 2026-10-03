@@ -293,7 +293,15 @@ AI_SUBJECT_ROWS = [
         "allowedAudience or allowedClients list pins the application, and a list "
         "holding a blank or * value does not count. A CUSTOM_JWT gateway with no such "
         "list fails as Unbounded, one whose discoveryUrl is not https fails as Issuer "
-        "Not HTTPS, and one that reports no customJWTAuthorizer is N/A",
+        "Not HTTPS, and one that reports no customJWTAuthorizer is N/A. AG-24 also "
+        "fails every gateway whose interceptorConfigurations has no REQUEST "
+        "interception point naming a Lambda function, and every AWS_IAM or CUSTOM_JWT "
+        "gateway whose policy engine AG-25 fails (no engine, not ENFORCE, no ACTIVE "
+        "enforcing policy, or an unconditioned allow-all permit); an engine AG-25 "
+        "could not read is N/A. "
+        "Whether the interceptor denies when it errors is not readable: "
+        "GatewayInterceptorConfiguration has only interceptor, interceptionPoints and "
+        "inputConfiguration, so the fail-safe half is a ceiling",
         [],
         4,
     ),
@@ -846,7 +854,12 @@ AI_SUBJECT_ROWS = [
         "missing from the cache and a missing cache are N/A. SCPs are not evaluated "
         "per principal. The control's second leg, a Lambda target scoped to one "
         "function ARN, is not expressible because the target ARN members reject a "
-        "wildcard",
+        "wildcard. A TOKEN_EXCHANGE grant fails on a gateway whose authorizerType is "
+        "not CUSTOM_JWT, and an AUTHORIZATION_CODE target on a gateway a "
+        "ListConsentPortals source names fails unless defaultReturnUrl is exactly "
+        "<portalUrl>/connect/callback; an unread portal list or authorizer type is "
+        "N/A. Whether the target and provider names read well to end users is not "
+        "judged",
         [],
         4,
     ),

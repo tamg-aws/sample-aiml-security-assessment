@@ -6123,6 +6123,21 @@ class TestAC13GatewayConfiguration:
 # ===================================================================
 # AG-24..AG-27: check_agentcore_gateway_agentic_security
 # ===================================================================
+_ENFORCING_ENGINE = {
+    "arn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/TestEngine-abcdefghij",
+    "mode": "ENFORCE",
+}
+
+_REQUEST_INTERCEPTOR = [
+    {
+        "interceptor": {
+            "lambda": {"arn": "arn:aws:lambda:us-east-1:123456789012:function:guard"}
+        },
+        "interceptionPoints": ["REQUEST"],
+    }
+]
+
+
 class TestAgenticGatewaySecurity:
     """Agentic AI Gateway security checks."""
 
@@ -6240,6 +6255,8 @@ class TestAgenticGatewaySecurity:
                 "mode": "ENFORCE",
             },
             "webAclArn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/test/abc",
+            # AG-24 fails a gateway with no REQUEST interceptor.
+            "interceptorConfigurations": _REQUEST_INTERCEPTOR,
         }
         # AG-24 now takes an AUTHENTICATE_ONLY gateway's verdict from AG-25's
         # reading of the engine's policies, so the engine needs a scoped permit.
@@ -6363,6 +6380,8 @@ class TestAgenticGatewaySecurity:
                 "mode": "ENFORCE",
             },
             "webAclArn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/test/abc",
+            # AG-24 fails a gateway with no REQUEST interceptor.
+            "interceptorConfigurations": _REQUEST_INTERCEPTOR,
             # AG-27 passes only a gateway that blocks when AWS WAF cannot be
             # evaluated, so the association alone no longer passes.
             "wafConfiguration": {"failureMode": "FAIL_CLOSE"},
@@ -12056,6 +12075,170 @@ class TestAC25OAuthReturnUrl:
         )
 
         assert rows["mixed"]["Status"] == "Failed"
+
+
+class TestAC25ConsentPortalAndTokenExchange:
+    """AC-25 joins a target to its gateway's authorizer and its consent portal."""
+
+    @staticmethod
+    def _run(mock_ac, gateways, configurations, portals=None):
+        mock_ac.list_gateways.return_value = {"items": gateways}
+        mock_ac.list_gateway_targets.side_effect = lambda gatewayIdentifier: {
+            "items": [
+                {"targetId": target_id, "name": target_id}
+                for target_id in configurations[gatewayIdentifier]
+            ]
+        }
+        mock_ac.get_gateway_target.side_effect = lambda gatewayIdentifier, targetId: {
+            "credentialProviderConfigurations": configurations[gatewayIdentifier][
+                targetId
+            ]
+        }
+        if isinstance(portals, Exception):
+            mock_ac.list_consent_portals.side_effect = portals
+        else:
+            mock_ac.list_consent_portals.return_value = {
+                "consentPortals": portals or []
+            }
+        findings = agentcore_app.check_agentcore_gateway_target_authorization()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-25"
+            assert_finding_schema(finding)
+        return {
+            finding["Finding_Details"].split("'")[1]: finding for finding in findings
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_token_exchange_needs_a_jwt_gateway(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            [
+                {"gatewayId": "gw-jwt", "name": "Jwt", "authorizerType": "CUSTOM_JWT"},
+                {"gatewayId": "gw-iam", "name": "Iam", "authorizerType": "AWS_IAM"},
+            ],
+            {
+                "gw-jwt": {"t-jwt": [_oauth_target("TOKEN_EXCHANGE")]},
+                "gw-iam": {"t-iam": [_oauth_target("TOKEN_EXCHANGE")]},
+            },
+        )
+
+        assert rows["t-jwt"]["Status"] == "Passed"
+        assert rows["t-iam"]["Status"] == "Failed"
+        assert rows["t-iam"]["Severity"] == "High"
+        assert (
+            rows["t-iam"]["Finding"]
+            == "AgentCore Gateway Target Token Exchange Without JWT"
+        )
+        assert "AWS_IAM" in rows["t-iam"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_summary_without_an_authorizer_is_read_from_get_gateway(self, mock_ac):
+        def gateway(gatewayIdentifier):
+            if gatewayIdentifier == "gw-unread":
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "GetGateway",
+                )
+            return {"authorizerType": "CUSTOM_JWT"}
+
+        mock_ac.get_gateway.side_effect = gateway
+        rows = self._run(
+            mock_ac,
+            [
+                {"gatewayId": "gw-read", "name": "Read"},
+                {"gatewayId": "gw-unread", "name": "Unread"},
+            ],
+            {
+                "gw-read": {"t-read": [_oauth_target("TOKEN_EXCHANGE")]},
+                "gw-unread": {"t-unread": [_oauth_target("TOKEN_EXCHANGE")]},
+            },
+        )
+
+        assert rows["t-read"]["Status"] == "Passed"
+        assert rows["t-unread"]["Status"] == "N/A"
+        assert "GetGateway" in rows["t-unread"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_portal_served_target_must_return_to_the_portal_callback(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            [
+                {"gatewayId": "gw-1", "name": "One", "authorizerType": "CUSTOM_JWT"},
+                {"gatewayId": "gw-2", "name": "Two", "authorizerType": "CUSTOM_JWT"},
+            ],
+            {
+                "gw-1": {
+                    "t-portal": [
+                        _oauth_target(
+                            "AUTHORIZATION_CODE",
+                            "https://portal.example/connect/callback",
+                        )
+                    ],
+                    "t-stale": [
+                        _oauth_target(
+                            "AUTHORIZATION_CODE", "https://app.example.com/callback"
+                        )
+                    ],
+                },
+                "gw-2": {
+                    "t-own": [
+                        _oauth_target(
+                            "AUTHORIZATION_CODE", "https://app.example.com/callback"
+                        )
+                    ]
+                },
+            },
+            portals=[
+                {
+                    "portalUrl": "https://portal.example/",
+                    "sources": [
+                        {
+                            "type": "agentcore-gateway",
+                            "identifier": (
+                                "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                                "gateway/gw-1"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        )
+
+        assert rows["t-portal"]["Status"] == "Passed"
+        assert "consent portal serves" in rows["t-portal"]["Finding_Details"]
+        assert rows["t-stale"]["Status"] == "Failed"
+        assert rows["t-stale"]["Finding"] == "AgentCore Gateway Target OAuth Return URL"
+        assert (
+            "https://portal.example/connect/callback"
+            in rows["t-stale"]["Finding_Details"]
+        )
+        assert rows["t-own"]["Status"] == "Passed"
+        assert "No consent portal" in rows["t-own"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_portal_list_withholds_an_authorization_code_pass(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            [{"gatewayId": "gw-1", "name": "One", "authorizerType": "CUSTOM_JWT"}],
+            {
+                "gw-1": {
+                    "t-3lo": [
+                        _oauth_target(
+                            "AUTHORIZATION_CODE", "https://app.example.com/callback"
+                        )
+                    ],
+                    "t-m2m": [_oauth_target("CLIENT_CREDENTIALS")],
+                }
+            },
+            portals=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "ListConsentPortals",
+            ),
+        )
+
+        assert rows["t-3lo"]["Status"] == "N/A"
+        assert "ListConsentPortals" in rows["t-3lo"]["Finding_Details"]
+        assert rows["t-m2m"]["Status"] == "Passed"
 
 
 class TestAC26LogRetentionAndKeyScope:
@@ -40096,10 +40279,17 @@ class TestAG24JWTGatewayAuthorization:
         mock_ac.list_gateways.return_value = {
             "items": [{"gatewayId": g, "name": f"name-{g}"} for g in details]
         }
+        # These tests judge the authorizer row; the interceptor and engine rows
+        # have their own.
+        for gateway in details.values():
+            gateway.setdefault("interceptorConfigurations", _REQUEST_INTERCEPTOR)
+            gateway.setdefault("policyEngineConfiguration", _ENFORCING_ENGINE)
         mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: details[
             gatewayIdentifier
         ]
-        mock_ac.list_policies.return_value = {"policies": []}
+        mock_ac.list_policies.return_value = {
+            "policies": [_cedar_policy("p-1", _SCOPED_PERMIT)]
+        }
         findings = agentcore_app.check_agentcore_gateway_agentic_security()
         return [f for f in findings if f["Check_ID"] == "AG-24"]
 
@@ -40159,9 +40349,13 @@ class TestAG24JWTGatewayAuthorization:
         mock_ac.get_gateway.return_value = {
             "authorizerConfiguration": {
                 "customJWTAuthorizer": {"discoveryUrl": _ISSUER}
-            }
+            },
+            "interceptorConfigurations": _REQUEST_INTERCEPTOR,
+            "policyEngineConfiguration": _ENFORCING_ENGINE,
         }
-        mock_ac.list_policies.return_value = {"policies": []}
+        mock_ac.list_policies.return_value = {
+            "policies": [_cedar_policy("p-1", _SCOPED_PERMIT)]
+        }
 
         findings = [
             f
@@ -40171,6 +40365,113 @@ class TestAG24JWTGatewayAuthorization:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         assert findings[0]["Finding"].endswith("Unbounded")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_without_a_request_interceptor_fails(self, mock_ac):
+        response_only = [dict(_REQUEST_INTERCEPTOR[0], interceptionPoints=["RESPONSE"])]
+        no_function = [dict(_REQUEST_INTERCEPTOR[0], interceptor={"lambda": {}})]
+        findings = self._ag24(
+            mock_ac,
+            {
+                "gw-guarded": {"authorizerType": "AWS_IAM"},
+                "gw-response": {
+                    "authorizerType": "AWS_IAM",
+                    "interceptorConfigurations": response_only,
+                },
+                "gw-nofn": {
+                    "authorizerType": "AWS_IAM",
+                    "interceptorConfigurations": no_function,
+                },
+                "gw-none": {
+                    "authorizerType": "AWS_IAM",
+                    "interceptorConfigurations": [],
+                },
+            },
+        )
+
+        missing = [
+            f
+            for f in findings
+            if f["Finding"] == "Agentic AI Gateway Request Interceptor Missing"
+        ]
+        assert sorted(
+            gateway
+            for f in missing
+            for gateway in ["gw-guarded", "gw-response", "gw-nofn", "gw-none"]
+            if f"({gateway})" in f["Finding_Details"]
+        ) == ["gw-nofn", "gw-none", "gw-response"]
+        assert all(f["Status"] == "Failed" for f in missing)
+        guarded = [f for f in findings if "(gw-guarded)" in f["Finding_Details"]]
+        assert [f["Status"] for f in guarded] == ["Passed"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_authorized_gateway_without_an_enforcing_engine_fails(self, mock_ac):
+        findings = self._ag24(
+            mock_ac,
+            {
+                "gw-enforced": {"authorizerType": "AWS_IAM"},
+                "gw-logonly": {
+                    "authorizerType": "AWS_IAM",
+                    "policyEngineConfiguration": dict(
+                        _ENFORCING_ENGINE, mode="LOG_ONLY"
+                    ),
+                },
+                "gw-noengine": {
+                    "authorizerType": "CUSTOM_JWT",
+                    "authorizerConfiguration": {
+                        "customJWTAuthorizer": {
+                            "discoveryUrl": _ISSUER,
+                            "allowedAudience": ["gateway-api"],
+                        }
+                    },
+                    "policyEngineConfiguration": {},
+                },
+            },
+        )
+
+        rows = {
+            gateway: [
+                f["Status"] for f in findings if f"({gateway})" in f["Finding_Details"]
+            ]
+            for gateway in ["gw-enforced", "gw-logonly", "gw-noengine"]
+        }
+        assert rows == {
+            "gw-enforced": ["Passed"],
+            "gw-logonly": ["Passed", "Failed"],
+            "gw-noengine": ["Passed", "Failed"],
+        }
+        missing = [f for f in findings if f["Finding"].endswith("Missing")]
+        assert {f["Finding"] for f in missing} == {
+            "Agentic AI Gateway Tool Call Authorization Missing"
+        }
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_engine_withholds_the_tool_call_pass(self, mock_ac):
+        mock_ac.list_policies.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListPolicies",
+        )
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "authorizerType": "AWS_IAM",
+            "interceptorConfigurations": _REQUEST_INTERCEPTOR,
+            "policyEngineConfiguration": _ENFORCING_ENGINE,
+        }
+
+        findings = [
+            f
+            for f in agentcore_app.check_agentcore_gateway_agentic_security()
+            if f["Check_ID"] == "AG-24"
+        ]
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert findings[1]["Finding"].endswith("Incomplete")
 
 
 def _keyed_rate_limit(rate_limit_id, *dimension_keys):

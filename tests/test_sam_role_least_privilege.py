@@ -525,6 +525,7 @@ _EXPECTED_ACTIONS = {
         "xray:GetTraceSegmentDestination",
         "bedrock:GetModelInvocationLoggingConfiguration",
         "bedrock-agentcore:ListAgentRuntimeVersions",
+        "bedrock-agentcore:ListConsentPortals",
         "ce:GetAnomalyMonitors",
         "ec2:DescribeNatGateways",
         "events:ListTargetsByRule",
@@ -1653,6 +1654,7 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
         "bedrock-agentcore:ListBatchEvaluations",
         "bedrock-agentcore:ListAgentRuntimeEndpoints",
         "bedrock-agentcore:ListAgentRuntimeVersions",
+        "bedrock-agentcore:ListConsentPortals",
         "ec2:DescribeNatGateways",
         "bedrock:GetModelInvocationLoggingConfiguration",
     ):
