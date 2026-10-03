@@ -676,7 +676,15 @@ AI_SUBJECT_ROWS = [
         "permit over named tools: a bare principal that no condition reads fails as "
         "Caller Scope Unbounded, and a resource named by type alone or not at all "
         "fails as Gateway Scope Unbounded. A policy with no readable text, or a head "
-        "without three scope positions, withholds the gateway's Passed. Default-deny "
+        "without three scope positions, withholds the gateway's Passed. An AC-35 Policy "
+        "Input Guard row per enforcing gateway fails a forbid that reads "
+        "context.input.<field> for a tool whose inline Lambda inputSchema does not list "
+        "the field as required, unless a has() test Cedar's short-circuit evaluates "
+        "first guards it, because Cedar skips a policy whose evaluation errors and a "
+        "missing attribute is an error, so the forbid fails open. A bare action reaches "
+        "every tool; a tool schema in S3, a non-Lambda target, an unreadable target or an "
+        "action group is N/A. Permits are not judged, since an erroring permit denies, "
+        "and fields nested below a top-level input are not judged. Default-deny "
         "and forbid-wins are engine behaviour and not a setting to read",
         [],
         4,

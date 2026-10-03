@@ -50600,3 +50600,269 @@ class TestAC06RecordingWriteScp:
                 )
                 == []
             )
+
+
+def _input_forbid(condition, action='action == AgentCore::Action::"pay___transfer"'):
+    return (
+        "forbid(\n"
+        "  principal,\n"
+        f"  {action},\n"
+        "  resource is AgentCore::Gateway\n"
+        f") {condition};"
+    )
+
+
+class TestAC35PolicyInputGuards:
+    """AIR-ACR-POL-01: an enforcing forbid that reads an optional
+    context.input field with no has() guard errors when the call omits it, and
+    Cedar skips an erroring policy, so the forbid fails open."""
+
+    # Tool transfer requires amount and leaves memo optional; tool refund
+    # requires nothing.
+    _TOOLS = [
+        {
+            "name": "transfer",
+            "description": "move money",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number"},
+                    "memo": {"type": "string"},
+                },
+                "required": ["amount"],
+            },
+        },
+        {
+            "name": "refund",
+            "description": "refund",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"memo": {"type": "string"}},
+            },
+        },
+    ]
+
+    def _run(self, statements, targets=None, target_error=None):
+        """Gateway gw-a enforces `statements[0]`, gw-b `statements[1]`; both
+        front Lambda target pay with the inline tools above, plus `targets`."""
+        mock_ac = MagicMock()
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-a", "name": "A"},
+                {"gatewayId": "gw-b", "name": "B"},
+            ]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **_: (
+            _policy_engine_gateway(arn=f"{_ENGINE_ARN}-{gatewayIdentifier}")
+        )
+        mock_ac.list_policies.side_effect = lambda policyEngineId, **_: {
+            "policies": [
+                _cedar_policy(
+                    f"p-{policyEngineId[-1]}",
+                    statements[0 if policyEngineId.endswith("a") else 1],
+                )
+            ]
+        }
+        details = {
+            "t-pay": {
+                "name": "pay",
+                "targetConfiguration": {
+                    "mcp": {
+                        "lambda": {
+                            "lambdaArn": "arn:aws:lambda:us-east-1:123456789012:function:pay",
+                            "toolSchema": {"inlinePayload": self._TOOLS},
+                        }
+                    }
+                },
+            }
+        }
+        details.update(targets or {})
+        mock_ac.list_gateway_targets.return_value = {
+            "items": [
+                {"targetId": target_id, "name": detail["name"]}
+                for target_id, detail in details.items()
+            ]
+        }
+
+        def get_target(gatewayIdentifier, targetId):
+            if target_error is not None:
+                raise target_error
+            return details[targetId]
+
+        mock_ac.get_gateway_target.side_effect = get_target
+        with patch("agentcore_app.agentcore_client", mock_ac):
+            findings = agentcore_app.check_agentcore_policy_input_guards()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-35"
+            assert finding["Finding"] == "AgentCore Policy Input Guard"
+        return {f["Finding_Details"].split("(", 2)[1][:4]: f for f in findings}
+
+    def test_an_unguarded_optional_read_fails_only_its_gateway(self):
+        rows = self._run(
+            [
+                _input_forbid('when { context.input.memo like "*wire*" }'),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ]
+        )
+        assert rows["gw-a"]["Status"] == "Failed"
+        assert (
+            "forbid p-a reads context.input.memo on pay___transfer, whose "
+            "inputSchema does not list it as required"
+        ) in rows["gw-a"]["Finding_Details"]
+        assert "Cedar skips a policy that errors" in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            (
+                'when { context.input has memo && context.input.memo like "*w*" }',
+                "Passed",
+            ),
+            (
+                'when { context has input.memo && context.input.memo like "*w*" }',
+                "Passed",
+            ),
+            (
+                'when { context.input has "memo" && context.input["memo"] == "x" }',
+                "Passed",
+            ),
+            (
+                'when { context.input.memo like "*w*" && context.input has memo }',
+                "Failed",
+            ),
+            ('when { context.input has memo || context.input.memo == "x" }', "Failed"),
+            (
+                'when { !(context.input has memo) || context.input.memo == "x" }',
+                "Passed",
+            ),
+            (
+                'when { !(context.input has memo) && context.input.memo == "x" }',
+                "Failed",
+            ),
+            (
+                'when { if context.input has memo then context.input.memo == "x" else false }',
+                "Passed",
+            ),
+            (
+                'when { context.input has memo } when { context.input.memo == "x" }',
+                "Passed",
+            ),
+            ('unless { context.input.memo == "ok" }', "Failed"),
+            (
+                'when { context.input has amount && context.input.memo == "x" }',
+                "Failed",
+            ),
+            ('when { principal.id == "context.input.memo" }', "Passed"),
+        ],
+    )
+    def test_a_has_guard_counts_only_where_cedar_evaluates_it_first(
+        self, condition, status
+    ):
+        rows = self._run(
+            [
+                _input_forbid(condition),
+                _input_forbid("when { context.input.amount > 1 }"),
+            ]
+        )
+        assert rows["gw-a"]["Status"] == status
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    def test_a_bare_action_reaches_every_inline_tool(self):
+        rows = self._run(
+            [
+                _input_forbid("when { context.input.amount > 500 }", action="action"),
+                _input_forbid(
+                    "when { context.input.amount > 500 }",
+                    action='action in [AgentCore::Action::"pay___transfer"]',
+                ),
+            ]
+        )
+        assert rows["gw-a"]["Status"] == "Failed"
+        assert "context.input.amount on pay___refund" in rows["gw-a"]["Finding_Details"]
+        assert "pay___transfer" not in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    def test_a_permit_is_not_judged(self):
+        rows = self._run(
+            [
+                _input_forbid('when { context.input.memo == "x" }').replace(
+                    "forbid", "permit"
+                ),
+                _input_forbid('when { context.input.memo == "x" }'),
+            ]
+        )
+        assert rows["gw-a"]["Status"] == "Passed"
+        assert rows["gw-b"]["Status"] == "Failed"
+
+    def test_an_unread_schema_is_not_judged(self):
+        s3_target = {
+            "t-s3": {
+                "name": "ledger",
+                "targetConfiguration": {
+                    "mcp": {
+                        "lambda": {
+                            "lambdaArn": "arn:aws:lambda:us-east-1:123456789012:function:l",
+                            "toolSchema": {"s3": {"uri": "s3://schemas/ledger.json"}},
+                        }
+                    }
+                },
+            },
+            "t-api": {
+                "name": "api",
+                "targetConfiguration": {
+                    "mcp": {"openApiSchema": {"inlinePayload": "{}"}}
+                },
+            },
+        }
+        rows = self._run(
+            [
+                _input_forbid("when { context.input.amount > 500 }", action="action"),
+                _input_forbid(
+                    "when { context.input.amount > 500 }",
+                    action='action == AgentCore::Action::"ledger___post"',
+                ),
+            ],
+            targets=s3_target,
+        )
+        # gw-a's bare action also reaches pay___refund, which fails on its own.
+        assert rows["gw-a"]["Status"] == "Failed"
+        assert "target api's tools" in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "N/A"
+        assert (
+            "ledger___post (its tool schema is in S3)"
+            in (rows["gw-b"]["Finding_Details"])
+        )
+
+    def test_an_unreadable_target_never_passes(self):
+        rows = self._run(
+            [
+                _input_forbid("when { context.input.amount > 500 }"),
+                _input_forbid("when { principal has id }"),
+            ],
+            target_error=_make_client_error("AccessDeniedException", "no"),
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert "bedrock-agentcore:GetGatewayTarget" in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    def test_an_action_group_is_not_judged(self):
+        rows = self._run(
+            [
+                _input_forbid(
+                    "when { context.input.amount > 500 }",
+                    action='action in AgentCore::Action::"payments"',
+                ),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ]
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert "action group" in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    def test_a_gateway_without_an_enforcing_engine_gets_no_row(self):
+        mock_ac = MagicMock()
+        mock_ac.list_gateways.return_value = {"items": [{"gatewayId": "gw-x"}]}
+        mock_ac.get_gateway.return_value = _policy_engine_gateway(mode="LOG_ONLY")
+        with patch("agentcore_app.agentcore_client", mock_ac):
+            assert agentcore_app.check_agentcore_policy_input_guards() == []

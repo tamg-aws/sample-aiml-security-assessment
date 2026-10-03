@@ -24097,6 +24097,335 @@ POLICY_ENGINE_SERVICE_ACTIONS = (
 KMS_KEY_LOSS_EVENTS = ("DisableKey", "ScheduleKeyDeletion")
 
 
+# Cedar skips a policy whose evaluation errors, and reading an attribute a
+# record does not have is an error, so a forbid that reads an optional tool
+# input the call omits never fires. Cedar documents both: "skip on error: if a
+# policy's evaluation returns error, the policy does not factor into the
+# authorization response; it is skipped"
+# (https://docs.cedarpolicy.com/auth/authorization.html), and "If an expression
+# accesses an attribute that isn't present, then evaluation produces an error"
+# (https://docs.cedarpolicy.com/policies/syntax-operators.html, `has`).
+CEDAR_AUTHORIZATION_REFERENCE_URL = (
+    "https://docs.cedarpolicy.com/auth/authorization.html"
+)
+AGENTCORE_POLICY_INPUT_GUARD_FINDING = "AgentCore Policy Input Guard"
+CEDAR_INPUT_READ_PATTERN = re.compile(
+    r"\bcontext\s*\.\s*input\s*(?:\.\s*([A-Za-z_]\w*)|\[\s*\"([^\"]+)\"\s*\])"
+)
+CEDAR_INPUT_HAS_PATTERN = re.compile(
+    r"\bcontext\s*\.\s*input\s+has\s+(?:([A-Za-z_]\w*)|\"([^\"]+)\")"
+    r"|\bcontext\s+has\s+input\s*\.\s*([A-Za-z_]\w*)"
+)
+
+
+def _cedar_input_has_tests(expression: str) -> Set[str]:
+    """Return the context.input fields an expression tests with `has`."""
+    return {
+        next(group for group in match.groups() if group)
+        for match in CEDAR_INPUT_HAS_PATTERN.finditer(expression)
+    }
+
+
+def _cedar_unguarded_input_reads(expression: str, guarded: Set[str]) -> Set[str]:
+    """Return the context.input fields an expression may read with no `has` guard.
+
+    Cedar's && and || short-circuit, so a `has` test guards a read in a later
+    && conjunct, and a negated one guards a read in a later || branch. Within
+    one operand a test guards only the reads after it, which is what an
+    `if ... has ... then` reads. `guarded` carries the fields an earlier
+    conjunct has tested.
+    """
+    expression = _cedar_unwrap_parentheses(expression)
+    branches = [part for part in _cedar_split(expression, "|") if part.strip()]
+    if len(branches) > 1:
+        unguarded: Set[str] = set()
+        carried = set(guarded)
+        for branch in branches:
+            unguarded |= _cedar_unguarded_input_reads(branch, carried)
+            stripped = _cedar_unwrap_parentheses(branch)
+            if stripped.startswith("!"):
+                carried |= _cedar_input_has_tests(stripped)
+        return unguarded
+    conjuncts = [part for part in _cedar_split(expression, "&") if part.strip()]
+    if len(conjuncts) > 1:
+        unguarded = set()
+        carried = set(guarded)
+        for conjunct in conjuncts:
+            unguarded |= _cedar_unguarded_input_reads(conjunct, carried)
+            if not _cedar_unwrap_parentheses(conjunct).startswith("!"):
+                carried |= _cedar_input_has_tests(conjunct)
+        return unguarded
+    blanked = re.sub(r'"(?:[^"\\]|\\.)*"', lambda m: " " * len(m.group(0)), expression)
+    tests = [
+        (match.start(), next(group for group in match.groups() if group))
+        for match in CEDAR_INPUT_HAS_PATTERN.finditer(expression)
+    ]
+    unguarded = set()
+    for match in CEDAR_INPUT_READ_PATTERN.finditer(expression):
+        if blanked[match.start()] == " ":
+            continue
+        field = match.group(1) or match.group(2)
+        if field in guarded or any(
+            start < match.start() and tested == field for start, tested in tests
+        ):
+            continue
+        unguarded.add(field)
+    return unguarded
+
+
+def _cedar_forbid_unguarded_inputs(conditions: str) -> Set[str]:
+    """Return the context.input fields a forbid's conditions read unguarded.
+
+    The when and unless blocks are ANDed in order, so a `has` test in an earlier
+    when block guards a later block.
+    """
+    unguarded: Set[str] = set()
+    guarded: Set[str] = set()
+    for keyword, body in _cedar_condition_blocks(conditions):
+        unguarded |= _cedar_unguarded_input_reads(body, guarded)
+        if keyword == "when":
+            guarded |= _cedar_input_has_tests(body)
+    return unguarded
+
+
+def _cedar_scope_actions(scope: List[str]) -> Optional[List[str]]:
+    """Return the action names a policy head names, [] for every action, or
+    None when the head names an action group or another form not read here."""
+    part = scope[CEDAR_SCOPE_POSITIONS.index("action")]
+    if part == "action":
+        return []
+    names = re.findall(r'AgentCore::Action::"((?:[^"\\]|\\.)*)"', part)
+    words = _cedar_scope_operators(part)
+    if not names or (words[1:2] == ["in"] and "[" not in part):
+        return None
+    return names
+
+
+def _gateway_tool_required_inputs(
+    gateway_id: str,
+) -> Tuple[Dict[str, Optional[Set[str]]], Dict[str, str]]:
+    """Map each tool of a gateway's targets to its required input fields.
+
+    Returns `{target___tool: required fields}` for every tool an inline Lambda
+    tool schema defines, and `{target name: reason}` for every target whose tool
+    schemas were not read: an S3 tool schema, an OpenAPI, Smithy, MCP server,
+    API Gateway or connector target, or a target that could not be read.
+    """
+    tools: Dict[str, Optional[Set[str]]] = {}
+    unread: Dict[str, str] = {}
+    for target in _agentcore_list_all(
+        "list_gateway_targets", ["items", "targets"], gatewayIdentifier=gateway_id
+    ):
+        target_id = target.get("targetId")
+        name = str(target.get("name") or target_id)
+        try:
+            detail = agentcore_client.get_gateway_target(
+                gatewayIdentifier=gateway_id, targetId=target_id
+            )
+        except Exception as error:
+            unread[name] = (
+                f"bedrock-agentcore:GetGatewayTarget {_assessment_error_label(error)}"
+            )
+            continue
+        name = str(detail.get("name") or name)
+        mcp = (detail.get("targetConfiguration") or {}).get("mcp") or {}
+        schema = (mcp.get("lambda") or {}).get("toolSchema") or {}
+        if "inlinePayload" not in schema:
+            unread[name] = (
+                "its tool schema is in S3"
+                if schema.get("s3")
+                else "it is not a Lambda target with an inline tool schema"
+            )
+            continue
+        for tool in schema.get("inlinePayload") or []:
+            input_schema = tool.get("inputSchema") or {}
+            tools[f"{name}___{tool.get('name')}"] = {
+                str(field) for field in input_schema.get("required") or []
+            }
+    return tools, unread
+
+
+def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
+    """AC-35: Judge whether each enforcing forbid guards the optional inputs it reads.
+
+    AIR-ACR-POL-01 asks to "guard optional context.input fields before
+    referencing them". An enforcing forbid that reads context.input.<field> for
+    a tool whose inputSchema does not list the field as required errors on any
+    call that omits it, and Cedar skips an erroring policy, so the forbid lets
+    that call through. A read is guarded by a `has` test that Cedar's
+    short-circuit evaluates first. A permit that errors denies the call, so
+    permits are not judged. A forbid over a tool whose schema was not read is
+    N/A, never Passed.
+    """
+    if agentcore_client is None:
+        return []
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-35",
+                finding_name=AGENTCORE_POLICY_INPUT_GUARD_FINDING,
+                error=error,
+                reference=CEDAR_AUTHORIZATION_REFERENCE_URL,
+            )
+        ]
+
+    policy_cache: Dict[str, List[Dict[str, Any]]] = {}
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        label = f"Gateway '{gateway.get('name', gateway_id)}' ({gateway_id})"
+
+        def row(status: str, text: str, resolution: str) -> Dict[str, Any]:
+            return create_finding(
+                check_id="AC-35",
+                finding_name=AGENTCORE_POLICY_INPUT_GUARD_FINDING,
+                finding_details=f"{label} {text}",
+                resolution=resolution,
+                reference=CEDAR_AUTHORIZATION_REFERENCE_URL,
+                severity=(
+                    SeverityEnum.INFORMATIONAL
+                    if status == StatusEnum.NA
+                    else SeverityEnum.MEDIUM
+                ),
+                status=status,
+            )
+
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+            policy_engine_id = _gateway_policy_engine_id(detail)
+            policies = (
+                _enforcing_policies(policy_engine_id, policy_cache)
+                if policy_engine_id
+                else []
+            )
+        except Exception as error:
+            findings.append(
+                row(
+                    StatusEnum.NA,
+                    f"policies could not be read: {_assessment_error_label(error)}.",
+                    "Grant bedrock-agentcore:GetGateway and "
+                    "bedrock-agentcore:ListPolicies, then retry.",
+                )
+            )
+            continue
+        if not policy_engine_id:
+            continue
+
+        forbids: List[Tuple[str, Optional[List[str]], Set[str]]] = []
+        unparsed: List[str] = []
+        for policy in policies:
+            policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
+            parsed = _cedar_policies(_policy_statement_text(policy))
+            if not parsed or any(
+                len(scope) != len(CEDAR_SCOPE_POSITIONS) for _, scope, _ in parsed
+            ):
+                unparsed.append(policy_name)
+                continue
+            for effect, scope, conditions in parsed:
+                fields = (
+                    _cedar_forbid_unguarded_inputs(conditions)
+                    if effect == "forbid"
+                    else set()
+                )
+                if fields:
+                    forbids.append((policy_name, _cedar_scope_actions(scope), fields))
+
+        tools: Dict[str, Optional[Set[str]]] = {}
+        unread_targets: Dict[str, str] = {}
+        if forbids:
+            try:
+                tools, unread_targets = _gateway_tool_required_inputs(gateway_id)
+            except Exception as error:
+                findings.append(
+                    row(
+                        StatusEnum.NA,
+                        f"enforces policy engine {policy_engine_id}, whose forbid "
+                        f"{', '.join(sorted({name for name, _, _ in forbids}))} "
+                        "reads context.input, but the gateway's targets could not "
+                        f"be listed: {_assessment_error_label(error)}.",
+                        "Grant bedrock-agentcore:ListGatewayTargets and retry.",
+                    )
+                )
+                continue
+
+        failures: List[str] = []
+        not_judged: List[str] = [
+            f"policy {name}, whose Cedar text was not parsed" for name in unparsed
+        ]
+        for policy_name, actions, fields in forbids:
+            if actions is None:
+                not_judged.append(
+                    f"forbid {policy_name}, whose head names an action group"
+                )
+                continue
+            if not actions:
+                in_scope = sorted(tools)
+                not_judged.extend(
+                    f"forbid {policy_name} on target {target}'s tools ({reason})"
+                    for target, reason in sorted(unread_targets.items())
+                )
+            else:
+                in_scope = [action for action in actions if action in tools]
+                not_judged.extend(
+                    f"forbid {policy_name} on {action} "
+                    f"({unread_targets[action.split('___', 1)[0]]})"
+                    for action in actions
+                    if action not in tools
+                    and action.split("___", 1)[0] in unread_targets
+                )
+            for action in in_scope:
+                optional = sorted(fields - tools[action])
+                if optional:
+                    failures.append(
+                        f"forbid {policy_name} reads context.input."
+                        f"{', context.input.'.join(optional)} on {action}, whose "
+                        "inputSchema does not list "
+                        f"{'it' if len(optional) == 1 else 'them'} as required, "
+                        "with no has() test before the read"
+                    )
+
+        if failures:
+            findings.append(
+                row(
+                    StatusEnum.FAILED,
+                    f"enforces policy engine {policy_engine_id}, but "
+                    f"{'; '.join(failures)}. A call that omits the field makes "
+                    "the forbid error, and Cedar skips a policy that errors, so "
+                    "the call is not forbidden."
+                    + (f" Not judged: {'; '.join(not_judged)}." if not_judged else ""),
+                    "Guard each optional input before reading it, for example "
+                    "context.input has amount && context.input.amount > 500, or "
+                    "list the field as required in the tool's inputSchema.",
+                )
+            )
+        elif not_judged:
+            findings.append(
+                row(
+                    StatusEnum.NA,
+                    f"enforces policy engine {policy_engine_id}, but whether its "
+                    "forbids guard the optional inputs they read was not judged: "
+                    f"{'; '.join(not_judged)}.",
+                    "Define the tools inline in a Lambda target's tool schema, or "
+                    "review these forbids by hand, and retry.",
+                )
+            )
+        else:
+            findings.append(
+                row(
+                    StatusEnum.PASSED,
+                    f"enforces policy engine {policy_engine_id}, and every "
+                    "enforcing forbid reads context.input only for fields its "
+                    "tools' inputSchema lists as required, or after a has() test "
+                    "on the field. Fields nested below a top-level input are not "
+                    "judged.",
+                    "No action required",
+                )
+            )
+    return findings
+
+
 def _arn_region(arn: Any) -> str:
     """Return the region segment of an ARN, or an empty string."""
     parts = str(arn or "").split(":", 5)
@@ -37094,6 +37423,11 @@ def lambda_handler(event, context):
                 ["AC-35"],
                 "Policy Tool Scope",
                 check_agentcore_policy_tool_scope,
+            ),
+            (
+                ["AC-35"],
+                "Policy Input Guard",
+                check_agentcore_policy_input_guards,
             ),
             (
                 ["AC-36"],
