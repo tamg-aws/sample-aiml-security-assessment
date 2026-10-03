@@ -1128,6 +1128,13 @@ MUTATIONS = [
         "find": '        resource = covered.get((registry_of.get(name, ""), name))\n',
         "replace": "        resource = next(\n            (r for (_, n), r in covered.items() if n == name), None\n        )\n",
     },
+    {
+        "name": "AC-34 claims the agent code is unreadable through any API",
+        "file": AGENTCORE,
+        "defect": "GetAgentRuntime returns the code's S3 location and the image URI, so the ceiling the Passed row states is false",
+        "find": '    "The agent\'s code and container image were not scanned: GetAgentRuntime "\n',
+        "replace": '    "The agent\'s code and container image are not readable through any "\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1400,6 +1407,7 @@ GROUPS: dict[str, str] = {
     "AC-18 fails a gap when an event data store was not read": "in the AgentCore verdict legs",
     "AC-18 ignores an event data store's memory ARN scope": "in the AgentCore verdict legs",
     "AC-50 matches Inspector coverage on repository name alone": "in the AgentCore verdict legs",
+    "AC-34 claims the agent code is unreadable through any API": "in the AgentCore verdict legs",
 }
 
 

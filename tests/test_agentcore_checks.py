@@ -18279,6 +18279,24 @@ class TestAC34RuntimeInlineCredentials:
         assert "no environment variables" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
+    def test_the_passing_row_names_why_code_was_not_scanned(self, mock_ac):
+        # GetAgentRuntime returns where the code and the image live, so they are
+        # readable; the role is not granted the S3 and ECR reads that fetch them.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.return_value = {"agentRuntimeId": "rt-clean"}
+
+        resolution = agentcore_app.check_agentcore_runtime_inline_credentials()[0][
+            "Resolution"
+        ]
+
+        assert "not readable through any" not in resolution
+        assert "agentRuntimeArtifact" in resolution
+        assert "s3:GetObject" in resolution
+        assert "ecr:GetDownloadUrlForLayer" in resolution
+
+    @patch("agentcore_app.agentcore_client")
     def test_one_unreadable_runtime_does_not_hide_the_others(self, mock_ac):
         mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": self._RUNTIMES}
 

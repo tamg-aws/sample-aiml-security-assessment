@@ -21185,8 +21185,11 @@ CREDENTIAL_TEXT_PATTERN = re.compile(
 
 # What every passing AC-34 finding states it could not read.
 AC34_CODE_CEILING = (
-    "The agent's code and container image are not readable through any "
-    "AgentCore API and were not scanned."
+    "The agent's code and container image were not scanned: GetAgentRuntime "
+    "names them in agentRuntimeArtifact (codeConfiguration.code.s3 and "
+    "containerConfiguration.containerUri), but the assessment role is not "
+    "granted s3:GetObject, ecr:BatchGetImage or ecr:GetDownloadUrlForLayer to "
+    "fetch them."
 )
 
 
@@ -21841,8 +21844,9 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
     definitions are read: each runtime's environment variables, each gateway
     target's sensitive fields, and each harness's sensitive fields. Only names
     and field paths are reported, never values, because the APIs model these
-    fields as sensitive. The agent's code and container image are not readable
-    through any AgentCore API and are the ceiling.
+    fields as sensitive. The agent's code and container image are named by
+    agentRuntimeArtifact but not fetched, because the role holds no S3 or ECR
+    image read.
     """
     if agentcore_client is None:
         return [

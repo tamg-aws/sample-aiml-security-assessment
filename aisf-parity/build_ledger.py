@@ -584,9 +584,10 @@ AI_SUBJECT_ROWS = [
         "system prompt, model parameters). A value holding a slash reads as a secret name "
         "unless it is a base64 string of 40 or more characters. No API reads the rest: there "
         "is no ListTokenVaults, so a vault no provider names and that is not configured is not "
-        "read, and the agent's code and container image are not readable through any "
-        "AgentCore API. The vault key policy's trust is not graded, and the harness leg reads "
-        "N/A until bedrock-agentcore:ListHarnesses is granted",
+        "read. The agent's code and container image are not scanned: GetAgentRuntime "
+        "names them in agentRuntimeArtifact, but the role is not granted s3:GetObject or "
+        "the ECR image reads that fetch them. The vault key policy's trust is not graded, "
+        "and a denied bedrock-agentcore:ListHarnesses makes the harness leg N/A",
         [],
         4,
     ),
