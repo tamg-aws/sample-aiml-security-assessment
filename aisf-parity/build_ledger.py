@@ -1013,9 +1013,12 @@ AI_SUBJECT_ROWS = [
         "required on a standalone Memory and defaults to 30 days on harness-managed "
         "memory, and in both it bounds raw events only, a different thing from the one "
         "this control asks about. eventExpiryDuration is "
-        "Required: Yes on CreateMemory, 3 to 365 days, and comes back on the Memory shape "
-        "GetMemory returns, so a presence check over it passes for every memory that "
-        "exists, which is worse than no check. It also bounds the wrong subject: the "
+        "Required: Yes on CreateMemory, which botocore bounds to 3 to 365 days as it "
+        "does UpdateMemory, and is required on the Memory shape GetMemory returns, "
+        "which botocore bounds to 1 to 365, so every memory that exists carries a "
+        "period. AIR-FND-DAT-08 reports that period for each memory through BR-04. A "
+        "period alone does not satisfy this control, because it is present on every "
+        "memory and because it bounds the wrong subject: the "
         "create page calls it event retention for raw events in short-term memory and "
         "applies it per event at write time, so updating it moves only later events, "
         "while what this control asks to bound is the long-term cross-session records "
@@ -1350,7 +1353,10 @@ AI_SUBJECT_ROWS = [
         None,
         "agentcore_assessments",
         ["AC-43", "AC-45", "AC-02", "AC-48"],
-        "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or "
+        "AC-45 scopes what each tool, runtime, memory, harness and payment manager "
+        "execution role may do, failing a grant of every resource or every action of "
+        "a service, so AWS's managed memory inference policy fails on its every-model "
+        "grant, and AC-02 flags wildcard or "
         "allow-except AgentCore grants on all resources across every cached role and "
         "user. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 "
         "reads the trust policy of every runtime, gateway, browser, code interpreter, "

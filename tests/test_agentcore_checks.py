@@ -41379,6 +41379,7 @@ class TestAC45RuntimeExecutionRole:
         # Each literal is an IAM action and its service reference lists no
         # resource for it, read 2026-09-28. The set is lowercase for matching.
         assert agentcore_app.AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS == {
+            "bedrock-mantle:callwithbearertoken",
             "ecr:getauthorizationtoken",
             "logs:describeloggroups",
             "xray:getsamplingrules",
@@ -41386,6 +41387,179 @@ class TestAC45RuntimeExecutionRole:
             "xray:puttelemetryrecords",
             "xray:puttracesegments",
         }
+
+
+class TestAC45ServiceExecutionRoles:
+    """AIR-FND-IAM-05: each workload role is scoped to what it needs. A memory,
+    harness or payment manager role runs on the workload's behalf as a runtime
+    role does, so AC-45 judges it by the same rules."""
+
+    _ACCOUNT = "123456789012"
+    _ARN = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}"
+
+    def _role(self, name, account=None):
+        return f"arn:aws:iam::{account or self._ACCOUNT}:role/{name}"
+
+    def _wire(self, mock_ac, memories=None, harnesses=None, managers=None):
+        _wire_tools(mock_ac)
+        _wire_runtime_roles(mock_ac, {})
+        memories = memories or {}
+        harnesses = harnesses or {}
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": memory_id} for memory_id in memories]
+        }
+
+        def get_memory(memoryId):
+            answer = memories[memoryId]
+            if isinstance(answer, Exception):
+                raise answer
+            return {
+                "memory": {
+                    "arn": f"{self._ARN}:memory/{memoryId}",
+                    "memoryExecutionRoleArn": answer,
+                }
+            }
+
+        mock_ac.get_memory.side_effect = get_memory
+        mock_ac.list_harnesses.return_value = {
+            "harnesses": [
+                {"harnessId": harness_id, "harnessName": f"h-{harness_id}"}
+                for harness_id in harnesses
+            ]
+        }
+        mock_ac.get_harness.side_effect = lambda harnessId: {
+            "harness": {
+                "arn": f"{self._ARN}:harness/{harnessId}",
+                "executionRoleArn": harnesses[harnessId],
+            }
+        }
+        if isinstance(managers, Exception):
+            mock_ac.list_payment_managers.side_effect = managers
+        else:
+            mock_ac.list_payment_managers.return_value = {
+                "paymentManagers": [
+                    {
+                        "paymentManagerId": manager_id,
+                        "name": f"pm-{manager_id}",
+                        "paymentManagerArn": f"{self._ARN}:payment-manager/{manager_id}",
+                        "roleArn": role_arn,
+                    }
+                    for manager_id, role_arn in (managers or {}).items()
+                ]
+            }
+
+    _cache = TestAC45RuntimeExecutionRole._cache
+    _allow = staticmethod(TestAC45RuntimeExecutionRole._allow)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_family_is_judged_on_its_own_role(self, mock_ac):
+        self._wire(
+            mock_ac,
+            memories={"m-1": self._role("ScopedRole"), "m-2": self._role("WideRole")},
+            harnesses={"h-1": self._role("WideRole")},
+            managers={"p-1": self._role("ScopedRole")},
+        )
+        cache = self._cache(
+            {
+                "ScopedRole": [
+                    self._allow(
+                        "bedrock:InvokeModel",
+                        "arn:aws:bedrock:us-east-1::foundation-model/"
+                        "anthropic.claude-opus-5-5",
+                    )
+                ],
+                "WideRole": [
+                    self._allow(
+                        "bedrock:InvokeModel", "arn:aws:bedrock:*::foundation-model/*"
+                    )
+                ],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        rows = {
+            f["Finding_Details"].split(" uses ")[0]: (f["Finding"], f["Status"])
+            for f in findings
+            if " uses execution role " in f["Finding_Details"]
+        }
+        assert rows == {
+            "Memory 'm-1'": ("AgentCore Memory Execution Role Scope", "Passed"),
+            "Memory 'm-2'": ("AgentCore Memory Execution Role Unscoped", "Failed"),
+            "Harness 'h-h-1' (h-1)": (
+                "AgentCore Harness Execution Role Unscoped",
+                "Failed",
+            ),
+            "Payment manager 'pm-p-1' (p-1)": (
+                "AgentCore Payment Manager Execution Role Scope",
+                "Passed",
+            ),
+        }
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert all(f["Severity"] == "High" for f in failed)
+        assert "so the memory reaches everything" in failed[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_foreign_or_unread_role_is_na(self, mock_ac):
+        self._wire(
+            mock_ac,
+            memories={
+                "m-1": self._role("WideRole", account="210987654321"),
+                "m-2": _make_client_error("AccessDeniedException", "no"),
+                "m-3": self._role("WideRole"),
+            },
+        )
+        cache = self._cache({"WideRole": [self._allow("s3:GetObject", "*")]})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        memory_rows = [f for f in findings if "Memory 'm-" in f["Finding_Details"]]
+        assert [f["Status"] for f in memory_rows] == ["N/A", "N/A", "Failed"]
+        assert "bedrock-agentcore:GetMemory" in memory_rows[0]["Resolution"]
+        assert "210987654321" in memory_rows[1]["Finding_Details"]
+        assert "Memory 'm-3'" in memory_rows[2]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_payment_manager_list_is_na(self, mock_ac):
+        self._wire(mock_ac, managers=_make_client_error("AccessDeniedException", "no"))
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope({})
+
+        na = [
+            f
+            for f in findings
+            if "bedrock-agentcore:ListPaymentManagers" in f["Resolution"]
+        ]
+        assert [f["Status"] for f in na] == ["N/A"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_managed_memory_policy_fails_on_every_model(self, mock_ac):
+        # AmazonBedrockAgentCoreMemoryBedrockModelInferenceExecutionRolePolicy
+        # v4, read 2026-10-03: every model and inference profile, and
+        # CallWithBearerToken, which takes no resource type, on "*".
+        self._wire(mock_ac, memories={"m-1": self._role("ManagedRole")})
+        managed = [
+            self._allow(
+                ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+                [
+                    "arn:aws:bedrock:*::foundation-model/*",
+                    "arn:aws:bedrock:*:*:inference-profile/*",
+                ],
+            ),
+            self._allow(
+                "bedrock-mantle:CreateInference", "arn:aws:bedrock-mantle:*:*:project/*"
+            ),
+            self._allow("bedrock-mantle:CallWithBearerToken", "*"),
+        ]
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(
+            self._cache({"ManagedRole": managed})
+        )
+
+        row = next(f for f in findings if "Memory 'm-1'" in f["Finding_Details"])
+        assert row["Status"] == "Failed"
+        assert "foundation-model/*" in row["Finding_Details"]
+        assert "(*)" not in row["Finding_Details"]
 
 
 class TestAC45ShellAlarmEveryRegion:

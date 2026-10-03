@@ -28208,9 +28208,12 @@ def _tool_resource_is_unbounded(resource: str) -> bool:
 # lists with no resource type, so Resource "*" is the only form a grant of one
 # can take and it reaches no resource. Read from the ecr, xray and logs service
 # reference JSON on 2026-09-28; cloudwatch:PutMetricData is left out because it
-# now takes the dataset resource.
+# now takes the dataset resource. bedrock-mantle:CallWithBearerToken, read from
+# its service reference on 2026-10-03, is granted on "*" by AWS's managed memory
+# execution role policy.
 AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS = frozenset(
     {
+        "bedrock-mantle:callwithbearertoken",
         "ecr:getauthorizationtoken",
         "logs:describeloggroups",
         "xray:getsamplingrules",
@@ -28724,6 +28727,11 @@ def check_agentcore_tool_execution_role_scope(
     AgentCore namespace only, so a runtime role granting s3:* on every bucket
     passed every check. CreateAgentRuntime requires roleArn, so a runtime whose
     detail reports none is not judged instead of passing.
+
+    A memory, harness or payment manager role is judged by the runtime's rules,
+    because the service acts for the workload with it: memory extraction invokes
+    a model, a harness runs its agent loop, and a payment manager retrieves the
+    payment credentials.
     """
     shell_rows = (
         _command_shell_findings(permission_cache)
@@ -28749,6 +28757,7 @@ def check_agentcore_tool_execution_role_scope(
     # here, and each unreadable tool is reported on its own line below.
     details, errors = _agentcore_tool_details(browser_inventory)
     runtime_details, runtime_errors = _agentcore_runtime_role_details()
+    service_references, service_errors = _agentcore_service_role_references()
     findings = (
         shell_rows
         + _agentcore_tool_read_findings(
@@ -28761,6 +28770,12 @@ def check_agentcore_tool_execution_role_scope(
             "AC-45",
             "AgentCore Runtime Execution Role Scope",
             runtime_errors,
+            AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
+        )
+        + _agentcore_tool_read_findings(
+            "AC-45",
+            "AgentCore Execution Role Scope",
+            service_errors,
             AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
         )
     )
@@ -28780,7 +28795,7 @@ def check_agentcore_tool_execution_role_scope(
                 status=StatusEnum.NA,
             )
         )
-        if not runtime_details:
+        if not runtime_details and not service_references:
             return findings
 
     role_permissions = (permission_cache or {}).get("role_permissions") or {}
@@ -28793,11 +28808,26 @@ def check_agentcore_tool_execution_role_scope(
     }
     v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
 
-    judged = [(label, detail, False) for label, detail in details] + [
-        (label, detail, True) for label, detail in runtime_details
-    ]
-    for label, detail, is_runtime in judged:
-        if is_runtime:
+    judged = (
+        [(label, detail, "tool") for label, detail in details]
+        + [(label, detail, "runtime") for label, detail in runtime_details]
+        + [
+            (label, {"roleArn": role_arn, "resourceArn": resource_arn}, family)
+            for family, label, role_arn, resource_arn in service_references
+        ]
+    )
+    for label, detail, kind in judged:
+        is_runtime = kind == "runtime"
+        if kind not in ("tool", "runtime"):
+            # The service assumes these roles for the resource; a memory with
+            # no role is not listed, and the other families require one.
+            role_arn = detail.get("roleArn")
+            scope_name = f"AgentCore {kind.title()} Execution Role Scope"
+            where = f"the {kind}"
+            runs_with = f"The service, acting for this {kind},"
+            subject = f"this {kind}"
+            role_reference = AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL
+        elif is_runtime:
             role_arn = detail.get("roleArn")
             scope_name = "AgentCore Runtime Execution Role Scope"
             where = "the runtime"
@@ -28811,7 +28841,7 @@ def check_agentcore_tool_execution_role_scope(
             runs_with = "Code the model writes"
             subject = "this tool"
             role_reference = AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL
-        if not role_arn and is_runtime:
+        if not role_arn and kind != "tool":
             findings.append(
                 create_finding(
                     check_id="AC-45",
@@ -28819,6 +28849,9 @@ def check_agentcore_tool_execution_role_scope(
                     finding_details=(
                         f"{label} reports no roleArn, which CreateAgentRuntime "
                         "requires, so the role its code runs with was not judged."
+                        if is_runtime
+                        else f"{label} reports no execution role, so the role "
+                        "the service uses for it was not judged."
                     ),
                     resolution=(
                         "No action is required on the assessed workload based on "
@@ -28855,7 +28888,8 @@ def check_agentcore_tool_execution_role_scope(
             role_arn,
             detail.get("codeInterpreterArn")
             or detail.get("browserArn")
-            or detail.get("agentRuntimeArn"),
+            or detail.get("agentRuntimeArn")
+            or detail.get("resourceArn"),
         )
         if foreign_account:
             findings.append(
@@ -28932,7 +28966,7 @@ def check_agentcore_tool_execution_role_scope(
 
         problems, unreadable = _tool_execution_role_problems(
             permissions,
-            AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS if is_runtime else frozenset(),
+            frozenset() if kind == "tool" else AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS,
         )
 
         if unreadable:
@@ -30391,6 +30425,105 @@ def _agentcore_tool_family(label: str) -> str:
     return "tool"
 
 
+def _agentcore_service_role_references() -> Tuple[
+    List[Tuple[str, str, str, str]], List[Tuple[str, Exception, str]]
+]:
+    """Return (family, label, role ARN, resource ARN) per memory, payment
+    manager and harness.
+
+    These roles act for the workload outside the agent's own code: memory
+    extraction invokes a model with memoryExecutionRoleArn, a payment manager's
+    roleArn is its ResourceRetrievalRole, and a harness runs its agent loop with
+    executionRoleArn. A family whose list or detail call fails is returned as an
+    error, so the families that did read are still judged.
+    """
+    references: List[Tuple[str, str, str, str]] = []
+    errors: List[Tuple[str, Exception, str]] = []
+
+    try:
+        memories = _agentcore_list_all("list_memories", ["memories"])
+    except Exception as error:
+        memories = []
+        logger.warning(f"Could not list AgentCore memories: {error}")
+        errors.append(
+            ("The list of AgentCore memories", error, "bedrock-agentcore:ListMemories")
+        )
+    for memory in memories:
+        memory_id = memory.get("id") or "unknown"
+        label = f"Memory '{memory_id}'"
+        try:
+            detail = agentcore_client.get_memory(memoryId=memory_id).get("memory", {})
+        except Exception as error:
+            logger.warning(f"Could not read memory {memory_id}: {error}")
+            errors.append((label, error, "bedrock-agentcore:GetMemory"))
+            continue
+        role_arn = detail.get("memoryExecutionRoleArn") or ""
+        # A memory with no execution role runs no model on the caller's
+        # behalf, so it has no trust policy to judge and is not listed.
+        if role_arn:
+            references.append(("memory", label, role_arn, detail.get("arn") or ""))
+
+    # ListPaymentManagers and ListHarnesses have no resource type, so each
+    # needs a Resource "*" grant; a denied list is reported as not read.
+    try:
+        managers = _agentcore_list_all("list_payment_managers", ["paymentManagers"])
+    except Exception as error:
+        managers = []
+        logger.warning(f"Could not list AgentCore payment managers: {error}")
+        errors.append(
+            (
+                "The list of AgentCore payment managers",
+                error,
+                "bedrock-agentcore:ListPaymentManagers",
+            )
+        )
+    for manager in managers:
+        manager_id = manager.get("paymentManagerId") or "unknown"
+        name = manager.get("name") or manager_id
+        references.append(
+            (
+                "payment manager",
+                f"Payment manager '{name}' ({manager_id})",
+                manager.get("roleArn") or "",
+                manager.get("paymentManagerArn") or "",
+            )
+        )
+
+    try:
+        harnesses = _agentcore_list_all("list_harnesses", ["harnesses"])
+    except Exception as error:
+        harnesses = []
+        logger.warning(f"Could not list AgentCore harnesses: {error}")
+        errors.append(
+            (
+                "The list of AgentCore harnesses",
+                error,
+                "bedrock-agentcore:ListHarnesses",
+            )
+        )
+    for harness in harnesses:
+        harness_id = harness.get("harnessId") or "unknown"
+        label = f"Harness '{harness.get('harnessName') or harness_id}' ({harness_id})"
+        try:
+            detail = agentcore_client.get_harness(harnessId=harness_id).get(
+                "harness", {}
+            )
+        except Exception as error:
+            logger.warning(f"Could not read harness {harness_id}: {error}")
+            errors.append((label, error, "bedrock-agentcore:GetHarness"))
+            continue
+        references.append(
+            (
+                "harness",
+                label,
+                detail.get("executionRoleArn") or "",
+                detail.get("arn") or "",
+            )
+        )
+
+    return references, errors
+
+
 def _agentcore_execution_role_references(
     browser_inventory: Dict[str, Any] = None,
 ) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, Exception, str]]]:
@@ -30459,78 +30592,9 @@ def _agentcore_execution_role_references(
             continue
         references.append(("gateway", label, detail.get("roleArn") or ""))
 
-    try:
-        memories = _agentcore_list_all("list_memories", ["memories"])
-    except Exception as error:
-        memories = []
-        logger.warning(f"Could not list AgentCore memories: {error}")
-        errors.append(
-            ("The list of AgentCore memories", error, "bedrock-agentcore:ListMemories")
-        )
-    for memory in memories:
-        memory_id = memory.get("id") or "unknown"
-        label = f"Memory '{memory_id}'"
-        try:
-            detail = agentcore_client.get_memory(memoryId=memory_id).get("memory", {})
-        except Exception as error:
-            logger.warning(f"Could not read memory {memory_id}: {error}")
-            errors.append((label, error, "bedrock-agentcore:GetMemory"))
-            continue
-        role_arn = detail.get("memoryExecutionRoleArn") or ""
-        # A memory with no execution role runs no model on the caller's
-        # behalf, so it has no trust policy to judge and is not listed.
-        if role_arn:
-            references.append(("memory", label, role_arn))
-
-    # ListPaymentManagers and ListHarnesses have no resource type, so each
-    # needs a Resource "*" grant; a denied list is reported as not read.
-    try:
-        managers = _agentcore_list_all("list_payment_managers", ["paymentManagers"])
-    except Exception as error:
-        managers = []
-        logger.warning(f"Could not list AgentCore payment managers: {error}")
-        errors.append(
-            (
-                "The list of AgentCore payment managers",
-                error,
-                "bedrock-agentcore:ListPaymentManagers",
-            )
-        )
-    for manager in managers:
-        manager_id = manager.get("paymentManagerId") or "unknown"
-        name = manager.get("name") or manager_id
-        references.append(
-            (
-                "payment manager",
-                f"Payment manager '{name}' ({manager_id})",
-                manager.get("roleArn") or "",
-            )
-        )
-
-    try:
-        harnesses = _agentcore_list_all("list_harnesses", ["harnesses"])
-    except Exception as error:
-        harnesses = []
-        logger.warning(f"Could not list AgentCore harnesses: {error}")
-        errors.append(
-            (
-                "The list of AgentCore harnesses",
-                error,
-                "bedrock-agentcore:ListHarnesses",
-            )
-        )
-    for harness in harnesses:
-        harness_id = harness.get("harnessId") or "unknown"
-        label = f"Harness '{harness.get('harnessName') or harness_id}' ({harness_id})"
-        try:
-            detail = agentcore_client.get_harness(harnessId=harness_id).get(
-                "harness", {}
-            )
-        except Exception as error:
-            logger.warning(f"Could not read harness {harness_id}: {error}")
-            errors.append((label, error, "bedrock-agentcore:GetHarness"))
-            continue
-        references.append(("harness", label, detail.get("executionRoleArn") or ""))
+    service_references, service_errors = _agentcore_service_role_references()
+    references.extend(reference[:3] for reference in service_references)
+    errors.extend(service_errors)
 
     try:
         tool_details, tool_errors = _agentcore_tool_details(browser_inventory)

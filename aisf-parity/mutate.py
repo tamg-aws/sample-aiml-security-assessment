@@ -1198,6 +1198,34 @@ MUTATIONS = [
         "find": "    return findings + link_findings\n",
         "replace": "    return findings\n",
     },
+    {
+        "name": "AC-45 skips memory, harness and payment manager roles",
+        "file": AGENTCORE,
+        "defect": "a memory role granting every model passes IAM-05 because no check reads it",
+        "find": "            for family, label, role_arn, resource_arn in service_references\n",
+        "replace": "            for family, label, role_arn, resource_arn in service_references[:0]\n",
+    },
+    {
+        "name": "AC-45 judges a foreign service role by a local namesake",
+        "file": AGENTCORE,
+        "defect": "a memory naming another account's role is judged by the local role of the same name",
+        "find": '            or detail.get("resourceArn"),\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-45 hides a failed memory or payment manager read",
+        "file": AGENTCORE,
+        "defect": "a denied GetMemory or ListPaymentManagers drops the family with no N/A row",
+        "find": '            "AgentCore Execution Role Scope",\n            service_errors,\n',
+        "replace": '            "AgentCore Execution Role Scope",\n            [],\n',
+    },
+    {
+        "name": "AC-45 reads CallWithBearerToken on * as every resource",
+        "file": AGENTCORE,
+        "defect": "an action with no resource type can only be granted on *, so failing it names a grant no policy can narrow",
+        "find": '        "bedrock-mantle:callwithbearertoken",\n',
+        "replace": "",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1480,6 +1508,10 @@ GROUPS: dict[str, str] = {
     "AC-22 credits a link from a suspended member account": "in the AgentCore verdict legs",
     "AC-22 passes stale links when ListAccounts fails": "in the AgentCore verdict legs",
     "AC-22 drops the link review on the policy continue": "in the AgentCore verdict legs",
+    "AC-45 skips memory, harness and payment manager roles": "in the AgentCore verdict legs",
+    "AC-45 judges a foreign service role by a local namesake": "in the AgentCore verdict legs",
+    "AC-45 hides a failed memory or payment manager read": "in the AgentCore verdict legs",
+    "AC-45 reads CallWithBearerToken on * as every resource": "in the AgentCore verdict legs",
 }
 
 
