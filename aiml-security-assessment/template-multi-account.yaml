@@ -1502,6 +1502,66 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
         - !Ref SageMakerAssessmentReadsPolicy
 
+  AgentCoreAssessmentReadsPolicy:
+    # Reads that do not fit the AgentCore function's 9000-byte inline policy
+    # budget. Attached only to AgentCoreSecurityAssessmentFunction through its
+    # Policies list. A managed policy document is limited to 6144 characters.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read-only grants for the AgentCore security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LogArchiveSubscriptionRead
+            # AC-26 reads the subscription filters that forward each AgentCore
+            # log group to its archive.
+            Effect: Allow
+            Action:
+              - logs:DescribeSubscriptionFilters # AC-26
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+          - Sid: LogArchiveStreamRead
+            # AC-26 follows a filter to a Firehose stream of this account only.
+            Effect: Allow
+            Action:
+              - firehose:DescribeDeliveryStream # AC-26
+            Resource: !Sub 'arn:${AWS::Partition}:firehose:*:${AWS::AccountId}:deliverystream/*'
+          - Sid: LogArchiveBucketRead
+            # AC-26 reads Object Lock on the stream's archive bucket and on
+            # each trail bucket. Both are customer-chosen and normally owned by
+            # a separate Log Archive account, so neither the name nor the owner
+            # is known at deploy time.
+            Effect: Allow
+            Action:
+              - s3:GetBucketObjectLockConfiguration # AC-26
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+          - Sid: BrowserRecordingOwnershipRead
+            # AC-06 reads Object Ownership on each custom browser's recording
+            # bucket, whose name is customer-chosen; every call also passes
+            # ExpectedBucketOwner.
+            Effect: Allow
+            Action:
+              - s3:GetBucketOwnershipControls # AC-06
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+          - Sid: FrontDoorShieldRead
+            # AC-51 lists the CloudFront distributions whose origin is an
+            # AgentCore gateway and reads their Shield Advanced enrollment.
+            # None of the three actions has a resource type in the service
+            # authorization reference, so each takes '*'.
+            Effect: Allow
+            Action:
+              - cloudfront:ListDistributions # AC-51
+              - shield:GetSubscriptionState # AC-51
+              - shield:ListProtections # AC-51
+            Resource: '*'
+          - Sid: RuntimeImageDigestRead
+            # AC-50 resolves the tag in each runtime's image URI to the digest
+            # Inspector's image coverage is keyed by. Only this account's
+            # registry is read.
+            Effect: Allow
+            Action:
+              - ecr:DescribeImages # AC-50
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
+
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1592,6 +1652,12 @@ Resources:
                 # Formerly CloudTrailTrailInventory
                 # ListTrails takes no resource.
                 - cloudtrail:ListTrails # AC-18, AC-26
+                # AC-18 lists the CloudTrail Lake event data stores. The service
+                # authorization reference lists no resource type for it.
+                - cloudtrail:ListEventDataStores # AC-18
+                # AC-22 reads each OAM link's source account state. The service
+                # authorization reference lists no resource type for it.
+                - organizations:ListAccounts # AC-22
                 # Formerly LogsDeliveryInventory
                 # AC-19 pairs each AgentCore delivery source with its delivery.
                 - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-26, AC-46
@@ -1623,8 +1689,9 @@ Resources:
                 - bedrock-agentcore:ListPaymentManagers # AC-02, AC-48
                 - bedrock-agentcore:ListHarnesses # AC-34, AC-48
                 - bedrock-agentcore:ListBatchEvaluations # AC-41
-                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30, AC-34
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30, AC-34, AC-47
                 - bedrock-agentcore:ListAgentRuntimeVersions # AC-01
+                - bedrock-agentcore:ListConsentPortals # AC-25
                 - ec2:DescribeNatGateways # AC-49
                 - bedrock:GetModelInvocationLoggingConfiguration # AC-26
                 # Formerly AgentCoreApprovedEnumerations
@@ -1664,6 +1731,9 @@ Resources:
                 # AC-46 reads the capacity provider a runtime names. The service
                 # authorization reference lists the capacity-provider type.
                 - bedrock-agentcore:GetCapacityProvider
+                # AC-27 reads each consent portal's executionRoleArn. The service
+                # authorization reference lists the consent-portal type.
+                - bedrock-agentcore:GetConsentPortal
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -1677,6 +1747,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:capacity-provider/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:consent-portal/*'
             # AC-18 counts workload identities and credential providers to decide
             # which identity data-event types are in use, and AC-14 reads the
             # token vault each provider ARN names. The service authorization
@@ -1773,7 +1844,12 @@ Resources:
                 - cloudtrail:GetEventSelectors
                 - cloudtrail:GetTrail # AC-26 log file validation, AC-18 trail region
                 - cloudtrail:GetTrailStatus # AC-18 IsLogging
-              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+                # AC-18 reads each CloudTrail Lake event data store's Status and
+                # selectors on the eventdatastore resource type.
+                - cloudtrail:GetEventDataStore # AC-18
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+                - !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
             # AC-20 reads masking configuration at both scopes: an account-wide
             # data-protection policy and a per-log-group one.
             - Sid: LogsDataProtectionPolicyRead
@@ -1786,22 +1862,21 @@ Resources:
               Effect: Allow
               Action:
                 - oam:GetSinkPolicy
+                # AC-22 lists the links attached to each sink, on the Sink
+                # resource type.
+                - oam:ListAttachedLinks # AC-22
               Resource: !Sub 'arn:${AWS::Partition}:oam:*:${AWS::AccountId}:sink/*'
-            # AC-26 reads the key policy behind a log group's customer managed
-            # key to see who the key lets decrypt the log data.
-            - Sid: LogEncryptionKeyPolicyRead
-              Effect: Allow
-              Action:
-                - kms:GetKeyPolicy
-              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             # AC-07, AC-11 and AC-14 read a memory, policy engine or token vault
             # key's manager and state, and AC-36 lists the key's grants to find
-            # the engine's management and evaluation grants.
+            # the engine's management and evaluation grants. AC-26 reads the
+            # key policy behind a log group's customer managed key to see who
+            # the key lets decrypt the log data.
             - Sid: PolicyEngineKeyStateRead
               Effect: Allow
               Action:
                 - kms:DescribeKey
                 - kms:ListGrants
+                - kms:GetKeyPolicy
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             # AC-28 reads the organization's service control policies to see
             # whether one denies creating a gateway with no inbound authorizer.
@@ -1822,7 +1897,12 @@ Resources:
               Effect: Allow
               Action:
                 - organizations:ListTargetsForPolicy # AC-28, AC-29, AC-37
-              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+              # AC-37 also reads where AWS managed FullAWSAccess is attached, to
+              # find a level whose policies allow no part of an action. That
+              # policy's ARN carries the account segment aws.
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/service_control_policy/*'
             - Sid: OrganizationsParentRead
               Effect: Allow
               Action:
@@ -1904,6 +1984,7 @@ Resources:
                 - s3:GetLifecycleConfiguration
                 - s3:GetBucketVersioning
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+        - !Ref AgentCoreAssessmentReadsPolicy
 
 
   AgentRegistrySecurityAssessmentFunction:

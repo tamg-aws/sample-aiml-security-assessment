@@ -313,6 +313,16 @@ _EXPECTED_ACTIONS = {
         "sso:ListPermissionSets",
         "tag:GetResources",
     },
+    "AgentCoreAssessmentReadsPolicy": {
+        "cloudfront:ListDistributions",
+        "ecr:DescribeImages",
+        "firehose:DescribeDeliveryStream",
+        "logs:DescribeSubscriptionFilters",
+        "s3:GetBucketObjectLockConfiguration",
+        "s3:GetBucketOwnershipControls",
+        "shield:GetSubscriptionState",
+        "shield:ListProtections",
+    },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
         "eks:ListFargateProfiles",
@@ -475,6 +485,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:GetCapacityProvider",
         "bedrock-agentcore:GetCodeInterpreter",
+        "bedrock-agentcore:GetConsentPortal",
         "bedrock-agentcore:GetGateway",
         "bedrock-agentcore:GetGatewayTarget",
         "bedrock-agentcore:GetHarness",
@@ -499,9 +510,11 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListPolicies",
         "bedrock-agentcore:ListPolicyEngines",
         "bedrock-agentcore:ListWorkloadIdentities",
+        "cloudtrail:GetEventDataStore",
         "cloudtrail:GetEventSelectors",
         "cloudtrail:GetTrail",
         "cloudtrail:GetTrailStatus",
+        "cloudtrail:ListEventDataStores",
         "cloudtrail:ListTrails",
         "cloudwatch:DescribeAlarms",
         "cloudwatch:PutMetricData",
@@ -528,8 +541,10 @@ _EXPECTED_ACTIONS = {
         "logs:DescribeLogGroups",
         "logs:GetDataProtectionPolicy",
         "oam:GetSinkPolicy",
+        "oam:ListAttachedLinks",
         "oam:ListSinks",
         "organizations:DescribePolicy",
+        "organizations:ListAccounts",
         "organizations:ListPolicies",
         "organizations:ListParents",
         "organizations:ListTargetsForPolicy",
@@ -567,6 +582,7 @@ _EXPECTED_ACTIONS = {
         "xray:GetTraceSegmentDestination",
         "bedrock:GetModelInvocationLoggingConfiguration",
         "bedrock-agentcore:ListAgentRuntimeVersions",
+        "bedrock-agentcore:ListConsentPortals",
         "ce:GetAnomalyMonitors",
         "ec2:DescribeNatGateways",
         "events:ListTargetsByRule",
@@ -988,7 +1004,11 @@ def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(templat
         for logical_id, resource in data["Resources"].items()
         if resource.get("Type") == "AWS::IAM::ManagedPolicy"
     }
-    assert managed == {"BedrockAssessmentReadsPolicy", "SageMakerAssessmentReadsPolicy"}
+    assert managed == {
+        "AgentCoreAssessmentReadsPolicy",
+        "BedrockAssessmentReadsPolicy",
+        "SageMakerAssessmentReadsPolicy",
+    }
     properties = data["Resources"]["BedrockAssessmentReadsPolicy"]["Properties"]
     assert not {"Roles", "Users", "Groups"} & set(properties)
 
@@ -1310,6 +1330,132 @@ def test_sagemaker_managed_policy_is_attached_only_to_the_sagemaker_function(tem
     ]
     assert references == [{"Fn::Ref": "SageMakerAssessmentReadsPolicy"}]
     assert not _references(data.get("Outputs", {}), "SageMakerAssessmentReadsPolicy")
+
+
+_AGENTCORE_MANAGED_GRANTS = [
+    (
+        "Allow",
+        "logs:DescribeSubscriptionFilters",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*"}
+        ),
+    ),
+    (
+        "Allow",
+        "firehose:DescribeDeliveryStream",
+        json.dumps(
+            {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:firehose:*:${AWS::AccountId}:"
+                    "deliverystream/*"
+                )
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "s3:GetBucketObjectLockConfiguration",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
+    ),
+    (
+        "Allow",
+        "s3:GetBucketOwnershipControls",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
+    ),
+    # No resource type in the service authorization reference (2026-10-03).
+    ("Allow", "cloudfront:ListDistributions", json.dumps("*")),
+    ("Allow", "shield:GetSubscriptionState", json.dumps("*")),
+    ("Allow", "shield:ListProtections", json.dumps("*")),
+    (
+        "Allow",
+        "ecr:DescribeImages",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+@pytest.mark.parametrize("partition", ["aws", "aws-us-gov"])
+def test_agentcore_managed_policy_renders_within_its_budget(template, partition):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    document = data["Resources"]["AgentCoreAssessmentReadsPolicy"]["Properties"][
+        "PolicyDocument"
+    ]
+    rendered = json.dumps(
+        _render_policy_intrinsics(document, partition), separators=(",", ":")
+    )
+    assert len(rendered) <= _MANAGED_POLICY_BUDGET, (
+        f"{os.path.basename(template)} AgentCoreAssessmentReadsPolicy renders to "
+        f"{len(rendered):,} characters in {partition}; keep it below the "
+        f"{_MANAGED_POLICY_BUDGET:,}-character project budget and never exceed "
+        f"IAM's {_MANAGED_POLICY_LIMIT:,}-character managed policy limit."
+    )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_agentcore_managed_policy_holds_exactly_the_approved_grants(template):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    resource = data["Resources"]["AgentCoreAssessmentReadsPolicy"]
+    assert resource["Type"] == "AWS::IAM::ManagedPolicy"
+    # No ManagedPolicyName: CloudFormation names it <stack>-<logical id>-<suffix>,
+    # which the deploy role's policy/aiml-security-* and policy/aiml-sec-*
+    # patterns admit for the stack names this project deploys.
+    assert "ManagedPolicyName" not in resource["Properties"]
+    document = resource["Properties"]["PolicyDocument"]
+    assert all(
+        set(s) <= {"Sid", "Effect", "Action", "Resource"} for s in document["Statement"]
+    )
+    grants = sorted(
+        (
+            statement["Effect"],
+            action,
+            json.dumps(statement["Resource"], sort_keys=True),
+        )
+        for statement in document["Statement"]
+        for action in statement["Action"]
+    )
+    assert grants == sorted(_AGENTCORE_MANAGED_GRANTS)
+    inline = _actions(template, "AgentCoreSecurityAssessmentFunction")
+    assert not {action for _, action, _ in grants} & inline
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_agentcore_managed_policy_is_attached_only_to_the_agentcore_function(template):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    properties = data["Resources"]["AgentCoreAssessmentReadsPolicy"]["Properties"]
+    assert not {"Roles", "Users", "Groups"} & set(properties)
+    referencing = {
+        logical_id
+        for logical_id, resource in data["Resources"].items()
+        if logical_id != "AgentCoreAssessmentReadsPolicy"
+        and _references(resource, "AgentCoreAssessmentReadsPolicy")
+    }
+    assert referencing == {"AgentCoreSecurityAssessmentFunction"}
+    policies = data["Resources"]["AgentCoreSecurityAssessmentFunction"]["Properties"][
+        "Policies"
+    ]
+    references = [
+        p for p in policies if _references(p, "AgentCoreAssessmentReadsPolicy")
+    ]
+    assert references == [{"Fn::Ref": "AgentCoreAssessmentReadsPolicy"}]
+    assert not _references(data.get("Outputs", {}), "AgentCoreAssessmentReadsPolicy")
+
+
+def test_agentcore_managed_policy_is_identical_in_both_templates():
+    documents = []
+    for template in _SAM_TEMPLATES:
+        with open(template, encoding="utf-8") as template_file:
+            data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+        documents.append(data["Resources"]["AgentCoreAssessmentReadsPolicy"])
+    assert documents[0] == documents[1]
 
 
 _ARTIFACT_PREFIXES = {
@@ -1828,10 +1974,6 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
             "oam:GetSinkPolicy",
             "oam:*:${AWS::AccountId}:sink/*",
         ),
-        "LogEncryptionKeyPolicyRead": (
-            "kms:GetKeyPolicy",
-            "kms:*:${AWS::AccountId}:key/*",
-        ),
         "PolicyEngineKeyStateRead": (
             "kms:ListGrants",
             "kms:*:${AWS::AccountId}:key/*",
@@ -1848,6 +1990,14 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         assert action in statement
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # AC-26's key policy read shares the key state statement's key/* resource.
+    key_state = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "PolicyEngineKeyStateRead"
+    )
+    assert "kms:GetKeyPolicy" in key_state
+    assert "kms:*:${AWS::AccountId}:key/*" in key_state
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", key_state)
 
     # AC-18 reads each trail's logging state beside its selectors, on the same
     # trail ARN, and lists the credential providers in the token vault.
@@ -1926,6 +2076,9 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
         "bedrock-agentcore:ListBatchEvaluations",
         "bedrock-agentcore:ListAgentRuntimeEndpoints",
         "bedrock-agentcore:ListAgentRuntimeVersions",
+        "bedrock-agentcore:ListConsentPortals",
+        "cloudtrail:ListEventDataStores",
+        "organizations:ListAccounts",
         "ec2:DescribeNatGateways",
         "bedrock:GetModelInvocationLoggingConfiguration",
     ):
