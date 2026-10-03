@@ -1435,7 +1435,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AG-27", "AG-39"],
+        ["AG-27", "AG-39", "AC-49"],
         "AG-27 asserts association: a gateway names a webAclArn. AG-39 reads the rule "
         "content behind it through wafv2:GetWebACL and fails an ACL with no rule, AWS "
         "managed rule group or default action that blocks, no SQL injection or cross-site "
@@ -1452,7 +1452,12 @@ AI_SUBJECT_ROWS = [
         "are not returned by GetWebACL, so their sensitivity and oversize handling are "
         "not read. A gateway whose wafConfiguration failureMode is FAIL_OPEN "
         "fails, because it allows a request when AWS WAF cannot be evaluated, and one "
-        "that reports no failureMode is Not Applicable. The subject is AgentCore gateways",
+        "that reports no failureMode is Not Applicable. The subject is AgentCore gateways. "
+        "AC-49's AgentCore Network Firewall Threat Inspection row is the egress IPS leg: "
+        "each AWS Network Firewall a VPC hosting AgentCore reaches by its default route "
+        "must run the AWS managed ThreatSignatures rule group and a malware or botnet "
+        "domain group, neither overridden to DROP_TO_ALERT. VPCs hosting no AgentCore "
+        "resource are not read, and no check reads recent detections",
         [],
         5,
     ),

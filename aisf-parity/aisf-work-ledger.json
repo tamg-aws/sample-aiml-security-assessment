@@ -1948,13 +1948,15 @@
       ],
       "incumbents": [
         "AG-27",
-        "AG-39"
+        "AG-39",
+        "AC-49"
       ],
       "incumbent_names": [
         "Agentic AI Gateway WAF Protection",
-        "Agentic AI Gateway WAF Rule Coverage"
+        "Agentic AI Gateway WAF Rule Coverage",
+        "AgentCore DNS Egress Control"
       ],
-      "gap": "AG-27 asserts association: a gateway names a webAclArn. AG-39 reads the rule content behind it through wafv2:GetWebACL and fails an ACL with no rule, AWS managed rule group or default action that blocks, no SQL injection or cross-site scripting coverage, no rate-based rule, or an association body inspection limit left at the 16 KB default, since a tool call carries its arguments in the body. A customer rule group or a non-AWS managed rule group, whose rules AG-39 does not read, turns a missing filter into Not Applicable with the group named. Only a rule whose action is Block is credited. AWS managed groups are credited by name, and not for a filter whose providing rule is overridden to an action other than Block or excluded. A customer SQL injection statement is credited only at SensitivityLevel HIGH, and a customer SQL injection or cross-site scripting statement on the body only with OversizeHandling MATCH, or NO_MATCH beside a rule that blocks an oversized body. The statements inside an AWS managed group are not returned by GetWebACL, so their sensitivity and oversize handling are not read. A gateway whose wafConfiguration failureMode is FAIL_OPEN fails, because it allows a request when AWS WAF cannot be evaluated, and one that reports no failureMode is Not Applicable. The subject is AgentCore gateways",
+      "gap": "AG-27 asserts association: a gateway names a webAclArn. AG-39 reads the rule content behind it through wafv2:GetWebACL and fails an ACL with no rule, AWS managed rule group or default action that blocks, no SQL injection or cross-site scripting coverage, no rate-based rule, or an association body inspection limit left at the 16 KB default, since a tool call carries its arguments in the body. A customer rule group or a non-AWS managed rule group, whose rules AG-39 does not read, turns a missing filter into Not Applicable with the group named. Only a rule whose action is Block is credited. AWS managed groups are credited by name, and not for a filter whose providing rule is overridden to an action other than Block or excluded. A customer SQL injection statement is credited only at SensitivityLevel HIGH, and a customer SQL injection or cross-site scripting statement on the body only with OversizeHandling MATCH, or NO_MATCH beside a rule that blocks an oversized body. The statements inside an AWS managed group are not returned by GetWebACL, so their sensitivity and oversize handling are not read. A gateway whose wafConfiguration failureMode is FAIL_OPEN fails, because it allows a request when AWS WAF cannot be evaluated, and one that reports no failureMode is Not Applicable. The subject is AgentCore gateways. AC-49's AgentCore Network Firewall Threat Inspection row is the egress IPS leg: each AWS Network Firewall a VPC hosting AgentCore reaches by its default route must run the AWS managed ThreatSignatures rule group and a malware or botnet domain group, neither overridden to DROP_TO_ALERT. VPCs hosting no AgentCore resource are not read, and no check reads recent detections",
       "extra_iam": [],
       "phase": 5,
       "tier": "ai_subject",

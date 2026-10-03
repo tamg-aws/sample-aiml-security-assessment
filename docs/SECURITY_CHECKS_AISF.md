@@ -248,7 +248,7 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 170 check-control pairs over 113 tagged checks in 4 modules, naming 103
+every run: 171 check-control pairs over 113 tagged checks in 4 modules, naming 103
 distinct controls. Tagged checks per module are bedrock 33, sagemaker 26,
 agentcore 50, agent_registry 4.
 
@@ -266,7 +266,7 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 59 bare, 0 `(partial)`, 111
+Census at the current head, also printed by gate 14: 59 bare, 0 `(partial)`, 112
 joint. The 59 bare tags plus the 44 jointly covered controls account for the 103
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
 incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
