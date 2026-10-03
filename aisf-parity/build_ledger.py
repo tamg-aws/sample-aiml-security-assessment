@@ -815,7 +815,12 @@ AI_SUBJECT_ROWS = [
         "that judge the input groups. Retention length is reported and not judged, "
         "because no API field states the workload's schedule. Tag values and the "
         "configuration's own description are free-form text AC-41 discloses without "
-        "judging",
+        "judging. The keys of custom evaluators and batch evaluations are credited "
+        "only when DescribeKey reports them customer managed and enabled and the key "
+        "policy allows kms:Decrypt with an encryption context naming that evaluator "
+        "or batch evaluation in one account, with kms:ViaService for an evaluator, "
+        "while a grant to the AgentCore service principal needs aws:SourceArn and an "
+        "open decrypt grant fails",
         [],
         4,
     ),

@@ -890,6 +890,55 @@ MUTATIONS = [
         "find": "    if not runtimes:\n        return []\n    alarm, alarm_unread = _metric_filter_alarm(_command_shell_filter_matches)\n",
         "replace": "    alarm, alarm_unread = _metric_filter_alarm(_command_shell_filter_matches)\n",
     },
+    {
+        "name": "AC-41 credits an evaluation key on DescribeKey alone",
+        "file": AGENTCORE,
+        "defect": "an enabled customer managed key whose policy lets any caller decrypt outside AgentCore passed, so the evaluator instructions it protects were readable by every principal the key policy names",
+        "find": "            if status == StatusEnum.PASSED:\n                status, fact = _evaluation_key_policy_verdict(\n                    key_arn,\n                    evaluators[evaluator_id]",
+        "replace": "            if False:\n                status, fact = _evaluation_key_policy_verdict(\n                    key_arn,\n                    evaluators[evaluator_id]",
+    },
+    {
+        "name": "AC-41 drops kms:ViaService from an evaluator's caller leg",
+        "file": AGENTCORE,
+        "defect": "a caller grant with no kms:ViaService lets the evaluation role decrypt evaluator data directly, outside AgentCore",
+        "find": "        and (\n            batch\n            or any(\n",
+        "replace": "        and (\n            True\n            or any(\n",
+    },
+    {
+        "name": "AC-41 accepts an encryption context open in the account segment",
+        "file": AGENTCORE,
+        "defect": "a context pattern of any account binds no evaluator of this account, so a key shared across accounts passed",
+        "find": "                or not (parts[4].isdigit() and len(parts[4]) == 12)\n                or resource_arn is not None\n",
+        "replace": "                or resource_arn is not None\n",
+    },
+    {
+        "name": "AC-41 credits a context that names another evaluator",
+        "file": AGENTCORE,
+        "defect": "a key policy naming only judge-9 passed judge-1, whose data the policy grants no scoped decrypt for",
+        "find": "                    or not fnmatchcase(target, value)\n",
+        "replace": "",
+    },
+    {
+        "name": "AC-41 ignores a service-principal grant with no aws:SourceArn",
+        "file": AGENTCORE,
+        "defect": "a decrypt grant to bedrock-agentcore.amazonaws.com with no aws:SourceArn is a confused-deputy path from another account's evaluations",
+        "find": '        and not _statement_names_evaluation_resource(statement, "aws:sourcearn")\n',
+        "replace": "        and False\n",
+    },
+    {
+        "name": "AC-41 passes a key policy it could not read",
+        "file": AGENTCORE,
+        "defect": "a denied kms:GetKeyPolicy says nothing about who may decrypt, so a Passed from it is a clean result from a failed read",
+        "find": '    if isinstance(key_policy, Exception):\n        return StatusEnum.NA, (\n            f"names customer managed key {key_arn}, whose key policy could not be "\n',
+        "replace": '    if isinstance(key_policy, Exception):\n        return StatusEnum.PASSED, (\n            f"names customer managed key {key_arn}, whose key policy could not be "\n',
+    },
+    {
+        "name": "AC-41 credits a batch evaluation key on DescribeKey alone",
+        "file": AGENTCORE,
+        "defect": "a batch output key whose policy grants no batch-scoped decrypt passed, so the stored results were readable by any principal the key policy names",
+        "find": "            if status == StatusEnum.PASSED:\n                status, fact = _evaluation_key_policy_verdict(\n                    key_arn,\n                    batch.get(",
+        "replace": "            if False:\n                status, fact = _evaluation_key_policy_verdict(\n                    key_arn,\n                    batch.get(",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1128,6 +1177,13 @@ GROUPS: dict[str, str] = {
     "AC-18 credits an ARN selector that names one of two memories": "in the AgentCore verdict legs",
     "AC-45 reads the shell alarm in the primary Region only": "in the AgentCore verdict legs",
     "AC-45 asks for a shell alarm in a Region with no runtime": "in the AgentCore verdict legs",
+    "AC-41 credits an evaluation key on DescribeKey alone": "in the AgentCore verdict legs",
+    "AC-41 drops kms:ViaService from an evaluator's caller leg": "in the AgentCore verdict legs",
+    "AC-41 accepts an encryption context open in the account segment": "in the AgentCore verdict legs",
+    "AC-41 credits a context that names another evaluator": "in the AgentCore verdict legs",
+    "AC-41 ignores a service-principal grant with no aws:SourceArn": "in the AgentCore verdict legs",
+    "AC-41 passes a key policy it could not read": "in the AgentCore verdict legs",
+    "AC-41 credits a batch evaluation key on DescribeKey alone": "in the AgentCore verdict legs",
 }
 
 

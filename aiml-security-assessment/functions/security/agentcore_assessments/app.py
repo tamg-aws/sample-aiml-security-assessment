@@ -25793,6 +25793,151 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
     return findings
 
 
+EVALUATOR_ENCRYPTION_CONTEXT_KEY = (
+    "kms:encryptioncontext:aws:bedrock-agentcore:evaluatorarn"
+)
+BATCH_EVALUATION_ENCRYPTION_CONTEXT_KEY = (
+    "kms:encryptioncontext:aws:bedrock-agentcore:batchevaluationarn"
+)
+
+
+def _statement_names_evaluation_resource(
+    statement: Dict[str, Any],
+    key: str,
+    resource_arn: Optional[str] = None,
+    resource_type: str = "",
+) -> bool:
+    """Return whether a condition on `key` names this evaluation resource.
+
+    Every value has to be a bedrock-agentcore ARN of `resource_type` in a
+    literal partition and a literal account, and has to match `resource_arn`,
+    so the documented `evaluator/*` and `batch-evaluate/*` patterns count and a
+    pattern open in the account segment does not. With no `resource_arn`, any
+    bedrock-agentcore ARN in a literal partition and account counts.
+    """
+    target = (resource_arn or "").lower()
+    for values in _positive_condition_values(statement, key):
+        bound = True
+        for value in values:
+            parts = value.split(":", 5)
+            if (
+                len(parts) != 6
+                or parts[0] != "arn"
+                or any(wildcard in parts[1] for wildcard in "*?")
+                or parts[2] != "bedrock-agentcore"
+                or not (parts[4].isdigit() and len(parts[4]) == 12)
+                or resource_arn is not None
+                and (
+                    not parts[5].startswith(f"{resource_type}/")
+                    or not fnmatchcase(target, value)
+                )
+            ):
+                bound = False
+                break
+        if bound:
+            return True
+    return False
+
+
+def _evaluation_key_policy_gaps(
+    policy_document: Any, resource_arn: str, key_arn: str, batch: bool
+) -> List[str]:
+    """Return the AgentCore scoping an evaluation key's policy is missing.
+
+    The caller leg needs a kms:Decrypt Allow whose encryption context names
+    this evaluator or batch evaluation; for an evaluator it also needs
+    kms:ViaService bedrock-agentcore in the key's region, as the devguide's
+    AllowCallerCryptoOps carries it and the batch policy does not. Every Allow
+    to the bedrock-agentcore service principal reaching kms:Decrypt needs an
+    aws:SourceArn naming bedrock-agentcore resources in one account, so the
+    batch statement of a key shared with evaluators does not fail the
+    evaluator. A statement granting
+    kms:Decrypt with no condition, such as the account-root kms:* statement, is
+    not subtracted.
+    """
+    region = _arn_region(key_arn)
+    if batch:
+        context_key, resource_type = (
+            BATCH_EVALUATION_ENCRYPTION_CONTEXT_KEY,
+            "batch-evaluate",
+        )
+        context_name = "kms:EncryptionContext:aws:bedrock-agentcore:batchEvaluationArn"
+    else:
+        context_key, resource_type = EVALUATOR_ENCRYPTION_CONTEXT_KEY, "evaluator"
+        context_name = "kms:EncryptionContext:aws:bedrock-agentcore:evaluatorArn"
+    via_service = f"bedrock-agentcore.{region}.amazonaws.com"
+    allows = _document_statements(policy_document, effect="Allow")
+    gaps: List[str] = []
+    if not any(
+        _statement_matches_action(statement, "kms:decrypt")
+        and _statement_names_evaluation_resource(
+            statement, context_key, resource_arn, resource_type
+        )
+        and (
+            batch
+            or any(
+                all(
+                    value in (via_service, "bedrock-agentcore.*.amazonaws.com")
+                    for value in values
+                )
+                for values in _positive_condition_values(statement, "kms:viaservice")
+            )
+        )
+        for statement in allows
+    ):
+        gaps.append(
+            "has no statement allowing kms:Decrypt only with "
+            + ("" if batch else f"kms:ViaService {via_service} and ")
+            + f"{context_name} naming {resource_arn} in one account"
+        )
+    if any(
+        AGENTCORE_SERVICE_PRINCIPAL
+        in [principal.lower() for principal in _statement_principals(statement)]
+        and _statement_matches_action(statement, "kms:decrypt")
+        and not _statement_names_evaluation_resource(statement, "aws:sourcearn")
+        for statement in allows
+    ):
+        gaps.append(
+            f"lets {AGENTCORE_SERVICE_PRINCIPAL} decrypt with no aws:SourceArn "
+            "naming bedrock-agentcore resources in one account"
+        )
+    if _kms_key_policy_allows_open_decrypt(policy_document):
+        gaps.append(
+            "lets every principal decrypt with no condition binding the caller's "
+            "account, organization, principal ARN or source"
+        )
+    return gaps
+
+
+def _evaluation_key_policy_verdict(
+    key_arn: str, resource_arn: str, batch: bool, key_policy_cache: Dict[str, Any]
+) -> Tuple[Any, str]:
+    """Judge an enabled customer managed evaluation key by its key policy."""
+    if key_arn not in key_policy_cache:
+        try:
+            key_policy_cache[key_arn] = kms_client.get_key_policy(KeyId=key_arn)[
+                "Policy"
+            ]
+        except (BotoCoreError, ClientError) as error:
+            key_policy_cache[key_arn] = error
+    key_policy = key_policy_cache[key_arn]
+    if isinstance(key_policy, Exception):
+        return StatusEnum.NA, (
+            f"names customer managed key {key_arn}, whose key policy could not be "
+            f"read: kms:GetKeyPolicy failed with {_assessment_error_label(key_policy)}"
+        )
+    gaps = _evaluation_key_policy_gaps(key_policy, resource_arn, key_arn, batch)
+    if gaps:
+        return StatusEnum.FAILED, (
+            f"names customer managed key {key_arn}, whose key policy " + "; ".join(gaps)
+        )
+    return StatusEnum.PASSED, (
+        f"is encrypted with customer managed key {key_arn}, whose key policy "
+        "allows kms:Decrypt through AgentCore only for this "
+        + ("batch evaluation" if batch else "evaluator")
+    )
+
+
 def _evaluation_key_verdict(
     key_arn: str, key_metadata_cache: Dict[str, Any]
 ) -> Tuple[Any, str]:
@@ -25837,8 +25982,9 @@ def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
     evaluation attaches is read with GetEvaluator. A batch evaluation's own
     kmsKeyArn encrypts its output, and its outputConfig names a results log
     group, which is judged by the rules the online results groups are. A key is
-    credited only when DescribeKey reports it customer managed and enabled. The
-    key policies' encryption context and kms:ViaService conditions are not read.
+    credited only when DescribeKey reports it customer managed and enabled and
+    its key policy, read by kms:GetKeyPolicy, scopes the AgentCore decrypt
+    grants to the evaluator or batch evaluation; an unreadable key policy is N/A.
     """
     finding_name = "AgentCore Evaluation Key Protection"
     if agentcore_client is None or kms_client is None:
@@ -25881,6 +26027,7 @@ def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
 
     findings: List[Dict[str, Any]] = []
     key_metadata_cache: Dict[str, Any] = {}
+    key_policy_cache: Dict[str, Any] = {}
     for evaluator_id in evaluator_ids:
         label = f"Custom evaluator {evaluator_id}"
         if evaluator_id in evaluator_errors:
@@ -25903,13 +26050,21 @@ def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
                 "managed key."
             )
         else:
-            status, fact = _evaluation_key_verdict(
-                evaluators[evaluator_id]["kmsKeyArn"], key_metadata_cache
-            )
+            key_arn = evaluators[evaluator_id]["kmsKeyArn"]
+            status, fact = _evaluation_key_verdict(key_arn, key_metadata_cache)
+            if status == StatusEnum.PASSED:
+                status, fact = _evaluation_key_policy_verdict(
+                    key_arn,
+                    evaluators[evaluator_id].get("evaluatorArn") or "",
+                    False,
+                    key_policy_cache,
+                )
             details_text = f"{label} {fact}."
             resolution = {
                 StatusEnum.PASSED: "No action required for this check.",
-                StatusEnum.NA: "Grant kms:DescribeKey on the key and retry.",
+                StatusEnum.NA: (
+                    "Grant kms:DescribeKey and kms:GetKeyPolicy on the key and retry."
+                ),
             }.get(
                 status,
                 "Set kmsKeyArn on the evaluator with UpdateEvaluator to an enabled "
@@ -25948,7 +26103,6 @@ def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
             )
         )
 
-    key_policy_cache: Dict[str, Any] = {}
     for batch in batches:
         batch_id = batch.get("batchEvaluationId") or "unknown"
         label = (
@@ -25958,6 +26112,13 @@ def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
         key_arn = batch.get("kmsKeyArn")
         if key_arn:
             status, fact = _evaluation_key_verdict(key_arn, key_metadata_cache)
+            if status == StatusEnum.PASSED:
+                status, fact = _evaluation_key_policy_verdict(
+                    key_arn,
+                    batch.get("batchEvaluationArn") or "",
+                    True,
+                    key_policy_cache,
+                )
         else:
             status, fact = (
                 StatusEnum.FAILED,
@@ -25973,7 +26134,10 @@ def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
                 finding_details=f"{label} {fact}.",
                 resolution={
                     StatusEnum.PASSED: "No action required for this check.",
-                    StatusEnum.NA: "Grant kms:DescribeKey on the key and retry.",
+                    StatusEnum.NA: (
+                        "Grant kms:DescribeKey and kms:GetKeyPolicy on the key and "
+                        "retry."
+                    ),
                 }.get(
                     status,
                     "Start batch evaluations with kmsKeyArn set to an enabled "

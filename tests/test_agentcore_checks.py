@@ -38575,6 +38575,56 @@ def _key_metadata(manager="CUSTOMER", state="Enabled"):
     return {"KeyMetadata": {"KeyManager": manager, "KeyState": state}}
 
 
+_EVAL_ARN_PREFIX = "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+
+
+def _evaluation_caller_statement(
+    context_key, pattern, via_service=True, op="StringLike"
+):
+    condition = {
+        op: {f"kms:EncryptionContext:aws:bedrock-agentcore:{context_key}": pattern}
+    }
+    if via_service:
+        condition.setdefault("StringEquals", {})["kms:ViaService"] = (
+            "bedrock-agentcore.us-east-1.amazonaws.com"
+        )
+    return {
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::123456789012:role/MyEvaluationRole"},
+        "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+        "Resource": "*",
+        "Condition": condition,
+    }
+
+
+def _evaluation_service_statement(source_arn=None):
+    condition = {"StringEquals": {"aws:SourceAccount": "123456789012"}}
+    if source_arn:
+        condition["ArnLike"] = {"aws:SourceArn": source_arn}
+    return {
+        "Effect": "Allow",
+        "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+        "Action": "kms:Decrypt",
+        "Resource": "*",
+        "Condition": condition,
+    }
+
+
+def _evaluation_key_policy(*statements):
+    """The devguide's evaluator and batch key policies, merged, unless given."""
+    statements = statements or (
+        _evaluation_caller_statement("evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"),
+        _evaluation_caller_statement(
+            "batchEvaluationArn",
+            f"{_EVAL_ARN_PREFIX}batch-evaluate/*",
+            via_service=False,
+        ),
+        _evaluation_service_statement(f"{_EVAL_ARN_PREFIX}evaluator/*"),
+        _evaluation_service_statement(f"{_EVAL_ARN_PREFIX}batch-evaluate/*"),
+    )
+    return {"Policy": json.dumps({"Statement": list(statements)})}
+
+
 class TestAC41EvaluationKeyProtection:
     """AC-41: custom evaluator and batch evaluation keys, and batch results groups."""
 
@@ -38593,6 +38643,7 @@ class TestAC41EvaluationKeyProtection:
         if kms is None:
             kms = MagicMock()
             kms.describe_key.return_value = _key_metadata()
+            kms.get_key_policy.return_value = _evaluation_key_policy()
         logs = MagicMock()
         logs.describe_log_groups.return_value = {
             "logGroups": [
@@ -38633,11 +38684,20 @@ class TestAC41EvaluationKeyProtection:
     def test_an_evaluator_key_is_credited_only_by_describe_key(
         self, mock_ac, metadata, status
     ):
+        # The customer-enabled case now also needs a bound key policy: before
+        # AC-41 read the key policy it passed on DescribeKey alone.
         kms = MagicMock()
         kms.describe_key.return_value = metadata
+        kms.get_key_policy.return_value = _evaluation_key_policy()
         findings, _ = self._run(
             mock_ac,
-            {"judge-1": {"evaluatorId": "judge-1", "kmsKeyArn": _EVAL_KEY}},
+            {
+                "judge-1": {
+                    "evaluatorId": "judge-1",
+                    "evaluatorArn": f"{_EVAL_ARN_PREFIX}evaluator/judge-1",
+                    "kmsKeyArn": _EVAL_KEY,
+                }
+            },
             kms=kms,
         )
 
@@ -38689,6 +38749,7 @@ class TestAC41EvaluationKeyProtection:
         batches = [
             {
                 "batchEvaluationId": "be-1",
+                "batchEvaluationArn": f"{_EVAL_ARN_PREFIX}batch-evaluate/be-1",
                 "batchEvaluationName": "nightly",
                 "kmsKeyArn": _BATCH_KEY,
                 "evaluators": [{"evaluatorId": "ThirdParty.DeepEval.Bias"}],
@@ -38719,6 +38780,7 @@ class TestAC41EvaluationKeyProtection:
         batches = [
             {
                 "batchEvaluationId": "be-1",
+                "batchEvaluationArn": f"{_EVAL_ARN_PREFIX}batch-evaluate/be-1",
                 "batchEvaluationName": "nightly",
                 "kmsKeyArn": _BATCH_KEY,
                 "evaluators": [{"evaluatorId": "Builtin.Harmfulness"}],
@@ -38738,7 +38800,13 @@ class TestAC41EvaluationKeyProtection:
         }
         findings, _ = self._run(
             mock_ac,
-            {"judge-2": {"evaluatorId": "judge-2", "kmsKeyArn": _EVAL_KEY}},
+            {
+                "judge-2": {
+                    "evaluatorId": "judge-2",
+                    "evaluatorArn": f"{_EVAL_ARN_PREFIX}evaluator/judge-2",
+                    "kmsKeyArn": _EVAL_KEY,
+                }
+            },
             batches=batches,
             batch_details={"be-1": output, "be-2": output},
         )
@@ -38778,7 +38846,13 @@ class TestAC41EvaluationKeyProtection:
 
     @patch("agentcore_app.agentcore_client")
     def test_a_denied_batch_read_is_na_naming_the_action(self, mock_ac):
-        batches = [{"batchEvaluationId": "be-1", "kmsKeyArn": _BATCH_KEY}]
+        batches = [
+            {
+                "batchEvaluationId": "be-1",
+                "batchEvaluationArn": f"{_EVAL_ARN_PREFIX}batch-evaluate/be-1",
+                "kmsKeyArn": _BATCH_KEY,
+            }
+        ]
         data_error = _make_client_error("AccessDeniedException", "no")
         _ac44_custom(mock_ac, {})
         data = MagicMock()
@@ -38786,6 +38860,7 @@ class TestAC41EvaluationKeyProtection:
         data.get_batch_evaluation.side_effect = data_error
         kms = MagicMock()
         kms.describe_key.return_value = _key_metadata()
+        kms.get_key_policy.return_value = _evaluation_key_policy()
         with (
             patch.object(agentcore_app, "agentcore_data_client", data),
             patch.object(agentcore_app, "kms_client", kms),
@@ -38810,6 +38885,223 @@ class TestAC41EvaluationKeyProtection:
 
         assert [f["Status"] for f in findings] == ["N/A"]
         mock_ac.get_evaluator.assert_not_called()
+
+
+_OTHER_EVAL_KEY = (
+    "arn:aws:kms:us-east-1:123456789012:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+)
+
+
+class TestAC41EvaluationKeyPolicy:
+    """AC-41: an enabled customer managed key is credited only by its key policy."""
+
+    def _run(self, mock_ac, evaluators, policies, batches=None):
+        _ac44_custom(
+            mock_ac,
+            {
+                evaluator_id: {
+                    "evaluatorId": evaluator_id,
+                    "evaluatorArn": f"{_EVAL_ARN_PREFIX}evaluator/{evaluator_id}",
+                    "kmsKeyArn": key,
+                }
+                for evaluator_id, key in evaluators.items()
+            },
+        )
+        data = MagicMock()
+        data.list_batch_evaluations.return_value = {
+            "batchEvaluations": [
+                {
+                    "batchEvaluationId": batch_id,
+                    "batchEvaluationArn": f"{_EVAL_ARN_PREFIX}batch-evaluate/{batch_id}",
+                    "kmsKeyArn": key,
+                }
+                for batch_id, key in (batches or {}).items()
+            ]
+        }
+        data.get_batch_evaluation.return_value = {}
+        kms = MagicMock()
+        kms.describe_key.return_value = _key_metadata()
+
+        def _policy(KeyId):
+            found = policies[KeyId]
+            if isinstance(found, Exception):
+                raise found
+            return found
+
+        kms.get_key_policy.side_effect = _policy
+        with (
+            patch.object(agentcore_app, "agentcore_data_client", data),
+            patch.object(agentcore_app, "kms_client", kms),
+        ):
+            findings = agentcore_app.check_agentcore_evaluation_key_protection()
+        return [(f["Status"], f["Finding_Details"], f["Resolution"]) for f in findings]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_caller_grant_without_via_service_fails_only_its_evaluator(self, mock_ac):
+        unbound = _evaluation_key_policy(
+            _evaluation_caller_statement(
+                "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*", via_service=False
+            )
+        )
+        rows = self._run(
+            mock_ac,
+            {"judge-1": _EVAL_KEY, "judge-2": _OTHER_EVAL_KEY},
+            {_EVAL_KEY: _evaluation_key_policy(), _OTHER_EVAL_KEY: unbound},
+        )
+
+        assert [row[0] for row in rows] == ["Passed", "Failed"]
+        assert (
+            "allows kms:Decrypt through AgentCore only for this evaluator" in rows[0][1]
+        )
+        assert "Custom evaluator judge-2" in rows[1][1]
+        assert (
+            "has no statement allowing kms:Decrypt only with kms:ViaService "
+            "bedrock-agentcore.us-east-1.amazonaws.com and "
+            "kms:EncryptionContext:aws:bedrock-agentcore:evaluatorArn naming "
+            f"{_EVAL_ARN_PREFIX}evaluator/judge-2 in one account"
+        ) in rows[1][1]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_context_naming_another_evaluator_does_not_credit_this_one(self, mock_ac):
+        policy = _evaluation_key_policy(
+            _evaluation_caller_statement(
+                "evaluatorArn",
+                f"{_EVAL_ARN_PREFIX}evaluator/judge-9",
+                op="StringEquals",
+            )
+        )
+        rows = self._run(
+            mock_ac,
+            {"judge-1": _EVAL_KEY, "judge-9": _EVAL_KEY},
+            {_EVAL_KEY: policy},
+        )
+
+        assert [row[0] for row in rows] == ["Failed", "Passed"]
+        assert "Custom evaluator judge-1" in rows[0][1]
+
+    @pytest.mark.parametrize(
+        "pattern, op",
+        [
+            ("arn:aws:bedrock-agentcore:us-east-1:*:evaluator/*", "StringLike"),
+            (
+                "arn:*:bedrock-agentcore:us-east-1:123456789012:evaluator/*",
+                "StringLike",
+            ),
+            (f"{_EVAL_ARN_PREFIX}*", "StringLike"),
+            (f"{_EVAL_ARN_PREFIX}evaluator/*", "StringLikeIfExists"),
+            (f"{_EVAL_ARN_PREFIX}evaluator/*", "ForAllValues:StringLike"),
+        ],
+        ids=["any-account", "any-partition", "any-type", "if-exists", "for-all-values"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unbound_context_is_not_credited(self, mock_ac, pattern, op):
+        policy = _evaluation_key_policy(
+            _evaluation_caller_statement("evaluatorArn", pattern, op=op)
+        )
+        rows = self._run(
+            mock_ac,
+            {"judge-1": _EVAL_KEY, "judge-2": _OTHER_EVAL_KEY},
+            {_EVAL_KEY: policy, _OTHER_EVAL_KEY: _evaluation_key_policy()},
+        )
+
+        assert [row[0] for row in rows] == ["Failed", "Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_service_grant_without_source_arn_fails(self, mock_ac):
+        caller = _evaluation_caller_statement(
+            "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
+        )
+        rows = self._run(
+            mock_ac,
+            {"judge-1": _EVAL_KEY, "judge-2": _OTHER_EVAL_KEY},
+            {
+                _EVAL_KEY: _evaluation_key_policy(
+                    caller, _evaluation_service_statement()
+                ),
+                _OTHER_EVAL_KEY: _evaluation_key_policy(
+                    caller,
+                    _evaluation_service_statement(f"{_EVAL_ARN_PREFIX}evaluator/*"),
+                ),
+            },
+        )
+
+        assert [row[0] for row in rows] == ["Failed", "Passed"]
+        assert (
+            "lets bedrock-agentcore.amazonaws.com decrypt with no aws:SourceArn "
+            "naming bedrock-agentcore resources in one account"
+        ) in rows[0][1]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_decrypt_grant_fails_beside_a_bound_one(self, mock_ac):
+        open_grant = {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "kms:Decrypt",
+            "Resource": "*",
+        }
+        rows = self._run(
+            mock_ac,
+            {"judge-1": _EVAL_KEY, "judge-2": _OTHER_EVAL_KEY},
+            {
+                _EVAL_KEY: _evaluation_key_policy(
+                    *json.loads(_evaluation_key_policy()["Policy"])["Statement"],
+                    open_grant,
+                ),
+                _OTHER_EVAL_KEY: _evaluation_key_policy(),
+            },
+        )
+
+        assert [row[0] for row in rows] == ["Failed", "Passed"]
+        assert "lets every principal decrypt with no condition" in rows[0][1]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_key_policy_is_na_naming_the_action(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            {"judge-1": _EVAL_KEY, "judge-2": _OTHER_EVAL_KEY},
+            {
+                _EVAL_KEY: _make_client_error("AccessDeniedException", "no"),
+                _OTHER_EVAL_KEY: _evaluation_key_policy(),
+            },
+        )
+
+        assert [row[0] for row in rows] == ["N/A", "Passed"]
+        assert "kms:GetKeyPolicy failed with AccessDeniedException" in rows[0][1]
+        assert rows[0][2] == (
+            "Grant kms:DescribeKey and kms:GetKeyPolicy on the key and retry."
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_batch_key_needs_the_batch_context_and_no_via_service(self, mock_ac):
+        # The batch devguide policy carries no kms:ViaService, so none is required;
+        # an evaluator context on a batch key does not bind the batch output.
+        rows = self._run(
+            mock_ac,
+            {},
+            {
+                _BATCH_KEY: _evaluation_key_policy(
+                    _evaluation_caller_statement(
+                        "batchEvaluationArn",
+                        f"{_EVAL_ARN_PREFIX}batch-evaluate/*",
+                        via_service=False,
+                    )
+                ),
+                _OTHER_EVAL_KEY: _evaluation_key_policy(
+                    _evaluation_caller_statement(
+                        "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
+                    )
+                ),
+            },
+            batches={"be-1": _BATCH_KEY, "be-2": _OTHER_EVAL_KEY},
+        )
+
+        assert [row[0] for row in rows] == ["Passed", "Failed"]
+        assert "only for this batch evaluation" in rows[0][1]
+        assert (
+            "kms:EncryptionContext:aws:bedrock-agentcore:batchEvaluationArn naming "
+            f"{_EVAL_ARN_PREFIX}batch-evaluate/be-2"
+        ) in rows[1][1]
+        assert "kms:ViaService" not in rows[1][1]
 
 
 _JUDGE_FM = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3"
