@@ -6136,7 +6136,15 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
 
     findings = not_judged
     coverage_error = None
-    covered: Dict[str, Dict[str, Any]] = {}
+    # A repository name is unique only within a registry, and an Inspector
+    # delegated administrator's ListCoverage returns member accounts'
+    # repositories too, so coverage is matched on account and name.
+    registry_of = {
+        str(repo.get("repositoryName")): str(repo.get("registryId") or "")
+        for repo in repositories
+        if repo
+    }
+    covered: Dict[Tuple[str, str], Dict[str, Any]] = {}
     if inspector2_client is None:
         coverage_error = "the Inspector client is not available in this region"
     else:
@@ -6162,7 +6170,9 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                 ) or {}
                 name = metadata.get("name")
                 if name:
-                    covered[str(name)] = resource
+                    covered[(str(resource.get("accountId") or ""), str(name))] = (
+                        resource
+                    )
 
     for name in names:
         if coverage_error:
@@ -6181,7 +6191,7 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                 )
             )
             continue
-        resource = covered.get(name)
+        resource = covered.get((registry_of.get(name, ""), name))
         if resource is None:
             findings.append(
                 create_finding(
@@ -6189,7 +6199,8 @@ def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
                     finding_name=coverage_name,
                     finding_details=(
                         f"Inspector's coverage lists no ECR repository '{name}' in "
-                        "this region, so its agent images are not scanned by "
+                        f"account {registry_of.get(name) or 'unknown'} in this "
+                        "region, so its agent images are not scanned by "
                         "Inspector."
                     ),
                     resolution=(

@@ -46524,10 +46524,12 @@ class TestAC49NetworkFirewallEgress:
 # ===================================================================
 # AC-50 Inspector coverage and finding gate
 # ===================================================================
-def _coverage(name, code="ACTIVE", reason="SUCCESSFUL"):
+def _coverage(name, code="ACTIVE", reason="SUCCESSFUL", account_id="123456789012"):
+    # accountId is a required CoveredResource member in botocore.
     return {
         "resourceType": "AWS_ECR_REPOSITORY",
-        "resourceId": f"arn:aws:ecr:us-east-1:123456789012:repository/{name}",
+        "resourceId": f"arn:aws:ecr:us-east-1:{account_id}:repository/{name}",
+        "accountId": account_id,
         "scanStatus": {"statusCode": code, "reason": reason},
         "resourceMetadata": {
             "ecrRepository": {"name": name, "scanFrequency": "CONTINUOUS_SCAN"}
@@ -46618,6 +46620,22 @@ class TestAC50ImageScanGate:
         assert statuses == ["Passed", "Failed", "Failed"]
         assert "INACTIVE (SCAN_FREQUENCY_MANUAL)" in findings[1]["Finding_Details"]
         assert "lists no ECR repository 'agentcore-c'" in findings[2]["Finding_Details"]
+
+    def test_a_member_accounts_repository_of_the_same_name_does_not_cover(self):
+        # An Inspector delegated administrator's ListCoverage returns member
+        # accounts' repositories too, and a name is unique only per registry.
+        findings = self._run(
+            repos=("agentcore-a", "agentcore-b"),
+            coverage=[
+                _coverage("agentcore-a", "INACTIVE", "SCAN_FREQUENCY_MANUAL"),
+                _coverage("agentcore-a", account_id="111111111111"),
+                _coverage("agentcore-b", account_id="111111111111"),
+            ],
+        )
+
+        assert [f["Status"] for f in findings[:2]] == ["Failed", "Failed"]
+        assert "INACTIVE (SCAN_FREQUENCY_MANUAL)" in findings[0]["Finding_Details"]
+        assert "lists no ECR repository 'agentcore-b'" in findings[1]["Finding_Details"]
 
     def test_denied_coverage_is_na_naming_the_action(self):
         findings = self._run(

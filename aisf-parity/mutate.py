@@ -1121,6 +1121,13 @@ MUTATIONS = [
         "find": "        for resource_type, scopes in store_scoped.items():\n",
         "replace": "        for resource_type, scopes in {}.items():\n",
     },
+    {
+        "name": "AC-50 matches Inspector coverage on repository name alone",
+        "file": AGENTCORE,
+        "defect": "a delegated administrator sees member accounts' repositories, so a member's ACTIVE repository of the same name passes an unscanned one",
+        "find": '        resource = covered.get((registry_of.get(name, ""), name))\n',
+        "replace": "        resource = next(\n            (r for (_, n), r in covered.items() if n == name), None\n        )\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1392,6 +1399,7 @@ GROUPS: dict[str, str] = {
     "AC-18 fails a gap when the event data stores were not listed": "in the AgentCore verdict legs",
     "AC-18 fails a gap when an event data store was not read": "in the AgentCore verdict legs",
     "AC-18 ignores an event data store's memory ARN scope": "in the AgentCore verdict legs",
+    "AC-50 matches Inspector coverage on repository name alone": "in the AgentCore verdict legs",
 }
 
 

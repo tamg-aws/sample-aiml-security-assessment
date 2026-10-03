@@ -1755,9 +1755,12 @@ FOUNDATION_ROWS = [
         "alone fails, because a CVE published after the push is not reported. "
         "BASIC scanning fails, and a filter that misses a repository fails and "
         "names it. A runtime whose image could not be read, or comes from a "
-        "registry in another account or region, is Not Applicable. No check "
-        "reads a deploy gate that blocks on finding severity, because no AWS "
-        "API records whether a pipeline stage fails on an Inspector finding",
+        "registry in another account or region, is Not Applicable. AC-50 also "
+        "requires ACTIVE Inspector ListCoverage for each of those repositories, "
+        "matched on account and name, and an enabled EventBridge rule with a "
+        "target that matches Inspector2 Finding events for container images. "
+        "What the target does with a finding is not read, because no AWS API "
+        "records whether a pipeline stage fails on an Inspector finding",
         [],
         6,
     ),
