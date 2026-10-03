@@ -19738,6 +19738,7 @@ def _sm43_rows(
     components=None,
     deployed=None,
     keys=None,
+    objects=None,
 ):
     """
     Run SM-43 over mocked SageMaker, ECR, S3 and KMS clients.
@@ -19903,6 +19904,25 @@ def _sm43_rows(
         return {"ServerSideEncryptionConfiguration": value}
 
     s3.get_bucket_encryption.side_effect = get_bucket_encryption
+    objects = objects or {}
+    _sm43_rows.head_calls = []
+
+    def head_object(Bucket, Key):
+        _sm43_rows.head_calls.append(f"s3://{Bucket}/{Key}")
+        # The default object carries the ETag the model package fixtures record.
+        value = objects.get(
+            f"s3://{Bucket}/{Key}",
+            {
+                "ETag": '"p-e"',
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": "arn:aws:kms:us-east-1:1:key/k",
+            },
+        )
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    s3.head_object.side_effect = head_object
     keys = keys or {}
     kms = MagicMock()
 
@@ -20208,6 +20228,240 @@ class TestSM43ModelArtifactIntegrity:
             "model 'm-1' container main ModelDataSource" in rows[0]["Finding_Details"]
         )
         assert "container pre" not in rows[0]["Finding_Details"]
+
+    def _object_source(self, data_type="S3Object", etag="e-1", **extra):
+        source = {"S3Uri": "s3://artifacts/m/model.tar.gz", "S3DataType": data_type}
+        if etag:
+            source["ETag"] = etag
+        source.update(extra)
+        return {
+            "PrimaryContainer": {
+                "Image": _sm43_image(),
+                "ModelDataSource": {"S3DataSource": source},
+            }
+        }
+
+    def _object(
+        self, etag='"e-1"', algorithm="aws:kms", key="arn:aws:kms:us-east-1:1:key/k"
+    ):
+        head = {"ETag": etag, "ServerSideEncryption": algorithm}
+        if key:
+            head["SSEKMSKeyId"] = key
+        return head
+
+    def test_an_s3_object_whose_etag_matches_the_recorded_one_passes(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": self._object_source(etag="E-1")},
+            objects={"s3://artifacts/m/model.tar.gz": self._object()},
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert _sm43_rows.head_calls == ["s3://artifacts/m/model.tar.gz"]
+
+    def test_an_s3_object_whose_etag_changed_fails(self):
+        rows = _sm43_rows(
+            models={
+                "m-1": self._object_source(),
+                "m-2": self._object_source(),
+            },
+            objects={"s3://artifacts/m/model.tar.gz": self._object(etag='"e-2"')},
+        )
+        assert _sm43_statuses(rows) == ["Failed", "Failed"]
+        assert (
+            "model 'm-1' container 1 ModelDataSource s3://artifacts/m/model.tar.gz "
+            "now has ETag e-2, not the recorded e-1, so the object changed after "
+            "its expected value was recorded"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_model_package_url_whose_etag_changed_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": {"ModelPackageName": "pkg"}}},
+            packages={
+                "pkg": {
+                    "InferenceSpecification": {
+                        "Containers": [
+                            {
+                                "Image": _sm43_image(),
+                                "ModelDataUrl": "s3://artifacts/p/model.tar.gz",
+                                "ModelDataETag": "p-e",
+                            }
+                        ]
+                    }
+                }
+            },
+            objects={"s3://artifacts/p/model.tar.gz": self._object(etag='"other"')},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "ModelDataUrl s3://artifacts/p/model.tar.gz now has ETag other, not "
+            "the recorded p-e"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_manifest_whose_etag_changed_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": self._object_source(
+                    data_type="S3Prefix",
+                    etag=None,
+                    ManifestS3Uri="s3://artifacts/m/manifest.csv",
+                    ManifestEtag="m-e",
+                )
+            },
+            objects={"s3://artifacts/m/manifest.csv": self._object(etag='"m-x"')},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "manifest s3://artifacts/m/manifest.csv now has ETag m-x, not the "
+            "recorded m-e"
+        ) in rows[0]["Finding_Details"]
+        assert _sm43_rows.head_calls == ["s3://artifacts/m/manifest.csv"]
+
+    def test_a_prefix_source_reads_no_object(self):
+        rows = _sm43_rows()
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert _sm43_rows.head_calls == []
+        assert (
+            "objects under an S3Prefix source are not read"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "head, text",
+        [
+            (
+                {"ETag": '"e-1"', "ServerSideEncryption": "AES256"},
+                "object s3://artifacts/m/model.tar.gz is encrypted with AES256, "
+                "not SSE-KMS",
+            ),
+            (
+                {"ETag": '"e-1"'},
+                "object s3://artifacts/m/model.tar.gz reports no server-side "
+                "encryption, not SSE-KMS",
+            ),
+            (
+                {
+                    "ETag": '"e-1"',
+                    "ServerSideEncryption": "aws:kms",
+                    "SSEKMSKeyId": "arn:aws:kms:us-east-1:1:key/aws-owned",
+                },
+                "object s3://artifacts/m/model.tar.gz is encrypted under "
+                "arn:aws:kms:us-east-1:1:key/aws-owned, an AWS managed key",
+            ),
+        ],
+    )
+    def test_object_encryption_below_a_customer_key_fails_over_a_kms_bucket(
+        self, head, text
+    ):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": self._object_source()},
+            objects={"s3://artifacts/m/model.tar.gz": head},
+            keys={
+                "arn:aws:kms:us-east-1:1:key/aws-owned": {
+                    "KeyManager": "AWS",
+                    "KeyState": "Enabled",
+                }
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert text in rows[0]["Finding_Details"]
+        assert "artifact bucket artifacts:" not in rows[0]["Finding_Details"]
+
+    def test_an_object_without_a_recorded_etag_still_has_its_encryption_read(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": {
+                    "Container": {
+                        "DeployedImage": {
+                            "SpecifiedImage": _sm43_image(tag=None, digest=_SM43_DIGEST)
+                        },
+                        "ArtifactUrl": "s3://artifacts/ic/model.tar.gz",
+                    }
+                },
+            },
+            objects={
+                "s3://artifacts/ic/model.tar.gz": {"ServerSideEncryption": "AES256"}
+            },
+        )
+        details = rows[0]["Finding_Details"]
+        assert "with no expected value recorded" in details
+        assert "object s3://artifacts/ic/model.tar.gz is encrypted with AES256" in (
+            details
+        )
+
+    def test_a_multi_model_url_is_a_prefix_and_is_not_read(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": {"ModelPackageName": "pkg"}}},
+            packages={
+                "pkg": {
+                    "InferenceSpecification": {
+                        "Containers": [
+                            {
+                                "Image": _sm43_image(),
+                                "ModelDataUrl": "s3://artifacts/many/",
+                                "ModelDataETag": "p-e",
+                            }
+                        ]
+                    }
+                }
+            },
+            objects={"s3://artifacts/many/": _sm43_error("404")},
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert _sm43_rows.head_calls == []
+
+    def test_a_missing_object_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": self._object_source()},
+            objects={"s3://artifacts/m/model.tar.gz": _sm43_error("404")},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "ModelDataSource s3://artifacts/m/model.tar.gz returned 404 to "
+            "HeadObject, so no object holds the recorded e-1"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("code", ["403", "AccessDenied", "400"])
+    def test_an_unread_object_is_na_and_holds_back_passed(self, code):
+        rows = _sm43_rows(
+            models={
+                "m-1": self._object_source(),
+                "m-2": {"PrimaryContainer": _sm43_container()},
+            },
+            objects={"s3://artifacts/m/model.tar.gz": _sm43_error(code)},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "endpoint 'ep-1': model 'm-1' container 1 ModelDataSource "
+            f"s3://artifacts/m/model.tar.gz was not read (s3:GetObject: {code})"
+        ) in rows[0]["Finding_Details"]
+        assert "1 InService endpoint(s)" in rows[0]["Finding_Details"]
+
+    def test_an_object_key_not_described_is_na(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": self._object_source()},
+            objects={
+                "s3://artifacts/m/model.tar.gz": self._object(
+                    key="arn:aws:kms:us-east-1:2:key/x"
+                )
+            },
+            keys={
+                "arn:aws:kms:us-east-1:2:key/x": _sm43_error("AccessDeniedException")
+            },
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "object s3://artifacts/m/model.tar.gz key was not read "
+            "(kms:DescribeKey on arn:aws:kms:us-east-1:2:key/x: AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
 
     def test_a_model_package_container_with_model_data_etag_passes(self):
         rows = _sm43_rows(

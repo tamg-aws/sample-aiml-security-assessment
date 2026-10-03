@@ -15776,7 +15776,12 @@ MODEL_ARTIFACT_INTEGRITY_RESOLUTION = (
 MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "A recorded ETag, ManifestEtag or ModelDataETag means an expected value is "
     "recorded; whether SageMaker or the container compared it to the object at "
-    "load time is not returned by any API this check reads. Weights fetched by "
+    "load time is not returned by any API this check reads. Model data named "
+    "as one S3 object (a ModelDataUrl, an S3Object source or a manifest) is read "
+    "with HeadObject: its current ETag is compared to the recorded value and its "
+    "own server-side encryption is judged. The objects under an S3Prefix source "
+    "are not read one by one, and no SageMaker field records a SHA256 digest to "
+    "compare. Weights fetched by "
     "container startup code, and models loaded by workloads on ECS, EKS or EC2, "
     "are not read. Of each container's environment only the keys are read."
 )
@@ -15886,6 +15891,7 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
     buckets = {}
     models = {}
     packages = {}
+    heads = {}
     s3_client = boto3.client("s3", config=boto3_config, region_name=region)
 
     def _ecr(image_region):
@@ -16069,8 +16075,64 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                 )
         return buckets[bucket]
 
+    def _head(uri):
+        if uri not in heads:
+            bucket, _, key = uri[len("s3://") :].partition("/")
+            try:
+                heads[uri] = s3_client.head_object(Bucket=bucket, Key=key)
+            except Exception as error:
+                heads[uri] = get_assessment_error_label(error)
+        return heads[uri]
+
+    def _judge_object(where, uri, recorded):
+        """Compare one S3 object to its recorded ETag and judge its own SSE."""
+        problems, unreads = [], []
+        head = _head(uri)
+        if isinstance(head, str):
+            if head in ("404", "NoSuchKey", "NotFound"):
+                problems.append(
+                    f"{where} {uri} returned 404 to HeadObject, so no object holds "
+                    f"the recorded {recorded or 'model data'}"
+                )
+            else:
+                unreads.append(f"{where} {uri} was not read (s3:GetObject: {head})")
+            return problems, unreads
+        actual = str(head.get("ETag") or "").strip('"')
+        if recorded and actual.lower() != str(recorded).strip('"').lower():
+            problems.append(
+                f"{where} {uri} now has ETag {actual or 'none'}, not the recorded "
+                f"{recorded}, so the object changed after its expected value was "
+                "recorded"
+            )
+        algorithm = head.get("ServerSideEncryption")
+        if algorithm not in S3_ENCRYPTION_KMS_ALGORITHMS:
+            problems.append(
+                f"{where} object {uri} "
+                + (
+                    f"is encrypted with {algorithm}"
+                    if algorithm
+                    else "reports no server-side encryption"
+                )
+                + ", not SSE-KMS"
+            )
+            return problems, unreads
+        key_id = str(head.get("SSEKMSKeyId") or "")
+        key = _kms_key_managers([key_id], region).get(key_id) if key_id else None
+        if not key or key["manager"] == "AWS":
+            problems.append(
+                f"{where} object {uri} is encrypted under "
+                f"{key_id or 'no named key'}, an AWS managed key"
+            )
+        elif key["manager"] is None:
+            unreads.append(
+                f"{where} object {uri} key was not read "
+                f"(kms:DescribeKey on {key_id}: {key['error']})"
+            )
+        return problems, unreads
+
     def _judge_data(label, unit, env_keys):
         problems, unreads, uris = [], [], []
+        objects = []
         url = unit.get("ModelDataUrl")
         source = (unit.get("ModelDataSource") or {}).get("S3DataSource")
         if url:
@@ -16078,6 +16140,14 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
             if not unit.get("ModelDataETag"):
                 problems.append(
                     f"{label} loads ModelDataUrl {url} with no expected value recorded"
+                )
+            if (
+                _s3_uri_bucket(url)
+                and not url.endswith("/")
+                and unit.get("Mode") != "MultiModel"
+            ):
+                objects.append(
+                    (f"{label} ModelDataUrl", url, unit.get("ModelDataETag"))
                 )
         sources = [("ModelDataSource", source)] if source else []
         for extra in unit.get("AdditionalModelDataSources") or []:
@@ -16097,6 +16167,22 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                     f"{label} {name} {s3_source.get('S3Uri')} records no ETag or "
                     "ManifestEtag"
                 )
+            if s3_source.get("S3DataType") == "S3Object" and _s3_uri_bucket(
+                s3_source.get("S3Uri")
+            ):
+                objects.append(
+                    (f"{label} {name}", s3_source["S3Uri"], s3_source.get("ETag"))
+                )
+            if s3_source.get("ManifestEtag") and _s3_uri_bucket(
+                s3_source.get("ManifestS3Uri")
+            ):
+                objects.append(
+                    (
+                        f"{label} {name} manifest",
+                        s3_source["ManifestS3Uri"],
+                        s3_source["ManifestEtag"],
+                    )
+                )
         if "HF_MODEL_ID" in env_keys and not url and not source:
             problems.append(
                 f"{label} sets HF_MODEL_ID with no ModelDataUrl or ModelDataSource, "
@@ -16115,6 +16201,10 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                     f"{label} artifact bucket {bucket} encryption was not read "
                     f"({detail})"
                 )
+        for where, uri, recorded in objects:
+            object_problems, object_unreads = _judge_object(where, uri, recorded)
+            problems += object_problems
+            unreads += object_unreads
         return problems, unreads
 
     def _package_containers(package_name):

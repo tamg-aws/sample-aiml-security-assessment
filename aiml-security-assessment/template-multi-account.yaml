@@ -964,6 +964,16 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis'
               - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis/*/routes'
               - !Sub 'arn:${AWS::Partition}:apigateway:*::/apis/*/integrations'
+          - Sid: OrganizationsPolicyDocumentRead
+            # SM-34 reads the policy document itself, which only
+            # DescribePolicy returns. Held here because the inline policy is
+            # at its budget.
+            Effect: Allow
+            Action:
+              - organizations:DescribePolicy # SM-34
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
+              - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1136,15 +1146,6 @@ Resources:
                 - ec2:DescribeSubnets # SM-10, SM-11, SM-28, SM-33
                 - ec2:DescribeRouteTables # SM-10, SM-11, SM-28, SM-33
               Resource: '*'
-            - Sid: OrganizationsPolicyDocumentRead
-              # SM-34 reads the policy document itself, which only
-              # DescribePolicy returns.
-              Effect: Allow
-              Action:
-                - organizations:DescribePolicy # SM-34
-              Resource:
-                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
-                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
             - Sid: OrganizationsPolicyAttachmentRead
               # SM-34 counts a service control policy only where it is attached on
               # this account's path to the root.
@@ -1330,6 +1331,14 @@ Resources:
               Action:
                 - kms:DescribeKey # SM-03, SM-11, SM-18, SM-27
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            - Sid: ModelArtifactObjectRead
+              # SM-43 calls HeadObject on each model artifact named as one S3
+              # object, to compare its ETag to the recorded one and read its own
+              # server-side encryption. HeadObject is authorized by s3:GetObject.
+              Effect: Allow
+              Action:
+                - s3:GetObject # SM-43
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
         - !Ref SageMakerAssessmentReadsPolicy
 
   AgentCoreSecurityAssessmentFunction:

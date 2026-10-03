@@ -151,3 +151,23 @@ def test_unapproved_reads_are_not_granted_to_the_sagemaker_function():
             assert not [s for s in statements if re.search(rf"- {action}\b", s)], (
                 f"{template_path.name}: {action} is granted without approval"
             )
+
+
+def test_model_artifact_object_read_is_get_object_on_objects_only():
+    # SM-43 calls only HeadObject, which s3:GetObject authorizes. The grant
+    # names the object resource type and sits apart from the report bucket's
+    # permissions-cache read, so neither widens the other.
+    for template_path in TEMPLATE_PATHS:
+        statements = _sagemaker_function_statements(
+            template_path.read_text(encoding="utf-8")
+        )
+        holding = [s for s in statements if re.search(r"- s3:GetObject\b", s)]
+        assert sorted(s.split()[0] for s in holding) == [
+            "ModelArtifactObjectRead",
+            "PermissionCacheRead",
+        ], template_path.name
+        artifact = next(s for s in holding if s.split()[0] == "ModelArtifactObjectRead")
+        assert re.findall(r"- ([a-z0-9-]+:[A-Za-z*]+)", artifact) == ["s3:GetObject"]
+        assert "Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'" in artifact
+        cache = next(s for s in holding if s.split()[0] == "PermissionCacheRead")
+        assert "permissions_cache_*.json" in cache

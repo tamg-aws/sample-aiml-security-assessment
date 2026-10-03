@@ -328,6 +328,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:GetAgentActionGroup",
         "bedrock-agentcore:ListGateways",
         "bedrock-agentcore:ListGatewayTargets",
+        "organizations:DescribePolicy",
         "bedrock-agentcore:GetGatewayTarget",
         "lambda:GetFunctionConfiguration",
         "apigateway:GET",
@@ -354,7 +355,6 @@ _EXPECTED_ACTIONS = {
         "iot:ListPolicies",
         "iot:ListTargetsForPolicy",
         "organizations:DescribeOrganization",
-        "organizations:DescribePolicy",
         "organizations:ListDelegatedAdministrators",
         "organizations:ListParents",
         "organizations:ListPolicies",
@@ -1078,6 +1078,17 @@ _SAGEMAKER_MANAGED_GRANTS = [
                 "Fn::Sub": "arn:${AWS::Partition}:securityhub:*:"
                 "${AWS::AccountId}:hub/default"
             }
+        ),
+    ),
+    (
+        "Allow",
+        "organizations:DescribePolicy",
+        json.dumps(
+            [
+                {"Fn::Sub": "arn:${AWS::Partition}:organizations::*:policy/*/*/*"},
+                {"Fn::Sub": "arn:${AWS::Partition}:organizations::aws:policy/*/*"},
+            ],
+            sort_keys=True,
         ),
     ),
     (

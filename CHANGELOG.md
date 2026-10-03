@@ -362,6 +362,14 @@ section.
   model and fails a credential-named plaintext variable, as it already did
   for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
   or `sagemaker:DescribeModel` holds back the propagation `Passed`.
+- `SM-43` reads each model artifact named as one S3 object (a
+  `ModelDataUrl` that is not a multi-model prefix, an `S3Object` source, or
+  a `ManifestS3Uri`) with `HeadObject`. It fails an object whose ETag
+  differs from the recorded `ETag`, `ManifestEtag` or `ModelDataETag`, an
+  object that returns 404, and an object whose own server-side encryption
+  is not SSE-KMS under a customer managed key, even when the bucket default
+  is. An unread object holds back `Passed`. Earlier the check only tested
+  that an expected value was recorded.
 - `SM-02` adds an `AI API Method Authorization` row. It reads every REST
   API method and HTTP API route whose integration reaches a Bedrock,
   AgentCore or SageMaker runtime, or a Lambda function an agent or gateway
@@ -1643,6 +1651,17 @@ and `lambda:GetFunctionConfiguration` on
 `arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*` (`SM-11`).
 A function in another account is reported as not read. Until the stack is
 updated, the new `SM-11` row reads as incomplete.
+
+**SageMaker model artifact object reads.** The SageMaker function gains an
+inline `ModelArtifactObjectRead` statement with `s3:GetObject` on
+`arn:${AWS::Partition}:s3:::*/*` (`SM-43`). The check calls only
+`HeadObject`, which `s3:GetObject` authorizes; the grant also permits
+reading object contents in any bucket whose policy admits the role. To keep
+the inline policy under its 9,000-character budget,
+`OrganizationsPolicyDocumentRead` (`organizations:DescribePolicy`, `SM-34`)
+moves unchanged into `SageMakerAssessmentReadsPolicy`. Until the stack is
+updated, `SM-43` endpoints with single-object model data read as
+incomplete.
 
 **SageMaker API Gateway method reads.** `SageMakerAssessmentReadsPolicy`
 gains `apigateway:GET` on

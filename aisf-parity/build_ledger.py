@@ -2012,12 +2012,23 @@ FOUNDATION_ROWS = [
         "additional model data source fails without an ETag or ManifestEtag unless it "
         "is SageMaker hub content. A container with an HF_MODEL_ID environment key and no model "
         "data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse "
-        "with a named key whose kms:DescribeKey KeyManager is CUSTOMER. An endpoint with an unread repository, signing status, "
-        "model or bucket reports N/A, never Passed. Partial, ceiling reached: a "
+        "with a named key whose kms:DescribeKey KeyManager is CUSTOMER. Model data "
+        "named as one S3 object (a ModelDataUrl that is not a multi-model prefix, an "
+        "S3Object source, or a ManifestS3Uri) is read with HeadObject: an ETag that "
+        "differs from the recorded value fails, a 404 fails, and the object's own "
+        "ServerSideEncryption must be aws:kms or aws:kms:dsse under a CUSTOMER key. "
+        "An endpoint with an unread repository, signing status, "
+        "model, bucket or object reports N/A, never Passed. Partial, ceiling reached: a "
         "recorded ETag says an expected value is recorded, and no AWS API returns "
         "whether SageMaker or the container compared it with the object at load "
-        "time. Weights fetched by container startup code, and models loaded on "
-        "ECS, EKS or EC2, are not read",
+        "time; no SageMaker container or S3ModelDataSource member records a SHA256 "
+        "digest, and ProductionVariant has no instance metadata option, so IMDSv2 "
+        "is not readable on endpoint instances. Not built: the objects under an "
+        "S3Prefix source are not read one by one, the model execution role's read "
+        "scope on the artifact is not judged, and a tag-pinned image in another "
+        "account's ECR registry stays N/A because ecr:DescribeRepositories is "
+        "granted on this account's repositories only. Weights fetched by container "
+        "startup code, and models loaded on ECS, EKS or EC2, are not read",
         [],
         6,
     ),
