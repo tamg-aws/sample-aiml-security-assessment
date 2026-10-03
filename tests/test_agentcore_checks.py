@@ -25605,6 +25605,158 @@ def _model_policy(resource, action=None):
     }
 
 
+_EVAL_LOG_ARN = "arn:aws:logs:us-east-1:123456789012:log-group:"
+
+
+def _documented_evaluation_role_policy(*extra):
+    """The execution role policy in evaluations-prerequisites.html, plus extras."""
+    return {
+        "name": "EvaluationPolicy",
+        "document": {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:DescribeLogGroups",
+                        "logs:GetQueryResults",
+                        "logs:StartQuery",
+                    ],
+                    "Resource": "*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents",
+                    ],
+                    "Resource": f"{_EVAL_LOG_ARN}/aws/bedrock-agentcore/evaluations/*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["logs:DescribeIndexPolicies", "logs:PutIndexPolicy"],
+                    "Resource": [
+                        f"{_EVAL_LOG_ARN}aws/spans",
+                        f"{_EVAL_LOG_ARN}aws/spans:*",
+                    ],
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    "Resource": "arn:aws:bedrock:us-east-1::foundation-model/*",
+                },
+                *extra,
+            ]
+        },
+    }
+
+
+class TestAC44EvaluationRolePermissions:
+    """AC-44: the execution role holds only what the evaluation service needs."""
+
+    _NAME = "AgentCore Evaluation Role Permissions Beyond Need"
+
+    def _run(self, mock_ac, policies):
+        details = [
+            _online_evaluation_detail(
+                onlineEvaluationConfigId=f"oec-{role}",
+                evaluationExecutionRoleArn=f"arn:aws:iam::123456789012:role/{role}",
+            )
+            for role in policies
+        ]
+        _online_evaluation_client(mock_ac, details)
+        cache = {
+            "role_permissions": {
+                role: {"attached_policies": [policy], "inline_policies": []}
+                for role, policy in policies.items()
+            }
+        }
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+        return [f for f in findings if f["Finding"] == self._NAME]
+
+    @pytest.mark.parametrize(
+        "statement, named",
+        [
+            (
+                {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"},
+                "s3:getobject",
+            ),
+            ({"Effect": "Allow", "Action": "logs:*", "Resource": "*"}, "logs:*"),
+            (
+                {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"},
+                "NotAction iam:*",
+            ),
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": "logs:PutLogEvents",
+                    "Resource": f"{_EVAL_LOG_ARN}/aws/bedrock-agentcore/runtimes/*",
+                },
+                "logs:putlogevents on "
+                f"{_EVAL_LOG_ARN}/aws/bedrock-agentcore/runtimes/*",
+            ),
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": "logs:CreateLogGroup",
+                    "Resource": "arn:aws:logs:us-east-1:*:log-group:"
+                    "/aws/bedrock-agentcore/evaluations/*",
+                },
+                "logs:createloggroup on arn:aws:logs:us-east-1:*:log-group:",
+            ),
+            (
+                {"Effect": "Allow", "Action": "logs:PutIndexPolicy", "Resource": "*"},
+                "logs:putindexpolicy on *",
+            ),
+        ],
+        ids=[
+            "other-service",
+            "wildcard-action",
+            "not-action",
+            "other-group",
+            "any-account",
+            "index-anywhere",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_beyond_the_documented_policy_fails_its_role_only(
+        self, mock_ac, statement, named
+    ):
+        rows = self._run(
+            mock_ac,
+            {
+                "GoodRole": _documented_evaluation_role_policy(),
+                "WideRole": _documented_evaluation_role_policy(statement),
+            },
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "Failed"
+        assert "role WideRole holds 1 grant(s)" in rows[0]["Finding_Details"]
+        assert named in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_its_own_deny_removes_is_not_counted(self, mock_ac):
+        rows = self._run(
+            mock_ac,
+            {
+                "DeniedRole": _documented_evaluation_role_policy(
+                    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "s3:*", "Resource": "*"},
+                ),
+                "WideRole": _documented_evaluation_role_policy(
+                    {"Effect": "Allow", "Action": "sqs:SendMessage", "Resource": "*"}
+                ),
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "WideRole" in rows[0]["Finding_Details"]
+
+
 class TestAC44EvaluationJudgeModelScope:
     """AC-44: which models the judge can be pointed at."""
 
@@ -25755,11 +25907,17 @@ class TestAC44EvaluationJudgeModelScope:
     @patch("agentcore_app.agentcore_client")
     def test_a_role_with_no_model_grant_passes(self, mock_ac):
         _online_evaluation_client(mock_ac)
+        # The log write names the evaluations log groups: on "*" it is now a
+        # grant beyond the role's need and fails on its own row.
         cache = {
             "role_permissions": {
                 "EvaluationRole": {
                     "attached_policies": [
-                        _model_policy("*", action="logs:PutLogEvents")
+                        _model_policy(
+                            "arn:aws:logs:us-east-1:123456789012:log-group:"
+                            "/aws/bedrock-agentcore/evaluations/*",
+                            action="logs:PutLogEvents",
+                        )
                     ],
                     "inline_policies": [],
                 }

@@ -27120,6 +27120,105 @@ def _model_pattern_reaches(pattern: str, model_id: str) -> bool:
     return any(fnmatchcase(candidate, tail) for candidate in candidates)
 
 
+# evaluations-prerequisites.html: the execution role's permissions policy grants
+# these log reads on any resource, these writes on the evaluations log groups,
+# and the index-policy actions on aws/spans. Model invocation is AC-44's own leg.
+EVALUATION_ROLE_LOG_READS = (
+    "logs:describeloggroups",
+    "logs:getqueryresults",
+    "logs:startquery",
+    "logs:describeindexpolicies",
+)
+EVALUATION_ROLE_LOG_WRITES = (
+    "logs:createloggroup",
+    "logs:createlogstream",
+    "logs:putlogevents",
+)
+EVALUATION_ROLE_INDEX_WRITES = ("logs:putindexpolicy",)
+EVALUATION_RESULTS_LOG_GROUP_PREFIX = "/aws/bedrock-agentcore/evaluations/"
+
+
+def _log_group_resource_within(resource: str, prefix: str, exact: bool) -> bool:
+    """Return whether a logs Resource pattern names only groups under `prefix`.
+
+    The account segment has to be literal and the group name has to begin with
+    `prefix` before any wildcard; with `exact`, the name has to be `prefix`
+    itself or `prefix:*`, its log streams.
+    """
+    parts = resource.split(":", 6)
+    if (
+        len(parts) < 7
+        or parts[0] != "arn"
+        or parts[2] != "logs"
+        or not (parts[4].isdigit() and len(parts[4]) == 12)
+        or parts[5] != "log-group"
+    ):
+        return False
+    name = parts[6]
+    if exact:
+        return name in (prefix, f"{prefix}:*")
+    return name.startswith(prefix)
+
+
+def _evaluation_role_extra_grants(permissions: Dict[str, Any]) -> List[str]:
+    """Return each grant an evaluation execution role holds beyond its need.
+
+    An action counts as needed only when an Allow names it literally: a
+    wildcard action pattern other than one over bedrock:InvokeModel, which
+    AC-44 judges, reaches actions the documented policy does not grant, and so
+    does NotAction. The log writes have to name only the evaluations log groups
+    and PutIndexPolicy only aws/spans. A grant the role's own unconditioned
+    Deny or permissions boundary removes is not counted, and a policy document
+    that cannot be parsed is skipped because AC-44 reports it.
+    """
+    extra: List[str] = []
+    for policy in _principal_policies(permissions):
+        try:
+            statements = list(_allow_statements(policy))
+        except (TypeError, ValueError):
+            continue
+        for statement in statements:
+            if "NotAction" in statement:
+                label = f"NotAction {', '.join(_statement_not_actions(statement))}"
+                if label not in extra:
+                    extra.append(label)
+                continue
+            resources = (
+                _statement_resources(statement) if "Resource" in statement else ["*"]
+            )
+            for action in _statement_actions(statement):
+                if action.startswith("bedrock:invokemodel") or not _grant_survives(
+                    permissions, action
+                ):
+                    continue
+                if action in EVALUATION_ROLE_LOG_READS:
+                    continue
+                if action in EVALUATION_ROLE_LOG_WRITES:
+                    outside = [
+                        resource
+                        for resource in resources
+                        if not _log_group_resource_within(
+                            resource, EVALUATION_RESULTS_LOG_GROUP_PREFIX, False
+                        )
+                    ]
+                elif action in EVALUATION_ROLE_INDEX_WRITES:
+                    outside = [
+                        resource
+                        for resource in resources
+                        if not _log_group_resource_within(resource, "aws/spans", True)
+                    ]
+                else:
+                    label = action
+                    if label not in extra:
+                        extra.append(label)
+                    continue
+                for resource in outside:
+                    label = f"{action} on {resource}"
+                    if label not in extra:
+                        extra.append(label)
+    return extra
+
+
 def check_agentcore_evaluation_judge_model_scope(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -27282,6 +27381,35 @@ def check_agentcore_evaluation_judge_model_scope(
             continue
 
         unbounded, bounded, unreadable = _model_invocation_scope(permissions)
+
+        extra_grants = _evaluation_role_extra_grants(permissions)
+        if extra_grants:
+            findings.append(
+                create_finding(
+                    check_id="AC-44",
+                    finding_name="AgentCore Evaluation Role Permissions Beyond Need",
+                    finding_details=(
+                        f"Evaluation execution role {role_name} holds "
+                        f"{len(extra_grants)} grant(s) beyond the CloudWatch Logs "
+                        "reads, the writes on log groups under "
+                        f"{EVALUATION_RESULTS_LOG_GROUP_PREFIX}, the aws/spans "
+                        "index policy and the model invocation the evaluation "
+                        f"service role needs: {', '.join(extra_grants)}. The "
+                        "service assumes the role while scoring agent output, so "
+                        "each extra grant is reachable from an evaluation. "
+                        f"{IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        "Reduce the role's policies to the execution role policy "
+                        "in the AgentCore Evaluations prerequisites, naming each "
+                        "action and scoping the log writes to "
+                        f"{EVALUATION_RESULTS_LOG_GROUP_PREFIX}*."
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
 
         if unreadable:
             findings.append(

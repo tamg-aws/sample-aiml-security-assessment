@@ -995,6 +995,48 @@ MUTATIONS = [
         "find": '            errors.append(\n                (\n                    f"The earlier versions of {label}",\n',
         "replace": '            continue\n            errors.append(\n                (\n                    f"The earlier versions of {label}",\n',
     },
+    {
+        "name": "AC-44 does not read the evaluation role's other grants",
+        "file": AGENTCORE,
+        "defect": "the role the service assumes while scoring agent output could hold any other grant, such as s3:GetObject on every bucket, and no row said so",
+        "find": "        extra_grants = _evaluation_role_extra_grants(permissions)\n",
+        "replace": "        extra_grants = []\n",
+    },
+    {
+        "name": "AC-44 credits a NotAction Allow on the evaluation role",
+        "file": AGENTCORE,
+        "defect": "an Allow with NotAction grants every action it does not list",
+        "find": "                label = f\"NotAction {', '.join(_statement_not_actions(statement))}\"\n                if label not in extra:\n                    extra.append(label)\n                continue\n",
+        "replace": "                continue\n",
+    },
+    {
+        "name": "AC-44 credits evaluation log writes on any group",
+        "file": AGENTCORE,
+        "defect": "PutLogEvents on the runtime log groups lets the role write into the agent's own logs, outside the evaluations groups the service needs",
+        "find": "                if action in EVALUATION_ROLE_LOG_READS:\n",
+        "replace": "                if action in EVALUATION_ROLE_LOG_READS + EVALUATION_ROLE_LOG_WRITES:\n",
+    },
+    {
+        "name": "AC-44 credits a log-group pattern open in the account segment",
+        "file": AGENTCORE,
+        "defect": "a log write on any account's evaluations groups reaches groups the assessed account does not own",
+        "find": '        or parts[2] != "logs"\n        or not (parts[4].isdigit() and len(parts[4]) == 12)\n        or parts[5] != "log-group"\n',
+        "replace": '        or parts[2] != "logs"\n        or parts[5] != "log-group"\n',
+    },
+    {
+        "name": "AC-44 credits PutIndexPolicy on any log group",
+        "file": AGENTCORE,
+        "defect": "an index policy written on any group changes which fields of every log group are indexed, beyond aws/spans",
+        "find": '                        if not _log_group_resource_within(resource, "aws/spans", True)\n',
+        "replace": "                        if False\n",
+    },
+    {
+        "name": "AC-44 counts an extra grant the role's own Deny removes",
+        "file": AGENTCORE,
+        "defect": "an Allow removed by the role's own unconditioned Deny grants nothing, so reporting it fails a role that holds no extra grant",
+        "find": '                if action.startswith("bedrock:invokemodel") or not _grant_survives(\n                    permissions, action\n                ):\n',
+        "replace": '                if action.startswith("bedrock:invokemodel"):\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1248,6 +1290,12 @@ GROUPS: dict[str, str] = {
     "AC-36 credits a trail homed in another Region": "in the AgentCore verdict legs",
     "AC-49 reads the latest runtime version only": "in the AgentCore verdict legs",
     "AC-49 drops an unlisted runtime version set silently": "in the AgentCore verdict legs",
+    "AC-44 does not read the evaluation role's other grants": "in the AgentCore verdict legs",
+    "AC-44 credits a NotAction Allow on the evaluation role": "in the AgentCore verdict legs",
+    "AC-44 credits evaluation log writes on any group": "in the AgentCore verdict legs",
+    "AC-44 credits a log-group pattern open in the account segment": "in the AgentCore verdict legs",
+    "AC-44 credits PutIndexPolicy on any log group": "in the AgentCore verdict legs",
+    "AC-44 counts an extra grant the role's own Deny removes": "in the AgentCore verdict legs",
 }
 
 

@@ -1261,12 +1261,15 @@
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-43"
+        "AC-43",
+        "AC-44"
       ],
       "incumbent_names": [
-        "AgentCore Evaluation Role Trust"
+        "AgentCore Evaluation Role Trust",
+        "AgentCore Evaluation Judge Model Scope",
+        "AgentCore Evaluation Role Permissions Beyond Need"
       ],
-      "gap": "AC-43 reads each evaluation execution role's own trust policy and fails every Allow statement trusting an AWS service principal, or every principal, unless an aws:SourceAccount or aws:SourceArn condition names the assessed account in every value: an IfExists or ForAllValues operator and a wildcard value do not count. The role can read the scored traces and invoke the judge model, so a service acting for another customer's configuration reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no evaluation role, because it reads the roles gateways name",
+      "gap": "AC-43 reads each evaluation execution role's own trust policy and fails every Allow statement trusting an AWS service principal, or every principal, unless an aws:SourceAccount or aws:SourceArn condition names the assessed account in every value: an IfExists or ForAllValues operator and a wildcard value do not count. The role can read the scored traces and invoke the judge model, so a service acting for another customer's configuration reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no evaluation role, because it reads the roles gateways name. AC-44 reads the role's cached permissions and fails any Allow beyond the documented execution role policy: the CloudWatch Logs reads, log writes naming only groups under /aws/bedrock-agentcore/evaluations/ in one account, PutIndexPolicy on aws/spans, and model invocation, which AC-44 judges by model. A wildcard action, NotAction, or any other action fails, and a grant the role's own unconditioned Deny or permissions boundary removes is not counted",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1287,7 +1290,8 @@
         "AC-44"
       ],
       "incumbent_names": [
-        "AgentCore Evaluation Judge Model Scope"
+        "AgentCore Evaluation Judge Model Scope",
+        "AgentCore Evaluation Role Permissions Beyond Need"
       ],
       "gap": "AC-44 reports whether each evaluation execution role's model-invocation grant names models at all: a Resource pattern ending in a bare wildcard, a wildcard in the service, account or resource type segment (arn:aws:bedrock:*::*), or a NotResource grant reaches every model the account can invoke, and the judge prompt carries the agent output being scored, so every model it reaches is one attacker-influenced text can be sent to. A region wildcard on a named model passes. A bare Action \"*\" counts, a grant the role's own Deny or boundary removes does not, and a role the IAM cache could not read is N/A. A bounded pattern then has to reach a model one of the role's custom evaluators calls, as GetEvaluator reports it: a pattern no judge uses fails, whether the configurations attach only built-in evaluators or custom ones that name no Bedrock judge model, such as code-based evaluators, and a configuration that returns no evaluator list is N/A. Which models a workload's judges may use is the workload owner's decision, so the check asserts only that each grant is bounded and used",
       "extra_iam": [],

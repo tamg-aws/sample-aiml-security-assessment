@@ -760,7 +760,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-43"],
+        ["AC-43", "AC-44"],
         "AC-43 reads each evaluation execution role's own trust policy and fails every "
         "Allow statement trusting an AWS service principal, or every principal, unless "
         "an aws:SourceAccount or aws:SourceArn condition names the assessed account in "
@@ -768,7 +768,13 @@ AI_SUBJECT_ROWS = [
         "count. The role can read the scored traces and invoke the judge model, so a "
         "service acting for another customer's configuration reaches both. AC-27 makes "
         "the same assertion on gateway execution roles and reaches no evaluation role, "
-        "because it reads the roles gateways name",
+        "because it reads the roles gateways name. AC-44 reads the role's cached "
+        "permissions and fails any Allow beyond the documented execution role policy: "
+        "the CloudWatch Logs reads, log writes naming only groups under "
+        "/aws/bedrock-agentcore/evaluations/ in one account, PutIndexPolicy on "
+        "aws/spans, and model invocation, which AC-44 judges by model. A wildcard "
+        "action, NotAction, or any other action fails, and a grant the role's own "
+        "unconditioned Deny or permissions boundary removes is not counted",
         [],
         4,
     ),
@@ -2233,7 +2239,10 @@ INCUMBENT_NAMES = {
     "AC-41": "AgentCore Evaluation Result Protection",
     "AC-42": "AgentCore Evaluation Pass Role Scope",
     "AC-43": "AgentCore Evaluation Role Trust",
-    "AC-44": "AgentCore Evaluation Judge Model Scope",
+    "AC-44": (
+        "AgentCore Evaluation Judge Model Scope",
+        "AgentCore Evaluation Role Permissions Beyond Need",
+    ),
     "AC-45": "AgentCore Tool Execution Role Scope",
     "AC-46": (
         "AgentCore Runtime Session Limits",

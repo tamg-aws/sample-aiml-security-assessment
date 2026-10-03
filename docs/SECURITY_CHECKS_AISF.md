@@ -248,7 +248,7 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 169 check-control pairs over 113 tagged checks in 4 modules, naming 103
+every run: 170 check-control pairs over 113 tagged checks in 4 modules, naming 103
 distinct controls. Tagged checks per module are bedrock 33, sagemaker 26,
 agentcore 50, agent_registry 4.
 
@@ -266,8 +266,8 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 60 bare, 0 `(partial)`, 109
-joint. The 60 bare tags plus the 43 jointly covered controls account for the 103
+Census at the current head, also printed by gate 14: 59 bare, 0 `(partial)`, 111
+joint. The 59 bare tags plus the 44 jointly covered controls account for the 103
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
 incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
 dropped `(1 of N)`, fails gate 14 with the row's verdict and incumbent count
@@ -275,13 +275,13 @@ named.
 
 A check that contributes to several controls carries them pipe-joined, with the
 `AISF ` prefix repeated on each element so a consumer that splits on `|` gets a
-complete token. 36 checks name more than one control. `AC-02` names five: bare
+complete token. 37 checks name more than one control. `AC-02` names five: bare
 on `AIR-ACR-EVAL-01` and on `AIR-ACR-PAY-01`, and joint on
 `AIR-ACR-RT-03 (1 of 3 checks)`, `AIR-FND-IAM-05 (1 of 4 checks)` and
 `AIR-FND-IAM-09 (1 of 4 checks)`.
 
 Mixing a `(partial)` with a tag of another form inside one value is no longer the
-common case, 0 of those 36, because no `tighten` control is left to carry a
+common case, 0 of those 37, because no `tighten` control is left to carry a
 `(partial)`. A foundational control such as `AIR-FND-NET-01` is asserted jointly by
 checks whose own service control they fully assert, so the same check carries a
 bare tag and a `(1 of N checks)` one. Nothing in the vocabulary forbids a mix,
@@ -467,16 +467,16 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 93/93 find-strings validated`, aborting and naming each entry whose
+   `entries 99/99 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 93 ways and requires a ledger gate or a test to go red for
+   breaks the code 99 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
    in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names
    the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown
    renderer, 1 in the census anchor, 1 in the published battery figures, 2 in the
    coverage bullets, 1 in the multi-control figures, 2 in the report section's
-   coverage figures, 1 in the foundation scope, 4 in the live tag probe and 59 in the AgentCore verdict legs. Gate
+   coverage figures, 1 in the foundation scope, 4 in the live tag probe and 65 in the AgentCore verdict legs. Gate
    20 derives every figure in this step from `mutate.py`'s own entry list and
    fails if this paragraph disagrees with it, because the earlier copy of this
    sentence went stale at 17 while the battery grew to 22 and nothing read the
