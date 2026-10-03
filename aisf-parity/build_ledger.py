@@ -1939,8 +1939,9 @@ FOUNDATION_ROWS = [
         ["AC-51", "AG-39"],
         "AC-51 judges the web ACL on each AgentCore gateway for the AWS "
         "Anti-DDoS managed rule group. Front doors other than AgentCore gateways "
-        "(API Gateway, ALB, CloudFront) are not identifiable as AI entry points by "
-        "any API, so they are not judged. The gateway's web ACL comes from the "
+        "(API Gateway, ALB, CloudFront) are not judged: an API Gateway integration "
+        "or an origin can name a Bedrock endpoint, but neither they nor their web "
+        "ACL associations are read. The gateway's web ACL comes from the "
         "lookup AG-27 and AG-39 already make, and the ACL passes when its rules "
         "include AWSManagedRulesAntiDDoSRuleSet with an override action other than "
         "Count. A passing finding names the Block and Challenge sensitivities the "

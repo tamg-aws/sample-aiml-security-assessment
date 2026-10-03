@@ -34389,11 +34389,15 @@ class TestAC51GatewayAntiDdos:
 
         assert len(findings) == 3
         for finding in findings:
+            # The row says what was not read. It used to say no API identifies
+            # these front doors, which an API Gateway integration URI refutes.
             assert finding["Finding_Details"].endswith(
                 "Front doors other than AgentCore gateways (API Gateway, ALB, "
-                "CloudFront) are not identifiable as AI entry points by any API, "
-                "so they are not judged."
+                "CloudFront) are not judged: an API Gateway integration or an "
+                "origin can name a Bedrock endpoint or a function that calls one, "
+                "but this check reads neither them nor their web ACL associations."
             )
+            assert "not identifiable" not in finding["Finding_Details"]
 
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")

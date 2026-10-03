@@ -1170,6 +1170,13 @@ MUTATIONS = [
         "find": "        elif _kms_key_policy_allows_open_decrypt(second):\n",
         "replace": "        elif False:\n",
     },
+    {
+        "name": "AC-51 claims no API identifies other AI front doors",
+        "file": AGENTCORE,
+        "defect": "an API Gateway integration URI can name bedrock-runtime, so the row stated a ceiling that does not exist",
+        "find": '    "not judged: an API Gateway integration or an origin can name a Bedrock "\n',
+        "replace": '    "not identifiable as AI entry points by any API, so they are not judged: "\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1448,6 +1455,7 @@ GROUPS: dict[str, str] = {
     "AC-06 does not read the recording key policy": "in the AgentCore verdict legs",
     "AC-06 passes a recording key whose policy it could not read": "in the AgentCore verdict legs",
     "AC-06 credits a recording key that lets anyone decrypt": "in the AgentCore verdict legs",
+    "AC-51 claims no API identifies other AI front doors": "in the AgentCore verdict legs",
 }
 
 

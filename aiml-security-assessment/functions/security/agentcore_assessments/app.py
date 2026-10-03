@@ -33269,7 +33269,9 @@ def _web_acl_with_firewall_manager_rules(web_acl: Dict[str, Any]) -> Dict[str, A
 
 AC51_OUT_OF_SCOPE_FRONT_DOORS = (
     "Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are "
-    "not identifiable as AI entry points by any API, so they are not judged."
+    "not judged: an API Gateway integration or an origin can name a Bedrock "
+    "endpoint or a function that calls one, but this check reads neither them nor "
+    "their web ACL associations."
 )
 AC51_SHIELD_NOT_JUDGED = (
     "Shield Advanced enrollment is not judged, because shield:CreateProtection "
@@ -33319,8 +33321,8 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
     make it up. An ACL without it leaves a rate-based rule as the only volume
     control, which counts per client and misses a flood spread over many.
 
-    The population is the AgentCore gateways, the one front door an API names
-    as an AI entry point, and each is judged by the web ACL GetGateway reports.
+    The population is the AgentCore gateways, each judged by the web ACL
+    GetGateway reports. Other front doors are not read.
     The group is credited only while it runs: a Count override on the rule that
     holds it, or an inner rule overridden to Count or Allow or excluded, turns
     that mitigation off. A passing gateway's finding names the Block and
