@@ -12992,6 +12992,52 @@ def _assess_storage_layer_encryption(
     )
 
 
+def _assess_kendra_index_encryption(
+    kb_configuration: Dict[str, Any], region: str
+) -> Dict[str, str]:
+    """
+    Judge the key on the Kendra index behind a KENDRA knowledge base, read
+    from DescribeIndex ServerSideEncryptionConfiguration.KmsKeyId.
+    """
+    arn = str(
+        (kb_configuration.get("kendraKnowledgeBaseConfiguration") or {}).get(
+            "kendraIndexArn"
+        )
+        or ""
+    )
+    store_region = _arn_region(arn) or region
+    index_id = arn.split("index/", 1)[1] if "index/" in arn else ""
+    if not index_id:
+        return _store_verdict(
+            "N/A",
+            "is a KENDRA knowledge base, but it reports no readable kendraIndexArn, "
+            "so the index key could not be read.",
+        )
+    located = f"Kendra index '{arn}'"
+    try:
+        response = boto3.client(
+            "kendra", config=boto3_config, region_name=store_region
+        ).describe_index(Id=index_id)
+    except (ClientError, BotoCoreError) as error:
+        return _store_verdict(
+            "N/A",
+            f"uses {located}. Its encryption key could not be read: "
+            f"{_store_read_error(error, 'kendra:DescribeIndex', store_region)}.",
+        )
+    key = str(
+        (response.get("ServerSideEncryptionConfiguration") or {}).get("KmsKeyId") or ""
+    )
+    if not key:
+        return _store_verdict(
+            "Failed",
+            f"uses {located}. DescribeIndex reports no "
+            "ServerSideEncryptionConfiguration.KmsKeyId, so the index names no "
+            "customer managed KMS key.",
+        )
+    status, observed = _kms_key_verdict(key, store_region)
+    return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+
+
 KB_DATA_SOURCE_ENCRYPTION_FINDING = "Knowledge Base Data Source Bucket Encryption"
 
 KB_DATA_SOURCE_ENCRYPTION_RESOLUTION = (
@@ -13462,6 +13508,12 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                                 ),
                                 "resolution": COULD_NOT_ASSESS_RESOLUTION,
                             }
+                        assessment.update({"name": kb_name, "id": kb_id})
+                        kbs_store_assessments.append(assessment)
+                    elif kb_type == "KENDRA":
+                        assessment = _assess_kendra_index_encryption(
+                            kb_configuration, region
+                        )
                         assessment.update({"name": kb_name, "id": kb_id})
                         kbs_store_assessments.append(assessment)
                     else:

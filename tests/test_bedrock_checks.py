@@ -33731,6 +33731,73 @@ class TestBR20ValueDepth:
         domain.describe_domain.assert_called_once_with(DomainName="d1")
         graph.get_graph.assert_called_once_with(graphIdentifier="g-1")
 
+    KENDRA_INDEX = f"arn:aws:kendra:us-west-2:{ACCOUNT}:index/idx-1"
+
+    def _kendra_run(self, index=None, error=None, body=None):
+        kendra = MagicMock()
+        if error is not None:
+            kendra.describe_index.side_effect = error
+        else:
+            kendra.describe_index.return_value = index or {}
+        rows = self._run(
+            {
+                "kb1": body
+                or {
+                    "knowledgeBaseConfiguration": {
+                        "type": "KENDRA",
+                        "kendraKnowledgeBaseConfiguration": {
+                            "kendraIndexArn": self.KENDRA_INDEX
+                        },
+                    }
+                }
+            },
+            clients={"kendra": kendra},
+        )
+        return rows, kendra
+
+    def test_kendra_index_with_a_customer_key_passes(self):
+        """DAT-01: a KENDRA knowledge base keeps its documents in the Kendra index,
+        whose key DescribeIndex returns. Before the fix it went to manual review."""
+        rows, kendra = self._kendra_run(
+            {"ServerSideEncryptionConfiguration": {"KmsKeyId": self.CMK}}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        kendra.describe_index.assert_called_once_with(Id="idx-1")
+        assert f"Kendra index '{self.KENDRA_INDEX}'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "index",
+        [{}, {"ServerSideEncryptionConfiguration": {}}],
+    )
+    def test_kendra_index_naming_no_key_fails(self, index):
+        rows, _ = self._kendra_run(index)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "DescribeIndex reports no ServerSideEncryptionConfiguration.KmsKeyId, "
+            "so the index names no customer managed KMS key"
+        ) in rows[0]["Finding_Details"]
+
+    def test_kendra_index_with_an_aws_managed_key_fails(self):
+        rows, _ = self._kendra_run(
+            {"ServerSideEncryptionConfiguration": {"KmsKeyId": self.AWS_KEY}}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_kendra_index_unread_is_na(self):
+        rows, _ = self._kendra_run(
+            error=_client_error("AccessDeniedException", "denied", "DescribeIndex")
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "kendra:DescribeIndex" in rows[0]["Finding_Details"]
+
+    def test_kendra_without_an_index_arn_is_na(self):
+        rows, kendra = self._kendra_run(
+            body={"knowledgeBaseConfiguration": {"type": "KENDRA"}}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "no readable kendraIndexArn" in rows[0]["Finding_Details"]
+        kendra.describe_index.assert_not_called()
+
     def test_neptune_without_a_key_fails(self):
         graph = MagicMock()
         graph.get_graph.return_value = {}

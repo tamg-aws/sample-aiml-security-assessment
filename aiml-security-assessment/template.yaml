@@ -461,6 +461,14 @@ Resources:
             Action:
               - rds:DescribeDBInstances # BR-20
             Resource: !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:db:*'
+          - Sid: KendraIndexRead
+            # BR-20 reads the KMS key of the Kendra index behind a KENDRA
+            # knowledge base. The service authorization reference gives
+            # DescribeIndex the index resource type.
+            Effect: Allow
+            Action:
+              - kendra:DescribeIndex # BR-20
+            Resource: !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

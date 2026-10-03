@@ -1109,7 +1109,9 @@ AI_SUBJECT_ROWS = [
         ["BR-20", "BR-11", "BR-17", "SM-03"],
         "four checks cover the stores this control names: BR-20 the key of a managed "
         "store, an S3 Vectors store, and the OpenSearch Serverless, Aurora, OpenSearch "
-        "domain and Neptune Analytics store each knowledge base names, each judged by "
+        "domain and Neptune Analytics store each knowledge base names, and the Kendra "
+        "index of a KENDRA knowledge base (kendra:DescribeIndex KmsKeyId; none named "
+        "fails), each judged by "
         "DescribeKey as customer managed and Enabled, plus the default encryption of each "
         "data source bucket, which is where the ingested objects sit before any index "
         "exists, and each data source's transient data key; BR-11 the custom model's "
