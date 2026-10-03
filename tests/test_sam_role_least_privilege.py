@@ -330,6 +330,16 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListGatewayTargets",
         "ecr:DescribeRepositories",
         "s3:ListBucket",
+        "route53resolver:ListFirewallRuleGroupAssociations",
+        "route53resolver:ListFirewallDomainLists",
+        "route53resolver:ListFirewallRules",
+        "route53resolver:ListFirewallDomains",
+        "route53resolver:GetFirewallConfig",
+        "ec2:DescribeNatGateways",
+        "network-firewall:ListFirewalls",
+        "network-firewall:DescribeFirewall",
+        "network-firewall:DescribeFirewallPolicy",
+        "network-firewall:DescribeRuleGroup",
         "organizations:DescribePolicy",
         "bedrock-agentcore:GetGatewayTarget",
         "lambda:GetFunctionConfiguration",
@@ -1090,6 +1100,76 @@ _SAGEMAKER_MANAGED_GRANTS = [
         "Allow",
         "ecr:DescribeRepositories",
         json.dumps({"Fn::Sub": "arn:${AWS::Partition}:ecr:*:*:repository/*"}),
+    ),
+    # SM-39: the DNS Firewall and Network Firewall reads AC-49 holds for the
+    # AgentCore role, over the ECS and Lambda workload VPCs.
+    ("Allow", "route53resolver:ListFirewallRuleGroupAssociations", '"*"'),
+    ("Allow", "route53resolver:ListFirewallDomainLists", '"*"'),
+    ("Allow", "ec2:DescribeNatGateways", '"*"'),
+    ("Allow", "network-firewall:ListFirewalls", '"*"'),
+    (
+        "Allow",
+        "route53resolver:ListFirewallRules",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:route53resolver:*:*:"
+                "firewall-rule-group/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "route53resolver:ListFirewallDomains",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:route53resolver:*:*:"
+                "firewall-domain-list/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "route53resolver:GetFirewallConfig",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:route53resolver:*:"
+                "${AWS::AccountId}:firewall-config/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "network-firewall:DescribeFirewall",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:"
+                "${AWS::AccountId}:firewall/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "network-firewall:DescribeFirewallPolicy",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:*:firewall-policy/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "network-firewall:DescribeRuleGroup",
+        json.dumps(
+            [
+                {
+                    "Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:*:"
+                    "stateful-rulegroup/*"
+                },
+                {
+                    "Fn::Sub": "arn:${AWS::Partition}:network-firewall:*:*:"
+                    "stateless-rulegroup/*"
+                },
+            ],
+            sort_keys=True,
+        ),
     ),
     (
         "Allow",

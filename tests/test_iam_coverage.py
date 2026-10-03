@@ -1219,6 +1219,23 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:ListTrainingJobs"}
 # nothing at index 0.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"lambda:ListTags"}
 
+# Verified on 2026-10-03 for SM-39's Lambda VPC guardrail with one
+# SERVICE_CONTROL_POLICY ValidatePolicy run. It reported INVALID_ACTION for the
+# negative controls lambda:CreateFunctionNotReal and the plausible
+# lambda:UpdateFunctionVpcConfig, and INVALID_SERVICE_CONDITION_KEY for
+# lambda:VpcIdsNotReal and lambda:SubnetIdNotReal, and none of the names below.
+# The lambda service-reference JSON lists the three keys as ActionConditionKeys
+# of both actions, lambda:VpcIds as String and the other two as ArrayOfString.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "lambda:CreateFunction",
+    "lambda:UpdateFunctionConfiguration",
+}
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "lambda:VpcIds",
+    "lambda:SubnetIds",
+    "lambda:SecurityGroupIds",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

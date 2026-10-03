@@ -379,6 +379,25 @@ section.
   `DescribeCluster` `remoteNetworkConfig` names remote node networks fails,
   because Runtime Monitoring does not support EKS Hybrid Nodes, and an
   unread cluster description holds back `Passed`.
+- `SM-39` judges egress for each VPC an ECS `awsvpc` service or a
+  VPC-attached Lambda function runs in, with the semantics `AC-49` applies
+  to AgentCore. `Agent Workload DNS Egress Control` fails a VPC with no DNS
+  Firewall association, one whose first rule in force over every name (a
+  customer domain list holding `*`, for every query type) is an `ALLOW` or
+  `ALERT` or never comes, and one whose `FirewallFailOpen` is `ENABLED`.
+  `Agent Workload Network Firewall Egress` follows each hosting subnet's
+  internet routes, through a NAT gateway to its subnet's onward route, and
+  fails a route to an internet gateway that passes no Network Firewall, and a
+  firewall policy with no `ALLOWLIST` domain group over `TLS_SNI` and
+  `HTTP_HOST`, a stateless `aws:pass` default or rule on port 80 or 443, a
+  stateful pass rule on those ports that is not scoped by a host name, or a
+  `HOME_NET` that leaves out a hosting subnet. A new Global row, `Lambda VPC
+  Creation Guardrail`, passes only on an attached SCP that denies
+  `lambda:CreateFunction` and `lambda:UpdateFunctionConfiguration` outside
+  approved `lambda:VpcIds`, `lambda:SubnetIds` or `lambda:SecurityGroupIds`
+  values, `IfExists` variants included. A failed read holds back `Passed` in
+  all three. Earlier the AIR-SLF-RT-02 ledger row put these hosts outside its
+  population.
 - `SM-43` lists each object under an `S3Prefix` source or a multi-model
   `ModelDataUrl` prefix with `ListObjectsV2` and reads each one with
   `HeadObject`, failing an object that is not SSE-KMS under a customer
@@ -1697,6 +1716,20 @@ incomplete.
 statement, which keeps `ecr:DescribeImageSigningStatus` on this account's
 repositories. Until the stack is updated, `SM-43` endpoints with prefix
 model data or a tag-pinned image in another account's registry report N/A.
+
+**SageMaker workload egress reads.** `SageMakerAssessmentReadsPolicy`
+gains, for `SM-39`: `route53resolver:ListFirewallRuleGroupAssociations`,
+`route53resolver:ListFirewallDomainLists` and `ec2:DescribeNatGateways` on
+`'*'` (no resource type); `network-firewall:ListFirewalls` on `'*'`, as the
+AgentCore role holds it; `route53resolver:ListFirewallRules` on
+`firewall-rule-group/*` and `route53resolver:ListFirewallDomains` on
+`firewall-domain-list/*`, both in any account;
+`route53resolver:GetFirewallConfig` on this account's `firewall-config/*`;
+`network-firewall:DescribeFirewall` on this account's `firewall/*`; and
+`network-firewall:DescribeFirewallPolicy` and
+`network-firewall:DescribeRuleGroup` on `firewall-policy/*`,
+`stateful-rulegroup/*` and `stateless-rulegroup/*` in any account. Until
+the stack is updated, the `SM-39` egress rows report N/A.
 
 **SageMaker API Gateway method reads.** `SageMakerAssessmentReadsPolicy`
 gains `apigateway:GET` on

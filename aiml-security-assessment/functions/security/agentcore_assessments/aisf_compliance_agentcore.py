@@ -22,7 +22,7 @@ row's own Status column carries the verdict.
 """
 
 AISF_COMPLIANCE_MAP = {
-    "AC-01": "AISF AIR-ACR-RT-08 (1 of 2 checks) | AISF AIR-FND-NET-01 (1 of 6 checks) | AISF AIR-FND-NET-06 (1 of 3 checks) | AISF AIR-SLF-RT-02",
+    "AC-01": "AISF AIR-ACR-RT-08 (1 of 2 checks) | AISF AIR-FND-NET-01 (1 of 6 checks) | AISF AIR-FND-NET-06 (1 of 3 checks) | AISF AIR-SLF-RT-02 (1 of 2 checks)",
     "AC-02": "AISF AIR-ACR-EVAL-01 | AISF AIR-ACR-PAY-01 | AISF AIR-ACR-RT-03 (1 of 3 checks) | AISF AIR-FND-IAM-05 (1 of 4 checks) | AISF AIR-FND-IAM-09 (1 of 4 checks)",
     "AC-06": "AISF AIR-ACR-RT-09",
     "AC-07": "AISF AIR-ACR-MEM-01 (1 of 2 checks)",

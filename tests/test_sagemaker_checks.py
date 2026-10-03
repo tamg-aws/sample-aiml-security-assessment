@@ -21567,3 +21567,968 @@ class TestSM43ExecutionRoleScope:
             "read scope was not judged (IAM cache read error)"
             in (rows[0]["Finding_Details"])
         )
+
+
+LAMBDA_VPC_ACTIONS = ["lambda:CreateFunction", "lambda:UpdateFunctionConfiguration"]
+LAMBDA_VPC_DENY = _scp_deny(
+    LAMBDA_VPC_ACTIONS, "StringNotEquals", "lambda:VpcIds", ["vpc-approved"]
+)
+OPEN_LAMBDA_CACHE = _creation_cache(
+    {"Deployer": [{"Effect": "Allow", "Action": "lambda:*", "Resource": "*"}]}
+)
+
+
+class TestSM39LambdaVpcGuardrail:
+    """AIR-SLF-RT-02: an attached SCP holds Lambda functions to approved VPCs."""
+
+    _sm34 = TestSM34CreationGuardrails()
+
+    def _run(self, *statements, cache=OPEN_LAMBDA_CACHE, targets=None, **kwargs):
+        inventory = self._sm34._inventory(
+            self._sm34._scp("LambdaNetwork", list(statements)), targets=targets
+        )
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=self._sm34._member_account_clients(**kwargs),
+        ):
+            return extract_csv_data(
+                sagemaker_app.check_lambda_vpc_creation_guardrails(
+                    region="Global", scp_inventory=inventory, permission_cache=cache
+                )
+            )
+
+    def test_an_attached_vpc_id_deny_on_both_actions_passes(self):
+        rows = self._run(LAMBDA_VPC_DENY)
+        assert [(f["Check_ID"], f["Status"]) for f in rows] == [("SM-39", "Passed")]
+        row = rows[0]
+        assert row["Finding"] == "Lambda VPC Creation Guardrail"
+        assert row["Region"] == "Global"
+        assert "All 2 Lambda VPC attachment requirements" in row["Finding_Details"]
+        assert "'LambdaNetwork'" in row["Finding_Details"]
+        assert_finding_schema(row)
+
+    def test_a_deny_on_create_only_leaves_the_update_path_failed(self):
+        rows = self._run(
+            _scp_deny(
+                "lambda:CreateFunction",
+                "StringNotEquals",
+                "lambda:VpcIds",
+                ["vpc-approved"],
+            )
+        )
+        assert [f["Status"] for f in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "1 of 2 Lambda VPC attachment requirements" in details
+        assert "UpdateFunctionConfiguration on lambda:VpcIds" in details
+        assert "Role 'Deployer'" in details
+
+    def test_the_documented_null_deny_admits_any_vpc(self):
+        rows = self._run(_scp_deny(LAMBDA_VPC_ACTIONS, "Null", "lambda:VpcIds", "true"))
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "admits any value" in rows[0]["Finding_Details"]
+
+    def test_an_if_exists_variant_still_enforces(self):
+        rows = self._run(
+            _scp_deny(
+                LAMBDA_VPC_ACTIONS,
+                "StringNotEqualsIfExists",
+                "lambda:VpcIds",
+                ["vpc-approved"],
+            )
+        )
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_an_unattached_policy_does_not_count(self):
+        rows = self._run(LAMBDA_VPC_DENY, targets=[])
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "is not attached to this account" in rows[0]["Finding_Details"]
+
+    def test_subnet_ids_is_multivalued(self):
+        # Without a set operator a negated test on an ArrayOfString key is not
+        # defined, and earns no credit.
+        bare = self._run(
+            _scp_deny(
+                LAMBDA_VPC_ACTIONS, "StringNotEquals", "lambda:SubnetIds", ["subnet-1"]
+            )
+        )
+        assert [f["Status"] for f in bare] == ["N/A"]
+        assert "operator IAM does not define" in bare[0]["Finding_Details"]
+        # ForAnyValue:StringNotEquals is false on an absent key, so it needs a
+        # Null partner, and the pair enforces.
+        any_value = _scp_deny(
+            LAMBDA_VPC_ACTIONS,
+            "ForAnyValue:StringNotEquals",
+            "lambda:SubnetIds",
+            ["subnet-1"],
+        )
+        alone = self._run(any_value)
+        assert [f["Status"] for f in alone] == ["Failed"]
+        assert (
+            "does not deny a request that omits the key"
+            in (alone[0]["Finding_Details"])
+        )
+        paired = self._run(
+            any_value,
+            _scp_deny(LAMBDA_VPC_ACTIONS, "Null", "lambda:SubnetIds", "true"),
+        )
+        assert [f["Status"] for f in paired] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        ("resource", "expected"),
+        [
+            ("arn:aws:lambda:*:*:function:*", "Passed"),
+            ("arn:*:lambda:*:*:*", "Passed"),
+            ("arn:aws:lambda:*:*:function:prod-*", "N/A"),
+            ("arn:aws:sagemaker:*:*:*", "N/A"),
+        ],
+    )
+    def test_the_deny_must_cover_every_function(self, resource, expected):
+        # A Deny on named resources only is conjunctive, which SM-34 reports as
+        # not established; it is never Passed.
+        rows = self._run(
+            _scp_deny(
+                LAMBDA_VPC_ACTIONS,
+                "StringNotEquals",
+                "lambda:VpcIds",
+                ["vpc-approved"],
+                resource=resource,
+            )
+        )
+        assert [f["Status"] for f in rows] == [expected]
+
+    def test_a_sagemaker_network_deny_does_not_guard_lambda(self):
+        rows = self._run(*SCP_NETWORK_DENIES)
+        assert [f["Status"] for f in rows] == ["Failed"]
+
+    def test_unread_scps_without_a_cache_are_not_assessed(self):
+        inventory = {"items": [], "errors": [], "list_error": "AccessDeniedException"}
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=self._sm34._member_account_clients(),
+        ):
+            rows = extract_csv_data(
+                sagemaker_app.check_lambda_vpc_creation_guardrails(
+                    region="Global", scp_inventory=inventory, permission_cache=None
+                )
+            )
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert rows[0]["Finding_Details"].startswith(
+            "Creation guardrails for Lambda VPC attachment were not assessed"
+        )
+
+    def test_the_handler_runs_it_once_globally(self):
+        source = open(os.path.join(_sm_dir, "app.py"), encoding="utf-8").read()
+        handler = source[source.index("def lambda_handler") :]
+        assert handler.count("check_lambda_vpc_creation_guardrails(") == 1
+        call_at = handler.index("check_lambda_vpc_creation_guardrails(")
+        call = handler[call_at : handler.index(")", call_at)]
+        assert "region=GLOBAL_REGION_LABEL" in call
+        assert "permission_cache=permission_cache" in call
+        assert handler.index("if is_primary_region:") < call_at
+        assert call_at < handler.index("check_sagemaker_notebook_access_guardrails(")
+
+    def test_sm34_keeps_its_sagemaker_subject(self):
+        inventory = {"items": [], "errors": [], "list_error": "AccessDeniedException"}
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=self._sm34._member_account_clients(),
+        ):
+            rows = extract_csv_data(
+                sagemaker_app.check_sagemaker_creation_guardrails(
+                    region="Global", scp_inventory=inventory, permission_cache=None
+                )
+            )
+        assert rows[0]["Finding_Details"].startswith(
+            "Creation guardrails for SageMaker were not assessed"
+        )
+
+
+_EGRESS_SUBNETS = {
+    "subnet-a1": ("vpc-a", "10.0.1.0/24"),
+    "subnet-a2": ("vpc-a", "10.0.2.0/24"),
+    "subnet-b1": ("vpc-b", "10.1.1.0/24"),
+    "subnet-nat": ("vpc-a", "10.0.9.0/24"),
+}
+_ALLOW_ALL = "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/allow"
+_DNS_RULES = {
+    # A customer list holding "*" (fully qualified, as the API returns it).
+    "rslvr-frg-block": [
+        {
+            "Name": "block-rest",
+            "Priority": 200,
+            "Action": "BLOCK",
+            "FirewallDomainListId": "rslvr-fdl-star",
+        }
+    ],
+}
+
+
+def _dns_association(group_id, priority=100, status="COMPLETE"):
+    return {
+        "FirewallRuleGroupId": group_id,
+        "Name": group_id,
+        "Priority": priority,
+        "Status": status,
+    }
+
+
+def _allowlist_group(types=("TLS_SNI", "HTTP_HOST"), home=None):
+    group = {
+        "RulesSource": {
+            "RulesSourceList": {
+                "Targets": [".example.com"],
+                "TargetTypes": list(types),
+                "GeneratedRulesType": "ALLOWLIST",
+            }
+        }
+    }
+    if home is not None:
+        group["RuleVariables"] = {"IPSets": {"HOME_NET": {"Definition": home}}}
+    return group
+
+
+class TestSM39WorkloadEgress:
+    """AIR-SLF-RT-02: DNS and Network Firewall egress for ECS and Lambda VPCs."""
+
+    def _run(
+        self,
+        services=None,
+        functions=None,
+        associations=None,
+        rules=None,
+        domains=None,
+        managed_lists=(),
+        fail_open=None,
+        tables=None,
+        firewalls=None,
+        policy=None,
+        groups=None,
+        nats=None,
+        errors=None,
+        subnets=None,
+    ):
+        """associations: {vpc: [associations]}; rules: {group: [rules] or pages};
+        tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}}."""
+        services = services or {}
+        functions = functions or []
+        associations = associations or {}
+        rules = {**_DNS_RULES, **(rules or {})}
+        domains = {"rslvr-fdl-star": ["*."], **(domains or {})}
+        fail_open = fail_open or {}
+        tables = tables or {}
+        firewalls = firewalls or {}
+        groups = {_ALLOW_ALL: _allowlist_group(), **(groups or {})}
+        nats = nats or {}
+        errors = errors or {}
+        subnets = _EGRESS_SUBNETS if subnets is None else subnets
+        policy = (
+            policy
+            if policy is not None
+            else {
+                "StatelessDefaultActions": ["aws:forward_to_sfe"],
+                "StatefulRuleGroupReferences": [{"ResourceArn": _ALLOW_ALL}],
+            }
+        )
+
+        def guarded(key, value):
+            def call(**kwargs):
+                if key in errors:
+                    raise errors[key]
+                return value(**kwargs) if callable(value) else value
+
+            return call
+
+        def rule_pages(FirewallRuleGroupId):
+            found = rules[FirewallRuleGroupId]
+            if found and isinstance(found[0], list):
+                return [{"FirewallRules": page} for page in found]
+            return [{"FirewallRules": found}]
+
+        def factory(service, **kwargs):
+            client = MagicMock()
+            if service == "ecs":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_clusters": guarded(
+                            "ecs",
+                            [{"clusterArns": [f"arn:c/cluster/{c}" for c in services]}],
+                        ),
+                        "list_services": lambda cluster: [
+                            {
+                                "serviceArns": [
+                                    s["serviceName"]
+                                    for s in services[cluster.rsplit("/", 1)[-1]]
+                                ]
+                            }
+                        ],
+                    }
+                )
+
+                def describe_services(cluster, services_=None, **kw):
+                    names = kw.get("services", services_)
+                    by_name = {
+                        s["serviceName"]: s
+                        for s in services[cluster.rsplit("/", 1)[-1]]
+                    }
+                    return {"services": [by_name[n] for n in names]}
+
+                client.describe_services.side_effect = describe_services
+            elif service == "lambda":
+                client.get_paginator.side_effect = _pager(
+                    {"list_functions": guarded("lambda", [{"Functions": functions}])}
+                )
+            elif service == "ec2":
+
+                def describe_subnets(Filters):
+                    wanted = Filters[0]["Values"]
+                    return [
+                        {
+                            "Subnets": [
+                                {"SubnetId": s, "VpcId": v, "CidrBlock": c}
+                                for s, (v, c) in subnets.items()
+                                if s in wanted
+                            ]
+                        }
+                    ]
+
+                def describe_route_tables(Filters):
+                    vpc = Filters[0]["Values"][0]
+                    return [{"RouteTables": tables.get(vpc, [])}]
+
+                def describe_nat_gateways(NatGatewayIds):
+                    return [
+                        {
+                            "NatGateways": [
+                                {"NatGatewayId": n, "SubnetId": nats[n]}
+                                for n in NatGatewayIds
+                                if n in nats
+                            ]
+                        }
+                    ]
+
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "describe_subnets": guarded("subnets", describe_subnets),
+                        "describe_route_tables": guarded(
+                            "route_tables", describe_route_tables
+                        ),
+                        "describe_nat_gateways": guarded("nat", describe_nat_gateways),
+                    }
+                )
+            elif service == "route53resolver":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_firewall_rule_group_associations": guarded(
+                            "associations",
+                            lambda VpcId: [
+                                {
+                                    "FirewallRuleGroupAssociations": associations.get(
+                                        VpcId, []
+                                    )
+                                }
+                            ],
+                        ),
+                        "list_firewall_rules": guarded("rules", rule_pages),
+                        "list_firewall_domain_lists": guarded(
+                            "domain_lists",
+                            [
+                                {
+                                    "FirewallDomainLists": [
+                                        {"Id": d, "ManagedOwnerName": "Route 53"}
+                                        for d in managed_lists
+                                    ]
+                                    + [{"Id": "rslvr-fdl-star"}]
+                                }
+                            ],
+                        ),
+                        "list_firewall_domains": guarded(
+                            "domains",
+                            lambda FirewallDomainListId: [
+                                {"Domains": domains[FirewallDomainListId]}
+                            ],
+                        ),
+                    }
+                )
+                client.get_firewall_config.side_effect = guarded(
+                    "config",
+                    lambda ResourceId: {
+                        "FirewallConfig": {
+                            "FirewallFailOpen": fail_open.get(ResourceId, "DISABLED")
+                        }
+                    },
+                )
+            elif service == "network-firewall":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_firewalls": guarded(
+                            "list_firewalls",
+                            lambda VpcIds: [
+                                {
+                                    "Firewalls": [
+                                        {
+                                            "FirewallName": name,
+                                            "FirewallArn": f"arn:fw/{name}",
+                                        }
+                                        for name in firewalls.get(VpcIds[0], {})
+                                    ]
+                                }
+                            ],
+                        )
+                    }
+                )
+
+                def describe_firewall(FirewallArn):
+                    name = FirewallArn.rsplit("/", 1)[-1]
+                    endpoint = next(
+                        e
+                        for by in firewalls.values()
+                        for n, e in by.items()
+                        if n == name
+                    )
+                    return {
+                        "Firewall": {
+                            "FirewallName": name,
+                            "FirewallArn": FirewallArn,
+                            "FirewallPolicyArn": "arn:policy/p",
+                        },
+                        "FirewallStatus": {
+                            "SyncStates": {
+                                "us-east-1a": {"Attachment": {"EndpointId": endpoint}}
+                            }
+                        },
+                    }
+
+                client.describe_firewall.side_effect = guarded(
+                    "describe_firewall", describe_firewall
+                )
+                client.describe_firewall_policy.side_effect = guarded(
+                    "policy", lambda FirewallPolicyArn: {"FirewallPolicy": policy}
+                )
+                client.describe_rule_group.side_effect = guarded(
+                    "rule_group",
+                    lambda RuleGroupArn: {"RuleGroup": groups[RuleGroupArn]},
+                )
+            else:
+                raise AssertionError(f"unexpected boto3 client: {service}")
+            return client
+
+        with patch("sagemaker_app.boto3.client", side_effect=factory):
+            return extract_csv_data(
+                sagemaker_app.check_workload_egress_control(region="us-east-1")
+            )
+
+    @staticmethod
+    def _function(name, subnets):
+        return {"FunctionName": name, "VpcConfig": {"SubnetIds": list(subnets)}}
+
+    @staticmethod
+    def _service(name, subnets):
+        return {
+            "serviceName": name,
+            "networkConfiguration": {"awsvpcConfiguration": {"subnets": list(subnets)}},
+        }
+
+    @staticmethod
+    def _table(subnets, *routes, main=False):
+        associations = [{"SubnetId": s} for s in subnets]
+        if main:
+            associations.append({"Main": True})
+        return {
+            "RouteTableId": f"rtb-{'-'.join(subnets) or 'main'}",
+            "Associations": associations,
+            "Routes": [{"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local"}]
+            + [
+                {"DestinationCidrBlock": destination, **target}
+                for destination, target in routes
+            ],
+        }
+
+    @staticmethod
+    def _rows(rows, name):
+        return [r for r in rows if r["Finding"] == name]
+
+    def _dns(self, rows):
+        return self._rows(rows, "Agent Workload DNS Egress Control")
+
+    def _nfw(self, rows):
+        return self._rows(rows, "Agent Workload Network Firewall Egress")
+
+    def test_the_handler_runs_it_per_region(self):
+        source = open(os.path.join(_sm_dir, "app.py"), encoding="utf-8").read()
+        handler = source[source.index("def lambda_handler") :]
+        assert "all_findings.append(check_workload_egress_control(region=region))" in (
+            handler
+        )
+
+    def test_no_vpc_workload_reports_both_legs_not_applicable(self):
+        rows = self._run(functions=[{"FunctionName": "outside"}])
+        assert [(r["Finding"], r["Status"]) for r in rows] == [
+            ("Agent Workload DNS Egress Control", "N/A"),
+            ("Agent Workload Network Firewall Egress", "N/A"),
+        ]
+        assert all(r["Check_ID"] == "SM-39" for r in rows)
+
+    def test_each_vpc_is_judged_and_one_without_dns_firewall_fails(self):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            services={"agents": [self._service("agent-svc", ["subnet-b1"])]},
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+        )
+        dns = self._dns(rows)
+        assert [r["Status"] for r in dns] == ["Passed", "Failed"]
+        assert (
+            "VPC vpc-a, which hosts Lambda function agent-fn"
+            in (dns[0]["Finding_Details"])
+        )
+        assert "FirewallFailOpen DISABLED" in dns[0]["Finding_Details"]
+        assert (
+            "VPC vpc-b, which hosts ECS service agent-svc in agents"
+            in (dns[1]["Finding_Details"])
+        )
+        assert (
+            "no Route 53 Resolver DNS Firewall rule group"
+            in (dns[1]["Finding_Details"])
+        )
+        assert len(self._nfw(rows)) == 2
+        for row in rows:
+            assert_finding_schema(row)
+
+    def test_an_allow_over_every_name_ends_evaluation_and_fails(self):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={
+                "vpc-a": [
+                    _dns_association("rslvr-frg-allow", priority=50),
+                    _dns_association("rslvr-frg-block", priority=100),
+                ]
+            },
+            rules={
+                "rslvr-frg-allow": [
+                    {
+                        "Name": "allow-all",
+                        "Priority": 1,
+                        "Action": "ALLOW",
+                        "FirewallDomainListId": "rslvr-fdl-star",
+                    }
+                ]
+            },
+        )
+        dns = self._dns(rows)
+        assert [r["Status"] for r in dns] == ["Failed"]
+        assert "action ALLOW" in dns[0]["Finding_Details"]
+
+    def test_association_priority_orders_groups_not_list_order(self):
+        # The allow-all group is listed second but has the lower Priority.
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={
+                "vpc-a": [
+                    _dns_association("rslvr-frg-block", priority=100),
+                    _dns_association("rslvr-frg-allow", priority=50),
+                ]
+            },
+            rules={
+                "rslvr-frg-allow": [
+                    {
+                        "Name": "allow-all",
+                        "Priority": 1,
+                        "Action": "ALLOW",
+                        "FirewallDomainListId": "rslvr-fdl-star",
+                    }
+                ]
+            },
+        )
+        assert [r["Status"] for r in self._dns(rows)] == ["Failed"]
+
+    def test_a_managed_list_and_a_qtype_block_never_decide(self):
+        partial = [
+            {
+                "Name": "managed",
+                "Priority": 1,
+                "Action": "BLOCK",
+                "FirewallDomainListId": "rslvr-fdl-managed",
+            },
+            {
+                "Name": "a-only",
+                "Priority": 2,
+                "Action": "BLOCK",
+                "FirewallDomainListId": "rslvr-fdl-star",
+                "Qtype": "A",
+            },
+        ]
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={"vpc-a": [_dns_association("rslvr-frg-partial")]},
+            rules={"rslvr-frg-partial": partial},
+            managed_lists=("rslvr-fdl-managed",),
+        )
+        dns = self._dns(rows)
+        assert [r["Status"] for r in dns] == ["Failed"]
+        assert "deny-list" in dns[0]["Finding_Details"]
+        assert "for query type A only" in dns[0]["Finding_Details"]
+        # The same rules followed by the terminal block pass.
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={
+                "vpc-a": [
+                    _dns_association("rslvr-frg-partial", priority=10),
+                    _dns_association("rslvr-frg-block", priority=20),
+                ]
+            },
+            rules={"rslvr-frg-partial": partial},
+            managed_lists=("rslvr-fdl-managed",),
+        )
+        assert [r["Status"] for r in self._dns(rows)] == ["Passed"]
+
+    def test_a_list_without_star_is_not_terminal(self):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+            domains={"rslvr-fdl-star": ["evil.example.", "bad.example."]},
+        )
+        dns = self._dns(rows)
+        assert [r["Status"] for r in dns] == ["Failed"]
+        assert 'list of 2 name(s) that does not hold "*"' in dns[0]["Finding_Details"]
+
+    def test_the_deciding_rule_on_a_later_page_is_read(self):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={"vpc-a": [_dns_association("rslvr-frg-paged")]},
+            rules={
+                "rslvr-frg-paged": [
+                    [],
+                    [
+                        {
+                            "Name": "block-rest",
+                            "Priority": 9,
+                            "Action": "BLOCK",
+                            "FirewallDomainListId": "rslvr-fdl-star",
+                        }
+                    ],
+                ]
+            },
+        )
+        assert [r["Status"] for r in self._dns(rows)] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        ("value", "status"),
+        [("DISABLED", "Passed"), ("ENABLED", "Failed"), ("USE_LOCAL", "N/A")],
+    )
+    def test_fail_open_is_judged_by_value(self, value, status):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+            fail_open={"vpc-a": value},
+        )
+        assert [r["Status"] for r in self._dns(rows)] == [status]
+
+    @pytest.mark.parametrize("key", ["associations", "rules", "domains", "config"])
+    def test_a_failed_dns_read_is_never_passed(self, key):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+            errors={key: ClientError({"Error": {"Code": "AccessDenied"}}, "x")},
+        )
+        dns = self._dns(rows)
+        assert [r["Status"] for r in dns] == ["N/A"]
+        assert "AccessDenied" in dns[0]["Finding_Details"]
+
+    def _firewalled(self, **kwargs):
+        defaults = {
+            "functions": [self._function("agent-fn", ["subnet-a1", "subnet-a2"])],
+            "firewalls": {"vpc-a": {"egress-fw": "vpce-fw1"}},
+            "tables": {
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"VpcEndpointId": "vpce-fw1"}),
+                    )
+                ]
+            },
+        }
+        defaults.update(kwargs)
+        return self._nfw(self._run(**defaults))
+
+    def test_egress_through_an_allow_list_firewall_passes(self):
+        rows = self._firewalled()
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "firewall(s) egress-fw" in rows[0]["Finding_Details"]
+        assert (
+            "IP and CIDR rules beside it are not judged" in (rows[0]["Finding_Details"])
+        )
+
+    def test_one_subnet_routing_to_an_internet_gateway_fails(self):
+        rows = self._firewalled(
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1"], ("0.0.0.0/0", {"VpcEndpointId": "vpce-fw1"})
+                    ),
+                    self._table(["subnet-a2"], ("0.0.0.0/0", {"GatewayId": "igw-1"})),
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "subnet-a2 (0.0.0.0/0 to igw-1)" in rows[0]["Finding_Details"]
+        assert "through no Network Firewall" in rows[0]["Finding_Details"]
+
+    def test_a_split_default_route_to_an_internet_gateway_fails(self):
+        rows = self._firewalled(
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/1", {"GatewayId": "igw-1"}),
+                        ("128.0.0.0/1", {"VpcEndpointId": "vpce-fw1"}),
+                    )
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_a_nat_gateway_is_followed_to_its_onward_route(self):
+        through_nat = {
+            "vpc-a": [
+                self._table(
+                    ["subnet-a1", "subnet-a2"], ("0.0.0.0/0", {"NatGatewayId": "nat-1"})
+                ),
+                self._table(
+                    ["subnet-nat"], ("0.0.0.0/0", {"VpcEndpointId": "vpce-fw1"})
+                ),
+            ]
+        }
+        rows = self._firewalled(tables=through_nat, nats={"nat-1": "subnet-nat"})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        bypass = {
+            "vpc-a": [
+                through_nat["vpc-a"][0],
+                self._table(["subnet-nat"], ("0.0.0.0/0", {"GatewayId": "igw-1"})),
+            ]
+        }
+        rows = self._firewalled(tables=bypass, nats={"nat-1": "subnet-nat"})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "then to igw-1" in rows[0]["Finding_Details"]
+
+    def test_the_main_route_table_applies_to_an_unassociated_subnet(self):
+        rows = self._firewalled(
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1"], ("0.0.0.0/0", {"VpcEndpointId": "vpce-fw1"})
+                    ),
+                    self._table([], ("0.0.0.0/0", {"GatewayId": "igw-1"}), main=True),
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "subnet-a2" in rows[0]["Finding_Details"]
+
+    def test_a_transit_gateway_route_is_not_judged(self):
+        rows = self._firewalled(
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"TransitGatewayId": "tgw-1"}),
+                    )
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "tgw-1" in rows[0]["Finding_Details"]
+
+    def test_an_allow_list_without_http_host_fails(self):
+        rows = self._firewalled(groups={_ALLOW_ALL: _allowlist_group(("TLS_SNI",))})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "matches no HTTP_HOST" in rows[0]["Finding_Details"]
+
+    def test_a_policy_with_no_allow_list_fails(self):
+        rows = self._firewalled(
+            policy={"StatelessDefaultActions": ["aws:forward_to_sfe"]}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "no stateful domain list rule group of type ALLOWLIST"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_stateless_default_pass_bypasses_the_allow_list(self):
+        rows = self._firewalled(
+            policy={
+                "StatelessDefaultActions": ["aws:pass"],
+                "StatefulRuleGroupReferences": [{"ResourceArn": _ALLOW_ALL}],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "stateless default action is aws:pass" in rows[0]["Finding_Details"]
+
+    def test_a_pass_rule_on_443_before_the_allow_list_fails(self):
+        passing = "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/p"
+        named = "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/n"
+        policy = {
+            "StatelessDefaultActions": ["aws:forward_to_sfe"],
+            "StatefulRuleGroupReferences": [
+                {"ResourceArn": _ALLOW_ALL},
+                {"ResourceArn": passing},
+                {"ResourceArn": named},
+            ],
+        }
+        groups = {
+            passing: {
+                "RulesSource": {
+                    "RulesString": "pass tcp $HOME_NET any -> any 443 (sid:1;)"
+                }
+            },
+            # A pass scoped by tls.sni admits named hosts, as an allow-list does.
+            named: {
+                "RulesSource": {
+                    "RulesString": (
+                        "pass tls $HOME_NET any -> any 443 "
+                        '(tls.sni; content:"ok.example"; sid:2;)'
+                    )
+                }
+            },
+        }
+        rows = self._firewalled(policy=policy, groups=groups)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "pass tcp $HOME_NET any -> any 443" in details
+        assert "stateful-rulegroup/p" not in details
+        assert "rule group p holds the pass rule pass tcp" in details
+        assert "ok.example" not in details
+        # The named pass alone passes.
+        policy["StatefulRuleGroupReferences"] = [
+            {"ResourceArn": _ALLOW_ALL},
+            {"ResourceArn": named},
+        ]
+        rows = self._firewalled(policy=policy, groups=groups)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_home_net_must_hold_every_hosting_subnet(self):
+        rows = self._firewalled(
+            groups={_ALLOW_ALL: _allowlist_group(home=["10.0.1.0/24"])}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "subnet-a2 (10.0.2.0/24)" in rows[0]["Finding_Details"]
+        rows = self._firewalled(
+            groups={_ALLOW_ALL: _allowlist_group(home=["10.0.0.0/16"])}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_managed_stateful_group_is_not_described(self):
+        managed = (
+            "arn:aws:network-firewall:us-east-1:aws-managed:stateful-rulegroup/"
+            "AttackInfrastructureStrictOrder"
+        )
+        rows = self._firewalled(
+            policy={
+                "StatelessDefaultActions": ["aws:forward_to_sfe"],
+                "StatefulRuleGroupReferences": [
+                    {"ResourceArn": managed},
+                    {"ResourceArn": _ALLOW_ALL},
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_subnets_with_no_internet_route_are_not_passed(self):
+        rows = self._firewalled(
+            firewalls={},
+            tables={"vpc-a": [self._table(["subnet-a1", "subnet-a2"])]},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "routes no hosting subnet toward an internet address"
+            in (rows[0]["Finding_Details"])
+        )
+        # One subnet with an internet route through no firewall still fails.
+        rows = self._firewalled(
+            firewalls={},
+            tables={
+                "vpc-a": [
+                    self._table(["subnet-a1"]),
+                    self._table(["subnet-a2"], ("0.0.0.0/0", {"GatewayId": "igw-1"})),
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_no_firewall_reached_is_not_passed(self):
+        rows = self._firewalled(
+            firewalls={},
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"VpcEndpointId": "vpce-other"}),
+                    )
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @pytest.mark.parametrize(
+        "key",
+        ["list_firewalls", "describe_firewall", "route_tables", "policy", "rule_group"],
+    )
+    def test_a_failed_firewall_read_is_never_passed(self, key):
+        rows = self._firewalled(
+            errors={key: ClientError({"Error": {"Code": "AccessDenied"}}, "x")}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "AccessDenied" in rows[0]["Finding_Details"]
+
+    def test_a_failed_nat_read_is_never_passed(self):
+        rows = self._firewalled(
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"NatGatewayId": "nat-1"}),
+                    )
+                ]
+            },
+            errors={"nat": ClientError({"Error": {"Code": "AccessDenied"}}, "x")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "ec2:DescribeNatGateways" in rows[0]["Finding_Details"]
+
+    def test_an_unread_workload_list_is_named_and_the_rest_judged(self):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+            errors={"ecs": ClientError({"Error": {"Code": "AccessDenied"}}, "x")},
+        )
+        dns = self._dns(rows) + self._rows(
+            rows, "Agent Workload DNS Egress Control Incomplete"
+        )
+        assert sorted(r["Status"] for r in dns) == ["N/A", "Passed"]
+        incomplete = [r for r in rows if r["Finding"].endswith("Incomplete")]
+        assert len(incomplete) == 2
+        assert all(
+            "ecs:ListClusters (AccessDenied)" in r["Finding_Details"]
+            for r in incomplete
+        )
+
+    def test_a_subnet_the_account_does_not_hold_is_named(self):
+        rows = self._run(
+            functions=[
+                self._function("agent-fn", ["subnet-a1"]),
+                self._function("stale-fn", ["subnet-gone"]),
+            ],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+        )
+        missing = [r for r in rows if "subnet-gone" in r["Finding_Details"]]
+        assert len(missing) == 2
+        assert {r["Status"] for r in missing} == {"N/A"}
+        assert [
+            r["Status"] for r in self._dns(rows) if "vpc-a" in r["Finding_Details"]
+        ] == ["Passed"]
+
+    def test_a_subnet_read_failure_reports_not_assessed(self):
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1"])],
+            errors={"subnets": ClientError({"Error": {"Code": "AccessDenied"}}, "x")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert all("AccessDenied" in r["Finding_Details"] for r in rows)

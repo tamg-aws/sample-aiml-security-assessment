@@ -875,6 +875,9 @@ Resources:
               - inspector2:GetDelegatedAdminAccount # SM-35
               - bedrock:ListAgents # SM-11
               - bedrock-agentcore:ListGateways # SM-11
+              - route53resolver:ListFirewallRuleGroupAssociations # SM-39
+              - route53resolver:ListFirewallDomainLists # SM-39
+              - ec2:DescribeNatGateways # SM-39
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a
@@ -932,6 +935,57 @@ Resources:
             Action:
               - eks:ListFargateProfiles # SM-38
             Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+          - Sid: NetworkFirewallList
+            # SM-39 lists the Network Firewalls in each VPC an ECS service or
+            # Lambda function runs in. ListFirewalls has the firewall resource
+            # type, but a request that names no resource is authorized against
+            # '*', as the AgentCore role's AC-49 grant is.
+            Effect: Allow
+            Action:
+              - network-firewall:ListFirewalls # SM-39
+            Resource: '*'
+          - Sid: WorkloadDNSFirewallRuleRead
+            # SM-39 reads the rules of each DNS Firewall rule group associated
+            # with a workload VPC. A rule group can be shared through AWS RAM,
+            # so the account segment stays open.
+            Effect: Allow
+            Action:
+              - route53resolver:ListFirewallRules # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:*:firewall-rule-group/*'
+          - Sid: WorkloadDNSFirewallDomainRead
+            # SM-39 reads the domains of each list a rule names. A domain list
+            # can be shared through AWS RAM, so the account segment stays open.
+            Effect: Allow
+            Action:
+              - route53resolver:ListFirewallDomains # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:*:firewall-domain-list/*'
+          - Sid: WorkloadDNSFirewallConfigRead
+            # SM-39 reads whether DNS Firewall fails open for each workload VPC.
+            Effect: Allow
+            Action:
+              - route53resolver:GetFirewallConfig # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:${AWS::AccountId}:firewall-config/*'
+          - Sid: WorkloadNetworkFirewallRead
+            # SM-39 describes each firewall in a workload VPC, in this account.
+            Effect: Allow
+            Action:
+              - network-firewall:DescribeFirewall # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall/*'
+          - Sid: WorkloadFirewallPolicyRead
+            # SM-39 reads the policy each such firewall names, and the customer
+            # rule groups it references. A policy or rule group can be shared
+            # through AWS RAM, so the account segment stays open.
+            Effect: Allow
+            Action:
+              - network-firewall:DescribeFirewallPolicy # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:network-firewall:*:*:firewall-policy/*'
+          - Sid: WorkloadFirewallRuleGroupRead
+            Effect: Allow
+            Action:
+              - network-firewall:DescribeRuleGroup # SM-39
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:network-firewall:*:*:stateful-rulegroup/*'
+              - !Sub 'arn:${AWS::Partition}:network-firewall:*:*:stateless-rulegroup/*'
           - Sid: AgentCoreRuntimeNetworkRead
             # SM-37 reads each AgentCore runtime's network mode and subnets to
             # find the flow logs that cover it.

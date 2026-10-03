@@ -1476,12 +1476,22 @@ FOUNDATION_ROWS = [
         "AIR-SLF-RT-02",
         COVERED,
         None,
-        "agentcore_assessments",
-        ["AC-01"],
+        ["agentcore_assessments", "sagemaker_assessments"],
+        ["AC-01", "SM-39"],
         "The population is the account's AgentCore runtimes, code interpreters and "
-        "browsers, where AgentCore runs the customer's own agent container and tools. "
-        "Agents hosted on ECS, EKS, Lambda or EC2 are outside it, because no API field "
-        "marks a task, function or instance as agent code. AC-01 unions the outbound "
+        "browsers, where AgentCore runs the customer's own agent container and tools, "
+        "plus every ECS service and Lambda function, since no API field marks a task "
+        "or function as agent code. SM-39 fails an ECS service or Lambda function "
+        "whose security groups together allow egress to any destination. For each "
+        "VPC an ECS awsvpc service or a VPC-attached Lambda function runs in, it "
+        "fails a DNS Firewall whose first rule in force over every name is not a "
+        "BLOCK, or that fails open, and fails an internet route that reaches an "
+        "internet gateway, on its own or through a NAT gateway, without passing a "
+        "Network Firewall whose policy holds an ALLOWLIST domain rule group over "
+        "TLS_SNI and HTTP_HOST. Its Global leg requires an attached SCP that denies "
+        "lambda:CreateFunction and lambda:UpdateFunctionConfiguration outside "
+        "approved lambda:VpcIds, lambda:SubnetIds or lambda:SecurityGroupIds. "
+        "Agents hosted on EKS or EC2 get no DNS or Network Firewall leg. AC-01 unions the outbound "
         "ranges of every security group on each resource and fails one whose groups "
         "together allow 0.0.0.0/0 or ::/0, fails a tool in PUBLIC or SANDBOX network "
         "mode, fails a runtime, custom code interpreter or custom browser subnet whose "
