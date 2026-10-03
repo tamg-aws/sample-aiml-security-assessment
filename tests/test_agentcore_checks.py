@@ -30187,6 +30187,100 @@ class TestAC49DnsEgressControl:
             for call in mock_r53.list_firewall_domains.call_args_list
         ] == ["rslvr-fdl-allowed", "rslvr-fdl-catchall"]
 
+    def _versioned(self, mock_ac, versions):
+        """Serve runtime rt-1 at latest version 3 and earlier versions by subnet."""
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {
+                    "agentRuntimeId": "rt-1",
+                    "agentRuntimeName": "rt-1",
+                    "agentRuntimeVersion": "3",
+                }
+            ]
+        }
+        if isinstance(versions, Exception):
+            mock_ac.list_agent_runtime_versions.side_effect = versions
+        else:
+            mock_ac.list_agent_runtime_versions.return_value = {
+                "agentRuntimes": [
+                    {"agentRuntimeId": "rt-1", "agentRuntimeVersion": number}
+                    for number in ["3", *versions]
+                ]
+            }
+
+        def get_runtime(agentRuntimeId, agentRuntimeVersion="3"):
+            subnet = (
+                "subnet-a"
+                if agentRuntimeVersion == "3"
+                else versions[agentRuntimeVersion]
+            )
+            return {
+                "agentRuntimeVersion": agentRuntimeVersion,
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {"subnets": [subnet]},
+                },
+            }
+
+        mock_ac.get_agent_runtime.side_effect = get_runtime
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_runtime_version_in_another_vpc_is_judged(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            subnet_vpcs={"subnet-a": "vpc-a", "subnet-b": "vpc-b"},
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+        self._versioned(mock_ac, {"2": "subnet-b", "1": "subnet-a"})
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+        by_vpc = {
+            vpc: [f for f in findings if vpc in f["Finding_Details"]]
+            for vpc in ("vpc-a", "vpc-b")
+        }
+
+        assert [f["Status"] for f in by_vpc["vpc-a"]] == ["Passed"]
+        assert [f["Status"] for f in by_vpc["vpc-b"]] == ["Failed"]
+        assert "version 2" in by_vpc["vpc-b"][0]["Finding_Details"]
+        assert {
+            call.kwargs.get("agentRuntimeVersion")
+            for call in mock_ac.get_agent_runtime.call_args_list
+        } == {None, "1", "2"}
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_unlisted_runtime_versions_are_na_naming_the_action(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+        self._versioned(mock_ac, _make_client_error("AccessDeniedException", "no"))
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        # The latest version's VPC is judged, and the unread versions stand on
+        # their own N/A row, as AC-01 reports them.
+        unread = [
+            f
+            for f in findings
+            if "bedrock-agentcore:ListAgentRuntimeVersions" in f["Resolution"]
+        ]
+        assert len(unread) == 1 and unread[0]["Status"] == "N/A"
+        assert "The earlier versions of Runtime 'rt-1'" in unread[0]["Finding_Details"]
+
     @patch("agentcore_app.route53resolver_client")
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")

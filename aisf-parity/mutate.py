@@ -981,6 +981,20 @@ MUTATIONS = [
         "find": '            if detail.get("IsMultiRegionTrail") is not True and (\n                detail.get("HomeRegion") != region\n            ):\n                continue\n            status = cloudtrail_client.get_trail_status(',
         "replace": "            status = cloudtrail_client.get_trail_status(",
     },
+    {
+        "name": "AC-49 reads the latest runtime version only",
+        "file": AGENTCORE,
+        "defect": "an endpoint serving an earlier version runs in that version's subnets, so a VPC only an earlier version uses went unjudged",
+        "find": "        for number in earlier:\n            version_label = ",
+        "replace": "        for number in []:\n            version_label = ",
+    },
+    {
+        "name": "AC-49 drops an unlisted runtime version set silently",
+        "file": AGENTCORE,
+        "defect": "a denied ListAgentRuntimeVersions left the earlier versions' VPCs unread with nothing reported",
+        "find": '            errors.append(\n                (\n                    f"The earlier versions of {label}",\n',
+        "replace": '            continue\n            errors.append(\n                (\n                    f"The earlier versions of {label}",\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1232,6 +1246,8 @@ GROUPS: dict[str, str] = {
     "AC-36 ignores ExcludeManagementEventSources": "in the AgentCore verdict legs",
     "AC-36 credits a read-only advanced selector": "in the AgentCore verdict legs",
     "AC-36 credits a trail homed in another Region": "in the AgentCore verdict legs",
+    "AC-49 reads the latest runtime version only": "in the AgentCore verdict legs",
+    "AC-49 drops an unlisted runtime version set silently": "in the AgentCore verdict legs",
 }
 
 

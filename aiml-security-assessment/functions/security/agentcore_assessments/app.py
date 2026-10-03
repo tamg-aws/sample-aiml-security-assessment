@@ -30373,6 +30373,9 @@ def _agentcore_hosting_subnets(
     networkConfiguration.networkModeConfig.subnets, and the built-in tools report
     theirs under networkConfiguration.vpcConfig.subnets. Bedrock's own VpcConfig
     spelling, subnetIds, belongs to neither API and is not read here.
+    GetAgentRuntime without a version reads the latest one, and an endpoint can
+    serve an earlier version, so every version ListAgentRuntimeVersions returns
+    is read as well.
     """
     subnets: List[Tuple[str, str]] = []
     errors: List[Tuple[str, Exception, str]] = []
@@ -30403,6 +30406,51 @@ def _agentcore_hosting_subnets(
         network = detail.get("networkConfiguration") or {}
         for subnet_id in (network.get("networkModeConfig") or {}).get("subnets") or []:
             subnets.append((label, subnet_id))
+        try:
+            versions = _agentcore_list_all(
+                "list_agent_runtime_versions",
+                ["agentRuntimes"],
+                agentRuntimeId=runtime_id,
+            )
+        except Exception as error:
+            logger.warning(f"Could not list versions of runtime {runtime_id}: {error}")
+            errors.append(
+                (
+                    f"The earlier versions of {label}",
+                    error,
+                    "bedrock-agentcore:ListAgentRuntimeVersions",
+                )
+            )
+            continue
+        latest = runtime.get("agentRuntimeVersion") or detail.get("agentRuntimeVersion")
+        earlier = sorted(
+            {
+                number
+                for number in (
+                    (version or {}).get("agentRuntimeVersion") for version in versions
+                )
+                if isinstance(number, str) and number and number != latest
+            }
+        )
+        for number in earlier:
+            version_label = f"Runtime '{name}' version {number} ({runtime_id})"
+            try:
+                version_detail = agentcore_client.get_agent_runtime(
+                    agentRuntimeId=runtime_id, agentRuntimeVersion=number
+                )
+            except Exception as error:
+                logger.warning(
+                    f"Could not read runtime {runtime_id} version {number}: {error}"
+                )
+                errors.append(
+                    (version_label, error, "bedrock-agentcore:GetAgentRuntime")
+                )
+                continue
+            network = version_detail.get("networkConfiguration") or {}
+            for subnet_id in (network.get("networkModeConfig") or {}).get(
+                "subnets"
+            ) or []:
+                subnets.append((version_label, subnet_id))
 
     try:
         tool_details, tool_errors = _agentcore_tool_details(browser_inventory)

@@ -1449,7 +1449,8 @@ AI_SUBJECT_ROWS = [
         "outside a pinned subnet and security group list. AC-15 requires each custom "
         "code interpreter to run in VPC mode with subnets and security groups. AC-49 "
         "asserts egress by destination "
-        "name on each VPC that hosts an AgentCore runtime, browser or code interpreter: it "
+        "name on each VPC that hosts an AgentCore runtime, at any version "
+        "ListAgentRuntimeVersions returns, browser or code interpreter: it "
         "walks the associated DNS Firewall rule groups in ascending association Priority "
         "and the enforcing rules in each in ascending Priority, as DNS Firewall evaluates "
         'them, and judges the first rule whose customer domain list holds "*", because the '
@@ -1525,7 +1526,8 @@ FOUNDATION_ROWS = [
         "agentcore_assessments",
         ["AC-49"],
         "AC-49 asserts an egress allow-list by destination name on each VPC that "
-        "hosts an AgentCore runtime, browser or code interpreter. It passes only "
+        "hosts an AgentCore runtime, at any version ListAgentRuntimeVersions "
+        "returns, browser or code interpreter. It passes only "
         'when the first DNS Firewall rule that matches "*" is a BLOCK, which is '
         "the walled garden pattern: the domains allowed by earlier rules are the "
         "allow-list and every other name is refused. It fails an ALLOW or ALERT "
