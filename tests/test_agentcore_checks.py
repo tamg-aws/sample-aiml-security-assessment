@@ -7744,6 +7744,106 @@ class TestAC18FieldsThatKeepEveryEvent:
         assert f"only where {field} match" in memory["Finding_Details"]
 
 
+_MEMORY_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/"
+
+
+class TestAC18MemoryArnScope:
+    """AIR-ACR-MEM-12 recommends scoping the memory data-event selector to the
+    memory ARNs, so a selector naming every listed memory covers them."""
+
+    @staticmethod
+    def _run(mock_ct, mock_ac, arn_field, extra=(), logging=True):
+        selector = _data_event_selector("AWS::BedrockAgentCore::Memory")
+        selector["FieldSelectors"].extend([{"Field": "resources.ARN", **arn_field}])
+        selector["FieldSelectors"].extend(extra)
+        mock_ct.list_trails.return_value = {"Trails": [_trail("t1")]}
+        mock_ct.get_event_selectors.return_value = {
+            "AdvancedEventSelectors": [selector]
+        }
+        _logging_trail(mock_ct, logging=logging)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-1", "arn": f"{_MEMORY_ARN}mem-1"},
+                {"id": "mem-2", "arn": f"{_MEMORY_ARN}mem-2"},
+            ]
+        }
+        finding = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+        assert_finding_schema(finding)
+        return finding
+
+    @pytest.mark.parametrize(
+        "arn_field",
+        [
+            {"Equals": [f"{_MEMORY_ARN}mem-2", f"{_MEMORY_ARN}mem-1"]},
+            {"StartsWith": [f"{_MEMORY_ARN}mem-"]},
+        ],
+        ids=["equals-each", "starts-with-each"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_selector_naming_every_memory_passes(self, mock_ct, mock_ac, arn_field):
+        memory = self._run(mock_ct, mock_ac, arn_field)
+
+        assert memory["Status"] == "Passed"
+        assert (
+            "selected by resources.ARN naming each of the 2"
+            in (memory["Finding_Details"])
+        )
+        assert (
+            "one created later is recorded only once the selector names it"
+            in (memory["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "arn_field",
+        [
+            {"Equals": [f"{_MEMORY_ARN}mem-1"]},
+            {"StartsWith": [f"{_MEMORY_ARN}mem-1"]},
+            {
+                "Equals": [f"{_MEMORY_ARN}mem-1", f"{_MEMORY_ARN}mem-2"],
+                "NotEquals": [f"{_MEMORY_ARN}mem-2"],
+            },
+            {"EndsWith": ["mem-1", "mem-2"]},
+        ],
+        ids=["equals-one", "starts-with-one", "mixed-operators", "ends-with"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_selector_missing_a_memory_fails(self, mock_ct, mock_ac, arn_field):
+        memory = self._run(mock_ct, mock_ac, arn_field)
+
+        assert memory["Status"] == "Failed"
+        assert "only where resources.ARN match" in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_another_narrowing_field_beside_the_arns_fails(self, mock_ct, mock_ac):
+        memory = self._run(
+            mock_ct,
+            mock_ac,
+            {"Equals": [f"{_MEMORY_ARN}mem-1", f"{_MEMORY_ARN}mem-2"]},
+            extra=[{"Field": "readOnly", "Equals": ["true"]}],
+        )
+
+        assert memory["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_stopped_trail_naming_every_memory_fails(self, mock_ct, mock_ac):
+        memory = self._run(
+            mock_ct,
+            mock_ac,
+            {"Equals": [f"{_MEMORY_ARN}mem-1", f"{_MEMORY_ARN}mem-2"]},
+            logging=False,
+        )
+
+        assert memory["Status"] == "Failed"
+        assert "is not logging" in memory["Finding_Details"]
+
+
 class TestAC18WholePopulation:
     """AC-18: every in-use type, every family, and only trails that record here."""
 

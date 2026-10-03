@@ -862,6 +862,20 @@ MUTATIONS = [
         "find": '    if operator.startswith("forallvalues:") or operator.endswith("ifexists"):\n        return False\n',
         "replace": '    if operator.startswith("forallvalues:"):\n        return False\n    operator = operator.removesuffix("ifexists")\n',
     },
+    {
+        "name": "AC-18 fails a memory selector that names every memory by ARN",
+        "file": AGENTCORE,
+        "defect": "the memory audit guidance scopes the data-event selector to the memory ARNs, and reading any resources.ARN value narrower than the region prefix as narrowing failed a trail that records every memory listed",
+        "find": '        if family["key"] == "memory":\n            for resource_type in list(missing):\n',
+        "replace": "        if False:\n            for resource_type in list(missing):\n",
+    },
+    {
+        "name": "AC-18 credits an ARN selector that names one of two memories",
+        "file": AGENTCORE,
+        "defect": "a selector naming mem-1 records nothing for mem-2, so crediting it when any memory matches passes a memory whose reads and writes are not in the audit trail",
+        "find": "                if arns and len(matched) == len(arns) and all(matched.values()):\n",
+        "replace": "                if arns and any(matched.values()):\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1096,6 +1110,8 @@ GROUPS: dict[str, str] = {
     "AC-06 credits an IfExists aws:PrincipalAccount binding": "in the AgentCore verdict legs",
     "AC-06 credits an IfExists aws:SourceAccount binding": "in the AgentCore verdict legs",
     "AC-06 credits an IfExists aws:PrincipalOrgID binding": "in the AgentCore verdict legs",
+    "AC-18 fails a memory selector that names every memory by ARN": "in the AgentCore verdict legs",
+    "AC-18 credits an ARN selector that names one of two memories": "in the AgentCore verdict legs",
 }
 
 

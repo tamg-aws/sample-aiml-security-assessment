@@ -1023,10 +1023,15 @@ AI_SUBJECT_ROWS = [
         ["AC-18", "AC-19"],
         "AC-18 requires a CloudTrail advanced event selector that logs data events for "
         "AWS::BedrockAgentCore::Memory whenever the region holds a memory resource. A "
-        "selector narrowed by readOnly, eventName, resources.ARN or any other field "
-        "does not count, nor does a trail that is not logging or that neither spans "
-        "all Regions nor is homed in the scanned one. An unreadable trail status is "
-        "N/A. AC-19 requires each memory's APPLICATION_LOGS delivery, which carries "
+        "selector narrowed only by one resources.ARN Equals or StartsWith operator "
+        "counts when its values name every memory ListMemories returns, which is the "
+        "scoping the control recommends, and the row says a memory created later is "
+        "recorded only once named. A selector narrowed by readOnly, eventName or any "
+        "other field does not count, nor does a trail that is not logging or that "
+        "neither spans all Regions nor is homed in the scanned one. An unreadable "
+        "trail status is N/A. CloudTrail Lake event data stores are not read, so "
+        "Memory data events captured only in Lake read as absent. AC-19 requires "
+        "each memory's APPLICATION_LOGS delivery, which carries "
         "the extraction and consolidation logs of long-term memory processing",
         [],
         4,

@@ -11438,6 +11438,39 @@ def _advanced_selector_data_resource_types(
     return resource_types, sorted(set(narrowing))
 
 
+def _selector_arn_scope(
+    selector: Dict[str, Any], region: str
+) -> Optional[Tuple[str, List[str]]]:
+    """Return the resources.ARN operator and values that alone narrow a selector.
+
+    A selector that names AgentCore resources by ARN is the scoping the memory
+    audit guidance recommends, so it is read as covering the resources it
+    names. It is credited only when one resources.ARN field selector drops
+    events, with a single Equals or StartsWith operator, and no other field
+    narrows. Returns None for any other shape.
+    """
+    narrowing = [
+        field_selector
+        for field_selector in selector.get("FieldSelectors") or []
+        if isinstance(field_selector, dict)
+        and field_selector.get("Field") not in DATA_EVENT_SELECTOR_SCOPE_FIELDS
+        and not _field_selector_keeps_every_agentcore_event(field_selector, region)
+    ]
+    if len(narrowing) != 1 or narrowing[0].get("Field") != "resources.ARN":
+        return None
+    operators = {
+        name: [str(value) for value in values]
+        for name, values in narrowing[0].items()
+        if name != "Field" and isinstance(values, list) and values
+    }
+    if len(operators) != 1:
+        return None
+    operator, values = next(iter(operators.items()))
+    if operator not in ("Equals", "StartsWith"):
+        return None
+    return operator, values
+
+
 def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
     """Collect the AgentCore resource types each logging trail selects whole.
 
@@ -11447,13 +11480,15 @@ def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
 
     Returns `whole` (type to the trails selecting every one of its data events),
     `narrowed` (type to notes naming the trail and the fields that drop some of
-    its events), `excluded` (notes on trails that select a type but do not
-    count) and `unreadable` (trails whose selectors, detail or status could not
-    be read), so a type no counted trail selects can be reported as unknown
-    instead of uncovered when the evidence is incomplete.
+    its events), `arn_scoped` (type to (trail, operator, values) for each
+    selector narrowed only by resources.ARN), `excluded` (notes on trails that
+    select a type but do not count) and `unreadable` (trails whose selectors,
+    detail or status could not be read), so a type no counted trail selects can
+    be reported as unknown instead of uncovered when the evidence is incomplete.
     """
     whole: Dict[str, List[str]] = {}
     narrowed: Dict[str, List[str]] = {}
+    arn_scoped: Dict[str, List[Tuple[str, str, List[str]]]] = {}
     excluded: List[str] = []
     unreadable: List[str] = []
 
@@ -11491,15 +11526,19 @@ def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
 
         trail_whole: Set[str] = set()
         trail_narrowed: Dict[str, Set[str]] = {}
+        trail_scoped: Dict[str, List[Tuple[str, List[str]]]] = {}
         for selector in advanced_selectors:
             if not isinstance(selector, dict):
                 continue
             types, narrowing = _advanced_selector_data_resource_types(selector, region)
+            scope = _selector_arn_scope(selector, region) if narrowing else None
             for resource_type in types:
                 if not resource_type.startswith("AWS::BedrockAgentCore::"):
                     continue
                 if narrowing:
                     trail_narrowed.setdefault(resource_type, set()).update(narrowing)
+                    if scope:
+                        trail_scoped.setdefault(resource_type, []).append(scope)
                 else:
                     trail_whole.add(resource_type)
         if not trail_whole and not trail_narrowed:
@@ -11540,10 +11579,15 @@ def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
                 f"trail {trail_identifier} selects {resource_type} only where "
                 f"{', '.join(sorted(fields))} match"
             )
+        for resource_type, scopes in trail_scoped.items():
+            arn_scoped.setdefault(resource_type, []).extend(
+                (trail_identifier, operator, values) for operator, values in scopes
+            )
 
     return {
         "whole": whole,
         "narrowed": narrowed,
+        "arn_scoped": arn_scoped,
         "excluded": excluded,
         "unreadable": unreadable,
     }
@@ -11684,14 +11728,69 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
         present = [t for t in resource_types if type_counts.get(t)]
         missing = [t for t in present if not coverage["whole"].get(t)]
 
+        # A memory selector naming each memory by ARN is the scoping the memory
+        # audit guidance recommends. It covers the memories listed now, and the
+        # row says a memory created later is recorded only once it is named.
+        by_arn: Dict[str, List[str]] = {}
+        if family["key"] == "memory":
+            for resource_type in list(missing):
+                scopes = coverage.get("arn_scoped", {}).get(resource_type) or []
+                if not scopes:
+                    continue
+                try:
+                    arns = [
+                        str(item.get("arn") or "")
+                        for item in _agentcore_list_all("list_memories", ["memories"])
+                    ]
+                except Exception:
+                    continue
+                matched = {
+                    arn: sorted(
+                        trail
+                        for trail, operator, values in scopes
+                        if arn in values
+                        or (
+                            operator == "StartsWith"
+                            and any(arn.startswith(value) for value in values)
+                        )
+                    )
+                    for arn in arns
+                    if arn
+                }
+                if arns and len(matched) == len(arns) and all(matched.values()):
+                    by_arn[resource_type] = sorted(
+                        {trail for trails in matched.values() for trail in trails}
+                    )
+                    missing.remove(resource_type)
+
         if not missing:
-            trails = sorted({trail for t in present for trail in coverage["whole"][t]})
+            trails = sorted(
+                {
+                    trail
+                    for t in present
+                    for trail in coverage["whole"].get(t) or by_arn.get(t) or []
+                }
+            )
+            arn_text = (
+                f" {', '.join(sorted(by_arn))} is selected by resources.ARN naming "
+                f"each of the {resource_count} {label.lower()} resource(s) listed "
+                "here; one created later is recorded only once the selector "
+                "names it."
+                if by_arn
+                else ""
+            )
             findings.append(
                 create_finding(
                     check_id="AC-18",
                     finding_name="AgentCore CloudTrail Data Event Coverage",
                     finding_details=(
                         f"{resource_count} AgentCore {label} resource(s) are "
+                        f"covered: every type in use here, {', '.join(present)}, "
+                        "is selected for data events by a trail that is logging "
+                        f"and records this region: {', '.join(trails)}."
+                        f"{arn_text}"
+                        if by_arn
+                        else f"{resource_count} AgentCore {label} resource(s) are "
                         f"covered: every type in use here, {', '.join(present)}, "
                         "is selected for data events with no narrowing field by "
                         "a trail that is logging and records this region: "
