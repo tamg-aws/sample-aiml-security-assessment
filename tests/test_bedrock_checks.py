@@ -27632,6 +27632,7 @@ class TestBR51AIUserConsoleMFA:
         managed=None,
         customer=None,
         aws_policies=None,
+        role_trust=None,
     ):
         """`managed` maps a permission set to the AWS managed policy ARNs
         ListManagedPoliciesInPermissionSet returns (a dict of pages keyed by
@@ -27726,6 +27727,9 @@ class TestBR51AIUserConsoleMFA:
 
         iam.get_login_profile.side_effect = get_login_profile
         iam.list_mfa_devices.side_effect = list_mfa_devices
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": (role_trust or {})[RoleName]}
+        }
 
         def client(service, **kwargs):
             self.clients.append((service, kwargs.get("region_name")))
@@ -27831,6 +27835,65 @@ class TestBR51AIUserConsoleMFA:
             in rows[0]["Finding_Details"]
         )
         assert self.iam.list_instances.call_count == 2
+
+    @pytest.mark.parametrize(
+        "role, provider, action",
+        [
+            (
+                "AWSReservedSSO_AIAdmin_0123456789abcdef",
+                "arn:aws:iam::123456789012:saml-provider/AWSSSO_0123_DO_NOT_DELETE",
+                "sts:AssumeRoleWithSAML",
+            ),
+            (
+                "OktaAIAdmin",
+                "arn:aws:iam::123456789012:saml-provider/Okta",
+                ["sts:AssumeRoleWithSAML", "sts:TagSession"],
+            ),
+        ],
+    )
+    def test_br51_a_federated_ai_write_role_stops_passed(self, role, provider, action):
+        """With no instance visible, as in a member account, a federated AI
+        write role is still people signing in, and no row judges their MFA."""
+        cache = _ai_user_cache()
+        cache["role_permissions"][role] = _identity(
+            attached=[
+                _customer_policy(
+                    "Write", {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
+                )
+            ]
+        )
+        _, rows = self._run(
+            cache,
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            regions=[
+                {
+                    "Regions": [
+                        {
+                            "RegionName": "us-east-1",
+                            "RegionOptStatus": "ENABLED_BY_DEFAULT",
+                        }
+                    ]
+                }
+            ],
+            role_trust={
+                role: _policy(
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"Federated": provider},
+                        "Action": action,
+                    }
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert f"{role} ({provider})" in details
+        assert "0 of the 1 in-scope IAM role(s)" in details
+        assert (
+            "1 in-scope IAM role(s) are assumed through a federated identity provider"
+            in details
+        )
 
     def test_br51_an_unread_region_is_not_passed(self):
         _, rows = self._run(

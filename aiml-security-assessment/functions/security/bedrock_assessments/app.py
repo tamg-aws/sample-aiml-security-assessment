@@ -25544,6 +25544,24 @@ def _trust_statements_without_mfa(trust_policy: Any) -> List[str]:
     return open_statements
 
 
+def _trust_federated_providers(trust_policy: Any) -> List[str]:
+    """
+    Return the federated identity providers an Allow in a role trust policy
+    names. The people who sign in through them, an IAM Identity Center
+    AWSReservedSSO_ role included, are held to MFA by the provider.
+    """
+    providers = []
+    for statement in _policy_statements(trust_policy):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        principal = statement.get("Principal")
+        if isinstance(principal, dict):
+            providers.extend(
+                str(value) for value in _as_list(principal.get("Federated"))
+            )
+    return sorted(set(providers))
+
+
 def check_bedrock_ai_user_console_mfa(
     permission_cache, region: str = "", identity_center_region: str = ""
 ) -> Dict[str, Any]:
@@ -25774,6 +25792,7 @@ def check_bedrock_ai_user_console_mfa(
                 no_console.append(user_name)
 
         trusted = []
+        federated = []
         for role_name, evidence in sorted(roles["users"].items()):
             try:
                 role = iam_client.get_role(RoleName=role_name)["Role"]
@@ -25820,14 +25839,35 @@ def check_bedrock_ai_user_console_mfa(
                     )
                 )
             else:
-                trusted.append(role_name)
+                providers = _trust_federated_providers(
+                    role.get("AssumeRolePolicyDocument")
+                )
+                if providers:
+                    federated.append(
+                        "{} ({})".format(role_name, ", ".join(providers[:3]))
+                    )
+                else:
+                    trusted.append(role_name)
 
-        if protected or no_console or deny_protected or trusted:
+        if protected or no_console or deny_protected or trusted or federated:
             sso_note, status, severity = (
                 identity_center["note"],
                 identity_center["status"],
                 identity_center["severity"],
             )
+            if federated:
+                # A member account lists no Identity Center instance, yet its
+                # AWSReservedSSO_ roles are people signing in.
+                sso_note = (
+                    "{} in-scope IAM role(s) are assumed through a federated "
+                    "identity provider ({}), and whether that provider required "
+                    "MFA is not read, so the people who sign in through them are "
+                    "judged by no row. {}".format(
+                        len(federated), "; ".join(federated[:10]), sso_note
+                    )
+                )
+                if status == "Passed":
+                    status, severity = "N/A", "Informational"
             findings["csv_data"].append(
                 row(
                     "{} of the {} in-scope IAM user(s) have an MFA device ({}) and "
