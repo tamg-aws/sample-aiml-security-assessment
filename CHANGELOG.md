@@ -362,6 +362,13 @@ section.
   model and fails a credential-named plaintext variable, as it already did
   for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
   or `sagemaker:DescribeModel` holds back the propagation `Passed`.
+- `SM-37` adds a `VPC DNS Resolver Visible to GuardDuty` row. It reads every
+  VPC's DHCP option set and fails a VPC whose `domain-name-servers` names a
+  server other than the Amazon DNS server (`AmazonProvidedDNS`,
+  `169.254.169.253`, `fd00:ec2::253` or the VPC base plus two), because
+  GuardDuty analyzes only DNS queries that reach the AWS-provided resolver.
+  An option set that names no server is not judged, and an unread VPC or
+  option set holds back `Passed`.
 - SageMaker rows that claimed more than they read now state what they read:
   - `SM-22` no longer says approval workflows "appear to be properly
     configured". It names the counts it read and says they do not show
@@ -1585,6 +1592,11 @@ section.
 service authorization reference, and all are read-only. Until the stack is
 updated, the `SM-41` audit row reads as incomplete, and so does an `SM-23`
 schedule whose latest execution is still running.
+
+**SageMaker VPC and DHCP option reads.** `SageMakerAssessmentReadsPolicy`
+gains `ec2:DescribeVpcs` and `ec2:DescribeDhcpOptions` on `'*'` (`SM-37`);
+neither action has a resource type in the service authorization reference.
+Until the stack is updated, the new `SM-37` row reads as incomplete.
 
 **SageMaker EKS Fargate profile read.** `SageMakerAssessmentReadsPolicy`
 gains `eks:ListFargateProfiles` on

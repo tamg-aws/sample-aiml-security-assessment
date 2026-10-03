@@ -1632,7 +1632,11 @@ FOUNDATION_ROWS = [
         "which does not say whether network behavior is analysed. SM-37 reads the "
         "detector's Features and passes when LAMBDA_NETWORK_LOGS is ENABLED, and "
         "fails otherwise. A Region with no detector is Not Applicable to SM-37, "
-        "since SM-04 already fails it",
+        "since SM-04 already fails it. SM-37 also fails a SageMaker endpoint whose "
+        "subnets no ACTIVE flow log into CloudWatch Logs covers, or whose flow log "
+        "group has no metric filter feeding an actioned alarm that can fire, and "
+        "fails a VPC whose DHCP option set names a domain name server other than "
+        "the Amazon DNS server, whose queries GuardDuty does not analyze",
         [],
         6,
     ),

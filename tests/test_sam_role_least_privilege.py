@@ -315,6 +315,8 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeModelExplainabilityJobDefinition",
         "sagemaker:DescribeModelQualityJobDefinition",
         "sagemaker:ListMonitoringExecutions",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeDhcpOptions",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -947,6 +949,8 @@ _SAGEMAKER_MANAGED_GRANTS = [
     ("Allow", "iot:ListAuditTasks", '"*"'),
     ("Allow", "iot:DescribeAuditTask", '"*"'),
     ("Allow", "sagemaker:ListMonitoringExecutions", '"*"'),
+    ("Allow", "ec2:DescribeVpcs", '"*"'),
+    ("Allow", "ec2:DescribeDhcpOptions", '"*"'),
     (
         "Allow",
         "ec2:GetManagedPrefixListEntries",

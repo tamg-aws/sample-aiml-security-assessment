@@ -124,8 +124,6 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
 # Reads the SageMaker legs call that are not approved. Each leg reports "not
 # read" on AccessDenied, so none may be granted.
 UNAPPROVED_SAGEMAKER_READS = [
-    "ec2:DescribeVpcs",
-    "ec2:DescribeDhcpOptions",
     "guardduty:ListMembers",
     "organizations:ListAccounts",
     "s3:GetObjectAttributes",

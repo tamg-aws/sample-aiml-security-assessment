@@ -869,6 +869,8 @@ Resources:
               - iot:ListAuditTasks # SM-41
               - iot:DescribeAuditTask # SM-41
               - sagemaker:ListMonitoringExecutions # SM-23
+              - ec2:DescribeVpcs # SM-37
+              - ec2:DescribeDhcpOptions # SM-37
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a

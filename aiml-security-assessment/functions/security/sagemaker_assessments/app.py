@@ -14891,6 +14891,174 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
     return findings
 
 
+VPC_DNS_RESOLVER_FINDING = "VPC DNS Resolver Visible to GuardDuty"
+VPC_DNS_RESOLVER_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_data-sources.html"
+)
+# The Amazon DNS server answers at these addresses and at the VPC IPv4 base
+# plus two, so a DHCP option set that names it by address still uses it.
+AMAZON_DNS_SERVER_VALUES = ("AmazonProvidedDNS", "169.254.169.253", "fd00:ec2::253")
+
+
+def check_vpc_dns_resolver_visibility(region: str = "") -> Dict[str, Any]:
+    """
+    SM-37: Verify every VPC resolves DNS through the Amazon DNS server.
+
+    GuardDuty analyzes DNS query logs only for queries that reach the
+    AWS-provided resolver, so a VPC whose DHCP option set names any other
+    domain name server sends DNS that GuardDuty never sees.
+    """
+    findings = {"csv_data": []}
+    unread = []
+    vpcs = []
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        for page in ec2_client.get_paginator("describe_vpcs").paginate():
+            vpcs.extend(page.get("Vpcs", []))
+    except Exception as error:
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-37",
+                VPC_DNS_RESOLVER_FINDING,
+                [f"ec2:DescribeVpcs ({get_assessment_error_label(error)})"],
+                "no VPC was read.",
+                VPC_DNS_RESOLVER_REFERENCE,
+                region,
+            )
+        )
+        return findings
+    option_ids = sorted(
+        {
+            v.get("DhcpOptionsId")
+            for v in vpcs
+            if v.get("DhcpOptionsId") not in (None, "default")
+        }
+    )
+    servers = {}
+    if option_ids:
+        try:
+            for page in ec2_client.get_paginator("describe_dhcp_options").paginate(
+                DhcpOptionsIds=option_ids
+            ):
+                for options in page.get("DhcpOptions", []):
+                    servers[options.get("DhcpOptionsId")] = [
+                        str(value.get("Value"))
+                        for entry in options.get("DhcpConfigurations") or []
+                        if entry.get("Key") == "domain-name-servers"
+                        for value in entry.get("Values") or []
+                    ]
+        except Exception as error:
+            unread.append(
+                f"ec2:DescribeDhcpOptions ({get_assessment_error_label(error)})"
+            )
+            servers = None
+
+    problems, unjudged, passed = [], [], []
+    for vpc in vpcs:
+        vpc_id, option_id = vpc.get("VpcId"), vpc.get("DhcpOptionsId")
+        if option_id in (None, "default"):
+            passed.append(f"{vpc_id} (no DHCP option set)")
+            continue
+        if servers is None:
+            continue
+        if option_id not in servers:
+            unread.append(f"DHCP option set {option_id} of {vpc_id}")
+            continue
+        if not servers[option_id]:
+            unjudged.append(f"{vpc_id} ({option_id})")
+            continue
+        amazon = set(AMAZON_DNS_SERVER_VALUES)
+        for block in vpc.get("CidrBlockAssociationSet") or [
+            {"CidrBlock": vpc.get("CidrBlock")}
+        ]:
+            try:
+                network = ipaddress.ip_network(block.get("CidrBlock"), strict=False)
+            except (TypeError, ValueError):
+                continue
+            amazon.add(str(network.network_address + 2))
+        other = [server for server in servers[option_id] if server not in amazon]
+        if other:
+            problems.append(
+                f"VPC {vpc_id} uses DHCP option set {option_id}, whose domain name "
+                f"servers include {', '.join(other[:4])}, which is not the Amazon "
+                "DNS server. GuardDuty analyzes DNS query logs only for queries "
+                "that reach the AWS-provided resolver, so DNS sent to these "
+                "servers is not analyzed."
+            )
+        else:
+            passed.append(f"{vpc_id} ({option_id})")
+
+    findings["csv_data"].extend(
+        _capped_problem_rows(
+            "SM-37",
+            VPC_DNS_RESOLVER_FINDING,
+            problems,
+            "Set domain-name-servers to AmazonProvidedDNS in the VPC's DHCP option "
+            "set, and forward on-premises names through Route 53 Resolver "
+            "outbound endpoints and rules in place of custom DNS servers.",
+            VPC_DNS_RESOLVER_REFERENCE,
+            "Medium",
+            region,
+            "VPCs with a DNS resolver GuardDuty does not see",
+        )
+    )
+    if unjudged:
+        findings["csv_data"].append(
+            create_finding(
+                check_id="SM-37",
+                finding_name=f"{VPC_DNS_RESOLVER_FINDING} Not Judged",
+                finding_details=(
+                    f"{len(unjudged)} VPC(s) use a DHCP option set that names no "
+                    f"domain name servers: {', '.join(unjudged[:10])}. Which DNS "
+                    "server their instances use is not stated by the option set, "
+                    "so whether GuardDuty sees their DNS queries was not judged."
+                ),
+                resolution=(
+                    "Set domain-name-servers to AmazonProvidedDNS in the DHCP "
+                    "option set."
+                ),
+                reference=VPC_DNS_RESOLVER_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    if unread:
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-37",
+                VPC_DNS_RESOLVER_FINDING,
+                unread,
+                f"{len(passed)} VPC(s) use the Amazon DNS server and "
+                f"{len(problems)} do not.",
+                VPC_DNS_RESOLVER_REFERENCE,
+                region,
+            )
+        )
+    elif not problems and not unjudged:
+        findings["csv_data"].append(
+            create_finding(
+                check_id="SM-37",
+                finding_name=VPC_DNS_RESOLVER_FINDING,
+                finding_details=(
+                    f"All {len(passed)} VPC(s) resolve DNS through the Amazon DNS "
+                    f"server: {', '.join(passed[:10])}. A VPC with no DHCP option "
+                    "set gets the Amazon DNS server at 169.254.169.253 on Nitro "
+                    "instances and no DNS server on Xen instances. Whether "
+                    "GuardDuty is enabled is reported by SM-04."
+                    if passed
+                    else "No VPCs were found in this region."
+                ),
+                resolution="No action required",
+                reference=VPC_DNS_RESOLVER_REFERENCE,
+                severity="Medium" if passed else "Informational",
+                status="Passed" if passed else "N/A",
+                region=region,
+            )
+        )
+    return findings
+
+
 MODEL_ARTIFACT_INTEGRITY_FINDING = "SageMaker Model Artifact Integrity"
 MODEL_ARTIFACT_INTEGRITY_REFERENCE = (
     "https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-tag-mutability.html"
@@ -18950,6 +19118,9 @@ def lambda_handler(event, context):
 
         logger.info("Running SageMaker endpoint flow log alerting check (SM-37)")
         all_findings.append(check_sagemaker_endpoint_flow_log_alerting(region=region))
+
+        logger.info("Running VPC DNS resolver visibility check (SM-37)")
+        all_findings.append(check_vpc_dns_resolver_visibility(region=region))
 
         logger.info("Running SageMaker model artifact integrity check (SM-43)")
         all_findings.append(check_sagemaker_model_artifact_integrity(region=region))

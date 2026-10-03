@@ -9554,6 +9554,144 @@ class TestSM37EndpointFlowLogAlerting:
         assert "can never fire" in rows[0]["Finding_Details"]
 
 
+class TestSM37VpcDnsResolver:
+    """AIR-FND-NET-07: GuardDuty sees DNS only through the Amazon DNS server."""
+
+    check = staticmethod(sagemaker_app.check_vpc_dns_resolver_visibility)
+
+    @staticmethod
+    def _vpc(vpc_id, option_id, cidr="10.0.0.0/16"):
+        return {
+            "VpcId": vpc_id,
+            "DhcpOptionsId": option_id,
+            "CidrBlockAssociationSet": [{"CidrBlock": cidr}],
+        }
+
+    @staticmethod
+    def _options(option_id, *servers):
+        configurations = [{"Key": "domain-name", "Values": [{"Value": "corp"}]}]
+        if servers:
+            configurations.append(
+                {
+                    "Key": "domain-name-servers",
+                    "Values": [{"Value": server} for server in servers],
+                }
+            )
+        return {"DhcpOptionsId": option_id, "DhcpConfigurations": configurations}
+
+    def _run(self, vpcs, options=(), errors=None):
+        errors = errors or {}
+        self.option_calls = []
+
+        def describe_vpcs():
+            if "vpcs" in errors:
+                raise errors["vpcs"]
+            # One VPC per page, so a reader of only the first page misses the rest.
+            return [{"Vpcs": [vpc]} for vpc in vpcs]
+
+        def describe_dhcp_options(DhcpOptionsIds):
+            self.option_calls.append(DhcpOptionsIds)
+            if "dhcp" in errors:
+                raise errors["dhcp"]
+            return [
+                {
+                    "DhcpOptions": [
+                        o for o in options if o["DhcpOptionsId"] in DhcpOptionsIds
+                    ]
+                }
+            ]
+
+        ec2 = MagicMock()
+        ec2.get_paginator.side_effect = _pager(
+            {
+                "describe_vpcs": describe_vpcs,
+                "describe_dhcp_options": describe_dhcp_options,
+            }
+        )
+        with patch("sagemaker_app.boto3.client", return_value=ec2):
+            return _rows(self.check(region="us-east-1"))
+
+    @pytest.mark.parametrize("custom_first", [True, False])
+    def test_one_custom_resolver_among_amazon_ones_fails(self, custom_first):
+        vpcs = [
+            self._vpc("vpc-amazon", "dopt-a"),
+            self._vpc("vpc-custom", "dopt-c"),
+        ]
+        if custom_first:
+            vpcs.reverse()
+        rows = self._run(
+            vpcs,
+            [
+                self._options("dopt-a", "AmazonProvidedDNS"),
+                self._options("dopt-c", "AmazonProvidedDNS", "8.8.8.8"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "VPC vpc-custom uses DHCP option set dopt-c" in details
+        assert "include 8.8.8.8," in details
+        assert "vpc-amazon" not in details
+
+    @pytest.mark.parametrize(
+        "server", ["AmazonProvidedDNS", "169.254.169.253", "10.0.0.2", "fd00:ec2::253"]
+    )
+    def test_the_amazon_dns_server_by_name_or_address_passes(self, server):
+        rows = self._run(
+            [self._vpc("vpc-1", "dopt-a"), self._vpc("vpc-2", "default")],
+            [self._options("dopt-a", server)],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "All 2 VPC(s)" in details
+        assert "vpc-2 (no DHCP option set)" in details
+
+    def test_the_base_plus_two_of_another_vpc_fails(self):
+        # 10.0.0.2 is the Amazon DNS server of 10.0.0.0/16, not of 10.1.0.0/16.
+        rows = self._run(
+            [self._vpc("vpc-1", "dopt-a", cidr="10.1.0.0/16")],
+            [self._options("dopt-a", "10.0.0.2")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "include 10.0.0.2," in rows[0]["Finding_Details"]
+
+    def test_an_option_set_with_no_servers_is_not_judged(self):
+        rows = self._run(
+            [self._vpc("vpc-1", "dopt-a"), self._vpc("vpc-2", "dopt-n")],
+            [self._options("dopt-a", "AmazonProvidedDNS"), self._options("dopt-n")],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "vpc-2 (dopt-n)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "errors, named",
+        [
+            ({"vpcs": _make_client_error("UnauthorizedOperation")}, "ec2:DescribeVpcs"),
+            (
+                {"dhcp": _make_client_error("UnauthorizedOperation")},
+                "ec2:DescribeDhcpOptions",
+            ),
+        ],
+    )
+    def test_a_failed_read_withholds_the_pass(self, errors, named):
+        rows = self._run(
+            [self._vpc("vpc-1", "dopt-a")],
+            [self._options("dopt-a", "AmazonProvidedDNS")],
+            errors=errors,
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert named in rows[0]["Finding_Details"]
+
+    def test_an_option_set_not_returned_withholds_the_pass(self):
+        rows = self._run([self._vpc("vpc-1", "dopt-gone")])
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "DHCP option set dopt-gone of vpc-1" in rows[0]["Finding_Details"]
+
+    def test_no_vpcs_is_not_applicable(self):
+        rows = self._run([])
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert self.option_calls == []
+
+
 class TestSM37GuardDutyLambdaNetworkLogs:
     """AIR-FND-NET-07: GuardDuty Lambda Protection."""
 
