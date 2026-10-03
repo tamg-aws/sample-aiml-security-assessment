@@ -24876,6 +24876,85 @@ def _ai_write_users(
     return {"users": users, "unreadable": unreadable}
 
 
+def _users_reaching_ai_roles(
+    permission_cache: Dict[str, Any], in_scope: Any
+) -> Dict[str, Any]:
+    """
+    Find the cached IAM users outside ``in_scope`` who can assume a cached role
+    that holds an AI permission, so a user whose only route to AI is
+    sts:AssumeRole is still judged. A same-account trust statement naming the
+    user admits it alone; one trusting the account or every principal admits a
+    user whose identity policies allow sts:AssumeRole on the role. Trust
+    conditions are not evaluated, which can only add a user.
+    """
+    found: Dict[str, List[str]] = {}
+    unread: List[str] = []
+    roles = _ai_write_users(permission_cache, "role_permissions", include_reads=True)[
+        "users"
+    ]
+    candidates = {
+        name: permissions
+        for name, permissions in permission_cache["user_permissions"].items()
+        if name not in in_scope
+    }
+    if not roles or not candidates:
+        return {"users": found, "unread": unread}
+    iam_client = boto3.client("iam", config=boto3_config)
+    for role_name in sorted(roles):
+        try:
+            role = iam_client.get_role(RoleName=role_name).get("Role", {})
+            document = _trust_policy_document(role)
+            statements = _policy_statements(document or {})
+        except (ClientError, BotoCoreError, ValueError, TypeError) as error:
+            unread.append(
+                f"The trust policy of AI role '{role_name}' was not read with "
+                f"iam:GetRole ({get_assessment_error_label(error)}), so an IAM "
+                "user who reaches AI only by assuming it was not placed in scope."
+            )
+            continue
+        role_arn = str(role.get("Arn") or "")
+        account = role_arn.split(":")[4] if role_arn.count(":") >= 5 else ""
+        for statement in statements:
+            if str(statement.get("Effect", "")).upper() != "ALLOW":
+                continue
+            if not _statement_matches_action(statement, "sts:assumerole"):
+                continue
+            principal = statement.get("Principal")
+            entries = _principal_entries(
+                principal.get("AWS") if isinstance(principal, dict) else principal
+            )
+            if "*" in entries or "NotPrincipal" in statement:
+                delegates = "trusts every principal"
+            elif account and any(
+                entry == account
+                or (entry.endswith(":root") and entry.split(":")[4:5] == [account])
+                for entry in entries
+            ):
+                delegates = "trusts the account"
+            else:
+                delegates = ""
+            for user_name, permissions in sorted(candidates.items()):
+                if user_name in found:
+                    continue
+                named = any(
+                    ":user/" in entry
+                    and entry.rsplit("/", 1)[-1] == user_name
+                    and entry.split(":")[4:5] == [account]
+                    for entry in entries
+                )
+                if named:
+                    how = "names the user"
+                elif delegates and _identity_allows_assume_role(permissions, role_arn):
+                    how = delegates
+                else:
+                    continue
+                found[user_name] = [
+                    f"it can assume role '{role_name}', whose trust policy {how}, "
+                    f"and the role holds {roles[role_name][0]}"
+                ]
+    return {"users": found, "unread": unread}
+
+
 def _ai_user_unread_findings(
     unreadable: Dict[str, List[str]],
     check_id: str,
@@ -24963,6 +25042,15 @@ def check_bedrock_ai_user_access_keys(
                 region,
                 AI_ACCESS_SCOPE_NOTE,
             )
+        )
+        through_roles = _users_reaching_ai_roles(
+            permission_cache,
+            set(population["users"]) | set(population["unreadable"]),
+        )
+        population["users"].update(through_roles["users"])
+        findings["csv_data"].extend(
+            row(detail, COULD_NOT_ASSESS_RESOLUTION, "Informational", "N/A")
+            for detail in through_roles["unread"]
         )
         if not population["users"]:
             findings["status"] = "N/A"

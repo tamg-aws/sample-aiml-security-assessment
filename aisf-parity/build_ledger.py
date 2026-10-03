@@ -1638,7 +1638,11 @@ FOUNDATION_ROWS = [
         "access keys: it reads ListAccessKeys for each cached IAM user whose "
         "attached, inline or group policies grant any bedrock:, sagemaker:, "
         "bedrock-agentcore: or bedrock-mantle: action, reads included, and whose permissions boundary "
-        "allows one too, fails each Active key and reports its age from CreateDate. "
+        "allows one too, and for each cached user who can assume a cached role "
+        "holding such an action: the role's trust policy, read with iam:GetRole, "
+        "names the user, or trusts the account or every principal and the user's "
+        "identity policies allow sts:AssumeRole on the role. An unread trust "
+        "policy is N/A. It fails each Active key and reports its age from CreateDate. "
         "Inactive keys do not count. A separate BR-50 row reads iam:GetAccountSummary "
         "and fails when AccountAccessKeysPresent is 1, a root user access key",
         [],

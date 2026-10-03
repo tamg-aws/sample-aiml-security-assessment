@@ -771,7 +771,7 @@ Resources:
               # BR-57 reads every role's trust policy for edges from agent roles.
               Effect: Allow
               Action:
-                - iam:GetRole # BR-51, BR-57
+                - iam:GetRole # BR-50, BR-51, BR-57
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
             - Sid: EC2InstanceProfileRoleRead
               # BR-02 resolves the role of each EC2 instance to the Bedrock

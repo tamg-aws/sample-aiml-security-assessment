@@ -27887,6 +27887,118 @@ class TestBR50AIUserAccessKeys:
             )
         return result, extract_csv_data(result), iam
 
+    # --- Users who reach AI only by assuming a role (AIR-FND-IAM-03) ---------
+
+    AI_ROLE_ARN = "arn:aws:iam::123456789012:role/AiRole"
+    ACTIVE_KEY = [
+        {
+            "AccessKeyId": "AKIAEXAMPLEASSUME001",  # pragma: allowlist secret - fake test key id
+            "Status": "Active",
+            "CreateDate": "2024-01-01T00:00:00Z",
+        }
+    ]
+
+    @staticmethod
+    def _trust(principal):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "Users",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": principal},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+
+    def _assume_run(self, user_policies, trust, role_error=None):
+        cache = _identity_cache(
+            roles={"AiRole": [("Invoke", _allow("bedrock:InvokeModel", "*"))]},
+            users={"carol": user_policies},
+        )
+        iam = MagicMock()
+        iam.list_access_keys.side_effect = lambda UserName, **kwargs: {
+            "AccessKeyMetadata": self.ACTIVE_KEY
+        }
+        if role_error is not None:
+            iam.get_role.side_effect = role_error
+        else:
+            iam.get_role.return_value = {
+                "Role": {"Arn": self.AI_ROLE_ARN, "AssumeRolePolicyDocument": trust}
+            }
+        with patch("boto3.client", return_value=iam):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_access_keys(cache, region="Global")
+            )
+
+    @pytest.mark.parametrize(
+        "user_policies, principal, how",
+        [
+            (
+                [("Assume", _allow("sts:AssumeRole", AI_ROLE_ARN))],
+                "arn:aws:iam::123456789012:root",
+                "trusts the account",
+            ),
+            (
+                [("Assume", _allow("sts:AssumeRole", "arn:aws:iam::*:role/Ai*"))],
+                "*",
+                "trusts every principal",
+            ),
+            ([], "arn:aws:iam::123456789012:user/team/carol", "names the user"),
+        ],
+    )
+    def test_br50_a_user_reaching_ai_only_through_a_role_is_in_scope(
+        self, user_policies, principal, how
+    ):
+        """IAM-03: a user whose only route to AI is sts:AssumeRole into an AI
+        role still signs that call with its access key. Before the fix the user
+        was out of scope and the row read N/A with no user named."""
+        rows = self._assume_run(user_policies, self._trust(principal))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "IAM user 'carol' has an active long-term access key" in details
+        assert (
+            f"it can assume role 'AiRole', whose trust policy {how}, and the role "
+            "holds attached policy 'Invoke'"
+        ) in details
+
+    @pytest.mark.parametrize(
+        "user_policies, principal",
+        [
+            (
+                [("Assume", _allow("sts:AssumeRole", "arn:aws:iam::*:role/Other"))],
+                "arn:aws:iam::123456789012:root",
+            ),
+            (
+                [("Assume", _allow("sts:AssumeRole", AI_ROLE_ARN))],
+                "arn:aws:iam::999999999999:root",
+            ),
+            ([], "arn:aws:iam::123456789012:user/dave"),
+        ],
+    )
+    def test_br50_a_user_who_cannot_assume_the_ai_role_stays_out(
+        self, user_policies, principal
+    ):
+        rows = self._assume_run(user_policies, self._trust(principal))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "No IAM user in the permissions cache" in rows[0]["Finding_Details"]
+
+    def test_br50_an_unread_ai_role_trust_policy_is_named(self):
+        rows = self._assume_run(
+            [("Assume", _allow("sts:AssumeRole", self.AI_ROLE_ARN))],
+            None,
+            role_error=ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetRole"
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert (
+            "The trust policy of AI role 'AiRole' was not read with iam:GetRole "
+            "(AccessDenied), so an IAM user who reaches AI only by assuming it "
+            "was not placed in scope."
+        ) in rows[0]["Finding_Details"]
+
     def test_br50_first_user_without_keys_passes_second_with_key_fails(self):
         result, rows, _ = self._run(
             _ai_user_cache(),
