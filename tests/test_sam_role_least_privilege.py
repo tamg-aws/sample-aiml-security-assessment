@@ -161,6 +161,7 @@ _EXPECTED_ACTIONS = {
         "iam:GetAccountSummary",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
+        "rds:DescribeDBInstances",
         "sagemaker:DescribeEndpoint",
         "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeInferenceComponent",
@@ -813,6 +814,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
             ),
             scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
+            scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
             scoped(
                 "bedrock-agentcore:GetBrowser",
                 "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",

@@ -454,6 +454,14 @@ Resources:
             Action:
               - iam:GetAccountSummary # BR-50
             Resource: '*'
+          - Sid: AuroraInstanceRead
+            # BR-20 reads PubliclyAccessible on each instance of the Aurora
+            # cluster behind a knowledge base. The service authorization
+            # reference gives DescribeDBInstances the db resource type.
+            Effect: Allow
+            Action:
+              - rds:DescribeDBInstances # BR-20
+            Resource: !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:db:*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

@@ -52,9 +52,11 @@ AI_SUBJECT_ROWS = [
         "policy. For an OpenSearch Service domain it fails an Allow admitting an "
         "unbounded principal unless fine-grained access control is on with anonymous "
         "authentication off, and for Neptune Analytics it fails a graph with "
-        "publicConnectivity true; an absent field is N/A. Aurora access, which runs "
-        "through database credentials, is not judged, and whether access matches the "
-        "source data's is not compared",
+        "publicConnectivity true; an absent field is N/A. For Aurora it fails a "
+        "cluster with a PubliclyAccessible member instance (rds:DescribeDBInstances "
+        "per DBClusterMembers entry), and an unread instance is N/A; database "
+        "credentials themselves are not judged. A MANAGED store is judged on its key "
+        "alone, and whether access matches the source data's is not compared",
         [],
         3,
     ),

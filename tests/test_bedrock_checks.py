@@ -33172,13 +33172,85 @@ class TestBR20ValueDepth:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "vectorIndexName is missing" in rows[0]["Finding_Details"]
 
-    def _rds(self, clusters=None, error=None):
+    def _rds(self, clusters=None, error=None, instances=None):
+        """``instances`` maps a DB instance identifier to its
+        PubliclyAccessible value, or to an exception DescribeDBInstances raises."""
         client = MagicMock()
         if error is not None:
             client.describe_db_clusters.side_effect = error
         else:
             client.describe_db_clusters.return_value = {"DBClusters": clusters or []}
+        instances = instances or {}
+
+        def describe_db_instances(DBInstanceIdentifier):
+            outcome = instances[DBInstanceIdentifier]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {
+                "DBInstances": [
+                    {
+                        "DBInstanceIdentifier": DBInstanceIdentifier,
+                        "PubliclyAccessible": outcome,
+                    }
+                ]
+            }
+
+        client.describe_db_instances.side_effect = describe_db_instances
         return client
+
+    def _aurora_cluster(self, *members):
+        return {
+            "StorageEncrypted": True,
+            "KmsKeyId": self.CMK,
+            "DBClusterMembers": [{"DBInstanceIdentifier": m} for m in members],
+        }
+
+    def test_aurora_with_a_public_member_instance_fails(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", "kb-db-2")],
+                    instances={"kb-db-1": False, "kb-db-2": True},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "member instance(s) kb-db-2 are PubliclyAccessible" in details
+        assert "kb-db-1" not in details.split("PubliclyAccessible")[0]
+
+    def test_aurora_with_private_member_instances_passes(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", "kb-db-2")],
+                    instances={"kb-db-1": False, "kb-db-2": False},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "No member instance of the cluster is PubliclyAccessible (kb-db-1, "
+            "kb-db-2)" in rows[0]["Finding_Details"]
+        )
+
+    def test_aurora_with_an_unread_member_instance_is_na(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", "kb-db-2")],
+                    instances={
+                        "kb-db-1": False,
+                        "kb-db-2": _make_client_error("AccessDenied"),
+                    },
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "rds:DescribeDBInstances" in rows[0]["Finding_Details"]
 
     def _rds_body(self):
         return self._store_body(

@@ -12585,6 +12585,65 @@ def _neptune_graph_access(graph: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+AURORA_ACCESS_RESOLUTION = (
+    "Set PubliclyAccessible to false on every instance of the Aurora cluster "
+    "that backs the knowledge base, so its endpoint resolves only inside the VPC."
+)
+
+
+def _aurora_member_access(
+    rds_client, cluster: Dict[str, Any], store_region: str
+) -> Dict[str, str]:
+    """
+    Judge whether any instance of an Aurora cluster is PubliclyAccessible for
+    BR-20. The cluster's own PubliclyAccessible field is only for non-Aurora
+    Multi-AZ clusters, so each DBClusterMembers instance is read.
+    """
+    members = [
+        str(member.get("DBInstanceIdentifier"))
+        for member in cluster.get("DBClusterMembers") or []
+        if member.get("DBInstanceIdentifier")
+    ]
+    public = []
+    unread = []
+    for member in members:
+        try:
+            instances = (
+                rds_client.describe_db_instances(DBInstanceIdentifier=member).get(
+                    "DBInstances"
+                )
+                or []
+            )
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"{member} ({_store_read_error(error, 'rds:DescribeDBInstances', store_region)})"
+            )
+            continue
+        flag = instances[0].get("PubliclyAccessible") if instances else None
+        if flag is True:
+            public.append(member)
+        elif flag is not False:
+            unread.append(f"{member} (no PubliclyAccessible value returned)")
+    if public:
+        return {
+            "status": "Failed",
+            "detail": "Its member instance(s) {} are PubliclyAccessible, so the "
+            "endpoint resolves to a public address, and only the security group "
+            "stands between it and the internet.".format(", ".join(public)),
+        }
+    if unread:
+        return {
+            "status": "N/A",
+            "detail": "Whether its member instances are PubliclyAccessible was not "
+            "read for {}.".format("; ".join(unread)),
+        }
+    return {
+        "status": "Passed",
+        "detail": "No member instance of the cluster is PubliclyAccessible "
+        "({}).".format(", ".join(members) or "the cluster has no instance"),
+    }
+
+
 def _store_with_access(
     key_status: str, key_detail: str, access: Dict[str, str], resolution: str
 ) -> Dict[str, str]:
@@ -12615,7 +12674,8 @@ def _assess_storage_layer_encryption(
     Neptune Analytics the graph's kmsKeyIdentifier (GetGraph). Each key is then
     read with DescribeKey, so an AWS managed or disabled key fails. The domain
     access policy and the graph's publicConnectivity, returned by the same
-    reads, are judged beside the key. A
+    reads, are judged beside the key, and so is PubliclyAccessible on each
+    Aurora member instance (DescribeDBInstances). A
     third-party store is judged on its credentials secret only, and never
     passes, because the vectors' own key is held by the provider.
     """
@@ -12701,11 +12761,12 @@ def _assess_storage_layer_encryption(
                 "rdsConfiguration.resourceArn, so the cluster key could not be read.",
             )
         located = f"Aurora cluster '{arn}'"
+        rds_client = boto3.client("rds", config=boto3_config, region_name=store_region)
         try:
             clusters = (
-                boto3.client("rds", config=boto3_config, region_name=store_region)
-                .describe_db_clusters(DBClusterIdentifier=arn)
-                .get("DBClusters")
+                rds_client.describe_db_clusters(DBClusterIdentifier=arn).get(
+                    "DBClusters"
+                )
                 or []
             )
         except (ClientError, BotoCoreError) as error:
@@ -12736,7 +12797,12 @@ def _assess_storage_layer_encryption(
                 "returned no KmsKeyId, so whose key it is could not be read.",
             )
         status, observed = _kms_key_verdict(key, store_region)
-        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+        return _store_with_access(
+            status,
+            f"uses {located}, encrypted with {observed}.",
+            _aurora_member_access(rds_client, cluster, store_region),
+            AURORA_ACCESS_RESOLUTION,
+        )
 
     if storage_type == "OPENSEARCH_MANAGED_CLUSTER":
         arn = (storage_config.get("opensearchManagedClusterConfiguration") or {}).get(
