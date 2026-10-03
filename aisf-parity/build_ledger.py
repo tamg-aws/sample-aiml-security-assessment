@@ -1747,9 +1747,17 @@ FOUNDATION_ROWS = [
         "$LATEST PACKAGE or CODE record is missing or not ACTIVE, naming the "
         "reason. A container-image function fails when the image digest "
         "GetFunction resolves it to has no ACTIVE AWS_ECR_CONTAINER_IMAGE "
-        "coverage record in its repository, and an image with no resolved "
-        "digest or from another account is Not Applicable. It also names the enabled EventBridge rules that match Inspector "
-        "findings without reading their targets. AC-50 covers AgentCore runtime "
+        "coverage record in its repository, or its repository's "
+        "AWS_ECR_REPOSITORY record has a scanFrequency other than "
+        "CONTINUOUS_SCAN, and an image with no resolved "
+        "digest or from another account is Not Applicable. Its 'Bedrock "
+        "Container Workload Image Scanning' row applies the same digest and "
+        "frequency test to every running ECS task and every SageMaker endpoint "
+        "variant and inference component whose role the IAM cache shows granted "
+        "a Bedrock or AgentCore action, and fails an image outside a private ECR "
+        "registry; EKS pods are not read, because the EKS API returns no pod "
+        "image. It also names the enabled EventBridge rules that match Inspector "
+        "findings and their targets. AC-50 covers AgentCore runtime "
         "images: it reads "
         "GetRegistryScanningConfiguration and passes when scanType is ENHANCED "
         "and a CONTINUOUS_SCAN rule has wildcard filters that match every ECR "
@@ -1758,9 +1766,11 @@ FOUNDATION_ROWS = [
         "alone fails, because a CVE published after the push is not reported. "
         "BASIC scanning fails, and a filter that misses a repository fails and "
         "names it. A runtime whose image could not be read, or comes from a "
-        "registry in another account or region, is Not Applicable. No check "
-        "reads a deploy gate that blocks on finding severity, because no AWS "
-        "API records whether a pipeline stage fails on an Inspector finding",
+        "registry in another account or region, is Not Applicable. AC-50's "
+        "'AgentCore Image Finding Gate' row requires an enabled default-bus "
+        "EventBridge rule that matches Inspector findings and has a target. "
+        "Whether that target fails a deploy is not read, because no AWS API "
+        "records whether a pipeline stage fails on an Inspector finding",
         [],
         6,
     ),

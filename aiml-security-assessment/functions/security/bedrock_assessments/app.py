@@ -18889,6 +18889,95 @@ INSPECTOR_LAMBDA_CEILING = (
 INSPECTOR_LAMBDA_SCAN_TYPES = ("PACKAGE", "CODE")
 
 
+def _ecr_image_scan_gaps(
+    inspector_client, by_repository: Dict[str, List[tuple]]
+) -> Dict[str, List[str]]:
+    """
+    Judge each (label, digest) entry of each ECR repository. The digest needs an
+    ACTIVE AWS_ECR_CONTAINER_IMAGE coverage record, and the repository's
+    AWS_ECR_REPOSITORY record a CONTINUOUS_SCAN frequency, so a CVE published
+    after the push is still reported. A repository record that is missing or
+    names no frequency leaves its scanned images unread.
+    """
+    inactive = []
+    unread = []
+    for repository, entries in sorted(by_repository.items()):
+        listed = {}
+        try:
+            for resource_type in ("AWS_ECR_CONTAINER_IMAGE", "AWS_ECR_REPOSITORY"):
+                listed[resource_type] = _list_all_items(
+                    inspector_client,
+                    "list_coverage",
+                    "coveredResources",
+                    max_results=200,
+                    filterCriteria={
+                        "resourceType": [
+                            {"comparison": "EQUALS", "value": resource_type}
+                        ],
+                        "ecrRepositoryName": [
+                            {"comparison": "EQUALS", "value": repository}
+                        ],
+                    },
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            unread.append(
+                f"image coverage for repository {repository} (inspector2:ListCoverage, "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        status = {}
+        for record in listed["AWS_ECR_CONTAINER_IMAGE"]:
+            if record.get("resourceType") != "AWS_ECR_CONTAINER_IMAGE":
+                continue
+            resource_id = str(record.get("resourceId") or "")
+            if "sha256:" not in resource_id:
+                continue
+            scan_status = record.get("scanStatus") or {}
+            status[resource_id[resource_id.rfind("sha256:") :]] = (
+                scan_status.get("statusCode"),
+                scan_status.get("reason"),
+            )
+        frequencies = sorted(
+            {
+                str(
+                    (
+                        (record.get("resourceMetadata") or {}).get("ecrRepository")
+                        or {}
+                    ).get("scanFrequency")
+                    or ""
+                )
+                for record in listed["AWS_ECR_REPOSITORY"]
+                if record.get("resourceType") == "AWS_ECR_REPOSITORY"
+            }
+            - {""}
+        )
+        for label, digest in entries:
+            code, reason = status.get(digest, (None, None))
+            if code is None:
+                inactive.append(
+                    f"{label} is not scanned: no coverage record for image "
+                    f"{repository}@{digest}"
+                )
+            elif code != "ACTIVE":
+                inactive.append(
+                    f"{label} is not scanned: PACKAGE scan {code} "
+                    f"({reason or 'no reason'}) on image {repository}@{digest}"
+                )
+            elif not frequencies:
+                unread.append(
+                    f"the scan frequency of repository {repository}, for {label} "
+                    "(inspector2:ListCoverage returned no AWS_ECR_REPOSITORY record "
+                    "with a scanFrequency)"
+                )
+            elif frequencies != ["CONTINUOUS_SCAN"]:
+                inactive.append(
+                    f"{label} is not rescanned: repository {repository} has scan "
+                    "frequency {}, so a CVE published after the push is not "
+                    "reported".format(", ".join(frequencies))
+                )
+    return {"inactive": inactive, "unread": unread}
+
+
 def _inspector_image_coverage(
     inspector_client,
     functions: List[Dict[str, Any]],
@@ -18897,10 +18986,10 @@ def _inspector_image_coverage(
 ) -> Dict[str, List[str]]:
     """
     Name each in-scope container-image function whose resolved image digest
-    has no ACTIVE ECR coverage record. ``images`` maps a function name to the
-    Code block lambda:GetFunction returned for it.
+    has no ACTIVE ECR coverage record, or sits in a repository Inspector does
+    not rescan continuously. ``images`` maps a function name to the Code block
+    lambda:GetFunction returned for it.
     """
-    inactive = []
     unread = []
     by_repository: Dict[str, List[tuple]] = {}
     for function in functions:
@@ -18929,54 +19018,9 @@ def _inspector_image_coverage(
                 f"{image_account}, whose Inspector coverage this account does not read"
             )
             continue
-        by_repository.setdefault(repository, []).append((name, digest))
-    for repository, entries in sorted(by_repository.items()):
-        try:
-            records = _list_all_items(
-                inspector_client,
-                "list_coverage",
-                "coveredResources",
-                max_results=200,
-                filterCriteria={
-                    "resourceType": [
-                        {"comparison": "EQUALS", "value": "AWS_ECR_CONTAINER_IMAGE"}
-                    ],
-                    "ecrRepositoryName": [
-                        {"comparison": "EQUALS", "value": repository}
-                    ],
-                },
-            )
-        except (ClientError, BotoCoreError, TypeError) as error:
-            unread.append(
-                f"image coverage for repository {repository} (inspector2:ListCoverage, "
-                f"{get_assessment_error_label(error)})"
-            )
-            continue
-        status = {}
-        for record in records:
-            if record.get("resourceType") != "AWS_ECR_CONTAINER_IMAGE":
-                continue
-            resource_id = str(record.get("resourceId") or "")
-            if "sha256:" not in resource_id:
-                continue
-            scan_status = record.get("scanStatus") or {}
-            status[resource_id[resource_id.rfind("sha256:") :]] = (
-                scan_status.get("statusCode"),
-                scan_status.get("reason"),
-            )
-        for name, digest in entries:
-            code, reason = status.get(digest, (None, None))
-            if code is None:
-                inactive.append(
-                    f"'{name}' is not scanned: no coverage record for image "
-                    f"{repository}@{digest}"
-                )
-            elif code != "ACTIVE":
-                inactive.append(
-                    f"'{name}' is not scanned: PACKAGE scan {code} "
-                    f"({reason or 'no reason'}) on image {repository}@{digest}"
-                )
-    return {"inactive": inactive, "unread": unread}
+        by_repository.setdefault(repository, []).append((f"'{name}'", digest))
+    gaps = _ecr_image_scan_gaps(inspector_client, by_repository)
+    return {"inactive": gaps["inactive"], "unread": unread + gaps["unread"]}
 
 
 def _inspector_lambda_coverage(
@@ -19580,6 +19624,444 @@ def check_inspector_lambda_code_scanning(
                 create_finding(
                     check_id="BR-33",
                     finding_name="Amazon Inspector Lambda Code Scanning Check",
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=reference,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+CONTAINER_IMAGE_SCAN_FINDING = "Bedrock Container Workload Image Scanning"
+
+CONTAINER_IMAGE_SCAN_CEILING = (
+    "Running ECS tasks, standalone or in a service, and SageMaker endpoint "
+    "variants and inference components are read. A stopped task has no image "
+    "digest to judge. EKS pods are not read: the EKS API returns no pod or "
+    "container image, and the images live in the Kubernetes API, which this "
+    "assessment does not call. No AWS API records whether a deployment pipeline "
+    "blocks on an Inspector finding."
+)
+
+# <account>.dkr.ecr[-fips].<region>.amazonaws.com[.cn]
+ECR_PRIVATE_REGISTRY = re.compile(
+    r"(\d{12})\.dkr\.ecr(?:-fips)?\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?"
+)
+
+
+def _bedrock_container_images(region: str, roles: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Collect the images run by every ECS task and SageMaker endpoint whose role
+    the IAM cache shows granted a Bedrock or AgentCore action. Images are keyed
+    by ECR repository; an image outside a private ECR registry is named in
+    ``outside``, and anything that could not be judged in ``unread``.
+    """
+    by_repository: Dict[str, List[tuple]] = {}
+    outside: List[str] = []
+    unread: List[str] = []
+    workloads: List[str] = []
+
+    def in_scope(label, role_arn):
+        role = str(role_arn or "").rsplit("/", 1)[-1]
+        if not role:
+            return False
+        if role not in roles:
+            unread.append(
+                f"{label} runs as role '{role}', which the IAM cache does not hold"
+            )
+            return False
+        try:
+            granted = _granted_bedrock_surfaces(roles[role], WORKLOAD_ENDPOINT_SURFACES)
+        except (ValueError, TypeError, AttributeError):
+            unread.append(
+                f"{label} runs as role '{role}', whose policies could not be parsed"
+            )
+            return False
+        if granted:
+            workloads.append(label)
+        return bool(granted)
+
+    def image(label, image_uri, digest, account):
+        registry, _, rest = str(image_uri or "").partition("/")
+        repository = re.split(r"[@:]", rest, maxsplit=1)[0]
+        match = ECR_PRIVATE_REGISTRY.fullmatch(registry)
+        if not match or not repository:
+            outside.append(
+                f"{label} runs image {image_uri or 'with no name'}, which is not in a "
+                "private Amazon ECR registry, so Inspector does not scan it"
+            )
+        elif match.group(1) != account:
+            unread.append(
+                f"{label} runs image {repository} from account {match.group(1)}, "
+                "whose Inspector coverage this account does not read"
+            )
+        elif match.group(2) != region:
+            unread.append(
+                f"{label} runs image {repository} from the registry in "
+                f"{match.group(2)}, whose Inspector coverage is held in that Region"
+            )
+        elif not str(digest or "").startswith("sha256:"):
+            unread.append(f"{label} (no image digest returned for {repository})")
+        else:
+            by_repository.setdefault(repository, []).append((label, digest))
+
+    ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
+    try:
+        clusters = _list_all_items(ecs_client, "list_clusters", "clusterArns")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        unread.append(
+            f"ECS clusters (ecs:ListClusters, {get_assessment_error_label(error)})"
+        )
+        clusters = []
+    task_roles: Dict[str, Any] = {}
+    for cluster in clusters:
+        try:
+            task_arns = _list_all_items(
+                ecs_client, "list_tasks", "taskArns", cluster=cluster
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            unread.append(
+                f"ECS tasks in {cluster} (ecs:ListTasks, "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        for start in range(0, len(task_arns), 100):
+            batch = task_arns[start : start + 100]
+            try:
+                described = ecs_client.describe_tasks(cluster=cluster, tasks=batch)
+            except (ClientError, BotoCoreError) as error:
+                unread.append(
+                    "ECS task(s) {} (ecs:DescribeTasks, {})".format(
+                        ", ".join(batch), get_assessment_error_label(error)
+                    )
+                )
+                continue
+            for failure in described.get("failures") or []:
+                unread.append(
+                    "ECS task {} (ecs:DescribeTasks, {})".format(
+                        failure.get("arn") or "unnamed",
+                        failure.get("reason") or "no reason returned",
+                    )
+                )
+            for task in described.get("tasks", []):
+                task_arn = str(task.get("taskArn") or "")
+                group = str(task.get("group") or "")
+                label = "ECS task '{}'{}".format(
+                    task_arn.split(":task/", 1)[-1] or "unnamed",
+                    f" of service '{group[8:]}'"
+                    if group.startswith("service:")
+                    else "",
+                )
+                role_arn = (task.get("overrides") or {}).get("taskRoleArn")
+                if not role_arn:
+                    definition = task.get("taskDefinitionArn")
+                    if definition and definition not in task_roles:
+                        try:
+                            task_roles[definition] = (
+                                ecs_client.describe_task_definition(
+                                    taskDefinition=definition
+                                )
+                                .get("taskDefinition", {})
+                                .get("taskRoleArn")
+                            )
+                        except (ClientError, BotoCoreError) as error:
+                            task_roles[definition] = error
+                    role_arn = task_roles.get(definition)
+                    if not definition or isinstance(role_arn, Exception):
+                        unread.append(
+                            "{} (task role, ecs:DescribeTaskDefinition, {})".format(
+                                label,
+                                get_assessment_error_label(role_arn)
+                                if isinstance(role_arn, Exception)
+                                else "no task definition returned",
+                            )
+                        )
+                        continue
+                if not in_scope(label, role_arn):
+                    continue
+                account = (task_arn.split(":") + [""] * 5)[4]
+                for container in task.get("containers") or []:
+                    image(
+                        f"{label} container '{container.get('name') or 'unnamed'}'",
+                        container.get("image"),
+                        container.get("imageDigest"),
+                        account,
+                    )
+
+    sagemaker_client = boto3.client(
+        "sagemaker", config=boto3_config, region_name=region
+    )
+    try:
+        endpoints = _list_all_items(
+            sagemaker_client,
+            "list_endpoints",
+            "Endpoints",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        unread.append(
+            "SageMaker endpoints (sagemaker:ListEndpoints, "
+            f"{get_assessment_error_label(error)})"
+        )
+        endpoints = []
+    model_roles: Dict[str, Any] = {}
+
+    def model_role(model_name):
+        if model_name not in model_roles:
+            try:
+                model_roles[model_name] = sagemaker_client.describe_model(
+                    ModelName=model_name
+                ).get("ExecutionRoleArn")
+            except (ClientError, BotoCoreError) as error:
+                model_roles[model_name] = error
+        return model_roles[model_name]
+
+    def deployed(label, role_arn, resolved_images, account):
+        if isinstance(role_arn, Exception):
+            unread.append(
+                f"{label} (model role, sagemaker:DescribeModel, "
+                f"{get_assessment_error_label(role_arn)})"
+            )
+            return
+        if not in_scope(label, role_arn):
+            return
+        if not resolved_images:
+            unread.append(f"{label} (no deployed image returned)")
+        for resolved in resolved_images:
+            image(label, resolved, str(resolved or "").partition("@")[2], account)
+
+    for endpoint in endpoints:
+        name = endpoint.get("EndpointName") or "unnamed"
+        label = f"SageMaker endpoint '{name}'"
+        try:
+            detail = sagemaker_client.describe_endpoint(EndpointName=name)
+            config = sagemaker_client.describe_endpoint_config(
+                EndpointConfigName=detail.get("EndpointConfigName")
+            )
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"{label} (sagemaker:DescribeEndpoint and "
+                f"sagemaker:DescribeEndpointConfig, {get_assessment_error_label(error)})"
+            )
+            continue
+        account = (
+            str(detail.get("EndpointArn") or endpoint.get("EndpointArn") or "").split(
+                ":"
+            )
+            + [""] * 5
+        )[4]
+        config_models = {
+            variant.get("VariantName"): variant.get("ModelName")
+            for variant in list(config.get("ProductionVariants") or [])
+            + list(config.get("ShadowProductionVariants") or [])
+        }
+        components = False
+        for variant in list(detail.get("ProductionVariants") or []) + list(
+            detail.get("ShadowProductionVariants") or []
+        ):
+            model_name = config_models.get(variant.get("VariantName"))
+            if not model_name:
+                components = True
+                continue
+            deployed(
+                f"variant '{variant.get('VariantName')}' of {label}",
+                model_role(model_name),
+                [
+                    image_detail.get("ResolvedImage")
+                    for image_detail in variant.get("DeployedImages") or []
+                ],
+                account,
+            )
+        if not components:
+            continue
+        try:
+            for component in _list_all_items(
+                sagemaker_client,
+                "list_inference_components",
+                "InferenceComponents",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                EndpointNameEquals=name,
+            ):
+                component_name = component.get("InferenceComponentName")
+                specification = (
+                    sagemaker_client.describe_inference_component(
+                        InferenceComponentName=component_name
+                    ).get("Specification")
+                    or {}
+                )
+                resolved = (
+                    (specification.get("Container") or {}).get("DeployedImage") or {}
+                ).get("ResolvedImage")
+                deployed(
+                    f"inference component '{component_name}' of {label}",
+                    model_role(specification["ModelName"])
+                    if specification.get("ModelName")
+                    else config.get("ExecutionRoleArn"),
+                    [resolved] if resolved else [],
+                    account,
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            unread.append(
+                f"the inference components of {label} "
+                "(sagemaker:ListInferenceComponents and "
+                "sagemaker:DescribeInferenceComponent, "
+                f"{get_assessment_error_label(error)})"
+            )
+    return {
+        "by_repository": by_repository,
+        "outside": outside,
+        "unread": unread,
+        "workloads": workloads,
+    }
+
+
+def check_bedrock_container_image_scanning(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-33: Judge Inspector scanning of the container images that ECS tasks and
+    SageMaker endpoints granted Bedrock or AgentCore run. Each image digest
+    needs an ACTIVE coverage record in a repository Inspector rescans
+    continuously, and an image outside a private ECR registry fails because
+    Inspector does not scan it. Any unread workload, role or coverage record
+    yields N/A, never Passed.
+    """
+    reference = "https://docs.aws.amazon.com/inspector/latest/user/scanning-ecr.html"
+    findings = {
+        "check_name": CONTAINER_IMAGE_SCAN_FINDING,
+        "status": "PASS",
+        "details": "",
+        "csv_data": [],
+    }
+
+    def row(details, resolution, severity, status):
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-33",
+                finding_name=CONTAINER_IMAGE_SCAN_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
+
+    try:
+        if permission_cache is None:
+            findings["status"] = "N/A"
+            row(
+                "The IAM permissions cache was not available, so which container "
+                f"workloads in {region} are granted Bedrock was not judged.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+            return findings
+        collected = _bedrock_container_images(
+            region, permission_cache.get("role_permissions") or {}
+        )
+        inspector_client = boto3.client(
+            "inspector2", config=boto3_config, region_name=region
+        )
+        coverage = _ecr_image_scan_gaps(inspector_client, collected["by_repository"])
+        gaps = collected["outside"] + coverage["inactive"]
+        unread = collected["unread"] + coverage["unread"]
+        workloads = collected["workloads"]
+        unread_note = (
+            " {} item(s) could not be judged: {}.".format(
+                len(unread), "; ".join(unread[:10])
+            )
+            if unread
+            else ""
+        )
+        if gaps:
+            findings["status"] = "FAIL"
+            row(
+                "{} image(s) run by the {} container workload(s) in {} granted a "
+                "Bedrock or AgentCore action are not scanned: {}.{} {}".format(
+                    len(gaps),
+                    len(workloads),
+                    region,
+                    "; ".join(gaps[:10]),
+                    unread_note,
+                    CONTAINER_IMAGE_SCAN_CEILING,
+                ),
+                "Push the image to a private Amazon ECR repository, turn on "
+                "enhanced scanning with a CONTINUOUS_SCAN filter that matches it, "
+                "and redeploy the workload so it runs a scanned digest.",
+                "Medium",
+                "Failed",
+            )
+        elif unread:
+            findings["status"] = "N/A"
+            row(
+                f"No container image of a workload in {region} granted Bedrock was "
+                f"found unscanned, but the population was not fully read.{unread_note} "
+                f"{CONTAINER_IMAGE_SCAN_CEILING}",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        elif not workloads:
+            findings["status"] = "N/A"
+            row(
+                f"No running ECS task or SageMaker endpoint in {region} runs as a "
+                "role granted a Bedrock or AgentCore action, so no container image "
+                f"was judged. {CONTAINER_IMAGE_SCAN_CEILING}",
+                "No action required.",
+                "Informational",
+                "N/A",
+            )
+        else:
+            images = sum(
+                len(entries) for entries in collected["by_repository"].values()
+            )
+            row(
+                "Each of the {} image(s) run by the {} container workload(s) in {} "
+                "granted a Bedrock or AgentCore action has an ACTIVE Inspector "
+                "coverage record for its digest, in a repository Inspector rescans "
+                "continuously: {}. {}".format(
+                    images,
+                    len(workloads),
+                    region,
+                    "; ".join(workloads[:10]),
+                    CONTAINER_IMAGE_SCAN_CEILING,
+                ),
+                "No action required.",
+                "Medium",
+                "Passed",
+            )
+        _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-33",
+            CONTAINER_IMAGE_SCAN_FINDING,
+            reference,
+            region,
+            principal_types=("role",),
+        )
+        return findings
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_container_image_scanning: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": CONTAINER_IMAGE_SCAN_FINDING,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-33",
+                    finding_name=CONTAINER_IMAGE_SCAN_FINDING,
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=reference,
@@ -34485,6 +34967,11 @@ def lambda_handler(event, context):
             region=region, permission_cache=permission_cache
         )
         all_findings.append(inspector_lambda_findings)
+        all_findings.append(
+            check_bedrock_container_image_scanning(
+                region=region, permission_cache=permission_cache
+            )
+        )
 
         logger.info("Running guardrail prompt attack filter check (BR-34)")
         all_findings.append(

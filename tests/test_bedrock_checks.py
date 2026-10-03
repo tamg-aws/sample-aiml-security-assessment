@@ -7942,6 +7942,7 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_batch_inference_output_encryption": "BR-31",
         "check_bedrock_cloudwatch_alarms": "BR-32",
         "check_inspector_lambda_code_scanning": "BR-33",
+        "check_bedrock_container_image_scanning": "BR-33",
         "check_bedrock_data_path_object_lock": "BR-52",
         "check_bedrock_resource_owner_tag": "BR-53",
         "check_ai_resource_owner_tag_sweep": "BR-53",
@@ -22192,6 +22193,17 @@ class TestBR33InspectorLambdaCodeScanning:
             "scanStatus": {"statusCode": status, "reason": reason},
         }
 
+    @staticmethod
+    def _repository_coverage(repo, frequency="CONTINUOUS_SCAN"):
+        return {
+            "resourceType": "AWS_ECR_REPOSITORY",
+            "resourceId": f"arn:aws:ecr:us-east-1:123456789012:repository/{repo}",
+            "resourceMetadata": {
+                "ecrRepository": {"name": repo, "scanFrequency": frequency}
+            },
+            "scanStatus": {"statusCode": "ACTIVE", "reason": "SUCCESSFUL"},
+        }
+
     @patch("bedrock_app.boto3.client")
     def test_br33_container_image_function_without_image_coverage_fails(
         self, mock_client
@@ -22236,7 +22248,8 @@ class TestBR33InspectorLambdaCodeScanning:
             [image],
             tags=tags,
             coverage=[
-                self._image_coverage("chat-api", self.IMAGE_DIGEST, status, reason)
+                self._image_coverage("chat-api", self.IMAGE_DIGEST, status, reason),
+                self._repository_coverage("chat-api"),
             ],
         )
 
@@ -22252,14 +22265,53 @@ class TestBR33InspectorLambdaCodeScanning:
             for call in inspector_client.list_coverage.call_args_list
             if "ecrRepositoryName" in call.kwargs["filterCriteria"]
         ]
+        # Stricter than before: the repository record is read for its scan
+        # frequency beside the image record.
         assert image_calls == [
             {
-                "resourceType": [
-                    {"comparison": "EQUALS", "value": "AWS_ECR_CONTAINER_IMAGE"}
-                ],
+                "resourceType": [{"comparison": "EQUALS", "value": resource_type}],
                 "ecrRepositoryName": [{"comparison": "EQUALS", "value": "chat-api"}],
             }
+            for resource_type in ("AWS_ECR_CONTAINER_IMAGE", "AWS_ECR_REPOSITORY")
         ]
+
+    @pytest.mark.parametrize(
+        "repository_records, expected, phrase",
+        [
+            (["SCAN_ON_PUSH"], "Failed", "has scan frequency SCAN_ON_PUSH"),
+            (["MANUAL"], "Failed", "has scan frequency MANUAL"),
+            ([None], "N/A", "returned no AWS_ECR_REPOSITORY record"),
+            ([], "N/A", "returned no AWS_ECR_REPOSITORY record"),
+        ],
+    )
+    @patch("bedrock_app.boto3.client")
+    def test_br33_image_in_a_repository_not_rescanned_does_not_pass(
+        self, mock_client, repository_records, expected, phrase
+    ):
+        image, tags = self._image_lambda()
+        repositories = []
+        for frequency in repository_records:
+            record = self._repository_coverage("chat-api", frequency or "")
+            if frequency is None:
+                record["resourceMetadata"] = {"ecrRepository": {"name": "chat-api"}}
+            repositories.append(record)
+        findings, _ = self._br33(
+            mock_client,
+            [image],
+            tags=tags,
+            coverage=[self._image_coverage("chat-api", self.IMAGE_DIGEST)]
+            + repositories,
+        )
+
+        statuses = [row["Status"] for row in findings]
+        assert "Passed" not in statuses
+        assert expected in statuses
+        assert any(
+            "'bedrock-image'" in row["Finding_Details"]
+            and phrase in row["Finding_Details"]
+            for row in findings
+            if row["Status"] == expected
+        )
 
     @pytest.mark.parametrize(
         "code, phrase",
@@ -37385,3 +37437,397 @@ class TestBR57AgentRolesSharedAcrossRegions:
             }
         )
         assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+
+
+class TestBR33ContainerWorkloadImageScanning:
+    """BR-33: the images ECS tasks and SageMaker endpoints granted Bedrock run."""
+
+    REGISTRY = "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+    DIGEST = "sha256:" + "a" * 64
+    OTHER = "sha256:" + "b" * 64
+    BEDROCK = ["bedrock:InvokeModel"]
+
+    @staticmethod
+    def _role(name):
+        return f"arn:aws:iam::123456789012:role/{name}"
+
+    def _task(
+        self,
+        task_id,
+        repo="agent",
+        digest=None,
+        definition="td-bedrock",
+        override=None,
+        group="family:agent",
+        image=None,
+    ):
+        task = {
+            "taskArn": f"arn:aws:ecs:us-east-1:123456789012:task/main/{task_id}",
+            "taskDefinitionArn": definition,
+            "group": group,
+            "containers": [
+                {
+                    "name": "app",
+                    "image": image or f"{self.REGISTRY}/{repo}:latest",
+                    "imageDigest": digest or self.DIGEST,
+                }
+            ],
+        }
+        if override:
+            task["overrides"] = {"taskRoleArn": self._role(override)}
+        return task
+
+    @staticmethod
+    def _image(repo, digest, status="ACTIVE"):
+        return {
+            "resourceType": "AWS_ECR_CONTAINER_IMAGE",
+            "resourceId": f"arn:aws:ecr:us-east-1:123456789012:repository/{repo}/{digest}",
+            "scanStatus": {"statusCode": status, "reason": "SUCCESSFUL"},
+        }
+
+    @staticmethod
+    def _repository(repo, frequency="CONTINUOUS_SCAN"):
+        return {
+            "resourceType": "AWS_ECR_REPOSITORY",
+            "resourceId": f"arn:aws:ecr:us-east-1:123456789012:repository/{repo}",
+            "resourceMetadata": {
+                "ecrRepository": {"name": repo, "scanFrequency": frequency}
+            },
+            "scanStatus": {"statusCode": "ACTIVE", "reason": "SUCCESSFUL"},
+        }
+
+    def _run(
+        self,
+        *,
+        tasks=(),
+        definitions=None,
+        roles=None,
+        coverage=(),
+        endpoints=None,
+        cache=True,
+        cache_errors=None,
+        list_tasks_error=None,
+        coverage_error=None,
+    ):
+        definitions = (
+            {"td-bedrock": "bedrock-task"} if definitions is None else definitions
+        )
+        roles = {"bedrock-task": self.BEDROCK} if roles is None else roles
+        endpoints = endpoints or {}
+        ecs = MagicMock()
+        ecs.list_clusters.return_value = {"clusterArns": ["main"]}
+        if list_tasks_error is not None:
+            ecs.list_tasks.side_effect = list_tasks_error
+        else:
+            ecs.list_tasks.return_value = {
+                "taskArns": [task["taskArn"] for task in tasks]
+            }
+        ecs.describe_tasks.side_effect = lambda cluster, tasks: {
+            "tasks": [task for task in self._tasks if task["taskArn"] in tasks]
+        }
+        self._tasks = list(tasks)
+        ecs.describe_task_definition.side_effect = lambda taskDefinition: {
+            "taskDefinition": {
+                "taskRoleArn": self._role(definitions[taskDefinition])
+                if definitions.get(taskDefinition)
+                else None
+            }
+        }
+
+        sagemaker = MagicMock()
+        sagemaker.list_endpoints.return_value = {
+            "Endpoints": [{"EndpointName": name} for name in endpoints]
+        }
+        sagemaker.describe_endpoint.side_effect = lambda EndpointName: endpoints[
+            EndpointName
+        ]["detail"]
+        sagemaker.describe_endpoint_config.side_effect = lambda EndpointConfigName: (
+            endpoints[EndpointConfigName]["config"]
+        )
+        sagemaker.describe_model.side_effect = lambda ModelName: {
+            "ExecutionRoleArn": self._role(ModelName.replace("model-", ""))
+        }
+        sagemaker.list_inference_components.side_effect = (
+            lambda EndpointNameEquals, **kwargs: {
+                "InferenceComponents": [
+                    {"InferenceComponentName": name}
+                    for name in endpoints[EndpointNameEquals].get("components", {})
+                ]
+            }
+        )
+        all_components = {
+            name: spec
+            for endpoint in endpoints.values()
+            for name, spec in endpoint.get("components", {}).items()
+        }
+        sagemaker.describe_inference_component.side_effect = (
+            lambda InferenceComponentName: {
+                "Specification": all_components[InferenceComponentName]
+            }
+        )
+
+        inspector = MagicMock()
+
+        def list_coverage(filterCriteria, **kwargs):
+            if coverage_error is not None:
+                raise coverage_error
+            resource_type = filterCriteria["resourceType"][0]["value"]
+            repo = filterCriteria["ecrRepositoryName"][0]["value"]
+            return {
+                "coveredResources": [
+                    record
+                    for record in coverage
+                    if record["resourceType"] == resource_type
+                    and record["resourceId"]
+                    .split("repository/", 1)[1]
+                    .split("/sha256:", 1)[0]
+                    == repo
+                ]
+            }
+
+        inspector.list_coverage.side_effect = list_coverage
+        clients = {"ecs": ecs, "sagemaker": sagemaker, "inspector2": inspector}
+        self.inspector = inspector
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_container_image_scanning(
+                    region="us-east-1",
+                    permission_cache=TestBR33InspectorLambdaCodeScanning._cache(
+                        roles, cache_errors
+                    )
+                    if cache
+                    else None,
+                )
+            )
+
+    def _scanned(self, *repos, digest=None):
+        records = []
+        for repo in repos:
+            records += [
+                self._image(repo, digest or self.DIGEST),
+                self._repository(repo),
+            ]
+        return records
+
+    def test_one_unscanned_task_image_among_scanned_ones_fails_alone(self):
+        rows = self._run(
+            tasks=[self._task("t-ok", repo="agent"), self._task("t-bad", repo="tools")],
+            coverage=self._scanned("agent") + [self._repository("tools")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            f"ECS task 'main/t-bad' container 'app' is not scanned: no coverage "
+            f"record for image tools@{self.DIGEST}" in detail
+        )
+        assert "t-ok" not in detail
+
+    def test_every_scanned_image_passes_and_a_task_without_bedrock_is_not_read(self):
+        rows = self._run(
+            tasks=[
+                self._task("t-1", repo="agent"),
+                self._task("t-2", repo="agent", group="service:chat"),
+                self._task("t-s3", repo="unscanned", definition="td-s3"),
+            ],
+            definitions={"td-bedrock": "bedrock-task", "td-s3": "s3-task"},
+            roles={"bedrock-task": self.BEDROCK, "s3-task": ["s3:GetObject"]},
+            coverage=self._scanned("agent"),
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "Each of the 2 image(s) run by the 2 container workload(s)" in detail
+        assert "ECS task 'main/t-2' of service 'chat'" in detail
+        assert "t-s3" not in detail
+        repos = {
+            call.kwargs["filterCriteria"]["ecrRepositoryName"][0]["value"]
+            for call in self.inspector.list_coverage.call_args_list
+        }
+        assert repos == {"agent"}
+
+    def test_the_digest_running_is_judged_not_another_digest_of_the_repository(self):
+        rows = self._run(
+            tasks=[self._task("t-1", digest=self.OTHER)],
+            coverage=self._scanned("agent"),
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert f"agent@{self.OTHER}" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "image",
+        [
+            "public.ecr.aws/docker/library/python:3.12",
+            "nginx:latest",
+            "ghcr.io/acme/agent:1",
+        ],
+    )
+    def test_an_image_outside_private_ecr_fails(self, image):
+        rows = self._run(tasks=[self._task("t-1", image=image)])
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            f"runs image {image}, which is not in a private Amazon ECR registry"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_a_repository_scanned_on_push_only_fails(self):
+        rows = self._run(
+            tasks=[self._task("t-1")],
+            coverage=[
+                self._image("agent", self.DIGEST),
+                self._repository("agent", "SCAN_ON_PUSH"),
+            ],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "has scan frequency SCAN_ON_PUSH" in rows[0]["Finding_Details"]
+
+    def test_an_overridden_task_role_is_read_before_the_definition_role(self):
+        rows = self._run(
+            tasks=[self._task("t-1", definition="td-s3", override="bedrock-task")],
+            definitions={"td-s3": "s3-task"},
+            roles={"bedrock-task": self.BEDROCK, "s3-task": ["s3:GetObject"]},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "ECS task 'main/t-1'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "image, phrase",
+        [
+            (
+                "999999999999.dkr.ecr.us-east-1.amazonaws.com/agent:1",
+                "from account 999999999999",
+            ),
+            (
+                "123456789012.dkr.ecr.eu-west-1.amazonaws.com/agent:1",
+                "from the registry in eu-west-1",
+            ),
+        ],
+    )
+    def test_an_image_whose_coverage_this_run_cannot_read_is_not_a_pass(
+        self, image, phrase
+    ):
+        rows = self._run(
+            tasks=[self._task("t-ok"), self._task("t-far", image=image)],
+            coverage=self._scanned("agent"),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "wiring, phrase",
+        [
+            (
+                {"roles": {}},
+                "runs as role 'bedrock-task', which the IAM cache does not hold",
+            ),
+            (
+                {"list_tasks_error": _make_client_error("AccessDeniedException")},
+                "ECS tasks in main (ecs:ListTasks, AccessDeniedException)",
+            ),
+            (
+                {"coverage_error": _make_client_error("AccessDeniedException")},
+                "image coverage for repository agent (inspector2:ListCoverage",
+            ),
+        ],
+    )
+    def test_an_unread_population_is_not_a_pass(self, wiring, phrase):
+        rows = self._run(
+            tasks=[self._task("t-1")], coverage=self._scanned("agent"), **wiring
+        )
+
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(phrase in row["Finding_Details"] for row in rows)
+
+    def test_an_unread_cache_principal_holds_back_the_pass(self):
+        rows = self._run(
+            tasks=[self._task("t-1")],
+            coverage=self._scanned("agent"),
+            cache_errors=[{"type": "role", "name": "other", "error": "AccessDenied"}],
+        )
+
+        assert "Passed" not in [row["Status"] for row in rows]
+
+    def test_no_cache_and_no_workload_are_na(self):
+        assert [row["Status"] for row in self._run(cache=False)] == ["N/A"]
+        rows = self._run(tasks=[])
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "No running ECS task or SageMaker endpoint" in rows[0]["Finding_Details"]
+
+    def _endpoint(self, name, variants=(), components=None, config_role=None):
+        detail = {
+            "EndpointArn": f"arn:aws:sagemaker:us-east-1:123456789012:endpoint/{name}",
+            "EndpointConfigName": name,
+            "ProductionVariants": [
+                {
+                    "VariantName": variant,
+                    "DeployedImages": [
+                        {"ResolvedImage": f"{self.REGISTRY}/{repo}@{self.DIGEST}"}
+                    ],
+                }
+                for variant, _, repo in variants
+            ]
+            + ([{"VariantName": "ic"}] if components else []),
+        }
+        config = {
+            "ProductionVariants": [
+                {"VariantName": variant, "ModelName": model}
+                for variant, model, _ in variants
+            ]
+            + ([{"VariantName": "ic"}] if components else []),
+        }
+        if config_role:
+            config["ExecutionRoleArn"] = self._role(config_role)
+        return {"detail": detail, "config": config, "components": components or {}}
+
+    def test_sagemaker_variants_are_judged_by_their_model_role_and_digest(self):
+        rows = self._run(
+            endpoints={
+                "chat": self._endpoint(
+                    "chat",
+                    variants=[
+                        ("a", "model-bedrock-task", "llm"),
+                        ("b", "model-s3-task", "plain"),
+                    ],
+                )
+            },
+            roles={"bedrock-task": self.BEDROCK, "s3-task": ["s3:GetObject"]},
+            coverage=[self._repository("llm")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "variant 'a' of SageMaker endpoint 'chat' is not scanned" in detail
+        assert "variant 'b'" not in detail
+
+    def test_sagemaker_inference_component_image_is_judged(self):
+        components = {
+            "ic-1": {
+                "ModelName": "model-bedrock-task",
+                "Container": {
+                    "DeployedImage": {
+                        "ResolvedImage": f"{self.REGISTRY}/llm@{self.DIGEST}"
+                    }
+                },
+            },
+            "ic-2": {"ModelName": "model-bedrock-task"},
+        }
+        rows = self._run(
+            endpoints={"chat": self._endpoint("chat", components=components)},
+            coverage=self._scanned("llm"),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "inference component 'ic-2' of SageMaker endpoint 'chat' (no deployed "
+            "image returned)" in detail
+        )
+        assert "'ic-1'" not in detail
