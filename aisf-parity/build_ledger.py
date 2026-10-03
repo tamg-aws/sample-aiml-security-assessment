@@ -1911,7 +1911,12 @@ FOUNDATION_ROWS = [
         "falls within its schedule plus one day. It fails a secret with rotation "
         "off, one that has never rotated, and one whose schedule allows a gap "
         "longer than 90 days, the default of Security Hub control "
-        "SecretsManager.4",
+        "SecretsManager.4. It fails an ECS secret that rotates while no "
+        "EventBridge rotation rule has a target, an ECS secret injected from "
+        "Parameter Store, and a credential-named plaintext environment variable "
+        "in an ECS container, a Lambda function or a SageMaker model container. "
+        "A Lambda function is not graded on propagation, because no API shows "
+        "whether it re-fetches a secret per invocation",
         [],
         6,
     ),

@@ -17496,6 +17496,42 @@ def _rotation_redeploy_rules(region: str) -> List[str]:
     return rules
 
 
+def _sagemaker_model_environments(
+    region: str,
+) -> Tuple[List[Tuple[str, Dict[str, Any]]], int, List[str]]:
+    """(where, Environment) of every container of every model, the model count, unread."""
+    try:
+        sagemaker_client = boto3.client(
+            "sagemaker", config=boto3_config, region_name=region
+        )
+        names = []
+        for page in sagemaker_client.get_paginator("list_models").paginate():
+            names.extend(m.get("ModelName") for m in page.get("Models", []))
+    except Exception as error:
+        return [], 0, [f"sagemaker:ListModels ({get_assessment_error_label(error)})"]
+    environments, unread = [], []
+    for name in names:
+        try:
+            model = sagemaker_client.describe_model(ModelName=name)
+        except Exception as error:
+            unread.append(
+                f"SageMaker model {name} ({get_assessment_error_label(error)})"
+            )
+            continue
+        containers = (
+            [model["PrimaryContainer"]] if model.get("PrimaryContainer") else []
+        )
+        containers.extend(model.get("Containers") or [])
+        for index, container in enumerate(containers, start=1):
+            environments.append(
+                (
+                    f"SageMaker model {name}, container {index}",
+                    container.get("Environment") or {},
+                )
+            )
+    return environments, len(names), unread
+
+
 def _propagation_and_plaintext_findings(
     region: str, secrets: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -17583,6 +17619,16 @@ def _propagation_and_plaintext_findings(
                     f"Lambda function {function.get('FunctionName')} sets {name} as a "
                     "plaintext environment variable"
                 )
+    model_environments, model_count, model_unread = _sagemaker_model_environments(
+        region
+    )
+    unread.extend(model_unread)
+    for where, variables in model_environments:
+        for name, value in variables.items():
+            if _looks_like_plaintext_credential(name, value):
+                plaintext.append(
+                    f"{where} sets {name} as a plaintext environment variable"
+                )
 
     rows = []
     stale = []
@@ -17638,8 +17684,8 @@ def _propagation_and_plaintext_findings(
                 "SM-40",
                 SECRET_PROPAGATION_FINDING,
                 list(dict.fromkeys(unread)),
-                f"{len(services)} ECS service(s) and {len(functions)} Lambda "
-                "function(s) were read.",
+                f"{len(services)} ECS service(s), {len(functions)} Lambda "
+                f"function(s) and {model_count} SageMaker model(s) were read.",
                 SECRET_PROPAGATION_REFERENCE,
                 region,
             )
@@ -17694,7 +17740,7 @@ def check_secret_rotation_history_and_propagation(region: str = "") -> Dict[str,
     """
     SM-40: Read rotation outcomes from CloudTrail and whether a rotated value
     reaches the ECS tasks that inject it, and find credentials held in plaintext
-    environment variables outside any rotation.
+    ECS, Lambda and SageMaker model environment variables outside any rotation.
     """
     findings = {"csv_data": []}
     try:

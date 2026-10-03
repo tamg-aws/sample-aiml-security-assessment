@@ -11610,9 +11610,14 @@ class TestSM40RotationHistoryAndPropagation:
         functions=None,
         rules=None,
         errors=None,
+        models=None,
     ):
-        """services: [(cluster, name, task def arn)]; rules: [(pattern, targets)]."""
+        """services: [(cluster, name, task def arn)]; rules: [(pattern, targets)].
+
+        models: {name: DescribeModel response, or an exception it raises}.
+        """
         errors = errors or {}
+        models = models or {}
         secrets = secrets if secrets is not None else [self._secret()]
         events = events or []
         services = services or []
@@ -11691,6 +11696,24 @@ class TestSM40RotationHistoryAndPropagation:
                 client.get_paginator.side_effect = _pager(
                     {"list_functions": source("lambda", [{"Functions": functions}])}
                 )
+            elif service == "sagemaker":
+                # One model per page, so a reader of only the first page misses
+                # every later model.
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_models": source(
+                            "models",
+                            [{"Models": [{"ModelName": n}]} for n in models],
+                        )
+                    }
+                )
+
+                def describe_model(ModelName):
+                    if isinstance(models[ModelName], Exception):
+                        raise models[ModelName]
+                    return models[ModelName]
+
+                client.describe_model.side_effect = describe_model
             elif service == "events":
                 client.get_paginator.side_effect = _pager(
                     {
@@ -12016,6 +12039,60 @@ class TestSM40RotationHistoryAndPropagation:
         )
         assert [r["Status"] for r in plaintext] == ["Failed"]
         assert "container app sets OPENAI_API_KEY" in plaintext[0]["Finding_Details"]
+
+    @staticmethod
+    def _model(primary_env=None, container_envs=()):
+        model = {"Containers": [{"Environment": env} for env in container_envs]}
+        if primary_env is not None:
+            model["PrimaryContainer"] = {"Environment": primary_env}
+        return model
+
+    @pytest.mark.parametrize("in_primary", [True, False])
+    def test_a_sagemaker_model_plaintext_credential_fails(self, in_primary):
+        clean = {"HF_MODEL_ID": "org/model", "SM_SECRET_ARN": self.ARN}
+        leaked = {"HF_TOKEN": "hf_x", "LOG_LEVEL": "info"}
+        plaintext = self._plaintext(
+            self._run(
+                models={
+                    "clean": self._model(clean),
+                    "leaky": (
+                        self._model(leaked)
+                        if in_primary
+                        else self._model(container_envs=[clean, leaked])
+                    ),
+                }
+            )
+        )
+        assert [r["Status"] for r in plaintext] == ["Failed"]
+        details = plaintext[0]["Finding_Details"]
+        container = 1 if in_primary else 2
+        assert f"SageMaker model leaky, container {container} sets HF_TOKEN" in (
+            details
+        )
+        assert "hf_x" not in details
+        assert "clean" not in details
+
+    @pytest.mark.parametrize(
+        "errors, models, named",
+        [
+            (
+                {"models": _make_client_error("AccessDeniedException")},
+                {},
+                "sagemaker:ListModels",
+            ),
+            (
+                {},
+                {"broken": _make_client_error("ValidationException")},
+                "SageMaker model broken",
+            ),
+        ],
+    )
+    def test_an_unread_model_withholds_the_propagation_pass(
+        self, errors, models, named
+    ):
+        propagation = self._propagation(self._run(errors=errors, models=models))
+        assert [r["Status"] for r in propagation] == ["N/A"]
+        assert named in propagation[0]["Finding_Details"]
 
     def test_list_secrets_denied_is_incomplete(self):
         rows = self._run(errors={"sm": _make_client_error("AccessDeniedException")})

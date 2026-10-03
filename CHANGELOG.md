@@ -358,6 +358,10 @@ section.
   workload. An open rule or a group shared with another workload fails, and
   an unread `ec2:DescribeInstances` holds back `Passed`. EC2 instances were
   not read before.
+- `SM-40` reads the `Environment` of every container of every SageMaker
+  model and fails a credential-named plaintext variable, as it already did
+  for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
+  or `sagemaker:DescribeModel` holds back the propagation `Passed`.
 - SageMaker rows that claimed more than they read now state what they read:
   - `SM-22` no longer says approval workflows "appear to be properly
     configured". It names the counts it read and says they do not show
