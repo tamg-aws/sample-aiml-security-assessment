@@ -11865,10 +11865,51 @@ class TestBR43AIServiceRegionControl:
         assert [f["Status"] for f in findings] == ["Failed"]
         detail = findings[0]["Finding_Details"]
         assert (
-            "denies sagemaker:createendpoint, sagemaker:invokeendpoint, s3:createbucket"
-            in detail
+            "denies sagemaker:createendpoint, sagemaker:createnotebookinstance, "
+            "sagemaker:createprocessingjob, sagemaker:createtransformjob, "
+            "sagemaker:invokeendpoint, sagemaker:invokeendpointasync, "
+            "bedrock:createknowledgebase, bedrock:createmodelcustomizationjob, "
+            "bedrock-agentcore:creatememory, s3:createbucket, "
+            "s3vectors:createvectorbucket, aoss:createcollection outside" in detail
         )
-        assert "sagemaker:createtrainingjob outside" not in detail
+        assert "sagemaker:createtrainingjob," not in detail
+
+    def test_a_deny_on_the_first_four_actions_leaves_the_rest_open(self):
+        """Endpoints, training, invocation and buckets are pinned, while
+        notebooks, processing, transform, async invocation, knowledge bases,
+        customization, memories, vector buckets and collections are not."""
+        findings = self._run(
+            [
+                (
+                    "PartialRegions",
+                    TestBR43RegionInvocationControl._region_scp(
+                        "StringNotEquals",
+                        ["us-east-1"],
+                        action=[
+                            "sagemaker:CreateEndpoint",
+                            "sagemaker:CreateTrainingJob",
+                            "sagemaker:InvokeEndpoint",
+                            "s3:CreateBucket",
+                        ],
+                    ),
+                )
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        for action in (
+            "sagemaker:createnotebookinstance",
+            "sagemaker:createprocessingjob",
+            "sagemaker:createtransformjob",
+            "sagemaker:invokeendpointasync",
+            "bedrock:createknowledgebase",
+            "bedrock:createmodelcustomizationjob",
+            "bedrock-agentcore:creatememory",
+            "s3vectors:createvectorbucket",
+            "aoss:createcollection",
+        ):
+            assert action in detail
 
     def test_unreadable_policies_are_na(self):
         findings = extract_csv_data(
@@ -12637,7 +12678,13 @@ class TestBR44MarketplaceModelControl:
         )
 
         assert [f["Status"] for f in findings] == ["N/A"]
-        assert "no identity can subscribe" in findings[0]["Finding_Details"]
+        details = findings[0]["Finding_Details"]
+        assert "no cached identity can change the account's Marketplace" in details
+        assert (
+            "this row does not establish that unapproved models cannot be used"
+            in details
+        )
+        assert "including the subscription Bedrock makes" not in details
 
     def test_br44_schema_valid(self):
         findings = self._run(

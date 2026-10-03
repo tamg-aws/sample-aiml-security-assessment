@@ -22347,13 +22347,23 @@ def check_bedrock_inference_region_evidence(
 
 AI_SERVICE_REGION_FINDING = "AI Service Region Control"
 
-# The SageMaker and storage actions a Region allow-list must also deny, so data
-# and endpoints stay in the approved Regions and not only Bedrock inference.
+# The SageMaker, Bedrock and storage actions a Region allow-list must also deny,
+# so data and compute stay in the approved Regions and not only Bedrock
+# inference. Each name is in the service authorization reference.
 AI_SERVICE_REGION_ACTIONS = (
     "sagemaker:createendpoint",
     "sagemaker:createtrainingjob",
+    "sagemaker:createnotebookinstance",
+    "sagemaker:createprocessingjob",
+    "sagemaker:createtransformjob",
     "sagemaker:invokeendpoint",
+    "sagemaker:invokeendpointasync",
+    "bedrock:createknowledgebase",
+    "bedrock:createmodelcustomizationjob",
+    "bedrock-agentcore:creatememory",
     "s3:createbucket",
+    "s3vectors:createvectorbucket",
+    "aoss:createcollection",
 )
 
 AI_SERVICE_REGION_REFERENCE = (
@@ -22366,8 +22376,11 @@ def check_ai_service_region_control(
     region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    BR-43: verify the attached Region allow-list also denies SageMaker endpoints,
-    training and invocation, and S3 bucket creation outside the approved Regions.
+    BR-43: verify the attached Region allow-list also denies, outside the
+    approved Regions, SageMaker endpoints, notebooks, training, processing,
+    transform and invocation, Bedrock knowledge base and customization job
+    creation, AgentCore memory creation, and S3 bucket, S3 Vectors bucket and
+    OpenSearch Serverless collection creation.
 
     A Control Tower Region deny is a Deny with NotAction and a negated
     aws:RequestedRegion test, and it is read like any other statement.
@@ -22456,9 +22469,10 @@ def check_ai_service_region_control(
                         f" Statements read: {described}." if described else "",
                         note,
                     ),
-                    "Extend the Region deny to SageMaker and S3, through AWS Control "
-                    "Tower (CT.MULTISERVICE.PV.1) if Control Tower manages it, or "
-                    "with a Deny using StringNotEquals on aws:RequestedRegion.",
+                    "Extend the Region deny to each action named, through AWS "
+                    "Control Tower (CT.MULTISERVICE.PV.1) if Control Tower manages "
+                    "it, or with a Deny using StringNotEquals on "
+                    "aws:RequestedRegion.",
                     "Medium",
                     "Failed",
                 )
@@ -23618,9 +23632,13 @@ def check_bedrock_marketplace_model_control(
                     finding_details=(
                         "No role or user in the IAM permissions cache allows "
                         f"{MARKETPLACE_SUBSCRIBE_ACTION} or "
-                        "aws-marketplace:unsubscribe, so no identity can subscribe "
-                        "to a third-party or Marketplace model, including the "
-                        "subscription Bedrock makes on a model's first invocation."
+                        "aws-marketplace:unsubscribe, so no cached identity can "
+                        "change the account's Marketplace subscriptions. A model "
+                        "the account already subscribes to stays invocable by any "
+                        "identity granted bedrock:InvokeModel without Marketplace "
+                        "permissions, so this row does not establish that "
+                        "unapproved models cannot be used; the model-ARN "
+                        "allow-list judged by BR-42 and BR-43 does."
                         "{}{}".format(
                             ""
                             if complete

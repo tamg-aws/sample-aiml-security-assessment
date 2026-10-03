@@ -1427,7 +1427,12 @@ FOUNDATION_ROWS = [
         "is the right one. The Deny must cover agent, flow, RetrieveAndGenerate and "
         "AgentCore runtime invocation too, an aws:PrincipalArn exemption with a "
         "wildcard role or user name is not credited, and an unread inference profile "
-        "list makes the row N/A",
+        "list makes the row N/A. The storage half is judged on the AI Service "
+        "Region Control row: the Deny must also cover bedrock:CreateKnowledgeBase, "
+        "bedrock:CreateModelCustomizationJob, bedrock-agentcore:CreateMemory, "
+        "s3:CreateBucket, s3vectors:CreateVectorBucket, aoss:CreateCollection and "
+        "the SageMaker endpoint, notebook, training, processing and transform "
+        "creation actions",
         [],
         6,
     ),
@@ -1505,9 +1510,14 @@ FOUNDATION_ROWS = [
         "matches only them. A Deny written with NotAction is read as covering "
         "those actions, and arn:aws:bedrock:*::foundation-model/* counts as no "
         "list. The leg asserts that a model list exists and never which models "
-        "are approved. Organization policies are readable only from the "
-        "management account, so from a delegated administrator the leg is Not "
-        "Applicable",
+        "are approved. Its AI Service Region Control row requires the same "
+        "Region Deny over SageMaker endpoint, notebook, training, processing, "
+        "transform and synchronous and asynchronous invocation, Bedrock knowledge "
+        "base and customization job creation, AgentCore memory creation, and S3 "
+        "bucket, S3 Vectors bucket and OpenSearch Serverless collection creation. "
+        "No leg reads a Deny on unapproved AI services. Organization policies are "
+        "readable only from the management account or a delegated administrator, "
+        "so from any other member account the leg is Not Applicable",
         [],
         6,
     ),
