@@ -298,6 +298,43 @@ section.
 
 ### Fixed
 
+- SageMaker checks that passed on a partial read now fail or hold back
+  `Passed`:
+  - `SM-10` fails a VPC notebook whose `DirectInternetAccess` is not
+    `Disabled`, an absent value included, because the notebook keeps a
+    SageMaker-managed internet path beside its VPC.
+  - `SM-11` judges the endpoint config of an inference-component endpoint.
+    A config without both `Subnets` and `SecurityGroupIds` fails, and its
+    subnets are resolved through their route tables under a new
+    `SageMaker Endpoint Config Subnet Internet Exposure` row.
+  - `SM-18` fails a transform job with no
+    `TransformResources.VolumeKmsKeyId`. An S3 endpoint policy statement
+    on every bucket fails whatever its principal, and one open to any
+    principal fails on a bucket pattern with a wildcard.
+  - `SM-23` credits an alarm only when its namespace matches the
+    schedule's monitoring type, its dimensions are exactly the endpoint and
+    schedule pair, and, for data quality, it reads a
+    `feature_baseline_drift_` metric with a rising threshold below 1. An
+    alarm on another schedule of the same endpoint no longer credits it,
+    and neither does an alarm on one of the two dimensions.
+  - `SM-41` bounds a policy variable only when nothing before it in the
+    resource path is a wildcard. Every Allow statement of a role alias's
+    role must be bounded by a `credentials-iot` variable, so one fleet-wide
+    statement beside a scoped one fails. The audit leg reads the scheduled
+    audit runs of the last 31 days and judges findings of the newest
+    completed run, so a schedule that never completed the
+    `DEVICE_CERTIFICATE_SHARED_CHECK` check fails.
+  - `SM-33` credits a VPC endpoint only when a gateway endpoint is on the
+    job subnet's route table or an interface endpoint has a subnet in the
+    job subnet's Availability Zone. An unread endpoint subnet or route
+    table holds back `Passed`.
+  - `SM-34` and the `SM-09` guardrail rows fail a requirement enforced by
+    identity policies alone, because the account root user is bound by no
+    identity policy. Only an attached SCP clears the root user.
+  - `SM-09` treats a partial-wildcard SageMaker action on every resource
+    as broad, and fails a trail that reports a CloudWatch Logs delivery
+    error or has never delivered.
+
 - `BR-47` and `BR-52` read custom AgentCore browsers. The Bedrock function
   calls `bedrock-agentcore:GetBrowser` to find each browser's recording
   bucket, but only the AgentCore function held that grant, so every browser
@@ -1494,6 +1531,12 @@ section.
     now be `Failed` or `N/A`.
 
 ### Deployment impact
+
+**SageMaker IoT audit run reads.** `SageMakerAssessmentReadsPolicy` gains
+`iot:ListAuditTasks` and `iot:DescribeAuditTask` on `'*'` (`SM-41`). Neither
+action has a resource type in the service authorization reference. Both are
+read-only. Until the stack is updated, the `SM-41` audit row reads as
+incomplete.
 
 **Bedrock and SageMaker read grants.** `BedrockAssessmentReadsPolicy`
 gains `bedrock-agentcore:GetBrowser` on `browser-custom/*` (`BR-47`,

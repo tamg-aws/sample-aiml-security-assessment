@@ -866,6 +866,8 @@ Resources:
             Action:
               - organizations:ListAWSServiceAccessForOrganization # SM-35
               - ec2:DescribeManagedPrefixLists # SM-39
+              - iot:ListAuditTasks # SM-41
+              - iot:DescribeAuditTask # SM-41
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a

@@ -4104,6 +4104,9 @@ def _role_name_from_arn(role_arn: str) -> str:
     return str(role_arn).rsplit("/", 1)[-1]
 
 
+SAGEMAKER_RESOURCE_PROBE = "arn:aws:sagemaker:us-east-1:123456789012:zz-probe/zz-probe"
+
+
 def _broad_role_grant(permissions: Dict[str, Any]) -> Optional[str]:
     """
     Return why a role holds every SageMaker action or more, or None.
@@ -4135,6 +4138,22 @@ def _broad_role_grant(permissions: Dict[str, Any]) -> Optional[str]:
                 return (
                     f"policy '{policy.get('name') or 'inline'}' allows every "
                     f"SageMaker action through {reason}"
+                )
+            # AIR-SGM-TRN-05: a partial wildcard such as sagemaker:Create* on
+            # every resource reaches every experiment's resources as well.
+            every_resource = "NotResource" in statement or any(
+                fnmatch.fnmatchcase(SAGEMAKER_RESOURCE_PROBE, str(r).lower())
+                for r in _policy_values(statement.get("Resource"))
+            )
+            partial = [
+                a
+                for a in _policy_values(statement.get("Action"))
+                if ("*" in a or "?" in a) and _pattern_may_match_sagemaker(a)
+            ]
+            if every_resource and partial:
+                return (
+                    f"policy '{policy.get('name') or 'inline'}' allows wildcard "
+                    f"SageMaker action(s) {', '.join(partial[:3])} on every resource"
                 )
     return None
 
@@ -4236,7 +4255,8 @@ def _environment_role_findings(
                 finding_details=(
                     f"None of the {len(environment_roles)} development environment "
                     "execution role(s) holds AmazonSageMakerFullAccess, an "
-                    "administrator policy, Action '*' or every SageMaker action. "
+                    "administrator policy, Action '*', every SageMaker action, or "
+                    "a wildcard SageMaker action on every resource. "
                     f"{SCP_NOT_EVALUATED_NOTE}"
                 ),
                 resolution="No action required",
@@ -4349,6 +4369,16 @@ def _environment_trail_finding(region: str) -> Dict[str, Any]:
         if status.get("IsLogging") is not True:
             problems.append(f"trail '{name}' is not logging")
             continue
+        # AIR-SGM-TRN-05: a trail can log while CloudWatch Logs delivery fails.
+        if status.get("LatestCloudWatchLogsDeliveryError"):
+            problems.append(
+                f"trail '{name}' reports CloudWatch Logs delivery error "
+                f"{str(status['LatestCloudWatchLogsDeliveryError'])[:120]}"
+            )
+            continue
+        if not status.get("LatestCloudWatchLogsDeliveryTime"):
+            problems.append(f"trail '{name}' has no recorded CloudWatch Logs delivery")
+            continue
         if not _selectors_record_sagemaker_management(selectors):
             problems.append(
                 f"trail '{name}' does not record both read and write SageMaker "
@@ -4361,7 +4391,9 @@ def _environment_trail_finding(region: str) -> Dict[str, Any]:
             finding_details=(
                 f"Trail '{name}' is logging, covers {region}, records read and "
                 "write SageMaker management events and delivers them to CloudWatch "
-                f"Logs group {trail['CloudWatchLogsLogGroupArn']}."
+                f"Logs group {trail['CloudWatchLogsLogGroupArn']}, last at "
+                f"{status['LatestCloudWatchLogsDeliveryTime']} with no delivery "
+                "error reported."
             ),
             resolution="No action required",
             reference=NOTEBOOK_TRAIL_REFERENCE,
@@ -4907,6 +4939,7 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
 
         notebooks_without_vpc = []
         notebooks_with_vpc = []
+        notebooks_with_direct_access = []
         notebook_error = None
 
         try:
@@ -4938,6 +4971,14 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
                                     "vpc_id": instance_details.get("VpcId", "N/A"),
                                 }
                             )
+                            # AIR-FND-NET-01: with DirectInternetAccess Enabled
+                            # SageMaker adds its own internet path beside the VPC,
+                            # so the subnet alone is no private boundary.
+                            direct_access = instance_details.get("DirectInternetAccess")
+                            if direct_access != "Disabled":
+                                notebooks_with_direct_access.append(
+                                    (instance_name, direct_access or "not returned")
+                                )
 
         except Exception as e:
             logger.error(f"Error checking notebook instances VPC: {str(e)}")
@@ -4981,14 +5022,44 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
-        elif notebook_error is None:
+        for name, direct_access in notebooks_with_direct_access:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-10",
+                    finding_name="SageMaker Notebook Direct Internet Access in VPC",
+                    finding_details=(
+                        f"Notebook instance '{name}' is deployed in a VPC, but its "
+                        f"DirectInternetAccess is {direct_access}. SageMaker then "
+                        "gives the notebook internet access outside the VPC's "
+                        "routing and security groups."
+                    ),
+                    resolution=(
+                        "Recreate the notebook instance with DirectInternetAccess "
+                        "set to Disabled, and route any internet traffic it needs "
+                        "through the VPC."
+                    ),
+                    reference="https://docs.aws.amazon.com/sagemaker/latest/dg/appendix-notebook-and-internet-access.html",
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if (
+            not notebooks_without_vpc
+            and not notebooks_with_direct_access
+            and notebook_error is None
+        ):
             if notebooks_with_vpc:
                 # Notebooks exist and all are in VPCs - Passed
                 findings["csv_data"].append(
                     create_finding(
                         check_id="SM-10",
                         finding_name="SageMaker Notebook VPC Deployment Check",
-                        finding_details=f"All {len(notebooks_with_vpc)} notebook instances are deployed in custom VPCs",
+                        finding_details=(
+                            f"All {len(notebooks_with_vpc)} notebook instances are "
+                            "deployed in custom VPCs with DirectInternetAccess Disabled"
+                        ),
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/appendix-notebook-and-internet-access.html",
                         severity="High",
@@ -5066,6 +5137,9 @@ RUNTIME_PRIVATE_PATH_FINDING = "SageMaker Runtime Private Invoke Path"
 ENDPOINT_MODEL_NETWORK_FINDING = "SageMaker Endpoint Model Network Path"
 ENDPOINT_CONFIG_KMS_FINDING = "SageMaker Endpoint Config Storage Encryption"
 MODEL_SUBNET_EXPOSURE_FINDING = "SageMaker Model Subnet Internet Exposure"
+ENDPOINT_CONFIG_SUBNET_EXPOSURE_FINDING = (
+    "SageMaker Endpoint Config Subnet Internet Exposure"
+)
 MODEL_VPC_ATTACHMENT_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/host-vpc.html"
 )
@@ -5318,6 +5392,7 @@ def _endpoint_model_network_findings(
     unread = list(inventory["unread"])
     compliant = []
     component_models = component_models or {}
+    config_networks = []
     for endpoint in inventory["endpoints"]:
         gaps = []
         endpoint_unread = False
@@ -5356,10 +5431,28 @@ def _endpoint_model_network_findings(
                     f"{', '.join(str(v) for v in endpoint['component_variants'])}) "
                     "has EnableNetworkIsolation off"
                 )
-            if not subnets:
+            security_groups = (
+                vpc_config.get("SecurityGroupIds")
+                if isinstance(vpc_config, dict)
+                else None
+            )
+            if not subnets or not security_groups:
                 gaps.append(
                     f"endpoint config '{endpoint['config_name']}' "
-                    "(inference-component variants) has no VpcConfig"
+                    "(inference-component variants) has no VpcConfig with subnets "
+                    "and security groups"
+                )
+            else:
+                # AIR-SGM-EP-01: a subnet id is no privacy claim; its route
+                # table is resolved below like a model's.
+                config_networks.append(
+                    {
+                        "name": (
+                            f"Endpoint config '{endpoint['config_name']}' of "
+                            f"endpoint '{endpoint['name']}'"
+                        ),
+                        "subnets": [s for s in subnets if s],
+                    }
                 )
         if gaps:
             emitted.append(
@@ -5383,7 +5476,10 @@ def _endpoint_model_network_findings(
 
     read_details = (
         f"{len(compliant)} endpoint(s) serve only models with network isolation "
-        f"on and a VpcConfig: {', '.join(compliant[:10]) or 'none'}."
+        f"on and a VpcConfig: {', '.join(compliant[:10]) or 'none'}. The route "
+        "tables of those subnets are judged under "
+        f"'{MODEL_SUBNET_EXPOSURE_FINDING}' and "
+        f"'{ENDPOINT_CONFIG_SUBNET_EXPOSURE_FINDING}'."
     )
     if unread:
         emitted.append(
@@ -5422,6 +5518,20 @@ def _endpoint_model_network_findings(
                 region=region,
             )
         )
+    emitted.extend(
+        _subnet_exposure_findings(
+            check_id="SM-11",
+            finding_name=ENDPOINT_CONFIG_SUBNET_EXPOSURE_FINDING,
+            resources=config_networks,
+            region=region,
+            reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+            resolution=(
+                "Recreate the endpoint config with VpcConfig naming subnets whose "
+                "route tables have no internet gateway route."
+            ),
+            severity="High",
+        )
+    )
     return emitted
 
 
@@ -7111,6 +7221,11 @@ def _transform_job_boundary_findings(
                 "TransformOutput.KmsKeyId is not set, so the results in S3 are not "
                 "encrypted with a customer managed key"
             )
+        if not (detail.get("TransformResources") or {}).get("VolumeKmsKeyId"):
+            problems.append(
+                "TransformResources.VolumeKmsKeyId is not set, so the instance "
+                "storage volume is not encrypted with a customer managed key"
+            )
         for field, key in (
             (
                 "TransformResources.VolumeKmsKeyId",
@@ -8624,6 +8739,24 @@ MODEL_MONITOR_METRIC_NAMESPACES = (
     "aws/sagemaker/Endpoints/bias-metrics",
     "aws/sagemaker/Endpoints/explainability-metrics",
 )
+# The namespaces each monitoring type publishes to, from the list above.
+MODEL_MONITOR_TYPE_NAMESPACES = {
+    "DataQuality": MODEL_MONITOR_METRIC_NAMESPACES[:3],
+    "ModelQuality": ("aws/sagemaker/Endpoints/model-metrics",),
+    "ModelBias": ("aws/sagemaker/Endpoints/bias-metrics",),
+    "ModelExplainability": ("aws/sagemaker/Endpoints/explainability-metrics",),
+}
+# Both dimension spellings the Model Monitor pages document, as (endpoint,
+# schedule). A metric is stored under its exact dimension set, so an alarm
+# naming only one of the pair reads a series Model Monitor never publishes.
+MODEL_MONITOR_DIMENSION_PAIRS = (
+    ("Endpoint", "MonitoringSchedule"),
+    ("EndpointName", "ScheduleName"),
+)
+# Data quality publishes each feature's distance from its baseline under this
+# prefix. The distance lies between 0 and 1, so a rising alarm at or above 1
+# never fires.
+DATA_QUALITY_DRIFT_METRIC_PREFIX = "feature_baseline_drift_"
 MONITOR_REPORT_STATUSES = ("Completed", "CompletedWithViolations")
 MONITOR_RUNNING_STATUSES = ("Pending", "InProgress")
 CAPTURE_DISK_ALARM_FINDING = "Data Capture Disk Utilization Alarm"
@@ -8928,28 +9061,41 @@ def _monitor_report_and_alarm_findings(
             )
         )
         return rows
+    # AIR-SGM-EP-06: an alarm credits a schedule only on the namespace of the
+    # schedule's own monitoring type and on that schedule's exact dimension
+    # pair, so a DataQuality alarm never stands in for ModelQuality. A
+    # DataQuality alarm must also read a drift metric with a threshold the
+    # distance can cross.
     alarmed = set()
     for alarm in alarms:
-        for namespace, _, dimensions in _alarm_metric_dimensions(alarm):
-            if namespace in MODEL_MONITOR_METRIC_NAMESPACES:
-                alarmed.add(
-                    (
-                        "schedule",
-                        dimensions.get("MonitoringSchedule")
-                        or dimensions.get("ScheduleName"),
+        single = bool(alarm.get("MetricName"))
+        operator = alarm.get("ComparisonOperator")
+        threshold = alarm.get("Threshold")
+        for namespace, metric_name, dimensions in _alarm_metric_dimensions(alarm):
+            for kind, namespaces in MODEL_MONITOR_TYPE_NAMESPACES.items():
+                if namespace not in namespaces:
+                    continue
+                if kind == "DataQuality" and (
+                    not str(metric_name).startswith(DATA_QUALITY_DRIFT_METRIC_PREFIX)
+                    or (
+                        single
+                        and (
+                            operator not in RISING_COMPARISONS
+                            or not isinstance(threshold, (int, float))
+                            or threshold >= 1
+                        )
                     )
-                )
-                alarmed.add(
-                    (
-                        "endpoint",
-                        dimensions.get("Endpoint") or dimensions.get("EndpointName"),
-                    )
-                )
+                ):
+                    continue
+                for endpoint_key, schedule_key in MODEL_MONITOR_DIMENSION_PAIRS:
+                    if set(dimensions) == {endpoint_key, schedule_key}:
+                        alarmed.add(
+                            (kind, dimensions[endpoint_key], dimensions[schedule_key])
+                        )
     unalarmed = [
         schedule
         for schedule in schedules
-        if ("schedule", schedule["name"]) not in alarmed
-        and ("endpoint", schedule["endpoint"]) not in alarmed
+        if (schedule.get("type"), schedule["endpoint"], schedule["name"]) not in alarmed
     ]
     for schedule in unalarmed[:20]:
         rows.append(
@@ -8957,10 +9103,18 @@ def _monitor_report_and_alarm_findings(
                 check_id="SM-23",
                 finding_name=MONITOR_ALARM_FINDING,
                 finding_details=(
-                    f"No enabled CloudWatch alarm with an action evaluates a Model "
-                    f"Monitor metric of schedule '{schedule['name']}' on endpoint "
-                    f"'{schedule['endpoint']}', so a violation in its report "
-                    "notifies no one."
+                    "No enabled CloudWatch alarm with an action evaluates a "
+                    f"{schedule.get('type') or 'Model Monitor'} metric of schedule "
+                    f"'{schedule['name']}' on endpoint '{schedule['endpoint']}' "
+                    "under that schedule's namespace and both its endpoint and "
+                    "schedule dimensions"
+                    + (
+                        ", reading a feature_baseline_drift_ metric with a rising "
+                        "threshold below 1"
+                        if schedule.get("type") == "DataQuality"
+                        else ""
+                    )
+                    + ", so a violation in its report notifies no one."
                 ),
                 resolution=(
                     "Publish the schedule's metrics to CloudWatch and alarm on the "
@@ -8980,9 +9134,13 @@ def _monitor_report_and_alarm_findings(
                 finding_name=MONITOR_ALARM_FINDING,
                 finding_details=(
                     f"All {len(schedules)} monitoring schedule(s) have an enabled "
-                    "alarm with an action on their Model Monitor metrics. Which "
-                    "Model Monitor metric each alarm evaluates, and whether its "
-                    "threshold marks drift for the model, are not judged."
+                    "alarm with an action on a metric of their own monitoring "
+                    "type, endpoint and schedule. A DataQuality alarm reads a "
+                    "feature_baseline_drift_ metric, and a single-metric one "
+                    "rises past a threshold below 1. For ModelQuality, ModelBias "
+                    "and ModelExplainability schedules, and for metric math, which "
+                    "metric the alarm evaluates and whether its threshold marks a "
+                    "violation are not judged."
                 ),
                 resolution="No action required",
                 reference=MONITOR_CLOUDWATCH_REFERENCE,
@@ -9056,7 +9214,11 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
                     schedules = monitoring_schedules[endpoint_name]
                     endpoints_with_monitoring.append(endpoint_name)
                     monitored_schedules.extend(
-                        {"name": s["name"], "endpoint": endpoint_name}
+                        {
+                            "name": s["name"],
+                            "endpoint": endpoint_name,
+                            "type": s["type"],
+                        }
                         for s in schedules
                         if s["status"] == "Scheduled"
                     )
@@ -11421,11 +11583,22 @@ def _endpoint_policy_principal_is_anyone(statement: Dict[str, Any]) -> bool:
     return True
 
 
+def _s3_bucket_pattern_is_wildcard(pattern: str) -> bool:
+    """Return whether the bucket segment of an S3 ARN pattern holds a wildcard."""
+    if not pattern.startswith("arn:"):
+        return True
+    bucket = pattern.split(":::", 1)[-1].split("/", 1)[0]
+    return "*" in bucket or "?" in bucket
+
+
 def _broad_s3_endpoint_statement(policy: Dict[str, Any]) -> Optional[str]:
     """
-    Return a description of the first Allow that lets any principal read or
-    write objects in every bucket, which is what the default full-access
-    endpoint policy does. Deny statements are not evaluated.
+    Return a description of the first Allow that lets a principal read or write
+    objects in every bucket, which is what the default full-access endpoint
+    policy does, or that lets any principal do so on a bucket pattern with a
+    wildcard, which reaches buckets outside the workload. A named principal does
+    not excuse every bucket: the endpoint is then no bucket boundary at all.
+    Deny statements are not evaluated.
     """
     for statement in _sm_policy_statements(policy):
         actions = [
@@ -11440,15 +11613,25 @@ def _broad_s3_endpoint_statement(policy: Dict[str, Any]) -> Optional[str]:
                 _iam_action_matches(p, S3_ENDPOINT_PROBE_OBJECT)
                 for p in _policy_values(statement.get("NotResource"))
             )
+            wildcard_buckets = ["NotResource"]
         else:
+            resources = _policy_values(statement.get("Resource"))
             every_bucket = any(
-                fnmatch.fnmatchcase(S3_ENDPOINT_PROBE_OBJECT, p)
-                for p in _policy_values(statement.get("Resource"))
+                fnmatch.fnmatchcase(S3_ENDPOINT_PROBE_OBJECT, p) for p in resources
             )
-        if every_bucket and _endpoint_policy_principal_is_anyone(statement):
+            wildcard_buckets = [
+                p for p in resources if _s3_bucket_pattern_is_wildcard(p)
+            ]
+        anyone = _endpoint_policy_principal_is_anyone(statement)
+        sid = statement.get("Sid") or "unnamed"
+        if every_bucket:
+            return f"statement '{sid}' allows {', '.join(actions)} on every bucket" + (
+                " to any principal" if anyone else ""
+            )
+        if anyone and wildcard_buckets:
             return (
-                f"statement '{statement.get('Sid') or 'unnamed'}' allows "
-                f"{', '.join(actions)} on every bucket to any principal"
+                f"statement '{sid}' allows {', '.join(actions)} to any principal "
+                f"on bucket pattern(s) with a wildcard: {', '.join(wildcard_buckets)}"
             )
     return None
 
@@ -11481,18 +11664,30 @@ def _training_vpc_endpoint_findings(
         return []
     prefix = f"com.amazonaws.{region}."
     subnet_vpcs = {}
+    subnet_azs = {}
+    subnet_tables = {}
     try:
         ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
         subnet_paginator = ec2_client.get_paginator("describe_subnets")
-        for chunk in _chunked(subnets, SUBNET_LOOKUP_BATCH_SIZE):
-            for page in subnet_paginator.paginate(
-                Filters=[{"Name": "subnet-id", "Values": chunk}]
-            ):
-                for subnet in page.get("Subnets", []):
-                    if subnet.get("SubnetId") in subnets and subnet.get("VpcId"):
-                        subnet_vpcs[subnet["SubnetId"]] = subnet["VpcId"]
+
+        def read_subnets(subnet_ids: List[str], record_vpc: bool) -> None:
+            for chunk in _chunked(subnet_ids, SUBNET_LOOKUP_BATCH_SIZE):
+                for page in subnet_paginator.paginate(
+                    Filters=[{"Name": "subnet-id", "Values": chunk}]
+                ):
+                    for subnet in page.get("Subnets", []):
+                        subnet_id = subnet.get("SubnetId")
+                        if subnet_id not in subnet_ids:
+                            continue
+                        if subnet.get("AvailabilityZone"):
+                            subnet_azs[subnet_id] = subnet["AvailabilityZone"]
+                        if record_vpc and subnet.get("VpcId"):
+                            subnet_vpcs[subnet_id] = subnet["VpcId"]
+
+        read_subnets(subnets, True)
         present = {vpc_id: set() for vpc_id in subnet_vpcs.values()}
         s3_endpoints = {vpc_id: [] for vpc_id in present}
+        service_endpoints = {vpc_id: {} for vpc_id in present}
         vpce_paginator = ec2_client.get_paginator("describe_vpc_endpoints")
         for chunk in _chunked(sorted(present), SUBNET_LOOKUP_BATCH_SIZE):
             for page in vpce_paginator.paginate(
@@ -11514,8 +11709,42 @@ def _training_vpc_endpoint_findings(
                     ):
                         continue
                     present[vpce["VpcId"]].add(short)
+                    service_endpoints[vpce["VpcId"]].setdefault(short, []).append(vpce)
                     if short == "s3":
                         s3_endpoints[vpce["VpcId"]].append(vpce)
+        # AIR-SGM-TRN-01: a gateway endpoint serves only the route tables it is
+        # associated with, and an interface endpoint only the Availability
+        # Zones it has a network interface in.
+        explicit_tables, main_tables = {}, {}
+        route_paginator = ec2_client.get_paginator("describe_route_tables")
+        for chunk in _chunked(sorted(present), SUBNET_LOOKUP_BATCH_SIZE):
+            for page in route_paginator.paginate(
+                Filters=[{"Name": "vpc-id", "Values": chunk}]
+            ):
+                for table in page.get("RouteTables", []):
+                    for association in table.get("Associations", []):
+                        if association.get("SubnetId"):
+                            explicit_tables[association["SubnetId"]] = table.get(
+                                "RouteTableId"
+                            )
+                        elif association.get("Main") is True and table.get("VpcId"):
+                            main_tables[table["VpcId"]] = table.get("RouteTableId")
+        for subnet_id, vpc_id in subnet_vpcs.items():
+            table_id = explicit_tables.get(subnet_id) or main_tables.get(vpc_id)
+            if table_id:
+                subnet_tables[subnet_id] = table_id
+        endpoint_subnets = sorted(
+            {
+                subnet_id
+                for by_service in service_endpoints.values()
+                for vpces in by_service.values()
+                for vpce in vpces
+                if vpce.get("VpcEndpointType") != "Gateway"
+                for subnet_id in vpce.get("SubnetIds") or []
+                if subnet_id not in subnet_azs
+            }
+        )
+        read_subnets(endpoint_subnets, False)
     except Exception as error:
         logger.warning(f"Error reading training VPC endpoints: {str(error)}")
         return [
@@ -11525,7 +11754,7 @@ def _training_vpc_endpoint_findings(
                 finding_details=(
                     f"The VPC endpoints of the {len(jobs_in_vpc)} VPC-attached "
                     f"{subject}(s) were not read (ec2:DescribeSubnets, "
-                    "ec2:DescribeVpcEndpoints: "
+                    "ec2:DescribeVpcEndpoints, ec2:DescribeRouteTables: "
                     f"{get_assessment_error_label(error)})."
                 ),
                 resolution=COULD_NOT_ASSESS_RESOLUTION,
@@ -11548,6 +11777,55 @@ def _training_vpc_endpoint_findings(
                 if any(subnet_vpcs.get(s) == vpc_id for s in job["subnets"])
             }
         )
+        vpc_subnets = [s for s in subnets if subnet_vpcs.get(s) == vpc_id]
+        uncovered = []
+        reach_unread = []
+        for service in services:
+            vpces = service_endpoints[vpc_id].get(service) or []
+            if not vpces:
+                continue
+            tables = {
+                table_id
+                for vpce in vpces
+                if vpce.get("VpcEndpointType") == "Gateway"
+                for table_id in vpce.get("RouteTableIds") or []
+            }
+            interface_subnets = [
+                subnet_id
+                for vpce in vpces
+                if vpce.get("VpcEndpointType") != "Gateway"
+                for subnet_id in vpce.get("SubnetIds") or []
+            ]
+            zones = {subnet_azs[s] for s in interface_subnets if s in subnet_azs}
+            zones_unread = [s for s in interface_subnets if s not in subnet_azs]
+            gaps = []
+            for subnet_id in vpc_subnets:
+                if subnet_tables.get(subnet_id) in tables or (
+                    subnet_azs.get(subnet_id) in zones
+                ):
+                    continue
+                if (
+                    subnet_id not in subnet_tables
+                    or subnet_id not in subnet_azs
+                    or zones_unread
+                ):
+                    reach_unread.append(
+                        f"whether the {prefix + service} endpoint reaches subnet "
+                        f"{subnet_id} in {vpc_id} (its route table, its "
+                        "Availability Zone or the endpoint's subnets were not read)"
+                    )
+                    continue
+                gaps.append(
+                    f"{subnet_id} (route table {subnet_tables[subnet_id]}, "
+                    f"{subnet_azs[subnet_id]})"
+                )
+            if gaps:
+                uncovered.append(
+                    f"the {prefix + service} endpoint(s) "
+                    f"{', '.join(str(v.get('VpcEndpointId')) for v in vpces)} serve "
+                    f"neither the route table nor the Availability Zone of subnet(s) "
+                    f"{', '.join(gaps[:5])}"
+                )
         broad = []
         policy_unread = []
         if judge_s3_policy and not missing:
@@ -11590,8 +11868,36 @@ def _training_vpc_endpoint_findings(
                     region=region,
                 )
             )
-        elif policy_unread:
-            unread.extend(policy_unread)
+        elif uncovered:
+            emitted.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"VPC {vpc_id}, used by {subject}(s) "
+                        f"{', '.join(jobs[:5])}: {'; '.join(uncovered)}. A gateway "
+                        "endpoint carries traffic only for the route tables it is "
+                        "associated with, and an interface endpoint has a network "
+                        "interface only in the Availability Zones of its subnets."
+                        + (
+                            f" Also missing: {', '.join(prefix + m for m in missing)}."
+                            if missing
+                            else ""
+                        )
+                    ),
+                    resolution=(
+                        "Associate the gateway endpoint with the route table of "
+                        "every job subnet, and add a subnet in each job subnet's "
+                        "Availability Zone to the interface endpoint."
+                    ),
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        elif policy_unread or reach_unread:
+            unread.extend(policy_unread + reach_unread)
         elif missing:
             emitted.append(
                 create_finding(
@@ -11616,14 +11922,17 @@ def _training_vpc_endpoint_findings(
     unresolved = [s for s in subnets if s not in subnet_vpcs]
     read_details = (
         f"{len(complete)} VPC(s) used by {subject}s have an endpoint for every "
-        f"required service: {', '.join(complete) or 'none'}."
+        "required service that serves each job subnet, through its route table "
+        "for a gateway endpoint or its Availability Zone for an interface "
+        f"endpoint: {', '.join(complete) or 'none'}."
     )
     if judge_s3_policy:
         read_details += (
-            " Their S3 endpoint policies do not grant object reads and writes on "
-            "every bucket to any principal; whether the buckets and principals "
-            "they name are the job's own is a workload decision this check does "
-            "not judge."
+            " Their S3 endpoint policies grant object reads and writes only on "
+            "buckets named without a wildcard, or only to named roles or users on "
+            "bucket patterns short of every bucket. Deny statements were not "
+            "evaluated; whether the buckets and principals they name are the "
+            "job's own is a workload decision this check does not judge."
         )
     unread.extend(f"subnet {s} (not found by ec2:DescribeSubnets)" for s in unresolved)
     if unread:
@@ -12845,9 +13154,15 @@ def _creation_category_finding(
         v1 = v1 or identity["v1"]
         scp_reason = _creation_scp_reason(scp_leg, scp)
         if identity["state"] == "guarded":
+            # AIR-SGM-TRN-08: identity policies bind roles and users only. The
+            # account root user is bound by no identity policy, so without an
+            # attached SCP it can still make the call without the key.
             used_identity = True
-            met.append(
-                f"{label} by the identity policies of every principal that can call it"
+            failed.append(
+                f"{label}: {scp_reason}, and although the identity policies of "
+                "every IAM role and user that can call it enforce it, the account "
+                "root user is bound by no identity policy and can call it with no "
+                "condition on that key"
             )
         elif identity["state"] == "open" and scp_leg["state"] in (
             "missing",
@@ -17248,6 +17563,11 @@ def _iot_resource_bounded_to_thing(resource: str) -> bool:
     parts = resource.split(IOT_THING_NAME_VARIABLE)
     if len(parts) < 2:
         return False
+    # A wildcard before the variable (topic/*/${ThingName}) matches across
+    # path segments, so it reaches topics under other devices' names too.
+    path = parts[0].split(":", 5)[-1] if parts[0].startswith("arn:") else parts[0]
+    if "*" in path or "?" in path:
+        return False
     return all(part.endswith("/") for part in parts[:-1]) and all(
         part == "" or part.startswith("/") for part in parts[1:]
     )
@@ -17303,6 +17623,43 @@ def _iot_policy_problems(document: Any) -> List[str]:
                 "to a thing"
             )
     return problems
+
+
+CREDENTIALS_IOT_VARIABLE = "${credentials-iot:"
+
+
+def _credentials_iot_bounded(value: str) -> bool:
+    """True when a value names a credentials-iot variable with no wildcard before it."""
+    text = str(value).lower()
+    if CREDENTIALS_IOT_VARIABLE not in text:
+        return False
+    before = text.split(CREDENTIALS_IOT_VARIABLE, 1)[0]
+    if before.startswith("arn:"):
+        before = before.split(":", 5)[-1]
+    return "*" not in before and "?" not in before
+
+
+def _credentials_iot_scoped(statement: Dict[str, Any]) -> bool:
+    """
+    AIR-PHY-EDG-01: an Allow is device-scoped when every Resource value is
+    bounded by a credentials-iot variable, or a positive condition requires a
+    value bounded by one. A Not operator, IfExists, Null or ForAllValues (true
+    on an absent key) leaves the grant open to every device.
+    """
+    resources = _policy_values(statement.get("Resource"))
+    if (
+        "NotResource" not in statement
+        and resources
+        and all(_credentials_iot_bounded(r) for r in resources)
+    ):
+        return True
+    for operator, _, values in _condition_entries(statement):
+        prefix, base, if_exists = _condition_operator_parts(operator)
+        if if_exists or "not" in base or base == "null" or prefix == "forallvalues":
+            continue
+        if values and all(_credentials_iot_bounded(v) for v in values):
+            return True
+    return False
 
 
 def _iot_role_alias_findings(
@@ -17364,17 +17721,23 @@ def _iot_role_alias_findings(
             unread.append(
                 f"role alias '{alias}' role {role_arn} (IAM cache read error)"
             )
-        elif any(
-            str(statement.get("Effect", "")).upper() == "ALLOW"
-            and "credentials-iot:"
-            in json.dumps([statement.get("Resource"), statement.get("Condition")])
-            for policy in (cached[name].get("attached_policies") or [])
-            + (cached[name].get("inline_policies") or [])
-            for statement in _sm_policy_statements(policy.get("document"))
-        ):
-            scoped.append(alias)
         else:
-            unscoped.append((alias, name))
+            allows = [
+                statement
+                for policy in (cached[name].get("attached_policies") or [])
+                + (cached[name].get("inline_policies") or [])
+                for statement in _sm_policy_statements(policy.get("document"))
+                if str(statement.get("Effect", "")).upper() == "ALLOW"
+            ]
+            open_sids = [
+                str(statement.get("Sid") or f"statement {index + 1}")
+                for index, statement in enumerate(allows)
+                if not _credentials_iot_scoped(statement)
+            ]
+            if allows and not open_sids:
+                scoped.append(alias)
+            else:
+                unscoped.append((alias, name, open_sids))
 
     def _row(details, resolution, severity, status):
         return create_finding(
@@ -17389,13 +17752,19 @@ def _iot_role_alias_findings(
         )
 
     rows = []
-    for alias, name in unscoped[:20]:
+    for alias, name, open_sids in unscoped[:20]:
         rows.append(
             _row(
                 f"AWS IoT role alias '{alias}' hands devices credentials for role "
-                f"'{name}', and no Allow statement of that role names a "
-                "credentials-iot policy variable in its Resource or Condition, so "
-                "every device that assumes the alias gets the same AWS access.",
+                f"'{name}', and "
+                + (
+                    f"its Allow statement(s) {', '.join(open_sids[:5])} are not "
+                    "bounded by a credentials-iot policy variable in every "
+                    "Resource or in a positive Condition"
+                    if open_sids
+                    else "that role has no Allow statement in the IAM cache"
+                )
+                + ", so every device that assumes the alias gets that AWS access.",
                 "Scope the role's Resource or Condition to the calling device with "
                 "${credentials-iot:ThingName}, ${credentials-iot:ThingTypeName} or "
                 "${credentials-iot:AwsCertificateId}.",
@@ -17427,11 +17796,10 @@ def _iot_role_alias_findings(
     elif scoped and not unscoped:
         rows.append(
             _row(
-                f"The roles of all {len(scoped)} role alias(es) name a "
-                "credentials-iot policy variable in the Resource or Condition of "
-                f"at least one Allow statement: {', '.join(sorted(scoped)[:5])}. "
-                "Whether every statement of the role is device-scoped is not "
-                "judged.",
+                f"Every Allow statement of the roles of all {len(scoped)} role "
+                "alias(es) is bounded by a credentials-iot policy variable, in "
+                "every Resource or in a positive Condition: "
+                f"{', '.join(sorted(scoped)[:5])}.",
                 "No action required",
                 "High",
                 "Passed",
@@ -17731,11 +18099,12 @@ def _iot_audit_finding(iot_client, region: str) -> Dict[str, Any]:
             f"({get_assessment_error_label(error)})"
         )
 
+    covering = []
     try:
         scheduled = []
         for page in iot_client.get_paginator("list_scheduled_audits").paginate():
             scheduled.extend(page.get("scheduledAudits") or [])
-        covering, audits_unread = [], []
+        audits_unread = []
         for audit in scheduled:
             name = audit.get("scheduledAuditName")
             try:
@@ -17757,12 +18126,69 @@ def _iot_audit_finding(iot_client, region: str) -> Dict[str, Any]:
     except Exception as error:
         unread.append(f"iot:ListScheduledAudits ({get_assessment_error_label(error)})")
 
+    # AIR-PHY-EDG-01: a schedule proves nothing until one of its runs completes
+    # the check. The latest completed run of a covering scheduled audit is the
+    # one whose findings are judged; a monthly schedule runs inside the window.
+    latest_task = None
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=IOT_AUDIT_FINDING_WINDOW_DAYS)
+        task_ids = []
+        for page in iot_client.get_paginator("list_audit_tasks").paginate(
+            startTime=start,
+            endTime=end,
+            taskType="SCHEDULED_AUDIT_TASK",
+            taskStatus="COMPLETED",
+        ):
+            task_ids.extend(
+                task.get("taskId")
+                for task in page.get("tasks") or []
+                if task.get("taskId")
+            )
+        tasks_unread = []
+        for task_id in task_ids:
+            try:
+                task = iot_client.describe_audit_task(taskId=task_id)
+            except Exception as error:
+                tasks_unread.append(
+                    f"audit task {task_id} ({get_assessment_error_label(error)})"
+                )
+                continue
+            run = (task.get("auditDetails") or {}).get(
+                IOT_SHARED_CERTIFICATE_CHECK
+            ) or {}
+            started = task.get("taskStartTime")
+            if (
+                task.get("scheduledAuditName") in covering
+                and str(run.get("checkRunStatus", "")).startswith("COMPLETED_")
+                and isinstance(started, datetime)
+                and (latest_task is None or started > latest_task[1])
+            ):
+                latest_task = (task_id, started)
+        if latest_task is None:
+            if tasks_unread:
+                unread.extend(tasks_unread)
+            elif covering:
+                problems.append(
+                    "no run of the scheduled audit(s) "
+                    f"{', '.join(covering[:3])} completed the "
+                    f"{IOT_SHARED_CERTIFICATE_CHECK} check in the last "
+                    f"{IOT_AUDIT_FINDING_WINDOW_DAYS} days"
+                )
+    except Exception as error:
+        unread.append(f"iot:ListAuditTasks ({get_assessment_error_label(error)})")
+
     try:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=IOT_AUDIT_FINDING_WINDOW_DAYS)
         open_findings = {}
+        finding_scope = (
+            {"taskId": latest_task[0]}
+            if latest_task
+            else {"startTime": start, "endTime": end}
+        )
         for page in iot_client.get_paginator("list_audit_findings").paginate(
-            startTime=start, endTime=end, listSuppressedFindings=False
+            listSuppressedFindings=False, **finding_scope
         ):
             for audit_finding in page.get("findings") or []:
                 if audit_finding.get("isSuppressed"):
@@ -17774,8 +18200,12 @@ def _iot_audit_finding(iot_client, region: str) -> Dict[str, Any]:
                 f"{name} ({count})" for name, count in sorted(open_findings.items())
             )
             problems.append(
-                f"the last {IOT_AUDIT_FINDING_WINDOW_DAYS} days hold "
-                f"{sum(open_findings.values())} unsuppressed audit finding(s): {counts}"
+                (
+                    f"the latest completed audit run ({latest_task[0]}) holds "
+                    if latest_task
+                    else f"the last {IOT_AUDIT_FINDING_WINDOW_DAYS} days hold "
+                )
+                + f"{sum(open_findings.values())} unsuppressed audit finding(s): {counts}"
             )
     except Exception as error:
         unread.append(f"iot:ListAuditFindings ({get_assessment_error_label(error)})")
@@ -17804,8 +18234,9 @@ def _iot_audit_finding(iot_client, region: str) -> Dict[str, Any]:
         )
     return _row(
         f"The {IOT_SHARED_CERTIFICATE_CHECK} audit check is enabled, a scheduled "
-        "audit runs it, and the last "
-        f"{IOT_AUDIT_FINDING_WINDOW_DAYS} days hold no unsuppressed audit finding.",
+        f"audit runs it, its latest run ({latest_task[0]}, started "
+        f"{latest_task[1].isoformat()}) completed the check, and that run holds no "
+        "unsuppressed audit finding.",
         "No action required",
         "Medium",
         "Passed",

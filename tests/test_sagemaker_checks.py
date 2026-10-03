@@ -1724,11 +1724,58 @@ class TestSM10NotebookVPC:
         mock_sm.describe_notebook_instance.return_value = {
             "NotebookInstanceName": "nb-1",
             "SubnetId": "subnet-123",
+            "DirectInternetAccess": "Disabled",
         }
         result = check()
         findings = extract_csv_data(result)
         assert len(findings) >= 1
         assert findings[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize("direct_access", ["Enabled", None])
+    @patch("sagemaker_app.boto3.client")
+    def test_sm10_vpc_notebook_with_direct_internet_access_fails(
+        self, mock_client, direct_access
+    ):
+        # AIR-FND-NET-01: a VPC notebook with DirectInternetAccess Enabled has a
+        # SageMaker-managed internet path. One bad notebook of two withholds the
+        # Passed row, and an absent field is not read as Disabled.
+        notebooks = {
+            "nb-open": {"NotebookInstanceName": "nb-open", "SubnetId": "subnet-1"},
+            "nb-closed": {
+                "NotebookInstanceName": "nb-closed",
+                "SubnetId": "subnet-2",
+                "DirectInternetAccess": "Disabled",
+            },
+        }
+        if direct_access:
+            notebooks["nb-open"]["DirectInternetAccess"] = direct_access
+        mock_sm = MagicMock()
+        mock_client.return_value = mock_sm
+        paginator = MagicMock()
+        mock_sm.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"NotebookInstances": [{"NotebookInstanceName": n} for n in notebooks]}
+        ]
+        mock_sm.describe_notebook_instance.side_effect = lambda NotebookInstanceName: (
+            notebooks[NotebookInstanceName]
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_notebook_vpc_deployment(region="us-east-1")
+        )
+        direct = [
+            f
+            for f in findings
+            if f["Finding"] == "SageMaker Notebook Direct Internet Access in VPC"
+        ]
+        assert [f["Status"] for f in direct] == ["Failed"]
+        assert "'nb-open'" in direct[0]["Finding_Details"]
+        assert "nb-closed" not in direct[0]["Finding_Details"]
+        assert not [
+            f
+            for f in findings
+            if f["Finding"] == "SageMaker Notebook VPC Deployment Check"
+            and f["Status"] == "Passed"
+        ]
 
     @patch("sagemaker_app.boto3.client")
     def test_sm10_exception_returns_error_finding(self, mock_client):
@@ -4471,6 +4518,8 @@ class TestSM23MonitorReportAndAlarm:
             "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:ops"],
             "Namespace": namespace,
             "MetricName": "feature_baseline_drift_age",
+            "ComparisonOperator": "GreaterThanThreshold",
+            "Threshold": 0.1,
             "Dimensions": [
                 {"Name": "Endpoint", "Value": "ep"},
                 {"Name": "MonitoringSchedule", "Value": schedule},
@@ -4595,13 +4644,76 @@ class TestSM23MonitorReportAndAlarm:
             sagemaker_app.MONITOR_ALARM_FINDING,
             schedules=self._two(),
             details={"dq": self._detail(1), "mq": self._detail(1)},
-            alarms=[self._alarm("dq"), self._alarm("mq")],
+            alarms=[
+                self._alarm("dq"),
+                self._alarm("mq", "aws/sagemaker/Endpoints/model-metrics"),
+            ],
         )
         assert [r["Status"] for r in rows] == ["Passed"]
         assert (
-            "Which Model Monitor metric each alarm evaluates, and whether its "
-            "threshold marks drift for the model, are not judged."
+            "For ModelQuality, ModelBias and ModelExplainability schedules, and for "
+            "metric math, which metric the alarm evaluates and whether its "
+            "threshold marks a violation are not judged."
         ) in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_data_quality_namespace_alarm_does_not_credit_model_quality(
+        self, mock_client
+    ):
+        # AIR-SGM-EP-06: this pair passed before, because any Model Monitor
+        # namespace on the schedule's dimension credited it.
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=[self._alarm("dq"), self._alarm("mq")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ModelQuality metric of schedule 'mq'" in rows[0]["Finding_Details"]
+        assert "'dq'" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"MetricName": "feature_non_null_age"},
+            {"ComparisonOperator": "LessThanThreshold"},
+            {"Threshold": 1.0},
+            {"Threshold": 4.0},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_data_quality_alarm_that_cannot_mark_drift_does_not_credit(
+        self, mock_client, overrides
+    ):
+        weak = dict(self._alarm("dq"), **overrides)
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=[weak, self._alarm("mq", "aws/sagemaker/Endpoints/model-metrics")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "DataQuality metric of schedule 'dq'" in rows[0]["Finding_Details"]
+        assert "'mq'" not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_alarm_on_another_schedule_of_the_endpoint_does_not_credit(
+        self, mock_client
+    ):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=[
+                self._schedule("dq", "DataQuality"),
+                self._schedule("dq2", "DataQuality"),
+            ],
+            details={"dq": self._detail(1), "dq2": self._detail(1)},
+            alarms=[self._alarm("dq")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'dq2'" in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_one_unalarmed_schedule_among_alarmed_fails(self, mock_client):
@@ -4681,15 +4793,17 @@ class TestSM23MonitorReportAndAlarm:
         ],
     )
     @patch("sagemaker_app.boto3.client")
-    def test_either_doc_dimension_alone_credits_only_its_schedule(
+    def test_either_doc_dimension_alone_credits_no_schedule(
         self, mock_client, dimensions
     ):
+        # Stricter than before: Model Monitor publishes under both dimensions,
+        # so an alarm naming one of them reads a series that never exists.
         alarm = self._doc_alarm("dq", "ep")
         alarm["Dimensions"] = dimensions
         rows = self._split_rows(mock_client, [alarm])
-        assert [r["Status"] for r in rows] == ["Failed"]
-        assert "'mq'" in rows[0]["Finding_Details"]
-        assert "'dq'" not in rows[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "'mq'" in rows[1]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "namespace",
@@ -5835,6 +5949,18 @@ def _orgs_path_client(master="999999999999", parents=None, parents_error=None):
     return orgs
 
 
+# AIR-SGM-TRN-08: identity policies bind roles and users, never the account
+# root user, so an identity-only guard leaves the requirement open. Tests that
+# passed on identity policies alone now fail on the root user, and name no role.
+ROOT_USER_OPEN = "the account root user is bound by no identity policy"
+
+
+def _assert_open_only_to_root(row):
+    assert row["Status"] == "Failed"
+    assert ROOT_USER_OPEN in row["Finding_Details"]
+    assert "Role '" not in row["Finding_Details"]
+
+
 class TestSM34CreationGuardrails:
     """AIR-SGM-TRN-08: SM-34 asserts creation of non-compliant resources is denied."""
 
@@ -6251,11 +6377,12 @@ class TestSM34CreationGuardrails:
             assert row["Status"] == "N/A"
             assert "alongside other conditions" in row["Finding_Details"]
 
-    def test_identity_conditions_pass_when_every_principal_is_guarded(self):
+    def test_identity_conditions_on_every_principal_leave_the_root_user_open(self):
         cache = _creation_cache({"Builder": GUARDED_CREATE_ALLOWS})
         findings = self._run(self._inventory(), cache=cache)
-        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
-        assert "identity policies of every principal" in findings[0]["Finding_Details"]
+        for finding in findings:
+            _assert_open_only_to_root(finding)
+        assert "every IAM role and user" in findings[0]["Finding_Details"]
         assert "not evaluated per principal" in findings[0]["Finding_Details"]
 
     def test_one_open_principal_among_two_fails_and_is_named(self):
@@ -6289,7 +6416,8 @@ class TestSM34CreationGuardrails:
             boundaries={"Admin": GUARDED_CREATE_ALLOWS},
         )
         findings = self._run(self._inventory(), cache=cache)
-        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
+        for finding in findings:
+            _assert_open_only_to_root(finding)
 
     def test_an_open_boundary_does_not_hide_an_open_policy(self):
         cache = _creation_cache(
@@ -6315,10 +6443,11 @@ class TestSM34CreationGuardrails:
         assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
         assert "role 'Hidden'" in findings[0]["Finding_Details"]
 
-    def test_a_v1_cache_passes_and_says_errors_were_not_recorded(self):
+    def test_a_v1_cache_says_errors_were_not_recorded(self):
         cache = _creation_cache({"Builder": GUARDED_CREATE_ALLOWS}, version=1)
         findings = self._run(self._inventory(), cache=cache)
-        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
+        for finding in findings:
+            _assert_open_only_to_root(finding)
         assert (
             sagemaker_app.UNRECORDED_PRINCIPAL_ERRORS_NOTE
             in findings[0]["Finding_Details"]
@@ -6342,7 +6471,8 @@ class TestSM34CreationGuardrails:
             cache=_creation_cache({"Builder": GUARDED_CREATE_ALLOWS}),
             management=True,
         )
-        assert [f["Status"] for f in guarded] == ["Passed", "Passed", "Passed"]
+        for finding in guarded:
+            _assert_open_only_to_root(finding)
 
     def test_inventory_reads_attachment_targets_for_every_policy(self):
         orgs = MagicMock()
@@ -6839,6 +6969,7 @@ class TestSubnetExposurePerCheck:
                     "NotebookInstanceName": "nb-public",
                     "SubnetId": "subnet-public",
                     "VpcId": "vpc-1",
+                    "DirectInternetAccess": "Disabled",
                 }
             },
             _ec2_exposure_client(*PUBLIC_SUBNET_FIXTURE),
@@ -6868,6 +6999,7 @@ class TestSubnetExposurePerCheck:
                     "NotebookInstanceName": "nb-private",
                     "SubnetId": "subnet-private",
                     "VpcId": "vpc-1",
+                    "DirectInternetAccess": "Disabled",
                 }
             },
             _ec2_exposure_client(*PRIVATE_SUBNET_FIXTURE),
@@ -11496,6 +11628,18 @@ class TestSM40RotationHistoryAndPropagation:
         assert "secretsmanager:ListSecrets" in rows[0]["Finding_Details"]
 
 
+def _audit_task(scheduled, started, run_status="COMPLETED_COMPLIANT"):
+    return {
+        "taskStatus": "COMPLETED",
+        "taskType": "SCHEDULED_AUDIT_TASK",
+        "taskStartTime": started,
+        "scheduledAuditName": scheduled,
+        "auditDetails": {
+            sagemaker_app.IOT_SHARED_CERTIFICATE_CHECK: {"checkRunStatus": run_status}
+        },
+    }
+
+
 class TestSM41IoTDeviceScopedPolicies:
     """AIR-PHY-EDG-01: thing-name scoping plus an attached-thing condition."""
 
@@ -11531,9 +11675,20 @@ class TestSM41IoTDeviceScopedPolicies:
         errors=None,
         group_things=None,
         thing_principals=None,
+        audit_tasks=None,
     ):
         client = MagicMock()
         errors = errors or {}
+        # {taskId: DescribeAuditTask}; by default one run of "daily" completed
+        # the shared-certificate check.
+        audit_tasks = (
+            audit_tasks
+            if audit_tasks is not None
+            else {
+                "t-1": _audit_task("daily", datetime.now(timezone.utc) - timedelta(1))
+            }
+        )
+        client.audit_findings_calls = []
         principal_things = principal_things or {}
         group_things = group_things or {}
         thing_principals = thing_principals or {}
@@ -11595,12 +11750,26 @@ class TestSM41IoTDeviceScopedPolicies:
                         },
                     ],
                 ),
-                "list_audit_findings": raising(
-                    "list_audit_findings", [{"findings": audit_findings or []}]
+                "list_audit_findings": lambda **kwargs: (
+                    client.audit_findings_calls.append(kwargs)
+                    or raising(
+                        "list_audit_findings", [{"findings": audit_findings or []}]
+                    )()
+                ),
+                "list_audit_tasks": raising(
+                    "list_audit_tasks",
+                    [{"tasks": []}, {"tasks": [{"taskId": t} for t in audit_tasks]}],
                 ),
                 "list_role_aliases": [{"roleAliases": []}],
             }
         )
+
+        def describe_audit_task(taskId):
+            if taskId in errors:
+                raise errors[taskId]
+            return audit_tasks[taskId]
+
+        client.describe_audit_task.side_effect = describe_audit_task
 
         def describe_config():
             if "describe_account_audit_configuration" in errors:
@@ -11849,6 +12018,59 @@ class TestSM41RoleAliasDeviceScope:
         assert "role alias 'b'" in rows[0]["Finding_Details"]
         assert "role-b" in rows[0]["Finding_Details"]
 
+    def test_one_fleet_wide_statement_beside_a_scoped_one_fails(self):
+        # AIR-PHY-EDG-01: one scoped Allow used to pass the whole role.
+        rows = self._run(
+            {"a": "role-a"},
+            self._cache(**{"role-a": [_THING_SCOPED, dict(_FLEET_WIDE, Sid="Fleet")]}),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Allow statement(s) Fleet" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            dict(_THING_SCOPED, Resource="arn:aws:s3:::*/${credentials-iot:ThingName}"),
+            dict(
+                _THING_SCOPED,
+                Resource=[
+                    "arn:aws:s3:::telemetry/${credentials-iot:ThingName}/*",
+                    "arn:aws:s3:::shared/*",
+                ],
+            ),
+            dict(
+                _FLEET_WIDE,
+                Condition={
+                    "StringNotEquals": {"s3:prefix": "${credentials-iot:ThingName}"}
+                },
+            ),
+            dict(
+                _FLEET_WIDE,
+                Condition={
+                    "StringLikeIfExists": {"s3:prefix": "${credentials-iot:ThingName}"}
+                },
+            ),
+            dict(
+                _FLEET_WIDE,
+                Condition={
+                    "ForAllValues:StringLike": {
+                        "s3:prefix": "${credentials-iot:ThingName}/*"
+                    }
+                },
+            ),
+            dict(
+                _FLEET_WIDE,
+                Condition={
+                    "StringLike": {"s3:prefix": "*/${credentials-iot:ThingName}"}
+                },
+            ),
+        ],
+    )
+    def test_a_variable_that_does_not_bound_the_grant_does_not_scope(self, statement):
+        # Each of these held the 'credentials-iot:' substring and passed.
+        rows = self._run({"a": "role-a"}, self._cache(**{"role-a": [statement]}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+
     def test_variable_only_in_a_deny_statement_does_not_scope(self):
         deny = dict(_THING_SCOPED, Effect="Deny")
         rows = self._run(
@@ -11958,6 +12180,11 @@ class TestSM41DeviceIdentityAndAudit:
             _IOT_TOPIC + "devices/*${iot:Connection.Thing.ThingName}/*",
             _IOT_TOPIC + "devices/x-${iot:Connection.Thing.ThingName}",
             _IOT_CLIENT + "*${iot:Connection.Thing.ThingName}",
+            # AIR-PHY-EDG-01: '*' spans segments, so these reach topics under
+            # other devices' names. Both passed before.
+            _IOT_TOPIC + "*/${iot:Connection.Thing.ThingName}",
+            _IOT_TOPIC + "devices/*/${iot:Connection.Thing.ThingName}/*",
+            _IOT_TOPIC + "d?vices/${iot:Connection.Thing.ThingName}",
         ],
     )
     @patch("sagemaker_app.boto3.client")
@@ -12152,6 +12379,43 @@ class TestSM41DeviceIdentityAndAudit:
         row = by_name[sagemaker_app.IOT_AUDIT_FINDING]
         assert row["Status"] == "Passed"
 
+    @patch("sagemaker_app.boto3.client")
+    def test_the_latest_completed_run_is_the_one_judged(self, mock_client):
+        # AIR-PHY-EDG-01: findings are read for the latest completed run of a
+        # covering scheduled audit, not a 31-day window.
+        now = datetime.now(timezone.utc)
+        tasks = {
+            "t-old": _audit_task("daily", now - timedelta(3)),
+            "t-new": _audit_task("daily", now - timedelta(1)),
+            "t-other": _audit_task("other", now - timedelta(hours=1)),
+            "t-failed": _audit_task("daily", now - timedelta(hours=2), "FAILED"),
+        }
+        by_name, _ = self._run(mock_client, audit_tasks=tasks)
+        row = by_name[sagemaker_app.IOT_AUDIT_FINDING]
+        assert row["Status"] == "Passed"
+        assert "latest run (t-new," in row["Finding_Details"]
+        calls = mock_client.return_value.audit_findings_calls
+        assert calls and all(c.get("taskId") == "t-new" for c in calls)
+
+    @pytest.mark.parametrize(
+        "tasks",
+        [
+            {},
+            {"t-1": _audit_task("other", datetime.now(timezone.utc))},
+            {"t-1": _audit_task("daily", datetime.now(timezone.utc), "FAILED")},
+            {"t-1": _audit_task("daily", datetime.now(timezone.utc), "CANCELED")},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_schedule_with_no_completed_run_fails(self, mock_client, tasks):
+        by_name, _ = self._run(mock_client, audit_tasks=tasks)
+        row = by_name[sagemaker_app.IOT_AUDIT_FINDING]
+        assert row["Status"] == "Failed"
+        assert (
+            "no run of the scheduled audit(s) daily completed"
+            in (row["Finding_Details"])
+        )
+
     @pytest.mark.parametrize(
         "kwargs,text",
         [
@@ -12204,6 +12468,8 @@ class TestSM41DeviceIdentityAndAudit:
             ("list_scheduled_audits", "iot:ListScheduledAudits"),
             ("list_audit_findings", "iot:ListAuditFindings"),
             ("daily", "scheduled audit 'daily'"),
+            ("list_audit_tasks", "iot:ListAuditTasks"),
+            ("t-1", "audit task t-1"),
         ],
     )
     @patch("sagemaker_app.boto3.client")
@@ -12862,6 +13128,7 @@ def _sm11_rows(
     permission_cache=None,
     key_managers=None,
     components=None,
+    subnet_fixtures=(PRIVATE_SUBNET_FIXTURE,),
 ):
     """Run SM-11 against models {name: DescribeModel}, endpoints {name: config}.
 
@@ -12928,8 +13195,10 @@ def _sm11_rows(
         ),
     )
     ec2_pages = {
-        "describe_subnets": [{"Subnets": PRIVATE_SUBNET_FIXTURE[0]}],
-        "describe_route_tables": [{"RouteTables": PRIVATE_SUBNET_FIXTURE[1]}],
+        "describe_subnets": [{"Subnets": [s for f in subnet_fixtures for s in f[0]]}],
+        "describe_route_tables": [
+            {"RouteTables": [t for f in subnet_fixtures for t in f[1]]}
+        ],
         "describe_vpc_endpoints": vpces
         if isinstance(vpces, Exception)
         else [{"VpcEndpoints": vpces or []}],
@@ -13170,6 +13439,72 @@ class TestSM11EndpointModelNetworkPath:
         assert (
             "model 'open' of inference component 'ic-b'" in (rows[0]["Finding_Details"])
         )
+
+    def test_an_inference_component_config_in_a_public_subnet_fails_alone(self):
+        public_config = dict(
+            self.IC_CONFIG,
+            VpcConfig={"Subnets": ["subnet-public"], "SecurityGroupIds": ["sg-1"]},
+        )
+        rows, _ = _sm11_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-a": "cfg-private", "ep-b": "cfg-public"},
+            configs={"cfg-private": self.IC_CONFIG, "cfg-public": public_config},
+            components={
+                "ic-a": self._component("ep-a", "good"),
+                "ic-b": self._component("ep-b", "good"),
+            },
+            subnet_fixtures=(PRIVATE_SUBNET_FIXTURE, PUBLIC_SUBNET_FIXTURE),
+        )
+        exposure = _by_finding(
+            rows, sagemaker_app.ENDPOINT_CONFIG_SUBNET_EXPOSURE_FINDING
+        )
+        failed = [r for r in exposure if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        details = failed[0]["Finding_Details"]
+        assert "Endpoint config 'cfg-public' of endpoint 'ep-b'" in details
+        assert "subnet-public" in details
+        assert "cfg-private" not in details
+        assert not [
+            r
+            for r in exposure
+            if r["Status"] == "Passed" and "cfg-public" in r["Finding_Details"]
+        ]
+
+    @pytest.mark.parametrize(
+        "vpc_config",
+        [
+            {"Subnets": ["subnet-private"]},
+            {"Subnets": [], "SecurityGroupIds": ["sg-1"]},
+            None,
+        ],
+    )
+    def test_an_inference_component_config_without_subnets_and_groups_fails(
+        self, vpc_config
+    ):
+        bare = dict(self.IC_CONFIG)
+        bare.pop("VpcConfig")
+        if vpc_config is not None:
+            bare["VpcConfig"] = vpc_config
+        rows, _ = _sm11_rows(
+            {"good": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-a": "cfg", "ep-b": "cfg-bare"},
+            configs={"cfg": self.IC_CONFIG, "cfg-bare": bare},
+            components={
+                "ic-a": self._component("ep-a", "good"),
+                "ic-b": self._component("ep-b", "good"),
+            },
+        )
+        network = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in network] == ["Failed"]
+        assert (
+            "endpoint config 'cfg-bare' (inference-component variants) has no "
+            "VpcConfig with subnets and security groups"
+        ) in network[0]["Finding_Details"]
+        assert "ep-a" not in network[0]["Finding_Details"]
+        exposure = _by_finding(
+            rows, sagemaker_app.ENDPOINT_CONFIG_SUBNET_EXPOSURE_FINDING
+        )
+        assert [r["Status"] for r in exposure] == ["Passed"]
 
     def test_inference_components_on_isolated_models_pass(self):
         rows = self._ic_rows(
@@ -13771,8 +14106,24 @@ class TestSM11InvokeSourceNetwork:
 # ===================================================================
 # SM-33 full grade: AIR-SGM-TRN-01
 # ===================================================================
-def _vpce(vpc_id, service, endpoint_type="Interface", state="available", dns=True):
-    return {
+# The job subnet and its route tables in each fixture VPC, so a default
+# endpoint serves the subnet the SM-18 and SM-33 fixtures place jobs in.
+_VPCE_REACH = {
+    "vpc-1": (["subnet-a"], ["rtb-a", "rtb-subnet-a"]),
+    "vpc-2": (["subnet-b"], ["rtb-subnet-b"]),
+}
+
+
+def _vpce(
+    vpc_id,
+    service,
+    endpoint_type="Interface",
+    state="available",
+    dns=True,
+    subnets=None,
+    route_tables=None,
+):
+    vpce = {
         "VpcEndpointId": f"vpce-{vpc_id}-{service}",
         "VpcId": vpc_id,
         "ServiceName": f"com.amazonaws.us-east-1.{service}",
@@ -13780,6 +14131,14 @@ def _vpce(vpc_id, service, endpoint_type="Interface", state="available", dns=Tru
         "State": state,
         "PrivateDnsEnabled": dns,
     }
+    default_subnets, default_tables = _VPCE_REACH.get(vpc_id, ([], []))
+    if endpoint_type == "Gateway":
+        vpce["RouteTableIds"] = (
+            route_tables if route_tables is not None else default_tables
+        )
+    else:
+        vpce["SubnetIds"] = subnets if subnets is not None else default_subnets
+    return vpce
 
 
 def _full_training_vpces(vpc_id):
@@ -13927,6 +14286,63 @@ class TestSM33VpcEndpointCoverage:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "vpc-1" in rows[0]["Finding_Details"]
         assert "vpc-2" in rows[0]["Finding_Details"]
+
+    def test_s3_gateway_not_associated_with_the_job_route_table_fails(self):
+        # AIR-SGM-TRN-01: an S3 gateway endpoint on another route table carries
+        # none of the job subnet's traffic, and this passed before.
+        vpces = [
+            v for v in _full_training_vpces("vpc-1") if "s3" not in v["ServiceName"]
+        ] + [_vpce("vpc-1", "s3", "Gateway", dns=None, route_tables=["rtb-other"])]
+        rows = _sm33_rows({"a": _in_vpc_job("subnet-a")}, vpces=vpces)
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "com.amazonaws.us-east-1.s3 endpoint(s) vpce-vpc-1-s3"
+            in (rows[0]["Finding_Details"])
+        )
+        assert (
+            "subnet-a (route table rtb-subnet-a, us-east-1a)"
+            in (rows[0]["Finding_Details"])
+        )
+        assert "logs" not in rows[0]["Finding_Details"]
+
+    def test_interface_endpoint_without_an_interface_in_the_job_zone_fails(self):
+        subnets = [
+            _subnet("subnet-a", "vpc-1"),
+            dict(_subnet("subnet-c", "vpc-1"), AvailabilityZone="us-east-1c"),
+            dict(_subnet("subnet-e", "vpc-1"), AvailabilityZone="us-east-1e"),
+        ]
+        vpces = [
+            v for v in _full_training_vpces("vpc-1") if "logs" not in v["ServiceName"]
+        ] + [_vpce("vpc-1", "logs", subnets=["subnet-a", "subnet-e"])]
+        rows = _sm33_rows(
+            {"a": _in_vpc_job("subnet-a"), "c": _in_vpc_job("subnet-c")},
+            subnets=subnets,
+            vpces=[
+                dict(v, RouteTableIds=["rtb-subnet-a", "rtb-subnet-c"])
+                if v["VpcEndpointType"] == "Gateway"
+                else dict(v, SubnetIds=v["SubnetIds"] + ["subnet-c"])
+                if "logs" not in v["ServiceName"]
+                else v
+                for v in vpces
+            ],
+        )
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "com.amazonaws.us-east-1.logs endpoint(s)" in details
+        assert "subnet-c (route table rtb-subnet-c, us-east-1c)" in details
+        assert "subnet-a (" not in details
+        assert "ecr.api" not in details
+
+    def test_unread_endpoint_subnet_withholds_the_pass(self):
+        vpces = [
+            v for v in _full_training_vpces("vpc-1") if "logs" not in v["ServiceName"]
+        ] + [_vpce("vpc-1", "logs", subnets=["subnet-gone"])]
+        rows = _sm33_rows({"a": _in_vpc_job("subnet-a")}, vpces=vpces)
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "logs endpoint reaches subnet subnet-a" in rows[0]["Finding_Details"]
 
     def test_endpoint_read_denied_is_incomplete(self):
         rows = _sm33_rows(
@@ -14135,6 +14551,13 @@ class TestSM18TransformJobBoundary:
         "job,models,text",
         [
             (_transform_job(output=None), None, "TransformOutput.KmsKeyId is not set"),
+            # AIR-SGM-EP-08: a job with no volume key was counted in the Passed
+            # row that claims customer managed keys for the volume.
+            (
+                _transform_job(volume=None),
+                None,
+                "TransformResources.VolumeKmsKeyId is not set",
+            ),
             (
                 _transform_job(model="open"),
                 {"open": {"EnableNetworkIsolation": True}},
@@ -14333,10 +14756,11 @@ class TestSM18TransformJobBoundary:
         assert [r["Status"] for r in row] == ["Failed"]
         assert "on every bucket to any principal" in row[0]["Finding_Details"]
 
+    # AIR-SGM-EP-08: these two passed before because the principal was named.
+    # Every bucket through the endpoint leaves no bucket boundary, so they fail.
     @pytest.mark.parametrize(
         "policy",
         [
-            _s3_endpoint_policy(["arn:aws:s3:::data", "arn:aws:s3:::data/*"]),
             _s3_endpoint_policy(
                 "*", principal={"AWS": "arn:aws:iam::123456789012:role/exec"}
             ),
@@ -14347,6 +14771,41 @@ class TestSM18TransformJobBoundary:
                         "aws:PrincipalArn": "arn:aws:iam::123456789012:role/exec"
                     }
                 },
+            ),
+        ],
+    )
+    def test_named_principal_on_every_bucket_fails(self, policy):
+        rows = _sm18_rows(
+            {"j": _transform_job()}, vpces=[_scoped_s3_gateway("vpc-1", policy)]
+        )
+        row = _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+        assert [r["Status"] for r in row] == ["Failed"]
+        assert "on every bucket" in row[0]["Finding_Details"]
+        assert "any principal" not in row[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "resource",
+        ["arn:aws:s3:::data-*/*", "arn:aws:s3:::dat?/*", "arn:aws:s3:::*a/*"],
+    )
+    def test_any_principal_on_a_wildcard_bucket_pattern_fails(self, resource):
+        rows = _sm18_rows(
+            {"j": _transform_job()},
+            vpces=[_scoped_s3_gateway("vpc-1", _s3_endpoint_policy(resource))],
+        )
+        row = _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+        assert [r["Status"] for r in row] == ["Failed"]
+        assert (
+            f"bucket pattern(s) with a wildcard: {resource}"
+            in (row[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            _s3_endpoint_policy(["arn:aws:s3:::data", "arn:aws:s3:::data/*"]),
+            _s3_endpoint_policy(
+                "arn:aws:s3:::data-*/*",
+                principal={"AWS": "arn:aws:iam::123456789012:role/exec"},
             ),
         ],
     )
@@ -15338,6 +15797,12 @@ _CLEAN_CACHE = _environment_cache(
 )
 
 
+_DELIVERING_STATUS = {
+    "IsLogging": True,
+    "LatestCloudWatchLogsDeliveryTime": datetime(2026, 1, 1, tzinfo=timezone.utc),
+}
+
+
 def _sm09_rows(
     notebooks=None,
     domains=None,
@@ -15425,7 +15890,7 @@ def _sm09_rows(
             "trailList": [_GOOD_TRAIL] if trails is None else trails
         }
     cloudtrail.get_trail_status.side_effect = lambda Name: lookup(
-        statuses, Name, {"IsLogging": True}
+        statuses, Name, _DELIVERING_STATUS
     )
     cloudtrail.get_event_selectors.side_effect = lambda TrailName: lookup(
         selectors, TrailName, _ALL_MANAGEMENT
@@ -15524,6 +15989,40 @@ class TestSM09ExecutionRolePrivilege:
                 "arn:aws:iam::123456789012:policy/custom",
                 [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
             ),
+            # AIR-SGM-TRN-05: partial wildcards on every resource passed before.
+            (
+                "custom",
+                "arn:aws:iam::123456789012:policy/custom",
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sagemaker:Create*", "sagemaker:Delete*"],
+                        "Resource": "*",
+                    }
+                ],
+            ),
+            (
+                "custom",
+                "arn:aws:iam::123456789012:policy/custom",
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "sagemaker:*Endpoint*",
+                        "Resource": "arn:aws:sagemaker:*:*:*",
+                    }
+                ],
+            ),
+            (
+                "custom",
+                "arn:aws:iam::123456789012:policy/custom",
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "sagemaker:Update?otebookInstance",
+                        "NotResource": "arn:aws:sagemaker:*:*:domain/*",
+                    }
+                ],
+            ),
         ],
     )
     def test_broad_grant_on_one_of_two_notebook_roles_fails(
@@ -15549,6 +16048,29 @@ class TestSM09ExecutionRolePrivilege:
         assert [r["Status"] for r in role_rows] == ["Failed"]
         assert "'bad'" in role_rows[0]["Finding_Details"]
         assert "wide-role" in role_rows[0]["Finding_Details"]
+
+    def test_a_partial_wildcard_on_named_resources_is_not_broad(self):
+        statement = {
+            "Effect": "Allow",
+            "Action": "sagemaker:Describe*",
+            "Resource": "arn:aws:sagemaker:*:123456789012:notebook-instance/team-a-*",
+        }
+        literal = {
+            "Effect": "Allow",
+            "Action": "sagemaker:DescribeNotebookInstance",
+            "Resource": "*",
+        }
+        for document in (statement, literal):
+            permissions = {
+                "attached_policies": [
+                    {
+                        "name": "p",
+                        "arn": "arn:aws:iam::123456789012:policy/p",
+                        "document": {"Statement": [document]},
+                    }
+                ]
+            }
+            assert sagemaker_app._broad_role_grant(permissions) is None
 
     def test_boundary_that_caps_sagemaker_passes(self):
         cache = _environment_cache(
@@ -15696,6 +16218,25 @@ class TestSM09ApiLogging:
     def test_trail_shape(self, change, status):
         rows = _sm09_rows(trails=[{**_GOOD_TRAIL, **change}])
         assert _statuses_of(rows, self.TRAIL) == [status]
+
+    @pytest.mark.parametrize(
+        "status,text",
+        [
+            (
+                dict(
+                    _DELIVERING_STATUS,
+                    LatestCloudWatchLogsDeliveryError="AccessDeniedException",
+                ),
+                "CloudWatch Logs delivery error AccessDeniedException",
+            ),
+            ({"IsLogging": True}, "no recorded CloudWatch Logs delivery"),
+        ],
+    )
+    def test_a_trail_that_does_not_deliver_to_cloudwatch_logs_fails(self, status, text):
+        # AIR-SGM-TRN-05: these logged and passed before, whatever delivery said.
+        rows = _sm09_rows(statuses={_GOOD_TRAIL["TrailARN"]: status})
+        assert _statuses_of(rows, self.TRAIL) == ["Failed"]
+        assert text in _by_finding(rows, self.TRAIL)[0]["Finding_Details"]
 
     def test_stopped_trail_fails(self):
         rows = _sm09_rows(statuses={_GOOD_TRAIL["TrailARN"]: {"IsLogging": False}})
@@ -15944,7 +16485,7 @@ class TestSM09NotebookAccessGuardrails:
         [
             ("0.0.0.0/0", "Failed"),
             (["::/0", "203.0.113.0/24"], "Failed"),
-            ("203.0.113.0/24", "Passed"),
+            ("203.0.113.0/24", "root only"),
         ],
     )
     def test_an_ip_allow_is_judged_on_its_ranges(self, ranges, expected):
@@ -15964,7 +16505,11 @@ class TestSM09NotebookAccessGuardrails:
             }
         )
         rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1], cache=cache)
-        assert [r["Status"] for r in rows] == [expected]
+        if expected == "root only":
+            _assert_open_only_to_root(rows[0])
+        else:
+            assert [r["Status"] for r in rows] == [expected]
+            assert "Role 'DataScientist'" in rows[0]["Finding_Details"]
 
     def test_source_vpce_deny_on_profile_arns_passes(self):
         vpce = _scp_deny(
@@ -15994,7 +16539,7 @@ class TestSM09NotebookAccessGuardrails:
         rows = self._run([weak] + SCP_NOTEBOOK_ACCESS_DENIES[1:])
         assert [r["Status"] for r in rows] == ["Failed"]
 
-    def test_identity_conditions_alone_pass(self):
+    def test_identity_conditions_alone_leave_the_root_user_open(self):
         cache = _creation_cache(
             {
                 "DataScientist": [
@@ -16027,7 +16572,8 @@ class TestSM09NotebookAccessGuardrails:
             }
         )
         rows = self._run([], cache=cache)
-        assert [r["Status"] for r in rows] == ["Passed"]
+        assert len(rows) == 1
+        _assert_open_only_to_root(rows[0])
 
     def test_scp_unread_and_no_cache_is_na(self):
         inventory = {"items": [], "errors": [], "list_error": "AccessDenied"}
@@ -17042,7 +17588,7 @@ class TestSM34ValuePinning:
         assert encryption["Status"] == "Failed"
         assert "Role 'Loose'" in encryption["Finding_Details"]
         assert "Role 'Builder'" not in encryption["Finding_Details"]
-        assert rows["approved network"]["Status"] == "Passed"
+        _assert_open_only_to_root(rows["approved network"])
 
     def test_the_model_and_transform_job_actions_are_guarded(self):
         three_actions = [
