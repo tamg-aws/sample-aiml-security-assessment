@@ -7848,6 +7848,33 @@ class TestBedrockHandlerMultiRegion:
             == "us-east-1"
         )
 
+    @pytest.mark.parametrize(
+        "targets, index, expected",
+        [
+            ("us-east-1,eu-west-1", 0, [["us-east-1", "eu-west-1"]]),
+            ("us-east-1,eu-west-1", 1, []),
+            ("us-east-1", 0, []),
+        ],
+    )
+    def test_the_cross_region_agent_role_leg_runs_once_over_every_region(
+        self, monkeypatch, targets, index, expected
+    ):
+        monkeypatch.setenv("TARGET_REGIONS", targets)
+        calls = []
+
+        def spy(regions, inventories=None):
+            calls.append(list(regions))
+            return {"check_name": "x", "status": "PASS", "csv_data": []}
+
+        with patch.object(
+            bedrock_app, "check_agent_roles_shared_across_regions", side_effect=spy
+        ):
+            resp, _ = self._run_handler_with_check_spies(
+                _bedrock_event(region=targets.split(",")[index], region_index=index)
+            )
+        assert resp["statusCode"] == 200
+        assert calls == expected
+
     def test_the_root_key_leg_runs_without_the_permissions_cache(self):
         # The root leg reads iam:GetAccountSummary, so an unavailable cache
         # must not drop it along with the cache-backed BR-50 user leg.
@@ -35388,3 +35415,94 @@ class TestSetOperatorPrefixesOnAbsentKeys:
         assert bedrock_app._exact_attestation_keys(
             deny("StringNotEquals"), negated=True
         ) == {self.PCR.lower()}
+
+
+class TestBR57AgentRolesSharedAcrossRegions:
+    """BR-57: an IAM role is global, so agents in two Regions can share one."""
+
+    @staticmethod
+    def _inventory(roles, errors=(), runtime_error=None):
+        return {
+            "roles": roles,
+            "collaborations": [],
+            "errors": list(errors),
+            "runtime_error": runtime_error,
+        }
+
+    ROLE = "arn:aws:iam::123456789012:role/AgentRole"
+    OTHER = "arn:aws:iam::123456789012:role/OtherRole"
+
+    def _run(self, inventories):
+        return extract_csv_data(
+            bedrock_app.check_agent_roles_shared_across_regions(
+                list(inventories), inventories
+            )
+        )
+
+    def test_one_role_run_by_agents_in_two_regions_fails(self):
+        rows = self._run(
+            {
+                "us-east-1": self._inventory(
+                    {self.ROLE: ["Bedrock agent 'east' version 1"]}
+                ),
+                "eu-west-1": self._inventory(
+                    {
+                        self.ROLE: ["Bedrock agent 'west' version 2"],
+                        self.OTHER: ["AgentCore runtime 'rt' version 1"],
+                    }
+                ),
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert rows[0]["Check_ID"] == "BR-57"
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"role {self.ROLE} is run by Bedrock agent 'west' in eu-west-1; "
+            "Bedrock agent 'east' in us-east-1" in details
+        )
+        assert self.OTHER not in details
+
+    def test_distinct_roles_per_region_pass(self):
+        rows = self._run(
+            {
+                "us-east-1": self._inventory(
+                    {self.ROLE: ["Bedrock agent 'east' version 1"]}
+                ),
+                "eu-west-1": self._inventory(
+                    {self.OTHER: ["Bedrock agent 'west' version 1"]}
+                ),
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 assessed Regions (us-east-1, eu-west-1)" in rows[0]["Finding_Details"]
+
+    def test_an_unread_region_is_not_passed(self):
+        rows = self._run(
+            {
+                "us-east-1": self._inventory(
+                    {self.ROLE: ["Bedrock agent 'east' version 1"]}
+                ),
+                "eu-west-1": self._inventory(
+                    {}, runtime_error="AgentCore runtimes were not listed"
+                ),
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "eu-west-1: AgentCore runtimes were not listed"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_unread_region_does_not_hide_a_shared_role(self):
+        rows = self._run(
+            {
+                "us-east-1": self._inventory(
+                    {self.ROLE: ["Bedrock agent 'east' version 1"]}
+                ),
+                "eu-west-1": self._inventory(
+                    {self.ROLE: ["Bedrock agent 'west' version 1"]},
+                    errors=["agent 'x' was not read"],
+                ),
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]

@@ -31109,6 +31109,116 @@ def check_agent_handoff_source_identity(
         }
 
 
+def check_agent_roles_shared_across_regions(
+    regions: List[str], inventories: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    """
+    BR-57 cross-Region leg: IAM roles are global, so two agents in different
+    Regions that run as one role carry no distinct identity, and the per-Region
+    inventory never compares them. Each assessed Region's agent roles are read,
+    and a role run by agents in two or more Regions fails. Run once, from the
+    primary Region.
+    """
+    check_name = AGENT_HANDOFF_FINDING
+    findings = {"check_name": check_name, "status": "PASS", "csv_data": []}
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-57",
+            finding_name=check_name,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENT_HANDOFF_REFERENCE,
+            severity=severity,
+            status=status,
+            region=GLOBAL_REGION_LABEL,
+        )
+
+    try:
+        by_role: Dict[str, Dict[str, List[str]]] = {}
+        unread = []
+        for scan_region in regions:
+            inventory = (
+                inventories[scan_region]
+                if inventories is not None
+                else get_agent_role_inventory(scan_region)
+            )
+            unread.extend(f"{scan_region}: {error}" for error in inventory["errors"])
+            if inventory["runtime_error"]:
+                unread.append(f"{scan_region}: {inventory['runtime_error']}")
+            for role_arn, labels in inventory["roles"].items():
+                agents = sorted({label.rsplit(" version ", 1)[0] for label in labels})
+                by_role.setdefault(role_arn, {})[scan_region] = agents
+        shared = [
+            "role {} is run by {}".format(
+                role_arn,
+                "; ".join(
+                    "{} in {}".format(", ".join(agents), scan_region)
+                    for scan_region, agents in sorted(placed.items())
+                ),
+            )
+            for role_arn, placed in sorted(by_role.items())
+            if len(placed) > 1
+        ]
+        if shared:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                row(
+                    "{} IAM role(s) are run by agents in more than one Region, so "
+                    "a handoff between those agents carries no distinct identity: "
+                    "{}.".format(len(shared), "; ".join(shared[:10])),
+                    "Give each agent its own role in every Region it runs in.",
+                    "High",
+                    "Failed",
+                )
+            )
+        elif unread:
+            findings["status"] = "N/A"
+        else:
+            findings["csv_data"].append(
+                row(
+                    "No IAM role is run by agents in more than one of the {} "
+                    "assessed Regions ({}); {} agent role(s) were read.".format(
+                        len(regions), ", ".join(regions), len(by_role)
+                    ),
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        if unread:
+            findings["csv_data"].append(
+                row(
+                    "{} part(s) of the agent inventory were not read, so a role "
+                    "they run as was not compared across Regions: {}.".format(
+                        len(unread), "; ".join(unread[:10])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        return findings
+    except Exception as e:
+        logger.error(
+            f"Error in check_agent_roles_shared_across_regions: {str(e)}",
+            exc_info=True,
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                row(
+                    build_could_not_assess_detail(e, GLOBAL_REGION_LABEL),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            ],
+        }
+
+
 AI_SERVICES_OPT_OUT_REFERENCE = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html"
 
 AI_SERVICES_OPT_OUT_POLICY_TYPE = "AISERVICES_OPT_OUT_POLICY"
@@ -32955,6 +33065,11 @@ def lambda_handler(event, context):
             if permission_cache is None
             else check_agent_handoff_source_identity(permission_cache, region=region)
         )
+        assessed_regions = _assessed_regions(region)
+        if is_primary_region and len(assessed_regions) > 1:
+            all_findings.append(
+                check_agent_roles_shared_across_regions(assessed_regions)
+            )
 
         logger.info("Building Agentic AI Security findings from Bedrock results")
         all_findings.append(build_agentic_bedrock_security_findings(all_findings))
