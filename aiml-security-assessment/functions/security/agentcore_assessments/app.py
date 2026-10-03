@@ -29789,6 +29789,7 @@ AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS = frozenset(
 def _tool_execution_role_problems(
     permissions: Dict[str, Any],
     resourceless_actions: frozenset = frozenset(),
+    aws_managed: Optional[Set[str]] = None,
 ) -> Tuple[List[str], int]:
     """Return one tool execution role's unscoped grants and unreadable count.
 
@@ -29802,11 +29803,14 @@ def _tool_execution_role_problems(
     the role's own unconditioned Deny or permissions boundary removes is not a
     grant, and group policies are read with the rest. A statement whose every
     action is in resourceless_actions is not read as granting every resource.
+    A caller passing `aws_managed` receives the name of each AWS managed policy
+    that holds one of the problems.
     """
     problems: List[str] = []
     unreadable = 0
 
     for policy in _principal_policies(permissions):
+        before = len(problems)
         try:
             statements = list(_allow_statements(policy))
         except Exception as error:
@@ -29845,6 +29849,12 @@ def _tool_execution_role_problems(
                     problems.append(TOOL_ROLE_EVERY_ACTION_LEG)
                 elif any(wildcard in action for wildcard in ("*", "?")):
                     problems.append(f"{TOOL_ROLE_ACTION_PATTERN_LEG} ({action})")
+        if (
+            aws_managed is not None
+            and len(problems) > before
+            and ":iam::aws:policy/" in str(policy.get("arn") or "")
+        ):
+            aws_managed.add(str(policy.get("name") or policy.get("arn")))
 
     return sorted(set(problems)), unreadable
 
@@ -30526,9 +30536,11 @@ def check_agentcore_tool_execution_role_scope(
             )
             continue
 
+        aws_managed: Set[str] = set()
         problems, unreadable = _tool_execution_role_problems(
             permissions,
             frozenset() if kind == "tool" else AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS,
+            aws_managed,
         )
 
         if unreadable:
@@ -30561,7 +30573,14 @@ def check_agentcore_tool_execution_role_scope(
                         f"{label} uses execution role {role_name}, which "
                         f"{'; '.join(problems)}. {runs_with} runs with this "
                         f"role, so {where} reaches everything the role reaches. "
-                        f"{IAM_CACHE_SCP_NOTE}"
+                        + (
+                            f"AWS managed policy {', '.join(sorted(aws_managed))} "
+                            "holds these grants, so the AWS default policy is what "
+                            "fails. "
+                            if aws_managed
+                            else ""
+                        )
+                        + f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         f"Rewrite the role's policies to name the ARNs {subject} "
@@ -36239,6 +36258,27 @@ def _gateway_jwt_authorization_finding(
     )
 
 
+# NET-04 asks for request filtering on every AI front door. The ones that are
+# not AgentCore gateways are found through their web ACL associations, and that
+# grant was declined, so each gateway WAF row says what it leaves out.
+GATEWAY_WAF_UNREAD_FRONT_DOORS = (
+    "API Gateway APIs, Application Load Balancers and CloudFront distributions "
+    "that front an AI workload are not read: finding them and their web ACLs "
+    "takes the AWS WAF association reads wafv2:ListWebACLs and "
+    "wafv2:ListResourcesForWebACL, whose grant was declined for this assessment."
+)
+
+
+def _with_unread_front_doors(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append the unread front doors to each AG-27 and AG-39 row."""
+    for finding in findings:
+        if finding.get("Check_ID") in ("AG-27", "AG-39"):
+            finding["Finding_Details"] = (
+                f"{finding['Finding_Details']} {GATEWAY_WAF_UNREAD_FRONT_DOORS}"
+            )
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -36271,69 +36311,73 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                     status=StatusEnum.NA,
                 )
             )
-        return findings
+        return _with_unread_front_doors(findings)
 
     gateway_check_ids = ["AG-24", "AG-25", "AG-26", "AG-27", "AG-39"]
 
     try:
         gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
     except (AttributeError, ClientError) as error:
-        return _incomplete_check_findings(
-            gateway_check_ids,
-            "Agentic AI Gateway Security Controls",
-            error,
-            "",
-            reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+        return _with_unread_front_doors(
+            _incomplete_check_findings(
+                gateway_check_ids,
+                "Agentic AI Gateway Security Controls",
+                error,
+                "",
+                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+            )
         )
 
     if not gateways:
-        return [
-            create_finding(
-                check_id="AG-24",
-                finding_name="Agentic AI Gateway Inbound Authorization",
-                finding_details="No AgentCore Gateways found",
-                resolution="No action required",
-                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            ),
-            create_finding(
-                check_id="AG-25",
-                finding_name="Agentic AI Gateway Tool Policy Enforcement",
-                finding_details="No AgentCore Gateways found",
-                resolution="No action required",
-                reference=AGENTCORE_POLICY_ENGINE_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            ),
-            create_finding(
-                check_id="AG-26",
-                finding_name="Agentic AI Gateway Error Detail Exposure",
-                finding_details="No AgentCore Gateways found",
-                resolution="No action required",
-                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            ),
-            create_finding(
-                check_id="AG-27",
-                finding_name="Agentic AI Gateway WAF Protection",
-                finding_details="No AgentCore Gateways found",
-                resolution="No action required",
-                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            ),
-            create_finding(
-                check_id="AG-39",
-                finding_name="Agentic AI Gateway WAF Rule Coverage",
-                finding_details="No AgentCore Gateways found",
-                resolution="No action required",
-                reference=WAF_RULE_ACTION_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            ),
-        ]
+        return _with_unread_front_doors(
+            [
+                create_finding(
+                    check_id="AG-24",
+                    finding_name="Agentic AI Gateway Inbound Authorization",
+                    finding_details="No AgentCore Gateways found",
+                    resolution="No action required",
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                ),
+                create_finding(
+                    check_id="AG-25",
+                    finding_name="Agentic AI Gateway Tool Policy Enforcement",
+                    finding_details="No AgentCore Gateways found",
+                    resolution="No action required",
+                    reference=AGENTCORE_POLICY_ENGINE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                ),
+                create_finding(
+                    check_id="AG-26",
+                    finding_name="Agentic AI Gateway Error Detail Exposure",
+                    finding_details="No AgentCore Gateways found",
+                    resolution="No action required",
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                ),
+                create_finding(
+                    check_id="AG-27",
+                    finding_name="Agentic AI Gateway WAF Protection",
+                    finding_details="No AgentCore Gateways found",
+                    resolution="No action required",
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                ),
+                create_finding(
+                    check_id="AG-39",
+                    finding_name="Agentic AI Gateway WAF Rule Coverage",
+                    finding_details="No AgentCore Gateways found",
+                    resolution="No action required",
+                    reference=WAF_RULE_ACTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                ),
+            ]
+        )
 
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId", "unknown")
@@ -36828,7 +36872,7 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                     )
                 )
 
-    return findings
+    return _with_unread_front_doors(findings)
 
 
 def lambda_handler(event, context):

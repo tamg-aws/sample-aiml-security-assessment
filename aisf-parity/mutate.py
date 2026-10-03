@@ -1674,6 +1674,27 @@ MUTATIONS = [
         "find": '        if "inlinePayload" not in schema:\n',
         "replace": "        if False:\n",
     },
+    {
+        "name": "AG-39 omits the unread front doors",
+        "file": AGENTCORE,
+        "defect": "an AG-39 row did not name the front doors it leaves unread",
+        "find": '        if finding.get("Check_ID") in ("AG-27", "AG-39"):\n',
+        "replace": '        if finding.get("Check_ID") in ("AG-27",):\n',
+    },
+    {
+        "name": "AC-45 names a customer policy as the AWS default",
+        "file": AGENTCORE,
+        "defect": "a customer managed policy was named as AWS's own default",
+        "find": '            and ":iam::aws:policy/" in str(policy.get("arn") or "")\n',
+        "replace": "            and True\n",
+    },
+    {
+        "name": "AC-45 hides the AWS managed policy",
+        "file": AGENTCORE,
+        "defect": "the AWS managed memory policy failed without being named",
+        "find": '                            "fails. "\n                            if aws_managed\n',
+        "replace": '                            "fails. "\n                            if False\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -2024,6 +2045,9 @@ GROUPS: dict[str, str] = {
     "AC-35 input guard reads an action group as every action": "in the AgentCore verdict legs",
     "AC-35 input guard drops an unreadable target": "in the AgentCore verdict legs",
     "AC-35 input guard reads an S3 tool schema as empty": "in the AgentCore verdict legs",
+    "AG-39 omits the unread front doors": "in the AgentCore verdict legs",
+    "AC-45 names a customer policy as the AWS default": "in the AgentCore verdict legs",
+    "AC-45 hides the AWS managed policy": "in the AgentCore verdict legs",
 }
 
 

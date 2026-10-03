@@ -41779,14 +41779,44 @@ class TestAC45ServiceExecutionRoles:
             self._allow("bedrock-mantle:CallWithBearerToken", "*"),
         ]
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(
-            self._cache({"ManagedRole": managed})
+        name = "AmazonBedrockAgentCoreMemoryBedrockModelInferenceExecutionRolePolicy"
+        cache = self._cache({"ManagedRole": managed})
+        cache["role_permissions"]["ManagedRole"]["attached_policies"][0].update(
+            name=name, arn=f"arn:aws:iam::aws:policy/service-role/{name}"
         )
+        cache["role_permissions"]["ManagedRole"]["attached_policies"].append(
+            {
+                "name": "CustomerWide",
+                "arn": "arn:aws:iam::123456789012:policy/CustomerWide",
+                "document": {
+                    "Statement": [self._allow("s3:Get*", "arn:aws:s3:::bucket/*")]
+                },
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
 
         row = next(f for f in findings if "Memory 'm-1'" in f["Finding_Details"])
         assert row["Status"] == "Failed"
+        assert row["Severity"] == "High"
         assert "foundation-model/*" in row["Finding_Details"]
         assert "(*)" not in row["Finding_Details"]
+        assert (
+            f"AWS managed policy {name} holds these grants" in (row["Finding_Details"])
+        )
+        assert "(s3:get*)" in row["Finding_Details"]
+        assert "CustomerWide" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_customer_policy_is_not_named_as_the_aws_default(self, mock_ac):
+        self._wire(mock_ac, memories={"m-1": self._role("WideRole")})
+        cache = self._cache({"WideRole": [self._allow("s3:GetObject", "*")]})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        row = next(f for f in findings if "Memory 'm-1'" in f["Finding_Details"])
+        assert row["Status"] == "Failed"
+        assert "AWS managed policy" not in row["Finding_Details"]
 
 
 class TestAC45ShellAlarmEveryRegion:
@@ -50866,3 +50896,58 @@ class TestAC35PolicyInputGuards:
         mock_ac.get_gateway.return_value = _policy_engine_gateway(mode="LOG_ONLY")
         with patch("agentcore_app.agentcore_client", mock_ac):
             assert agentcore_app.check_agentcore_policy_input_guards() == []
+
+
+class TestGatewayWafUnreadFrontDoors:
+    """AIR-FND-NET-04: the WAF rows judge AgentCore gateways only, because the
+    association reads that find other front doors were declined, so each row
+    names the front doors it leaves out and why."""
+
+    _SENTENCE = (
+        "API Gateway APIs, Application Load Balancers and CloudFront "
+        "distributions that front an AI workload are not read"
+    )
+
+    @patch("agentcore_app.wafv2_client", None)
+    @patch("agentcore_app.agentcore_client")
+    def test_every_waf_row_names_the_unread_front_doors(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-1", "name": "One"},
+                {"gatewayId": "gw-2", "name": "Two"},
+            ]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayId": gatewayIdentifier,
+            "authorizerType": "AWS_IAM",
+            **(
+                {
+                    "webAclArn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/a/1"
+                }
+                if gatewayIdentifier == "gw-1"
+                else {}
+            ),
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_agentic_security()
+
+        waf_rows = [f for f in findings if f["Check_ID"] in ("AG-27", "AG-39")]
+        assert len(waf_rows) == 4
+        for finding in waf_rows:
+            assert self._SENTENCE in finding["Finding_Details"]
+            assert "whose grant was declined" in finding["Finding_Details"]
+            assert "ceiling" not in finding["Finding_Details"]
+        assert all(
+            self._SENTENCE not in f["Finding_Details"]
+            for f in findings
+            if f["Check_ID"] not in ("AG-27", "AG-39")
+        )
+
+    def test_the_no_gateway_rows_name_them_too(self):
+        mock_ac = MagicMock()
+        mock_ac.list_gateways.return_value = {"items": []}
+        with patch("agentcore_app.agentcore_client", mock_ac):
+            findings = agentcore_app.check_agentcore_gateway_agentic_security()
+        waf_rows = [f for f in findings if f["Check_ID"] in ("AG-27", "AG-39")]
+        assert len(waf_rows) == 2
+        assert all(self._SENTENCE in f["Finding_Details"] for f in waf_rows)
