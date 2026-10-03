@@ -39969,6 +39969,85 @@ class TestAC45RuntimeExecutionRole:
         }
 
 
+class TestAC45ShellAlarmEveryRegion:
+    """AIR-ACR-RT-03: a metric filter and its alarm are regional, so a runtime
+    outside the primary region is watched only by an alarm in its own region."""
+
+    def _rows(self, cache, logs, cloudwatch, runtimes=("rt-1", "rt-2")):
+        mock_ac = MagicMock()
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": runtime_id, "agentRuntimeName": runtime_id}
+                for runtime_id in runtimes
+            ]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: {
+            "agentRuntimeArn": _runtime_arn(agentRuntimeId)
+        }
+        mock_ac.list_code_interpreters.return_value = {"codeInterpreterSummaries": []}
+        mock_ac.list_browsers.return_value = {"browserSummaries": []}
+        with (
+            patch.object(agentcore_app, "logs_client", logs),
+            patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
+            patch.object(agentcore_app, "agentcore_client", mock_ac),
+        ):
+            findings = agentcore_app.check_agentcore_tool_execution_role_scope(
+                cache, assess_shell=False
+            )
+        for finding in findings:
+            assert_finding_schema(finding)
+        return [f for f in findings if "Command Shell" in f["Finding"]]
+
+    def _cache(self):
+        return TestAC45CommandShellAlarm()._holder()
+
+    def test_a_region_with_runtimes_and_no_alarm_fails(self):
+        rows = self._rows(self._cache(), *_shell_alarm_clients(filters=()))
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert rows[0]["Finding"].endswith("Unwatched")
+        assert "2 runtime(s) in this region" in rows[0]["Finding_Details"]
+        assert rows[0]["Region"] != "Global"
+
+    def test_a_region_with_an_acting_alarm_passes(self):
+        rows = self._rows(self._cache(), *_shell_alarm_clients())
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "alarm shell-opened with an action" in rows[0]["Finding_Details"]
+
+    def test_a_muted_alarm_beside_no_other_fails(self):
+        rows = self._rows(
+            self._cache(),
+            *_shell_alarm_clients(alarms=({**_SHELL_ALARM, "ActionsEnabled": False},)),
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+
+    def test_an_unread_alarm_leg_is_na(self):
+        logs, cloudwatch = _shell_alarm_clients()
+        logs.describe_metric_filters.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        rows = self._rows(self._cache(), logs, cloudwatch)
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "logs:DescribeMetricFilters (AccessDenied" in rows[0]["Finding_Details"]
+
+    def test_a_region_with_no_runtime_gets_no_row(self):
+        logs, cloudwatch = _shell_alarm_clients(filters=())
+
+        assert self._rows(self._cache(), logs, cloudwatch, runtimes=()) == []
+        logs.describe_metric_filters.assert_not_called()
+
+    def test_no_holder_gets_no_row(self):
+        logs, cloudwatch = _shell_alarm_clients(filters=())
+        cache = _v2_cache(roles={"Reader": _principal_with([])})
+
+        assert self._rows(cache, logs, cloudwatch) == []
+        logs.describe_metric_filters.assert_not_called()
+
+
 class TestAC45CommandShellAlarm:
     """AC-45 requires an acting alarm on shell connections when anyone holds one."""
 

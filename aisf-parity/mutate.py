@@ -876,6 +876,20 @@ MUTATIONS = [
         "find": "                if arns and len(matched) == len(arns) and all(matched.values()):\n",
         "replace": "                if arns and any(matched.values()):\n",
     },
+    {
+        "name": "AC-45 reads the shell alarm in the primary Region only",
+        "file": AGENTCORE,
+        "defect": "a metric filter and its alarm are regional, so a shell-capable runtime in another assessed Region with no alarm there was never judged",
+        "find": "        else _command_shell_region_alarm_rows(permission_cache)\n",
+        "replace": "        else []\n",
+    },
+    {
+        "name": "AC-45 asks for a shell alarm in a Region with no runtime",
+        "file": AGENTCORE,
+        "defect": "a Region with no runtime has no session to open a shell in, and failing it for a missing alarm is a finding nobody can act on",
+        "find": "    if not runtimes:\n        return []\n    alarm, alarm_unread = _metric_filter_alarm(_command_shell_filter_matches)\n",
+        "replace": "    alarm, alarm_unread = _metric_filter_alarm(_command_shell_filter_matches)\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1112,6 +1126,8 @@ GROUPS: dict[str, str] = {
     "AC-06 credits an IfExists aws:PrincipalOrgID binding": "in the AgentCore verdict legs",
     "AC-18 fails a memory selector that names every memory by ARN": "in the AgentCore verdict legs",
     "AC-18 credits an ARN selector that names one of two memories": "in the AgentCore verdict legs",
+    "AC-45 reads the shell alarm in the primary Region only": "in the AgentCore verdict legs",
+    "AC-45 asks for a shell alarm in a Region with no runtime": "in the AgentCore verdict legs",
 }
 
 

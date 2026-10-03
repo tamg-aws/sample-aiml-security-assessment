@@ -27671,6 +27671,101 @@ def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, 
     return findings
 
 
+def _command_shell_region_alarm_rows(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return the AC-45 shell alarm row for a Region other than the primary one.
+
+    The principals who can open a shell are account-wide and judged once, on
+    the primary Region. A metric filter and its alarm are regional, so a
+    runtime here is watched only by an alarm here. A Region with no runtime,
+    or no principal able to open a shell, needs no alarm and gets no row.
+    """
+    finding_name = "AgentCore Runtime Command Shell Access"
+    cache = permission_cache if isinstance(permission_cache, dict) else {}
+    holders = [
+        principal
+        for kind, key in (("role", "role_permissions"), ("user", "user_permissions"))
+        for group in _command_shell_holders(cache.get(key) or {}, kind)[:2]
+        for principal in group
+    ]
+    if not holders or agentcore_client is None:
+        return []
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except (AttributeError, BotoCoreError, ClientError):
+        return []
+    if not runtimes:
+        return []
+    alarm, alarm_unread = _metric_filter_alarm(_command_shell_filter_matches)
+    count = f"{len(runtimes)} runtime(s) in this region"
+    if alarm_unread:
+        return [
+            create_finding(
+                check_id="AC-45",
+                finding_name=f"{finding_name} Incomplete",
+                finding_details=(
+                    f"Principals in the IAM permission cache can open a shell in "
+                    f"the {count}, and whether an alarm counts shell connections "
+                    f"in this region was not read: {'; '.join(alarm_unread)}."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Grant logs:DescribeMetricFilters and "
+                    "cloudwatch:DescribeAlarms and rerun the assessment."
+                ),
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    if not alarm:
+        return [
+            create_finding(
+                check_id="AC-45",
+                finding_name=f"{finding_name} Unwatched",
+                finding_details=(
+                    f"Principals in the IAM permission cache can open a shell in "
+                    f"the {count}, and no metric filter in this region that names "
+                    "InvokeAgentRuntimeCommandShell, or names a shell on an "
+                    "AgentCore runtime log group, feeds an alarm with an action. "
+                    "The service does not log what is typed in a shell, so a "
+                    "connection nobody is alerted to leaves no record of the "
+                    "commands run."
+                ),
+                resolution=(
+                    "Add a CloudWatch Logs metric filter on shell connections in "
+                    "this region, in the runtime log group or on the "
+                    "InvokeAgentRuntimeCommandShell CloudTrail event, and an alarm "
+                    "with an action on its metric."
+                ),
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="AC-45",
+            finding_name=finding_name,
+            finding_details=(
+                f"Principals in the IAM permission cache can open a shell in the "
+                f"{count}, and in this region {alarm}, which counts shell "
+                "connections; the alarm's targets and the filter's source trail "
+                "are not read. Who holds the grant is judged on the primary "
+                "region's row."
+            ),
+            resolution=(
+                "No action required for this check. Treat each production shell "
+                "connection as an incident to review."
+            ),
+            reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+    ]
+
+
 def _agentcore_runtime_role_details() -> Tuple[
     List[Tuple[str, Dict[str, Any]]], List[Tuple[str, Exception, str]]
 ]:
@@ -27725,7 +27820,9 @@ def check_agentcore_tool_execution_role_scope(
     the IAM cache could not read, or one with an unparseable policy, is named
     and never passes. With assess_shell set, which the handler does on the
     primary region only, the check also reads who can run a command or open a
-    shell inside a runtime session, which reaches the runtime's own role. The
+    shell inside a runtime session, which reaches the runtime's own role. In
+    every other region holding a runtime, it reads only whether an alarm there
+    counts shell connections, since filters and alarms are regional. The
     trust policy and the reuse of a tool role across resources are AC-48's.
 
     Each runtime's own roleArn is judged by the same rules, because the agent's
@@ -27734,7 +27831,11 @@ def check_agentcore_tool_execution_role_scope(
     passed every check. CreateAgentRuntime requires roleArn, so a runtime whose
     detail reports none is not judged instead of passing.
     """
-    shell_rows = _command_shell_findings(permission_cache) if assess_shell else []
+    shell_rows = (
+        _command_shell_findings(permission_cache)
+        if assess_shell
+        else _command_shell_region_alarm_rows(permission_cache)
+    )
     if agentcore_client is None:
         return shell_rows + [
             create_finding(

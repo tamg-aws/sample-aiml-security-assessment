@@ -432,7 +432,9 @@ AI_SUBJECT_ROWS = [
         "account-root principal, holds a role whose GetRole ARN differs from the ARN "
         "the resource names (a role in another account) at N/A, and fails a role that "
         "more than one AgentCore resource names. The shell-connection alarm leg of "
-        "AC-45 reads the primary Region's log groups only",
+        "AC-45 runs in every assessed Region that holds a runtime, because metric "
+        "filters and alarms are regional, and fails a Region with no acting alarm "
+        "counting shell connections",
         [],
         4,
     ),
