@@ -28190,6 +28190,157 @@ class TestAC47RuntimeInvocationPath:
         assert legs["Caller Scope"]["Severity"] == "High"
         assert "allowedWorkloadConfiguration" in legs["Caller Scope"]["Finding_Details"]
 
+    def _wire_versions(
+        self, mock_ac, served_allowed, endpoints_error=None, endpoints=None
+    ):
+        # Version 2 is the latest and admits only the fronting gateway. Version 1,
+        # which the "legacy" endpoint still serves, is set by served_allowed.
+        _wire_fronting_gateways(mock_ac, {"gw-1": [_runtime_target("rt-1")]})
+        gated = {"hostingEnvironments": [{"arn": _gateway_arn("gw-1")}]}
+
+        def authorizer(allowed):
+            jwt = {
+                "discoveryUrl": "https://example.com/.well-known/openid-configuration"
+            }
+            if allowed is not None:
+                jwt["allowedWorkloadConfiguration"] = allowed
+            return {"customJWTAuthorizer": jwt}
+
+        summary, latest = _vpc_runtime(
+            agentRuntimeVersion="2", authorizerConfiguration=authorizer(gated)
+        )
+        _, earlier = _vpc_runtime(
+            agentRuntimeVersion="1", authorizerConfiguration=authorizer(served_allowed)
+        )
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": [summary]}
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId, **kw: {
+            None: latest,
+            "2": latest,
+            "1": earlier,
+        }[kw.get("agentRuntimeVersion")]
+        mock_ac.get_resource_policy.return_value = {"policy": ""}
+        if endpoints_error is not None:
+            mock_ac.list_agent_runtime_endpoints.side_effect = endpoints_error
+        else:
+            mock_ac.list_agent_runtime_endpoints.return_value = {
+                "runtimeEndpoints": endpoints
+                or [
+                    {"name": "DEFAULT", "liveVersion": "2"},
+                    {"name": "legacy", "liveVersion": "1"},
+                ]
+            }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_endpoint_serving_an_ungated_earlier_version_fails_the_caller_leg(
+        self, mock_ac
+    ):
+        # GetAgentRuntime without a version returns the latest one. An endpoint
+        # that still serves version 1 answers with version 1's authorizer, so a
+        # gate added in version 2 does not bind calls through that endpoint.
+        self._wire_versions(mock_ac, served_allowed=None)
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        callers = [
+            finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime Caller")
+        ]
+
+        assert len(callers) == 2
+        by_version = {
+            "1" if "version 1" in finding["Finding_Details"] else "latest": finding
+            for finding in callers
+        }
+        assert by_version["latest"]["Status"] == "Passed"
+        assert by_version["1"]["Status"] == "Failed"
+        assert by_version["1"]["Finding"] == "AgentCore Runtime Caller Unrestricted"
+        assert "legacy" in by_version["1"]["Finding_Details"]
+        mock_ac.get_agent_runtime.assert_any_call(
+            agentRuntimeId="rt-1", agentRuntimeVersion="1"
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_endpoint_serving_a_gated_earlier_version_passes_both(self, mock_ac):
+        self._wire_versions(
+            mock_ac,
+            served_allowed={"hostingEnvironments": [{"arn": _gateway_arn("gw-1")}]},
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        callers = [
+            finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime Caller")
+        ]
+
+        assert len(callers) == 2
+        assert {finding["Status"] for finding in callers} == {"Passed"}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_target_version_an_endpoint_rolls_toward_is_judged(self, mock_ac):
+        # targetVersion is the version an endpoint is updating to, and it takes
+        # traffic once the update completes.
+        self._wire_versions(
+            mock_ac,
+            served_allowed=None,
+            endpoints=[{"name": "DEFAULT", "liveVersion": "2", "targetVersion": "1"}],
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        failed = [
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore Runtime Caller Unrestricted"
+        ]
+
+        assert len(failed) == 1
+        assert (
+            "version 1, served by endpoint(s) DEFAULT" in failed[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_served_version_is_na(self, mock_ac):
+        self._wire_versions(mock_ac, served_allowed=None)
+        latest_lookup = mock_ac.get_agent_runtime.side_effect
+
+        def get_agent_runtime(agentRuntimeId, **kw):
+            if kw.get("agentRuntimeVersion") == "1":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return latest_lookup(agentRuntimeId, **kw)
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        version_rows = [
+            finding for finding in findings if "version 1" in finding["Finding_Details"]
+        ]
+
+        assert len(version_rows) == 1
+        assert version_rows[0]["Status"] == "N/A"
+        assert version_rows[0]["Finding"] == "AgentCore Runtime Caller Scope"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_unlisted_endpoints_do_not_pass_the_caller_leg(self, mock_ac):
+        # Without the endpoint list the versions a caller can reach are unknown,
+        # so the latest version's gate is not reported as the runtime's.
+        self._wire_versions(
+            mock_ac,
+            served_allowed=None,
+            endpoints_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        callers = [
+            finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime Caller")
+        ]
+
+        assert len(callers) == 1
+        assert callers[0]["Status"] == "N/A"
+        assert "ListAgentRuntimeEndpoints" in callers[0]["Finding_Details"]
+        assert "ListAgentRuntimeEndpoints" in callers[0]["Resolution"]
+
     @patch("agentcore_app.agentcore_client")
     def test_an_empty_allowed_workload_configuration_restricts_nothing(self, mock_ac):
         self._wire(

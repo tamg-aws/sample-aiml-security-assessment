@@ -1058,6 +1058,34 @@ MUTATIONS = [
         "find": '                    "Grant bedrock-agentcore:GetConsentPortal and retry.",\n                    SeverityEnum.INFORMATIONAL,\n                    StatusEnum.NA,\n',
         "replace": '                    "Grant bedrock-agentcore:GetConsentPortal and retry.",\n                    SeverityEnum.INFORMATIONAL,\n                    StatusEnum.PASSED,\n',
     },
+    {
+        "name": "AC-47 judges only the default runtime version",
+        "file": AGENTCORE,
+        "defect": "an endpoint still serving a version with no allowedWorkloadConfiguration lets a caller skip the gateway while the latest version's gate reads as the runtime's",
+        "find": '        caller_details = [(label, detail)]\n        default_version = str(detail.get("agentRuntimeVersion"))\n        for version in sorted(v for v in served if v != default_version):\n',
+        "replace": '        caller_details = [(label, detail)]\n        default_version = str(detail.get("agentRuntimeVersion"))\n        for version in sorted(v for v in served if v != default_version and False):\n',
+    },
+    {
+        "name": "AC-47 ignores the version an endpoint rolls toward",
+        "file": AGENTCORE,
+        "defect": "a targetVersion takes the endpoint's traffic once the update completes, so its authorizer goes unjudged",
+        "find": '            endpoints, endpoints_error = [], error\n        served: Dict[str, List[str]] = {}\n        for endpoint in endpoints:\n            endpoint_name = endpoint.get("name") or endpoint.get("id") or "unnamed"\n            for field in ("liveVersion", "targetVersion"):\n',
+        "replace": '            endpoints, endpoints_error = [], error\n        served: Dict[str, List[str]] = {}\n        for endpoint in endpoints:\n            endpoint_name = endpoint.get("name") or endpoint.get("id") or "unnamed"\n            for field in ("liveVersion",):\n',
+    },
+    {
+        "name": "AC-47 passes the caller leg when the endpoints are unlisted",
+        "file": AGENTCORE,
+        "defect": "a denied ListAgentRuntimeEndpoints hides every served version, so the latest version's Passed is a clean result from a failed read",
+        "find": '            if findings[-1]["Status"] == StatusEnum.PASSED.value:\n                findings[-1] = create_finding(\n                    check_id="AC-47",\n',
+        "replace": '            if False:\n                findings[-1] = create_finding(\n                    check_id="AC-47",\n',
+    },
+    {
+        "name": "AC-47 passes a served version it could not read",
+        "file": AGENTCORE,
+        "defect": "a denied GetAgentRuntime on a served version says nothing about its authorizer, so a Passed from it is a clean result from a failed read",
+        "find": '                            "Grant bedrock-agentcore:GetAgentRuntime on this "\n                            "runtime and retry."\n                        ),\n                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,\n                        severity=SeverityEnum.INFORMATIONAL,\n                        status=StatusEnum.NA,\n',
+        "replace": '                            "Grant bedrock-agentcore:GetAgentRuntime on this "\n                            "runtime and retry."\n                        ),\n                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,\n                        severity=SeverityEnum.INFORMATIONAL,\n                        status=StatusEnum.PASSED,\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1320,6 +1348,10 @@ GROUPS: dict[str, str] = {
     "AC-27 does not read consent portal execution roles": "in the AgentCore verdict legs",
     "AC-27 accepts any resource type in a portal role's aws:SourceArn": "in the AgentCore verdict legs",
     "AC-27 passes a consent portal it could not read": "in the AgentCore verdict legs",
+    "AC-47 judges only the default runtime version": "in the AgentCore verdict legs",
+    "AC-47 ignores the version an endpoint rolls toward": "in the AgentCore verdict legs",
+    "AC-47 passes the caller leg when the endpoints are unlisted": "in the AgentCore verdict legs",
+    "AC-47 passes a served version it could not read": "in the AgentCore verdict legs",
 }
 
 

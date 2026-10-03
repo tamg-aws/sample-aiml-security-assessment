@@ -1388,7 +1388,7 @@ Resources:
                 - bedrock-agentcore:ListPaymentManagers # AC-02, AC-48
                 - bedrock-agentcore:ListHarnesses # AC-34, AC-48
                 - bedrock-agentcore:ListBatchEvaluations # AC-41
-                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30, AC-34
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30, AC-34, AC-47
                 - bedrock-agentcore:ListAgentRuntimeVersions # AC-01
                 - bedrock-agentcore:ListConsentPortals # AC-25
                 - ec2:DescribeNatGateways # AC-49

@@ -29776,169 +29776,251 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                 )
             )
 
-        jwt_authorizer = (detail.get("authorizerConfiguration") or {}).get(
-            "customJWTAuthorizer"
-        ) or {}
-        allowed_workload = jwt_authorizer.get("allowedWorkloadConfiguration") or {}
-        restrictions = []
-        workload_verdict, workload_text = "", ""
-        if allowed_workload.get("hostingEnvironments") or allowed_workload.get(
-            "workloadIdentities"
-        ):
-            if fronting is None:
-                fronting = _runtime_fronting_gateways()
-            workload_verdict, workload_text = _allowed_workload_verdict(
-                allowed_workload, str(runtime_arn or ""), *fronting
+        # The authorizer is per version. GetAgentRuntime without a version
+        # returns the latest, and an endpoint can serve an older version, so
+        # each liveVersion and targetVersion ListAgentRuntimeEndpoints reports
+        # is judged on its own row, as AC-30 and AC-34 do.
+        endpoints_error = None
+        try:
+            endpoints = _agentcore_list_all(
+                "list_agent_runtime_endpoints",
+                ["runtimeEndpoints"],
+                agentRuntimeId=runtime_id,
             )
-            if workload_verdict == "passed":
-                restrictions.append(workload_text)
-
-        def principal_bounded(_key: str, values: List[str]) -> bool:
-            return bool(values) and not any(
-                _arn_pattern_is_unbounded(value) for value in values
+        except (BotoCoreError, ClientError) as error:
+            endpoints, endpoints_error = [], error
+        served: Dict[str, List[str]] = {}
+        for endpoint in endpoints:
+            endpoint_name = endpoint.get("name") or endpoint.get("id") or "unnamed"
+            for field in ("liveVersion", "targetVersion"):
+                version = endpoint.get(field)
+                if version and endpoint_name not in served.setdefault(str(version), []):
+                    served[str(version)].append(endpoint_name)
+        caller_details = [(label, detail)]
+        default_version = str(detail.get("agentRuntimeVersion"))
+        for version in sorted(v for v in served if v != default_version):
+            version_label = (
+                f"{label} version {version}, served by endpoint(s) "
+                f"{', '.join(sorted(served[version]))},"
             )
-
-        caller_keys, caller_gaps, caller_open = _runtime_invoke_restriction(
-            statements,
-            str(runtime_arn or ""),
-            {"aws:principalarn"},
-            principal_bounded,
-        )
-        principal_verdict, principal_text = "", ""
-        if caller_keys:
-            if fronting is None:
-                fronting = _runtime_fronting_gateways()
-            principal_verdict, principal_text = _principal_arn_verdict(
-                statements, str(runtime_arn or ""), principal_bounded, *fronting
-            )
-            if principal_verdict == "passed":
-                restrictions.append(principal_text)
-
-        failed_texts = [
-            text
-            for verdict, text in (
-                (workload_verdict, workload_text),
-                (principal_verdict, principal_text),
-            )
-            if verdict == "failed"
-        ]
-        na_texts = [
-            text
-            for verdict, text in (
-                (workload_verdict, workload_text),
-                (principal_verdict, principal_text),
-            )
-            if verdict == "na"
-        ]
-        if failed_texts:
-            findings.append(
-                create_finding(
-                    check_id="AC-47",
-                    finding_name="AgentCore Runtime Caller Unrestricted",
-                    finding_details=f"{label} {'; and '.join(failed_texts)}.",
-                    resolution=(
-                        "Set allowedWorkloadConfiguration on the runtime's JWT "
-                        "authorizer to the hosting environment ARN or workload "
-                        "identity of the gateway whose target routes to this "
-                        "runtime, and to nothing else; for SigV4 callers, name "
-                        "only that gateway's execution role in the resource "
-                        "policy Deny's aws:PrincipalArn list."
-                    ),
-                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.FAILED,
+            try:
+                caller_details.append(
+                    (
+                        version_label,
+                        agentcore_client.get_agent_runtime(
+                            agentRuntimeId=runtime_id, agentRuntimeVersion=version
+                        ),
+                    )
                 )
+            except (BotoCoreError, ClientError) as error:
+                findings.append(
+                    create_finding(
+                        check_id="AC-47",
+                        finding_name="AgentCore Runtime Caller Scope",
+                        finding_details=(
+                            f"{version_label} could not be read, so the callers "
+                            "that reach it were not judged: "
+                            f"{_assessment_error_label(error)}."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:GetAgentRuntime on this "
+                            "runtime and retry."
+                        ),
+                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+
+        for caller_label, caller_detail in caller_details:
+            jwt_authorizer = (caller_detail.get("authorizerConfiguration") or {}).get(
+                "customJWTAuthorizer"
+            ) or {}
+            allowed_workload = jwt_authorizer.get("allowedWorkloadConfiguration") or {}
+            restrictions = []
+            workload_verdict, workload_text = "", ""
+            if allowed_workload.get("hostingEnvironments") or allowed_workload.get(
+                "workloadIdentities"
+            ):
+                if fronting is None:
+                    fronting = _runtime_fronting_gateways()
+                workload_verdict, workload_text = _allowed_workload_verdict(
+                    allowed_workload, str(runtime_arn or ""), *fronting
+                )
+                if workload_verdict == "passed":
+                    restrictions.append(workload_text)
+
+            def principal_bounded(_key: str, values: List[str]) -> bool:
+                return bool(values) and not any(
+                    _arn_pattern_is_unbounded(value) for value in values
+                )
+
+            caller_keys, caller_gaps, caller_open = _runtime_invoke_restriction(
+                statements,
+                str(runtime_arn or ""),
+                {"aws:principalarn"},
+                principal_bounded,
             )
-        elif restrictions:
-            workload_note = "".join(
-                f" Not credited: {label} {text}." for text in na_texts
+            principal_verdict, principal_text = "", ""
+            if caller_keys:
+                if fronting is None:
+                    fronting = _runtime_fronting_gateways()
+                principal_verdict, principal_text = _principal_arn_verdict(
+                    statements, str(runtime_arn or ""), principal_bounded, *fronting
+                )
+                if principal_verdict == "passed":
+                    restrictions.append(principal_text)
+
+            failed_texts = [
+                text
+                for verdict, text in (
+                    (workload_verdict, workload_text),
+                    (principal_verdict, principal_text),
+                )
+                if verdict == "failed"
+            ]
+            na_texts = [
+                text
+                for verdict, text in (
+                    (workload_verdict, workload_text),
+                    (principal_verdict, principal_text),
+                )
+                if verdict == "na"
+            ]
+            if failed_texts:
+                findings.append(
+                    create_finding(
+                        check_id="AC-47",
+                        finding_name="AgentCore Runtime Caller Unrestricted",
+                        finding_details=f"{caller_label} {'; and '.join(failed_texts)}.",
+                        resolution=(
+                            "Set allowedWorkloadConfiguration on the runtime's JWT "
+                            "authorizer to the hosting environment ARN or workload "
+                            "identity of the gateway whose target routes to this "
+                            "runtime, and to nothing else; for SigV4 callers, name "
+                            "only that gateway's execution role in the resource "
+                            "policy Deny's aws:PrincipalArn list."
+                        ),
+                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            elif restrictions:
+                workload_note = "".join(
+                    f" Not credited: {caller_label} {text}." for text in na_texts
+                )
+                findings.append(
+                    create_finding(
+                        check_id="AC-47",
+                        finding_name="AgentCore Runtime Caller Scope",
+                        finding_details=(
+                            f"{caller_label} restricts who may invoke it through "
+                            f"{' and '.join(restrictions)}.{workload_note}"
+                        ),
+                        resolution=(
+                            "No action required. Confirm the named workloads or "
+                            "principals are the gateway this agent is meant to be "
+                            "reached through."
+                        ),
+                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.PASSED,
+                    )
+                )
+            elif na_texts:
+                findings.append(
+                    create_finding(
+                        check_id="AC-47",
+                        finding_name="AgentCore Runtime Caller Scope",
+                        finding_details=(
+                            f"{caller_label} {'; and '.join(na_texts)}, so the caller leg is "
+                            "not reported as restricted."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:ListGateways, ListGatewayTargets, "
+                            "GetGatewayTarget and GetGateway and retry."
+                            if fronting and fronting[1]
+                            else "Confirm which gateway fronts this runtime: no "
+                            "gateway target in this region routes to it."
+                        ),
+                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+            else:
+                allow_principals = sorted(
+                    {
+                        principal
+                        for statement in _document_statements(policy, effect="Allow")
+                        for principal in _statement_principals(statement)
+                    }
+                )
+                allow_text = (
+                    f" Its resource policy Allow names {', '.join(allow_principals)}, "
+                    "which grants access and does not stop a same-account caller "
+                    "whose own identity policy allows "
+                    "bedrock-agentcore:InvokeAgentRuntime."
+                    if allow_principals
+                    else ""
+                )
+                gap_text = (
+                    f" A statement names aws:PrincipalArn, but {'; '.join(caller_gaps)}."
+                    if caller_gaps
+                    else ""
+                )
+                findings.append(
+                    create_finding(
+                        check_id="AC-47",
+                        finding_name="AgentCore Runtime Caller Unrestricted",
+                        finding_details=(
+                            f"{caller_label} carries neither an allowedWorkloadConfiguration "
+                            "on its JWT authorizer nor a resource policy Deny that "
+                            "refuses every runtime invoke action to every principal "
+                            "outside a bounded aws:PrincipalArn list, so a caller that "
+                            "satisfies its inbound authentication reaches the agent "
+                            "directly and the tool policy, rate limits and audit "
+                            "trail of the gateway in front of it do not apply."
+                            f"{_open_actions_text(caller_open)}{allow_text}{gap_text}"
+                        ),
+                        resolution=(
+                            "Set allowedWorkloadConfiguration on the runtime's JWT "
+                            "authorizer to the gateways allowed to invoke it, or for "
+                            "SigV4 callers attach a resource policy that denies "
+                            f"{invoke_actions} to every principal whose "
+                            "aws:PrincipalArn is not the gateway's execution role."
+                        ),
+                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+
+        if endpoints_error is not None:
+            unread = (
+                " The versions its endpoints serve could not be listed: "
+                "ListAgentRuntimeEndpoints failed with "
+                f"{_assessment_error_label(endpoints_error)}."
             )
-            findings.append(
-                create_finding(
+            if findings[-1]["Status"] == StatusEnum.PASSED.value:
+                findings[-1] = create_finding(
                     check_id="AC-47",
                     finding_name="AgentCore Runtime Caller Scope",
                     finding_details=(
-                        f"{label} restricts who may invoke it through "
-                        f"{' and '.join(restrictions)}.{workload_note}"
+                        f"{findings[-1]['Finding_Details']}{unread} A version an "
+                        "endpoint serves may carry another authorizer, so the "
+                        "caller leg is not reported as restricted."
                     ),
                     resolution=(
-                        "No action required. Confirm the named workloads or "
-                        "principals are the gateway this agent is meant to be "
-                        "reached through."
-                    ),
-                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
-                )
-            )
-        elif na_texts:
-            findings.append(
-                create_finding(
-                    check_id="AC-47",
-                    finding_name="AgentCore Runtime Caller Scope",
-                    finding_details=(
-                        f"{label} {'; and '.join(na_texts)}, so the caller leg is "
-                        "not reported as restricted."
-                    ),
-                    resolution=(
-                        "Grant bedrock-agentcore:ListGateways, ListGatewayTargets, "
-                        "GetGatewayTarget and GetGateway and retry."
-                        if fronting and fronting[1]
-                        else "Confirm which gateway fronts this runtime: no "
-                        "gateway target in this region routes to it."
+                        "Grant bedrock-agentcore:ListAgentRuntimeEndpoints and retry."
                     ),
                     reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
-            )
-        else:
-            allow_principals = sorted(
-                {
-                    principal
-                    for statement in _document_statements(policy, effect="Allow")
-                    for principal in _statement_principals(statement)
-                }
-            )
-            allow_text = (
-                f" Its resource policy Allow names {', '.join(allow_principals)}, "
-                "which grants access and does not stop a same-account caller "
-                "whose own identity policy allows "
-                "bedrock-agentcore:InvokeAgentRuntime."
-                if allow_principals
-                else ""
-            )
-            gap_text = (
-                f" A statement names aws:PrincipalArn, but {'; '.join(caller_gaps)}."
-                if caller_gaps
-                else ""
-            )
-            findings.append(
-                create_finding(
-                    check_id="AC-47",
-                    finding_name="AgentCore Runtime Caller Unrestricted",
-                    finding_details=(
-                        f"{label} carries neither an allowedWorkloadConfiguration "
-                        "on its JWT authorizer nor a resource policy Deny that "
-                        "refuses every runtime invoke action to every principal "
-                        "outside a bounded aws:PrincipalArn list, so a caller that "
-                        "satisfies its inbound authentication reaches the agent "
-                        "directly and the tool policy, rate limits and audit "
-                        "trail of the gateway in front of it do not apply."
-                        f"{_open_actions_text(caller_open)}{allow_text}{gap_text}"
-                    ),
-                    resolution=(
-                        "Set allowedWorkloadConfiguration on the runtime's JWT "
-                        "authorizer to the gateways allowed to invoke it, or for "
-                        "SigV4 callers attach a resource policy that denies "
-                        f"{invoke_actions} to every principal whose "
-                        "aws:PrincipalArn is not the gateway's execution role."
-                    ),
-                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.FAILED,
-                )
-            )
+            else:
+                findings[-1]["Finding_Details"] += unread
 
     return findings
 
