@@ -30391,8 +30391,13 @@ class TestBR53OwnerTagSweep:
             for c in tagging.get_resources.call_args_list
         ] == [["sagemaker"], ["bedrock-agentcore"]]
 
-    def test_every_returned_resource_owned_still_does_not_pass(self):
-        _, rows, _ = self._run(
+    def test_every_returned_resource_owned_passes_and_names_the_types_left_unlisted(
+        self,
+    ):
+        """GOV-02: changed from N/A under the round-6 direction. Every list read
+        and filter was read and nothing lacks an owner, so the row passes; the
+        types only GetResources reaches are still named."""
+        result, rows, _ = self._run(
             {
                 "sagemaker": [
                     [
@@ -30404,9 +30409,12 @@ class TestBR53OwnerTagSweep:
                 ]
             }
         )
-        assert [r["Status"] for r in rows] == ["N/A"]
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert result["status"] == "PASS"
         details = rows[0]["Finding_Details"]
         assert "1 of the 1 SageMaker and AgentCore" in details
+        assert "production resources are not told apart" in details
+        assert "This is not a verdict" not in details
         assert "a resource never tagged is not listed" in details
         assert "APIReference/API_GetResources.html)." in details
         assert (
@@ -30418,6 +30426,45 @@ class TestBR53OwnerTagSweep:
         assert "not granted" not in details
         assert "ceiling reached" not in details
         assert "bedrock-agentcore:ListAgentRuntimes" in details
+
+    SM_LISTED = "arn:aws:sagemaker:us-east-1:123456789012:endpoint/listed"
+
+    def test_listed_resources_all_tagged_pass_and_one_unread_list_does_not(self):
+        tagged = {
+            "sagemaker": [
+                [
+                    {
+                        "ResourceARN": self.SM_LISTED,
+                        "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                    }
+                ]
+            ]
+        }
+        _, rows, _ = self._run(
+            tagged, lists={"list_endpoints": [{"EndpointArn": self.SM_LISTED}]}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "sagemaker:ListEndpoints listed 1 endpoint(s), 0 of them absent"
+            in rows[0]["Finding_Details"]
+        )
+        _, rows, _ = self._run(
+            tagged,
+            lists={
+                "list_endpoints": [{"EndpointArn": self.SM_LISTED}],
+                "list_memories": _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "bedrock-agentcore:ListMemories (AccessDeniedException)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_no_resource_at_all_is_na_not_passed(self):
+        result, rows, _ = self._run({})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert result["status"] == "N/A"
 
     def test_an_unowned_resource_on_a_later_page_is_failed(self):
         _, rows, _ = self._run(
@@ -30626,7 +30673,9 @@ class TestBR53OwnerTagSweep:
                 ]
             },
         )
-        assert [r["Status"] for r in rows] == ["N/A"]
+        # Passed, not N/A, since the summary can pass (GOV-02, round 6); a faked
+        # never-tagged notebook would read ["Failed", "N/A"].
+        assert [r["Status"] for r in rows] == ["Passed"]
 
     def test_a_never_tagged_notebook_on_a_later_page_is_failed(self):
         def pages(**kwargs):

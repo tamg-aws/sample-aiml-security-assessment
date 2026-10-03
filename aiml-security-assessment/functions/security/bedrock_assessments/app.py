@@ -30027,8 +30027,9 @@ def _arn_resource_segment(arn: str) -> str:
 def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
     """
     BR-53 SageMaker and AgentCore leg: fail each resource GetResources returns
-    for those services with no owner tag whose value names someone. GetResources
-    returns only resources that are or were tagged, so this never passes.
+    for those services, or a List API returns and GetResources does not, with no
+    owner tag whose value names someone. GetResources returns only resources
+    that are or were tagged, so other types never tagged are named as unread.
     """
     findings = {"check_name": RESOURCE_OWNER_SWEEP_FINDING, "csv_data": []}
 
@@ -30193,23 +30194,31 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
             )
         )
     unread_note = " These reads failed: {}.".format("; ".join(unread)) if unread else ""
+    # Every list read and every GetResources filter was read, and nothing read
+    # lacks an owner: the ten listed types are judged whole, so the row passes
+    # and names the types only GetResources reaches.
+    complete = owned > 0 and not unowned and not unread
     findings["csv_data"].append(
         row(
             "{} of the {} SageMaker and AgentCore resource(s) GetResources returned "
-            "carry an owner tag with a non-placeholder value.{} {} This is not a "
-            "verdict on every SageMaker or AgentCore resource.{}".format(
+            "carry an owner tag with a non-placeholder value.{} {} {}{}".format(
                 owned,
                 returned,
                 list_note,
                 RESOURCE_OWNER_SWEEP_GAP,
+                "Whether each value resolves to a person or an on-call rotation is "
+                "not verified, and production resources are not told apart from "
+                "others."
+                if complete
+                else "This is not a verdict on every SageMaker or AgentCore resource.",
                 unread_note,
             ),
-            COULD_NOT_ASSESS_RESOLUTION,
-            "Informational",
-            "N/A",
+            "No action required" if complete else COULD_NOT_ASSESS_RESOLUTION,
+            "Low" if complete else "Informational",
+            "Passed" if complete else "N/A",
         )
     )
-    findings["status"] = "WARN" if unowned else "N/A"
+    findings["status"] = "WARN" if unowned else "PASS" if complete else "N/A"
     return findings
 
 

@@ -1861,11 +1861,14 @@ FOUNDATION_ROWS = [
         "GetResources returns only resources that are or were tagged, so a sweep "
         "omits the resources that most need an owner. SageMaker and AgentCore "
         "resources are read through a ResourceTypeFilters sweep: each returned "
-        "resource without an owner tag fails, and the sweep never passes. SageMaker "
+        "resource without an owner tag fails. SageMaker "
         "endpoints, models, notebook instances, training jobs and domains, and agent "
         "runtimes, memories, gateways, custom browsers and custom code interpreters, "
         "listed by their SageMaker and AgentCore list APIs and absent from the "
-        "sweep, fail as never tagged",
+        "sweep, fail as never tagged. The sweep summary passes only when every "
+        "filter and list read succeeded and no resource lacks an owner, and it names "
+        "the other types, which only the sweep reaches, as unlisted when never "
+        "tagged",
         [],
         6,
     ),
