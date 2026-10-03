@@ -1443,6 +1443,55 @@ MUTATIONS = [
         "find": '    state, response = reads["ownership"]\n    if state == "error":\n',
         "replace": '    state, response = reads["ownership"]\n    if state == "error":\n        state, response = "read", {"OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}}\n    if False:\n',
     },
+    {
+        "name": "AC-06 skips the recording key-use leg",
+        "file": AGENTCORE,
+        "defect": "a role that cannot use the bucket's key for kms:GenerateDataKey was reported able to write recordings",
+        "find": "    for key_arn, key_policy in recording_keys or []:\n",
+        "replace": "    for key_arn, key_policy in []:\n",
+    },
+    {
+        "name": "AC-06 credits a key policy Deny",
+        "file": AGENTCORE,
+        "defect": "a Deny of kms:GenerateDataKey reaching the role was ignored",
+        "find": '        if not statement.get("Condition"):\n            return "failed", (\n                f"a Deny in {source} refuses execution role {role_name} "\n                f"kms:GenerateDataKey',
+        "replace": '        if False:\n            return "failed", (\n                f"a Deny in {source} refuses execution role {role_name} "\n                f"kms:GenerateDataKey',
+    },
+    {
+        "name": "AC-06 reads any key grant as root delegation",
+        "file": AGENTCORE,
+        "defect": "a key policy that delegates to no one but an admin role was read as delegating to the account",
+        "find": "        elif names(statement, {root, account}):\n",
+        "replace": "        elif True:\n",
+    },
+    {
+        "name": "AC-06 admits any kms:CallerAccount",
+        "file": AGENTCORE,
+        "defect": "a key grant limited to another account's callers was credited",
+        "find": '            if key == "kms:calleraccount" and account not in values:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "AC-06 admits any kms:ViaService",
+        "file": AGENTCORE,
+        "defect": "a key grant limited to calls through EC2 was credited for S3",
+        "find": '            if key == "kms:viaservice" and not any(\n',
+        "replace": "            if False and not any(\n",
+    },
+    {
+        "name": "AC-06 admits an unread key-policy condition key",
+        "file": AGENTCORE,
+        "defect": "a key grant conditioned on a principal tag was credited without evaluating the tag",
+        "find": "            if key not in RECORDING_KEY_USE_CONDITION_KEYS or not values:\n",
+        "replace": "            if not values:\n",
+    },
+    {
+        "name": "AC-06 ignores the boundary for the recording key",
+        "file": AGENTCORE,
+        "defect": "a permissions boundary that allows no kms action was ignored for the recording key",
+        "find": '    if (\n        boundary is not None\n        and not allows(boundary_statements, "the permissions boundary")\n        and len(conditional) == before\n    ):\n        return "failed", (\n            f"the permissions boundary of execution role {role_name} does not "\n            f"allow kms:GenerateDataKey',
+        "replace": '    if (\n        False\n        and not allows(boundary_statements, "the permissions boundary")\n        and len(conditional) == before\n    ):\n        return "failed", (\n            f"the permissions boundary of execution role {role_name} does not "\n            f"allow kms:GenerateDataKey',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1760,6 +1809,13 @@ GROUPS: dict[str, str] = {
     "AC-06 judges public grants under RestrictPublicBuckets": "in the AgentCore verdict legs",
     "AC-06 credits ACLs left on": "in the AgentCore verdict legs",
     "AC-06 reads an unread ownership setting as enforced": "in the AgentCore verdict legs",
+    "AC-06 skips the recording key-use leg": "in the AgentCore verdict legs",
+    "AC-06 credits a key policy Deny": "in the AgentCore verdict legs",
+    "AC-06 reads any key grant as root delegation": "in the AgentCore verdict legs",
+    "AC-06 admits any kms:CallerAccount": "in the AgentCore verdict legs",
+    "AC-06 admits any kms:ViaService": "in the AgentCore verdict legs",
+    "AC-06 admits an unread key-policy condition key": "in the AgentCore verdict legs",
+    "AC-06 ignores the boundary for the recording key": "in the AgentCore verdict legs",
 }
 
 

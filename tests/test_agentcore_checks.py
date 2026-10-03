@@ -3673,8 +3673,13 @@ class TestAC06RecordingKeyPolicy:
 
         mock_kms.describe_key.side_effect = describe_key
         mock_kms.get_key_policy.side_effect = get_key_policy
+        # The key policy delegates to the account root, so since RT-09 the role
+        # needs its own kms:GenerateDataKey grant to encrypt a recording.
         cache = _recorder_cache(
-            statements=[{"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}]
+            statements=[
+                {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"},
+                {"Effect": "Allow", "Action": "kms:GenerateDataKey", "Resource": "*"},
+            ]
         )
         return _record(
             _browser_inventory(
@@ -50033,3 +50038,203 @@ class TestAC06RecordingServicePrincipalsAndAcls:
         assert finding["Status"] == "N/A"
         assert "Object Ownership setting" in finding["Finding_Details"]
         assert "s3:GetBucketOwnershipControls" in finding["Resolution"]
+
+
+class TestAC06RecordingKeyUse:
+    """AIR-ACR-RT-09: S3 encrypts each recording with a data key it requests as
+    the execution role, so the role must be able to use the bucket's customer
+    managed key for kms:GenerateDataKey."""
+
+    _ROOT = {
+        "Sid": "Root",
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+        "Action": "kms:*",
+        "Resource": "*",
+    }
+    _WRITE = {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}
+    _USE = {"Effect": "Allow", "Action": "kms:GenerateDataKey", "Resource": "*"}
+
+    def _run(self, other_policy, identity, boundary=None, other_key=True, rows=False):
+        """Bucket `recordings` encrypts with a key whose policy names the role;
+        bucket `other` with a key holding `other_policy`, or with aws/s3 when
+        `other_key` is False."""
+        good_key = "arn:aws:kms:us-east-1:123456789012:key/good"
+        other = "arn:aws:kms:us-east-1:123456789012:key/other"
+        policies = {
+            good_key: [
+                self._ROOT,
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": _RECORDER_ROLE},
+                    "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+                    "Resource": "*",
+                },
+            ],
+            other: other_policy,
+        }
+        mock_s3 = MagicMock()
+        mock_kms = MagicMock()
+        _wire_recording_bucket(
+            mock_s3,
+            statements=[
+                _plaintext_deny(
+                    Resource=[
+                        "arn:aws:s3:::recordings",
+                        "arn:aws:s3:::recordings/*",
+                        "arn:aws:s3:::other",
+                        "arn:aws:s3:::other/*",
+                    ]
+                )
+            ],
+        )
+
+        def encryption(Bucket, ExpectedBucketOwner):
+            default = {"SSEAlgorithm": "aws:kms"}
+            if Bucket == "recordings":
+                default["KMSMasterKeyID"] = good_key
+            elif other_key:
+                default["KMSMasterKeyID"] = other
+            return {
+                "ServerSideEncryptionConfiguration": {
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": default}]
+                }
+            }
+
+        mock_s3.get_bucket_encryption.side_effect = encryption
+        mock_kms.describe_key.side_effect = lambda KeyId: {
+            "KeyMetadata": {"Arn": KeyId}
+        }
+        mock_kms.get_key_policy.side_effect = lambda KeyId, **_: {
+            "Policy": json.dumps(
+                {"Version": "2012-10-17", "Statement": policies[KeyId]}
+            )
+        }
+        with (
+            patch("agentcore_app.s3_client", mock_s3),
+            patch("agentcore_app.kms_client", mock_kms),
+        ):
+            findings = _record(
+                _browser_inventory(
+                    _recorded_browser("br-1"),
+                    _recorded_browser("br-2", bucket="other"),
+                ),
+                _recorder_cache(statements=identity, boundary=boundary),
+            )
+        by_id = {f["Finding_Details"].split("(", 2)[1][:4]: f for f in findings}
+        if rows:
+            return by_id
+        assert by_id["br-1"]["Status"] == "Passed"
+        assert "through its key policy" in by_id["br-1"]["Finding_Details"]
+        return by_id["br-2"]
+
+    def test_a_root_delegating_key_needs_the_role_identity_grant(self):
+        failed = self._run([self._ROOT], [self._WRITE])
+        assert failed["Status"] == "Failed"
+        assert "allows kms:GenerateDataKey" in failed["Finding_Details"]
+        assert "kms:GenerateDataKey on the bucket's key" in failed["Resolution"]
+        passed = self._run([self._ROOT], [self._WRITE, self._USE])
+        assert passed["Status"] == "Passed"
+        assert "an identity policy the key delegates to" in passed["Finding_Details"]
+
+    def test_an_identity_grant_without_delegation_fails(self):
+        # The key policy does not delegate to the account root, so the role's
+        # own kms grant does not reach the key.
+        statement = {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/admin"},
+            "Action": "kms:*",
+            "Resource": "*",
+        }
+        failed = self._run([statement], [self._WRITE, self._USE])
+        assert failed["Status"] == "Failed"
+
+    def test_a_star_grant_bound_to_s3_in_this_account_passes(self):
+        statement = {
+            "Effect": "Allow",
+            "Principal": {"AWS": "*"},
+            "Action": ["kms:GenerateDataKey*", "kms:Decrypt"],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "kms:CallerAccount": "123456789012",
+                    "kms:ViaService": "s3.us-east-1.amazonaws.com",
+                }
+            },
+        }
+        passed = self._run([statement], [self._WRITE])
+        assert passed["Status"] == "Passed"
+        assert "through its key policy" in passed["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"kms:CallerAccount": "999988887777"}},
+            {"StringEquals": {"kms:ViaService": "ec2.us-east-1.amazonaws.com"}},
+            {"StringEquals": {"aws:PrincipalTag/team": "rec"}},
+        ],
+        ids=["other-account", "other-service", "unread-key"],
+    )
+    def test_a_role_grant_with_another_condition_is_not_credited(self, condition):
+        # Named on the role, not "*", so the open-decrypt leg stays clean and
+        # only the key-use verdict decides the row.
+        statement = {
+            "Effect": "Allow",
+            "Principal": {"AWS": _RECORDER_ROLE},
+            "Action": "kms:GenerateDataKey",
+            "Resource": "*",
+            "Condition": condition,
+        }
+        row = self._run([statement], [self._WRITE])
+        assert row["Status"] == "N/A"
+        assert "carries a condition that is not evaluated" in row["Finding_Details"]
+
+    def test_a_key_policy_deny_fails(self):
+        deny = {
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "kms:GenerateDataKey",
+            "Resource": "*",
+        }
+        failed = self._run([self._ROOT, deny], [self._WRITE, self._USE])
+        assert failed["Status"] == "Failed"
+        assert "a Deny in the key policy" in failed["Finding_Details"]
+
+    def test_an_identity_deny_on_the_other_key_fails_only_there(self):
+        deny = {
+            "Effect": "Deny",
+            "Action": "kms:*",
+            "Resource": "arn:aws:kms:us-east-1:123456789012:key/other",
+        }
+        failed = self._run([self._ROOT], [self._WRITE, self._USE, deny])
+        assert failed["Status"] == "Failed"
+        assert "a Deny in an identity policy" in failed["Finding_Details"]
+
+    def test_a_boundary_without_kms_fails(self):
+        boundary = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}
+            ],
+        }
+        role_key = [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": _RECORDER_ROLE},
+                "Action": "kms:GenerateDataKey",
+                "Resource": "*",
+            }
+        ]
+        # The boundary binds the role, so the key that names it fails too.
+        by_id = self._run(role_key, [self._WRITE], boundary=boundary, rows=True)
+        for row in by_id.values():
+            assert row["Status"] == "Failed"
+            assert (
+                "permissions boundary of execution role browser-recorder does not "
+                "allow kms:GenerateDataKey" in row["Finding_Details"]
+            )
+
+    def test_the_aws_managed_key_needs_no_grant(self):
+        passed = self._run([], [self._WRITE], other_key=False)
+        assert passed["Status"] == "Passed"
+        assert "use key" not in passed["Finding_Details"]

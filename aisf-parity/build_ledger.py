@@ -333,8 +333,13 @@ AI_SUBJECT_ROWS = [
         "bucket policy does not show; an unread setting is N/A. "
         "Each KMSMasterKeyID the bucket encrypts with is resolved by kms:DescribeKey and its "
         "policy read by kms:GetKeyPolicy: a decrypt grant to a principal no condition binds "
-        "fails, and an unreadable key is N/A. SCPs and the role's use of that key are not "
-        "evaluated for the write, so a Passed write can still be refused. The AWS managed browser has no recording configuration and is "
+        "fails, and an unreadable key is N/A. The execution role must also be able to use each "
+        "such key for kms:GenerateDataKey: granted by the key policy to the role, to * bound "
+        "only by kms:CallerAccount and kms:ViaService naming the account and S3, or to the "
+        "account root with the role's identity policy granting it, allowed by the boundary, "
+        "and reached by no Deny; any other condition is N/A. SCPs are not evaluated for the "
+        "write and the multipart kms:Decrypt is not judged, so a Passed write can still be "
+        "refused. The AWS managed browser has no recording configuration and is "
         "outside the population",
         [],
         4,

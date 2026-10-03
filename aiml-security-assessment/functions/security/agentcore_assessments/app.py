@@ -6421,9 +6421,9 @@ BROWSER_RECORDING_BUCKET_READS = (
 BROWSER_RECORDING_WRITE_ACTION = "s3:putobject"
 BROWSER_RECORDING_READ_ACTION = "s3:getobject"
 BROWSER_RECORDING_WRITE_CEILING = (
-    "Service control policies, the bucket key's policy and the role's use of "
-    "that key are not evaluated for this write, so any of them may still refuse "
-    "it: this leg can report a write the account would block."
+    "Service control policies are not evaluated for this write, so one may "
+    "still refuse it, and the kms:Decrypt a multipart upload also needs is not "
+    "judged: this leg can report a write the account would block."
 )
 
 
@@ -6551,6 +6551,174 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _recording_bucket_key_ids(reads: Dict[str, Tuple[str, Any]]) -> List[str]:
+    """Return the KMSMasterKeyID of each KMS default encryption rule, sorted.
+
+    A rule naming no KMSMasterKeyID uses the AWS managed aws/s3 key, whose
+    policy lets every principal of the account use it through S3.
+    """
+    state, response = reads["encryption"]
+    if state == "error":
+        return []
+    return sorted(
+        {
+            str(default.get("KMSMasterKeyID"))
+            for rule in (
+                (response or {}).get("ServerSideEncryptionConfiguration") or {}
+            ).get("Rules")
+            or []
+            if isinstance(rule, dict)
+            for default in [rule.get("ApplyServerSideEncryptionByDefault") or {}]
+            if default.get("SSEAlgorithm") in BROWSER_RECORDING_KMS_ALGORITHMS
+            and default.get("KMSMasterKeyID")
+        }
+    )
+
+
+# The key policy conditions a write through S3 by a principal of the bucket's
+# account satisfies: S3 calls KMS on the writer's behalf with the writer's
+# account as kms:CallerAccount and s3.<region>.amazonaws.com as kms:ViaService.
+RECORDING_KEY_USE_CONDITION_KEYS = {"kms:calleraccount", "kms:viaservice"}
+RECORDING_KEY_USE_ACTION = "kms:generatedatakey"
+
+
+def _recording_key_condition_admits(statement: Dict[str, Any], account: str) -> bool:
+    """Return whether a key policy Allow's condition admits a write through S3.
+
+    Only kms:CallerAccount naming `account` and kms:ViaService naming an S3
+    endpoint are read, each under StringEquals or StringLike. Any other key or
+    operator is not evaluated, so it does not admit.
+    """
+    conditions = statement.get("Condition")
+    if not conditions:
+        return True
+    if not isinstance(conditions, dict):
+        return False
+    for operator, entries in conditions.items():
+        if str(operator).strip().lower() not in ("stringequals", "stringlike"):
+            return False
+        if not isinstance(entries, dict):
+            return False
+        for key, raw in entries.items():
+            key = str(key).strip().lower()
+            values = [value.strip() for value in _condition_values(raw)]
+            if key not in RECORDING_KEY_USE_CONDITION_KEYS or not values:
+                return False
+            if key == "kms:calleraccount" and account not in values:
+                return False
+            if key == "kms:viaservice" and not any(
+                value.lower().startswith("s3.") for value in values
+            ):
+                return False
+    return True
+
+
+def _recording_key_use_verdict(
+    role_arn: str,
+    role_name: str,
+    key_arn: str,
+    key_policy: Any,
+    identity: List[Dict[str, Any]],
+    boundary: Any,
+    boundary_statements: List[Dict[str, Any]],
+    account: str,
+    partition: str,
+) -> Tuple[str, str]:
+    """Judge whether the execution role may use the recording key for a write.
+
+    S3 encrypts each recording with a data key it requests from KMS as the
+    writer, so the role needs kms:GenerateDataKey on the key. The key policy
+    must grant it to the role or to the account root, which delegates the
+    decision to the role's identity policy; the permissions boundary must
+    allow it too, and no Deny may reach it. A condition other than the ones
+    _recording_key_condition_admits reads withholds the verdict.
+    """
+    statements = _document_statements(key_policy)
+    root = f"arn:{partition}:iam::{account}:root"
+    conditional: List[str] = []
+
+    def reaches(statement: Dict[str, Any]) -> bool:
+        return _statement_matches_action(
+            statement, RECORDING_KEY_USE_ACTION
+        ) and _statement_resource_covers(statement, [key_arn])
+
+    def names(statement: Dict[str, Any], principals: Set[str]) -> bool:
+        if "NotPrincipal" in statement:
+            excluded = _statement_principals({"Principal": statement["NotPrincipal"]})
+            return role_arn not in excluded and root not in excluded
+        return bool(principals & set(_statement_principals(statement)))
+
+    everyone = {"*", role_arn, root, account}
+    for source, statement in (
+        [("the key policy", st) for st in statements if names(st, everyone)]
+        + [("an identity policy", st) for st in identity]
+        + [("the permissions boundary", st) for st in boundary_statements]
+    ):
+        if statement.get("Effect") != "Deny" or not reaches(statement):
+            continue
+        if not statement.get("Condition"):
+            return "failed", (
+                f"a Deny in {source} refuses execution role {role_name} "
+                f"kms:GenerateDataKey on recording key {key_arn}, so S3 cannot "
+                "encrypt its recordings"
+            )
+        conditional.append(f"a Deny in {source} on key {key_arn}")
+
+    direct = delegated = False
+    for statement in statements:
+        if statement.get("Effect") != "Allow" or not reaches(statement):
+            continue
+        if names(statement, {"*", role_arn}):
+            if _recording_key_condition_admits(statement, account):
+                direct = True
+            else:
+                conditional.append(f"an Allow in the policy of key {key_arn}")
+        elif names(statement, {root, account}):
+            if not statement.get("Condition"):
+                delegated = True
+            else:
+                conditional.append(f"an Allow in the policy of key {key_arn}")
+
+    def allows(policy_statements: List[Dict[str, Any]], source: str) -> bool:
+        granted = False
+        for statement in policy_statements:
+            if statement.get("Effect") != "Allow" or not reaches(statement):
+                continue
+            if statement.get("Condition"):
+                conditional.append(f"an Allow in {source}")
+            else:
+                granted = True
+        return granted
+
+    identity_allows = delegated and allows(identity, "an identity policy")
+    if not direct and not identity_allows and not conditional:
+        return "failed", (
+            f"neither the policy of recording key {key_arn} nor, through the "
+            f"account root, an identity policy of execution role {role_name} "
+            "allows kms:GenerateDataKey, so S3 cannot encrypt its recordings"
+        )
+    before = len(conditional)
+    if (
+        boundary is not None
+        and not allows(boundary_statements, "the permissions boundary")
+        and len(conditional) == before
+    ):
+        return "failed", (
+            f"the permissions boundary of execution role {role_name} does not "
+            f"allow kms:GenerateDataKey on recording key {key_arn}"
+        )
+    if conditional or not (direct or identity_allows):
+        return "unread", (
+            f"whether execution role {role_name} can use recording key {key_arn}: "
+            f"{', '.join(sorted(set(conditional)))} carries a condition that is "
+            "not evaluated"
+        )
+    return "granted", (
+        f"use key {key_arn} for kms:GenerateDataKey through "
+        + ("its key policy" if direct else "an identity policy the key delegates to")
+    )
+
+
 def _recording_key_gaps(
     reads: Dict[str, Tuple[str, Any]], bucket: str, key_cache: Dict[str, Any]
 ) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
@@ -6568,23 +6736,9 @@ def _recording_key_gaps(
     unread: List[str] = []
     retries: List[str] = []
     facts: List[str] = []
-    state, response = reads["encryption"]
-    if state == "error":
+    if reads["encryption"][0] == "error":
         return problems, fixes, unread, retries, facts
-    key_ids = sorted(
-        {
-            str(default.get("KMSMasterKeyID"))
-            for rule in (
-                (response or {}).get("ServerSideEncryptionConfiguration") or {}
-            ).get("Rules")
-            or []
-            if isinstance(rule, dict)
-            for default in [rule.get("ApplyServerSideEncryptionByDefault") or {}]
-            if default.get("SSEAlgorithm") in BROWSER_RECORDING_KMS_ALGORITHMS
-            and default.get("KMSMasterKeyID")
-        }
-    )
-    for key_id in key_ids:
+    for key_id in _recording_bucket_key_ids(reads):
         if key_id not in key_cache:
             try:
                 key_arn = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["Arn"]
@@ -7062,6 +7216,7 @@ def _recording_write_verdict(
     object_arn: str,
     account: str,
     partition: str,
+    recording_keys: Optional[List[Tuple[str, Any]]] = None,
 ) -> Tuple[str, str]:
     """Judge whether a browser's execution role may write its recordings.
 
@@ -7070,7 +7225,9 @@ def _recording_write_verdict(
     the role's permissions boundary must allow it too, and no Deny in any of
     them may reach it. A Deny keyed only on aws:SecureTransport does not refuse
     the service, which writes over TLS. Any other condition is not evaluated,
-    so it withholds the verdict.
+    so it withholds the verdict. Each customer managed key in `recording_keys`, as
+    (key ARN, key policy) or (key id, read error), must also let the role
+    encrypt with it.
     """
     if not isinstance(permission_cache, dict):
         return "unread", (
@@ -7195,9 +7352,31 @@ def _recording_write_verdict(
             f"whether the bucket policy denies execution role {role_name} the "
             "write (the bucket policy was not read)"
         )
+    key_notes: List[str] = []
+    for key_arn, key_policy in recording_keys or []:
+        if isinstance(key_policy, Exception):
+            return "unread", (
+                f"whether execution role {role_name} can use recording key "
+                f"{key_arn} (its key policy was not read)"
+            )
+        verdict, text = _recording_key_use_verdict(
+            role_arn,
+            role_name,
+            key_arn,
+            key_policy,
+            identity,
+            boundary,
+            boundary_statements,
+            account,
+            partition,
+        )
+        if verdict != "granted":
+            return verdict, text
+        key_notes.append(text)
     return "granted", (
         f"execution role {role_name} may write s3:PutObject on {object_arn} "
         f"through {' and '.join(sources)}"
+        + (f" and may {'; '.join(key_notes)}" if key_notes else "")
     )
 
 
@@ -7431,6 +7610,12 @@ def check_browser_tool_recording(
                         )
                 reader_note = _recording_cached_readers(permission_cache, object_arn)
                 if role_arn:
+                    keys = [
+                        (key_id, key_cache[key_id][1])
+                        if isinstance(key_cache[key_id][1], Exception)
+                        else key_cache[key_id]
+                        for key_id in _recording_bucket_key_ids(reads)
+                    ]
                     verdict, text = _recording_write_verdict(
                         str(role_arn),
                         permission_cache,
@@ -7438,13 +7623,15 @@ def check_browser_tool_recording(
                         object_arn,
                         account,
                         partition,
+                        keys,
                     )
                     if verdict == "failed":
                         problems.append(text)
                         fixes.append(
                             "Allow the execution role s3:PutObject on the recording "
-                            "prefix in its identity policy and permissions boundary, "
-                            "and remove the Deny that refuses it."
+                            "prefix and kms:GenerateDataKey on the bucket's key in "
+                            "its identity policy, key policy and permissions "
+                            "boundary, and remove the Deny that refuses it."
                         )
                     elif verdict == "unread":
                         unread.append(text)
