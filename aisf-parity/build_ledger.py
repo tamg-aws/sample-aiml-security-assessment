@@ -36,7 +36,22 @@ FOUNDATION = "foundation"  # the account or runtime an AI workload sits on
 AI_SUBJECT_ROWS = [
     # ---------------- BDR: 19 controls, bedrock_assessments ----------------
     ("AIR-BDR-GRD-01", COVERED, None, "bedrock_assessments", ["BR-10"], "", [], 3),
-    ("AIR-BDR-GRD-03", COVERED, None, "bedrock_assessments", ["BR-26"], "", [], 3),
+    (
+        "AIR-BDR-GRD-03",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-26"],
+        "BR-26 judges entity and regex actions on the input and output sides of each "
+        "draft and deployed guardrail version. Each deployed version that passes those "
+        "settings is then applied once with bedrock:ApplyGuardrail, source OUTPUT and "
+        "outputScope INTERVENTIONS, to a fixed probe string built from AWS's documented "
+        "example access key and secret key: both blocked or anonymized is Passed, either "
+        "let through is Failed, and an ApplyGuardrail error is N/A. PASSWORD detection "
+        "of the probe text and the custom regex patterns are stated, not judged",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-KB-03",
         COVERED,
@@ -52,9 +67,14 @@ AI_SUBJECT_ROWS = [
         "policy. For an OpenSearch Service domain it fails an Allow admitting an "
         "unbounded principal unless fine-grained access control is on with anonymous "
         "authentication off, and for Neptune Analytics it fails a graph with "
-        "publicConnectivity true; an absent field is N/A. Aurora access, which runs "
-        "through database credentials, is not judged, and whether access matches the "
-        "source data's is not compared",
+        "publicConnectivity true; an absent field is N/A. For Aurora it fails a "
+        "cluster with a PubliclyAccessible member instance (rds:DescribeDBInstances "
+        "per DBClusterMembers entry), and an unread instance is N/A; database "
+        "credentials themselves are not judged. For a SQL knowledge base it fails a "
+        "Redshift cluster with PubliclyAccessible true or a Serverless workgroup with "
+        "publiclyAccessible true, and holds an AWS_DATA_CATALOG store at N/A. A "
+        "MANAGED store is judged on its key "
+        "alone, and whether access matches the source data's is not compared",
         [],
         3,
     ),
@@ -66,14 +86,44 @@ AI_SUBJECT_ROWS = [
         ["BR-37"],
         "BR-37 reads bedrock:GetAccountDataRetention for the control plane, and the "
         "bedrock-mantle account mode plus every mantle project's data_retention mode "
-        "over SigV4-signed HTTPS; each project's effective mode is judged, and only "
-        "none passes",
+        "over SigV4-signed HTTPS; the mantle account mode is judged on its own row "
+        "even with no project listed, each project's effective mode is judged, and "
+        "only none passes. Each model's allowed_modes are not read",
         [],
         3,
     ),
-    ("AIR-BDR-GRD-02", COVERED, None, "bedrock_assessments", ["BR-34"], "", [], 3),
+    (
+        "AIR-BDR-GRD-02",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-34"],
+        "BR-34 requires a PROMPT_ATTACK filter with inputEnabled, BLOCK and HIGH "
+        "on the STANDARD tier for every reached guardrail version. Its 'Guardrail "
+        "Prompt Attack Invocation Evidence' row reads the last 24 hours of "
+        "CloudWatch invocation log records with logs:FilterLogEvents, fails a "
+        "guarded InvokeModel call whose input carries no guardContent tag, and "
+        "passes on a logged PROMPT_ATTACK block with every guarded call tagged. "
+        "Converse guardContent blocks and S3-only log destinations are not read",
+        [],
+        3,
+    ),
     ("AIR-BDR-GRD-04", COVERED, None, "bedrock_assessments", ["BR-32"], "", [], 3),
-    ("AIR-BDR-GRD-09", COVERED, None, "bedrock_assessments", ["BR-27"], "", [], 3),
+    (
+        "AIR-BDR-GRD-09",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-27"],
+        "BR-27 requires active GROUNDING and RELEVANCE filters with BLOCK and a "
+        "threshold above 0 and at most 0.99. Its 'Guardrail Contextual Grounding "
+        "Score Evidence' row fails when invocation logging delivers no text, so "
+        "no score is logged, and passes on a scored GROUNDING or RELEVANCE entry "
+        "read from the last 24 hours of CloudWatch invocation log records. Whether "
+        "callers supply the grounding qualifiers is not recorded by any API",
+        [],
+        3,
+    ),
     ("AIR-BDR-GRD-10", COVERED, None, "bedrock_assessments", ["BR-41"], "", [], 3),
     (
         "AIR-BDR-KB-06",
@@ -82,7 +132,9 @@ AI_SUBJECT_ROWS = [
         "bedrock_assessments",
         ["BR-06"],
         "BR-06 credits retrieval traceability only when a trail or event data store "
-        "records AWS::Bedrock::KnowledgeBase data events, invocation logging records "
+        "records AWS::Bedrock::KnowledgeBase data events, read from multi-Region "
+        "trails and from single-Region trails homed in the knowledge base's Region, "
+        "invocation logging records "
         "text, and every S3 source bucket has versioning Enabled "
         "(s3:GetBucketVersioning); an unread data source or bucket is N/A. The "
         "RetrieveAndGenerate citations are not read, and sources outside S3 are not "
@@ -96,9 +148,12 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-06"],
-        "BR-06 credits Bedrock management and data events from multi-region trails and "
-        "from each ENABLED CloudTrail Lake event data store, whose advanced selectors "
-        "it reads with cloudtrail:GetEventDataStore and judges as a trail's. A management "
+        "BR-06 credits Bedrock management and data events from multi-region trails, "
+        "from single-Region trails homed in the assessed Region, and from each ENABLED "
+        "CloudTrail Lake event data store homed there or, with MultiRegionEnabled, "
+        "in another assessed Region. A store homed in an unassessed Region is not "
+        "read. Each store's advanced selectors are read with "
+        "cloudtrail:GetEventDataStore and judged as a trail's. A management "
         "selector must admit both bedrock.amazonaws.com and bedrock-mantle.amazonaws.com, "
         "and a data-event row needs all six AWS::BedrockMantle:: resource types. "
         "An unread "
@@ -123,7 +178,9 @@ AI_SUBJECT_ROWS = [
         "bedrock_assessments",
         ["BR-46"],
         "BR-46 passes a knowledge base S3 source only when a recurring, full-depth "
-        "Macie job scopes in its prefix. With Macie off, a source that no completed "
+        "Macie job scopes in its prefix, the latest ingestion did not start after "
+        "the job's last run, and every source list was read. With Macie off, a "
+        "source that no completed "
         "Comprehend PII detection job read fails, and a Comprehend-screened source "
         "is N/A. Whether classification is carried into per-document metadata needs "
         "s3:GetObject on the metadata sidecars, which the Bedrock role is not granted",
@@ -131,7 +188,24 @@ AI_SUBJECT_ROWS = [
         3,
     ),
     ("AIR-BDR-MDL-01", COVERED, None, "bedrock_assessments", ["BR-42"], "", [], 3),
-    ("AIR-BDR-MDL-03", COVERED, None, "bedrock_assessments", ["BR-43"], "", [], 3),
+    (
+        "AIR-BDR-MDL-03",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-43", "BR-42"],
+        "BR-43 reads the attached Region-deny SCPs and every inference profile in "
+        "each assessed Region. It fails an allow-list that admits unspecified while "
+        "global profiles exist, and one that omits a destination Region of any "
+        "available geographic profile; the row names which of those profiles a "
+        "call named as requestParameters.modelId in the last 24 hours of event "
+        "history, without narrowing the test, since a profile not called in the "
+        "window is still callable. BR-42 carries the IAM step, failing an "
+        "identity policy that grants invocation on an unscoped foundation-model "
+        "or inference-profile ARN",
+        [],
+        3,
+    ),
     ("AIR-BDR-MDL-04", COVERED, None, "bedrock_assessments", ["BR-44"], "", [], 3),
     ("AIR-BDR-MDL-09", COVERED, None, "bedrock_assessments", ["BR-45"], "", [], 3),
     (
@@ -168,10 +242,12 @@ AI_SUBJECT_ROWS = [
         "with no POST_CHUNKING transformation step and no completed Comprehend "
         "ONLY_REDACTION job whose output location holds everything the source "
         "ingests, whose PiiEntityTypes names ALL, and that ended before the source's "
-        "latest ingestion job started, and that is reached through no agent version "
-        "or flow node whose guardrail blocks or masks AWS_ACCESS_KEY, AWS_SECRET_KEY "
-        "and PASSWORD on both sides with a custom regex on the output, or through one "
-        "whose guardrail does not. It never passes one. An account-enforced configuration is "
+        "latest ingestion job started. An agent version or flow node guardrail is not "
+        "credited as screening the retrieved chunks, because the agent guardrail guide "
+        "describes it evaluating user messages and model responses only. Each object "
+        "the source ingests is listed with s3:ListBucket, and one last modified after "
+        "the job's EndTime fails the source; an unread or capped listing is N/A. It "
+        "never passes one, because no API records that the job wrote each object. An account-enforced configuration is "
         "credited only when it applies to every model and every message, without "
         "SELECTIVE guarding or inputTags HONOR. comprehend:ListPiiEntitiesDetectionJobs has "
         "no resource type and is granted on *, and a failed read leaves an S3 "
@@ -1099,7 +1175,11 @@ AI_SUBJECT_ROWS = [
         ["BR-20", "BR-11", "BR-17", "SM-03"],
         "four checks cover the stores this control names: BR-20 the key of a managed "
         "store, an S3 Vectors store, and the OpenSearch Serverless, Aurora, OpenSearch "
-        "domain and Neptune Analytics store each knowledge base names, each judged by "
+        "domain and Neptune Analytics store each knowledge base names, and the Kendra "
+        "index of a KENDRA knowledge base (kendra:DescribeIndex KmsKeyId; none named "
+        "fails), and the Redshift engine of a SQL knowledge base (a provisioned "
+        "cluster's KmsKeyId, failing when Encrypted is false, or a Serverless "
+        "namespace's kmsKeyId, failing on AWS_OWNED_KMS_KEY), each judged by "
         "DescribeKey as customer managed and Enabled, plus the default encryption of each "
         "data source bucket, which is where the ingested objects sit before any index "
         "exists, and each data source's transient data key; BR-11 the custom model's "
@@ -1134,7 +1214,12 @@ AI_SUBJECT_ROWS = [
         "principals, resources or actions it misses, since a Deny scoped to some "
         "principals leaves the rest able to use HTTP. The aws:PrincipalIsAWSService "
         "false exception of the S3 example policy is credited, since the Deny still "
-        "reaches every identity. Every data source and job is read "
+        "reaches every identity. The exact exclusion the recommendation prescribes for "
+        "broken ingestion is credited too: a negated aws:PrincipalArn test with no "
+        "set-operator prefix whose every value is an ARN with no wildcard or policy "
+        "variable, or Bool aws:ViaAWSService false. The Passed text names each exempted "
+        "ARN as keeping plaintext access, and a wildcard value, a set-operator prefix or "
+        "another narrowing key still fails. Every data source and job is read "
         "with no cap, and a failed read withholds the Passed row, since an unread bucket "
         "may accept plaintext",
         [],
@@ -1149,14 +1234,17 @@ AI_SUBJECT_ROWS = [
         "BR-46 judges the per-object leg by value on every AI source bucket: each "
         "knowledge base S3 source with its inclusion prefixes, and the training, "
         "validation and invocation-log source buckets of every customization job, "
+        "the input bucket of every batch inference job, "
         "and the training data buckets of the newest 200 SageMaker training jobs. "
+        "A failed or capped source read keeps every source off Passed. "
         "DescribeClassificationJob is read for each job that names the bucket or is its "
         "jobDetails.lastJobId, and a job clears the source only when it is SCHEDULED, "
         "RUNNING or IDLE, has run at least once with no ERROR, ran over existing "
         "objects, samples 100 percent, has data identifiers, and scopes in the source "
         "prefix. Automated discovery samples, so a MONITORED bucket with no such job "
         "fails. A source that an ingestion, customization or training job read "
-        "before the Macie job was created fails. An exclude condition on extension, "
+        "before the Macie job was created fails, and one whose latest ingestion "
+        "started after the job's last run is N/A. An exclude condition on extension, "
         "size, date or tag is N/A, and a failed read is N/A. The order of "
         "classification and ingestion per object needs object write times, which "
         "are not read. When Macie is off, completed Comprehend PII detection jobs "
@@ -1179,8 +1267,9 @@ AI_SUBJECT_ROWS = [
         "attached to the root, an OU in the account's path or the account assigns "
         'optOut and sets ["@@none"] at services, services.default and '
         "services.default.opt_out_policy. A lock on the value alone lets a child add a "
-        "service section that opts back in, so it fails, and an unread path or policy "
-        "is N/A. optOut and optIn are compared exactly, as the policy syntax spells "
+        "service section that opts back in, so it fails, as does a locking policy "
+        'that sets a child operator other than ["@@none"] on a section below its '
+        "lock, and an unread path or policy is N/A. optOut and optIn are compared exactly, as the policy syntax spells "
         "them. The policy type does not govern Amazon Bedrock, and every row says it "
         "does not establish how Bedrock handles content",
         [],
@@ -1191,7 +1280,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "bedrock_assessments",
-        ["BR-04", "BR-12"],
+        ["BR-04", "BR-12", "BR-06"],
         "BR-04 reads loggingConfig for a destination, the log group's retention, the five "
         "modality flags (textDataDeliveryEnabled, imageDataDeliveryEnabled, "
         "embeddingDataDeliveryEnabled, videoDataDeliveryEnabled, audioDataDeliveryEnabled) "
@@ -1203,7 +1292,15 @@ AI_SUBJECT_ROWS = [
         "customer-managed key, judged by DescribeKey, on the S3 destination bucket, fails a "
         "bucket with no default encryption, and judges the CloudWatch Logs group the "
         "same way: a group with no kmsKeyId, or whose key is not an enabled customer "
-        "managed key, fails. A key that cannot be described is Not Applicable",
+        "managed key, fails. A key that cannot be described is Not Applicable. BR-06 "
+        "carries the CloudTrail pairing: it reads every trail's and ENABLED event data "
+        "store's selectors and fails a Region where Bedrock management events, the "
+        "bedrock-mantle.amazonaws.com event source or the Bedrock and "
+        "AWS::BedrockMantle:: data event types go unrecorded; an unread trail or store "
+        "is Not Applicable. For the sample retained entry, BR-04 reads the log group's "
+        "most recently written stream (DescribeLogStreams lastEventTimestamp) and the "
+        "first object under the bucket's AWSLogs/ root (ListObjectsV2, one item), with "
+        "no content read; a destination with no entry is Not Applicable",
         [],
         5,
     ),
@@ -1245,8 +1342,8 @@ AI_SUBJECT_ROWS = [
         "AIR-FND-IAM-05",
         COVERED,
         None,
-        "agentcore_assessments",
-        ["AC-43", "AC-45", "AC-02", "AC-48"],
+        ["agentcore_assessments", "bedrock_assessments"],
+        ["AC-43", "AC-45", "AC-02", "AC-48", "BR-57"],
         "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or "
         "allow-except AgentCore grants on all resources across every cached role and "
         "user. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 "
@@ -1261,7 +1358,13 @@ AI_SUBJECT_ROWS = [
         "The sharing Passed is withheld while any family "
         "could not be listed, so it reads N/A until "
         "bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are "
-        "granted. AC-27 also reads the gateway roles",
+        "granted. AC-27 also reads the gateway roles. BR-57 carries the Bedrock "
+        "Agents leg: it reads the trust policy of every agent role (the "
+        "agentResourceRoleArn of each DRAFT and alias-routed version) and fails a "
+        "bedrock.amazonaws.com statement without both a positive aws:SourceAccount "
+        "and aws:SourceArn test naming the role's own account, fails a role two "
+        "agents share, and fails an execution role that two action group Lambda "
+        "functions of those versions run as",
         [],
         5,
     ),
@@ -1323,7 +1426,12 @@ AI_SUBJECT_ROWS = [
         "override or task definition role, ENI subnet), for every model behind a "
         "SageMaker endpoint (production and shadow variants and inference "
         "components, with the model's execution role and VPC), and for EKS pod "
-        "identity associations (the cluster's VPC and the association's role). Partial, "
+        "identity associations (the cluster's VPC and the association's role). BR-02 "
+        "counts only endpoints in the available state. A workload granted a Bedrock or "
+        "AgentCore surface must also have a private-DNS endpoint for each SageMaker API "
+        "or runtime surface its role is granted, and a gateway or private-DNS endpoint "
+        "for S3 and DynamoDB; a gateway endpoint is credited for its whole VPC, because "
+        "subnet route tables are not compared with the endpoint's. Partial, "
         "ceiling reached for IAM roles for service accounts (IRSA): a pod that takes "
         "its role through IRSA is not read, because which service account a pod runs "
         "as, and the role annotation on it, are held by the Kubernetes API, which "
@@ -1415,7 +1523,12 @@ FOUNDATION_ROWS = [
         "is the right one. The Deny must cover agent, flow, RetrieveAndGenerate and "
         "AgentCore runtime invocation too, an aws:PrincipalArn exemption with a "
         "wildcard role or user name is not credited, and an unread inference profile "
-        "list makes the row N/A",
+        "list makes the row N/A. The storage half is judged on the AI Service "
+        "Region Control row: the Deny must also cover bedrock:CreateKnowledgeBase, "
+        "bedrock:CreateModelCustomizationJob, bedrock-agentcore:CreateMemory, "
+        "s3:CreateBucket, s3vectors:CreateVectorBucket, aoss:CreateCollection and "
+        "the SageMaker endpoint, notebook, training, processing and transform "
+        "creation actions",
         [],
         6,
     ),
@@ -1430,6 +1543,11 @@ FOUNDATION_ROWS = [
         ["BR-42", "SM-02"],
         "BR-42 fails each cached role or user whose Bedrock invocation grant reaches "
         "every model instead of naming foundation-model or inference-profile ARNs. "
+        "On the training data buckets of customization and SageMaker training jobs "
+        "it fails an identity s3:GetObject grant that reaches the bucket through a "
+        "wildcard, and reads each bucket policy with s3:GetBucketPolicy: an Allow "
+        "of s3:GetObject to every principal with no condition fails, a conditioned "
+        "one is named and not evaluated, and an unread policy withholds Passed. "
         "SM-02 fails each cached role or user whose sagemaker:InvokeEndpoint grant "
         "reaches every endpoint with no aws:ResourceTag condition that narrows "
         "it; a Like value made only of wildcards narrows nothing. Together they "
@@ -1493,9 +1611,14 @@ FOUNDATION_ROWS = [
         "matches only them. A Deny written with NotAction is read as covering "
         "those actions, and arn:aws:bedrock:*::foundation-model/* counts as no "
         "list. The leg asserts that a model list exists and never which models "
-        "are approved. Organization policies are readable only from the "
-        "management account, so from a delegated administrator the leg is Not "
-        "Applicable",
+        "are approved. Its AI Service Region Control row requires the same "
+        "Region Deny over SageMaker endpoint, notebook, training, processing, "
+        "transform and synchronous and asynchronous invocation, Bedrock knowledge "
+        "base and customization job creation, AgentCore memory creation, and S3 "
+        "bucket, S3 Vectors bucket and OpenSearch Serverless collection creation. "
+        "No leg reads a Deny on unapproved AI services. Organization policies are "
+        "readable only from the management account or a delegated administrator, "
+        "so from any other member account the leg is Not Applicable",
         [],
         6,
     ),
@@ -1515,9 +1638,13 @@ FOUNDATION_ROWS = [
         "never versioned, and the Expiration rule alone decides it. An Object Lock "
         "default retention beside the rule fails, since Lifecycle does not delete a "
         "retained version. A replicated log bucket is N/A, because per-object "
-        "ReplicationStatus needs s3:GetObject, which is not granted, and AgentCore "
-        "Memory eventExpiryDuration is N/A as a ceiling: MEM-07 and DAT-08 set no "
-        "maximum retention period, so no threshold is assumed",
+        "ReplicationStatus needs s3:GetObject, which is not granted. Every page of "
+        "ListMemories is read and each AgentCore memory's eventExpiryDuration is read "
+        "with GetMemory: a read memory is Passed and its period in days is named as a "
+        "service-enforced expiry, with no claim that deletion ran, and an unread list "
+        "or memory is N/A naming the action. The field is required and bounded 1 to "
+        "365 days, so a readable memory has no Failed outcome, and no retention "
+        "threshold is assumed",
         [],
         6,
     ),
@@ -1599,11 +1726,16 @@ FOUNDATION_ROWS = [
         "bedrock_assessments",
         ["BR-45", "BR-50"],
         "BR-45 ('Bedrock API Key Inventory') covers the Bedrock API keys, which "
-        "are one kind of long-lived credential. BR-50 covers the other, IAM user "
+        "are one kind of long-lived credential, and fails every active long-term "
+        "key, one inside the lifetime cap at Medium. BR-50 covers the other, IAM user "
         "access keys: it reads ListAccessKeys for each cached IAM user whose "
         "attached, inline or group policies grant any bedrock:, sagemaker:, "
         "bedrock-agentcore: or bedrock-mantle: action, reads included, and whose permissions boundary "
-        "allows one too, fails each Active key and reports its age from CreateDate. "
+        "allows one too, and for each cached user who can assume a cached role "
+        "holding such an action: the role's trust policy, read with iam:GetRole, "
+        "names the user, or trusts the account or every principal and the user's "
+        "identity policies allow sts:AssumeRole on the role. An unread trust "
+        "policy is N/A. It fails each Active key and reports its age from CreateDate. "
         "Inactive keys do not count. A separate BR-50 row reads iam:GetAccountSummary "
         "and fails when AccountAccessKeysPresent is 1, a root user access key",
         [],
@@ -1644,9 +1776,17 @@ FOUNDATION_ROWS = [
         "$LATEST PACKAGE or CODE record is missing or not ACTIVE, naming the "
         "reason. A container-image function fails when the image digest "
         "GetFunction resolves it to has no ACTIVE AWS_ECR_CONTAINER_IMAGE "
-        "coverage record in its repository, and an image with no resolved "
-        "digest or from another account is Not Applicable. It also names the enabled EventBridge rules that match Inspector "
-        "findings without reading their targets. AC-50 covers AgentCore runtime "
+        "coverage record in its repository, or its repository's "
+        "AWS_ECR_REPOSITORY record has a scanFrequency other than "
+        "CONTINUOUS_SCAN, and an image with no resolved "
+        "digest or from another account is Not Applicable. Its 'Bedrock "
+        "Container Workload Image Scanning' row applies the same digest and "
+        "frequency test to every running ECS task and every SageMaker endpoint "
+        "variant and inference component whose role the IAM cache shows granted "
+        "a Bedrock or AgentCore action, and fails an image outside a private ECR "
+        "registry; EKS pods are not read, because the EKS API returns no pod "
+        "image. It also names the enabled EventBridge rules that match Inspector "
+        "findings and their targets. AC-50 covers AgentCore runtime "
         "images: it reads "
         "GetRegistryScanningConfiguration and passes when scanType is ENHANCED "
         "and a CONTINUOUS_SCAN rule has wildcard filters that match every ECR "
@@ -1655,9 +1795,11 @@ FOUNDATION_ROWS = [
         "alone fails, because a CVE published after the push is not reported. "
         "BASIC scanning fails, and a filter that misses a repository fails and "
         "names it. A runtime whose image could not be read, or comes from a "
-        "registry in another account or region, is Not Applicable. No check "
-        "reads a deploy gate that blocks on finding severity, because no AWS "
-        "API records whether a pipeline stage fails on an Inspector finding",
+        "registry in another account or region, is Not Applicable. AC-50's "
+        "'AgentCore Image Finding Gate' row requires an enabled default-bus "
+        "EventBridge rule that matches Inspector findings and has a target. "
+        "Whether that target fails a deploy is not read, because no AWS API "
+        "records whether a pipeline stage fails on an Inspector finding",
         [],
         6,
     ),
@@ -1741,9 +1883,10 @@ FOUNDATION_ROWS = [
         "NitroTPMPCR<n> for NitroTPM. Both are judged and each row names the "
         "family. An exact value on any of those keys pins the key. An "
         "enclave-bound key fails when no statement pins it, and when an Allow "
-        "grants kms:Decrypt, kms:DeriveSharedSecret, kms:GenerateDataKey or "
-        "kms:GenerateDataKeyPair with no attestation condition and no Deny covers "
-        "it. A Deny to every principal counts when it covers all four operations "
+        "grants kms:Decrypt, kms:DeriveSharedSecret, kms:GenerateDataKey, "
+        "kms:GenerateDataKeyPair or kms:ReEncryptFrom, which carries no "
+        "attestation, with no attestation condition and no Deny covers "
+        "it. A Deny to every principal counts when it covers all five operations "
         "and tests the attestation key with Null true or a negated operator. A "
         "positive operator, with or without IfExists, does not count. The default "
         "statement that grants the account root is such a bypass unless it "
@@ -1754,7 +1897,7 @@ FOUNDATION_ROWS = [
         "PCR8) and an exact deployment value (PCR3 or PCR4), each in itself or "
         "through a single-test Deny, because the image file is not secret, so a "
         "PCR3-only pin fails. A Deny narrowed by another condition key is not credited. Every "
-        "grant is read, and a grant of the four operations fails the key unless a "
+        "grant is read, and a grant of the five operations fails the key unless a "
         "Deny covers it; unread grants are N/A. Which workloads must be "
         "enclave-bound is the customer's decision, and no API records it, so a key "
         "without the condition is never failed",
@@ -1780,11 +1923,14 @@ FOUNDATION_ROWS = [
         "GetResources returns only resources that are or were tagged, so a sweep "
         "omits the resources that most need an owner. SageMaker and AgentCore "
         "resources are read through a ResourceTypeFilters sweep: each returned "
-        "resource without an owner tag fails, and the sweep never passes. SageMaker "
+        "resource without an owner tag fails. SageMaker "
         "endpoints, models, notebook instances, training jobs and domains, and agent "
         "runtimes, memories, gateways, custom browsers and custom code interpreters, "
         "listed by their SageMaker and AgentCore list APIs and absent from the "
-        "sweep, fail as never tagged",
+        "sweep, fail as never tagged. The sweep summary passes only when every "
+        "filter and list read succeeded and no resource lacks an owner, and it names "
+        "the other types, which only the sweep reaches, as unlisted when never "
+        "tagged",
         [],
         6,
     ),
@@ -1809,12 +1955,20 @@ FOUNDATION_ROWS = [
         "reached. When a Region cannot be read, or the enabled Regions cannot be "
         "listed and only the primary scan Region is read, the row is N/A. It "
         "passes only when every enabled Region was read and none returns an "
-        "instance. That row "
+        "instance, and no AI write role in the cache trusts a federated identity "
+        "provider. A member account lists no organization instance, so an "
+        "AWSReservedSSO_ or SAML role granted AI writes is named and keeps the row "
+        "at N/A, because whether the provider required MFA is not read. That row "
         "names each permission set whose inline or AWS managed policies grant an "
         "AI write (sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet, "
         "sso:ListManagedPoliciesInPermissionSet, iam:GetPolicyVersion), and fails "
         "each one where no policy of the permission set carries a Deny keyed on "
-        "one aws:PrincipalTag value over every AI service it grants. A permission "
+        "one aws:PrincipalTag value over every AI service it grants. Each instance's "
+        "attributes for access control are read with "
+        "sso:DescribeInstanceAccessControlAttributeConfiguration, and each guarded "
+        "permission set names the source its tag key is set from, or that the key is "
+        "not a configured attribute and comes only from the identity provider's SAML "
+        "assertion; whether that source reflects MFA is not judged. A permission "
         "set whose AWS managed policy is unread is N/A. Customer managed policy "
         "references resolve in each target account, so they are named and not "
         "read, and that permission set is not judged; the attributes for access "
@@ -1933,7 +2087,10 @@ FOUNDATION_ROWS = [
         "version and resolved through its alias routing, fails when it runs as "
         "its supervisor's own role, and two collaborators of one supervisor fail "
         "when they run as one role. Two agents fail when they run as one role, "
-        "while versions of one agent may share it. Every cached role's trust "
+        "while versions of one agent may share it. From the primary Region, "
+        "every assessed Region's agent roles are read and a role run by agents "
+        "in two Regions fails; an unread Region withholds Passed. Every cached "
+        "role's trust "
         "policy is read with iam:GetRole. An Allow on sts:AssumeRole is an edge from an agent role "
         "when it names that role, or names its account or * and the agent role's "
         "own identity policy allows sts:AssumeRole on the target, and a boundary "

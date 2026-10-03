@@ -578,6 +578,205 @@ MUTATIONS = [
         "find": "        elif actual != expected:\n",
         "replace": "        elif actual == expected:\n",
     },
+    {
+        "name": "a ForAnyValue: model-list Deny is credited again",
+        "file": BEDROCK,
+        "defect": "a ForAnyValue:ArnNotLike Deny on bedrock:ModelArn reads as a "
+        "complete allow-list with no gaps, so BR-42 and BR-43 pass while "
+        "InvokeModelWithResponseStream, which sends no bedrock:ModelArn, stays "
+        "open to every model",
+        "find": '        if list_key is not None and list_key[0].startswith("foranyvalue:"):\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "a non-available VPC endpoint counts as coverage again",
+        "file": BEDROCK,
+        "defect": "a pendingAcceptance, rejected or failed Bedrock endpoint is "
+        "collected as coverage, so BR-02 passes a workload whose VPC endpoint "
+        "carries no traffic",
+        "find": '            if str(endpoint.get("State", "")).lower() != "available":\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "a role shared by two Regions passes BR-57 again",
+        "file": BEDROCK,
+        "defect": "the cross-Region leg counts a role as shared only when three "
+        "Regions run it, so agents in two Regions that share one role pass",
+        "find": "            if len(placed) > 1\n",
+        "replace": "            if len(placed) > 2\n",
+    },
+    {
+        "name": "a single-Region event data store elsewhere counts again",
+        "file": BEDROCK,
+        "defect": "BR-06 credits a store homed in another assessed Region that "
+        "records only its own Region, so this Region's Bedrock calls pass "
+        "unrecorded",
+        "find": '        if home_region and detail.get("MultiRegionEnabled") is not True:\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "a training bucket open to every principal passes BR-42 again",
+        "file": BEDROCK,
+        "defect": "the bucket-policy leg drops every open grant, so a training "
+        "bucket any AWS identity can read passes on identity policies alone",
+        "find": '            if not grants["open"]:\n',
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "a user reaching AI through a role leaves BR-50 again",
+        "file": BEDROCK,
+        "defect": "a user whose only route to AI is sts:AssumeRole into a role the "
+        "account trusts drops out of scope, so its access key is never judged",
+        "find": "                elif delegates and _identity_allows_assume_role("
+        "permissions, role_arn):\n",
+        "replace": "                elif False:\n",
+    },
+    {
+        "name": "a KENDRA knowledge base goes back to manual review",
+        "file": BEDROCK,
+        "defect": "BR-20 stops reading the Kendra index key, so a KENDRA knowledge "
+        "base whose index names no customer managed key reads N/A, not Failed",
+        "find": '                    elif kb_type == "KENDRA":\n',
+        "replace": "                    elif False:\n",
+    },
+    {
+        "name": "a wildcard PrincipalArn exemption passes BR-47",
+        "file": BEDROCK,
+        "defect": "BR-47 credits an aws:PrincipalArn exclusion with a wildcard or "
+        "policy variable in its ARN, so a TLS Deny that exempts every role reads "
+        "Passed",
+        "find": '            and not any(character in arn for character in "*?$")\n',
+        "replace": "            and True\n",
+    },
+    {
+        "name": "a second ListMemories page goes unread in BR-04",
+        "file": BEDROCK,
+        "defect": "BR-04 stops after the first ListMemories page, so a memory on a "
+        "later page gets no event retention row",
+        "find": '            summaries.extend(page.get("memories") or [])\n',
+        "replace": '            summaries.extend(page.get("memories") or [])\n'
+        "            break\n",
+    },
+    {
+        "name": "an agent guardrail screens retrieved chunks for BR-26 again",
+        "file": BEDROCK,
+        "defect": "BR-26 credits an agent or flow guardrail as screening the chunks a "
+        "knowledge base returns, so an unredacted source behind one reads N/A",
+        "find": "    fronts_screen_chunks: bool = False,\n",
+        "replace": "    fronts_screen_chunks: bool = True,\n",
+    },
+    {
+        "name": "an object written after the redaction job passes BR-26 again",
+        "file": BEDROCK,
+        "defect": "BR-26 stops comparing each ingested object with the redaction "
+        "job's EndTime, so an unredacted object under its output is credited",
+        "find": "                    if gap > 0:\n",
+        "replace": "                    if False:\n",
+    },
+    {
+        "name": "a guardrail that lets an example key through passes the BR-26 probe",
+        "file": BEDROCK,
+        "defect": "BR-26 reads every ApplyGuardrail probe as Passed, so a version "
+        "that returns the example credentials unmasked is credited",
+        "find": '        if action == "GUARDRAIL_INTERVENED" and not missing:\n',
+        "replace": "        if True:\n",
+    },
+    {
+        "name": "BR-51 stops matching the tag key to its access control attribute",
+        "file": BEDROCK,
+        "defect": "BR-51 never finds the configured attribute for a Deny's tag key, "
+        "so every guarded permission set reads as taking its tag from SAML alone",
+        "find": '    sources = abac["attributes"].get(tag.lower())\n',
+        "replace": '    sources = abac["attributes"].get("")\n',
+    },
+    {
+        "name": "a public Redshift Serverless workgroup passes BR-20",
+        "file": BEDROCK,
+        "defect": "BR-20 stops reading publiclyAccessible on the workgroup behind a SQL "
+        "knowledge base, so a public query engine with a customer key passes",
+        "find": '    if workgroup.get("publiclyAccessible") is True:\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-04 credits any object in the log bucket as a retained entry",
+        "file": BEDROCK,
+        "defect": "BR-04 lists the log bucket from its root, so an object outside the "
+        "AWSLogs/ root Bedrock writes under reads as a retained invocation log entry",
+        "find": "                    Prefix=log_root,\n",
+        "replace": '                    Prefix="",\n',
+    },
+    {
+        "name": "an unread list read lets the BR-53 sweep summary pass",
+        "file": BEDROCK,
+        "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
+        "read failed, so resources it never listed read as owned",
+        "find": "    complete = owned > 0 and not unowned and not unread\n",
+        "replace": "    complete = owned > 0 and not unowned\n",
+    },
+    {
+        "name": "BR-43 stops reducing a profile ARN modelId to its ID",
+        "file": BEDROCK,
+        "defect": "BR-43 misses a call that names the inference profile by ARN, so "
+        "a profile in use reads as not called",
+        "find": '    if model_id.startswith("arn:") and "inference-profile/" in model_id:\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-57 credits a SourceAccount naming another account",
+        "file": BEDROCK,
+        "defect": "BR-57 accepts any aws:SourceAccount value on an agent role trust, "
+        "so Bedrock acting for another account can assume it",
+        "find": "                and all(text == account for text in texts)\n",
+        "replace": "                and all(text for text in texts)\n",
+    },
+    {
+        "name": "two action group functions on one role pass BR-57",
+        "file": BEDROCK,
+        "defect": "BR-57 fails a shared execution role only when three functions run "
+        "as it, so a pair shares one identity unnoticed",
+        "find": "            if len(arns) > 1\n",
+        "replace": "            if len(arns) > 2\n",
+    },
+    {
+        "name": "BR-33 credits an image its repository scans only on push",
+        "file": BEDROCK,
+        "defect": "BR-33 ignores the repository scan frequency, so an image scanned "
+        "once at push passes though a CVE published later is never reported",
+        "find": '            elif frequencies != ["CONTINUOUS_SCAN"]:\n',
+        "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-33 judges another account's image by this account's coverage",
+        "file": BEDROCK,
+        "defect": "BR-33 matches an image from another account to a same-named "
+        "repository here, so a coverage record for a different image passes it",
+        "find": "        elif match.group(1) != account:\n",
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "BR-34 credits a detected prompt attack the guardrail let through",
+        "file": BEDROCK,
+        "defect": "BR-34 counts any PROMPT_ATTACK filter entry as a catch, so a "
+        "detection whose action was NONE reads as a blocked attack",
+        "find": '                item.get("type") == "PROMPT_ATTACK" and item.get("action") == "BLOCKED"\n',
+        "replace": '                item.get("type") == "PROMPT_ATTACK"\n',
+    },
+    {
+        "name": "BR-34 credits an untagged guarded InvokeModel call",
+        "file": BEDROCK,
+        "defect": "BR-34 stops reading the request body for the guardContent tag, so "
+        "an InvokeModel prompt the prompt attack filter never evaluated passes",
+        "find": "            elif GUARDRAIL_INPUT_TAG not in json.dumps(body):\n",
+        "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-27 reads an absent text delivery flag as delivered",
+        "file": BEDROCK,
+        "defect": "BR-27 fails grounding capture only on an explicit false, so an "
+        "account with no logging configuration escapes the Failed row",
+        "find": "    if text_delivery is not True:\n",
+        "replace": "    if text_delivery is False:\n",
+    },
 ]
 
 # Directories whose contents are generated by the suites and hidden from git by
@@ -771,6 +970,78 @@ GROUPS: dict[str, str] = {
     "the live tag probe passes when any row agrees": "in the live tag probe",
     "the live tag probe's as-written verdict is discarded": "in the live tag probe",
     "the live tag probe's comparison is inverted": "in the live tag probe",
+    "a ForAnyValue: model-list Deny is credited again": (
+        "in the Bedrock condition parsers"
+    ),
+    "a non-available VPC endpoint counts as coverage again": (
+        "in the Bedrock endpoint collector"
+    ),
+    "a role shared by two Regions passes BR-57 again": (
+        "in the Bedrock cross-Region agent roles"
+    ),
+    "a single-Region event data store elsewhere counts again": (
+        "in the Bedrock CloudTrail Lake reader"
+    ),
+    "a training bucket open to every principal passes BR-42 again": (
+        "in the Bedrock training bucket policies"
+    ),
+    "a user reaching AI through a role leaves BR-50 again": (
+        "in the Bedrock AI user population"
+    ),
+    "a KENDRA knowledge base goes back to manual review": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "a wildcard PrincipalArn exemption passes BR-47": (
+        "in the Bedrock data path TLS exemptions"
+    ),
+    "a second ListMemories page goes unread in BR-04": (
+        "in the Bedrock AgentCore memory retention"
+    ),
+    "an agent guardrail screens retrieved chunks for BR-26 again": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "an object written after the redaction job passes BR-26 again": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "a guardrail that lets an example key through passes the BR-26 probe": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-51 stops matching the tag key to its access control attribute": (
+        "in the Bedrock Identity Center attributes"
+    ),
+    "a public Redshift Serverless workgroup passes BR-20": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-04 credits any object in the log bucket as a retained entry": (
+        "in the Bedrock invocation log entries"
+    ),
+    "an unread list read lets the BR-53 sweep summary pass": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-43 stops reducing a profile ARN modelId to its ID": (
+        "in the Bedrock profiles in use"
+    ),
+    "BR-57 credits a SourceAccount naming another account": (
+        "in the Bedrock agent workload identity"
+    ),
+    "two action group functions on one role pass BR-57": (
+        "in the Bedrock agent workload identity"
+    ),
+    "BR-33 credits an image its repository scans only on push": (
+        "in the Bedrock container image scanning"
+    ),
+    "BR-33 judges another account's image by this account's coverage": (
+        "in the Bedrock container image scanning"
+    ),
+    "BR-34 credits a detected prompt attack the guardrail let through": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 credits an untagged guarded InvokeModel call": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 reads an absent text delivery flag as delivered": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
 }
 
 

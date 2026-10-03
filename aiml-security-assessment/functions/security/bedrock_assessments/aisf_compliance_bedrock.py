@@ -24,12 +24,12 @@ row's own Status column carries the verdict.
 AISF_COMPLIANCE_MAP = {
     "BR-01": "AISF AIR-FND-IAM-09 (1 of 4 checks)",
     "BR-02": "AISF AIR-FND-NET-02 (1 of 2 checks)",
-    "BR-04": "AISF AIR-BDR-MDL-02 (1 of 2 checks) | AISF AIR-FND-DAT-08 | AISF AIR-FND-DET-01 (1 of 2 checks)",
-    "BR-06": "AISF AIR-BDR-KB-06 | AISF AIR-BDR-MDL-07",
+    "BR-04": "AISF AIR-BDR-MDL-02 (1 of 2 checks) | AISF AIR-FND-DAT-08 | AISF AIR-FND-DET-01 (1 of 3 checks)",
+    "BR-06": "AISF AIR-BDR-KB-06 | AISF AIR-BDR-MDL-07 | AISF AIR-FND-DET-01 (1 of 3 checks)",
     "BR-07": "AISF AIR-BDR-MDL-08",
     "BR-10": "AISF AIR-BDR-GRD-01",
     "BR-11": "AISF AIR-FND-DAT-01 (1 of 4 checks)",
-    "BR-12": "AISF AIR-BDR-MDL-02 (1 of 2 checks) | AISF AIR-FND-DET-01 (1 of 2 checks) | AISF AIR-FND-DET-09 (1 of 2 checks)",
+    "BR-12": "AISF AIR-BDR-MDL-02 (1 of 2 checks) | AISF AIR-FND-DET-01 (1 of 3 checks) | AISF AIR-FND-DET-09 (1 of 2 checks)",
     "BR-17": "AISF AIR-FND-DAT-01 (1 of 4 checks)",
     "BR-20": "AISF AIR-BDR-KB-03 | AISF AIR-FND-DAT-01 (1 of 4 checks)",
     "BR-26": "AISF AIR-BDR-GRD-03 | AISF AIR-BDR-KB-08",
@@ -40,8 +40,8 @@ AISF_COMPLIANCE_MAP = {
     "BR-37": "AISF AIR-BDR-MDL-10",
     "BR-39": "AISF AIR-FND-NET-01 (1 of 6 checks)",
     "BR-41": "AISF AIR-BDR-GRD-10 | AISF AIR-FND-DET-04 (1 of 4 checks)",
-    "BR-42": "AISF AIR-BDR-MDL-01 | AISF AIR-FND-IAM-01 (1 of 2 checks)",
-    "BR-43": "AISF AIR-BDR-MDL-03 | AISF AIR-FND-ACC-02 | AISF AIR-FND-DAT-04",
+    "BR-42": "AISF AIR-BDR-MDL-01 | AISF AIR-BDR-MDL-03 (1 of 2 checks) | AISF AIR-FND-IAM-01 (1 of 2 checks)",
+    "BR-43": "AISF AIR-BDR-MDL-03 (1 of 2 checks) | AISF AIR-FND-ACC-02 | AISF AIR-FND-DAT-04",
     "BR-44": "AISF AIR-BDR-MDL-04",
     "BR-45": "AISF AIR-BDR-MDL-09 | AISF AIR-FND-IAM-03 (1 of 2 checks)",
     "BR-46": "AISF AIR-BDR-KB-01 | AISF AIR-FND-DAT-03",
@@ -54,7 +54,7 @@ AISF_COMPLIANCE_MAP = {
     "BR-53": "AISF AIR-FND-GOV-02",
     "BR-54": "AISF AIR-SLF-RT-08",
     "BR-55": "AISF AIR-FND-DAT-10",
-    "BR-57": "AISF AIR-SLF-AGT-05",
+    "BR-57": "AISF AIR-FND-IAM-05 (1 of 5 checks) | AISF AIR-SLF-AGT-05",
 }
 
 

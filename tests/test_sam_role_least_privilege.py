@@ -146,9 +146,11 @@ _EXPECTED_ACTIONS = {
         "aoss:GetAccessPolicy",
         "aoss:ListAccessPolicies",
         "bedrock-agentcore:GetBrowser",
+        "bedrock-agentcore:GetMemory",
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
+        "bedrock:ApplyGuardrail",
         "bedrock:ListIngestionJobs",
         "cloudtrail:GetEventDataStore",
         "ecs:DescribeTasks",
@@ -161,6 +163,14 @@ _EXPECTED_ACTIONS = {
         "iam:GetAccountSummary",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
+        "kendra:DescribeIndex",
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "rds:DescribeDBInstances",
+        "redshift-serverless:GetNamespace",
+        "redshift-serverless:ListWorkgroups",
+        "redshift:DescribeClusters",
+        "s3:ListBucket",
         "sagemaker:DescribeEndpoint",
         "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeInferenceComponent",
@@ -169,6 +179,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListDomains",
         "sagemaker:ListInferenceComponents",
         "sagemaker:ListTrainingJobs",
+        "sso:DescribeInstanceAccessControlAttributeConfiguration",
         "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
         "sso:ListManagedPoliciesInPermissionSet",
     },
@@ -813,6 +824,43 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
             ),
             scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
+            scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
+            scoped("kendra:DescribeIndex", "kendra:*:${AWS::AccountId}:index/*"),
+            scoped("logs:DescribeLogStreams", "logs:*:${AWS::AccountId}:log-group:*"),
+            scoped("logs:FilterLogEvents", "logs:*:${AWS::AccountId}:log-group:*"),
+            scoped(
+                "redshift:DescribeClusters", "redshift:*:${AWS::AccountId}:cluster:*"
+            ),
+            scoped(
+                "redshift-serverless:GetNamespace",
+                "redshift-serverless:*:${AWS::AccountId}:namespace/*",
+            ),
+            ("Allow", "redshift-serverless:ListWorkgroups", '"*"'),
+            scoped(
+                "bedrock-agentcore:GetMemory",
+                "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
+            ),
+            scoped("s3:ListBucket", "s3:::*"),
+            (
+                "Allow",
+                "bedrock:ApplyGuardrail",
+                json.dumps(
+                    [
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                            "${AWS::AccountId}:guardrail/*"
+                        },
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                            "${AWS::AccountId}:guardrail-profile/*"
+                        },
+                    ]
+                ),
+            ),
+            scoped(
+                "sso:DescribeInstanceAccessControlAttributeConfiguration",
+                "sso:::instance/*",
+            ),
             scoped(
                 "bedrock-agentcore:GetBrowser",
                 "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
