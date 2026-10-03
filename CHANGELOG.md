@@ -352,6 +352,12 @@ section.
   six-character suffix, to its secret, so a rotating secret injected that
   way is judged. A secret ARN that is not among the account's secrets in
   the Region, such as another account's, holds back `Passed` and is named.
+- `SM-39` workload segmentation reads the security groups on every network
+  interface of each pending, running, stopping or stopped EC2 instance,
+  beside ECS services and Lambda functions. The instances of one Auto Scaling group count as one
+  workload. An open rule or a group shared with another workload fails, and
+  an unread `ec2:DescribeInstances` holds back `Passed`. EC2 instances were
+  not read before.
 - SageMaker rows that claimed more than they read now state what they read:
   - `SM-22` no longer says approval workflows "appear to be properly
     configured". It names the counts it read and says they do not show

@@ -1889,7 +1889,14 @@ FOUNDATION_ROWS = [
         "returns. Absent or false fails. A cluster with no managed vpc-cni add-on "
         "is Not Applicable, because a self-managed CNI's configuration is not "
         "readable through the EKS API, and so is an EKS Auto Mode cluster, which "
-        "sets network policy on its NodeClass and runs no managed vpc-cni add-on",
+        "sets network policy on its NodeClass and runs no managed vpc-cni add-on. "
+        "SM-39 also fails a cluster that enforces network policy in standard "
+        "mode, where a pod accepts all traffic until a NetworkPolicy selects it, "
+        "and reads the security groups of every ECS service, Lambda function and "
+        "EC2 instance (the instances of one Auto Scaling group count as one "
+        "workload). It fails a group shared between workloads, a rule to the VPC "
+        "default group, and a CIDR of /16 (IPv6 /48) or wider, named directly or "
+        "in a customer-managed prefix list",
         [],
         6,
     ),

@@ -10555,11 +10555,14 @@ class TestSM39WorkloadSegmentation:
         eks=None,
         errors=None,
         prefix_lists=None,
+        instances=None,
     ):
         """services: {cluster: [service dicts]}; eks: {cluster: config string}.
 
         prefix_lists: {id: (owner, [cidrs] or an exception the entries read raises)}.
+        instances: EC2 instance dicts, one reservation page each.
         """
+        instances = instances or []
         prefix_lists = prefix_lists or {}
         errors = errors or {}
         by_cluster = services or {}
@@ -10665,12 +10668,33 @@ class TestSM39WorkloadSegmentation:
                     {
                         "describe_managed_prefix_lists": describe_prefix_lists,
                         "get_managed_prefix_list_entries": prefix_list_entries,
+                        "describe_instances": source(
+                            "instances",
+                            lambda Filters: [
+                                {"Reservations": [{"Instances": [instance]}]}
+                                for instance in instances
+                            ],
+                        ),
                     }
                 )
             return client
 
         with patch("sagemaker_app.boto3.client", side_effect=factory):
             return _rows(self.check(region="us-east-1"))
+
+    @staticmethod
+    def _instance(instance_id, groups, extra_groups=(), asg=None):
+        instance = {
+            "InstanceId": instance_id,
+            "SecurityGroups": [{"GroupId": g} for g in groups],
+            "NetworkInterfaces": [
+                {"Groups": [{"GroupId": g} for g in groups]},
+                {"Groups": [{"GroupId": g} for g in extra_groups]},
+            ],
+        }
+        if asg:
+            instance["Tags"] = [{"Key": "aws:autoscaling:groupName", "Value": asg}]
+        return instance
 
     @staticmethod
     def _service(name, groups):
@@ -11128,6 +11152,83 @@ class TestSM39WorkloadSegmentation:
         )
         assert [r["Status"] for r in seg] == ["Failed", "Failed"]
         assert "sg-a is shared with 1 other workload(s)" in seg[0]["Finding_Details"]
+
+    def test_an_open_ec2_instance_among_scoped_ones_fails(self):
+        # The open group is on the instance's second network interface only.
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                instances=[
+                    self._instance("i-scoped", ["sg-b"]),
+                    self._instance("i-open", ["sg-c"], extra_groups=["sg-d"]),
+                ],
+                groups=[
+                    self._sg("sg-a"),
+                    self._sg("sg-b"),
+                    self._sg("sg-c"),
+                    self._sg("sg-d", ingress=[self._open("0.0.0.0/0", "tcp", 22)]),
+                ],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert "EC2 instance i-open: sg-d allows ingress tcp 22 from 0.0.0.0/0" in (
+            details
+        )
+        assert "i-scoped" not in details
+
+    def test_scoped_ec2_instances_pass_and_are_counted(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                instances=[
+                    self._instance("i-1", ["sg-b"]),
+                    self._instance("i-2", ["sg-c"]),
+                ],
+                groups=[self._sg("sg-a"), self._sg("sg-b"), self._sg("sg-c")],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+        details = seg[0]["Finding_Details"]
+        assert "All 1 ECS service(s) and Lambda function(s)" in details
+        assert "all 2 EC2 instance(s) or Auto Scaling group(s)" in details
+        assert "not read" not in details
+
+    def test_instances_of_one_auto_scaling_group_are_one_workload(self):
+        seg = self._seg(
+            self._run(
+                instances=[
+                    self._instance("i-1", ["sg-a"], asg="agents"),
+                    self._instance("i-2", ["sg-a"], asg="agents"),
+                ],
+                groups=[self._sg("sg-a")],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+
+    def test_standalone_instances_sharing_a_group_fail(self):
+        seg = self._seg(
+            self._run(
+                instances=[
+                    self._instance("i-1", ["sg-a"]),
+                    self._instance("i-2", ["sg-a"], asg="agents"),
+                ],
+                groups=[self._sg("sg-a")],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed", "Failed"]
+        assert "sg-a is shared with 1 other workload(s)" in seg[0]["Finding_Details"]
+
+    def test_instance_list_denied_withholds_passed(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a")],
+                errors={"instances": _make_client_error("UnauthorizedOperation")},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert "ec2:DescribeInstances" in seg[0]["Finding_Details"]
 
     def test_bridge_mode_service_and_non_vpc_function_fail(self):
         seg = self._seg(

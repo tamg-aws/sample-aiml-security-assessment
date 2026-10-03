@@ -16641,8 +16641,57 @@ def _lambda_functions(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
         return [], [f"lambda:ListFunctions ({get_assessment_error_label(error)})"]
 
 
+def _ec2_instance_workloads(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Each Auto Scaling group, and each EC2 instance outside one, with its groups.
+
+    Instances of one Auto Scaling group are replicas of one workload, so they
+    share its security groups by design and count as one workload. Every
+    network interface's groups are read, not only the primary interface's.
+    """
+    workloads: Dict[str, Dict[str, Any]] = {}
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        for page in ec2_client.get_paginator("describe_instances").paginate(
+            Filters=[
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                }
+            ]
+        ):
+            for reservation in page.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    tags = {
+                        tag.get("Key"): tag.get("Value")
+                        for tag in instance.get("Tags") or []
+                    }
+                    asg = tags.get("aws:autoscaling:groupName")
+                    label = (
+                        f"EC2 Auto Scaling group {asg}"
+                        if asg
+                        else f"EC2 instance {instance.get('InstanceId')}"
+                    )
+                    groups = workloads.setdefault(
+                        label,
+                        {"label": label, "groups": [], "awsvpc": True, "ingress": True},
+                    )["groups"]
+                    for group in [
+                        *(instance.get("SecurityGroups") or []),
+                        *(
+                            group
+                            for interface in instance.get("NetworkInterfaces") or []
+                            for group in interface.get("Groups") or []
+                        ),
+                    ]:
+                        if group.get("GroupId") and group["GroupId"] not in groups:
+                            groups.append(group["GroupId"])
+    except Exception as error:
+        return [], [f"ec2:DescribeInstances ({get_assessment_error_label(error)})"]
+    return list(workloads.values()), []
+
+
 def _segmentation_workloads(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """ECS services and Lambda functions with the security groups they run in."""
+    """ECS services, Lambda functions and EC2 workloads with their security groups."""
     workloads = []
     services, unread = _ecs_services(region)
     for cluster_name, service in services:
@@ -16671,6 +16720,9 @@ def _segmentation_workloads(region: str) -> Tuple[List[Dict[str, Any]], List[str
                 "ingress": False,
             }
         )
+    instances, instance_unread = _ec2_instance_workloads(region)
+    unread.extend(instance_unread)
+    workloads.extend(instances)
     return workloads, unread
 
 
@@ -16872,27 +16924,33 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
                 "SM-39",
                 WORKLOAD_SEGMENTATION_FINDING,
                 list(dict.fromkeys(unread)),
-                f"{len(workloads)} ECS service(s) and Lambda function(s) were read.",
+                f"{len(workloads)} ECS service(s), Lambda function(s) and EC2 "
+                "instance(s) or Auto Scaling group(s) were read.",
                 WORKLOAD_SEGMENTATION_REFERENCE,
                 region,
             )
         )
     elif not problems and not unjudged:
+        ec2_count = sum(1 for w in workloads if w["label"].startswith("EC2 "))
         rows.append(
             create_finding(
                 check_id="SM-39",
                 finding_name=WORKLOAD_SEGMENTATION_FINDING,
                 finding_details=(
-                    f"All {len(workloads)} ECS service(s) and Lambda function(s) run "
+                    f"All {len(workloads) - ec2_count} ECS service(s) and Lambda "
+                    f"function(s) and all {ec2_count} EC2 instance(s) or Auto Scaling "
+                    "group(s) run "
                     "in their own security groups with no rule to or from the VPC "
                     "default security group or a CIDR wider than "
                     f"/{UNJUDGED_IPV4_PREFIX + 1} (IPv6 /{UNJUDGED_IPV6_PREFIX + 1}), "
                     "named directly or as an entry of a customer-managed prefix "
                     "list. A rule to an AWS-managed prefix list names one AWS "
-                    "service's published ranges and is not judged by width. "
-                    "Standalone EC2 instances are not read."
+                    "service's published ranges and is not judged by width. The "
+                    "instances of one Auto Scaling group count as one workload; "
+                    "every other instance counts as its own."
                     if workloads
-                    else "No ECS services or Lambda functions found in this region."
+                    else "No ECS services, Lambda functions or EC2 instances found "
+                    "in this region."
                 ),
                 resolution="No action required",
                 reference=WORKLOAD_SEGMENTATION_REFERENCE,
@@ -16907,7 +16965,8 @@ def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
 def check_workload_network_segmentation(region: str = "") -> Dict[str, Any]:
     """
     SM-39: Read the EKS network-policy enforcing mode and the security groups
-    each ECS service and Lambda function runs in, so a workload that can reach
+    each ECS service, Lambda function and EC2 instance (one per Auto Scaling
+    group) runs in, so a workload that can reach
     any destination does not pass on the vpc-cni flag alone.
     """
     findings = {"csv_data": []}
