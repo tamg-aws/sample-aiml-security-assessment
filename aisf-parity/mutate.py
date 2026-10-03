@@ -1408,6 +1408,41 @@ MUTATIONS = [
         "find": '    if state == "ok":\n        return create_finding(\n            check_id="AC-26",\n            finding_name=finding_name,\n            finding_details=f"Trail {label} writes to {text}.",\n',
         "replace": '    if True:\n        return create_finding(\n            check_id="AC-26",\n            finding_name=finding_name,\n            finding_details=f"Trail {label} writes to {text}.",\n',
     },
+    {
+        "name": "AC-06 credits an unbound service reader",
+        "file": AGENTCORE,
+        "defect": "a service principal reading the recordings for a resource in any account was credited",
+        "find": "        if services and not _confused_deputy_guard_account(statement, account):\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "AC-06 skips services under RestrictPublicBuckets",
+        "file": AGENTCORE,
+        "defect": "a public statement under RestrictPublicBuckets hid an unbound service principal grant",
+        "find": "    services_only = bool(\n        restrict and any(_s3_public_statement(st) for st in statements)\n    )\n",
+        "replace": "    services_only = bool(\n        restrict and any(_s3_public_statement(st) for st in statements)\n    )\n    if services_only:\n        return [], []\n",
+    },
+    {
+        "name": "AC-06 judges public grants under RestrictPublicBuckets",
+        "file": AGENTCORE,
+        "defect": "another account's role named beside '*', which RestrictPublicBuckets confines, was reported as a reader",
+        "find": "        if services_only:\n            continue\n",
+        "replace": "",
+    },
+    {
+        "name": "AC-06 credits ACLs left on",
+        "file": AGENTCORE,
+        "defect": "a bucket with ACLs enabled was credited",
+        "find": '        if ownership == ["BucketOwnerEnforced"]:\n',
+        "replace": "        if True:\n",
+    },
+    {
+        "name": "AC-06 reads an unread ownership setting as enforced",
+        "file": AGENTCORE,
+        "defect": "a denied ownership read was credited as BucketOwnerEnforced",
+        "find": '    state, response = reads["ownership"]\n    if state == "error":\n',
+        "replace": '    state, response = reads["ownership"]\n    if state == "error":\n        state, response = "read", {"OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}}\n    if False:\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1720,6 +1755,11 @@ GROUPS: dict[str, str] = {
     "AC-26 judges a trail bucket of another region": "in the AgentCore verdict legs",
     "AC-26 reads an unread trail bucket as clean": "in the AgentCore verdict legs",
     "AC-26 drops the trail bucket verdict": "in the AgentCore verdict legs",
+    "AC-06 credits an unbound service reader": "in the AgentCore verdict legs",
+    "AC-06 skips services under RestrictPublicBuckets": "in the AgentCore verdict legs",
+    "AC-06 judges public grants under RestrictPublicBuckets": "in the AgentCore verdict legs",
+    "AC-06 credits ACLs left on": "in the AgentCore verdict legs",
+    "AC-06 reads an unread ownership setting as enforced": "in the AgentCore verdict legs",
 }
 
 

@@ -306,6 +306,7 @@ _EXPECTED_ACTIONS = {
         "firehose:DescribeDeliveryStream",
         "logs:DescribeSubscriptionFilters",
         "s3:GetBucketObjectLockConfiguration",
+        "s3:GetBucketOwnershipControls",
     },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
@@ -1077,6 +1078,11 @@ _AGENTCORE_MANAGED_GRANTS = [
     (
         "Allow",
         "s3:GetBucketObjectLockConfiguration",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
+    ),
+    (
+        "Allow",
+        "s3:GetBucketOwnershipControls",
         json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
     ),
 ]

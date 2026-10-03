@@ -1300,6 +1300,14 @@ Resources:
             Action:
               - s3:GetBucketObjectLockConfiguration # AC-26
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+          - Sid: BrowserRecordingOwnershipRead
+            # AC-06 reads Object Ownership on each custom browser's recording
+            # bucket, whose name is customer-chosen; every call also passes
+            # ExpectedBucketOwner.
+            Effect: Allow
+            Action:
+              - s3:GetBucketOwnershipControls # AC-06
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

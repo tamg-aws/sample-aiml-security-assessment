@@ -6411,6 +6411,12 @@ BROWSER_RECORDING_BUCKET_READS = (
         "s3:GetLifecycleConfiguration",
     ),
     ("versioning", "get_bucket_versioning", None, "s3:GetBucketVersioning"),
+    (
+        "ownership",
+        "get_bucket_ownership_controls",
+        "OwnershipControlsNotFoundError",
+        "s3:GetBucketOwnershipControls",
+    ),
 )
 BROWSER_RECORDING_WRITE_ACTION = "s3:putobject"
 BROWSER_RECORDING_READ_ACTION = "s3:getobject"
@@ -6797,6 +6803,38 @@ def _recording_bucket_gaps(
         else:
             facts.append(f"expires it by lifecycle rule {', '.join(expiring)}")
 
+    # An object ACL can grant another account or every caller a read the
+    # bucket policy never shows, and only BucketOwnerEnforced disables ACLs.
+    # A bucket with no ownership controls keeps ACLs on.
+    state, response = reads["ownership"]
+    if state == "error":
+        not_read("ownership", "Object Ownership setting")
+    else:
+        ownership = sorted(
+            {
+                str(rule.get("ObjectOwnership") or "")
+                for rule in ((response or {}).get("OwnershipControls") or {}).get(
+                    "Rules"
+                )
+                or []
+                if isinstance(rule, dict)
+            }
+            - {""}
+        )
+        if ownership == ["BucketOwnerEnforced"]:
+            facts.append("disables ACLs with Object Ownership BucketOwnerEnforced")
+        else:
+            problems.append(
+                f"bucket '{bucket}' Object Ownership is "
+                f"{', '.join(ownership) or 'not set'}, so ACLs stay enabled and "
+                "an object ACL can grant a recording read the bucket policy does "
+                "not show"
+            )
+            fixes.append(
+                "Set the recording bucket's Object Ownership to "
+                "BucketOwnerEnforced, which disables ACLs."
+            )
+
     return problems, fixes, unread, retries, facts
 
 
@@ -6899,20 +6937,38 @@ def _recording_bucket_read_grants(
     the recording prefix counts when it names Principal "*", uses NotPrincipal,
     or names a principal in another account, unless aws:PrincipalAccount or
     aws:SourceAccount names `account` by value or aws:PrincipalOrgID names this
-    account's organization. A service principal is not counted.
-    RestrictPublicBuckets limits a bucket with a public policy to its own
-    account and AWS service principals, so while it is on and any statement is
-    public no grant counts, and a public "*" or NotPrincipal grant counts only
-    when it is known to be off.
+    account's organization. An AWS service principal counts unless
+    aws:SourceAccount or aws:SourceArn names `account` by value, because without
+    either the service reads the recordings on behalf of a resource in any
+    account. RestrictPublicBuckets limits a bucket with a public policy to its
+    own account and AWS service principals, so while it is on and any statement
+    is public only service principal grants count, and a public "*" or
+    NotPrincipal grant counts only when it is known to be off.
     """
-    if restrict and any(_s3_public_statement(st) for st in statements):
-        return [], []
+    services_only = bool(
+        restrict and any(_s3_public_statement(st) for st in statements)
+    )
     grants: List[str] = []
     org_bound: List[Tuple[str, str]] = []
     for index, statement in enumerate(statements, start=1):
         if statement.get("Effect") != "Allow" or not _statement_reaches_object(
             statement, BROWSER_RECORDING_READ_ACTION, object_arn
         ):
+            continue
+        services = [
+            principal
+            for principal in _statement_principals(statement)
+            if principal.endswith((".amazonaws.com", ".amazonaws.com.cn"))
+        ]
+        if services and not _confused_deputy_guard_account(statement, account):
+            sid = statement.get("Sid")
+            source = f"statement '{sid}'" if sid else f"statement {index}"
+            grants.append(
+                f"by {source} to service principal {', '.join(sorted(services))} "
+                f"with no aws:SourceAccount or aws:SourceArn naming account "
+                f"{account}, so the service reads them for a resource in any account"
+            )
+        if services_only:
             continue
         open_to_all = restrict is False or not _s3_public_statement(statement)
         if "NotPrincipal" in statement:
@@ -7342,7 +7398,8 @@ def check_browser_tool_recording(
                             "Remove the bucket policy Allow of s3:GetObject on the "
                             "recording prefix to Principal '*' or another account, "
                             "or add an aws:PrincipalOrgID or aws:PrincipalAccount "
-                            "condition naming this organization or account."
+                            "condition naming this organization or account; bind "
+                            "a service principal grant with aws:SourceAccount."
                         )
                     if org_bound:
                         unread.append(
@@ -7367,10 +7424,10 @@ def check_browser_tool_recording(
                             else ""
                         )
                         facts.append(
-                            "its bucket policy allows no other account and no "
-                            f"anonymous caller s3:GetObject on {object_arn}"
-                            f"{restricted} (statements naming a service principal "
-                            "and object ACLs are not judged)"
+                            "its bucket policy allows no other account, no "
+                            "anonymous caller and no service principal unbound "
+                            f"to account {account} s3:GetObject on {object_arn}"
+                            f"{restricted}"
                         )
                 reader_note = _recording_cached_readers(permission_cache, object_arn)
                 if role_arn:

@@ -424,8 +424,9 @@ def test_required_agentcore_actions_are_granted_to_the_agentcore_function(templa
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=lambda p: os.path.basename(p))
-def test_ac26_archive_reads_are_granted_to_the_agentcore_managed_policy(template):
-    # AC-26 reads the archive chain from the AgentCore function. The Bedrock
+def test_agentcore_managed_policy_reads_are_granted(template):
+    # AC-26 reads the archive chain and AC-06 the recording bucket's Object
+    # Ownership from the AgentCore function. The Bedrock
     # function's own logs:DescribeSubscriptionFilters grant does not reach it,
     # and the inline policy has no room, so the reads live in the managed
     # policy attached only to the AgentCore function.
@@ -436,6 +437,7 @@ def test_ac26_archive_reads_are_granted_to_the_agentcore_managed_policy(template
             "logs:DescribeSubscriptionFilters",
             "firehose:DescribeDeliveryStream",
             "s3:GetBucketObjectLockConfiguration",
+            "s3:GetBucketOwnershipControls",
         )
         if a not in granted
     )
@@ -1265,6 +1267,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "oam:ListAttachedLinks",
     "organizations:ListAccounts",
 }
+
+# AC-06 names s3:GetBucketOwnershipControls in its retry text. validate-policy
+# on 2026-10-03 reported nothing for it, in the same run that reported
+# INVALID_ACTION for the negative control logs:DescribeSubscriptionFilterz, and
+# it is in the s3 service reference JSON with the bucket resource type.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3:GetBucketOwnershipControls"}
 
 # AC-26 follows each log group's subscription filters to a Firehose stream and
 # its archive bucket. validate-policy on 2026-10-03 reported nothing for each

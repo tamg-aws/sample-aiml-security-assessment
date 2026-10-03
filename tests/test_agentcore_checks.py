@@ -3522,6 +3522,7 @@ def _wire_recording_bucket(
     rules=None,
     versioning=None,
     key_id=None,
+    ownership="BucketOwnerEnforced",
 ):
     """One recording bucket that passes every AC-06 leg unless overridden."""
     default = {"SSEAlgorithm": algorithm}
@@ -3549,6 +3550,9 @@ def _wire_recording_bucket(
         "Rules": [_expire_rule()] if rules is None else rules
     }
     mock_s3.get_bucket_versioning.return_value = versioning or {}
+    mock_s3.get_bucket_ownership_controls.return_value = {
+        "OwnershipControls": {"Rules": [{"ObjectOwnership": ownership}]}
+    }
 
 
 def _recorder_cache(statements=None, boundary=None, errors=None, version=2):
@@ -4573,9 +4577,10 @@ class TestAC06RecordingReadLeg:
         details = findings["br-1"]["Finding_Details"]
         assert "statement 'Reader'" not in details
         assert (
-            "its bucket policy allows no other account and no anonymous caller "
-            f"s3:GetObject on {_RECORDING_OBJECTS}, because RestrictPublicBuckets "
-            "confines its public statements to account 123456789012"
+            "its bucket policy allows no other account, no anonymous caller and no "
+            "service principal unbound to account 123456789012 s3:GetObject on "
+            f"{_RECORDING_OBJECTS}, because RestrictPublicBuckets confines its "
+            "public statements to account 123456789012"
         ) in details
         clean = findings["br-2"]["Finding_Details"]
         assert "because RestrictPublicBuckets" not in clean
@@ -4617,8 +4622,9 @@ class TestAC06RecordingReadLeg:
             "Passed",
         ]
         assert (
-            "its bucket policy allows no other account and no anonymous caller "
-            f"s3:GetObject on {_RECORDING_OBJECTS}"
+            "its bucket policy allows no other account, no anonymous caller and no "
+            "service principal unbound to account 123456789012 s3:GetObject on "
+            f"{_RECORDING_OBJECTS}"
         ) in findings["br-1"]["Finding_Details"]
 
     @patch("agentcore_app.organizations_client")
@@ -46143,19 +46149,30 @@ class TestAC06RecordingReaders:
         assert finding["Status"] == "Passed"
         assert "999988887777" not in finding["Finding_Details"]
 
+    # Before RT-09 the "service" case read Passed: a service principal was not
+    # judged. With no aws:SourceAccount or aws:SourceArn the service reads the
+    # recordings for a resource in any account, so it now fails.
     @pytest.mark.parametrize(
-        "principal, status",
+        "principal, status, named",
         [
-            ({"AWS": "arn:aws:iam::999988887777:role/outsider"}, "Failed"),
-            ({"AWS": "999988887777"}, "Failed"),
-            ({"AWS": "arn:aws:iam::123456789012:role/reader"}, "Passed"),
-            ({"Service": "cloudfront.amazonaws.com"}, "Passed"),
+            (
+                {"AWS": "arn:aws:iam::999988887777:role/outsider"},
+                "Failed",
+                "999988887777",
+            ),
+            ({"AWS": "999988887777"}, "Failed", "999988887777"),
+            ({"AWS": "arn:aws:iam::123456789012:role/reader"}, "Passed", None),
+            (
+                {"Service": "cloudfront.amazonaws.com"},
+                "Failed",
+                "service principal cloudfront.amazonaws.com",
+            ),
         ],
         ids=["other-account-role", "other-account-id", "same-account", "service"],
     )
     @patch("agentcore_app.s3_client")
     def test_only_a_principal_outside_the_account_fails(
-        self, mock_s3, principal, status
+        self, mock_s3, principal, status, named
     ):
         _wire_recording_bucket(
             mock_s3, statements=[_plaintext_deny(), self._read(principal)]
@@ -46165,7 +46182,7 @@ class TestAC06RecordingReaders:
 
         assert finding["Status"] == status
         if status == "Failed":
-            assert "999988887777" in finding["Finding_Details"]
+            assert named in finding["Finding_Details"]
 
     @pytest.mark.parametrize(
         "statement",
@@ -49842,3 +49859,177 @@ class TestAC26TrailBucketObjectLock:
     def test_the_handler_runs_the_trail_bucket_leg(self):
         source = inspect.getsource(agentcore_app.lambda_handler)
         assert "check_agentcore_trail_bucket_object_lock" in source
+
+
+class TestAC06RecordingServicePrincipalsAndAcls:
+    """AIR-ACR-RT-09: a service principal reading the recordings with no
+    aws:SourceAccount or aws:SourceArn naming the account, and a bucket whose
+    Object Ownership leaves ACLs on, open the responder-only read leg."""
+
+    _SERVICE = {"Service": "cloudfront.amazonaws.com"}
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize("restrict", [True, False])
+    @patch("agentcore_app.s3_client")
+    def test_an_unbound_service_reader_fails_even_under_restrict(
+        self, mock_s3, restrict, reverse
+    ):
+        findings = _record_two_buckets(
+            mock_s3,
+            _recording_reader(Principal=self._SERVICE),
+            reverse,
+            restrict=restrict,
+        )
+
+        assert findings["br-1"]["Status"] == "Failed"
+        assert (
+            "service principal cloudfront.amazonaws.com"
+            in findings["br-1"]["Finding_Details"]
+        )
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_restrict_with_a_public_statement_still_judges_the_service(self, mock_s3):
+        reader = _recording_reader(
+            Principal={"AWS": "*", "Service": "logs.amazonaws.com"}
+        )
+        findings = _record_two_buckets(mock_s3, reader, False, restrict=True)
+
+        assert findings["br-1"]["Status"] == "Failed"
+        details = findings["br-1"]["Finding_Details"]
+        assert "service principal logs.amazonaws.com" in details
+        assert "to *" not in details
+
+    @patch("agentcore_app.s3_client")
+    def test_restrict_still_confines_a_named_other_account(self, mock_s3):
+        # The service leg must not reopen the rest: under RestrictPublicBuckets a
+        # public policy admits only the account and service principals, so a
+        # role of another account named beside "*" stays confined.
+        reader = _recording_reader(
+            Principal={"AWS": ["*", "arn:aws:iam::999988887777:role/outsider"]}
+        )
+        findings = _record_two_buckets(mock_s3, reader, False, restrict=True)
+
+        assert findings["br-1"]["Status"] == "Passed"
+        assert "999988887777" not in findings["br-1"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+            {
+                "ArnLike": {
+                    "aws:SourceArn": (
+                        "arn:aws:cloudfront::123456789012:distribution/E1"
+                    )
+                }
+            },
+        ],
+        ids=["source-account", "source-arn"],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_service_reader_bound_to_this_account_passes(self, mock_s3, condition):
+        findings = _record_two_buckets(
+            mock_s3,
+            _recording_reader(Principal=self._SERVICE, Condition=condition),
+            False,
+        )
+
+        assert findings["br-1"]["Status"] == "Passed"
+        assert "no service principal unbound" in findings["br-1"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringLike": {"aws:SourceAccount": "*"}},
+            {"ArnLike": {"aws:SourceArn": "arn:aws:cloudfront::*:distribution/E1"}},
+            {"StringEquals": {"aws:SourceAccount": "999988887777"}},
+        ],
+        ids=["wildcard-account", "wildcard-arn-account", "other-account"],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_service_reader_bound_loosely_fails(self, mock_s3, condition):
+        findings = _record_two_buckets(
+            mock_s3,
+            _recording_reader(Principal=self._SERVICE, Condition=condition),
+            False,
+        )
+
+        assert findings["br-1"]["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "ownership", ["ObjectWriter", "BucketOwnerPreferred", None]
+    )
+    @patch("agentcore_app.s3_client")
+    def test_acls_left_on_fail_beside_an_enforced_bucket(self, mock_s3, ownership):
+        _wire_recording_bucket(mock_s3)
+        controls = {
+            "recordings": (
+                _make_client_error("OwnershipControlsNotFoundError")
+                if ownership is None
+                else {"OwnershipControls": {"Rules": [{"ObjectOwnership": ownership}]}}
+            ),
+            "clean": {
+                "OwnershipControls": {
+                    "Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]
+                }
+            },
+        }
+
+        def get_bucket_ownership_controls(Bucket, ExpectedBucketOwner):
+            value = controls[Bucket]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        mock_s3.get_bucket_ownership_controls.side_effect = (
+            get_bucket_ownership_controls
+        )
+        mock_s3.get_bucket_policy.side_effect = lambda Bucket, ExpectedBucketOwner: {
+            "Policy": json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        _plaintext_deny(
+                            Resource=[
+                                f"arn:aws:s3:::{Bucket}",
+                                f"arn:aws:s3:::{Bucket}/*",
+                            ]
+                        )
+                    ],
+                }
+            )
+        }
+        findings = _record(
+            _browser_inventory(
+                _recorded_browser("br-1"), _recorded_browser("br-2", bucket="clean")
+            ),
+            _recorder_cache(
+                statements=[
+                    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}
+                ]
+            ),
+        )
+        by_id = {f["Finding_Details"].split("(", 2)[1][:4]: f for f in findings}
+
+        assert by_id["br-1"]["Status"] == "Failed"
+        assert (
+            f"Object Ownership is {ownership or 'not set'}"
+            in by_id["br-1"]["Finding_Details"]
+        )
+        assert "BucketOwnerEnforced" in by_id["br-1"]["Resolution"]
+        assert by_id["br-2"]["Status"] == "Passed"
+        assert "disables ACLs" in by_id["br-2"]["Finding_Details"]
+
+    @patch("agentcore_app.s3_client")
+    def test_an_unread_ownership_setting_is_na(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_bucket_ownership_controls.side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
+
+        (finding,) = _record(_browser_inventory(_recorded_browser()))
+
+        assert finding["Status"] == "N/A"
+        assert "Object Ownership setting" in finding["Finding_Details"]
+        assert "s3:GetBucketOwnershipControls" in finding["Resolution"]
