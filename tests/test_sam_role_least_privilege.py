@@ -319,6 +319,9 @@ _EXPECTED_ACTIONS = {
         "ec2:DescribeDhcpOptions",
         "bedrock-agentcore:ListAgentRuntimes",
         "bedrock-agentcore:GetAgentRuntime",
+        "guardduty:GetAdministratorAccount",
+        "inspector2:GetDelegatedAdminAccount",
+        "securityhub:GetAdministratorAccount",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -988,6 +991,18 @@ _SAGEMAKER_MANAGED_GRANTS = [
         ),
     ),
     ("Allow", "bedrock-agentcore:ListAgentRuntimes", '"*"'),
+    ("Allow", "guardduty:GetAdministratorAccount", '"*"'),
+    ("Allow", "inspector2:GetDelegatedAdminAccount", '"*"'),
+    (
+        "Allow",
+        "securityhub:GetAdministratorAccount",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:securityhub:*:"
+                "${AWS::AccountId}:hub/default"
+            }
+        ),
+    ),
     (
         "Allow",
         "bedrock-agentcore:GetAgentRuntime",

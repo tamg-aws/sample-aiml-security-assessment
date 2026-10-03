@@ -7969,6 +7969,160 @@ class TestSM35TrustedAccess:
         assert "No active delegated administrator" in detective[0]["Finding_Details"]
 
 
+class TestSM35RegionalAdministrator:
+    """AIR-FND-ACC-09: each service's administrator in this Region."""
+
+    check = staticmethod(sagemaker_app.check_regional_security_admin)
+    ME = "111111111111"
+    MGMT = "999999999999"
+    TOOLING = "222222222222"
+
+    def _run(self, guardduty=None, securityhub=None, inspector=None, detector="d-1"):
+        """Each service spec: an admin account id (member, Enabled), "self",
+        (admin id, status), None for no administrator, or an exception the
+        administrator read raises."""
+
+        def not_admin():
+            raise _make_client_error("BadRequestException", "not the admin")
+
+        def build(spec, get_name, self_name, wrap):
+            client = MagicMock()
+
+            def get_admin(**_):
+                if isinstance(spec, Exception):
+                    raise spec
+                if spec in (None, "self"):
+                    return {}
+                account, status = spec if isinstance(spec, tuple) else (spec, "Enabled")
+                return wrap(account, status)
+
+            getattr(client, get_name).side_effect = get_admin
+            getattr(client, self_name).side_effect = lambda **_: (
+                {} if spec == "self" else not_admin()
+            )
+            return client
+
+        gd = build(
+            guardduty,
+            "get_administrator_account",
+            "describe_organization_configuration",
+            lambda a, st: {"Administrator": {"AccountId": a, "RelationshipStatus": st}},
+        )
+        sh = build(
+            securityhub,
+            "get_administrator_account",
+            "describe_organization_configuration",
+            lambda a, st: {"Administrator": {"AccountId": a, "MemberStatus": st}},
+        )
+        inspector2 = MagicMock()
+
+        def delegated_admin():
+            if isinstance(inspector, Exception):
+                raise inspector
+            if inspector == "self":
+                raise _make_client_error(
+                    "ValidationException", "Invoking account is the delegated admin."
+                )
+            if inspector is None:
+                raise _make_client_error(
+                    "ResourceNotFoundException",
+                    "No delegated admin found for caller account.",
+                )
+            account, status = (
+                inspector if isinstance(inspector, tuple) else (inspector, "ENABLED")
+            )
+            return {
+                "delegatedAdmin": {"accountId": account, "relationshipStatus": status}
+            }
+
+        inspector2.get_delegated_admin_account.side_effect = delegated_admin
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": self.ME}
+        orgs = MagicMock()
+        orgs.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": self.MGMT}
+        }
+        clients = {
+            "sts": sts,
+            "organizations": orgs,
+            "guardduty": gd,
+            "securityhub": sh,
+            "inspector2": inspector2,
+        }
+        with patch(
+            "sagemaker_app.boto3.client", side_effect=lambda svc, **_: clients[svc]
+        ):
+            return _rows(
+                self.check(
+                    region="us-west-2",
+                    detector_inventory={
+                        "detector_id": detector,
+                        "detail": {},
+                        "error": None,
+                    },
+                )
+            )
+
+    def test_one_tooling_administrator_for_all_three_passes(self):
+        rows = self._run(self.TOOLING, self.TOOLING, self.TOOLING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert f"account {self.TOOLING}" in rows[0]["Finding_Details"]
+        assert rows[0]["Region"] == "us-west-2"
+
+    def test_this_account_as_administrator_of_all_three_passes(self):
+        rows = self._run("self", "self", "self")
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert f"account {self.ME}" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("missing", ["guardduty", "securityhub", "inspector"])
+    def test_a_region_with_no_administrator_for_one_service_fails(self, missing):
+        specs = {k: self.TOOLING for k in ("guardduty", "securityhub", "inspector")}
+        specs[missing] = None
+        rows = self._run(**specs)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        name = {
+            "guardduty": "Amazon GuardDuty",
+            "securityhub": "AWS Security Hub",
+            "inspector": "Amazon Inspector",
+        }[missing]
+        assert f"{name} has no delegated administrator" in details
+        assert details.count("has no delegated administrator") == 1
+
+    def test_the_management_account_as_administrator_fails(self):
+        rows = self._run(self.TOOLING, self.MGMT, self.TOOLING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"AWS Security Hub is administered from the organization management "
+            f"account {self.MGMT}" in rows[0]["Finding_Details"]
+        )
+
+    def test_two_different_administrators_fail(self):
+        rows = self._run(self.TOOLING, self.TOOLING, "333333333333")
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "2 different accounts" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["Invited", "Removed"])
+    def test_a_relationship_that_is_not_enabled_fails(self, status):
+        rows = self._run((self.TOOLING, status), self.TOOLING, self.TOOLING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"relationship status {status}" in rows[0]["Finding_Details"]
+
+    def test_no_detector_fails(self):
+        rows = self._run(None, self.TOOLING, self.TOOLING, detector=None)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "GuardDuty has no detector" in rows[0]["Finding_Details"]
+
+    def test_a_denied_read_withholds_the_pass(self):
+        rows = self._run(
+            self.TOOLING,
+            _make_client_error("AccessDeniedException"),
+            self.TOOLING,
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "AWS Security Hub" in rows[0]["Finding_Details"]
+
+
 class TestSM35DelegatedAdminConsolidation:
     """AIR-FND-ACC-09: every security service shares one tooling account."""
 

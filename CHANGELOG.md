@@ -362,6 +362,13 @@ section.
   model and fails a credential-named plaintext variable, as it already did
   for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
   or `sagemaker:DescribeModel` holds back the propagation `Passed`.
+- `SM-35` adds a `Security Service Regional Delegated Administrator` row in
+  every scanned Region. GuardDuty, Security Hub and Amazon Inspector name
+  their administrator per Region, so the organization-wide delegated
+  administrator list missed a Region with none. The row fails a Region where
+  a service has no administrator with an Enabled relationship, where it is
+  the management account, or where the three services name different
+  accounts.
 - `SM-37` network anomaly alerting judges every AgentCore runtime beside the
   SageMaker endpoints: a runtime in `PUBLIC` network mode fails, and one in
   `VPC` mode must have its subnets covered by a flow log whose metric
@@ -1602,6 +1609,14 @@ schedule whose latest execution is still running.
 gains `ec2:DescribeVpcs` and `ec2:DescribeDhcpOptions` on `'*'` (`SM-37`);
 neither action has a resource type in the service authorization reference.
 Until the stack is updated, the new `SM-37` row reads as incomplete.
+
+**SageMaker regional administrator reads.** `SageMakerAssessmentReadsPolicy`
+gains `guardduty:GetAdministratorAccount` and
+`inspector2:GetDelegatedAdminAccount` on `'*'` (no resource type) and
+`securityhub:GetAdministratorAccount` on
+`arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default`
+(`SM-35`). Until the stack is updated, the new `SM-35` row reads as
+incomplete.
 
 **SageMaker AgentCore runtime reads.** `SageMakerAssessmentReadsPolicy`
 gains `bedrock-agentcore:ListAgentRuntimes` on `'*'` (no resource type)

@@ -1713,7 +1713,13 @@ FOUNDATION_ROWS = [
         "when it is the management account, or when trusted access for the "
         "principal is not enabled; an unread trusted-access list makes each "
         "administered service Not Applicable. A member account that cannot call "
-        "the API is Not Applicable with the reason",
+        "the API is Not Applicable with the reason. In every scanned Region a "
+        "second SM-35 row reads the administrator of GuardDuty, Security Hub and "
+        "Inspector for this account, from GetAdministratorAccount or "
+        "GetDelegatedAdminAccount, or this account itself when it can read the "
+        "organization configuration. It fails a Region where a service has no "
+        "administrator with an Enabled relationship, where the administrator is "
+        "the management account, or where the three differ",
         [],
         6,
     ),

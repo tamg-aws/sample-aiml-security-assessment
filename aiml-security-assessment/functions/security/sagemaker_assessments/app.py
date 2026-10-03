@@ -13936,6 +13936,243 @@ def _delegated_admin_consolidation_finding(
     )
 
 
+REGIONAL_ADMIN_FINDING = "Security Service Regional Delegated Administrator"
+REGIONAL_ADMIN_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_organizations.html"
+)
+
+
+def _account_and_status(response, key, account_field, status_field):
+    record = response.get(key) or {}
+    return record.get(account_field), record.get(status_field)
+
+
+def _regional_admin(
+    get_administrator, read_self_admin, account_id: str
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """(administrator, how it was read, unread reason) for one service.
+
+    get_administrator returns (administrator id, relationship status), or
+    (None, None). Only an Enabled relationship counts. A caller with no
+    administrator is its own when read_self_admin succeeds, because only an
+    administrator can read its organization configuration.
+    """
+    try:
+        administrator, status = get_administrator()
+    except Exception as error:
+        return None, None, get_assessment_error_label(error)
+    if administrator and str(status).lower() == "enabled":
+        return administrator, "administers this account as a member", None
+    if administrator:
+        return (
+            None,
+            f"a member of {administrator} with relationship status {status}",
+            None,
+        )
+    try:
+        read_self_admin()
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code", "") in (
+            ACCESS_DENIED_ERROR_CODES
+        ):
+            return None, None, get_assessment_error_label(error)
+        return (
+            None,
+            f"not the administrator ({get_assessment_error_label(error)})",
+            None,
+        )
+    except Exception as error:
+        return None, None, get_assessment_error_label(error)
+    return (
+        account_id,
+        "is this account, which reads the organization configuration",
+        None,
+    )
+
+
+def check_regional_security_admin(
+    region: str = "", detector_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    SM-35: Verify GuardDuty, Security Hub and Amazon Inspector are administered
+    in this Region from one delegated administrator that is not the
+    organization management account (AIR-FND-ACC-09).
+
+    Each of these services designates its administrator per Region, so the
+    organization-wide delegated administrator list does not show a Region
+    where the service has none. The admin listing APIs answer only the
+    management account; a member reads its own administrator instead.
+    """
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status, name=REGIONAL_ADMIN_FINDING):
+        return create_finding(
+            check_id="SM-35",
+            finding_name=name,
+            finding_details=details,
+            resolution=resolution,
+            reference=REGIONAL_ADMIN_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        account_id = boto3.client(
+            "sts", config=boto3_config, region_name=region
+        ).get_caller_identity()["Account"]
+        master_account_id = boto3.client(
+            "organizations", config=boto3_config
+        ).describe_organization()["Organization"]["MasterAccountId"]
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    detector_inventory = detector_inventory or get_guardduty_detector_inventory(region)
+    admins, problems, unread = {}, [], []
+    guardduty = boto3.client("guardduty", config=boto3_config, region_name=region)
+    detector_id = detector_inventory.get("detector_id")
+    if detector_inventory.get("error") is not None:
+        unread.append(
+            "Amazon GuardDuty (guardduty:ListDetectors: "
+            f"{get_assessment_error_label(detector_inventory['error'])})"
+        )
+    elif not detector_id:
+        problems.append(
+            "Amazon GuardDuty has no detector in this Region, so no administrator "
+            "administers it here"
+        )
+    else:
+        admins["Amazon GuardDuty"] = _regional_admin(
+            lambda: _account_and_status(
+                guardduty.get_administrator_account(DetectorId=detector_id),
+                "Administrator",
+                "AccountId",
+                "RelationshipStatus",
+            ),
+            lambda: guardduty.describe_organization_configuration(
+                DetectorId=detector_id
+            ),
+            account_id,
+        )
+    securityhub = boto3.client("securityhub", config=boto3_config, region_name=region)
+    admins["AWS Security Hub"] = _regional_admin(
+        lambda: _account_and_status(
+            securityhub.get_administrator_account(),
+            "Administrator",
+            "AccountId",
+            "MemberStatus",
+        ),
+        securityhub.describe_organization_configuration,
+        account_id,
+    )
+    inspector = boto3.client("inspector2", config=boto3_config, region_name=region)
+
+    def _inspector_admin():
+        try:
+            return _account_and_status(
+                inspector.get_delegated_admin_account(),
+                "delegatedAdmin",
+                "accountId",
+                "relationshipStatus",
+            )
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code", "") in (
+                "ResourceNotFoundException",
+                "ValidationException",
+            ):
+                return None, None
+            raise
+
+    def _inspector_self():
+        # GetDelegatedAdminAccount answers the delegated administrator itself
+        # with a ValidationException naming it as the invoking account.
+        try:
+            inspector.get_delegated_admin_account()
+        except ClientError as error:
+            message = str(error.response.get("Error", {}).get("Message", ""))
+            if "Invoking account is the delegated admin" in message:
+                return
+            raise
+
+    admins["Amazon Inspector"] = _regional_admin(
+        _inspector_admin, _inspector_self, account_id
+    )
+
+    dedicated = {}
+    for service, (administrator, how, reason) in admins.items():
+        if reason:
+            unread.append(f"{service} ({reason})")
+        elif administrator is None:
+            problems.append(
+                f"{service} has no delegated administrator for this account in this "
+                f"Region: this account is {how}"
+            )
+        elif administrator == master_account_id:
+            problems.append(
+                f"{service} is administered from the organization management "
+                f"account {master_account_id}"
+            )
+        else:
+            dedicated.setdefault(administrator, []).append(service)
+    if len(dedicated) > 1:
+        problems.append(
+            "the services are administered from "
+            f"{len(dedicated)} different accounts ("
+            + "; ".join(
+                f"account {account}: {', '.join(services)}"
+                for account, services in sorted(dedicated.items())
+            )
+            + "), and administrator-member relationships do not carry across "
+            "services"
+        )
+
+    if problems:
+        findings["csv_data"].append(
+            _row(
+                f"In {region}, " + "; ".join(problems) + ".",
+                "Designate the same dedicated security tooling account as the "
+                "delegated administrator of GuardDuty, Security Hub and Amazon "
+                "Inspector in every Region, and enroll this account as a member.",
+                "High",
+                "Failed",
+            )
+        )
+    if unread:
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-35",
+                REGIONAL_ADMIN_FINDING,
+                unread,
+                f"{sum(len(v) for v in dedicated.values())} service(s) were read "
+                "with a non-management administrator.",
+                REGIONAL_ADMIN_REFERENCE,
+                region,
+            )
+        )
+    if not problems and not unread:
+        ((administrator, services),) = dedicated.items()
+        findings["csv_data"].append(
+            _row(
+                f"In {region}, {', '.join(services)} are all administered from "
+                f"account {administrator}, which is not the organization "
+                "management account. Each Region is judged by its own run, so "
+                "whether every Region names the same account is not compared here.",
+                "No action required",
+                "High",
+                "Passed",
+            )
+        )
+    return findings
+
+
 AI_SECURITY_STANDARD_FINDING = "Security Hub AI Security Best Practices Standard"
 AI_SECURITY_STANDARD_REFERENCE = "https://docs.aws.amazon.com/securityhub/latest/userguide/standards-ai-security.html"
 AI_SECURITY_STANDARD_ARN_FRAGMENT = "standards/ai-security-best-practices/v/1.0.0"
@@ -18964,6 +19201,13 @@ def lambda_handler(event, context):
             region=region, detector_inventory=guardduty_inventory
         )
         all_findings.append(guardduty_findings)
+
+        logger.info("Running regional security service administrator check (SM-35)")
+        all_findings.append(
+            check_regional_security_admin(
+                region=region, detector_inventory=guardduty_inventory
+            )
+        )
 
         logger.info("Running GuardDuty AI Protection check (SM-26)")
         all_findings.append(

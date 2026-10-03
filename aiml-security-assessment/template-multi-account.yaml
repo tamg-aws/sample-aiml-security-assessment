@@ -872,6 +872,8 @@ Resources:
               - ec2:DescribeVpcs # SM-37
               - ec2:DescribeDhcpOptions # SM-37
               - bedrock-agentcore:ListAgentRuntimes # SM-37
+              - guardduty:GetAdministratorAccount # SM-35
+              - inspector2:GetDelegatedAdminAccount # SM-35
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a
@@ -920,6 +922,13 @@ Resources:
             Action:
               - bedrock-agentcore:GetAgentRuntime # SM-37
             Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
+          - Sid: SecurityHubAdministratorRead
+            # SM-35 reads which account administers this account's Security
+            # Hub in each Region.
+            Effect: Allow
+            Action:
+              - securityhub:GetAdministratorAccount # SM-35
+            Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
