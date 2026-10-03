@@ -882,7 +882,11 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-18", "AC-19", "AC-20", "AC-26"],
+        ["AC-12", "AC-18", "AC-19", "AC-20", "AC-26"],
+        "AC-12 requires each gateway's kmsKeyArn to name an enabled customer managed "
+        "key whose key policy allows kms:Decrypt and kms:GenerateDataKey only with "
+        "kms:ViaService for AgentCore and the "
+        "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn of that gateway. "
         "AC-18 requires a CloudTrail data event selector for "
         "AWS::BedrockAgentCore::Gateway whenever the region holds a gateway, so "
         "each gateway call is recorded with its caller. AC-19 pairs each AgentCore delivery source with its delivery and AC-20 "
@@ -2186,6 +2190,13 @@ INCUMBENT_NAMES = {
     "AC-08": "AgentCore VPC Endpoints Check",
     "AC-10": "AgentCore Resource-Based Policies Check",
     "AC-11": "AgentCore Policy Engine Encryption Check",
+    "AC-12": (
+        "AgentCore Gateway Encryption Check",
+        "AgentCore Gateway Encryption Missing",
+        "AgentCore Gateway Key Unusable",
+        "AgentCore Gateway Key Policy Unscoped",
+        "AgentCore Gateway Encryption Incomplete",
+    ),
     "AC-14": "AgentCore Identity Token Vault CMK Encryption",
     "AC-15": "AgentCore Code Interpreter Network Isolation",
     "AC-17": "AgentCore Online Evaluation Coverage",
