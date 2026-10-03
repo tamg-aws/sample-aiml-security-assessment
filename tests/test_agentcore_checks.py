@@ -3521,13 +3521,15 @@ def _wire_recording_bucket(
     statements=None,
     rules=None,
     versioning=None,
+    key_id=None,
 ):
     """One recording bucket that passes every AC-06 leg unless overridden."""
+    default = {"SSEAlgorithm": algorithm}
+    if key_id:
+        default["KMSMasterKeyID"] = key_id
     mock_s3.get_bucket_encryption.return_value = {
         "ServerSideEncryptionConfiguration": {
-            "Rules": [
-                {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": algorithm}}
-            ]
+            "Rules": [{"ApplyServerSideEncryptionByDefault": default}]
         }
     }
     mock_s3.get_public_access_block.return_value = {
@@ -3585,6 +3587,135 @@ def _record(inventory, cache=None):
         return agentcore_app.check_browser_tool_recording(
             inventory, _recorder_cache() if cache is None else cache
         )
+
+
+_RECORDING_KEY = "arn:aws:kms:us-east-1:123456789012:key/rec-key"
+_OPEN_RECORDING_KEY = "arn:aws:kms:us-east-1:123456789012:key/open-key"
+
+
+def _recording_key_policy(open_decrypt=False):
+    statements = [
+        {
+            "Sid": "Root",
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+            "Action": "kms:*",
+            "Resource": "*",
+        }
+    ]
+    if open_decrypt:
+        statements.append(
+            {
+                "Sid": "Anyone",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "kms:Decrypt",
+                "Resource": "*",
+            }
+        )
+    return json.dumps({"Version": "2012-10-17", "Statement": statements})
+
+
+class TestAC06RecordingKeyPolicy:
+    """AIR-ACR-RT-09: the recording key's policy decides who can decrypt a
+    recording anyone fetches, so an unbounded decrypt grant fails the row."""
+
+    def _wire(self, mock_s3, mock_kms, describe_error=None, policy_error=None):
+        # One TLS deny covers both buckets, so the key is the only leg that
+        # differs between them.
+        _wire_recording_bucket(
+            mock_s3,
+            statements=[
+                _plaintext_deny(
+                    Resource=[
+                        "arn:aws:s3:::recordings",
+                        "arn:aws:s3:::recordings/*",
+                        "arn:aws:s3:::other",
+                        "arn:aws:s3:::other/*",
+                    ]
+                )
+            ],
+        )
+        good = mock_s3.get_bucket_encryption.return_value
+
+        def encryption(Bucket, ExpectedBucketOwner):
+            key = "alias/recordings" if Bucket == "recordings" else _OPEN_RECORDING_KEY
+            rule = dict(good["ServerSideEncryptionConfiguration"]["Rules"][0])
+            rule["ApplyServerSideEncryptionByDefault"] = {
+                "SSEAlgorithm": "aws:kms",
+                "KMSMasterKeyID": key,
+            }
+            return {"ServerSideEncryptionConfiguration": {"Rules": [rule]}}
+
+        mock_s3.get_bucket_encryption.side_effect = encryption
+        arns = {
+            "alias/recordings": _RECORDING_KEY,
+            _OPEN_RECORDING_KEY: _OPEN_RECORDING_KEY,
+        }
+
+        def describe_key(KeyId):
+            if describe_error is not None:
+                raise describe_error
+            return {"KeyMetadata": {"Arn": arns[KeyId]}}
+
+        def get_key_policy(KeyId, **_):
+            if policy_error is not None:
+                raise policy_error
+            return {
+                "Policy": _recording_key_policy(
+                    open_decrypt=KeyId == _OPEN_RECORDING_KEY
+                )
+            }
+
+        mock_kms.describe_key.side_effect = describe_key
+        mock_kms.get_key_policy.side_effect = get_key_policy
+        cache = _recorder_cache(
+            statements=[{"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}]
+        )
+        return _record(
+            _browser_inventory(
+                _recorded_browser("br-1"), _recorded_browser("br-2", bucket="other")
+            ),
+            cache,
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_open_decrypt_grant_fails_only_its_bucket(self, mock_s3, mock_kms):
+        findings = self._wire(mock_s3, mock_kms)
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert _RECORDING_KEY in findings[0]["Finding_Details"]
+        assert (
+            f"encrypts with key {_OPEN_RECORDING_KEY}, whose key policy lets a "
+            "principal no condition binds decrypt" in findings[1]["Finding_Details"]
+        )
+        assert "without TLS" not in findings[1]["Finding_Details"]
+        mock_kms.get_key_policy.assert_any_call(KeyId=_RECORDING_KEY)
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_unreadable_key_policy_is_na(self, mock_s3, mock_kms):
+        findings = self._wire(
+            mock_s3,
+            mock_kms,
+            policy_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        assert "kms:GetKeyPolicy" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_undescribable_key_is_na(self, mock_s3, mock_kms):
+        findings = self._wire(
+            mock_s3,
+            mock_kms,
+            describe_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        assert "kms:DescribeKey" in findings[0]["Resolution"]
 
 
 class TestAC06RecordingDestination:

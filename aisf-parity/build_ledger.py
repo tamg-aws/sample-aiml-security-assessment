@@ -326,8 +326,10 @@ AI_SUBJECT_ROWS = [
         "is on, a public policy confines every grant to the account and AWS service principals, so "
         "none fails. Every row names the cached roles and users whose identity policies read the "
         "prefix. Statements naming a service principal and object ACLs are not judged for reads. "
-        "SCPs, the bucket key policy and the role's use of that key are not evaluated, so a Passed "
-        "write can still be refused. The AWS managed browser has no recording configuration and is "
+        "Each KMSMasterKeyID the bucket encrypts with is resolved by kms:DescribeKey and its "
+        "policy read by kms:GetKeyPolicy: a decrypt grant to a principal no condition binds "
+        "fails, and an unreadable key is N/A. SCPs and the role's use of that key are not "
+        "evaluated for the write, so a Passed write can still be refused. The AWS managed browser has no recording configuration and is "
         "outside the population",
         [],
         4,

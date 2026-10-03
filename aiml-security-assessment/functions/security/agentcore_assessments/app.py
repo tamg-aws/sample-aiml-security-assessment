@@ -6537,6 +6537,75 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _recording_key_gaps(
+    reads: Dict[str, Tuple[str, Any]], bucket: str, key_cache: Dict[str, Any]
+) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
+    """Judge the policy of each KMS key a recording bucket encrypts with.
+
+    A recording anyone fetches is plaintext to whoever the key policy lets
+    decrypt, so an unbounded decrypt grant fails. A rule naming no
+    KMSMasterKeyID uses the AWS managed aws/s3 key. DescribeKey resolves an
+    alias or key id to the ARN GetKeyPolicy reads; either read failing is
+    unread, never a pass. Returns problems, fixes, unread legs, retries and
+    facts, as _recording_bucket_gaps does.
+    """
+    problems: List[str] = []
+    fixes: List[str] = []
+    unread: List[str] = []
+    retries: List[str] = []
+    facts: List[str] = []
+    state, response = reads["encryption"]
+    if state == "error":
+        return problems, fixes, unread, retries, facts
+    key_ids = sorted(
+        {
+            str(default.get("KMSMasterKeyID"))
+            for rule in (
+                (response or {}).get("ServerSideEncryptionConfiguration") or {}
+            ).get("Rules")
+            or []
+            if isinstance(rule, dict)
+            for default in [rule.get("ApplyServerSideEncryptionByDefault") or {}]
+            if default.get("SSEAlgorithm") in BROWSER_RECORDING_KMS_ALGORITHMS
+            and default.get("KMSMasterKeyID")
+        }
+    )
+    for key_id in key_ids:
+        if key_id not in key_cache:
+            try:
+                key_arn = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["Arn"]
+            except Exception as error:
+                key_cache[key_id] = ("kms:DescribeKey", error)
+            else:
+                try:
+                    key_cache[key_id] = (
+                        key_arn,
+                        kms_client.get_key_policy(KeyId=key_arn)["Policy"],
+                    )
+                except Exception as error:
+                    key_cache[key_id] = ("kms:GetKeyPolicy", error)
+        first, second = key_cache[key_id]
+        if isinstance(second, Exception):
+            unread.append(
+                f"bucket '{bucket}' key {key_id} policy ({first} "
+                f"{_assessment_error_label(second)})"
+            )
+            retries.append(f"Grant {first} on the recording key and retry.")
+        elif _kms_key_policy_allows_open_decrypt(second):
+            problems.append(
+                f"bucket '{bucket}' encrypts with key {first}, whose key policy "
+                "lets a principal no condition binds decrypt, so a recording "
+                "fetched from the bucket is readable from any account"
+            )
+            fixes.append(
+                "Remove the wildcard decrypt grant from the recording key's "
+                "policy, or bind it with kms:CallerAccount or aws:PrincipalOrgID."
+            )
+        else:
+            facts.append(f"its key {first} grants decrypt to no unbounded principal")
+    return problems, fixes, unread, retries, facts
+
+
 def _recording_bucket_gaps(
     reads: Dict[str, Tuple[str, Any]], bucket: str, key_prefix: str, object_arn: str
 ) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
@@ -7156,6 +7225,7 @@ def check_browser_tool_recording(
             return organization["id"]
 
         bucket_reads: Dict[str, Dict[str, Tuple[str, Any]]] = {}
+        key_cache: Dict[str, Any] = {}
         for item in browsers:
             summary = item["summary"]
             detail = item["detail"]
@@ -7228,6 +7298,11 @@ def check_browser_tool_recording(
                     _recording_bucket_gaps(reads, bucket, key_prefix, object_arn),
                 ):
                     found.extend(bucket_list)
+                for found, key_list in zip(
+                    (problems, fixes, unread, retries, facts),
+                    _recording_key_gaps(reads, bucket, key_cache),
+                ):
+                    found.extend(key_list)
                 policy_state, policy = reads["policy"]
                 bucket_statements = (
                     None

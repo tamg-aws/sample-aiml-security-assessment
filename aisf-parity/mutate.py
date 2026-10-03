@@ -1149,6 +1149,27 @@ MUTATIONS = [
         "find": '        "*" in value.split(":", 5)[5] or "?" in value.split(":", 5)[5]\n',
         "replace": "        False\n",
     },
+    {
+        "name": "AC-06 does not read the recording key policy",
+        "file": AGENTCORE,
+        "defect": "a key policy granting decrypt to * makes every fetched recording plaintext to any account while the row passes",
+        "find": "                    _recording_key_gaps(reads, bucket, key_cache),\n",
+        "replace": "                    ([], [], [], [], []),\n",
+    },
+    {
+        "name": "AC-06 passes a recording key whose policy it could not read",
+        "file": AGENTCORE,
+        "defect": "a denied GetKeyPolicy or DescribeKey says nothing about who can decrypt, so a Passed from it is a clean result from a failed read",
+        "find": "        if isinstance(second, Exception):\n            unread.append(\n                f\"bucket '{bucket}' key {key_id} policy ({first} \"\n",
+        "replace": "        if isinstance(second, Exception):\n            (lambda *_: None)(\n                f\"bucket '{bucket}' key {key_id} policy ({first} \"\n",
+    },
+    {
+        "name": "AC-06 credits a recording key that lets anyone decrypt",
+        "file": AGENTCORE,
+        "defect": "the key read but never judged reports an open decrypt grant as a key that admits no unbounded principal",
+        "find": "        elif _kms_key_policy_allows_open_decrypt(second):\n",
+        "replace": "        elif False:\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1424,6 +1445,9 @@ GROUPS: dict[str, str] = {
     "AC-34 claims the agent code is unreadable through any API": "in the AgentCore verdict legs",
     "AC-26 accepts several exempt principals on the tamper SCP": "in the AgentCore verdict legs",
     "AC-26 accepts a wildcard name as the tamper SCP exemption": "in the AgentCore verdict legs",
+    "AC-06 does not read the recording key policy": "in the AgentCore verdict legs",
+    "AC-06 passes a recording key whose policy it could not read": "in the AgentCore verdict legs",
+    "AC-06 credits a recording key that lets anyone decrypt": "in the AgentCore verdict legs",
 }
 
 
