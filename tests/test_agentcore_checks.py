@@ -4367,6 +4367,41 @@ class TestAC06RecordingReadLeg:
 
     @pytest.mark.parametrize("reverse", [False, True])
     @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("aws:PrincipalAccount", "123456789012"),
+            ("aws:SourceAccount", "123456789012"),
+            ("aws:PrincipalOrgID", "o-mine"),
+        ],
+    )
+    @pytest.mark.parametrize("operator", ["StringEquals", "StringEqualsIfExists"])
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_if_exists_binding_is_not_credited(
+        self, mock_s3, mock_orgs, operator, key, value, reverse
+    ):
+        # RT-09: an anonymous request carries no aws:PrincipalAccount,
+        # aws:SourceAccount or aws:PrincipalOrgID, so under IfExists the Allow
+        # matches it. Only the operator varies between the two cases, so the
+        # grant reported under IfExists and absent under StringEquals pins the
+        # cause. RestrictPublicBuckets is off, so both rows fail on that leg and
+        # the grant text is what discriminates.
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-mine"}
+        }
+        reader = _recording_reader(Condition={operator: {key: value}})
+
+        findings = _record_two_buckets(mock_s3, reader, reverse, restrict=False)
+
+        details = findings["br-1"]["Finding_Details"]
+        assert findings["br-1"]["Status"] == "Failed"
+        assert ("by statement 'Reader' to *" in details) is operator.endswith(
+            "IfExists"
+        )
+        assert findings["br-2"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize(
         "reader",
         [
             _recording_reader(),

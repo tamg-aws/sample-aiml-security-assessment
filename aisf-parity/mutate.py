@@ -841,6 +841,27 @@ MUTATIONS = [
         "find": "    extras = [value for value in values if value not in roles]\n",
         "replace": "    extras = []\n",
     },
+    {
+        "name": "AC-06 credits an IfExists aws:PrincipalAccount binding",
+        "file": AGENTCORE,
+        "defect": "an anonymous request carries no aws:PrincipalAccount, so an Allow to * under StringEqualsIfExists matches it and the recordings are readable by anyone",
+        "find": "        if name not in CONFUSED_DEPUTY_GUARD_OPERATORS:\n            continue\n        for entry_key, raw in entries.items():\n",
+        "replace": '        if name.removesuffix("ifexists") not in CONFUSED_DEPUTY_GUARD_OPERATORS:\n            continue\n        for entry_key, raw in entries.items():\n',
+    },
+    {
+        "name": "AC-06 credits an IfExists aws:SourceAccount binding",
+        "file": AGENTCORE,
+        "defect": "aws:SourceAccount is present only on a service-to-service call, so under IfExists the Allow matches every direct and anonymous request",
+        "find": "        if name not in CONFUSED_DEPUTY_GUARD_OPERATORS:\n            continue\n        for key, raw in entries.items():\n            values = _condition_values(raw)\n            if not values:\n                continue\n            key = str(key).strip().lower()\n            if key not in keys:\n",
+        "replace": '        if name.removesuffix("ifexists") not in CONFUSED_DEPUTY_GUARD_OPERATORS:\n            continue\n        for key, raw in entries.items():\n            values = _condition_values(raw)\n            if not values:\n                continue\n            key = str(key).strip().lower()\n            if key not in keys:\n',
+    },
+    {
+        "name": "AC-06 credits an IfExists aws:PrincipalOrgID binding",
+        "file": AGENTCORE,
+        "defect": "an anonymous request carries no aws:PrincipalOrgID, so the organization binding under IfExists admits it",
+        "find": '    if operator.startswith("forallvalues:") or operator.endswith("ifexists"):\n        return False\n',
+        "replace": '    if operator.startswith("forallvalues:"):\n        return False\n    operator = operator.removesuffix("ifexists")\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1072,6 +1093,9 @@ GROUPS: dict[str, str] = {
     "AC-32 credits a DiscoveryUrl deny-list of one bad issuer": "in the AgentCore verdict legs",
     "AC-47 passes a PrincipalArn Deny naming no fronting gateway role": "in the AgentCore verdict legs",
     "AC-47 passes a PrincipalArn Deny naming a role beside the gateway's": "in the AgentCore verdict legs",
+    "AC-06 credits an IfExists aws:PrincipalAccount binding": "in the AgentCore verdict legs",
+    "AC-06 credits an IfExists aws:SourceAccount binding": "in the AgentCore verdict legs",
+    "AC-06 credits an IfExists aws:PrincipalOrgID binding": "in the AgentCore verdict legs",
 }
 
 
