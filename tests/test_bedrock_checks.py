@@ -8274,6 +8274,7 @@ class TestBR41CentralGuardrailEnforcement:
                 else [{"guardrailsConfig": list(account_configs)}]
             )
 
+        bedrock_client.get_guardrail.return_value = {}
         bedrock_client.get_resource_policy.return_value = {
             "resourcePolicy": json.dumps(
                 share_policy
@@ -8306,6 +8307,12 @@ class TestBR41CentralGuardrailEnforcement:
     }
 
     ROOT_TARGET = [{"TargetId": "r-abc123", "Type": "ROOT"}]
+
+    # A service control policy never restricts the management account, so the
+    # SCP route is credited only from a member account (here a delegated
+    # administrator). These SCP tests ran as the management account before
+    # round 6 and now run as member account MEMBER_ACCOUNT.
+    MEMBER_ACCOUNT = "222222222222"
 
     def _run_clients(
         self,
@@ -8436,6 +8443,7 @@ class TestBR41CentralGuardrailEnforcement:
                     "StringNotEquals", self.GUARDRAIL_ARN
                 ),
             },
+            account=self.MEMBER_ACCOUNT,
         )
 
         passed = [f for f in findings if f["Status"] == "Passed"]
@@ -8657,7 +8665,9 @@ class TestBR41CentralGuardrailEnforcement:
         first["Statement"][0]["Action"] = "bedrock:InvokeModel"
         second = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
         second["Statement"][0]["Action"] = "bedrock:InvokeModelWithResponseStream"
-        _, findings = self._scp_run({"p-a": first, "p-b": second})
+        _, findings = self._scp_run(
+            {"p-a": first, "p-b": second}, account=self.MEMBER_ACCOUNT
+        )
 
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "Scp-p-a" in findings[0]["Finding_Details"]
@@ -8714,7 +8724,8 @@ class TestBR41CentralGuardrailEnforcement:
                 "p-ifexists": self._deny_without_guardrail(
                     "StringNotEqualsIfExists", self.GUARDRAIL_ARN
                 )
-            }
+            },
+            account=self.MEMBER_ACCOUNT,
         )
 
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -8745,6 +8756,101 @@ class TestBR41CentralGuardrailEnforcement:
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "222222222222" in findings[0]["Finding_Details"]
         assert "management account" not in findings[0]["Finding_Details"]
+
+    def test_br41_scp_in_the_management_account_is_not_enforcement(self):
+        # GRD-10, DET-04: the same Deny that passes from a member account fails
+        # in the management account, which no service control policy restricts.
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        _, management = self._scp_run({"p-guardrail": document})
+        _, member = self._scp_run(
+            {"p-guardrail": document}, account=self.MEMBER_ACCOUNT
+        )
+
+        assert [f["Status"] for f in management] == ["Failed"]
+        details = management[0]["Finding_Details"]
+        assert "Scp-p-guardrail" in details
+        assert "management account 123456789012" in details
+        assert "never restrict" in details
+        assert "PutEnforcedGuardrailConfiguration" in management[0]["Resolution"]
+        assert [f["Status"] for f in member] == ["Passed"]
+
+    def _reasoning_run(self, guardrails, **kwargs):
+        """guardrails: {version: GetGuardrail response or an exception}."""
+        org_client, bedrock_client, factory = self._client_factory(
+            kwargs.pop("bedrock_policies", ()),
+            (),
+            kwargs.pop("targets", {}),
+            kwargs.pop("contents", {}),
+            "123456789012",
+            kwargs.pop("account_configs", ()),
+            None,
+            None,
+            effective=kwargs.pop("effective", None),
+        )
+
+        def get_guardrail(guardrailIdentifier, guardrailVersion):
+            outcome = guardrails[guardrailVersion]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        bedrock_client.get_guardrail.side_effect = get_guardrail
+        with patch("bedrock_app.boto3.client", side_effect=factory):
+            result = bedrock_app.check_bedrock_central_guardrail_enforcement(
+                region="Global", api_region="us-east-1"
+            )
+        return bedrock_client, extract_csv_data(result)
+
+    REASONING = {
+        "automatedReasoningPolicy": {
+            "policies": [
+                "arn:aws:bedrock:us-east-1:123456789012:automated-reasoning-policy/p1"
+            ]
+        }
+    }
+
+    @pytest.mark.parametrize("source", ["account", "effective"])
+    def test_br41_enforced_version_with_automated_reasoning_is_not_enforcement(
+        self, source
+    ):
+        # GRD-10: enforcements do not support an Automated Reasoning policy, so
+        # the version that carries one fails and the clean version passes.
+        def run(version):
+            if source == "account":
+                return self._reasoning_run(
+                    {"3": self.REASONING, "4": {}},
+                    account_configs=[self._account_config("cfg-1", version=version)],
+                )
+            return self._reasoning_run(
+                {"3": self.REASONING, "4": {}},
+                effective=self._effective_policy_document(self.GUARDRAIL_ARN, version),
+            )
+
+        client, flagged = run("3")
+        _, clean = run("4")
+
+        assert not [f for f in flagged if f["Status"] == "Passed"]
+        failed = [f for f in flagged if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Automated Reasoning policy" in failed[0]["Finding_Details"]
+        assert "automated-reasoning-policy/p1" in failed[0]["Finding_Details"]
+        client.get_guardrail.assert_called_with(
+            guardrailIdentifier=self.GUARDRAIL_ARN, guardrailVersion="3"
+        )
+        assert [f["Status"] for f in clean] == ["Passed"]
+
+    def test_br41_unread_enforced_version_is_not_passed(self):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "GetGuardrail"
+        )
+        _, findings = self._reasoning_run(
+            {"3": denied},
+            account_configs=[self._account_config("cfg-1", version="3")],
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "bedrock:GetGuardrail" in findings[0]["Finding_Details"]
+        assert "AccessDenied" in findings[0]["Finding_Details"]
 
     def test_br41_effective_draft_policy_fails(self):
         _, findings = self._run(
@@ -9026,8 +9132,8 @@ class TestBR41CentralGuardrailEnforcement:
         ]
         narrow = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
         narrow["Statement"][0]["Resource"] = "arn:aws:bedrock:*:*:imported-model/*"
-        _, findings = self._scp_run({"p-all": document})
-        _, mixed = self._scp_run({"p-narrow": narrow})
+        _, findings = self._scp_run({"p-all": document}, account=self.MEMBER_ACCOUNT)
+        _, mixed = self._scp_run({"p-narrow": narrow}, account=self.MEMBER_ACCOUNT)
 
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "Scp-p-all" in findings[0]["Finding_Details"]

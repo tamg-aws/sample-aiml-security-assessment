@@ -10168,6 +10168,61 @@ def _guardrail_share_finding(
     )
 
 
+def _enforced_guardrail_reasoning_policies(
+    guardrail: str, version: str, scan_region: str, cache: Dict[tuple, Any]
+) -> Dict[str, Any]:
+    """
+    Read the Automated Reasoning policies on one enforced guardrail version.
+
+    Enforcements do not support an Automated Reasoning policy, and configuring
+    one makes invocations fail at runtime, so an enforced version that carries
+    one enforces nothing. Returns {"read": True, "policies": [...]} or
+    {"read": False, "error": str}; GetGuardrail answers once per version.
+    """
+    key = (scan_region, guardrail, version)
+    if key not in cache:
+        try:
+            if not guardrail or not version:
+                raise ValueError("the configuration names no guardrail version")
+            detail = boto3.client(
+                "bedrock", config=boto3_config, region_name=scan_region
+            ).get_guardrail(guardrailIdentifier=guardrail, guardrailVersion=version)
+            policy = detail.get("automatedReasoningPolicy") or {}
+            cache[key] = {
+                "read": True,
+                "policies": [str(arn) for arn in policy.get("policies") or []],
+            }
+        except Exception as error:
+            cache[key] = {
+                "read": False,
+                "error": "guardrail {} version {} in {} could not be read with "
+                "bedrock:GetGuardrail ({}), so whether it carries an Automated "
+                "Reasoning policy, which fails enforced invocations at runtime, is "
+                "unknown".format(
+                    guardrail or "unnamed",
+                    version or "none",
+                    scan_region,
+                    get_assessment_error_label(error),
+                ),
+            }
+    return cache[key]
+
+
+def _reasoning_policy_deficiency(
+    source: str, scan_region: str, policies: List[str]
+) -> Dict[str, Any]:
+    """Describe an enforced guardrail version that carries Automated Reasoning."""
+    return {
+        "name": source,
+        "id": scan_region,
+        "reason": "the guardrail version it enforces in {} carries an Automated "
+        "Reasoning policy, which enforcements do not support and which makes "
+        "enforced invocations fail at runtime".format(scan_region),
+        "observed": "Automated Reasoning policies {}".format(", ".join(policies)),
+        "resolution": "Publish a guardrail version without an Automated Reasoning policy and point the enforcement at it; apply Automated Reasoning checks per application through ApplyGuardrail or the request's guardrailConfig instead.",
+    }
+
+
 def check_bedrock_central_guardrail_enforcement(
     region: str = "",
     api_region: str = "",
@@ -10209,6 +10264,7 @@ def check_bedrock_central_guardrail_enforcement(
         policy_errors = []
         region_errors = {}
         share_rows = {}
+        reasoning_reads = {}
 
         regions = _assessed_regions(api_region)
         for scan_region in regions:
@@ -10232,6 +10288,24 @@ def check_bedrock_central_guardrail_enforcement(
             for config in configs:
                 scope = _account_enforced_guardrail_scope(config)
                 if scope["enforced"]:
+                    reasoning = _enforced_guardrail_reasoning_policies(
+                        config.get("guardrailArn") or config.get("guardrailId") or "",
+                        str(config.get("guardrailVersion") or ""),
+                        scan_region,
+                        reasoning_reads,
+                    )
+                    if not reasoning["read"]:
+                        region_errors.setdefault(scan_region, reasoning["error"])
+                        continue
+                    if reasoning["policies"]:
+                        deficient_policies.append(
+                            _reasoning_policy_deficiency(
+                                f"account-enforced {scope['label']}",
+                                scan_region,
+                                reasoning["policies"],
+                            )
+                        )
+                        continue
                     region_mechanisms.setdefault(scan_region, []).append(
                         "account-enforced {} in {} applying to {} with {}".format(
                             scope["label"],
@@ -10407,6 +10481,23 @@ def check_bedrock_central_guardrail_enforcement(
                     scope["source"] = "Organizations Bedrock policy"
                     narrowed_configs.append(scope)
                     continue
+                reasoning = _enforced_guardrail_reasoning_policies(
+                    config["guardrailArn"], version, scan_region, reasoning_reads
+                )
+                if not reasoning["read"]:
+                    region_errors.setdefault(scan_region, reasoning["error"])
+                    continue
+                if reasoning["policies"]:
+                    deficient_policies.append(
+                        _reasoning_policy_deficiency(
+                            "the effective Bedrock policy configuration {}".format(
+                                config["configId"]
+                            ),
+                            scan_region,
+                            reasoning["policies"],
+                        )
+                    )
+                    continue
                 region_mechanisms.setdefault(scan_region, []).append(
                     "the effective Bedrock policy of account {} enforcing {} in {} "
                     "applying to {} with {}{}".format(
@@ -10455,6 +10546,12 @@ def check_bedrock_central_guardrail_enforcement(
             policy_errors.extend(scps["errors"])
             scp_gaps = {}
             scp_short = {}
+            management_scp = {}
+            # A service control policy never restricts the management account,
+            # so its guardrail Deny governs member accounts and not this one.
+            management_account = bool(
+                context.get("management_account") or scps.get("management_account")
+            )
             for scan_region in scp_pending:
                 scp_actions = set()
                 scp_enforcing = []
@@ -10476,7 +10573,11 @@ def check_bedrock_central_guardrail_enforcement(
                             scan_region
                         )
                 missing = [a for a in GUARDRAIL_INVOKE_ACTIONS if a not in scp_actions]
-                if scp_enforcing and not missing:
+                if scp_enforcing and not missing and management_account:
+                    management_scp.setdefault("; ".join(scp_enforcing[:3]), []).append(
+                        scan_region
+                    )
+                elif scp_enforcing and not missing:
                     region_mechanisms.setdefault(scan_region, []).extend(
                         f"{text} in {scan_region}" for text in scp_enforcing
                     )
@@ -10500,6 +10601,26 @@ def check_bedrock_central_guardrail_enforcement(
                             ", ".join(gap_regions)
                         ),
                         "observed": gap,
+                    }
+                )
+            for observed, management_regions in management_scp.items():
+                deficient_policies.append(
+                    {
+                        "name": ", ".join(
+                            sorted(
+                                {
+                                    text.split("'")[1]
+                                    for text in observed.split("; ")
+                                    if "'" in text
+                                }
+                            )
+                        ),
+                        "id": "service control policy",
+                        "reason": "this is the management account {}, which service control policies never restrict, so its guardrail Deny does not apply to invocations made here in {}".format(
+                            caller_account or "unknown", ", ".join(management_regions)
+                        ),
+                        "observed": observed,
+                        "resolution": "Enforce the approved guardrail in the management account with PutEnforcedGuardrailConfiguration or an Organizations Bedrock policy, which do apply to it, or keep model invocation out of the management account.",
                     }
                 )
             for (names, missing_text, observed), short_regions in scp_short.items():
@@ -10528,7 +10649,10 @@ def check_bedrock_central_guardrail_enforcement(
                         policy["reason"],
                         policy["observed"],
                     ),
-                    resolution="Attach the policy to the root, an organizational unit, or an account, name a published numeric guardrail version instead of DRAFT, and deny both invoke actions over every model unless bedrock:GuardrailIdentifier names the approved guardrail ARN without a wildcard.",
+                    resolution=policy.get(
+                        "resolution",
+                        "Attach the policy to the root, an organizational unit, or an account, name a published numeric guardrail version instead of DRAFT, and deny both invoke actions over every model unless bedrock:GuardrailIdentifier names the approved guardrail ARN without a wildcard.",
+                    ),
                     reference=reference,
                     severity="High",
                     status="Failed",
