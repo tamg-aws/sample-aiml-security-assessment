@@ -22563,8 +22563,8 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str], List[str]]:
     filters on the key id is not credited: the id's form depends on how the
     caller named the key. What the target does with the event is not read. A
     metric filter counts when its pattern names both calls and an alarm with an
-    action watches its metric. Which trail feeds the filter's log group is not
-    read.
+    action watches its metric, and the filter sits on the log group of a logging
+    trail that records kms.amazonaws.com write management events here.
     """
     unread: List[str] = []
     untargeted: List[str] = []
@@ -22634,7 +22634,8 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str], List[str]]:
                 {"eventSource": "kms.amazonaws.com", "eventName": event_name},
             )
             for event_name in KMS_KEY_LOSS_EVENTS
-        )
+        ),
+        trail_event_source="kms.amazonaws.com",
     )
     if alarm:
         return (
@@ -22905,15 +22906,127 @@ def _actioned_alarm_label(alarm: Dict[str, Any], composite: Optional[str]) -> st
     )
 
 
+def _trail_records_write_events(selectors: Dict[str, Any], event_source: str) -> bool:
+    """Return whether a trail's selectors record `event_source`'s write
+    management events.
+
+    A basic selector counts when IncludeManagementEvents is true, ReadWriteType
+    is All or WriteOnly, and ExcludeManagementEventSources does not name the
+    source. An advanced selector counts when eventCategory equals Management,
+    readOnly is absent or equals false, and eventSource, if present, equals the
+    source or excludes it with NotEquals only. Any other field or operator is not
+    credited.
+    """
+    for selector in selectors.get("EventSelectors") or []:
+        if (
+            isinstance(selector, dict)
+            and selector.get("IncludeManagementEvents") is True
+            and selector.get("ReadWriteType", "All") in ("All", "WriteOnly")
+            and event_source
+            not in (selector.get("ExcludeManagementEventSources") or [])
+        ):
+            return True
+    for selector in selectors.get("AdvancedEventSelectors") or []:
+        if not isinstance(selector, dict):
+            continue
+        fields = {
+            str(field.get("Field")): field
+            for field in selector.get("FieldSelectors") or []
+            if isinstance(field, dict)
+        }
+        category = fields.pop("eventCategory", {})
+        if set(category) - {"Field", "Equals"} or "Management" not in (
+            category.get("Equals") or []
+        ):
+            continue
+        read_only = fields.pop("readOnly", None)
+        if read_only is not None and (
+            set(read_only) - {"Field", "Equals"}
+            or (read_only.get("Equals") or []) != ["false"]
+        ):
+            continue
+        source = fields.pop("eventSource", None)
+        if source is not None and not (
+            set(source) - {"Field", "Equals"} == set()
+            and event_source in (source.get("Equals") or [])
+            or set(source) - {"Field", "NotEquals"} == set()
+            and event_source not in (source.get("NotEquals") or [])
+        ):
+            continue
+        if not fields:
+            return True
+    return False
+
+
+def _trail_fed_log_groups(event_source: str) -> Tuple[Set[str], List[str]]:
+    """Return the log groups in this region a trail delivers `event_source`'s
+    write management events to, and each read that failed.
+
+    A trail counts only when it records this region (multi-region, or homed
+    here), GetTrailStatus reports IsLogging true, its selectors record the
+    source's write management events, and its CloudWatchLogsLogGroupArn names a
+    group in this region.
+    """
+    if cloudtrail_client is None:
+        return set(), ["cloudtrail:ListTrails (no CloudTrail client)"]
+    try:
+        trails = _paginate_aws_list(
+            cloudtrail_client,
+            "list_trails",
+            "Trails",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except (BotoCoreError, ClientError) as error:
+        return set(), [f"cloudtrail:ListTrails ({_assessment_error_label(error)})"]
+    region = cloudtrail_client.meta.region_name
+    groups: Set[str] = set()
+    unread: List[str] = []
+    for trail in trails:
+        trail_identifier = trail.get("TrailARN") or trail.get("Name")
+        if not trail_identifier:
+            continue
+        try:
+            detail = (
+                cloudtrail_client.get_trail(Name=trail_identifier).get("Trail") or {}
+            )
+            group_arn = str(detail.get("CloudWatchLogsLogGroupArn") or "")
+            if ":log-group:" not in group_arn or _arn_region(group_arn) != region:
+                continue
+            if detail.get("IsMultiRegionTrail") is not True and (
+                detail.get("HomeRegion") != region
+            ):
+                continue
+            status = cloudtrail_client.get_trail_status(Name=trail_identifier)
+            if status.get("IsLogging") is not True:
+                continue
+            selectors = cloudtrail_client.get_event_selectors(
+                TrailName=trail_identifier
+            )
+        except (BotoCoreError, ClientError) as error:
+            unread.append(
+                f"cloudtrail:GetTrail, GetTrailStatus or GetEventSelectors on "
+                f"{trail_identifier} ({_assessment_error_label(error)})"
+            )
+            continue
+        if _trail_records_write_events(selectors, event_source):
+            name = group_arn.split(":log-group:", 1)[1]
+            groups.add(name[:-2] if name.endswith(":*") else name)
+    return groups, unread
+
+
 def _metric_filter_alarm(
     filter_matches: Callable[[Dict[str, Any]], bool],
+    trail_event_source: Optional[str] = None,
 ) -> Tuple[str, List[str]]:
     """Return which alarm with an action watches a matching metric filter in
     this region, or "", and each read that failed.
 
     A filter counts when filter_matches accepts it, and an alarm counts when
     its actions are enabled, it has an alarm action, and it watches the
-    namespace and name one of the filter's transformations publishes.
+    namespace and name one of the filter's transformations publishes. With
+    `trail_event_source`, a filter counts only on a log group a logging trail
+    delivers that source's write management events to.
     """
     if logs_client is None or cloudwatch_client is None:
         return "", [
@@ -22935,8 +23048,18 @@ def _metric_filter_alarm(
         if filter_matches(metric_filter)
         for transformation in metric_filter.get("metricTransformations") or []
     }
-    if not metrics:
-        return "", []
+    if metrics and trail_event_source:
+        fed_groups, trail_unread = _trail_fed_log_groups(trail_event_source)
+        fed_filters = {
+            metric_filter.get("filterName")
+            for metric_filter in metric_filters
+            if metric_filter.get("logGroupName") in fed_groups
+        }
+        metrics = {
+            metric: name for metric, name in metrics.items() if name in fed_filters
+        }
+        if not metrics:
+            return "", trail_unread
     try:
         alarms = _agentcore_actioned_metric_alarms()
     except Exception as error:
@@ -23205,7 +23328,8 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                     if untargeted
                     else ""
                 )
-                + ", and no metric filter naming both feeds an "
+                + ", and no metric filter naming both, on a log group a logging "
+                "trail delivers KMS write events to, feeds an "
                 "alarm with an action, so losing the key, which denies every "
                 "Cedar decision, raises nothing"
             )

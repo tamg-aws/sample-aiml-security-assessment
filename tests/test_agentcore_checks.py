@@ -20529,6 +20529,7 @@ class TestAC36KeyLossAlarmAndServiceBounds:
         cloudwatch=None,
         engines=("pe-1",),
         policies=None,
+        cloudtrail=None,
     ):
         mock_ac.list_policy_engines.return_value = {
             "policyEngines": [
@@ -20562,8 +20563,59 @@ class TestAC36KeyLossAlarmAndServiceBounds:
             patch.object(agentcore_app, "events_client", events, create=True),
             patch.object(agentcore_app, "logs_client", logs),
             patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
+            patch.object(
+                agentcore_app,
+                "cloudtrail_client",
+                cloudtrail if cloudtrail is not None else self._trails(self._TRAIL),
+            ),
         ):
             return agentcore_app.check_agentcore_policy_engine_key_scope()
+
+    _TRAIL_GROUP = "aws-cloudtrail-logs-management"
+    _TRAIL = {
+        "TrailARN": "arn:aws:cloudtrail:us-east-1:123456789012:trail/management",
+        "IsMultiRegionTrail": True,
+        "HomeRegion": "us-east-1",
+        "CloudWatchLogsLogGroupArn": (
+            "arn:aws:logs:us-east-1:123456789012:log-group:"
+            "aws-cloudtrail-logs-management:*"
+        ),
+        "_logging": True,
+        "_selectors": {
+            "EventSelectors": [
+                {"ReadWriteType": "All", "IncludeManagementEvents": True}
+            ]
+        },
+    }
+
+    @staticmethod
+    def _trails(*trails, denied=False):
+        client = MagicMock()
+        client.meta.region_name = "us-east-1"
+        client.list_trails.return_value = {
+            "Trails": [{"TrailARN": trail["TrailARN"]} for trail in trails]
+        }
+        by_arn = {trail["TrailARN"]: trail for trail in trails}
+
+        def _get_trail(Name):
+            if denied:
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {
+                "Trail": {
+                    key: value
+                    for key, value in by_arn[Name].items()
+                    if not key.startswith("_")
+                }
+            }
+
+        client.get_trail.side_effect = _get_trail
+        client.get_trail_status.side_effect = lambda Name: {
+            "IsLogging": by_arn[Name]["_logging"]
+        }
+        client.get_event_selectors.side_effect = lambda TrailName: by_arn[TrailName][
+            "_selectors"
+        ]
+        return client
 
     @staticmethod
     def _denied_events():
@@ -20594,6 +20646,7 @@ class TestAC36KeyLossAlarmAndServiceBounds:
 
     _FILTER = {
         "filterName": "kms-key-loss",
+        "logGroupName": "aws-cloudtrail-logs-management",
         "filterPattern": (
             "{ ($.eventSource = kms.amazonaws.com) && (($.eventName = DisableKey) "
             "|| ($.eventName = ScheduleKeyDeletion)) }"
@@ -20744,6 +20797,132 @@ class TestAC36KeyLossAlarmAndServiceBounds:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "is watched by no alarm" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "trail",
+        [
+            {**_TRAIL, "_logging": False},
+            {**_TRAIL, "IsMultiRegionTrail": False, "HomeRegion": "eu-west-1"},
+            {
+                **_TRAIL,
+                "CloudWatchLogsLogGroupArn": (
+                    "arn:aws:logs:us-east-1:123456789012:log-group:other:*"
+                ),
+            },
+            {
+                **_TRAIL,
+                "_selectors": {
+                    "EventSelectors": [
+                        {"ReadWriteType": "ReadOnly", "IncludeManagementEvents": True}
+                    ]
+                },
+            },
+            {
+                **_TRAIL,
+                "_selectors": {
+                    "EventSelectors": [
+                        {
+                            "ReadWriteType": "All",
+                            "IncludeManagementEvents": True,
+                            "ExcludeManagementEventSources": ["kms.amazonaws.com"],
+                        }
+                    ]
+                },
+            },
+            {
+                **_TRAIL,
+                "_selectors": {
+                    "AdvancedEventSelectors": [
+                        {
+                            "FieldSelectors": [
+                                {"Field": "eventCategory", "Equals": ["Management"]},
+                                {"Field": "readOnly", "Equals": ["true"]},
+                            ]
+                        }
+                    ]
+                },
+            },
+        ],
+        ids=[
+            "not-logging",
+            "other-region",
+            "other-group",
+            "read-only",
+            "kms-excluded",
+            "advanced-read-only",
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_filter_no_logging_trail_feeds_is_not_an_alarm(
+        self, mock_ac, mock_kms, trail
+    ):
+        # Two trails: the second feeds a group no filter sits on, so the verdict
+        # turns on the first trail's own feed.
+        decoy = {
+            **self._TRAIL,
+            "TrailARN": "arn:aws:cloudtrail:us-east-1:123456789012:trail/decoy",
+            "CloudWatchLogsLogGroupArn": (
+                "arn:aws:logs:us-east-1:123456789012:log-group:decoy:*"
+            ),
+        }
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=self._denied_events(),
+            logs=self._logs(self._FILTER),
+            cloudwatch=self._cloudwatch(self._ALARM),
+            cloudtrail=self._trails(trail, decoy),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "events:ListRules" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_advanced_management_selector_feeds_the_filter(self, mock_ac, mock_kms):
+        trail = {
+            **self._TRAIL,
+            "_selectors": {
+                "AdvancedEventSelectors": [
+                    {
+                        "FieldSelectors": [
+                            {"Field": "eventCategory", "Equals": ["Management"]},
+                            {"Field": "eventSource", "NotEquals": ["s3.amazonaws.com"]},
+                        ]
+                    }
+                ]
+            },
+        }
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(),
+            logs=self._logs(
+                {**self._FILTER, "filterName": "unfed", "logGroupName": "other"},
+                self._FILTER,
+            ),
+            cloudwatch=self._cloudwatch(self._ALARM),
+            cloudtrail=self._trails(trail),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "filter kms-key-loss" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_trail_is_named_and_not_credited(self, mock_ac, mock_kms):
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(),
+            logs=self._logs(self._FILTER),
+            cloudwatch=self._cloudwatch(self._ALARM),
+            cloudtrail=self._trails(self._TRAIL, denied=True),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "cloudtrail:GetTrail" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")

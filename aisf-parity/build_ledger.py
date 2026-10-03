@@ -627,9 +627,10 @@ AI_SUBJECT_ROWS = [
         "policy shows), and that the key carries the engine's management and "
         "evaluation grants; the key cannot be added to or changed on an existing "
         "engine, so the key policy is the whole guard. AC-36 reads an EventBridge rule "
-        "or a metric-filter alarm on DisableKey and ScheduleKeyDeletion, but not which "
-        "trail feeds the filtered log group, and the break-glass runbook is not "
-        "readable, which AC-36's passing resolution says",
+        "or a metric-filter alarm on DisableKey and ScheduleKeyDeletion, crediting a "
+        "filter only on the log group of a logging trail that records this region's "
+        "kms.amazonaws.com write management events, and the break-glass runbook is "
+        "not readable, which AC-36's passing resolution says",
         [],
         4,
     ),

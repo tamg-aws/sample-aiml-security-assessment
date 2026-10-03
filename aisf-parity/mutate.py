@@ -939,6 +939,48 @@ MUTATIONS = [
         "find": "            if status == StatusEnum.PASSED:\n                status, fact = _evaluation_key_policy_verdict(\n                    key_arn,\n                    batch.get(",
         "replace": "            if False:\n                status, fact = _evaluation_key_policy_verdict(\n                    key_arn,\n                    batch.get(",
     },
+    {
+        "name": "AC-36 credits a key-loss metric filter no trail feeds",
+        "file": AGENTCORE,
+        "defect": "a metric filter on a log group no logging trail delivers KMS events to never sees DisableKey or ScheduleKeyDeletion, so its alarm never fires",
+        "find": '        trail_event_source="kms.amazonaws.com",\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-36 credits a trail that is not logging",
+        "file": AGENTCORE,
+        "defect": "a stopped trail delivers nothing to its log group, so the filter on it counts no key-loss call",
+        "find": '            if status.get("IsLogging") is not True:\n                continue\n            selectors = cloudtrail_client.get_event_selectors(\n',
+        "replace": "            selectors = cloudtrail_client.get_event_selectors(\n",
+    },
+    {
+        "name": "AC-36 credits a read-only management selector",
+        "file": AGENTCORE,
+        "defect": "DisableKey and ScheduleKeyDeletion are write events, which a ReadOnly selector drops",
+        "find": '            and selector.get("ReadWriteType", "All") in ("All", "WriteOnly")\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-36 ignores ExcludeManagementEventSources",
+        "file": AGENTCORE,
+        "defect": "a trail excluding kms.amazonaws.com records no KMS call, so the filter on its group sees none",
+        "find": '            and event_source\n            not in (selector.get("ExcludeManagementEventSources") or [])\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-36 credits a read-only advanced selector",
+        "file": AGENTCORE,
+        "defect": "an advanced selector with readOnly true records no write event",
+        "find": '            or (read_only.get("Equals") or []) != ["false"]\n',
+        "replace": "            and False\n",
+    },
+    {
+        "name": "AC-36 credits a trail homed in another Region",
+        "file": AGENTCORE,
+        "defect": "a single-Region trail homed elsewhere records no KMS call made in this Region",
+        "find": '            if detail.get("IsMultiRegionTrail") is not True and (\n                detail.get("HomeRegion") != region\n            ):\n                continue\n            status = cloudtrail_client.get_trail_status(',
+        "replace": "            status = cloudtrail_client.get_trail_status(",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1184,6 +1226,12 @@ GROUPS: dict[str, str] = {
     "AC-41 ignores a service-principal grant with no aws:SourceArn": "in the AgentCore verdict legs",
     "AC-41 passes a key policy it could not read": "in the AgentCore verdict legs",
     "AC-41 credits a batch evaluation key on DescribeKey alone": "in the AgentCore verdict legs",
+    "AC-36 credits a key-loss metric filter no trail feeds": "in the AgentCore verdict legs",
+    "AC-36 credits a trail that is not logging": "in the AgentCore verdict legs",
+    "AC-36 credits a read-only management selector": "in the AgentCore verdict legs",
+    "AC-36 ignores ExcludeManagementEventSources": "in the AgentCore verdict legs",
+    "AC-36 credits a read-only advanced selector": "in the AgentCore verdict legs",
+    "AC-36 credits a trail homed in another Region": "in the AgentCore verdict legs",
 }
 
 
