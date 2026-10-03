@@ -131,6 +131,13 @@ BOUNDED_DIRECT_CALLS = {
         "_workload_identities_by_role_in_regions",
         "list_agent_runtimes",
     ): ("maxResults", 1),
+    # AC-32 probes each assessed Region before it reads the issuers that
+    # Region's runtime and gateway authorizers trust.
+    (
+        "agentcore_assessments/app.py",
+        "_jwt_authorizer_issuers",
+        "list_agent_runtimes",
+    ): ("maxResults", 1),
     (
         "responsible_ai_grc_assessments/app.py",
         "detect_finserv_regional_footprint",

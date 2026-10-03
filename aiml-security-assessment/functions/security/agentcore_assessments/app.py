@@ -17362,6 +17362,212 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
     return findings
 
 
+GATEWAY_DISCOVERY_URL_CONDITION_KEY = "bedrock-agentcore:discoveryurl"
+
+# A discovery URL no organization approves. An SCP pins the gateway's identity
+# provider only when its Deny fires on a URL it does not list, as the
+# developer guide's EnforceGatewayIdP example does with StringNotEquals.
+GATEWAY_DISCOVERY_URL_UNLISTED_VALUE = (
+    "https://aisf-unlisted-issuer.invalid/.well-known/openid-configuration"
+)
+
+
+def check_agentcore_gateway_discovery_url_scp() -> List[Dict[str, Any]]:
+    """AC-32: Require an SCP that pins the identity provider a gateway may trust.
+
+    AC-31 reads the discoveryUrl of the gateways that exist now, and the IAM
+    leg of AC-32 bounds the token exchange. The control's third layer is
+    preventive: the developer guide declares bedrock-agentcore:DiscoveryUrl on
+    CreateGateway and UpdateGateway and ships an EnforceGatewayIdP SCP that
+    denies both with StringNotEquals on the approved discovery URL, so a
+    gateway cannot be pointed at another identity provider later. A Deny is
+    credited when it fires on a discovery URL it does not list, on both writes
+    and every gateway, and only when the policy binds the assessed account.
+    Which discovery URLs it approves is not compared with the gateways'.
+    """
+    reference = AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL
+    finding_name = "AgentCore Gateway Identity Provider Guardrail"
+    if organizations_client is None:
+        return [
+            create_finding(
+                check_id="AC-32",
+                finding_name=finding_name,
+                finding_details="Organizations client not available.",
+                resolution="No action required unless this account is in an organization.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        policies = _paginate_aws_list(
+            organizations_client,
+            "list_policies",
+            "Policies",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            Filter="SERVICE_CONTROL_POLICY",
+        )
+    except Exception as error:
+        if _assessment_error_label(error) in ORGANIZATIONS_UNREADABLE_ERROR_CODES:
+            return [
+                create_finding(
+                    check_id="AC-32",
+                    finding_name=finding_name,
+                    finding_details=(
+                        "Service control policies could not be listed from this "
+                        f"account: {_assessment_error_label(error)}. A member "
+                        "account cannot read the organization's policies."
+                    ),
+                    resolution=(
+                        "Run the assessment from the management account or an "
+                        "Organizations delegated administrator, with "
+                        "organizations:ListPolicies and organizations:DescribePolicy."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            ]
+        return [
+            _incomplete_check_finding(
+                check_id="AC-32",
+                finding_name=finding_name,
+                error=error,
+                reference=reference,
+            )
+        ]
+
+    coverage: Dict[str, Tuple[str, Set[str]]] = {}
+    attempting_policies: List[str] = []
+    findings: List[Dict[str, Any]] = []
+    for policy in policies:
+        policy_name = policy.get("Name", policy.get("Id", "unknown"))
+        try:
+            detail = organizations_client.describe_policy(PolicyId=policy["Id"])
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-32",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"Service control policy '{policy_name}' could not be read: "
+                        f"{_assessment_error_label(error)}, so it was not judged."
+                    ),
+                    resolution="Grant organizations:DescribePolicy and retry.",
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        covered, names_key = _scp_authorizer_deny_coverage(
+            (detail.get("Policy") or {}).get("Content", ""),
+            GATEWAY_WRITE_ACTIONS,
+            GATEWAY_DISCOVERY_URL_CONDITION_KEY,
+            GATEWAY_DISCOVERY_URL_UNLISTED_VALUE,
+            "gateway",
+        )
+        if covered:
+            coverage[policy["Id"]] = (policy_name, covered)
+        elif names_key:
+            attempting_policies.append(policy_name)
+
+    covered_actions, guarding_policies, unattached, stop = _attached_scp_coverage(
+        "AC-32",
+        finding_name,
+        reference,
+        _scp_attachment(policies, set(coverage)),
+        coverage,
+        GATEWAY_WRITE_ACTIONS,
+    )
+    if stop:
+        return findings + stop
+
+    missing = [
+        name
+        for action, name in GATEWAY_WRITE_ACTIONS.items()
+        if action not in covered_actions
+    ]
+    if not missing:
+        attached_label = "; ".join(
+            f"{name} is attached to {target}" for name, target in guarding_policies
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-32",
+                finding_name=finding_name,
+                finding_details=(
+                    "CreateGateway and UpdateGateway are both denied when "
+                    "bedrock-agentcore:DiscoveryUrl names an identity provider the "
+                    "policy does not list, by service control policy: "
+                    f"{', '.join(name for name, _ in guarding_policies)}. "
+                    f"{attached_label}, which binds this account. Which discovery "
+                    "URLs the policy approves was not compared with the gateways'."
+                ),
+                resolution=(
+                    "No action required. Confirm the approved discovery URLs are "
+                    "the organization's own identity providers."
+                ),
+                reference=reference,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+        return findings
+
+    if covered_actions:
+        details = (
+            "An unlisted discovery URL is denied on "
+            f"{', '.join(sorted(GATEWAY_WRITE_ACTIONS[a] for a in covered_actions))} "
+            f"but not on {', '.join(missing)}, so an existing gateway can still be "
+            "pointed at another identity provider."
+        )
+        name_suffix = " Partial"
+    elif unattached:
+        details = (
+            f"Service control policy {', '.join(unattached)} denies gateway writes "
+            "that name an unlisted discovery URL, but is attached to neither this "
+            "account nor an organizational unit or root above it, so it binds "
+            "nothing here."
+        )
+        name_suffix = " Unattached"
+    elif attempting_policies:
+        details = (
+            "bedrock-agentcore:DiscoveryUrl is conditioned on in a shape that does "
+            "not deny a discovery URL the policy does not list, by service control "
+            f"policy: {', '.join(sorted(attempting_policies))}."
+        )
+        name_suffix = " Ineffective"
+    else:
+        details = (
+            f"None of the {len(policies)} service control policy(s) readable from "
+            "this account denies CreateGateway and UpdateGateway when "
+            "bedrock-agentcore:DiscoveryUrl names an unapproved identity provider, "
+            "so a gateway can be created or repointed to trust any issuer."
+        )
+        name_suffix = " Missing"
+    findings.append(
+        create_finding(
+            check_id="AC-32",
+            finding_name=finding_name + name_suffix,
+            finding_details=details,
+            resolution=(
+                "Attach to the root or this account's organizational unit a service "
+                "control policy that denies bedrock-agentcore:CreateGateway and "
+                "bedrock-agentcore:UpdateGateway on Resource * with StringNotEquals "
+                "on bedrock-agentcore:DiscoveryUrl naming the approved discovery "
+                "URLs, and prove it in a test organizational unit first."
+            ),
+            reference=reference,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    )
+    return findings
+
+
 def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
     """AC-29: Require an SCP that keeps a runtime off SigV4-only inbound auth.
 
@@ -19135,20 +19341,36 @@ INBOUND_JWT_ISSUER_KEY = "bedrock-agentcore:inboundjwtclaim/iss"
 # empty claim set, and a negated operator admits every issuer it does not name.
 INBOUND_JWT_PIN_OPERATORS = {"stringequals", "stringequalsignorecase", "stringlike"}
 
+# The claims that name the application a token was minted for. The control asks
+# for them beside the issuer, because an approved issuer mints tokens for every
+# application registered with it.
+INBOUND_JWT_APPLICATION_KEYS = (
+    "bedrock-agentcore:inboundjwtclaim/aud",
+    "bedrock-agentcore:inboundjwtclaim/client_id",
+)
 
-def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement binds the exchange to named issuers.
+# The network keys the control combines with the claim conditions, so a token
+# is exchanged only from an approved VPC or VPC endpoint.
+INBOUND_JWT_NETWORK_KEYS = ("aws:sourcevpc", "aws:sourcevpce")
 
-    An aud or client_id condition names the application, and any issuer can
-    mint a token carrying that value, so only an iss condition pins. The claim
-    must sit under StringEquals or StringLike, optionally qualified
-    with ForAnyValue, and every value must name something narrower than a
+OIDC_DISCOVERY_SUFFIX = "/.well-known/openid-configuration"
+
+
+def _statement_inbound_jwt_pins(
+    statement: Dict[str, Any], keys: Tuple[str, ...]
+) -> List[Tuple[str, bool]]:
+    """Return the values one statement pins any of `keys` to, or [] when none.
+
+    Each value comes with whether its operator compares without case. A key
+    pins when it sits under StringEquals or StringLike, optionally qualified
+    with ForAnyValue, and every value names something narrower than a
     wildcard. Under StringLike any `*` or `?` fails the pin, because a pattern
     such as `https://cognito-idp.*.amazonaws.com/*` admits every user pool.
     """
     conditions = statement.get("Condition")
     if not isinstance(conditions, dict):
-        return False
+        return []
+    pins: List[Tuple[str, bool]] = []
     for operator, block in conditions.items():
         if not isinstance(block, dict):
             continue
@@ -19158,7 +19380,7 @@ def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
         if operator_name not in INBOUND_JWT_PIN_OPERATORS:
             continue
         for key, values in block.items():
-            if str(key).strip().lower() != INBOUND_JWT_ISSUER_KEY:
+            if str(key).strip().lower() not in keys:
                 continue
             if isinstance(values, str):
                 values = [values]
@@ -19173,27 +19395,37 @@ def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
                 )
                 for value in values
             ):
-                return True
-    return False
+                pins.extend(
+                    (str(value), operator_name.endswith("ignorecase"))
+                    for value in values
+                )
+    return pins
 
 
 def _principals_exchanging_inbound_jwts(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
-) -> Tuple[List[str], List[str], List[str]]:
-    """Split principals exchanging inbound JWTs into unpinned and pinned grants.
+) -> Tuple[
+    List[str], List[str], List[str], List[Tuple[str, Set[Tuple[str, bool]]]], List[str]
+]:
+    """Split principals exchanging inbound JWTs by the weakest statement each holds.
 
     The resource element cannot answer this question: both actions take the
     workload identity as their resource, so naming one workload still accepts a
-    token from any issuer that workload's authorizer trusts. Only a condition on
-    the issuer, audience or client id narrows which tokens the exchange accepts.
-    Any action pattern reaching an exchange counts, a bare `Action: "*"`
-    included, and only if it survives the principal's own unconditioned Deny
-    statements and permissions boundary. The third list names principals with
-    a policy that could not be parsed.
+    token from any issuer that workload's authorizer trusts. A statement is
+    judged on its issuer pin first, then on an aud or client_id pin, then on an
+    aws:SourceVpc or aws:SourceVpce pin. Returns the principals whose weakest
+    statement pins no issuer, pins no application, or pins no network path,
+    then each fully pinned principal with the issuer values it names, then the
+    principals with a policy that could not be parsed. Any action pattern
+    reaching an exchange counts, a bare `Action: "*"` included, and only if it
+    survives the principal's own unconditioned Deny statements and permissions
+    boundary.
     """
     unpinned: List[str] = []
-    pinned: List[str] = []
+    application_unbound: List[str] = []
+    network_unbound: List[str] = []
+    pinned: List[Tuple[str, Set[Tuple[str, bool]]]] = []
     unreadable: List[str] = []
 
     for principal_name, permissions in permissions_by_name.items():
@@ -19201,6 +19433,7 @@ def _principals_exchanging_inbound_jwts(
             continue
         label = f"{principal_kind} {principal_name}"
         verdicts = set()
+        issuers: Set[Tuple[str, bool]] = set()
 
         for policy in _principal_policies(permissions):
             try:
@@ -19217,19 +19450,151 @@ def _principals_exchanging_inbound_jwts(
                     )
                     if _grant_survives(permissions, f"bedrock-agentcore:{action}")
                 ]
-                if reached:
-                    verdicts.add(_statement_pins_inbound_jwt_issuer(statement))
+                if not reached:
+                    continue
+                statement_issuers = _statement_inbound_jwt_pins(
+                    statement, (INBOUND_JWT_ISSUER_KEY,)
+                )
+                if not statement_issuers:
+                    verdicts.add("issuer")
+                elif not _statement_inbound_jwt_pins(
+                    statement, INBOUND_JWT_APPLICATION_KEYS
+                ):
+                    verdicts.add("application")
+                elif not _statement_inbound_jwt_pins(
+                    statement, INBOUND_JWT_NETWORK_KEYS
+                ):
+                    verdicts.add("network")
+                else:
+                    verdicts.add("pinned")
+                    issuers.update(statement_issuers)
 
-        if False in verdicts:
+        if "issuer" in verdicts:
             unpinned.append(label)
-        elif True in verdicts:
-            pinned.append(label)
+        elif "application" in verdicts:
+            application_unbound.append(label)
+        elif "network" in verdicts:
+            network_unbound.append(label)
+        elif "pinned" in verdicts:
+            pinned.append((label, issuers))
 
-    return unpinned, pinned, unreadable
+    return unpinned, application_unbound, network_unbound, pinned, unreadable
+
+
+def _oidc_issuer(discovery_url: str) -> str:
+    """Return the issuer an OpenID discovery URL names, by dropping its suffix.
+
+    OpenID Connect Discovery serves the configuration at the issuer followed by
+    /.well-known/openid-configuration, so the issuer is what precedes it. A
+    trailing slash is dropped, because some providers include one in iss.
+    """
+    url = str(discovery_url).strip()
+    if url.endswith(OIDC_DISCOVERY_SUFFIX):
+        url = url[: -len(OIDC_DISCOVERY_SUFFIX)]
+    return url.rstrip("/")
+
+
+def _jwt_authorizer_issuers(
+    regions: Optional[List[str]],
+) -> Tuple[Set[str], List[str], List[str]]:
+    """Return the issuers the JWT authorizers of runtimes and gateways trust.
+
+    Each runtime's GetAgentRuntime and each gateway's GetGateway return the
+    customJWTAuthorizer's discoveryUrl. With `regions` each Region is probed and
+    read with its own client, skipping one where AgentCore has no endpoint;
+    without them the current client's Region is read. Returns the issuers, each
+    read that failed, and the Regions read. Only the version GetAgentRuntime
+    returns by default is read.
+    """
+    global agentcore_client
+    issuers: Set[str] = set()
+    unread: List[str] = []
+    clients: List[Tuple[str, Any]] = []
+    if regions is None:
+        if agentcore_client is None:
+            return issuers, ["the AgentCore client is not available"], []
+        clients.append((agentcore_client.meta.region_name, agentcore_client))
+    for region in regions or []:
+        try:
+            client = boto3.client(
+                "bedrock-agentcore-control", config=boto3_config, region_name=region
+            )
+            client.list_agent_runtimes(maxResults=1)
+        except EndpointConnectionError:
+            continue
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code not in REGION_UNAVAILABLE_ERROR_CODES:
+                unread.append(
+                    f"bedrock-agentcore:ListAgentRuntimes in {region} "
+                    f"({_assessment_error_label(error)})"
+                )
+            continue
+        except Exception as error:
+            unread.append(
+                f"bedrock-agentcore:ListAgentRuntimes in {region} "
+                f"({_assessment_error_label(error)})"
+            )
+            continue
+        clients.append((region, client))
+
+    held = agentcore_client
+    try:
+        for region, client in clients:
+            agentcore_client = client
+            for list_method, keys, id_key, get_method, get_param, action in (
+                (
+                    "list_agent_runtimes",
+                    ["agentRuntimes"],
+                    "agentRuntimeId",
+                    "get_agent_runtime",
+                    "agentRuntimeId",
+                    "AgentRuntime",
+                ),
+                (
+                    "list_gateways",
+                    ["items", "gateways"],
+                    "gatewayId",
+                    "get_gateway",
+                    "gatewayIdentifier",
+                    "Gateway",
+                ),
+            ):
+                try:
+                    items = _agentcore_list_all(list_method, keys)
+                except Exception as error:
+                    unread.append(
+                        f"bedrock-agentcore:List{action}s in {region} "
+                        f"({_assessment_error_label(error)})"
+                    )
+                    continue
+                for item in items:
+                    try:
+                        detail = getattr(client, get_method)(
+                            **{get_param: item.get(id_key)}
+                        )
+                    except Exception as error:
+                        unread.append(
+                            f"bedrock-agentcore:Get{action} on {item.get(id_key)} "
+                            f"in {region} ({_assessment_error_label(error)})"
+                        )
+                        continue
+                    discovery_url = (
+                        (detail.get("authorizerConfiguration") or {}).get(
+                            "customJWTAuthorizer"
+                        )
+                        or {}
+                    ).get("discoveryUrl")
+                    if discovery_url:
+                        issuers.add(_oidc_issuer(discovery_url))
+    finally:
+        agentcore_client = held
+    return issuers, unread, [region for region, _ in clients]
 
 
 def check_agentcore_inbound_jwt_issuer_conditions(
     permission_cache: Dict[str, Any],
+    regions: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """AC-32: Report who can exchange a JWT from any issuer for a workload token.
 
@@ -19239,6 +19604,11 @@ def check_agentcore_inbound_jwt_issuer_conditions(
     InboundJwtClaim condition trades a token from any issuer the workload trusts
     for a workload access token, without passing through a gateway authorizer.
     An action element of "*" reaches both exchanges and is counted here too.
+
+    A grant passes only when each statement pins the issuer, the application
+    (aud or client_id) and the network path (aws:SourceVpc or aws:SourceVpce),
+    and every issuer it pins is one a runtime or gateway JWT authorizer read in
+    `regions` trusts.
     """
     findings = []
 
@@ -19270,8 +19640,10 @@ def check_agentcore_inbound_jwt_issuer_conditions(
         role_groups = _principals_exchanging_inbound_jwts(role_permissions, "role")
         user_groups = _principals_exchanging_inbound_jwts(user_permissions, "user")
         unpinned = sorted(role_groups[0] + user_groups[0])
-        pinned = sorted(role_groups[1] + user_groups[1])
-        unreadable = sorted(role_groups[2] + user_groups[2])
+        application_unbound = sorted(role_groups[1] + user_groups[1])
+        network_unbound = sorted(role_groups[2] + user_groups[2])
+        pinned = sorted(role_groups[3] + user_groups[3])
+        unreadable = sorted(role_groups[4] + user_groups[4])
         findings.extend(gap_rows)
         if unreadable:
             findings.append(
@@ -19331,29 +19703,146 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                 )
             )
 
-        if pinned:
+        if application_unbound:
             findings.append(
                 create_finding(
                     check_id="AC-32",
-                    finding_name="AgentCore Inbound JWT Issuer Conditions",
+                    finding_name="AgentCore Inbound JWT Application Conditions Missing",
                     finding_details=(
-                        "The following principals exchange inbound JWTs only under "
-                        "an issuer condition that names a value under StringEquals "
-                        "or StringLike: "
-                        f"{', '.join(pinned)}."
+                        "The following principals exchange inbound JWTs under an "
+                        "issuer condition but with no InboundJwtClaim/aud or "
+                        "InboundJwtClaim/client_id condition naming a value under "
+                        "StringEquals or StringLike, so a token the approved issuer "
+                        "minted for any application registered with it is "
+                        f"accepted: {', '.join(application_unbound)}. "
+                        f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
-                        "No action required. Confirm the pinned values name this "
-                        "workload's own identity providers and client applications."
+                        "Add a ForAnyValue:StringEquals condition on "
+                        "bedrock-agentcore:InboundJwtClaim/aud, or a StringEquals "
+                        "condition on InboundJwtClaim/client_id, naming the "
+                        "approved applications, to each statement."
                     ),
                     reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
                     region=GLOBAL_REGION_LABEL,
                 )
             )
 
-        if not unpinned and not pinned and not gap_rows and not unreadable:
+        if network_unbound:
+            findings.append(
+                create_finding(
+                    check_id="AC-32",
+                    finding_name="AgentCore Inbound JWT Network Path Unbound",
+                    finding_details=(
+                        "The following principals exchange inbound JWTs under "
+                        "issuer and application conditions but with no "
+                        "aws:SourceVpc or aws:SourceVpce condition naming a value "
+                        "under StringEquals or StringLike, so a stolen token can "
+                        "be exchanged from any network path: "
+                        f"{', '.join(network_unbound)}. {IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        "Add an aws:SourceVpc or aws:SourceVpce condition naming "
+                        "the approved VPC or VPC endpoint to each statement. The "
+                        "keys are in the request context only when the call "
+                        "traverses a VPC endpoint, so test the condition against "
+                        "the Runtime-initiated token exchange first."
+                    ),
+                    reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if pinned:
+            known, issuer_unread, read_regions = _jwt_authorizer_issuers(regions)
+            matched: List[str] = []
+            unmatched: List[str] = []
+            for label, values in pinned:
+                strange = sorted(
+                    value
+                    for value, ignore_case in values
+                    if not any(
+                        value.rstrip("/") == issuer
+                        or (
+                            ignore_case
+                            and value.rstrip("/").casefold() == issuer.casefold()
+                        )
+                        for issuer in known
+                    )
+                )
+                if strange:
+                    unmatched.append(f"{label} ({', '.join(strange)})")
+                else:
+                    matched.append(label)
+            if matched:
+                findings.append(
+                    create_finding(
+                        check_id="AC-32",
+                        finding_name="AgentCore Inbound JWT Issuer Conditions",
+                        finding_details=(
+                            "The following principals exchange inbound JWTs only "
+                            "under an issuer condition, an aud or client_id "
+                            "condition and an aws:SourceVpc or aws:SourceVpce "
+                            "condition, each naming a value under StringEquals or "
+                            "StringLike, and every issuer they name is one a "
+                            "runtime or gateway JWT authorizer read in "
+                            f"{', '.join(read_regions)} trusts: "
+                            f"{', '.join(matched)}."
+                        ),
+                        resolution=(
+                            "No action required. Confirm the pinned audiences, "
+                            "clients and network paths are this workload's own."
+                        ),
+                        reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.PASSED,
+                        region=GLOBAL_REGION_LABEL,
+                    )
+                )
+            if unmatched:
+                unread_note = (
+                    f" These reads failed: {', '.join(issuer_unread)}."
+                    if issuer_unread
+                    else ""
+                )
+                findings.append(
+                    create_finding(
+                        check_id="AC-32",
+                        finding_name="AgentCore Inbound JWT Issuer Unapproved",
+                        finding_details=(
+                            "The following principals pin every condition the "
+                            "control asks for, but name an issuer that no runtime "
+                            "or gateway JWT authorizer read in "
+                            f"{', '.join(read_regions) or 'any Region'} trusts, "
+                            "taking each authorizer's issuer as its discoveryUrl "
+                            "without /.well-known/openid-configuration, so whether "
+                            "the issuer is an approved identity provider was not "
+                            f"established: {', '.join(unmatched)}.{unread_note}"
+                        ),
+                        resolution=(
+                            "Confirm each named issuer is an approved identity "
+                            "provider, or change the condition to the issuer the "
+                            "workload's authorizer trusts."
+                        ),
+                        reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                        region=GLOBAL_REGION_LABEL,
+                    )
+                )
+
+        if (
+            not unpinned
+            and not application_unbound
+            and not network_unbound
+            and not pinned
+            and not gap_rows
+            and not unreadable
+        ):
             findings.append(
                 create_finding(
                     check_id="AC-32",
@@ -33496,6 +33985,11 @@ def lambda_handler(event, context):
                         check_agentcore_gateway_identity_authorizer_scp,
                     ),
                     (
+                        ["AC-32"],
+                        "Gateway Identity Provider Guardrail",
+                        check_agentcore_gateway_discovery_url_scp,
+                    ),
+                    (
                         ["AC-01"],
                         "VPC Placement Guardrail",
                         check_agentcore_vpc_placement_scp,
@@ -33551,7 +34045,9 @@ def lambda_handler(event, context):
                         ["AC-32"],
                         "Inbound JWT Issuer Conditions",
                         lambda: check_agentcore_inbound_jwt_issuer_conditions(
-                            permission_cache
+                            permission_cache,
+                            [region]
+                            + [r for r in target_regions or [] if r and r != region],
                         ),
                     ),
                     # AC-33 reads the same global IAM cache: which workload
@@ -33585,6 +34081,11 @@ def lambda_handler(event, context):
                         ["AC-29"],
                         "Gateway Identity Authorizer Guardrail",
                         check_agentcore_gateway_identity_authorizer_scp,
+                    ),
+                    (
+                        ["AC-32"],
+                        "Gateway Identity Provider Guardrail",
+                        check_agentcore_gateway_discovery_url_scp,
                     ),
                     (
                         ["AC-01"],

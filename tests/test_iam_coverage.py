@@ -869,6 +869,15 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
 # Verified with the bedrock-mantle:CreateInference entry above.
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"bedrock-mantle:Model"}
 
+# Verified 2026-10-03 with ValidatePolicy (SERVICE_CONTROL_POLICY) on a Deny of
+# CreateGateway and UpdateGateway: bedrock-agentcore:DiscoveryUrlNotReal came
+# back INVALID_SERVICE_CONDITION_KEY, aws:SourceVpcNotReal came back
+# INVALID_GLOBAL_CONDITION_KEY, and neither key below raised a key finding.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "bedrock-agentcore:DiscoveryUrl",
+    "aws:SourceVpc",
+}
+
 # Verified the same way on 2026-09-25 for the SageMaker phase-3 checks. The
 # condition key was submitted in its qualified aws:ResourceTag/<key> form, which
 # is the only form IAM accepts; a bogus aws:...Tag/<key> key came back as

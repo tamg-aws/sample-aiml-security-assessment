@@ -799,6 +799,34 @@ MUTATIONS = [
         "find": "                    in {region.lower() for region in read_regions}\n",
         "replace": "                    in set()\n",
     },
+    {
+        "name": "AC-32 passes an issuer pin with no application pin",
+        "file": AGENTCORE,
+        "defect": "an approved issuer mints tokens for every application registered with it, so a statement pinning iss alone accepts a token minted for another application, and the control asks for aud or client_id beside it",
+        "find": '                elif not _statement_inbound_jwt_pins(\n                    statement, INBOUND_JWT_APPLICATION_KEYS\n                ):\n                    verdicts.add("application")\n',
+        "replace": '                elif False:\n                    verdicts.add("application")\n',
+    },
+    {
+        "name": "AC-32 passes claim pins with no network pin",
+        "file": AGENTCORE,
+        "defect": "the control combines the claim conditions with aws:SourceVpc or aws:SourceVpce, and without them a stolen token is exchanged from any network path",
+        "find": '                elif not _statement_inbound_jwt_pins(\n                    statement, INBOUND_JWT_NETWORK_KEYS\n                ):\n                    verdicts.add("network")\n',
+        "replace": '                elif False:\n                    verdicts.add("network")\n',
+    },
+    {
+        "name": "AC-32 passes an issuer no authorizer trusts",
+        "file": AGENTCORE,
+        "defect": "a literal iss pin names one issuer but not an approved one, and the row passed without comparing it with the issuers the runtimes' and gateways' JWT authorizers trust",
+        "find": "                if strange:\n                    unmatched.append(",
+        "replace": "                if False:\n                    unmatched.append(",
+    },
+    {
+        "name": "AC-32 credits a DiscoveryUrl deny-list of one bad issuer",
+        "file": AGENTCORE,
+        "defect": "a Deny that fires on one named bad issuer admits every issuer it does not name, so the probe must be a discovery URL no policy lists",
+        "find": "            GATEWAY_DISCOVERY_URL_CONDITION_KEY,\n            GATEWAY_DISCOVERY_URL_UNLISTED_VALUE,\n",
+        "replace": '            GATEWAY_DISCOVERY_URL_CONDITION_KEY,\n            "https://evil.example.com/.well-known/openid-configuration",\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1024,6 +1052,10 @@ GROUPS: dict[str, str] = {
     "AC-33 lets a ? Deny pattern cover every runtime endpoint": "in the AgentCore verdict legs",
     "AC-33 reads a NotResource ForUser grant as reaching nothing": "in the AgentCore verdict legs",
     "AC-33 never credits a foreign identity in a read Region as crossing": "in the AgentCore verdict legs",
+    "AC-32 passes an issuer pin with no application pin": "in the AgentCore verdict legs",
+    "AC-32 passes claim pins with no network pin": "in the AgentCore verdict legs",
+    "AC-32 passes an issuer no authorizer trusts": "in the AgentCore verdict legs",
+    "AC-32 credits a DiscoveryUrl deny-list of one bad issuer": "in the AgentCore verdict legs",
 }
 
 

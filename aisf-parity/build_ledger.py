@@ -960,12 +960,16 @@ AI_SUBJECT_ROWS = [
         "AC-32 covers the second door, where the token-exchange APIs take an end "
         "user's JWT without passing a gateway authorizer at all, and fails a cached "
         "principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth "
-        "unless every InboundJwtClaim/iss value is a literal or a pattern narrower "
-        'than *. A bare Action "*" and group policies count, a grant the principal\'s '
-        "own Deny or boundary removes does not, and a principal the IAM cache could "
-        "not read is N/A. The gateway's third, preventive layer, an SCP denying "
-        "CreateGateway and UpdateGateway with StringNotEquals on "
-        "bedrock-agentcore:DiscoveryUrl, is not judged",
+        "unless each statement pins InboundJwtClaim/iss, then aud or client_id, then "
+        "aws:SourceVpc or aws:SourceVpce, to values with no wildcard, and passes a "
+        "principal only when every pinned issuer is the discoveryUrl issuer of a "
+        "runtime or gateway JWT authorizer read in every assessed Region; another "
+        'issuer is N/A. A bare Action "*" and group policies count, a grant the '
+        "principal's own Deny or boundary removes does not, and a principal the IAM "
+        "cache could not read is N/A. The preventive layer is judged too: an "
+        "attached SCP must deny CreateGateway and UpdateGateway on every gateway when "
+        "bedrock-agentcore:DiscoveryUrl names a URL it does not list. Which URLs it "
+        "approves is not compared with the gateways'",
         [],
         4,
     ),

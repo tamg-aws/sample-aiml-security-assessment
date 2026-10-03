@@ -16450,7 +16450,37 @@ class TestAC31CheckRegistration:
         assert jwt.required_members == ["discoveryUrl"]
 
 
-class TestAC32InboundJwtIssuerConditions:
+_AC32_TRUSTED_ISSUERS = {
+    "https://idp.example",
+    "https://idp",
+    "https://idp.example.com",
+    "app-1",
+}
+
+
+def _ac32_full_pin(condition):
+    """Add the aud and aws:SourceVpce pins AC-32 requires beside an iss pin."""
+    merged = {operator: dict(block) for operator, block in condition.items()}
+    merged.setdefault("ForAnyValue:StringEquals", {}).setdefault(
+        "bedrock-agentcore:InboundJwtClaim/aud", "app-1"
+    )
+    merged.setdefault("StringEquals", {}).setdefault("aws:SourceVpce", "vpce-1")
+    return merged
+
+
+class _TrustedIssuers:
+    """Stand in for the authorizer read, so these tests judge the conditions."""
+
+    @pytest.fixture(autouse=True)
+    def _trusted_issuers(self):
+        with patch(
+            "agentcore_app._jwt_authorizer_issuers",
+            return_value=(_AC32_TRUSTED_ISSUERS, [], ["us-east-1"]),
+        ):
+            yield
+
+
+class TestAC32InboundJwtIssuerConditions(_TrustedIssuers):
     """AC-32: who can trade a JWT from any issuer for a workload access token."""
 
     _WORKLOAD_ARN = (
@@ -16495,7 +16525,9 @@ class TestAC32InboundJwtIssuerConditions:
     @pytest.mark.parametrize(
         "condition_key, status",
         [
-            ("bedrock-agentcore:InboundJwtClaim/iss", "Passed"),
+            # Tightened from Passed: an issuer pin alone admits a token the
+            # issuer minted for any application, and reaches no network path.
+            ("bedrock-agentcore:InboundJwtClaim/iss", "Failed"),
             # Inverted: these passed. Any issuer can mint a token carrying the
             # approved aud or client_id, so neither alone pins the issuer.
             ("bedrock-agentcore:InboundJwtClaim/aud", "Failed"),
@@ -16679,13 +16711,15 @@ class TestAC32InboundJwtIssuerConditions:
                                     "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
                                 ),
                                 "Resource": "*",
-                                "Condition": {
-                                    "StringEquals": {
-                                        "bedrock-agentcore:InboundJwtClaim/iss": (
-                                            "https://idp.example/"
-                                        )
+                                "Condition": _ac32_full_pin(
+                                    {
+                                        "StringEquals": {
+                                            "bedrock-agentcore:InboundJwtClaim/iss": (
+                                                "https://idp.example/"
+                                            )
+                                        }
                                     }
-                                },
+                                ),
                             }
                         ]
                     },
@@ -16747,9 +16781,9 @@ class TestAC32InboundJwtIssuerConditions:
         findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
             self._cache(
                 ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
-                condition={
-                    "StringLike": {"bedrock-agentcore:InboundJwtClaim/iss": value}
-                },
+                condition=_ac32_full_pin(
+                    {"StringLike": {"bedrock-agentcore:InboundJwtClaim/iss": value}}
+                ),
             )
         )
         assert [f["Status"] for f in findings] == [status]
@@ -16769,11 +16803,13 @@ class TestAC32InboundJwtIssuerConditions:
         cache["role_permissions"].update(
             self._cache(
                 ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
-                condition={
-                    "StringEquals": {
-                        "bedrock-agentcore:InboundJwtClaim/iss": "https://idp.example/"
+                condition=_ac32_full_pin(
+                    {
+                        "StringEquals": {
+                            "bedrock-agentcore:InboundJwtClaim/iss": "https://idp.example/"
+                        }
                     }
-                },
+                ),
                 principal="pinned-role",
             )["role_permissions"]
         )
@@ -16786,7 +16822,7 @@ class TestAC32InboundJwtIssuerConditions:
         assert "pinned-role" not in failed[0]["Finding_Details"]
 
 
-class TestAC32IssuerMustBePinned:
+class TestAC32IssuerMustBePinned(_TrustedIssuers):
     """AC-32 counts an exchange as pinned only when the issuer is pinned."""
 
     _EXCHANGE = "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
@@ -16825,7 +16861,13 @@ class TestAC32IssuerMustBePinned:
                 roles={
                     "wide": _principal_with([self._allow(condition)]),
                     "narrow": _principal_with(
-                        [self._allow({"StringEquals": {self._ISS: "https://idp/"}})]
+                        [
+                            self._allow(
+                                _ac32_full_pin(
+                                    {"StringEquals": {self._ISS: "https://idp/"}}
+                                )
+                            )
+                        ]
                     ),
                 }
             )
@@ -16851,12 +16893,312 @@ class TestAC32IssuerMustBePinned:
         ],
         ids=["iss-and-aud", "iss-beside-any-aud", "iss-ignore-case"],
     )
-    def test_an_issuer_condition_passes_with_or_without_an_audience(self, condition):
+    def test_an_issuer_condition_passes_only_with_the_other_pins(self, condition):
+        # Tightened from Passed: the control pins the application and the
+        # network path beside the issuer, so each condition here now fails on
+        # its own and passes once the missing pins are added.
         findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
             _v2_cache(roles={"role": _principal_with([self._allow(condition)])})
         )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        has_application = any(
+            self._AUD in block or self._CLIENT in block for block in condition.values()
+        )
+        assert findings[0]["Finding"] == (
+            "AgentCore Inbound JWT Network Path Unbound"
+            if has_application
+            else "AgentCore Inbound JWT Application Conditions Missing"
+        )
+
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(
+                roles={
+                    "role": _principal_with([self._allow(_ac32_full_pin(condition))])
+                }
+            )
+        )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "issuer condition" in findings[0]["Finding_Details"]
+
+
+class TestAC32ApplicationNetworkAndIssuer:
+    """AC-32 pins the application and network path, and compares the issuer."""
+
+    _EXCHANGE = "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
+    _ISS = "bedrock-agentcore:InboundJwtClaim/iss"
+    _COGNITO = "https://cognito-idp.us-west-2.amazonaws.com/us-west-2_abc"
+
+    @classmethod
+    def _role(cls, condition):
+        return _principal_with(
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": cls._EXCHANGE,
+                    "Resource": "*",
+                    "Condition": condition,
+                }
+            ]
+        )
+
+    @staticmethod
+    def _rows(findings):
+        rows = {}
+        for finding in findings:
+            rows.setdefault(finding["Finding"], []).append(finding)
+        return rows
+
+    @pytest.mark.parametrize(
+        "network",
+        [
+            {"StringEqualsIfExists": {"aws:SourceVpce": "vpce-1"}},
+            {"StringLike": {"aws:SourceVpce": "vpce-*"}},
+            {"StringNotEquals": {"aws:SourceVpc": "vpc-other"}},
+        ],
+        ids=["if-exists", "wildcard", "negated"],
+    )
+    def test_each_missing_pin_fails_only_its_role(self, network):
+        iss = {"StringEquals": {self._ISS: "https://idp.example"}}
+        aud = {
+            "ForAnyValue:StringEquals": {
+                "bedrock-agentcore:InboundJwtClaim/aud": "app-1"
+            }
+        }
+        with patch(
+            "agentcore_app._jwt_authorizer_issuers",
+            return_value=({"https://idp.example"}, [], ["us-east-1"]),
+        ):
+            findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+                _v2_cache(
+                    roles={
+                        "no-app": self._role(dict(iss, StringLike={})),
+                        "no-net": self._role({**iss, **aud, **network}),
+                        "full": self._role(_ac32_full_pin(iss)),
+                    }
+                )
+            )
+
+        rows = self._rows(findings)
+        app = rows["AgentCore Inbound JWT Application Conditions Missing"]
+        net = rows["AgentCore Inbound JWT Network Path Unbound"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert [f["Status"] for f in app + net] == ["Failed", "Failed"]
+        assert "role no-app" in app[0]["Finding_Details"]
+        assert "role no-net" not in app[0]["Finding_Details"]
+        assert "role no-net" in net[0]["Finding_Details"]
+        assert "role no-app" not in net[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "role full" in passed[0]["Finding_Details"]
+        assert "role no-" not in passed[0]["Finding_Details"]
+
+    def test_a_pinned_issuer_is_compared_with_every_regions_authorizers(self):
+        def region_client(runtimes, gateways):
+            client = MagicMock()
+            client.list_agent_runtimes.return_value = {
+                "agentRuntimes": [{"agentRuntimeId": rid} for rid in runtimes]
+            }
+            client.get_agent_runtime.side_effect = lambda agentRuntimeId: runtimes[
+                agentRuntimeId
+            ]
+            client.list_gateways.return_value = {
+                "items": [{"gatewayId": gid} for gid in gateways]
+            }
+            client.get_gateway.side_effect = lambda gatewayIdentifier: gateways[
+                gatewayIdentifier
+            ]
+            return client
+
+        def jwt(url):
+            return {
+                "authorizerConfiguration": {
+                    "customJWTAuthorizer": {"discoveryUrl": url}
+                }
+            }
+
+        denied = MagicMock()
+        denied.list_agent_runtimes.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListAgentRuntimes",
+        )
+        clients = {
+            "us-east-1": region_client(
+                {"rt-iam": {}},
+                {"gw-1": jwt("https://idp.example/.well-known/openid-configuration")},
+            ),
+            "us-west-2": region_client(
+                {"rt-1": jwt(f"{self._COGNITO}/.well-known/openid-configuration")}, {}
+            ),
+            "eu-west-1": denied,
+        }
+        roles = {
+            "gateway-idp": self._role(
+                _ac32_full_pin({"StringEquals": {self._ISS: "https://idp.example/"}})
+            ),
+            "west-pool": self._role(
+                _ac32_full_pin({"StringEquals": {self._ISS: self._COGNITO}})
+            ),
+            "stranger": self._role(
+                _ac32_full_pin({"StringEquals": {self._ISS: "https://other.example"}})
+            ),
+        }
+        with (
+            patch("agentcore_app.agentcore_client", None),
+            patch(
+                "agentcore_app.boto3.client",
+                side_effect=lambda service, config=None, region_name=None: clients[
+                    region_name
+                ],
+            ),
+        ):
+            findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+                _v2_cache(roles=roles), ["us-east-1", "us-west-2", "eu-west-1"]
+            )
+
+        rows = self._rows(findings)
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "role gateway-idp" in passed[0]["Finding_Details"]
+        assert "role west-pool" in passed[0]["Finding_Details"]
+        assert "stranger" not in passed[0]["Finding_Details"]
+        unapproved = rows["AgentCore Inbound JWT Issuer Unapproved"]
+        assert [f["Status"] for f in unapproved] == ["N/A"]
+        details = unapproved[0]["Finding_Details"]
+        assert "role stranger (https://other.example)" in details
+        assert "gateway-idp" not in details
+        assert "eu-west-1" in details
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_the_handler_passes_every_assessed_region(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        call = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func)
+            == "check_agentcore_inbound_jwt_issuer_conditions"
+        )
+        assert len(call.args) == 2
+        assert "target_regions" in ast.unparse(call.args[1])
+
+
+_APPROVED_DISCOVERY_URL = (
+    "https://login.example.com/oauth2/default/.well-known/openid-configuration"
+)
+
+
+def _discovery_url_guard(operator="StringNotEquals", value=None, action=None):
+    return [
+        {
+            "Effect": "Deny",
+            "Action": action or _GATEWAY_WRITE,
+            "Resource": "*",
+            "Condition": {
+                operator: {
+                    "bedrock-agentcore:DiscoveryUrl": value or _APPROVED_DISCOVERY_URL
+                }
+            },
+        }
+    ]
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestAC32GatewayDiscoveryUrlSCP:
+    """AIR-ACR-ID-11: an attached SCP denies CreateGateway and UpdateGateway when
+    bedrock-agentcore:DiscoveryUrl names an identity provider it does not list."""
+
+    _run = TestSCPAttachment._run
+
+    def _finding(self, mock_orgs, documents, targets=None):
+        (finding,) = self._run(
+            mock_orgs, "check_agentcore_gateway_discovery_url_scp", documents, targets
+        )
+        assert finding["Check_ID"] == "AC-32"
+        return finding
+
+    @pytest.mark.parametrize("decoy_first", [False, True])
+    @patch("agentcore_app.organizations_client")
+    def test_an_attached_allow_list_passes(self, mock_orgs, decoy_first):
+        guard = {"EnforceGatewayIdP": _discovery_url_guard()}
+        decoy = {"DenyNone": _gateway_guard()}
+        documents = {**decoy, **guard} if decoy_first else {**guard, **decoy}
+        finding = self._finding(mock_orgs, documents)
+        assert finding["Status"] == "Passed"
+        assert "EnforceGatewayIdP" in finding["Finding_Details"]
+        assert "DenyNone" not in finding["Finding_Details"]
+        assert "was not compared with the gateways'" in finding["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_list_of_one_bad_url_is_ineffective(self, mock_orgs):
+        # A StringEquals Deny on one known-bad issuer admits every issuer it does
+        # not name, so it is reported and not credited.
+        finding = self._finding(
+            mock_orgs,
+            {
+                "DenyOneIssuer": _discovery_url_guard(
+                    operator="StringEquals",
+                    value="https://evil.example.com/.well-known/openid-configuration",
+                )
+            },
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Ineffective")
+        assert "DenyOneIssuer" in finding["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_create_only_deny_is_partial(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {"CreateOnly": _discovery_url_guard(action=_GATEWAY_WRITE[:1])},
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Partial")
+        assert "UpdateGateway" in finding["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_regional_resource_scope_is_not_credited(self, mock_orgs):
+        guard = _discovery_url_guard()
+        guard[0]["Resource"] = "arn:aws:bedrock-agentcore:us-east-1:*:gateway/*"
+        finding = self._finding(mock_orgs, {"OneRegion": guard})
+        assert finding["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unattached_guard_fails_unattached(self, mock_orgs):
+        finding = self._finding(
+            mock_orgs,
+            {"EnforceGatewayIdP": _discovery_url_guard()},
+            targets={"p-0": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}]},
+        )
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Unattached")
+
+    @patch("agentcore_app.organizations_client")
+    def test_no_guard_fails_missing(self, mock_orgs):
+        finding = self._finding(mock_orgs, {"DenyNone": _gateway_guard()})
+        assert finding["Status"] == "Failed"
+        assert finding["Finding"].endswith("Missing")
+
+    def test_the_handler_registers_the_leg_on_both_cache_paths(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        for registration in registrations:
+            assert "check_agentcore_gateway_discovery_url_scp" in ast.unparse(
+                registration.value
+            )
+
+    def test_the_condition_key_is_spelled_as_the_reference_declares(self):
+        assert agentcore_app.GATEWAY_DISCOVERY_URL_CONDITION_KEY == (
+            "bedrock-agentcore:discoveryurl"
+        )
 
 
 class TestAC32CheckRegistration:
@@ -36112,7 +36454,7 @@ def _v2_cache(roles=None, users=None, errors=()):
     }
 
 
-class TestAC32WholePopulation:
+class TestAC32WholePopulation(_TrustedIssuers):
     """AC-32 pins the issuer by value and reads every principal's grants."""
 
     _EXCHANGE = "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
@@ -36156,7 +36498,9 @@ class TestAC32WholePopulation:
             _v2_cache(
                 roles={
                     "wide": _principal_with([self._allow(self._EXCHANGE, condition)]),
-                    "narrow": _principal_with([self._allow(self._EXCHANGE, self._PIN)]),
+                    "narrow": _principal_with(
+                        [self._allow(self._EXCHANGE, _ac32_full_pin(self._PIN))]
+                    ),
                 }
             )
         )
@@ -36186,13 +36530,15 @@ class TestAC32WholePopulation:
                         [
                             self._allow(
                                 self._EXCHANGE,
-                                {
-                                    "ForAnyValue:StringEquals": {
-                                        f"bedrock-agentcore:InboundJwtClaim/{claim}": (
-                                            "app-1"
-                                        )
+                                _ac32_full_pin(
+                                    {
+                                        "ForAnyValue:StringEquals": {
+                                            f"bedrock-agentcore:InboundJwtClaim/{claim}": (
+                                                "app-1"
+                                            )
+                                        }
                                     }
-                                },
+                                ),
                             )
                         ]
                     )
