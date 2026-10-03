@@ -6127,6 +6127,186 @@ def _invoke_source_network_findings(
     return rows
 
 
+AI_LAMBDA_NETWORK_FINDING = "AI Lambda Function Network Boundary"
+AI_LAMBDA_NETWORK_REFERENCE = (
+    "https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html"
+)
+AI_LAMBDA_NETWORK_RESOLUTION = (
+    "Attach each Lambda function an agent action group or AgentCore gateway "
+    "target invokes to private VPC subnets whose route tables have no route to "
+    "an internet gateway, and reach AWS services through VPC endpoints."
+)
+
+
+def _ai_lambda_references(region: str) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Lambda ARN -> what names it: agent action groups and gateway targets."""
+    named, unread = {}, []
+    try:
+        agent_client = boto3.client(
+            "bedrock-agent", config=boto3_config, region_name=region
+        )
+        agents = []
+        for page in agent_client.get_paginator("list_agents").paginate():
+            agents.extend(page.get("agentSummaries", []))
+    except Exception as error:
+        agents = []
+        unread.append(f"bedrock:ListAgents ({get_assessment_error_label(error)})")
+    for agent in agents:
+        agent_id = agent.get("agentId")
+        label = f"agent {agent.get('agentName') or agent_id}"
+        try:
+            versions = []
+            for page in agent_client.get_paginator("list_agent_versions").paginate(
+                agentId=agent_id
+            ):
+                versions.extend(
+                    v.get("agentVersion") for v in page.get("agentVersionSummaries", [])
+                )
+            for version in versions:
+                for page in agent_client.get_paginator(
+                    "list_agent_action_groups"
+                ).paginate(agentId=agent_id, agentVersion=version):
+                    for group in page.get("actionGroupSummaries", []):
+                        detail = agent_client.get_agent_action_group(
+                            agentId=agent_id,
+                            agentVersion=version,
+                            actionGroupId=group.get("actionGroupId"),
+                        ).get("agentActionGroup", {})
+                        arn = (detail.get("actionGroupExecutor") or {}).get("lambda")
+                        if arn:
+                            named.setdefault(arn, []).append(
+                                f"{label} version {version} action group "
+                                f"{group.get('actionGroupName')}"
+                            )
+        except Exception as error:
+            unread.append(
+                f"action groups of {label} ({get_assessment_error_label(error)})"
+            )
+    try:
+        gateway_client = boto3.client(
+            "bedrock-agentcore-control", config=boto3_config, region_name=region
+        )
+        gateways = []
+        for page in gateway_client.get_paginator("list_gateways").paginate():
+            gateways.extend(page.get("items", []))
+    except Exception as error:
+        gateways = []
+        unread.append(
+            f"bedrock-agentcore:ListGateways ({get_assessment_error_label(error)})"
+        )
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId")
+        label = f"gateway {gateway.get('name') or gateway_id}"
+        try:
+            for page in gateway_client.get_paginator("list_gateway_targets").paginate(
+                gatewayIdentifier=gateway_id
+            ):
+                for target in page.get("items", []):
+                    detail = gateway_client.get_gateway_target(
+                        gatewayIdentifier=gateway_id, targetId=target.get("targetId")
+                    )
+                    arn = (
+                        (
+                            (detail.get("targetConfiguration") or {}).get("mcp") or {}
+                        ).get("lambda")
+                        or {}
+                    ).get("lambdaArn")
+                    if arn:
+                        named.setdefault(arn, []).append(
+                            f"{label} target {target.get('name')}"
+                        )
+        except Exception as error:
+            unread.append(f"targets of {label} ({get_assessment_error_label(error)})")
+    return named, unread
+
+
+def check_ai_lambda_network_boundary(region: str = "") -> Dict[str, Any]:
+    """
+    SM-11: Verify every Lambda function an agent action group or AgentCore
+    gateway target invokes runs in private VPC subnets (AIR-FND-NET-01).
+
+    No Lambda field marks a function as AI compute, so the population is the
+    functions an AI resource names as its executor.
+    """
+    findings = {"csv_data": []}
+    named, unread = _ai_lambda_references(region)
+    lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+    outside, attached = [], []
+    for arn in sorted(named):
+        where = "; ".join(named[arn][:3])
+        try:
+            configuration = lambda_client.get_function_configuration(FunctionName=arn)
+        except Exception as error:
+            unread.append(
+                f"Lambda function {arn}, named by {where} "
+                f"(lambda:GetFunctionConfiguration: {get_assessment_error_label(error)})"
+            )
+            continue
+        subnets = (configuration.get("VpcConfig") or {}).get("SubnetIds") or []
+        name = f"Lambda function {arn} (named by {where})"
+        if subnets:
+            attached.append({"name": name, "subnets": list(subnets)})
+        else:
+            outside.append(
+                f"{name} runs outside a VPC, so it reaches the internet through "
+                "the Lambda service network and no subnet route bounds it."
+            )
+    findings["csv_data"].extend(
+        _capped_problem_rows(
+            "SM-11",
+            AI_LAMBDA_NETWORK_FINDING,
+            outside,
+            AI_LAMBDA_NETWORK_RESOLUTION,
+            AI_LAMBDA_NETWORK_REFERENCE,
+            "Medium",
+            region,
+            "AI Lambda functions outside a VPC",
+        )
+    )
+    exposure_rows = _subnet_exposure_findings(
+        "SM-11",
+        AI_LAMBDA_NETWORK_FINDING,
+        attached,
+        region,
+        AI_LAMBDA_NETWORK_REFERENCE,
+        AI_LAMBDA_NETWORK_RESOLUTION,
+        "Medium",
+    )
+    if unread:
+        exposure_rows = [r for r in exposure_rows if r.get("Status") != "Passed"]
+        findings["csv_data"].extend(exposure_rows)
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-11",
+                AI_LAMBDA_NETWORK_FINDING,
+                unread,
+                f"{len(named)} Lambda function(s) named by an agent action group or "
+                f"gateway target were found; {len(outside)} run outside a VPC.",
+                AI_LAMBDA_NETWORK_REFERENCE,
+                region,
+            )
+        )
+    else:
+        findings["csv_data"].extend(exposure_rows)
+    if not named and not unread:
+        findings["csv_data"].append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=AI_LAMBDA_NETWORK_FINDING,
+                finding_details=(
+                    "No Bedrock agent action group or AgentCore gateway target "
+                    "in this region names a Lambda function."
+                ),
+                resolution="No action required",
+                reference=AI_LAMBDA_NETWORK_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    return findings
+
+
 def check_sagemaker_model_network_isolation(
     region: str = "", permission_cache: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -19265,6 +19445,9 @@ def lambda_handler(event, context):
             region=region, permission_cache=permission_cache
         )
         all_findings.append(model_isolation_findings)
+
+        logger.info("Running AI Lambda function network boundary check (SM-11)")
+        all_findings.append(check_ai_lambda_network_boundary(region=region))
 
         logger.info("Running SageMaker endpoint instance count check")
         endpoint_instance_findings = check_sagemaker_endpoint_instance_count(

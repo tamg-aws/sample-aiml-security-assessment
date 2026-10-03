@@ -322,6 +322,14 @@ _EXPECTED_ACTIONS = {
         "guardduty:GetAdministratorAccount",
         "inspector2:GetDelegatedAdminAccount",
         "securityhub:GetAdministratorAccount",
+        "bedrock:ListAgents",
+        "bedrock:ListAgentVersions",
+        "bedrock:ListAgentActionGroups",
+        "bedrock:GetAgentActionGroup",
+        "bedrock-agentcore:ListGateways",
+        "bedrock-agentcore:ListGatewayTargets",
+        "bedrock-agentcore:GetGatewayTarget",
+        "lambda:GetFunctionConfiguration",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -993,6 +1001,56 @@ _SAGEMAKER_MANAGED_GRANTS = [
     ("Allow", "bedrock-agentcore:ListAgentRuntimes", '"*"'),
     ("Allow", "guardduty:GetAdministratorAccount", '"*"'),
     ("Allow", "inspector2:GetDelegatedAdminAccount", '"*"'),
+    ("Allow", "bedrock:ListAgents", '"*"'),
+    ("Allow", "bedrock-agentcore:ListGateways", '"*"'),
+    (
+        "Allow",
+        "bedrock:ListAgentVersions",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock:ListAgentActionGroups",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock:GetAgentActionGroup",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock-agentcore:ListGatewayTargets",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:gateway/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "bedrock-agentcore:GetGatewayTarget",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:gateway/*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "lambda:GetFunctionConfiguration",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*"}
+        ),
+    ),
     (
         "Allow",
         "securityhub:GetAdministratorAccount",

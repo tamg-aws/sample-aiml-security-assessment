@@ -3294,6 +3294,228 @@ def _role_cache(roles):
     }
 
 
+class TestSM11AILambdaNetworkBoundary:
+    """AIR-FND-NET-01: Lambda functions an agent or gateway target invokes."""
+
+    check = staticmethod(sagemaker_app.check_ai_lambda_network_boundary)
+    FN = "arn:aws:lambda:us-east-1:111122223333:function:"
+
+    def _run(
+        self, agents=None, gateways=None, functions=None, errors=None, exposure=None
+    ):
+        """agents: {agent: {version: {group: lambda arn or None}}};
+        gateways: {gateway: {target: lambda arn or None}};
+        functions: {arn: subnets list, or an exception}; exposure: subnet -> public?"""
+        agents = agents or {}
+        gateways = gateways or {}
+        functions = functions or {}
+        errors = errors or {}
+        exposure = exposure or {}
+
+        def raising(key, pages):
+            def paginate(**kwargs):
+                if key in errors:
+                    raise errors[key]
+                return pages(**kwargs)
+
+            return paginate
+
+        agent = MagicMock()
+        agent.get_paginator.side_effect = _pager(
+            {
+                "list_agents": raising(
+                    "agents",
+                    lambda: [
+                        {"agentSummaries": [{"agentId": a, "agentName": a}]}
+                        for a in agents
+                    ],
+                ),
+                "list_agent_versions": lambda agentId: [
+                    {"agentVersionSummaries": [{"agentVersion": v}]}
+                    for v in agents[agentId]
+                ],
+                "list_agent_action_groups": raising(
+                    "groups",
+                    lambda agentId, agentVersion: [
+                        {
+                            "actionGroupSummaries": [
+                                {"actionGroupId": g, "actionGroupName": g}
+                            ]
+                        }
+                        for g in agents[agentId][agentVersion]
+                    ],
+                ),
+            }
+        )
+
+        def get_group(agentId, agentVersion, actionGroupId):
+            arn = agents[agentId][agentVersion][actionGroupId]
+            executor = {"lambda": arn} if arn else {"customControl": "RETURN_CONTROL"}
+            return {"agentActionGroup": {"actionGroupExecutor": executor}}
+
+        agent.get_agent_action_group.side_effect = get_group
+        gateway = MagicMock()
+        gateway.get_paginator.side_effect = _pager(
+            {
+                "list_gateways": raising(
+                    "gateways",
+                    lambda: [
+                        {"items": [{"gatewayId": g, "name": g}]} for g in gateways
+                    ],
+                ),
+                "list_gateway_targets": lambda gatewayIdentifier: [
+                    {"items": [{"targetId": t, "name": t}]}
+                    for t in gateways[gatewayIdentifier]
+                ],
+            }
+        )
+
+        def get_target(gatewayIdentifier, targetId):
+            arn = gateways[gatewayIdentifier][targetId]
+            mcp = (
+                {"lambda": {"lambdaArn": arn}}
+                if arn
+                else {"mcpServer": {"endpoint": "https://x"}}
+            )
+            return {"targetConfiguration": {"mcp": mcp}}
+
+        gateway.get_gateway_target.side_effect = get_target
+        lam = MagicMock()
+
+        def configuration(FunctionName):
+            spec = functions[FunctionName]
+            if isinstance(spec, Exception):
+                raise spec
+            return {"VpcConfig": {"SubnetIds": spec}} if spec else {}
+
+        lam.get_function_configuration.side_effect = configuration
+        clients = {
+            "bedrock-agent": agent,
+            "bedrock-agentcore-control": gateway,
+            "lambda": lam,
+        }
+
+        def resolve(subnet_ids, region=""):
+            return {
+                "public": {
+                    s: {
+                        "destination": "0.0.0.0/0",
+                        "gateway": "igw-1",
+                        "route_table": "rtb-1",
+                    }
+                    for s in subnet_ids
+                    if exposure.get(s)
+                },
+                "private": [s for s in subnet_ids if exposure.get(s) is False],
+                "unresolved": [s for s in subnet_ids if s not in exposure],
+                "error": None,
+            }
+
+        with (
+            patch(
+                "sagemaker_app.boto3.client", side_effect=lambda svc, **_: clients[svc]
+            ),
+            patch(
+                "sagemaker_app.resolve_subnet_internet_exposure", side_effect=resolve
+            ),
+        ):
+            return _rows(self.check(region="us-east-1"))
+
+    @pytest.mark.parametrize("via", ["agent", "gateway"])
+    def test_an_ai_function_outside_a_vpc_fails_only_itself(self, via):
+        private, bare = self.FN + "private", self.FN + "bare"
+        if via == "agent":
+            kwargs = {"agents": {"a1": {"DRAFT": {"g1": private, "g2": bare}}}}
+        else:
+            kwargs = {"gateways": {"gw": {"t1": private, "t2": bare}}}
+        rows = self._run(
+            functions={private: ["subnet-p"], bare: []},
+            exposure={"subnet-p": False},
+            **kwargs,
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert f"Lambda function {bare} (named by" in failed[0]["Finding_Details"]
+        assert "runs outside a VPC" in failed[0]["Finding_Details"]
+        assert len(passed) == 1 and private in passed[0]["Finding_Details"]
+
+    def test_an_ai_function_in_a_public_subnet_fails(self):
+        arn = self.FN + "tool"
+        rows = self._run(
+            agents={"a1": {"1": {"g1": arn}}},
+            functions={arn: ["subnet-pub"]},
+            exposure={"subnet-pub": True},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "runs in a public subnet" in rows[0]["Finding_Details"]
+        assert "agent a1 version 1 action group g1" in rows[0]["Finding_Details"]
+
+    def test_every_agent_version_is_read(self):
+        # The draft names a private function; published version 2 a bare one.
+        private, bare = self.FN + "private", self.FN + "old"
+        rows = self._run(
+            agents={"a1": {"DRAFT": {"g1": private}, "2": {"g1": bare}}},
+            functions={private: ["subnet-p"], bare: []},
+            exposure={"subnet-p": False},
+        )
+        assert "Failed" in [r["Status"] for r in rows]
+        assert any(
+            bare in r["Finding_Details"] for r in rows if r["Status"] == "Failed"
+        )
+
+    def test_return_control_groups_and_non_lambda_targets_are_not_in_scope(self):
+        rows = self._run(
+            agents={"a1": {"DRAFT": {"g1": None}}}, gateways={"gw": {"t1": None}}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "names a Lambda function" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "errors, functions, named",
+        [
+            (
+                {"agents": _make_client_error("AccessDeniedException")},
+                {},
+                "bedrock:ListAgents",
+            ),
+            (
+                {"gateways": _make_client_error("AccessDeniedException")},
+                {},
+                "bedrock-agentcore:ListGateways",
+            ),
+            (
+                {"groups": _make_client_error("AccessDeniedException")},
+                {},
+                "action groups of agent a1",
+            ),
+            (
+                {},
+                {
+                    "arn:aws:lambda:us-east-1:999999999999:function:x": (
+                        _make_client_error("AccessDeniedException")
+                    )
+                },
+                "lambda:GetFunctionConfiguration",
+            ),
+        ],
+    )
+    def test_an_unread_read_withholds_the_pass(self, errors, functions, named):
+        private = self.FN + "private"
+        foreign = "arn:aws:lambda:us-east-1:999999999999:function:x"
+        groups = {"g1": private}
+        if foreign in functions:
+            groups["g2"] = foreign
+        rows = self._run(
+            agents={"a1": {"DRAFT": groups}},
+            functions={private: ["subnet-p"], **functions},
+            exposure={"subnet-p": False},
+            errors=errors,
+        )
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert any(named in r["Finding_Details"] for r in rows if r["Status"] == "N/A")
+
+
 class TestSM11ModelVpcAttachment:
     """AIR-SGM-EP-01: SM-11 reports the VpcConfig leg per model."""
 

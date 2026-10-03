@@ -874,6 +874,8 @@ Resources:
               - bedrock-agentcore:ListAgentRuntimes # SM-37
               - guardduty:GetAdministratorAccount # SM-35
               - inspector2:GetDelegatedAdminAccount # SM-35
+              - bedrock:ListAgents # SM-11
+              - bedrock-agentcore:ListGateways # SM-11
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a
@@ -929,6 +931,26 @@ Resources:
             Action:
               - securityhub:GetAdministratorAccount # SM-35
             Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'
+          - Sid: AILambdaExecutorRead
+            # SM-11 reads the Lambda function each agent action group and
+            # AgentCore gateway target names, and that function's VpcConfig.
+            Effect: Allow
+            Action:
+              - bedrock:ListAgentVersions # SM-11
+              - bedrock:ListAgentActionGroups # SM-11
+              - bedrock:GetAgentActionGroup # SM-11
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*'
+          - Sid: AILambdaGatewayTargetRead
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:ListGatewayTargets # SM-11
+              - bedrock-agentcore:GetGatewayTarget # SM-11
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:gateway/*'
+          - Sid: AILambdaConfigurationRead
+            Effect: Allow
+            Action:
+              - lambda:GetFunctionConfiguration # SM-11
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

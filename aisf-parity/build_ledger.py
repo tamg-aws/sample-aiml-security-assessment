@@ -1302,9 +1302,13 @@ AI_SUBJECT_ROWS = [
         "job's NetworkConfig and every training job with no item cap; BR-39 resolves "
         "every subnet, and also fails every Bedrock model customization job and batch "
         "inference job whose vpcConfig is absent or names a subnet routed to an igw- "
-        "gateway. Ceiling: Lambda GetFunctionConfiguration and ECS DescribeServices "
-        "return no field that marks a function or service as AI inference, so general "
-        "Lambda and ECS compute is not in the population",
+        "gateway. SM-11 also reads every Lambda function a Bedrock agent action "
+        "group (actionGroupExecutor.lambda, every agent version) or an AgentCore "
+        "gateway target (mcp.lambda.lambdaArn) names, fails one outside a VPC and "
+        "resolves the subnets of one inside. Ceiling: Lambda GetFunctionConfiguration "
+        "and ECS DescribeServices return no field that marks a function or service as "
+        "AI inference, so a Lambda function no agent or gateway names, and ECS "
+        "compute, are not in the population",
         [],
         5,
     ),

@@ -362,6 +362,12 @@ section.
   model and fails a credential-named plaintext variable, as it already did
   for ECS containers and Lambda functions. An unread `sagemaker:ListModels`
   or `sagemaker:DescribeModel` holds back the propagation `Passed`.
+- `SM-11` adds an `AI Lambda Function Network Boundary` row. It reads the
+  Lambda function every Bedrock agent action group (every agent version) and
+  every AgentCore gateway Lambda target names, fails one outside a VPC, and
+  fails one whose subnet routes to an internet gateway. These functions were
+  outside every network check before, although the agent and target name
+  them.
 - `SM-35` adds a `Security Service Regional Delegated Administrator` row in
   every scanned Region. GuardDuty, Security Hub and Amazon Inspector name
   their administrator per Region, so the organization-wide delegated
@@ -1617,6 +1623,19 @@ gains `guardduty:GetAdministratorAccount` and
 `arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default`
 (`SM-35`). Until the stack is updated, the new `SM-35` row reads as
 incomplete.
+
+**SageMaker AI Lambda executor reads.** `SageMakerAssessmentReadsPolicy`
+gains `bedrock:ListAgents` and `bedrock-agentcore:ListGateways` on `'*'`
+(no resource type); `bedrock:ListAgentVersions`,
+`bedrock:ListAgentActionGroups` and `bedrock:GetAgentActionGroup` on
+`arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*`;
+`bedrock-agentcore:ListGatewayTargets` and
+`bedrock-agentcore:GetGatewayTarget` on
+`arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:gateway/*`;
+and `lambda:GetFunctionConfiguration` on
+`arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*` (`SM-11`).
+A function in another account is reported as not read. Until the stack is
+updated, the new `SM-11` row reads as incomplete.
 
 **SageMaker AgentCore runtime reads.** `SageMakerAssessmentReadsPolicy`
 gains `bedrock-agentcore:ListAgentRuntimes` on `'*'` (no resource type)
