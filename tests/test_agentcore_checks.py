@@ -36682,6 +36682,143 @@ class TestAC33UserIdTokenOnJwtRuntimes:
         assert "role other-role" in rows[0]["Finding_Details"]
 
 
+class TestAC33EveryAssessedRegion:
+    """AC-33 runs once, so it reads the JWT runtimes of every assessed Region."""
+
+    _FOR_USER = "bedrock-agentcore:InvokeAgentRuntimeForUser"
+    _FOR_USER_ID = "bedrock-agentcore:GetWorkloadAccessTokenForUserId"
+    _WEST = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/rt-west"
+    _EAST = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-east"
+
+    @staticmethod
+    def _region_client(region, runtimes):
+        client = MagicMock()
+        client.meta.region_name = region
+        client.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": rid} for rid in runtimes]
+        }
+        client.get_agent_runtime.side_effect = lambda agentRuntimeId: runtimes[
+            agentRuntimeId
+        ]
+        client.list_gateways.return_value = {"items": []}
+        return client
+
+    def _clients(self):
+        jwt = {
+            "customJWTAuthorizer": {
+                "discoveryUrl": "https://idp.example.com/.well-known/openid-configuration"
+            }
+        }
+        denied = MagicMock()
+        denied.list_agent_runtimes.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListAgentRuntimes",
+        )
+        absent = MagicMock()
+        absent.list_agent_runtimes.side_effect = EndpointConnectionError(
+            endpoint_url="https://bedrock-agentcore-control.ap-south-2.amazonaws.com"
+        )
+        return {
+            "us-east-1": self._region_client(
+                "us-east-1",
+                {
+                    "rt-east": {
+                        "agentRuntimeArn": self._EAST,
+                        "agentRuntimeName": "east",
+                        "roleArn": "arn:aws:iam::123456789012:role/east-role",
+                    }
+                },
+            ),
+            "us-west-2": self._region_client(
+                "us-west-2",
+                {
+                    "rt-west": {
+                        "agentRuntimeArn": self._WEST,
+                        "agentRuntimeName": "west",
+                        "roleArn": "arn:aws:iam::123456789012:role/west-role",
+                        "authorizerConfiguration": jwt,
+                    }
+                },
+            ),
+            "eu-west-1": denied,
+            "ap-south-2": absent,
+        }
+
+    def _findings(self, regions):
+        clients = self._clients()
+        roles = {
+            "west-role": _principal_with(
+                [{"Effect": "Allow", "Action": self._FOR_USER_ID, "Resource": "*"}]
+            ),
+            "east-role": _principal_with(
+                [{"Effect": "Allow", "Action": self._FOR_USER_ID, "Resource": "*"}]
+            ),
+            "caller": _principal_with(
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": self._FOR_USER,
+                        "Resource": [self._WEST, self._EAST],
+                    }
+                ]
+            ),
+        }
+        # A cold container has no AgentCore client when the global checks run.
+        with (
+            patch("agentcore_app.agentcore_client", None),
+            patch(
+                "agentcore_app.boto3.client",
+                side_effect=lambda service, config=None, region_name=None: clients[
+                    region_name
+                ],
+            ),
+        ):
+            return agentcore_app.check_agentcore_token_issuance_scope(
+                _v2_cache(roles=roles), regions
+            )
+
+    def test_a_jwt_runtime_in_another_region_is_judged(self):
+        findings = self._findings(["us-east-1", "us-west-2", "ap-south-2"])
+
+        by_name = {}
+        for finding in findings:
+            by_name.setdefault(finding["Finding"], []).append(finding)
+        minted = by_name["AgentCore Token Issuance By User ID"]
+        assert [f["Status"] for f in minted] == ["Failed"]
+        assert "'west' (rt-west) in us-west-2" in minted[0]["Finding_Details"]
+        assert "east-role" not in minted[0]["Finding_Details"]
+        invoked = by_name["AgentCore Runtime Invocation By User ID"]
+        assert [f["Status"] for f in invoked] == ["Failed"]
+        assert "'west' (rt-west) in us-west-2" in invoked[0]["Finding_Details"]
+        assert "rt-east" not in invoked[0]["Finding_Details"]
+
+    def test_an_unread_region_withholds_a_clean_result(self):
+        findings = self._findings(["us-east-1", "eu-west-1"])
+
+        rows = [
+            f
+            for f in findings
+            if f["Finding"]
+            in (
+                "AgentCore Token Issuance By User ID",
+                "AgentCore Runtime Invocation By User ID",
+            )
+        ]
+        assert sorted(f["Status"] for f in rows) == ["N/A", "N/A"]
+        assert all("eu-west-1" in f["Finding_Details"] for f in rows)
+
+    def test_the_handler_passes_every_assessed_region(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        call = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "check_agentcore_token_issuance_scope"
+        )
+        assert len(call.args) == 2
+        assert "target_regions" in ast.unparse(call.args[1])
+
+
 class TestAC33InvokeForUserOnJwtRuntimes:
     """AC-33: no principal should invoke a JWT runtime for a user id it names."""
 
@@ -36774,6 +36911,33 @@ class TestAC33InvokeForUserOnJwtRuntimes:
         assert agentcore_app.IAM_CACHE_SCP_NOTE in details
         assert "InvokeAgentRuntimeForUser" in rows[0]["Resolution"]
         assert rows[0]["Severity"] == "Medium"
+
+    def test_a_single_character_endpoint_deny_leaves_the_other_endpoints(self):
+        runtime = self._RUNTIME.format("rt-1")
+
+        def principal(endpoint_pattern):
+            return _principal_with(
+                [
+                    self._allow(self._FOR_USER, runtime + "/*"),
+                    self._allow(self._FOR_USER, runtime),
+                    {
+                        "Effect": "Deny",
+                        "Action": self._FOR_USER,
+                        "Resource": [runtime, runtime + endpoint_pattern],
+                    },
+                ]
+            )
+
+        rows = self._rows(
+            {
+                "one-char": principal("/runtime-endpoint/?"),
+                "every": principal("/runtime-endpoint/*"),
+            }
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "role one-char" in rows[0]["Finding_Details"]
+        assert "role every" not in rows[0]["Finding_Details"]
 
     def test_the_failed_row_does_not_depend_on_runtime_order(self):
         forward = self._rows(self._population(), order=("rt-1", "rt-2", "rt-3"))

@@ -376,7 +376,9 @@ AI_SUBJECT_ROWS = [
         "role or an unread runtime is N/A. Every cached role and user fails when an "
         "Allow of InvokeAgentRuntimeForUser or InvokeAgentRuntimeWithWebSocketStreamForUser "
         "reaches such a runtime or one of its endpoints and survives its own Deny and "
-        "boundary; conditions on that Allow are not read",
+        "boundary; conditions on that Allow are not read. The runtimes and gateways "
+        "behind both user-id rows and the role-to-identity map are read in every "
+        "assessed Region, and a Region whose probe fails is an N/A runtime read",
         [],
         4,
     ),

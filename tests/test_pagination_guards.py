@@ -124,6 +124,13 @@ BOUNDED_DIRECT_CALLS = {
         "_agentcore_other_region_role_references",
         "list_agent_runtimes",
     ): ("maxResults", 1),
+    # AC-33 probes each assessed Region the same way before it reads that
+    # Region's runtimes and gateways in full.
+    (
+        "agentcore_assessments/app.py",
+        "_workload_identities_by_role_in_regions",
+        "list_agent_runtimes",
+    ): ("maxResults", 1),
     (
         "responsible_ai_grc_assessments/app.py",
         "detect_finserv_regional_footprint",

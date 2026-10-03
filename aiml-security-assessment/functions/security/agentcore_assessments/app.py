@@ -19589,6 +19589,69 @@ def _workload_identities_by_role() -> Tuple[
     return own, unread, jwt_runtimes, jwt_runtime_arns
 
 
+def _workload_identities_by_role_in_regions(
+    regions: List[str],
+) -> Tuple[
+    Dict[str, Set[str]], List[str], Dict[str, List[str]], Dict[str, str], List[str]
+]:
+    """Run _workload_identities_by_role in each of `regions` and merge the result.
+
+    An IAM role is global and a runtime is regional, so a role's own workload
+    identity and a JWT runtime it runs as can sit in any assessed Region. Each
+    runtime label ends with its Region. A Region where AgentCore has no
+    endpoint, or that the account has not opted into, is skipped as the handler
+    skips it; any other failed probe is an unread read naming the Region. The
+    fifth list names the Regions whose resources were read.
+    """
+    global agentcore_client
+    own: Dict[str, Set[str]] = {}
+    unread: List[str] = []
+    jwt_runtimes: Dict[str, List[str]] = {}
+    jwt_runtime_arns: Dict[str, str] = {}
+    read_regions: List[str] = []
+    held = agentcore_client
+    try:
+        for region in regions:
+            try:
+                client = boto3.client(
+                    "bedrock-agentcore-control", config=boto3_config, region_name=region
+                )
+                client.list_agent_runtimes(maxResults=1)
+            except EndpointConnectionError:
+                continue
+            except ClientError as error:
+                code = error.response.get("Error", {}).get("Code", "")
+                if code in REGION_UNAVAILABLE_ERROR_CODES:
+                    continue
+                unread.append(
+                    f"bedrock-agentcore:ListAgentRuntimes in {region} "
+                    f"({_assessment_error_label(error)})"
+                )
+                continue
+            except Exception as error:
+                unread.append(
+                    f"bedrock-agentcore:ListAgentRuntimes in {region} "
+                    f"({_assessment_error_label(error)})"
+                )
+                continue
+            agentcore_client = client
+            found, failed, runtimes, arns = _workload_identities_by_role()
+            read_regions.append(region)
+            for role_name, identities in found.items():
+                own.setdefault(role_name, set()).update(identities)
+            unread.extend(f"{read} in {region}" for read in failed)
+            for role_name, labels in runtimes.items():
+                jwt_runtimes.setdefault(role_name, []).extend(
+                    f"{label} in {region}" for label in labels
+                )
+            jwt_runtime_arns.update(
+                {arn: f"{label} in {region}" for arn, label in arns.items()}
+            )
+    finally:
+        agentcore_client = held
+    return own, unread, jwt_runtimes, jwt_runtime_arns, read_regions
+
+
 def _user_id_token_findings(
     jwt_runtimes: Dict[str, List[str]],
     role_permissions: Dict[str, Any],
@@ -19926,6 +19989,7 @@ def _user_id_invoke_findings(
 
 def check_agentcore_token_issuance_scope(
     permission_cache: Dict[str, Any],
+    regions: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """AC-33: Report which resources each principal may mint agent tokens against.
 
@@ -19937,6 +20001,10 @@ def check_agentcore_token_issuance_scope(
     identity, vault and credential provider they reach. AWS's own consent-portal
     execution role allows three of them on Resource "*", so the widest grant on
     the page is one a customer may have copied forward.
+
+    The check runs once, on the primary Region. When the handler passes the
+    assessed `regions`, the runtimes and gateways of each are read; without
+    them only the current client's Region is.
     """
     findings = []
 
@@ -19979,15 +20047,24 @@ def check_agentcore_token_issuance_scope(
         unattributed: List[str] = []
         attributed: List[str] = []
         jwt_runtimes: Dict[str, List[str]] = {}
-        if agentcore_client is None:
+        if regions is None and agentcore_client is None:
             own_by_role: Dict[str, Set[str]] = {}
             unread = ["the AgentCore client is not available in this region"]
-            assessed_region = ""
+            read_regions: List[str] = []
         else:
-            own_by_role, unread, jwt_runtimes, jwt_runtime_arns = (
-                _workload_identities_by_role()
-            )
-            assessed_region = agentcore_client.meta.region_name
+            if regions is None:
+                own_by_role, unread, jwt_runtimes, jwt_runtime_arns = (
+                    _workload_identities_by_role()
+                )
+                read_regions = [agentcore_client.meta.region_name]
+            else:
+                (
+                    own_by_role,
+                    unread,
+                    jwt_runtimes,
+                    jwt_runtime_arns,
+                    read_regions,
+                ) = _workload_identities_by_role_in_regions(regions)
             runtime_reads_failed = [read for read in unread if "AgentRuntime" in read]
             findings.extend(
                 _user_id_token_findings(
@@ -20028,7 +20105,8 @@ def check_agentcore_token_issuance_scope(
                     for identity in others
                     if own
                     and not unread
-                    and _arn_region(identity).lower() == assessed_region.lower()
+                    and _arn_region(identity).lower()
+                    in {region.lower() for region in read_regions}
                 ]
                 if crossing:
                     foreign.append(f"{label} ({', '.join(crossing)})")
@@ -20044,7 +20122,8 @@ def check_agentcore_token_issuance_scope(
                         finding_details=(
                             "The following principals hold agent token-issuance "
                             "actions only against named workload identities, but no "
-                            f"runtime or gateway read in {assessed_region or 'this region'} "
+                            "runtime or gateway read in "
+                            f"{', '.join(read_regions) or 'this region'} "
                             "runs as that principal with that identity, so whether "
                             "each identity is the principal's own agent's was not "
                             f"established: {', '.join(unattributed)}.{reason}"
@@ -33478,10 +33557,16 @@ def lambda_handler(event, context):
                     # AC-33 reads the same global IAM cache: which workload
                     # identity a role may mint a token against is written in the
                     # policy's resource element, which carries its own region.
+                    # The runtimes and gateways it joins to roles are read in
+                    # every assessed Region, because this runs only here.
                     (
                         ["AC-33"],
                         "Token Issuance Scope",
-                        lambda: check_agentcore_token_issuance_scope(permission_cache),
+                        lambda: check_agentcore_token_issuance_scope(
+                            permission_cache,
+                            [region]
+                            + [r for r in target_regions or [] if r and r != region],
+                        ),
                     ),
                     # AC-28 and AC-29 judge organization-wide service control
                     # policies, the same documents whatever region a gateway or a

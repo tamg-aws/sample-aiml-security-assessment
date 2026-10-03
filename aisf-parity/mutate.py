@@ -757,6 +757,48 @@ MUTATIONS = [
         "find": '            if engine_status == StatusEnum.FAILED.value:\n                findings.append(\n                    create_finding(\n                        check_id="AG-24",\n                        finding_name="Agentic AI Gateway Tool Call Authorization Missing",\n',
         "replace": '            if False:\n                findings.append(\n                    create_finding(\n                        check_id="AG-24",\n                        finding_name="Agentic AI Gateway Tool Call Authorization Missing",\n',
     },
+    {
+        "name": "AC-29 credits a runtime Deny narrowed to some resources",
+        "file": AGENTCORE,
+        "defect": "a Deny whose Resource names one Region or a name prefix leaves runtimes outside it free to move to SigV4, and it was credited as the guardrail",
+        "find": "        if not _scp_deny_reaches_every_resource(statement, resource_type):\n            continue\n",
+        "replace": "",
+    },
+    {
+        "name": "AC-33 reads only the primary Region's runtimes",
+        "file": AGENTCORE,
+        "defect": "AC-33 runs once, on the primary Region, and a JWT runtime in another assessed Region was never judged for either ForUser leg and got no row",
+        "find": "            agentcore_client = client\n            found, failed, runtimes, arns = _workload_identities_by_role()\n",
+        "replace": "            if region != regions[0]:\n                continue\n            agentcore_client = client\n            found, failed, runtimes, arns = _workload_identities_by_role()\n",
+    },
+    {
+        "name": "AC-33 fails a JWT runtime role whose own Deny removes ForUserId",
+        "file": AGENTCORE,
+        "defect": "the role's own explicit Deny or permissions boundary removes GetWorkloadAccessTokenForUserId, and counting the Allow alone fails a role that cannot make the call",
+        "find": '        if granted and _grant_survives(\n            permissions, "bedrock-agentcore:getworkloadaccesstokenforuserid"\n        ):\n',
+        "replace": "        if granted:\n",
+    },
+    {
+        "name": "AC-33 lets a ? Deny pattern cover every runtime endpoint",
+        "file": AGENTCORE,
+        "defect": "fnmatch reads the endpoint probe's literal * as text, so a ? in the Deny pattern matched it and the Deny read as covering endpoints it does not name",
+        "find": '            and not (probe != runtime_arn and "?" in pattern)\n',
+        "replace": "",
+    },
+    {
+        "name": "AC-33 reads a NotResource ForUser grant as reaching nothing",
+        "file": AGENTCORE,
+        "defect": "a NotResource Allow of InvokeAgentRuntimeForUser reaches every runtime it does not exclude, and reading only Resource passed it",
+        "find": '    probes = (runtime_arn, f"{runtime_arn}/runtime-endpoint/*")\n    if "NotResource" in statement:\n        excluded = statement.get("NotResource")\n        excluded = excluded if isinstance(excluded, list) else [excluded]\n        return not all(\n',
+        "replace": '    probes = (runtime_arn, f"{runtime_arn}/runtime-endpoint/*")\n    if False:\n        excluded = statement.get("NotResource")\n        excluded = excluded if isinstance(excluded, list) else [excluded]\n        return not all(\n',
+    },
+    {
+        "name": "AC-33 never credits a foreign identity in a read Region as crossing",
+        "file": AGENTCORE,
+        "defect": "a role named for another agent's workload identity in a Region whose resources were read acts as that agent, and with no Region compared the row fell back to N/A",
+        "find": "                    in {region.lower() for region in read_regions}\n",
+        "replace": "                    in set()\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -976,6 +1018,12 @@ GROUPS: dict[str, str] = {
     "AC-25 passes token exchange on a gateway with no JWT inbound": "in the AgentCore verdict legs",
     "AC-25 passes an AUTHORIZATION_CODE target beside an unread portal list": "in the AgentCore verdict legs",
     "AG-24 passes an authorized gateway with no enforcing engine": "in the AgentCore verdict legs",
+    "AC-29 credits a runtime Deny narrowed to some resources": "in the AgentCore verdict legs",
+    "AC-33 reads only the primary Region's runtimes": "in the AgentCore verdict legs",
+    "AC-33 fails a JWT runtime role whose own Deny removes ForUserId": "in the AgentCore verdict legs",
+    "AC-33 lets a ? Deny pattern cover every runtime endpoint": "in the AgentCore verdict legs",
+    "AC-33 reads a NotResource ForUser grant as reaching nothing": "in the AgentCore verdict legs",
+    "AC-33 never credits a foreign identity in a read Region as crossing": "in the AgentCore verdict legs",
 }
 
 
