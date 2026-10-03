@@ -387,6 +387,12 @@ class TestSM04SecurityHubRouting:
         assert rows[0]["Status"] == "Passed"
         assert "monitoring for security threats" not in rows[0]["Finding_Details"]
         assert "Status ENABLED" in rows[0]["Finding_Details"]
+        # AIR-FND-DET-02: Security Hub Workflow.Status does record review.
+        assert "not recorded by any" not in rows[0]["Finding_Details"]
+        assert (
+            "Workflow.Status, which this check does not read"
+            in (rows[0]["Finding_Details"])
+        )
 
     @patch("sagemaker_app.boto3.client")
     def test_guardduty_integration_on_a_later_page_passes(self, mock_client):
@@ -11693,6 +11699,46 @@ class TestSM40RotationHistoryAndPropagation:
             "ECS service tools in agents, container app injects rotating secret 'db'"
             in prop[0]["Finding_Details"]
         )
+
+    @pytest.mark.parametrize(
+        "value_from",
+        [
+            "arn:aws:secretsmanager:us-east-1:111122223333:secret:db",
+            "arn:aws:secretsmanager:us-east-1:111122223333:secret:db:password::",
+        ],
+    )
+    def test_a_partial_arn_injection_of_a_rotating_secret_fails(self, value_from):
+        prop = self._propagation(self._run(**self._ecs_injecting(value_from)))
+        assert [r["Status"] for r in prop] == ["Failed"]
+        assert "injects rotating secret 'db'" in prop[0]["Finding_Details"]
+        assert "planner" not in prop[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "value_from",
+        [
+            "arn:aws:secretsmanager:us-east-1:444455556666:secret:shared-AbCdEf",
+            "arn:aws:secretsmanager:us-west-2:111122223333:secret:db-AbCdEf",
+        ],
+    )
+    def test_a_secret_from_another_account_or_region_is_not_read(self, value_from):
+        prop = self._propagation(self._run(**self._ecs_injecting(value_from)))
+        assert [r["Status"] for r in prop] == ["N/A"]
+        details = prop[0]["Finding_Details"]
+        assert f"injects secret {value_from}" in details
+        assert "whether it rotates was not read" in details
+        assert "No ECS task injects a rotating secret" not in details
+
+    def test_a_non_rotating_secret_by_partial_arn_is_not_a_gap(self):
+        other = "arn:aws:secretsmanager:us-east-1:111122223333:secret:cfg-QwErTy"
+        prop = self._propagation(
+            self._run(
+                secrets=[self._secret(), self._secret("cfg", other, rotating=False)],
+                **self._ecs_injecting(
+                    "arn:aws:secretsmanager:us-east-1:111122223333:secret:cfg"
+                ),
+            )
+        )
+        assert [r["Status"] for r in prop] == ["Passed"]
 
     def test_rotation_rule_with_a_target_covers_injection(self):
         prop = self._propagation(

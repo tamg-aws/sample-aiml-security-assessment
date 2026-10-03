@@ -348,6 +348,10 @@ section.
   compatible nodes, and a cluster with a Fargate profile, whose pods
   Runtime Monitoring does not cover. A cluster whose node counts are not
   returned, or whose Fargate profiles were not read, holds back `Passed`.
+- `SM-40` matches an ECS secret injected by partial ARN, which omits the
+  six-character suffix, to its secret, so a rotating secret injected that
+  way is judged. A secret ARN that is not among the account's secrets in
+  the Region, such as another account's, holds back `Passed` and is named.
 - SageMaker rows that claimed more than they read now state what they read:
   - `SM-22` no longer says approval workflows "appear to be properly
     configured". It names the counts it read and says they do not show
@@ -355,6 +359,9 @@ section.
   - `SM-32` no longer says training jobs are covered by periodic Config
     rules. AWS Config has no resource type for a SageMaker training,
     processing or transform job.
+  - `SM-04` no longer says no API records whether findings are reviewed.
+    Security Hub records review in `Workflow.Status`, which `SM-04` does
+    not read, and the row says so.
   - `SM-14` judges only the models an endpoint or inference component
     serves, and every container of a multi-container model, which it
     failed as `Platform` before. Its `Failed` row no longer says

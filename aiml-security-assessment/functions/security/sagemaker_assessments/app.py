@@ -923,9 +923,10 @@ def check_guardduty_enabled(
                     finding_details=(
                         "The GuardDuty detector in this region has Status ENABLED. "
                         "Only the detector status was read here: the AI Protection "
-                        "plan is reported by SM-26, and whether anyone reviews the "
-                        "findings is not recorded by any GuardDuty or Security Hub "
-                        "API."
+                        "plan is reported by SM-26. Security Hub records each "
+                        "finding's review in its Workflow.Status, which this check "
+                        "does not read, so whether the findings are reviewed was "
+                        "not assessed."
                     ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html",
@@ -17442,6 +17443,17 @@ def _propagation_and_plaintext_findings(
     rotating = {
         s.get("ARN"): s.get("Name") for s in secrets if s.get("RotationEnabled") is True
     }
+    # AIR-SLF-RT-06: ECS accepts a partial ARN, which omits the six-character
+    # suffix Secrets Manager appends, so each secret is keyed both ways.
+    known = {}
+    for secret in secrets:
+        arn = str(secret.get("ARN") or "")
+        if not arn:
+            continue
+        known.setdefault(arn[:-7] if re.search(r"-[A-Za-z0-9]{6}$", arn) else arn, arn)
+    for secret in secrets:
+        if secret.get("ARN"):
+            known[secret["ARN"]] = secret["ARN"]
     services, unread = _ecs_services(region)
     functions, lambda_unread = _lambda_functions(region)
     unread.extend(lambda_unread)
@@ -17471,6 +17483,15 @@ def _propagation_and_plaintext_findings(
             for entry in container.get("secrets") or []:
                 value_from = str(entry.get("valueFrom") or "")
                 secret_arn = _secret_arn_prefix(value_from)
+                if secret_arn is not None and secret_arn not in known:
+                    unread.append(
+                        f"{where} injects secret {secret_arn}, which is not among "
+                        f"the secrets listed in {region or 'this region'} (another "
+                        "account's or Region's secret), so whether it rotates was "
+                        "not read"
+                    )
+                    continue
+                secret_arn = known.get(secret_arn)
                 if secret_arn in rotating:
                     injected.append(
                         f"{where} injects rotating secret '{rotating[secret_arn]}'"
