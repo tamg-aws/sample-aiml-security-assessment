@@ -344,6 +344,10 @@ section.
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
   with no finished execution, or whose newest finished one failed or is
   older than twice its cadence, fails.
+- `SM-38` fails an EKS cluster that GuardDuty reports `HEALTHY` with 0
+  compatible nodes, and a cluster with a Fargate profile, whose pods
+  Runtime Monitoring does not cover. A cluster whose node counts are not
+  returned, or whose Fargate profiles were not read, holds back `Passed`.
 - SageMaker rows that claimed more than they read now state what they read:
   - `SM-22` no longer says approval workflows "appear to be properly
     configured". It names the counts it read and says they do not show
@@ -1564,6 +1568,13 @@ section.
 service authorization reference, and all are read-only. Until the stack is
 updated, the `SM-41` audit row reads as incomplete, and so does an `SM-23`
 schedule whose latest execution is still running.
+
+**SageMaker EKS Fargate profile read.** `SageMakerAssessmentReadsPolicy`
+gains `eks:ListFargateProfiles` on
+`arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*` (`SM-38`), its
+resource type in the service authorization reference. It is read-only.
+Until the stack is updated, an account with an EKS cluster reads the
+`SM-38` coverage row as incomplete.
 
 **Bedrock and SageMaker read grants.** `BedrockAssessmentReadsPolicy`
 gains `bedrock-agentcore:GetBrowser` on `browser-custom/*` (`BR-47`,

@@ -9806,8 +9806,12 @@ class TestSM38RuntimeCoverageAndLambdaTier:
         lambda_state=None,
         errors=None,
         instances=None,
+        fargate=None,
     ):
+        """fargate maps an EKS cluster to its Fargate profile names or an
+        exception; an unnamed cluster has none."""
         errors = errors or {}
+        fargate = fargate or {}
         self.ec2_calls = []
         coverage = coverage or []
         functions = functions if functions is not None else [{"FunctionName": "fn"}]
@@ -9840,8 +9844,21 @@ class TestSM38RuntimeCoverageAndLambdaTier:
                     {"list_coverage": source("gd", [{"Resources": coverage}])}
                 )
             elif service == "eks":
+
+                def fargate_profiles(clusterName):
+                    value = fargate.get(clusterName, [])
+                    if isinstance(value, Exception):
+                        raise value
+                    return [
+                        {"fargateProfileNames": value[:1]},
+                        {"fargateProfileNames": value[1:]},
+                    ]
+
                 client.get_paginator.side_effect = _pager(
-                    {"list_clusters": source("eks", [{"clusters": eks or []}])}
+                    {
+                        "list_clusters": source("eks", [{"clusters": eks or []}]),
+                        "list_fargate_profiles": fargate_profiles,
+                    }
                 )
             elif service == "ecs":
                 arns = [
@@ -9887,6 +9904,53 @@ class TestSM38RuntimeCoverageAndLambdaTier:
     @staticmethod
     def _named(rows, name):
         return [r for r in rows if r["Finding"].startswith(name)]
+
+    def _coverage_rows(self, **kwargs):
+        rows = self._run(self._detail(), **kwargs)
+        return self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+
+    @pytest.mark.parametrize("bad_first", [True, False])
+    def test_a_healthy_cluster_with_no_compatible_node_fails(self, bad_first):
+        coverage = [self._eks("good"), self._eks("empty", covered=0, compatible=0)]
+        if bad_first:
+            coverage.reverse()
+        cov = self._coverage_rows(coverage=coverage, eks=["good", "empty"])
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert (
+            "EKS empty is HEALTHY with 0 compatible nodes"
+            in (cov[0]["Finding_Details"])
+        )
+        assert "good" not in cov[0]["Finding_Details"]
+
+    def test_a_fargate_profile_fails_a_cluster_whose_nodes_are_covered(self):
+        cov = self._coverage_rows(
+            coverage=[self._eks("good"), self._eks("mixed")],
+            eks=["good", "mixed"],
+            fargate={"mixed": ["batch", "web"]},
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        details = cov[0]["Finding_Details"]
+        assert "EKS cluster mixed has Fargate profile(s) batch, web" in details
+        assert "good" not in details
+
+    @pytest.mark.parametrize(
+        "case",
+        ["fargate_error", "no_counts"],
+    )
+    def test_an_unread_cluster_leg_withholds_the_pass(self, case):
+        coverage = [self._eks("good"), self._eks("other")]
+        fargate = {}
+        if case == "fargate_error":
+            fargate = {"other": _make_client_error("AccessDeniedException")}
+            text = "eks:ListFargateProfiles other"
+        else:
+            del coverage[1]["ResourceDetails"]["EksClusterDetails"]["CompatibleNodes"]
+            text = "EKS other reports no CompatibleNodes or CoveredNodes"
+        cov = self._coverage_rows(
+            coverage=coverage, eks=["good", "other"], fargate=fargate
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert text in cov[0]["Finding_Details"]
 
     def _audit(self, status, runtime="ENABLED", detector_status="ENABLED"):
         detector = self._detail(runtime=runtime)

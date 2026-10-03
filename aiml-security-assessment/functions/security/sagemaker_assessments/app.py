@@ -15627,12 +15627,28 @@ def _runtime_coverage_findings(
         ]
 
     eks_clusters = []
+    fargate_profiles = {}
     try:
         eks_client = boto3.client("eks", config=boto3_config, region_name=region)
         for page in eks_client.get_paginator("list_clusters").paginate():
             eks_clusters.extend(page.get("clusters", []))
     except Exception as error:
         unread.append(f"eks:ListClusters ({get_assessment_error_label(error)})")
+    # AIR-SLF-RT-04: Runtime Monitoring does not cover pods on Fargate, and a
+    # cluster's node counts say nothing about them.
+    for cluster in eks_clusters:
+        try:
+            for page in eks_client.get_paginator("list_fargate_profiles").paginate(
+                clusterName=cluster
+            ):
+                fargate_profiles.setdefault(cluster, []).extend(
+                    page.get("fargateProfileNames", [])
+                )
+        except Exception as error:
+            unread.append(
+                f"eks:ListFargateProfiles {cluster} "
+                f"({get_assessment_error_label(error)})"
+            )
     ecs_clusters = []
     try:
         ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
@@ -15695,21 +15711,33 @@ def _runtime_coverage_findings(
                 + (f" ({str(issue)[:160]})" if issue else "")
             )
             continue
-        compatible = eks.get("CompatibleNodes")
-        covered_nodes = eks.get("CoveredNodes")
-        if (
-            isinstance(compatible, int)
-            and isinstance(covered_nodes, int)
-            and covered_nodes < compatible
-        ):
-            problems.append(
-                f"{label} covers {covered_nodes} of {compatible} compatible nodes"
-            )
-            continue
+        if kind == "EKS":
+            compatible = eks.get("CompatibleNodes")
+            covered_nodes = eks.get("CoveredNodes")
+            if not isinstance(compatible, int) or not isinstance(covered_nodes, int):
+                unread.append(f"{label} reports no CompatibleNodes or CoveredNodes")
+                continue
+            if compatible == 0:
+                problems.append(
+                    f"{label} is HEALTHY with 0 compatible nodes, so no node "
+                    "runs the GuardDuty agent"
+                )
+                continue
+            if covered_nodes < compatible:
+                problems.append(
+                    f"{label} covers {covered_nodes} of {compatible} compatible nodes"
+                )
+                continue
         healthy.append(label)
     for cluster in eks_clusters:
         if cluster not in covered["EKS"]:
             problems.append(f"EKS cluster {cluster} has no Runtime Monitoring coverage")
+        if fargate_profiles.get(cluster):
+            problems.append(
+                f"EKS cluster {cluster} has Fargate profile(s) "
+                f"{', '.join(sorted(fargate_profiles[cluster])[:5])}, whose pods "
+                "Runtime Monitoring does not cover"
+            )
     for cluster in ecs_clusters:
         if cluster not in covered["ECS"]:
             problems.append(f"ECS cluster {cluster} has no Runtime Monitoring coverage")
@@ -15811,7 +15839,9 @@ def _runtime_coverage_findings(
                 finding_name=RUNTIME_COVERAGE_FINDING,
                 finding_details=(
                     f"All {len(healthy)} resource(s) in Runtime Monitoring coverage "
-                    "are HEALTHY, including every EKS and ECS cluster listed and "
+                    "are HEALTHY, including every EKS cluster listed, each with "
+                    "every compatible node covered and no Fargate profile, every "
+                    "ECS cluster listed, and "
                     f"every running EC2 instance ({len(instances)}): "
                     f"{', '.join(healthy[:10])}. {excluded}."
                 ),

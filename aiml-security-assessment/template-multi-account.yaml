@@ -903,6 +903,13 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-quality-job-definition/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-bias-job-definition/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-explainability-job-definition/*'
+          - Sid: EKSFargateProfileList
+            # SM-38 lists each EKS cluster's Fargate profiles, whose pods
+            # Runtime Monitoring does not cover.
+            Effect: Allow
+            Action:
+              - eks:ListFargateProfiles # SM-38
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

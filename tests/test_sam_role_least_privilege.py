@@ -304,6 +304,7 @@ _EXPECTED_ACTIONS = {
     },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
+        "eks:ListFargateProfiles",
         "ec2:GetManagedPrefixListEntries",
         "iot:DescribeAuditTask",
         "iot:ListAuditTasks",
@@ -972,6 +973,13 @@ _SAGEMAKER_MANAGED_GRANTS = [
             "sagemaker:DescribeModelBiasJobDefinition",
             "sagemaker:DescribeModelExplainabilityJobDefinition",
         )
+    ),
+    (
+        "Allow",
+        "eks:ListFargateProfiles",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*"}
+        ),
     ),
 ]
 
