@@ -24,7 +24,7 @@ row's own Status column carries the verdict.
 AISF_COMPLIANCE_MAP = {
     "SM-01": "AISF AIR-SGM-TRN-05 (1 of 3 checks)",
     "SM-02": "AISF AIR-FND-IAM-01 (1 of 2 checks) | AISF AIR-FND-IAM-09 (1 of 4 checks) | AISF AIR-SGM-EP-02",
-    "SM-03": "AISF AIR-FND-DAT-01 (1 of 4 checks) | AISF AIR-SGM-TRN-02 | AISF AIR-SGM-TRN-05 (1 of 3 checks)",
+    "SM-03": "AISF AIR-FND-DAT-01 (1 of 4 checks) | AISF AIR-SGM-TRN-02 (1 of 2 checks) | AISF AIR-SGM-TRN-05 (1 of 3 checks)",
     "SM-04": "AISF AIR-FND-DET-02 (1 of 3 checks) | AISF AIR-FND-NET-07 (1 of 2 checks) | AISF AIR-SLF-RT-04 (1 of 2 checks)",
     "SM-09": "AISF AIR-SGM-TRN-05 (1 of 3 checks)",
     "SM-10": "AISF AIR-FND-NET-01 (1 of 6 checks)",
@@ -38,7 +38,7 @@ AISF_COMPLIANCE_MAP = {
     "SM-31": "AISF AIR-SGM-EP-06 (1 of 2 checks)",
     "SM-32": "AISF AIR-SGM-GOV-10",
     "SM-33": "AISF AIR-FND-NET-01 (1 of 6 checks) | AISF AIR-SGM-TRN-01 (1 of 2 checks)",
-    "SM-34": "AISF AIR-SGM-TRN-01 (1 of 2 checks) | AISF AIR-SGM-TRN-08",
+    "SM-34": "AISF AIR-SGM-TRN-01 (1 of 2 checks) | AISF AIR-SGM-TRN-02 (1 of 2 checks) | AISF AIR-SGM-TRN-08",
     "SM-35": "AISF AIR-FND-ACC-09",
     "SM-36": "AISF AIR-FND-DET-02 (1 of 3 checks)",
     "SM-37": "AISF AIR-FND-NET-07 (1 of 2 checks)",

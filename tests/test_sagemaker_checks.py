@@ -1985,8 +1985,14 @@ class TestSM14ContainerRepository:
         assert_could_not_assess_finding(findings[0])
 
 
-def _sm14_rows(models, pages=None):
-    """Run SM-14 over {model name: DescribeModel response or exception}."""
+def _sm14_rows(models, pages=None, endpoints=None):
+    """Run SM-14 over {model name: DescribeModel response or exception}.
+
+    endpoints is {endpoint name: [model names]}; by default one endpoint
+    serves every model.
+    """
+    if endpoints is None:
+        endpoints = {"ep": list(models)}
 
     def describe_model(ModelName):
         value = models[ModelName]
@@ -1994,9 +2000,39 @@ def _sm14_rows(models, pages=None):
             raise value
         return value
 
-    listing = {"list_models": [{"Models": [{"ModelName": n} for n in models]}]}
+    def describe_endpoint(EndpointName):
+        if isinstance(endpoints[EndpointName], Exception):
+            raise endpoints[EndpointName]
+        return {
+            "EndpointName": EndpointName,
+            "EndpointConfigName": f"cfg-{EndpointName}",
+        }
+
+    listing = {
+        "list_models": [{"Models": [{"ModelName": n} for n in models]}],
+        "list_endpoints": [
+            {
+                "Endpoints": [
+                    {"EndpointName": n, "EndpointStatus": "InService"}
+                    for n in endpoints
+                ]
+            }
+        ],
+    }
     listing.update(pages or {})
-    sm = _pages_client(listing, describe_model=MagicMock(side_effect=describe_model))
+    sm = _pages_client(
+        listing,
+        describe_model=MagicMock(side_effect=describe_model),
+        describe_endpoint=MagicMock(side_effect=describe_endpoint),
+        describe_endpoint_config=MagicMock(
+            side_effect=lambda EndpointConfigName: {
+                "ProductionVariants": [
+                    {"VariantName": f"v{i}", "ModelName": m}
+                    for i, m in enumerate(endpoints[EndpointConfigName[4:]])
+                ]
+            }
+        ),
+    )
     with patch("sagemaker_app.boto3.client", return_value=sm):
         return extract_csv_data(
             sagemaker_app.check_sagemaker_model_container_repository("us-east-1")
@@ -2047,12 +2083,63 @@ class TestSM14UnreadModels:
         assert "sagemaker:DescribeModel broken" in unread[0]["Finding_Details"]
 
     def test_a_failed_list_is_not_reported_as_no_models(self):
+        # The population is now the models endpoints serve, so the list that
+        # can fail is ListEndpoints.
         rows = _sm14_rows(
-            {}, pages={"list_models": _make_client_error("AccessDeniedException")}
+            {}, pages={"list_endpoints": _make_client_error("AccessDeniedException")}
         )
         assert [r["Status"] for r in rows] == ["N/A"]
-        assert "sagemaker:ListModels" in rows[0]["Finding_Details"]
+        assert "sagemaker:ListEndpoints" in rows[0]["Finding_Details"]
         assert "No models found" not in rows[0]["Finding_Details"]
+        assert "serves a model" not in rows[0]["Finding_Details"]
+
+    def test_only_models_an_endpoint_serves_are_judged(self):
+        rows = _sm14_rows(
+            {
+                "served": _sm14_model("Vpc"),
+                "idle": _sm14_model("Platform"),
+            },
+            endpoints={"ep": ["served"]},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 1 models served" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("platform_first", [True, False])
+    def test_a_platform_container_of_a_multi_container_model_fails(
+        self, platform_first
+    ):
+        containers = [
+            {"Image": "img-vpc", "ImageConfig": {"RepositoryAccessMode": "Vpc"}},
+            {"Image": "img-ecr"},
+        ]
+        if platform_first:
+            containers.reverse()
+        rows = _sm14_rows(
+            {"good": _sm14_model("Vpc"), "multi": {"Containers": containers}}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "Model 'multi', served by endpoint(s) ep" in details
+        assert "img-ecr" in details
+        assert "hosted in Amazon ECR" in details
+        assert "public/external" not in details
+
+    def test_a_multi_container_model_all_in_vpc_mode_passes(self):
+        vpc = {"Image": "i", "ImageConfig": {"RepositoryAccessMode": "Vpc"}}
+        rows = _sm14_rows({"multi": {"Containers": [vpc, dict(vpc)]}})
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize("broken_first", [True, False])
+    def test_an_unread_endpoint_withholds_passed(self, broken_first):
+        endpoints = [
+            ("ep", ["good"]),
+            ("broken", _make_client_error("ThrottlingException")),
+        ]
+        if broken_first:
+            endpoints.reverse()
+        rows = _sm14_rows({"good": _sm14_model("Vpc")}, endpoints=dict(endpoints))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "endpoint 'broken'" in rows[0]["Finding_Details"]
 
 
 # ===================================================================
@@ -3526,6 +3613,34 @@ class TestSM22ApproverAttribution:
             ModelPackageName
         ]
         return mock_sm
+
+    @patch("sagemaker_app.boto3.client")
+    def test_the_workflow_pass_claims_only_the_counts_it_read(self, mock_client):
+        # AIR-SGM-GOV-01: this row said approval workflows "appear to be
+        # properly configured", which no field read here establishes.
+        self._registry(
+            mock_client,
+            {
+                f"arn:aws:sagemaker:::model-package/fraud/{n}": {
+                    "ModelPackageName": f"fraud/{n}",
+                    "LastModifiedBy": {"UserProfileName": "risk-reviewer"},
+                }
+                for n in (1, 2)
+            },
+        )
+        rows = [
+            f
+            for f in extract_csv_data(
+                sagemaker_app.check_model_approval_workflow(region="us-east-1")
+            )
+            if f["Finding"] == "Model Approval Workflow Check"
+        ]
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "properly configured" not in details
+        assert "Checked 1 model package group(s)" in details
+        assert "each of the 2 Approved version(s) records an approver" in details
+        assert "not established by these counts" in details
 
     @patch("sagemaker_app.boto3.client")
     def test_unattributed_approval_is_failed_and_attributed_one_is_passed(
@@ -15093,9 +15208,18 @@ def _training_job(output=_CMK, volume=_CMK, bucket="data"):
 
 
 def _sm03_rows(
-    jobs, keys=None, buckets=None, pages=None, notebooks=None, file_systems=None
+    jobs,
+    keys=None,
+    buckets=None,
+    pages=None,
+    notebooks=None,
+    file_systems=None,
+    endpoint_configs=None,
 ):
     """Run SM-03 over training jobs {name: DescribeTrainingJob or exception}.
+
+    endpoint_configs maps an endpoint name to the DescribeEndpointConfig of
+    its config, named cfg-<endpoint>, or to an exception.
 
     file_systems maps a file system id to its EFS or FSx description, or an
     exception; an id it does not name is denied.
@@ -15104,6 +15228,7 @@ def _sm03_rows(
     buckets = buckets or {}
     notebooks = notebooks or {}
     file_systems = file_systems or {}
+    endpoint_configs = endpoint_configs or {}
     file_system_calls = []
 
     def describe_file_system(file_system_id):
@@ -15147,10 +15272,32 @@ def _sm03_rows(
             {"NotebookInstances": [{"NotebookInstanceName": n} for n in notebooks]}
         ],
         "list_domains": [{"Domains": []}],
+        "list_endpoints": [
+            {
+                "Endpoints": [
+                    {"EndpointName": n, "EndpointStatus": "InService"}
+                    for n in endpoint_configs
+                ]
+            }
+        ],
     }
     listing.update(pages or {})
+
+    def describe_endpoint(EndpointName):
+        lookup(endpoint_configs, EndpointName)
+        return {
+            "EndpointName": EndpointName,
+            "EndpointConfigName": f"cfg-{EndpointName}",
+        }
+
     sm = _pages_client(
         listing,
+        describe_endpoint=MagicMock(side_effect=describe_endpoint),
+        describe_endpoint_config=MagicMock(
+            side_effect=lambda EndpointConfigName: lookup(
+                endpoint_configs, EndpointConfigName[4:]
+            )
+        ),
         describe_training_job=MagicMock(
             side_effect=lambda TrainingJobName: lookup(jobs, TrainingJobName)
         ),
@@ -15273,6 +15420,110 @@ class TestSM03InterContainerAndSources:
         assert "training job 'fs' channel 'extra'" in unread[0]["Finding_Details"]
         assert text in unread[0]["Finding_Details"]
         assert "'clean'" not in unread[0]["Finding_Details"]
+
+
+def _sm03_endpoint_config(**extra):
+    config = {
+        "ProductionVariants": [
+            {"VariantName": "v", "ModelName": "m", "InstanceType": "ml.m5.large"}
+        ],
+        "KmsKeyId": _CMK,
+    }
+    config.update(extra)
+    return config
+
+
+class TestSM03EndpointConfigEncryption:
+    """AIR-FND-DAT-01: SM-03 reads each endpoint config's keys."""
+
+    @pytest.mark.parametrize(
+        "bad, issue",
+        [
+            (_sm03_endpoint_config(KmsKeyId=None), "No KmsKeyId"),
+            (
+                _sm03_endpoint_config(
+                    DataCaptureConfig={
+                        "EnableCapture": True,
+                        "DestinationS3Uri": "s3://c",
+                    }
+                ),
+                "DataCaptureConfig.KmsKeyId is not set",
+            ),
+            (
+                _sm03_endpoint_config(
+                    AsyncInferenceConfig={"OutputConfig": {"S3OutputPath": "s3://o"}}
+                ),
+                "AsyncInferenceConfig.OutputConfig.KmsKeyId is not set",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("bad_first", [True, False])
+    def test_one_unkeyed_endpoint_config_fails_alone(self, bad, issue, bad_first):
+        configs = [
+            (
+                "good",
+                _sm03_endpoint_config(
+                    DataCaptureConfig={"EnableCapture": True, "KmsKeyId": _CMK}
+                ),
+            ),
+            ("bad", bad),
+        ]
+        if bad_first:
+            configs.reverse()
+        rows = _sm03_rows({"job": _training_job()}, endpoint_configs=dict(configs))
+        assert not _by_finding(rows, "Data Protection Check")
+        missing = _by_finding(rows, "Missing Encryption Configuration")
+        assert len(missing) == 1
+        assert "'cfg-bad' of endpoint 'bad'" in missing[0]["Finding_Details"]
+        assert issue in missing[0]["Finding_Details"]
+
+    def test_an_aws_managed_capture_key_fails(self):
+        rows = _sm03_rows(
+            {"job": _training_job()},
+            keys={"alias/aws/s3": "AWS"},
+            endpoint_configs={
+                "ep": _sm03_endpoint_config(
+                    DataCaptureConfig={
+                        "EnableCapture": True,
+                        "KmsKeyId": "alias/aws/s3",
+                    }
+                )
+            },
+        )
+        managed = _by_finding(rows, "AWS Managed Key Usage")
+        assert len(managed) == 1
+        assert "Endpoint Config data capture 'cfg-ep'" in managed[0]["Finding_Details"]
+
+    def test_keyed_and_serverless_endpoint_configs_pass(self):
+        serverless = {
+            "ProductionVariants": [
+                {
+                    "VariantName": "v",
+                    "ModelName": "m",
+                    "ServerlessConfig": {"MemorySizeInMB": 2048, "MaxConcurrency": 1},
+                }
+            ],
+            "DataCaptureConfig": {"EnableCapture": False},
+        }
+        rows = _sm03_rows(
+            {"job": _training_job()},
+            endpoint_configs={"keyed": _sm03_endpoint_config(), "sls": serverless},
+        )
+        assert [r["Status"] for r in _by_finding(rows, "Data Protection Check")] == [
+            "Passed"
+        ]
+
+    def test_an_unread_endpoint_withholds_passed(self):
+        rows = _sm03_rows(
+            {"job": _training_job()},
+            endpoint_configs={
+                "keyed": _sm03_endpoint_config(),
+                "broken": _make_client_error("ThrottlingException"),
+            },
+        )
+        assert not _by_finding(rows, "Data Protection Check")
+        unread = [r for r in rows if r["Finding"].endswith("Incomplete")]
+        assert "endpoint 'broken'" in unread[0]["Finding_Details"]
 
 
 def _file_system_job(file_system_id, system_type="EFS"):
@@ -16826,6 +17077,15 @@ class TestSM32UnevaluatedRules:
             for name, kind in zip(_SM32_REQUIRED_RULE_NAMES, types)
             if kind
         ]
+
+    def test_the_pass_claims_no_config_coverage_of_jobs(self):
+        # AIR-SGM-GOV-10: this row said training jobs "are covered by periodic
+        # rules"; Config's ResourceType enum has no SageMaker job type.
+        rows = _by_finding(_sm32_rows(), self.RULES)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "training jobs are covered" not in details
+        assert "no Config rule evaluates a job" in details
 
     def test_insufficient_data_withholds_passed(self):
         rows = _by_finding(

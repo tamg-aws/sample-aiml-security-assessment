@@ -1,6 +1,6 @@
 # AISF parity work ledger
 
-Generated 2026-09-30 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
+Generated 2026-10-03 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
 
 105 controls in scope: 67 hosted (BDR, SGM, ACR) plus 11 FND controls whose assertion subject is an AI resource, plus 27 foundation controls (FND, PHY, SLF) over the account or runtime an AI workload sits on.
 
@@ -48,13 +48,13 @@ Generated 2026-09-30 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 |---|---|---|---|---|---|
 | `AIR-SGM-EP-01` | covered | — | `sagemaker_assessments` | `SM-11` | — |
 | `AIR-SGM-EP-02` *(workload-specific)* | covered | — | `sagemaker_assessments` | `SM-02` | — |
-| `AIR-SGM-EP-03` | covered | — | `sagemaker_assessments` | `SM-11`, `SM-14` | SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint serves and reads the endpoint config KmsKeyId of each instance-backed endpoint, and SM-14 requires RepositoryAccessMode Vpc on each model's image config. The one field not read is inter-container traffic encryption, because no endpoint API returns it: EnableInterContainerTrafficEncryption is a member of DescribeTrainingJob, DescribeProcessingJob and DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, DescribeModel, DescribeEndpoint or DescribeInferenceComponent (botocore 1.43.85). The AISF slug sagemaker_endpoint_intercontainer_encryption_enabled names that absent field and should be fixed in the AISF repo |
+| `AIR-SGM-EP-03` | covered | — | `sagemaker_assessments` | `SM-11`, `SM-14` | SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint serves and reads the endpoint config KmsKeyId of each instance-backed endpoint, and SM-14 requires RepositoryAccessMode Vpc on every container of each model an endpoint or inference component serves. The one field not read is inter-container traffic encryption, because no endpoint API returns it: EnableInterContainerTrafficEncryption is a member of DescribeTrainingJob, DescribeProcessingJob and DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, DescribeModel, DescribeEndpoint or DescribeInferenceComponent (botocore 1.43.85). The AISF slug sagemaker_endpoint_intercontainer_encryption_enabled names that absent field and should be fixed in the AISF repo |
 | `AIR-SGM-EP-06` | covered | — | `sagemaker_assessments` | `SM-23`, `SM-31` | SM-23 fails an InService endpoint with no Model Monitor schedule, or with no DataQuality or no ModelQuality schedule, and a schedule that is not Scheduled |
 | `AIR-SGM-EP-08` | covered | — | `sagemaker_assessments` | `SM-18`, `SM-42` | — |
 | `AIR-SGM-GOV-01` | covered | — | `sagemaker_assessments` | `SM-22` | — |
 | `AIR-SGM-GOV-10` | covered | — | `sagemaker_assessments` | `SM-32` | — |
-| `AIR-SGM-TRN-01` | covered | — | `sagemaker_assessments` | `SM-33`, `SM-34` | SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation, by a Deny in an attached service control policy or by a condition in every identity policy that grants the action |
-| `AIR-SGM-TRN-02` | covered | — | `sagemaker_assessments` | `SM-03` | — |
+| `AIR-SGM-TRN-01` | covered | — | `sagemaker_assessments` | `SM-33`, `SM-34` | SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation by a Deny in an attached service control policy. A condition held only in identity policies fails, because the account root user is bound by none |
+| `AIR-SGM-TRN-02` | covered | — | `sagemaker_assessments` | `SM-03`, `SM-34` | SM-34 is the preventive leg: it requires sagemaker:CreateTrainingJob to be bound on sagemaker:VolumeKmsKeyArn by a Deny in an attached service control policy, and fails a binding held only in identity policies because the account root user is bound by none |
 | `AIR-SGM-TRN-05` | covered | — | `sagemaker_assessments` | `SM-09`, `SM-01`, `SM-03` | all three legs present |
 | `AIR-SGM-TRN-08` | covered | — | `sagemaker_assessments` | `SM-34` | — |
 

@@ -334,6 +334,26 @@ section.
   - `SM-09` treats a partial-wildcard SageMaker action on every resource
     as broad, and fails a trail that reports a CloudWatch Logs delivery
     error or has never delivered.
+  - `SM-03` reads every endpoint config. An instance-backed config with no
+    `KmsKeyId`, a config that captures data with no
+    `DataCaptureConfig.KmsKeyId`, and an asynchronous config with no
+    `AsyncInferenceConfig.OutputConfig.KmsKeyId` fail, an AWS managed key
+    on any of them fails, and an unread endpoint holds back `Passed`.
+- SageMaker rows that claimed more than they read now state what they read:
+  - `SM-22` no longer says approval workflows "appear to be properly
+    configured". It names the counts it read and says they do not show
+    that approval is required.
+  - `SM-32` no longer says training jobs are covered by periodic Config
+    rules. AWS Config has no resource type for a SageMaker training,
+    processing or transform job.
+  - `SM-14` judges only the models an endpoint or inference component
+    serves, and every container of a multi-container model, which it
+    failed as `Platform` before. Its `Failed` row no longer says
+    `Platform` images come from public or external registries: `Platform`
+    means the image is hosted in Amazon ECR.
+- The AISF ledger maps `SM-34` to `AIR-SGM-TRN-02`, because its
+  `sagemaker:VolumeKmsKeyArn` creation guardrail is the preventive leg of
+  that control.
 
 - `BR-47` and `BR-52` read custom AgentCore browsers. The Bedrock function
   calls `bedrock-agentcore:GetBrowser` to find each browser's recording

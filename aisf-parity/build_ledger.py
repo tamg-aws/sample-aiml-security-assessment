@@ -233,7 +233,19 @@ AI_SUBJECT_ROWS = [
     ("AIR-SGM-EP-01", COVERED, None, "sagemaker_assessments", ["SM-11"], "", [], 3),
     ("AIR-SGM-EP-02", COVERED, None, "sagemaker_assessments", ["SM-02"], "", [], 3),
     ("AIR-SGM-GOV-01", COVERED, None, "sagemaker_assessments", ["SM-22"], "", [], 3),
-    ("AIR-SGM-TRN-02", COVERED, None, "sagemaker_assessments", ["SM-03"], "", [], 3),
+    (
+        "AIR-SGM-TRN-02",
+        COVERED,
+        None,
+        "sagemaker_assessments",
+        ["SM-03", "SM-34"],
+        "SM-34 is the preventive leg: it requires sagemaker:CreateTrainingJob to "
+        "be bound on sagemaker:VolumeKmsKeyArn by a Deny in an attached service "
+        "control policy, and fails a binding held only in identity policies "
+        "because the account root user is bound by none",
+        [],
+        3,
+    ),
     (
         "AIR-SGM-EP-06",
         COVERED,
@@ -256,8 +268,9 @@ AI_SUBJECT_ROWS = [
         "SM-34 is the approved-exception leg: its approved network and no direct "
         "internet access verdicts require sagemaker:CreateTrainingJob to be bound "
         "on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on "
-        "sagemaker:NetworkIsolation, by a Deny in an attached service control "
-        "policy or by a condition in every identity policy that grants the action",
+        "sagemaker:NetworkIsolation by a Deny in an attached service control "
+        "policy. A condition held only in identity policies fails, because the "
+        "account root user is bound by none",
         [],
         3,
     ),
@@ -270,8 +283,8 @@ AI_SUBJECT_ROWS = [
         ["SM-11", "SM-14"],
         "SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint "
         "serves and reads the endpoint config KmsKeyId of each instance-backed "
-        "endpoint, and SM-14 requires RepositoryAccessMode Vpc on each model's image "
-        "config. The one field not read is inter-container traffic encryption, "
+        "endpoint, and SM-14 requires RepositoryAccessMode Vpc on every container "
+        "of each model an endpoint or inference component serves. The one field not read is inter-container traffic encryption, "
         "because no endpoint API returns it: EnableInterContainerTrafficEncryption "
         "is a member of DescribeTrainingJob, DescribeProcessingJob and "
         "DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, "

@@ -3393,6 +3393,66 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                 f"sagemaker:ListTrainingJobs ({get_assessment_error_label(e)})"
             )
 
+        # AIR-FND-DAT-01: an endpoint config keys its instance storage volume,
+        # its captured requests and responses, and its asynchronous output
+        # separately, and each is read.
+        try:
+            endpoint_inventory = _endpoint_hosting_inventory(sagemaker_client)
+        except Exception as e:
+            logger.error(f"Error checking endpoint config encryption: {str(e)}")
+            unread.append(f"sagemaker:ListEndpoints ({get_assessment_error_label(e)})")
+            endpoint_inventory = {"endpoints": [], "unread": []}
+        unread.extend(endpoint_inventory["unread"])
+        configs_seen = set()
+        for endpoint in endpoint_inventory["endpoints"]:
+            config_name = endpoint["config_name"]
+            if config_name in configs_seen:
+                continue
+            configs_seen.add(config_name)
+            total_resources_checked += 1
+            config = endpoint["config"]
+            label = f"{config_name}' of endpoint '{endpoint['name']}"
+            legs = []
+            # Serverless variants have no instance storage volume for the key.
+            if any(v.get("InstanceType") for v in endpoint["variants"]):
+                legs.append(
+                    (
+                        "Endpoint Config",
+                        config.get("KmsKeyId"),
+                        "No KmsKeyId, so the instance storage volume is not "
+                        "encrypted with a customer managed key",
+                    )
+                )
+            capture = config.get("DataCaptureConfig") or {}
+            if capture.get("EnableCapture"):
+                legs.append(
+                    (
+                        "Endpoint Config data capture",
+                        capture.get("KmsKeyId"),
+                        "DataCaptureConfig.KmsKeyId is not set, so captured "
+                        "requests and responses in S3 are not encrypted with a "
+                        "customer managed key",
+                    )
+                )
+            async_config = config.get("AsyncInferenceConfig")
+            if async_config:
+                legs.append(
+                    (
+                        "Endpoint Config async output",
+                        (async_config.get("OutputConfig") or {}).get("KmsKeyId"),
+                        "AsyncInferenceConfig.OutputConfig.KmsKeyId is not set, so "
+                        "asynchronous inference output in S3 is not encrypted with "
+                        "a customer managed key",
+                    )
+                )
+            for resource_type, key_id, issue in legs:
+                if key_id:
+                    note_key(resource_type, label, key_id)
+                else:
+                    resources_without_encryption.append(
+                        {"type": resource_type, "name": label, "issue": issue}
+                    )
+
         for (system_type, file_system_id), users in sorted(
             training_file_systems.items(), key=str
         ):
@@ -6576,8 +6636,8 @@ def check_sagemaker_monitoring_network_isolation(region: str = "") -> Dict[str, 
 
 def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, Any]:
     """
-    Check if SageMaker models pull container images from private ECR in VPC.
-    Using Platform mode exposes supply chain risks.
+    Check that every model an endpoint serves pulls each container image with
+    RepositoryAccessMode=Vpc, from a private Docker registry in the VPC.
     Aligns with AWS Security Hub control SageMaker.16
     """
     logger.debug("Starting check for SageMaker model container repository access")
@@ -6591,75 +6651,62 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
         models_platform_mode = []
         models_vpc_mode = []
         unread = []
+        served = {}
 
+        # AIR-SGM-EP-03 asks about inference endpoints, so the population is
+        # the models an endpoint or its inference components serve.
         try:
-            paginator = sagemaker_client.get_paginator("list_models")
-            for page in paginator.paginate():
-                for model in page.get("Models", []):
-                    model_name = model.get("ModelName")
-                    if model_name:
-                        try:
-                            model_details = sagemaker_client.describe_model(
-                                ModelName=model_name
-                            )
-
-                            # Check primary container
-                            primary_container = model_details.get(
-                                "PrimaryContainer", {}
-                            )
-                            image_config = primary_container.get("ImageConfig", {})
-                            repository_access_mode = image_config.get(
-                                "RepositoryAccessMode", "Platform"
-                            )
-
-                            if repository_access_mode == "Platform":
-                                models_platform_mode.append(
-                                    {
-                                        "name": model_name,
-                                        "image": primary_container.get(
-                                            "Image", "Unknown"
-                                        )[:50],
-                                    }
-                                )
-                            else:
-                                models_vpc_mode.append(model_name)
-
-                            # Check additional containers
-                            for container in model_details.get("Containers", []):
-                                container_image_config = container.get(
-                                    "ImageConfig", {}
-                                )
-                                container_access_mode = container_image_config.get(
-                                    "RepositoryAccessMode", "Platform"
-                                )
-
-                                if container_access_mode == "Platform":
-                                    container_name = container.get(
-                                        "ContainerHostname", "Unknown"
-                                    )
-                                    if {
-                                        "name": model_name,
-                                        "container": container_name,
-                                    } not in models_platform_mode:
-                                        models_platform_mode.append(
-                                            {
-                                                "name": model_name,
-                                                "container": container_name,
-                                            }
-                                        )
-
-                        except Exception as e:
-                            logger.warning(
-                                f"Error describing model {model_name}: {str(e)}"
-                            )
-                            unread.append(
-                                f"sagemaker:DescribeModel {model_name} "
-                                f"({get_assessment_error_label(e)})"
-                            )
-
+            inventory = _endpoint_hosting_inventory(sagemaker_client)
         except Exception as e:
-            logger.error(f"Error listing models: {str(e)}")
-            unread.append(f"sagemaker:ListModels ({get_assessment_error_label(e)})")
+            logger.error(f"Error listing endpoints: {str(e)}")
+            unread.append(f"sagemaker:ListEndpoints ({get_assessment_error_label(e)})")
+            inventory = {"endpoints": [], "unread": []}
+        unread.extend(inventory["unread"])
+        for endpoint in inventory["endpoints"]:
+            for model_name in endpoint["models"]:
+                served.setdefault(model_name, []).append(endpoint["name"])
+        for endpoint_name, (
+            components,
+            component_unread,
+        ) in _inference_component_models(sagemaker_client, inventory).items():
+            unread.extend(component_unread)
+            for _, model_name in components:
+                served.setdefault(model_name, []).append(endpoint_name)
+
+        for model_name in sorted(served):
+            try:
+                model_details = sagemaker_client.describe_model(ModelName=model_name)
+            except Exception as e:
+                logger.warning(f"Error describing model {model_name}: {str(e)}")
+                unread.append(
+                    f"sagemaker:DescribeModel {model_name} "
+                    f"({get_assessment_error_label(e)})"
+                )
+                continue
+            # A model with no PrimaryContainer is a multi-container model,
+            # whose images are all in Containers.
+            primary_container = model_details.get("PrimaryContainer")
+            containers = ([primary_container] if primary_container else []) + list(
+                model_details.get("Containers") or []
+            )
+            platform = [
+                container
+                for container in containers
+                if (container.get("ImageConfig") or {}).get(
+                    "RepositoryAccessMode", "Platform"
+                )
+                == "Platform"
+            ]
+            for container in platform:
+                models_platform_mode.append(
+                    {
+                        "name": model_name,
+                        "endpoints": sorted(set(served[model_name])),
+                        "image": str(container.get("Image", "Unknown"))[:80],
+                    }
+                )
+            if not platform:
+                models_vpc_mode.append(model_name)
 
         if models_platform_mode:
             # Limit findings
@@ -6668,8 +6715,19 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                     create_finding(
                         check_id="SM-14",
                         finding_name="SageMaker Model Platform Repository Access",
-                        finding_details=f"Model '{model['name']}' uses Platform repository access mode. Container images are pulled from public/external registries, exposing supply chain risks.",
-                        resolution="Configure RepositoryAccessMode=Vpc in ImageConfig to pull images from private ECR repositories through VPC. This provides supply chain security.",
+                        finding_details=(
+                            f"Model '{model['name']}', served by endpoint(s) "
+                            f"{', '.join(model['endpoints'])}, has a container "
+                            f"(image {model['image']}) in Platform repository "
+                            "access mode, which means the image is hosted in "
+                            "Amazon ECR and is not pulled from a private Docker "
+                            "registry in the VPC."
+                        ),
+                        resolution=(
+                            "Set ImageConfig.RepositoryAccessMode=Vpc on each "
+                            "container to pull its image from a private Docker "
+                            "registry in your VPC."
+                        ),
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-container-repositories.html",
                         severity="Medium",
                         status="Failed",
@@ -6682,7 +6740,7 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                     create_finding(
                         check_id="SM-14",
                         finding_name="SageMaker Model Repository Access Summary",
-                        finding_details=f"Found {len(models_platform_mode)} total models using Platform repository access (showing first 15)",
+                        finding_details=f"Found {len(models_platform_mode)} served model containers using Platform repository access (showing first 15)",
                         resolution="Review all models and configure VPC repository access where appropriate",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-container-repositories.html",
                         severity="Medium",
@@ -6697,7 +6755,11 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                     create_finding(
                         check_id="SM-14",
                         finding_name="SageMaker Model Repository Access Check",
-                        finding_details=f"All {len(models_vpc_mode)} models use VPC repository access",
+                        finding_details=(
+                            f"All {len(models_vpc_mode)} models served by an "
+                            "endpoint or inference component use VPC repository "
+                            "access on every container"
+                        ),
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-container-repositories.html",
                         severity="Medium",
@@ -6711,7 +6773,7 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                     create_finding(
                         check_id="SM-14",
                         finding_name="SageMaker Model Repository Access Check",
-                        finding_details="No models found or all use default Platform access",
+                        finding_details="No endpoint or inference component serves a model",
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-container-repositories.html",
                         severity="Informational",
@@ -6726,8 +6788,8 @@ def check_sagemaker_model_container_repository(region: str = "") -> Dict[str, An
                     "SM-14",
                     "SageMaker Model Repository Access Check",
                     unread,
-                    f"{len(models_vpc_mode)} model(s) have a primary container "
-                    "with VPC repository access.",
+                    f"{len(models_vpc_mode)} served model(s) use VPC repository "
+                    "access on every container.",
                     "https://docs.aws.amazon.com/sagemaker/latest/dg/model-container-repositories.html",
                     region,
                 )
@@ -8652,7 +8714,17 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                 create_finding(
                     check_id="SM-22",
                     finding_name="Model Approval Workflow Check",
-                    finding_details=f"Checked {groups_checked} model package groups. Approval workflows appear to be properly configured.",
+                    # AIR-SGM-GOV-01: the counts below are all this branch
+                    # established; they do not show approval is enforced.
+                    finding_details=(
+                        f"Checked {groups_checked} model package group(s): none "
+                        "with more than 3 versions has every version Approved, "
+                        "none has more than 5 versions pending approval, and each "
+                        f"of the {approval_versions_examined} Approved version(s) "
+                        "records an approver. Whether a version can be approved "
+                        "or deployed without review is not established by these "
+                        "counts."
+                    ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry-approve.html",
                     severity="Medium",
@@ -11440,10 +11512,10 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
                     finding_details=(
                         f"{len(readable_rules)} ACTIVE AWS Config rule(s) evaluate "
                         f"SageMaker in {region or 'this region'} and report no "
-                        f"non-compliant resource: {described}. AWS Config records "
-                        "configuration items for the AWS::SageMaker::* types only, "
-                        "so endpoints and training jobs are covered by periodic "
-                        "rules rather than by configuration history."
+                        f"non-compliant resource: {described}. AWS Config has no "
+                        "resource type for a training, processing or transform "
+                        "job, so no Config rule evaluates a job and this row "
+                        "makes no claim about jobs."
                     ),
                     resolution="No action required",
                     reference=CONFIG_REFERENCE,
@@ -13312,8 +13384,8 @@ def check_sagemaker_creation_guardrails(
 
     One verdict per guardrail category. Each (action, key) requirement is met by
     a Deny in a service control policy attached on this account's path to the
-    root, or by a condition on the key in every identity policy that grants the
-    action.
+    root. A condition on the key in every identity policy that grants the action
+    still fails, because the account root user is bound by no identity policy.
     """
     logger.debug("Starting check for SageMaker creation guardrails")
     return _creation_guardrail_findings(
@@ -13440,8 +13512,9 @@ def check_sagemaker_notebook_access_guardrails(
     conditions (AIR-SGM-TRN-05).
 
     Each (action, key) requirement is met by a Deny in a service control policy
-    attached on this account's path to the root, or by a condition on the key
-    in every identity policy that grants the action.
+    attached on this account's path to the root. A condition on the key in every
+    identity policy that grants the action still fails, because the account root
+    user is bound by no identity policy.
     """
     logger.debug("Starting check for SageMaker notebook access guardrails")
     try:

@@ -1,5 +1,5 @@
 {
-  "generated": "2026-09-30",
+  "generated": "2026-10-03",
   "generator": "aisf-parity/build_ledger.py",
   "aisf_repo": "/Users/tamg/WorkDocs/Builder/aws-ai-security-framework-assessment",
   "summary": {
@@ -612,12 +612,14 @@
         "sagemaker_assessments"
       ],
       "incumbents": [
-        "SM-03"
+        "SM-03",
+        "SM-34"
       ],
       "incumbent_names": [
-        "SageMaker Data Protection Check"
+        "SageMaker Data Protection Check",
+        "SageMaker Creation Guardrail"
       ],
-      "gap": "",
+      "gap": "SM-34 is the preventive leg: it requires sagemaker:CreateTrainingJob to be bound on sagemaker:VolumeKmsKeyArn by a Deny in an attached service control policy, and fails a binding held only in identity policies because the account root user is bound by none",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
@@ -692,7 +694,7 @@
         "Training Job Network Boundary",
         "SageMaker Creation Guardrail"
       ],
-      "gap": "SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation, by a Deny in an attached service control policy or by a condition in every identity policy that grants the action",
+      "gap": "SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation by a Deny in an attached service control policy. A condition held only in identity policies fails, because the account root user is bound by none",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
@@ -741,7 +743,7 @@
         "SageMaker Model Platform Repository Access",
         "SageMaker Model Repository Access Check"
       ],
-      "gap": "SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint serves and reads the endpoint config KmsKeyId of each instance-backed endpoint, and SM-14 requires RepositoryAccessMode Vpc on each model's image config. The one field not read is inter-container traffic encryption, because no endpoint API returns it: EnableInterContainerTrafficEncryption is a member of DescribeTrainingJob, DescribeProcessingJob and DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, DescribeModel, DescribeEndpoint or DescribeInferenceComponent (botocore 1.43.85). The AISF slug sagemaker_endpoint_intercontainer_encryption_enabled names that absent field and should be fixed in the AISF repo",
+      "gap": "SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint serves and reads the endpoint config KmsKeyId of each instance-backed endpoint, and SM-14 requires RepositoryAccessMode Vpc on every container of each model an endpoint or inference component serves. The one field not read is inter-container traffic encryption, because no endpoint API returns it: EnableInterContainerTrafficEncryption is a member of DescribeTrainingJob, DescribeProcessingJob and DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, DescribeModel, DescribeEndpoint or DescribeInferenceComponent (botocore 1.43.85). The AISF slug sagemaker_endpoint_intercontainer_encryption_enabled names that absent field and should be fixed in the AISF repo",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
