@@ -25734,6 +25734,59 @@ def _aws_managed_policy_document(
     return cache[policy_arn]
 
 
+def _instance_access_control_attributes(client: Any, instance_arn: str) -> Dict:
+    """
+    Read the attributes for access control an Identity Center instance passes as
+    session tags: {"status", "attributes": {lowercased key: [sources]}, "error"}.
+    """
+    try:
+        response = client.describe_instance_access_control_attribute_configuration(
+            InstanceArn=instance_arn
+        )
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "status": "",
+            "attributes": {},
+            "error": (
+                "sso:DescribeInstanceAccessControlAttributeConfiguration on "
+                f"{instance_arn} ({get_assessment_error_label(error)})"
+            ),
+        }
+    configuration = response.get("InstanceAccessControlAttributeConfiguration") or {}
+    return {
+        "status": str(response.get("Status") or "not reported"),
+        "attributes": {
+            str(attribute.get("Key", "")).lower(): [
+                str(source)
+                for source in (attribute.get("Value") or {}).get("Source") or []
+            ]
+            for attribute in configuration.get("AccessControlAttributes") or []
+        },
+        "error": "",
+    }
+
+
+def _access_control_attribute_note(abac: Dict[str, Any], tag: str) -> str:
+    """Say where an Identity Center session's aws:PrincipalTag/<tag> comes from."""
+    if abac["error"]:
+        return (
+            f"where aws:PrincipalTag/{tag} comes from was not read, because "
+            f"{abac['error']} failed"
+        )
+    sources = abac["attributes"].get(tag.lower())
+    if sources is None:
+        return (
+            f"aws:PrincipalTag/{tag} is not an attribute for access control on the "
+            f"instance (configuration status {abac['status']}), so any value comes "
+            "only from the identity provider's SAML assertion, which is not read"
+        )
+    return (
+        f"aws:PrincipalTag/{tag} is the instance's attribute for access control "
+        f"set from {', '.join(sources) or 'no source'} (configuration status "
+        f"{abac['status']}); whether that source reflects MFA is not judged"
+    )
+
+
 def _identity_center_ai_permission_sets(
     instance_arns: List[str], region: str
 ) -> Dict[str, List[str]]:
@@ -25758,6 +25811,9 @@ def _identity_center_ai_permission_sets(
     unread = []
     customer_managed = []
     for instance_arn in instance_arns:
+        abac = _instance_access_control_attributes(client, instance_arn)
+        if abac["error"]:
+            unread.append(abac["error"])
         try:
             permission_sets = _list_all_items(
                 client,
@@ -25892,7 +25948,16 @@ def _identity_center_ai_permission_sets(
                     }
                 )
             else:
-                guarded.append("{}: {}".format(label, "; ".join(tests)))
+                tags = sorted({deny["tag"] for deny in denies if deny["services"]})
+                guarded.append(
+                    "{}: {} ({})".format(
+                        label,
+                        "; ".join(tests),
+                        "; ".join(
+                            _access_control_attribute_note(abac, t) for t in tags
+                        ),
+                    )
+                )
     return {
         "granting": granting,
         "guarded": guarded,
@@ -26026,10 +26091,7 @@ def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
             "{}IAM Identity Center instance(s) {} are visible to this "
             "account (listed in {}), and the people who sign in through them "
             "are judged by no row.{} Partial, ceiling reached: the instance's "
-            "MFA settings are returned by no sso-admin operation ({}). The "
-            "attributes for access control that set the tag "
-            "(sso:DescribeInstanceAccessControlAttributeConfiguration) are "
-            "not read.".format(
+            "MFA settings are returned by no sso-admin operation ({}).".format(
                 region_note,
                 ", ".join(sorted(instances)[:5]),
                 ", ".join(sorted(found)),
@@ -26179,6 +26241,7 @@ def _principal_tag_deny_statement(statement: Dict[str, Any]) -> Dict[str, Any]:
             next(iter(block)),
             ", ".join(str(value) for value in values),
         ),
+        "tag": str(next(iter(block)))[len(PRINCIPAL_TAG_KEY_PREFIX) :],
     }
 
 

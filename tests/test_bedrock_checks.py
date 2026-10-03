@@ -28438,8 +28438,10 @@ class TestBR51AIUserConsoleMFA:
         customer=None,
         aws_policies=None,
         role_trust=None,
+        abac=None,
     ):
-        """`managed` maps a permission set to the AWS managed policy ARNs
+        """`abac` is the DescribeInstanceAccessControlAttributeConfiguration
+        response, or an exception it raises. `managed` maps a permission set to the AWS managed policy ARNs
         ListManagedPoliciesInPermissionSet returns (a dict of pages keyed by
         NextToken, or an exception), `customer` to its customer managed
         references, and `aws_policies` an AWS managed ARN to its default
@@ -28507,6 +28509,20 @@ class TestBR51AIUserConsoleMFA:
             return {"InlinePolicy": outcome}
 
         iam.list_permission_sets.side_effect = list_permission_sets
+        if isinstance(abac, Exception):
+            iam.describe_instance_access_control_attribute_configuration.side_effect = (
+                abac
+            )
+        else:
+            iam.describe_instance_access_control_attribute_configuration.return_value = (
+                abac
+                or {
+                    "Status": "ENABLED",
+                    "InstanceAccessControlAttributeConfiguration": {
+                        "AccessControlAttributes": []
+                    },
+                }
+            )
         iam.get_inline_policy_for_permission_set.side_effect = get_inline_policy
         if isinstance(instances, Exception):
             iam.list_instances.side_effect = instances
@@ -28948,7 +28964,70 @@ class TestBR51AIUserConsoleMFA:
         details = rows[0]["Finding_Details"]
         assert "2 of them carry" in details
         assert "Partial, ceiling reached" in details
-        assert "sso:DescribeInstanceAccessControlAttributeConfiguration" in details
+        # Stricter since DescribeInstanceAccessControlAttributeConfiguration is
+        # read: the row used to say only that it was not read, and now says
+        # where each guarded set's tag comes from.
+        assert (
+            "aws:PrincipalTag/authn is not an attribute for access control on the "
+            "instance (configuration status ENABLED), so any value comes only "
+            "from the identity provider's SAML assertion, which is not read"
+        ) in details
+        assert "are not read." not in details
+
+    def test_br51_a_configured_attribute_names_its_source_per_permission_set(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(self._tag_deny()),
+                self.PS_LATE: self._grant_with(
+                    self._tag_deny(key="aws:PrincipalTag/Level")
+                ),
+            },
+            abac={
+                "Status": "ENABLED",
+                "InstanceAccessControlAttributeConfiguration": {
+                    "AccessControlAttributes": [
+                        {
+                            "Key": "AuthN",
+                            "Value": {"Source": ["${path:enterprise.amr}"]},
+                        }
+                    ]
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"{self.PS_WRITE} (bedrock): StringNotEquals aws:PrincipalTag/authn mfa "
+            "(aws:PrincipalTag/authn is the instance's attribute for access control "
+            "set from ${path:enterprise.amr} (configuration status ENABLED); whether "
+            "that source reflects MFA is not judged)"
+        ) in details
+        assert (
+            f"{self.PS_LATE} (bedrock): StringNotEquals aws:PrincipalTag/Level mfa "
+            "(aws:PrincipalTag/Level is not an attribute for access control"
+        ) in details
+        self.iam.describe_instance_access_control_attribute_configuration.assert_called_once_with(
+            InstanceArn=self.INSTANCE
+        )
+
+    def test_br51_an_unread_attribute_configuration_is_named(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={self.PS_WRITE: self._grant_with(self._tag_deny())},
+            abac=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "where aws:PrincipalTag/authn comes from was not read, because "
+            "sso:DescribeInstanceAccessControlAttributeConfiguration on "
+            f"{self.INSTANCE} (AccessDenied"
+        ) in details
+        assert (
+            "These reads failed: sso:DescribeInstanceAccessControlAttributeConfiguration"
+            in details
+        )
 
     def test_br51_principal_tag_deny_forms_that_do_not_fire_are_not_credited(self):
         forms = {

@@ -174,6 +174,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListDomains",
         "sagemaker:ListInferenceComponents",
         "sagemaker:ListTrainingJobs",
+        "sso:DescribeInstanceAccessControlAttributeConfiguration",
         "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
         "sso:ListManagedPoliciesInPermissionSet",
     },
@@ -840,6 +841,10 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                         },
                     ]
                 ),
+            ),
+            scoped(
+                "sso:DescribeInstanceAccessControlAttributeConfiguration",
+                "sso:::instance/*",
             ),
             scoped(
                 "bedrock-agentcore:GetBrowser",

@@ -497,6 +497,14 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail-profile/*'
+          - Sid: IdentityCenterAttributeRead
+            # BR-51 reads the attributes for access control that set the
+            # aws:PrincipalTag key a permission set's Deny tests. The service
+            # authorization reference gives the action the Instance resource type.
+            Effect: Allow
+            Action:
+              - sso:DescribeInstanceAccessControlAttributeConfiguration # BR-51
+            Resource: !Sub 'arn:${AWS::Partition}:sso:::instance/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
