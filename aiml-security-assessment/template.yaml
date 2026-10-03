@@ -1360,6 +1360,9 @@ Resources:
                 # AC-18 lists the CloudTrail Lake event data stores. The service
                 # authorization reference lists no resource type for it.
                 - cloudtrail:ListEventDataStores # AC-18
+                # AC-22 reads each OAM link's source account state. The service
+                # authorization reference lists no resource type for it.
+                - organizations:ListAccounts # AC-22
                 # Formerly LogsDeliveryInventory
                 # AC-19 pairs each AgentCore delivery source with its delivery.
                 - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-26, AC-46
@@ -1564,22 +1567,21 @@ Resources:
               Effect: Allow
               Action:
                 - oam:GetSinkPolicy
+                # AC-22 lists the links attached to each sink, on the Sink
+                # resource type.
+                - oam:ListAttachedLinks # AC-22
               Resource: !Sub 'arn:${AWS::Partition}:oam:*:${AWS::AccountId}:sink/*'
-            # AC-26 reads the key policy behind a log group's customer managed
-            # key to see who the key lets decrypt the log data.
-            - Sid: LogEncryptionKeyPolicyRead
-              Effect: Allow
-              Action:
-                - kms:GetKeyPolicy
-              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             # AC-07, AC-11 and AC-14 read a memory, policy engine or token vault
             # key's manager and state, and AC-36 lists the key's grants to find
-            # the engine's management and evaluation grants.
+            # the engine's management and evaluation grants. AC-26 reads the
+            # key policy behind a log group's customer managed key to see who
+            # the key lets decrypt the log data.
             - Sid: PolicyEngineKeyStateRead
               Effect: Allow
               Action:
                 - kms:DescribeKey
                 - kms:ListGrants
+                - kms:GetKeyPolicy
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             # AC-28 reads the organization's service control policies to see
             # whether one denies creating a gateway with no inbound authorizer.

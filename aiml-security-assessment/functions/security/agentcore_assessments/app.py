@@ -13651,13 +13651,43 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
                     organization["error"] = "no organization id returned"
         return organization["id"]
 
+    member_states: Dict[str, Any] = {}
+
+    def read_member_states() -> Dict[str, str]:
+        if "states" not in member_states:
+            member_states["states"] = None
+            if organizations_client is None:
+                member_states["error"] = "no Organizations client"
+            else:
+                try:
+                    member_states["states"] = {
+                        account.get("Id"): account.get("State")
+                        or account.get("Status", "")
+                        for account in _paginate_aws_list(
+                            organizations_client,
+                            "list_accounts",
+                            "Accounts",
+                            token_request_key="NextToken",
+                            token_response_key="NextToken",
+                        )
+                    }
+                except Exception as error:
+                    member_states["error"] = type(error).__name__
+        return member_states["states"]
+
     findings = []
+    link_findings = []
     for sink in sinks:
         sink_arn = sink.get("Arn")
         if not sink_arn:
             continue
         sink_name = sink.get("Name", sink_arn)
         sink_account = _arn_account(sink_arn)
+        link_findings.extend(
+            _telemetry_stale_link_findings(
+                sink_arn, sink_name, read_member_states, member_states
+            )
+        )
 
         try:
             policy_text = oam_client.get_sink_policy(SinkIdentifier=sink_arn).get(
@@ -13872,7 +13902,121 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
             )
         )
 
-    return findings
+    return findings + link_findings
+
+
+def _telemetry_stale_link_findings(
+    sink_arn: str,
+    sink_name: str,
+    read_member_states: Callable[[], Optional[Dict[str, str]]],
+    member_states: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-22 (OBS-06): fail a sink holding a link from a non-member account.
+
+    A link stays attached after its source account leaves the organization or
+    is suspended or closed, and keeps sharing that account's telemetry into
+    the sink. No OAM field records when a link was last used, so a link from
+    an ACTIVE member is not judged for staleness by age.
+    """
+    try:
+        links = _paginate_aws_list(
+            oam_client,
+            "list_attached_links",
+            "Items",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            SinkIdentifier=sink_arn,
+        )
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Link Review",
+                finding_details=(
+                    f"Links attached to sink '{sink_name}' could not be listed: "
+                    f"{type(error).__name__}, so stale source-account links are "
+                    "not judged."
+                ),
+                resolution="Grant oam:ListAttachedLinks and retry.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    link_accounts = sorted(
+        {_arn_account(link.get("LinkArn", "")) for link in links} - {""}
+    )
+    if not link_accounts:
+        return []
+
+    states = read_member_states()
+    if states is None:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Link Review",
+                finding_details=(
+                    f"Sink '{sink_name}' has {len(links)} link(s), but the "
+                    "organization's accounts could not be listed "
+                    f"({member_states.get('error', '')}), so whether each source "
+                    "account is still an active member is not read."
+                ),
+                resolution=(
+                    "Grant organizations:ListAccounts and run the assessment from "
+                    "the management account or a delegated administrator, the "
+                    "only accounts where ListAccounts answers."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    stale = [
+        f"{account} ({states[account]})"
+        if account in states
+        else f"{account} (not in the organization)"
+        for account in link_accounts
+        if states.get(account) != "ACTIVE"
+    ]
+    if stale:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Link Stale",
+                finding_details=(
+                    f"Sink '{sink_name}' holds links from source accounts that are "
+                    f"not active members of the organization: {', '.join(stale)}. "
+                    "Their telemetry still flows into the sink."
+                ),
+                resolution=(
+                    "Delete the link from each listed source account, and remove "
+                    "the account from the sink policy."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="AC-22",
+            finding_name="AgentCore Telemetry Link Review",
+            finding_details=(
+                f"Sink '{sink_name}' has {len(links)} link(s), each from an "
+                "account that is an ACTIVE member of the organization. No OAM "
+                "field records when a link was last used, so an unused link from "
+                "an active member is not detected."
+            ),
+            resolution=(
+                "No action required. Review the links periodically and delete any "
+                "a source account no longer needs."
+            ),
+            reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+    ]
 
 
 def _statement_condition_keys(statement: Dict[str, Any]) -> List[str]:

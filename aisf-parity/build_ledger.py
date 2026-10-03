@@ -1132,7 +1132,11 @@ AI_SUBJECT_ROWS = [
         "aws:PrincipalOrgPaths under StringEquals, StringEqualsIgnoreCase or "
         "StringLike with a value whose organization segment has no wildcard. A "
         "negated, IfExists or ForAllValues operator and a wildcard organization do not "
-        "count",
+        "count. Each sink's attached links fail when the source account is not an "
+        "ACTIVE member of the organization; a failed ListAttachedLinks or "
+        "ListAccounts read is N/A. No OAM field records a link's last use, so an "
+        "unused link from an active member is not found, and the monitoring "
+        "account's viewing IAM and the data-protection policies are not read",
         [],
         4,
     ),

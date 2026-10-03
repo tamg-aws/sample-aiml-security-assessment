@@ -1618,7 +1618,7 @@
       "incumbent_names": [
         "AgentCore Telemetry Sink Scope"
       ],
-      "gap": "AC-22 reads each Allow statement on an OAM sink policy by value. A statement naming principals passes only when no principal is a wildcard and no NotPrincipal is present; otherwise it needs aws:PrincipalOrgID or aws:PrincipalOrgPaths under StringEquals, StringEqualsIgnoreCase or StringLike with a value whose organization segment has no wildcard. A negated, IfExists or ForAllValues operator and a wildcard organization do not count",
+      "gap": "AC-22 reads each Allow statement on an OAM sink policy by value. A statement naming principals passes only when no principal is a wildcard and no NotPrincipal is present; otherwise it needs aws:PrincipalOrgID or aws:PrincipalOrgPaths under StringEquals, StringEqualsIgnoreCase or StringLike with a value whose organization segment has no wildcard. A negated, IfExists or ForAllValues operator and a wildcard organization do not count. Each sink's attached links fail when the source account is not an ACTIVE member of the organization; a failed ListAttachedLinks or ListAccounts read is N/A. No OAM field records a link's last use, so an unused link from an active member is not found, and the monitoring account's viewing IAM and the data-protection policies are not read",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",

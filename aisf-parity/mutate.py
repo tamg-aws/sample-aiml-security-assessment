@@ -1177,6 +1177,27 @@ MUTATIONS = [
         "find": '    "not judged: an API Gateway integration or an origin can name a Bedrock "\n',
         "replace": '    "not identifiable as AI entry points by any API, so they are not judged: "\n',
     },
+    {
+        "name": "AC-22 credits a link from a suspended member account",
+        "file": AGENTCORE,
+        "defect": "a link from a SUSPENDED or CLOSED member still shares its telemetry, and reading membership alone passes it",
+        "find": '        if states.get(account) != "ACTIVE"\n',
+        "replace": "        if account not in states\n",
+    },
+    {
+        "name": "AC-22 passes stale links when ListAccounts fails",
+        "file": AGENTCORE,
+        "defect": "a failed ListAccounts read gives a verdict on every link instead of an N/A",
+        "find": "    if states is None:\n",
+        "replace": "    if states is None:\n        states = {}\n    if False:\n",
+    },
+    {
+        "name": "AC-22 drops the link review on the policy continue",
+        "file": AGENTCORE,
+        "defect": "the link review is computed but never emitted",
+        "find": "    return findings + link_findings\n",
+        "replace": "    return findings\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1456,6 +1477,9 @@ GROUPS: dict[str, str] = {
     "AC-06 passes a recording key whose policy it could not read": "in the AgentCore verdict legs",
     "AC-06 credits a recording key that lets anyone decrypt": "in the AgentCore verdict legs",
     "AC-51 claims no API identifies other AI front doors": "in the AgentCore verdict legs",
+    "AC-22 credits a link from a suspended member account": "in the AgentCore verdict legs",
+    "AC-22 passes stale links when ListAccounts fails": "in the AgentCore verdict legs",
+    "AC-22 drops the link review on the policy continue": "in the AgentCore verdict legs",
 }
 
 

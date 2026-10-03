@@ -187,6 +187,9 @@ REQUIRED_AGENTCORE_ACTIONS = {
     # AC-18 reads the CloudTrail Lake event data stores beside the trails.
     "cloudtrail:ListEventDataStores",
     "cloudtrail:GetEventDataStore",
+    # AC-22 lists each sink's attached links and the organization's accounts.
+    "oam:ListAttachedLinks",
+    "organizations:ListAccounts",
     # AC-50 reads the registry scanning configuration.
     "ecr:GetRegistryScanningConfiguration",
     # AC-52 reads the Cognito user pools AgentCore JWT authorizers name.
@@ -1232,6 +1235,16 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"lambda:ListTags"}
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "cloudtrail:ListEventDataStores",
     "cloudtrail:GetEventDataStore",
+}
+
+# AC-22 lists each sink's attached links and the organization's accounts.
+# validate-policy on 2026-10-03 reported the negative control
+# oam:ListAttachedLinkz as INVALID_ACTION at Action index 2 and nothing at
+# indexes 0 and 1. Both names are also in the oam and organizations service
+# reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "oam:ListAttachedLinks",
+    "organizations:ListAccounts",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {

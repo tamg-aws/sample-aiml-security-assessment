@@ -489,8 +489,10 @@ _EXPECTED_ACTIONS = {
         "logs:DescribeLogGroups",
         "logs:GetDataProtectionPolicy",
         "oam:GetSinkPolicy",
+        "oam:ListAttachedLinks",
         "oam:ListSinks",
         "organizations:DescribePolicy",
+        "organizations:ListAccounts",
         "organizations:ListPolicies",
         "organizations:ListParents",
         "organizations:ListTargetsForPolicy",
@@ -1559,10 +1561,6 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
             "oam:GetSinkPolicy",
             "oam:*:${AWS::AccountId}:sink/*",
         ),
-        "LogEncryptionKeyPolicyRead": (
-            "kms:GetKeyPolicy",
-            "kms:*:${AWS::AccountId}:key/*",
-        ),
         "PolicyEngineKeyStateRead": (
             "kms:ListGrants",
             "kms:*:${AWS::AccountId}:key/*",
@@ -1579,6 +1577,14 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         assert action in statement
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # AC-26's key policy read shares the key state statement's key/* resource.
+    key_state = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "PolicyEngineKeyStateRead"
+    )
+    assert "kms:GetKeyPolicy" in key_state
+    assert "kms:*:${AWS::AccountId}:key/*" in key_state
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", key_state)
 
     # AC-18 reads each trail's logging state beside its selectors, on the same
     # trail ARN, and lists the credential providers in the token vault.
@@ -1659,6 +1665,7 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
         "bedrock-agentcore:ListAgentRuntimeVersions",
         "bedrock-agentcore:ListConsentPortals",
         "cloudtrail:ListEventDataStores",
+        "organizations:ListAccounts",
         "ec2:DescribeNatGateways",
         "bedrock:GetModelInvocationLoggingConfiguration",
     ):

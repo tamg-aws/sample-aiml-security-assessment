@@ -9920,6 +9920,114 @@ class TestAC22TelemetrySinkScope:
         assert mock_oam.list_sinks.call_args_list[1].kwargs == {"NextToken": "page-2"}
 
 
+class TestAC22StaleLinks:
+    """AIR-ACR-OBS-06: review and revoke stale source-account links. A link from
+    an account that is no longer an ACTIVE member of the organization still
+    shares its telemetry into the sink."""
+
+    _SINK = TestAC22TelemetrySinkScope._SINK
+    _POLICY = {
+        "Policy": (
+            '{"Statement": [{"Effect": "Allow", "Principal": "*", '
+            '"Action": "oam:CreateLink", "Resource": "*", '
+            '"Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-1"}}}]}'
+        )
+    }
+
+    @staticmethod
+    def _link(account):
+        return {
+            "Label": f"source-{account}",
+            "LinkArn": f"arn:aws:oam:us-east-1:{account}:link/l-{account}",
+            "ResourceTypes": ["AWS::Logs::LogGroup"],
+        }
+
+    def _run(self, mock_oam, mock_orgs, links, accounts=None, accounts_error=None):
+        mock_orgs.describe_organization.return_value = {"Organization": {"Id": "o-1"}}
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = self._POLICY
+        if isinstance(links, Exception):
+            mock_oam.list_attached_links.side_effect = links
+        else:
+            mock_oam.list_attached_links.return_value = {
+                "Items": [self._link(account) for account in links]
+            }
+        if accounts_error is not None:
+            mock_orgs.list_accounts.side_effect = accounts_error
+        else:
+            mock_orgs.list_accounts.return_value = {
+                "Accounts": [
+                    {"Id": account, "State": state}
+                    for account, state in (accounts or {}).items()
+                ]
+            }
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        rows = [
+            f for f in findings if f["Finding"].startswith("AgentCore Telemetry Link")
+        ]
+        for row in rows:
+            assert_finding_schema(row)
+        return rows
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_link_from_a_closed_or_departed_account_fails(self, mock_oam, mock_orgs):
+        rows = self._run(
+            mock_oam,
+            mock_orgs,
+            ["111111111111", "222222222222", "333333333333"],
+            accounts={"111111111111": "ACTIVE", "222222222222": "SUSPENDED"},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert rows[0]["Finding"] == "AgentCore Telemetry Link Stale"
+        details = rows[0]["Finding_Details"]
+        assert "222222222222 (SUSPENDED)" in details
+        assert "333333333333 (not in the organization)" in details
+        assert "111111111111" not in details
+        mock_oam.list_attached_links.assert_called_with(
+            SinkIdentifier=self._SINK["Arn"]
+        )
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_links_from_active_members_pass(self, mock_oam, mock_orgs):
+        rows = self._run(
+            mock_oam,
+            mock_orgs,
+            ["111111111111", "222222222222"],
+            accounts={"111111111111": "ACTIVE", "222222222222": "ACTIVE"},
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "2 link(s)" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_unlisted_organization_is_na(self, mock_oam, mock_orgs):
+        rows = self._run(
+            mock_oam,
+            mock_orgs,
+            ["111111111111"],
+            accounts_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "organizations:ListAccounts" in rows[0]["Resolution"]
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_unlisted_links_are_na(self, mock_oam, mock_orgs):
+        rows = self._run(
+            mock_oam,
+            mock_orgs,
+            _make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "oam:ListAttachedLinks" in rows[0]["Resolution"]
+
+
 class TestAC22SinkScopeValues:
     """AC-22: a sink is scoped by the values it names, not by the keys present."""
 
