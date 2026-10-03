@@ -1292,9 +1292,10 @@ Resources:
               - firehose:DescribeDeliveryStream # AC-26
             Resource: !Sub 'arn:${AWS::Partition}:firehose:*:${AWS::AccountId}:deliverystream/*'
           - Sid: LogArchiveBucketRead
-            # AC-26 reads Object Lock on the stream's archive bucket. The bucket
-            # is customer-chosen and normally owned by a separate Log Archive
-            # account, so neither its name nor its owner is known at deploy time.
+            # AC-26 reads Object Lock on the stream's archive bucket and on
+            # each trail bucket. Both are customer-chosen and normally owned by
+            # a separate Log Archive account, so neither the name nor the owner
+            # is known at deploy time.
             Effect: Allow
             Action:
               - s3:GetBucketObjectLockConfiguration # AC-26

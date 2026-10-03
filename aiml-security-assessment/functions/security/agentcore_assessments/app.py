@@ -313,6 +313,9 @@ LOGS_SUBSCRIPTION_REFERENCE_URL = (
     "API_PutSubscriptionFilter.html"
 )
 AGENTCORE_LOG_ARCHIVE_FINDING = "AgentCore Log Archive Forwarding"
+S3_OBJECT_LOCK_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html"
+)
 # The scan frequencies under which ECR enhanced scanning scans a matched
 # repository without a manual request.
 ECR_ENHANCED_SCAN_FREQUENCIES = ("SCAN_ON_PUSH", "CONTINUOUS_SCAN")
@@ -16223,6 +16226,130 @@ def check_agentcore_trail_log_file_validation() -> List[Dict[str, Any]]:
             status=StatusEnum.PASSED,
         )
     ]
+
+
+def check_agentcore_trail_bucket_object_lock() -> List[Dict[str, Any]]:
+    """AC-26 trail-bucket leg: each trail recording this Region writes to a
+    bucket whose Object Lock default retention is in COMPLIANCE mode.
+
+    Log file validation detects a changed or deleted log file and does not
+    stop either, so AIR-FND-DET-09 also asks for Object Lock on the trail
+    bucket. The trails are the ones the validation leg counts.
+    """
+    finding_name = "AgentCore Trail Bucket Object Lock"
+    if cloudtrail_client is None:
+        return []
+    try:
+        trails = _paginate_aws_list(
+            cloudtrail_client,
+            "list_trails",
+            "Trails",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-26",
+                finding_name=finding_name,
+                error=error,
+                reference=S3_OBJECT_LOCK_REFERENCE_URL,
+            )
+        ]
+    region = cloudtrail_client.meta.region_name
+    lock_cache: Dict[str, Tuple[str, Any]] = {}
+    findings: List[Dict[str, Any]] = []
+    for trail in trails:
+        identifier = trail.get("TrailARN") or trail.get("Name")
+        if not identifier:
+            continue
+        try:
+            detail = cloudtrail_client.get_trail(Name=identifier).get("Trail") or {}
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-26",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"Trail {identifier} could not be read: "
+                        f"{_assessment_error_label(error)}, so its bucket's Object "
+                        "Lock was not judged."
+                    ),
+                    resolution="Grant cloudtrail:GetTrail and retry.",
+                    reference=S3_OBJECT_LOCK_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        if not detail.get("IsMultiRegionTrail") and detail.get("HomeRegion") != region:
+            continue
+        findings.append(
+            _trail_bucket_lock_finding(
+                detail.get("TrailARN") or identifier, detail, lock_cache
+            )
+        )
+    return findings
+
+
+def _trail_bucket_lock_finding(
+    label: str, detail: Dict[str, Any], lock_cache: Dict[str, Tuple[str, Any]]
+) -> Dict[str, Any]:
+    """Judge Object Lock on the bucket one trail recording this Region writes to."""
+    finding_name = "AgentCore Trail Bucket Object Lock"
+    bucket = str(detail.get("S3BucketName") or "")
+    if not bucket:
+        return create_finding(
+            check_id="AC-26",
+            finding_name=finding_name,
+            finding_details=f"Trail {label} reports no S3BucketName.",
+            resolution="No action required.",
+            reference=S3_OBJECT_LOCK_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    state, text = _archive_bucket_lock(bucket, lock_cache)
+    if state == "ok":
+        return create_finding(
+            check_id="AC-26",
+            finding_name=finding_name,
+            finding_details=f"Trail {label} writes to {text}.",
+            resolution="No action required.",
+            reference=S3_OBJECT_LOCK_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+    if state == "unread":
+        return create_finding(
+            check_id="AC-26",
+            finding_name=finding_name,
+            finding_details=(
+                f"Trail {label} writes to bucket '{bucket}', whose Object Lock "
+                f"was not read: {text}."
+            ),
+            resolution=(
+                "Confirm in the account that owns the bucket that Object Lock "
+                "default retention is in COMPLIANCE mode."
+            ),
+            reference=S3_OBJECT_LOCK_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    return create_finding(
+        check_id="AC-26",
+        finding_name=finding_name,
+        finding_details=(
+            f"Trail {label} writes to {text}, so a principal allowed to delete "
+            "objects there can remove its log files."
+        ),
+        resolution=(
+            "Enable Object Lock on the trail bucket with a default retention in "
+            "COMPLIANCE mode."
+        ),
+        reference=S3_OBJECT_LOCK_REFERENCE_URL,
+        severity=SeverityEnum.MEDIUM,
+        status=StatusEnum.FAILED,
+    )
 
 
 def _agentcore_span_log_deletion_protection_finding() -> Optional[Dict[str, Any]]:
@@ -36211,6 +36338,11 @@ def lambda_handler(event, context):
                 ["AC-26"],
                 "Log Archive Forwarding",
                 check_agentcore_log_archive_forwarding,
+            ),
+            (
+                ["AC-26"],
+                "Trail Bucket Object Lock",
+                check_agentcore_trail_bucket_object_lock,
             ),
             (
                 ["AC-27"],

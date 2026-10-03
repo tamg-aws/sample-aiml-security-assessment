@@ -49727,3 +49727,118 @@ class TestAC26LogArchiveForwarding:
     def test_the_handler_runs_the_archive_leg(self):
         source = inspect.getsource(agentcore_app.lambda_handler)
         assert "check_agentcore_log_archive_forwarding" in source
+
+
+class TestAC26TrailBucketObjectLock:
+    """AIR-FND-DET-09: each trail recording the Region writes to a bucket with
+    Object Lock default retention in COMPLIANCE mode."""
+
+    @staticmethod
+    def _trail(name, bucket, multi_region=True, home="us-east-1"):
+        return {
+            "Name": name,
+            "TrailARN": f"arn:aws:cloudtrail:{home}:123456789012:trail/{name}",
+            "HomeRegion": home,
+            "IsMultiRegionTrail": multi_region,
+            "S3BucketName": bucket,
+        }
+
+    def _run(self, trails, locks, errors=()):
+        mock_ct = MagicMock()
+        mock_ct.meta.region_name = "us-east-1"
+        mock_ct.list_trails.return_value = {
+            "Trails": [{"Name": t["Name"], "TrailARN": t["TrailARN"]} for t in trails]
+        }
+        by_arn = {t["TrailARN"]: t for t in trails}
+
+        def get_trail(Name):
+            if Name in errors:
+                raise _make_client_error("AccessDeniedException")
+            return {"Trail": by_arn[Name]}
+
+        mock_ct.get_trail.side_effect = get_trail
+        mock_s3 = MagicMock()
+
+        def get_object_lock_configuration(Bucket=None, **_):
+            value = locks[Bucket]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        mock_s3.get_object_lock_configuration.side_effect = (
+            get_object_lock_configuration
+        )
+        with (
+            patch("agentcore_app.cloudtrail_client", mock_ct),
+            patch("agentcore_app.s3_client", mock_s3),
+        ):
+            findings = agentcore_app.check_agentcore_trail_bucket_object_lock()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-26"
+            assert finding["Finding"] == "AgentCore Trail Bucket Object Lock"
+            assert_finding_schema(finding)
+        self.s3 = mock_s3
+        return {f["Finding_Details"].split()[1]: f for f in findings}
+
+    _LOCKED = TestAC26LogArchiveForwarding._lock()
+
+    def test_a_locked_bucket_passes_beside_an_unlocked_one(self):
+        good = self._trail("good", "locked-bucket")
+        bad = self._trail("bad", "open-bucket", multi_region=False)
+        rows = self._run(
+            [good, bad],
+            {
+                "locked-bucket": self._LOCKED,
+                "open-bucket": _make_client_error(
+                    "ObjectLockConfigurationNotFoundError"
+                ),
+            },
+        )
+        assert rows[good["TrailARN"]]["Status"] == "Passed"
+        assert "COMPLIANCE mode" in rows[good["TrailARN"]]["Finding_Details"]
+        assert rows[bad["TrailARN"]]["Status"] == "Failed"
+        assert "Object Lock off" in rows[bad["TrailARN"]]["Finding_Details"]
+
+    def test_governance_mode_fails(self):
+        trail = self._trail("t", "gov-bucket")
+        rows = self._run(
+            [trail],
+            {"gov-bucket": TestAC26LogArchiveForwarding._lock(mode="GOVERNANCE")},
+        )
+        assert rows[trail["TrailARN"]]["Status"] == "Failed"
+
+    def test_a_trail_elsewhere_is_not_judged(self):
+        here = self._trail("here", "locked-bucket")
+        elsewhere = self._trail(
+            "elsewhere", "other-bucket", multi_region=False, home="us-west-2"
+        )
+        rows = self._run(
+            [here, elsewhere],
+            {"locked-bucket": self._LOCKED, "other-bucket": self._LOCKED},
+        )
+        assert set(rows) == {here["TrailARN"]}
+
+    def test_an_unreadable_bucket_or_trail_is_na(self):
+        org = self._trail("org", "archive-account-bucket")
+        hidden = self._trail("hidden", "x")
+        rows = self._run(
+            [org, hidden],
+            {"archive-account-bucket": _make_client_error("AccessDenied")},
+            errors=(hidden["TrailARN"],),
+        )
+        assert rows[org["TrailARN"]]["Status"] == "N/A"
+        assert (
+            "s3:GetBucketObjectLockConfiguration"
+            in rows[org["TrailARN"]]["Finding_Details"]
+        )
+        assert rows[hidden["TrailARN"]]["Status"] == "N/A"
+
+    def test_a_shared_bucket_is_read_once(self):
+        trails = [self._trail("a", "locked-bucket"), self._trail("b", "locked-bucket")]
+        rows = self._run(trails, {"locked-bucket": self._LOCKED})
+        assert {row["Status"] for row in rows.values()} == {"Passed"}
+        assert self.s3.get_object_lock_configuration.call_count == 1
+
+    def test_the_handler_runs_the_trail_bucket_leg(self):
+        source = inspect.getsource(agentcore_app.lambda_handler)
+        assert "check_agentcore_trail_bucket_object_lock" in source

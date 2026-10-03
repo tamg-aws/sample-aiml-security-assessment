@@ -1387,6 +1387,27 @@ MUTATIONS = [
         "find": "    if destination not in stream_cache:\n",
         "replace": "    if True:\n",
     },
+    {
+        "name": "AC-26 judges a trail bucket of another region",
+        "file": AGENTCORE,
+        "defect": "a single-Region trail homed elsewhere was judged for this Region",
+        "find": '        if not detail.get("IsMultiRegionTrail") and detail.get("HomeRegion") != region:\n            continue\n        findings.append(\n            _trail_bucket_lock_finding(',
+        "replace": "        findings.append(\n            _trail_bucket_lock_finding(",
+    },
+    {
+        "name": "AC-26 reads an unread trail bucket as clean",
+        "file": AGENTCORE,
+        "defect": "a denied trail-bucket read produced a row that was not N/A",
+        "find": '    if state == "unread":\n        return create_finding(\n            check_id="AC-26",\n            finding_name=finding_name,\n',
+        "replace": '    if state == "unread":\n        state = "ok"\n    if False:\n        return create_finding(\n            check_id="AC-26",\n            finding_name=finding_name,\n',
+    },
+    {
+        "name": "AC-26 drops the trail bucket verdict",
+        "file": AGENTCORE,
+        "defect": "an unlocked trail bucket was reported Passed",
+        "find": '    if state == "ok":\n        return create_finding(\n            check_id="AC-26",\n            finding_name=finding_name,\n            finding_details=f"Trail {label} writes to {text}.",\n',
+        "replace": '    if True:\n        return create_finding(\n            check_id="AC-26",\n            finding_name=finding_name,\n            finding_details=f"Trail {label} writes to {text}.",\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -1696,6 +1717,9 @@ GROUPS: dict[str, str] = {
     "AC-26 skips the spans group": "in the AgentCore verdict legs",
     "AC-26 drops the no-filter verdict": "in the AgentCore verdict legs",
     "AC-26 describes a stream once per group": "in the AgentCore verdict legs",
+    "AC-26 judges a trail bucket of another region": "in the AgentCore verdict legs",
+    "AC-26 reads an unread trail bucket as clean": "in the AgentCore verdict legs",
+    "AC-26 drops the trail bucket verdict": "in the AgentCore verdict legs",
 }
 
 

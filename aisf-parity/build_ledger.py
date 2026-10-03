@@ -1673,8 +1673,9 @@ FOUNDATION_ROWS = [
         "destination, GOVERNANCE mode or no default retention fails. A CloudWatch "
         "Logs destination, a Kinesis or Lambda target, another account's stream or "
         "a failed read is N/A naming it, so the cross-account Log Archive pattern "
-        "the control prescribes reads N/A from the member account. Object Lock on "
-        "the CloudTrail bucket is not read",
+        "the control prescribes reads N/A from the member account. Each trail "
+        "recording the Region gets a row on its S3BucketName's Object Lock, judged "
+        "the same way, and an unread trail or bucket is N/A",
         [],
         6,
     ),
