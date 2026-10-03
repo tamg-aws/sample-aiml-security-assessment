@@ -60,7 +60,7 @@
         "Guardrail Sensitive Information Filter Check",
         "Deployed Guardrail Sensitive Information Filter"
       ],
-      "gap": "",
+      "gap": "BR-26 judges entity and regex actions on the input and output sides of each draft and deployed guardrail version. Each deployed version that passes those settings is then applied once with bedrock:ApplyGuardrail, source OUTPUT and outputScope INTERVENTIONS, to a fixed probe string built from AWS's documented example access key and secret key: both blocked or anonymized is Passed, either let through is Failed, and an ApplyGuardrail error is N/A. PASSWORD detection of the probe text and the custom regex patterns are stated, not judged",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",

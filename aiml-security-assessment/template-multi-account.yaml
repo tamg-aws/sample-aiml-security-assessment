@@ -487,6 +487,17 @@ Resources:
             Action:
               - s3:ListBucket # BR-26
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+          - Sid: GuardrailOutputProbe
+            # BR-26 applies each deployed guardrail version that passes its
+            # settings test once to a fixed probe string on the OUTPUT source.
+            # The service authorization reference gives ApplyGuardrail the
+            # guardrail and guardrail-profile resource types.
+            Effect: Allow
+            Action:
+              - bedrock:ApplyGuardrail # BR-26
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail-profile/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

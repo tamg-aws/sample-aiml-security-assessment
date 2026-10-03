@@ -24,7 +24,7 @@ Generated 2026-10-03 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 |---|---|---|---|---|---|
 | `AIR-BDR-GRD-01` | covered | — | `bedrock_assessments` | `BR-10` | — |
 | `AIR-BDR-GRD-02` | covered | — | `bedrock_assessments` | `BR-34` | — |
-| `AIR-BDR-GRD-03` | covered | — | `bedrock_assessments` | `BR-26` | — |
+| `AIR-BDR-GRD-03` | covered | — | `bedrock_assessments` | `BR-26` | BR-26 judges entity and regex actions on the input and output sides of each draft and deployed guardrail version. Each deployed version that passes those settings is then applied once with bedrock:ApplyGuardrail, source OUTPUT and outputScope INTERVENTIONS, to a fixed probe string built from AWS's documented example access key and secret key: both blocked or anonymized is Passed, either let through is Failed, and an ApplyGuardrail error is N/A. PASSWORD detection of the probe text and the custom regex patterns are stated, not judged |
 | `AIR-BDR-GRD-04` | covered | — | `bedrock_assessments` | `BR-32` | — |
 | `AIR-BDR-GRD-09` | covered | — | `bedrock_assessments` | `BR-27` | — |
 | `AIR-BDR-GRD-10` | covered | — | `bedrock_assessments` | `BR-41` | — |

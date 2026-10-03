@@ -32211,6 +32211,161 @@ def test_handler_reports_guardrail_condition_pins_unread_without_a_cache():
     assert "IAM permissions cache was unavailable" in received["errors"][0]
 
 
+_PROBE_PASSING_DETAIL = {
+    "sensitiveInformationPolicy": {
+        "piiEntities": [
+            {"type": t, "inputAction": "BLOCK", "outputAction": "ANONYMIZE"}
+            for t in ("AWS_ACCESS_KEY", "AWS_SECRET_KEY", "PASSWORD")
+        ],
+        "regexes": [{"name": "k", "pattern": "k", "outputAction": "BLOCK"}],
+    }
+}
+
+
+def _probe_response(action, **entities):
+    return {
+        "action": action,
+        "assessments": [
+            {
+                "sensitiveInformationPolicy": {
+                    "piiEntities": [
+                        {"type": t, "action": a, "match": "redacted-by-test"}
+                        for t, a in entities.items()
+                    ]
+                }
+            }
+        ],
+    }
+
+
+def _probe_rows(versions, responses):
+    client = MagicMock()
+    regions = []
+
+    def make_client(service, region_name=None, **_):
+        regions.append((service, region_name))
+        return client
+
+    def apply_guardrail(guardrailIdentifier, guardrailVersion, **kwargs):
+        client.calls.append((guardrailIdentifier, guardrailVersion, kwargs))
+        value = responses[(guardrailIdentifier, guardrailVersion)]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    client.calls = []
+    client.apply_guardrail.side_effect = apply_guardrail
+    inventory = {
+        "versions": {
+            key: {
+                "surfaces": [f"agent '{key[0]}'"],
+                "narrowings": {},
+                "detail": detail,
+                "error": "" if detail else "AccessDeniedException",
+                "region": region,
+            }
+            for key, (detail, region) in versions.items()
+        }
+    }
+    with patch.object(bedrock_app.boto3, "client", side_effect=make_client):
+        rows = bedrock_app._sensitive_output_probe_findings("us-east-1", inventory)
+    return rows, client.calls, regions
+
+
+def test_br26_output_probe_passes_a_masking_version_and_fails_one_that_lets_keys_through():
+    rows, calls, _ = _probe_rows(
+        {
+            ("gr-a", "1"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+            ("gr-b", "2"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+        },
+        {
+            ("gr-a", "1"): _probe_response(
+                "GUARDRAIL_INTERVENED",
+                AWS_ACCESS_KEY="BLOCKED",
+                AWS_SECRET_KEY="ANONYMIZED",
+            ),
+            ("gr-b", "2"): _probe_response("NONE"),
+        },
+    )
+    assert [(r["Check_ID"], r["Status"]) for r in rows] == [
+        ("BR-26", "Passed"),
+        ("BR-26", "Failed"),
+    ]
+    assert (
+        "returned action GUARDRAIL_INTERVENED for the guardrail gr-a version 1 "
+        "(applied by agent 'gr-a'): AWS_ACCESS_KEY BLOCKED; AWS_SECRET_KEY "
+        "ANONYMIZED; PASSWORD not reported." in rows[0]["Finding_Details"]
+    )
+    assert (
+        "returned action NONE for the guardrail gr-b version 2"
+        in (rows[1]["Finding_Details"])
+    )
+    assert (
+        "AWS_ACCESS_KEY, AWS_SECRET_KEY was not blocked" in (rows[1]["Finding_Details"])
+    )
+    assert rows[1]["Severity"] == "High"
+    for identifier, version, kwargs in calls:
+        assert kwargs["source"] == "OUTPUT"
+        assert kwargs["outputScope"] == "INTERVENTIONS"
+        assert kwargs["content"] == [
+            {"text": {"text": bedrock_app.SENSITIVE_OUTPUT_PROBE_TEXT}}
+        ]
+    assert [(i, v) for i, v, _ in calls] == [("gr-a", "1"), ("gr-b", "2")]
+    assert "redacted-by-test" not in " ".join(r["Finding_Details"] for r in rows)
+
+
+def test_br26_output_probe_fails_a_version_that_masks_only_one_key():
+    rows, _, _ = _probe_rows(
+        {("gr-a", "1"): (_PROBE_PASSING_DETAIL, "us-east-1")},
+        {
+            ("gr-a", "1"): _probe_response(
+                "GUARDRAIL_INTERVENED", AWS_ACCESS_KEY="BLOCKED", AWS_SECRET_KEY="NONE"
+            )
+        },
+    )
+    assert [r["Status"] for r in rows] == ["Failed"]
+    assert "AWS_SECRET_KEY was not blocked" in rows[0]["Finding_Details"]
+    assert "AWS_ACCESS_KEY, " not in rows[0]["Finding_Details"]
+
+
+def test_br26_output_probe_error_is_na_and_does_not_hide_the_next_version():
+    rows, calls, _ = _probe_rows(
+        {
+            ("gr-a", "1"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+            ("gr-b", "1"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+        },
+        {
+            ("gr-a", "1"): _make_client_error("AccessDeniedException"),
+            ("gr-b", "1"): _probe_response(
+                "GUARDRAIL_INTERVENED",
+                AWS_ACCESS_KEY="ANONYMIZED",
+                AWS_SECRET_KEY="ANONYMIZED",
+            ),
+        },
+    )
+    assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+    assert (
+        "was not probed with bedrock:ApplyGuardrail (AccessDenied"
+        in (rows[0]["Finding_Details"])
+    )
+    assert len(calls) == 2
+
+
+def test_br26_output_probe_skips_failing_and_unread_versions_and_uses_their_region():
+    failing = {"sensitiveInformationPolicy": {"piiEntities": []}}
+    rows, calls, regions = _probe_rows(
+        {
+            ("gr-fail", "1"): (failing, "us-east-1"),
+            ("gr-unread", "1"): (None, "us-east-1"),
+            ("gr-west", "3"): (_PROBE_PASSING_DETAIL, "us-west-2"),
+        },
+        {("gr-west", "3"): _probe_response("NONE")},
+    )
+    assert [(i, v) for i, v, _ in calls] == [("gr-west", "3")]
+    assert regions == [("bedrock-runtime", "us-west-2")]
+    assert [r["Status"] for r in rows] == ["Failed"]
+
+
 def _memory_client(pages, memories, list_error=None):
     """A control-plane client: ListMemories pages, then GetMemory per id."""
     client = MagicMock()

@@ -36,7 +36,22 @@ FOUNDATION = "foundation"  # the account or runtime an AI workload sits on
 AI_SUBJECT_ROWS = [
     # ---------------- BDR: 19 controls, bedrock_assessments ----------------
     ("AIR-BDR-GRD-01", COVERED, None, "bedrock_assessments", ["BR-10"], "", [], 3),
-    ("AIR-BDR-GRD-03", COVERED, None, "bedrock_assessments", ["BR-26"], "", [], 3),
+    (
+        "AIR-BDR-GRD-03",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-26"],
+        "BR-26 judges entity and regex actions on the input and output sides of each "
+        "draft and deployed guardrail version. Each deployed version that passes those "
+        "settings is then applied once with bedrock:ApplyGuardrail, source OUTPUT and "
+        "outputScope INTERVENTIONS, to a fixed probe string built from AWS's documented "
+        "example access key and secret key: both blocked or anonymized is Passed, either "
+        "let through is Failed, and an ApplyGuardrail error is N/A. PASSWORD detection "
+        "of the probe text and the custom regex patterns are stated, not judged",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-KB-03",
         COVERED,

@@ -630,16 +630,17 @@ def get_guardrail_attachment_inventory(
                     attachment["narrowings"]
                 )
             continue
+        target_region = attachment["region"]
         entry = {
             "surfaces": [attachment["surface"]],
             "narrowings": {},
             "detail": None,
             "error": "",
+            "region": target_region,
         }
         if attachment.get("narrowings"):
             entry["narrowings"][attachment["surface"]] = attachment["narrowings"]
         inventory["versions"][key] = entry
-        target_region = attachment["region"]
         if target_region not in clients:
             clients[target_region] = boto3.client(
                 "bedrock", config=boto3_config, region_name=target_region
@@ -16023,6 +16024,139 @@ SENSITIVE_INFORMATION_RESOLUTION = (
 )
 
 
+SENSITIVE_OUTPUT_PROBE_FINDING = "Deployed Guardrail Sensitive Information Output Probe"
+
+SENSITIVE_OUTPUT_PROBE_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-use-independent-api.html"
+
+# A fixed probe string built from AWS's documented example credentials, so the
+# probe sends nothing from the account and nothing that authenticates.
+SENSITIVE_OUTPUT_PROBE_TEXT = (
+    "Assessment probe. Access key ID: "
+    "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret - AWS's documented example id
+    ". Secret access key: "
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret - AWS's documented example secret key
+    ". Password: Example-Passw0rd-1."  # pragma: allowlist secret - fixed probe text
+)
+
+# The two types whose example values follow AWS's own credential formats. Whether
+# the PASSWORD type detects the probe's password is not established, so its
+# outcome is stated and not judged.
+SENSITIVE_OUTPUT_PROBE_TYPES = ("AWS_ACCESS_KEY", "AWS_SECRET_KEY")
+
+
+def _sensitive_output_probe_findings(
+    region: str, attachment_inventory: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Apply each deployed guardrail version that passes the static BR-26 test to
+    the fixed probe string on the OUTPUT source, once, and report whether it
+    blocked or anonymized both example credentials.
+
+    outputScope INTERVENTIONS keeps the response to what the guardrail acted on,
+    and only the action and each entity's type and action are read.
+    """
+
+    def row(details: str, resolution: str, severity: str, status: str):
+        return create_finding(
+            check_id="BR-26",
+            finding_name=SENSITIVE_OUTPUT_PROBE_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=SENSITIVE_OUTPUT_PROBE_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    clients, rows = {}, []
+    for (identifier, version), entry in sorted(
+        (attachment_inventory.get("versions") or {}).items()
+    ):
+        if entry.get("detail") is None:
+            continue
+        if _sensitive_information_verdict(entry["detail"])[0] != "Passed":
+            continue
+        label = "guardrail {} version {} (applied by {})".format(
+            identifier, version, ", ".join(entry["surfaces"])
+        )
+        target_region = entry.get("region") or region
+        try:
+            if target_region not in clients:
+                clients[target_region] = boto3.client(
+                    "bedrock-runtime", config=boto3_config, region_name=target_region
+                )
+            response = clients[target_region].apply_guardrail(
+                guardrailIdentifier=identifier,
+                guardrailVersion=version,
+                source="OUTPUT",
+                content=[{"text": {"text": SENSITIVE_OUTPUT_PROBE_TEXT}}],
+                outputScope="INTERVENTIONS",
+            )
+        except (ClientError, BotoCoreError) as error:
+            rows.append(
+                row(
+                    f"The {label} was not probed with bedrock:ApplyGuardrail "
+                    f"({get_assessment_error_label(error)}), so whether it acts on "
+                    "credentials in model output was not observed.",
+                    "Grant bedrock:ApplyGuardrail on the guardrail and re-run the "
+                    "assessment.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            continue
+        acted = {}
+        for assessment in response.get("assessments") or []:
+            policy = assessment.get("sensitiveInformationPolicy") or {}
+            for entity in policy.get("piiEntities") or []:
+                acted.setdefault(str(entity.get("type")), set()).add(
+                    str(entity.get("action"))
+                )
+        outcomes = "; ".join(
+            "{} {}".format(
+                entity_type,
+                "/".join(sorted(acted[entity_type]))
+                if entity_type in acted
+                else "not reported",
+            )
+            for entity_type in SENSITIVE_OUTPUT_PROBE_TYPES + ("PASSWORD",)
+        )
+        missing = [
+            entity_type
+            for entity_type in SENSITIVE_OUTPUT_PROBE_TYPES
+            if not acted.get(entity_type, set()) & {"BLOCKED", "ANONYMIZED"}
+        ]
+        action = str(response.get("action"))
+        probe = (
+            f"ApplyGuardrail with source OUTPUT on a fixed probe string holding "
+            f"AWS's documented example access key and secret key returned action "
+            f"{action} for the {label}: {outcomes}."
+        )
+        if action == "GUARDRAIL_INTERVENED" and not missing:
+            rows.append(
+                row(
+                    f"{probe} Both example credentials were blocked or anonymized. "
+                    "PASSWORD detection of the probe text and the custom regexes "
+                    "are not judged by this probe.",
+                    "No action required",
+                    "Low",
+                    "Passed",
+                )
+            )
+        else:
+            rows.append(
+                row(
+                    f"{probe} {', '.join(missing) or 'The response'} was not blocked "
+                    "or anonymized, although the version's static settings pass, so "
+                    "model output carrying such a credential is returned unmasked.",
+                    SENSITIVE_INFORMATION_RESOLUTION,
+                    "High",
+                    "Failed",
+                )
+            )
+    return rows
+
+
 def _comprehend_redaction_outputs(region: str) -> Tuple[List[Dict[str, str]], str]:
     """
     List the S3 output location, redacted entity types, mask mode and end
@@ -16201,6 +16335,7 @@ def check_bedrock_guardrail_pii_filters(
             SENSITIVE_INFORMATION_RESOLUTION,
             "High",
         )
+        deployed.extend(_sensitive_output_probe_findings(region, attachment_inventory))
         if knowledge_base_inventory is None:
             knowledge_base_inventory = get_knowledge_base_screening_inventory(
                 region, attachment_inventory

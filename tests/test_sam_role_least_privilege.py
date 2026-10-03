@@ -150,6 +150,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
+        "bedrock:ApplyGuardrail",
         "bedrock:ListIngestionJobs",
         "cloudtrail:GetEventDataStore",
         "ecs:DescribeTasks",
@@ -824,6 +825,22 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
             ),
             scoped("s3:ListBucket", "s3:::*"),
+            (
+                "Allow",
+                "bedrock:ApplyGuardrail",
+                json.dumps(
+                    [
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                            "${AWS::AccountId}:guardrail/*"
+                        },
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                            "${AWS::AccountId}:guardrail-profile/*"
+                        },
+                    ]
+                ),
+            ),
             scoped(
                 "bedrock-agentcore:GetBrowser",
                 "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
