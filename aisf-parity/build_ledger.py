@@ -1180,8 +1180,9 @@ AI_SUBJECT_ROWS = [
         "attached to the root, an OU in the account's path or the account assigns "
         'optOut and sets ["@@none"] at services, services.default and '
         "services.default.opt_out_policy. A lock on the value alone lets a child add a "
-        "service section that opts back in, so it fails, and an unread path or policy "
-        "is N/A. optOut and optIn are compared exactly, as the policy syntax spells "
+        "service section that opts back in, so it fails, as does a locking policy "
+        'that sets a child operator other than ["@@none"] on a section below its '
+        "lock, and an unread path or policy is N/A. optOut and optIn are compared exactly, as the policy syntax spells "
         "them. The policy type does not govern Amazon Bedrock, and every row says it "
         "does not establish how Bedrock handles content",
         [],
@@ -1743,9 +1744,10 @@ FOUNDATION_ROWS = [
         "NitroTPMPCR<n> for NitroTPM. Both are judged and each row names the "
         "family. An exact value on any of those keys pins the key. An "
         "enclave-bound key fails when no statement pins it, and when an Allow "
-        "grants kms:Decrypt, kms:DeriveSharedSecret, kms:GenerateDataKey or "
-        "kms:GenerateDataKeyPair with no attestation condition and no Deny covers "
-        "it. A Deny to every principal counts when it covers all four operations "
+        "grants kms:Decrypt, kms:DeriveSharedSecret, kms:GenerateDataKey, "
+        "kms:GenerateDataKeyPair or kms:ReEncryptFrom, which carries no "
+        "attestation, with no attestation condition and no Deny covers "
+        "it. A Deny to every principal counts when it covers all five operations "
         "and tests the attestation key with Null true or a negated operator. A "
         "positive operator, with or without IfExists, does not count. The default "
         "statement that grants the account root is such a bypass unless it "
@@ -1756,7 +1758,7 @@ FOUNDATION_ROWS = [
         "PCR8) and an exact deployment value (PCR3 or PCR4), each in itself or "
         "through a single-test Deny, because the image file is not secret, so a "
         "PCR3-only pin fails. A Deny narrowed by another condition key is not credited. Every "
-        "grant is read, and a grant of the four operations fails the key unless a "
+        "grant is read, and a grant of the five operations fails the key unless a "
         "Deny covers it; unread grants are N/A. Which workloads must be "
         "enclave-bound is the customer's decision, and no API records it, so a key "
         "without the condition is never failed",

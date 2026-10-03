@@ -29506,13 +29506,18 @@ ATTESTATION_BINDING_KEY = re.compile(
 
 NITRO_TPM_KEY_PREFIX = ATTESTATION_CONDITION_PREFIX + "nitrotpmpcr"
 
-# The key operations that honor RecipientAttestation. GenerateRandom also does,
-# but it takes no key, so a key policy cannot grant it.
+# The key operations that honor RecipientAttestation, and kms:ReEncryptFrom.
+# GenerateRandom also honors it, but it takes no key, so a key policy cannot
+# grant it. ReEncrypt has no Recipient member in botocore, so it never carries
+# attestation: an Allow on ReEncryptFrom moves the plaintext under another key
+# off the attested path, and only a Deny that fires on an absent attestation
+# key, or no grant at all, closes it.
 ENCLAVE_SENSITIVE_ACTIONS = (
     "kms:decrypt",
     "kms:derivesharedsecret",
     "kms:generatedatakey",
     "kms:generatedatakeypair",
+    "kms:reencryptfrom",
 )
 
 
@@ -29541,6 +29546,7 @@ ENCLAVE_SENSITIVE_GRANT_OPERATIONS = {
     "DeriveSharedSecret": "kms:derivesharedsecret",
     "GenerateDataKey": "kms:generatedatakey",
     "GenerateDataKeyPair": "kms:generatedatakeypair",
+    "ReEncryptFrom": "kms:reencryptfrom",
 }
 
 
@@ -29920,8 +29926,8 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     f"KMS key {key_id} declares a {family} attestation condition, "
                     f"but {'; '.join(deficiencies)}.",
                     "Require an exact attestation measurement on every key policy "
-                    "statement that allows decryption, shared secret derivation "
-                    "or data key generation, including the statement that "
+                    "statement that allows decryption, shared secret derivation, "
+                    "data key generation or kms:ReEncryptFrom, including the statement that "
                     "delegates to the account root. Where that statement must "
                     "stay unconditioned, add a Deny statement for every "
                     "principal on those operations with a Null condition that "
@@ -29941,9 +29947,11 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "bind a Nitro Enclave pin to its image through ImageSha384, "
                     "PCR0 or PCR8 and to its deployment through PCR3 or PCR4, and allow decryption, shared secret derivation and "
                     "data key generation only with attestation, through the key "
-                    "policy and every grant: {}.".format(
-                        len(passed), ", ".join(passed[:5])
-                    ),
+                    "policy and every grant. Re-encryption out of the key "
+                    "(kms:ReEncryptFrom), which carries no attestation, is "
+                    "allowed only by a statement that requires attestation or "
+                    "is refused by a Deny, so no grant or statement releases it "
+                    "unattested: {}.".format(len(passed), ", ".join(passed[:5])),
                     "No action required",
                     "High",
                     "Passed",
@@ -31024,11 +31032,15 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
     delegation. ``locking`` names each policy attached to the root that locks
     the default at every placement, ``locked_below`` each such policy attached
     only below the root, which binds no policy attached above it, and ``open``
-    names what each other policy leaves open.
+    names what each other policy leaves open. ``locking_delegating`` names each
+    locking policy that also sets a child operator other than ["@@none"] on a
+    node below its lock, such as a services.lex section that allows @@assign,
+    which leaves that service's value open to a child policy.
     """
     result = {
         "readable": False,
         "delegating": [],
+        "locking_delegating": [],
         "errors": [],
         "locking": [],
         "locked_below": [],
@@ -31132,6 +31144,11 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
             result["open"].append(f"{described}: {'; '.join(gaps)}")
         elif any(target.get("TargetId") == root_id for target in targets):
             result["locking"].append(described)
+            if delegated:
+                result["locking_delegating"].append(
+                    f"{described} delegates {', '.join(delegated)} to child "
+                    "policies below its lock"
+                )
         else:
             result["locked_below"].append(described)
 
@@ -31317,6 +31334,7 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
             overrides = {
                 "readable": False,
                 "delegating": [],
+                "locking_delegating": [],
                 "errors": [
                     "the source opt-out policy documents could not be read: "
                     f"{get_assessment_error_label(error)}"
@@ -31441,6 +31459,40 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                     reference=AI_SERVICES_OPT_OUT_REFERENCE,
                     severity="Informational",
                     status="N/A",
+                    region=region,
+                )
+            )
+        elif (
+            default_opts_out
+            and not scope["opted_in"]
+            and overrides["locking_delegating"]
+        ):
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        '{}, and {} sets ["@@none"] at {}, but the same policy '
+                        "sets a child operator below that lock: {}. A child "
+                        "policy can change the value of a section whose own "
+                        "@@operators_allowed_for_child_policies allows it, so a "
+                        "service can be opted back in.".format(
+                            effective_clause,
+                            " and ".join(overrides["locking"][:3]),
+                            lock_placements,
+                            "; ".join(overrides["locking_delegating"][:3]),
+                        )
+                    ),
+                    resolution=(
+                        "Remove the @@operators_allowed_for_child_policies entries "
+                        'other than ["@@none"] from the service sections of the '
+                        "root-attached opt-out policy, or set them to "
+                        '["@@none"].'
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
                     region=region,
                 )
             )

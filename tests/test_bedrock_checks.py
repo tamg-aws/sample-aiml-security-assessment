@@ -23946,6 +23946,33 @@ class TestBR48AIServicesOptOut:
         )
         assert_finding_schema(findings[0])
 
+    def test_br48_a_root_lock_that_delegates_a_service_section_fails(self):
+        # DAT-09: the lock at services, services.default and the value holds, but
+        # the same root policy lets child policies @@assign under services.lex,
+        # so a child can opt Lex back in. The plain lock beside it still passes.
+        delegating = json.loads(json.dumps(self.LOCKED))
+        delegating["services"]["lex"] = {
+            "@@operators_allowed_for_child_policies": ["@@assign"],
+            "opt_out_policy": {"@@assign": "optOut"},
+        }
+        effective = {"services": {"default": {"opt_out_policy": "optOut"}}}
+        findings = self._run(
+            effective_content=effective,
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": delegating},
+        )
+        clean = self._run(
+            effective_content=effective,
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": self.LOCKED},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "'ai-lock' (attached to root r-root) delegates @@assign" in details
+        assert "no policy attached below it can opt a service back in" not in details
+        assert [f["Status"] for f in clean] == ["Passed"]
+
     def test_br48_opt_out_value_is_compared_case_sensitively(self):
         findings = self._run(
             effective_content={
@@ -30332,7 +30359,12 @@ class TestBR55EnclaveKeyBinding:
             "Sid": "DenyOtherParents",
             "Effect": "Deny",
             "Principal": "*",
-            "Action": ["kms:Decrypt", "kms:DeriveSharedSecret", "kms:GenerateDataKey*"],
+            "Action": [
+                "kms:Decrypt",
+                "kms:DeriveSharedSecret",
+                "kms:GenerateDataKey*",
+                "kms:ReEncryptFrom",
+            ],
             "Resource": "*",
             "Condition": {"StringNotEqualsIgnoreCase": {self.PCR3: self.DIGEST}},
         }
@@ -30402,7 +30434,7 @@ class TestBR55EnclaveKeyBinding:
         assert "to the account" not in details
         assert (
             f"statement 'Enable IAM User Permissions' releases kms:decrypt, "
-            f"kms:derivesharedsecret, kms:generatedatakey, kms:generatedatakeypair "
+            f"kms:derivesharedsecret, kms:generatedatakey, kms:generatedatakeypair, kms:reencryptfrom "
             f"{self.DEPLOYMENT_GAP}" in details
         )
 
@@ -30474,7 +30506,8 @@ class TestBR55EnclaveKeyBinding:
         assert "arn:k/b-root" in rows[0]["Finding_Details"]
         assert (
             "grants kms:decrypt, kms:derivesharedsecret, kms:generatedatakey, "
-            "kms:generatedatakeypair to the account" in rows[0]["Finding_Details"]
+            "kms:generatedatakeypair, kms:reencryptfrom to the account"
+            in rows[0]["Finding_Details"]
         )
         assert (
             "declares a Nitro Enclave attestation condition"
@@ -30542,7 +30575,12 @@ class TestBR55EnclaveKeyBinding:
             "Sid": "DenyUnattested",
             "Effect": "Deny",
             "Principal": "*",
-            "Action": ["kms:Decrypt", "kms:DeriveSharedSecret", "kms:GenerateDataKey*"],
+            "Action": [
+                "kms:Decrypt",
+                "kms:DeriveSharedSecret",
+                "kms:GenerateDataKey*",
+                "kms:ReEncryptFrom",
+            ],
             "Resource": "*",
             "Condition": {
                 "StringNotEqualsIgnoreCase": {
@@ -30577,6 +30615,7 @@ class TestBR55EnclaveKeyBinding:
                 "kms:DeriveSharedSecret",
                 "kms:GenerateDataKey*",
                 "kms:GenerateRandom",
+                "kms:ReEncryptFrom",
             ]
         return statement
 
@@ -30616,7 +30655,9 @@ class TestBR55EnclaveKeyBinding:
             assert "to the account" in rows[1]["Finding_Details"], deny
 
     def test_br55_null_deny_omitting_derive_shared_secret_fails(self):
-        deny = self._null_deny(action=["kms:Decrypt", "kms:GenerateDataKey*"])
+        deny = self._null_deny(
+            action=["kms:Decrypt", "kms:GenerateDataKey*", "kms:ReEncryptFrom"]
+        )
         _, rows, _ = self._run(
             {
                 "a-denied": [self.ROOT, self._enclave_allow(), self._null_deny()],
@@ -30767,7 +30808,7 @@ class TestBR55EnclaveKeyBinding:
             "Sid": "DenyUnattested",
             "Effect": "Deny",
             "Principal": "*",
-            "Action": ["kms:Decrypt", "kms:GenerateDataKey*"],
+            "Action": ["kms:Decrypt", "kms:GenerateDataKey*", "kms:ReEncryptFrom"],
             "Resource": "*",
             "Condition": {
                 "StringNotEqualsIgnoreCase": {
@@ -30912,7 +30953,7 @@ class TestBR55EnclaveKeyBinding:
         assert "arn:k/b-whole" in rows[1]["Finding_Details"]
         assert (
             "statement 'Enable IAM User Permissions' releases kms:decrypt, "
-            "kms:derivesharedsecret, kms:generatedatakey, kms:generatedatakeypair "
+            "kms:derivesharedsecret, kms:generatedatakey, kms:generatedatakeypair, kms:reencryptfrom "
             f"{self.IMAGE_GAP}" in rows[1]["Finding_Details"]
         )
         assert self.DEPLOYMENT_GAP not in rows[1]["Finding_Details"]
@@ -30992,6 +31033,44 @@ class TestBR55EnclaveKeyBinding:
         assert "arn:k/b-denied" in rows[1]["Finding_Details"]
         assert "arn:k/c-harmless" in rows[1]["Finding_Details"]
         kms.list_grants.assert_any_call(KeyId="arn:k/a-granted", Limit=100, Marker="1")
+
+    def test_br55_unattested_re_encrypt_from_is_a_bypass(self):
+        # DAT-10: ReEncrypt has no Recipient, so an Allow or a grant of
+        # ReEncryptFrom moves the plaintext under another key with no
+        # attestation. The same key with only its pinned Allow still passes.
+        reencrypt = {
+            "Sid": "AppReEncrypt",
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+            "Action": "kms:ReEncrypt*",
+            "Resource": "*",
+        }
+        grant = {
+            "GrantId": "g-re",
+            "Name": "re-grant",
+            "GranteePrincipal": "arn:aws:iam::123456789012:role/app",
+            "Operations": ["ReEncryptFrom"],
+        }
+        _, rows, _ = self._run(
+            {
+                "a-statement": [self._enclave_allow(), reencrypt],
+                "b-grant": [self._enclave_allow()],
+                "c-clean": [self._enclave_allow()],
+            },
+            grants={"arn:k/b-grant": [[grant]]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
+        assert (
+            "statement 'AppReEncrypt' allows kms:reencryptfrom with no attestation "
+            "condition" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "grant 're-grant' lets arn:aws:iam::123456789012:role/app call "
+            "kms:reencryptfrom with no attestation condition"
+            in rows[1]["Finding_Details"]
+        )
+        assert "arn:k/c-clean" in rows[2]["Finding_Details"]
+        assert "kms:ReEncryptFrom" in rows[2]["Finding_Details"]
 
     def test_br55_unread_grants_never_pass_a_key(self):
         _, rows, _ = self._run(
