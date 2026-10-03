@@ -1744,6 +1744,27 @@ MUTATIONS = [
         "find": '            for page in shield_client.get_paginator("list_protections").paginate()\n',
         "replace": '            for page in shield_client.get_paginator("list_protections").paginate()[:1]\n',
     },
+    {
+        "name": "AC-48 credits an IfExists deputy guard",
+        "file": AGENTCORE,
+        "defect": "an IfExists aws:SourceAccount or aws:SourceArn guard was credited",
+        "find": '    "stringequals",\n    "stringequalsignorecase",\n    "stringlike",\n    "arnequals",\n    "arnlike",\n}\n\n\n# Negated operators whose Deny',
+        "replace": '    "stringequals",\n    "stringequalsignorecase",\n    "stringlike",\n    "arnequals",\n    "arnlike",\n    "stringequalsifexists",\n    "arnlikeifexists",\n}\n\n\n# Negated operators whose Deny',
+    },
+    {
+        "name": "AC-48 credits a ForAllValues deputy guard",
+        "file": AGENTCORE,
+        "defect": "a ForAllValues: aws:SourceAccount or aws:SourceArn guard was credited",
+        "find": '    if not account_id:\n        return False\n    conditions = statement.get("Condition")\n    if not isinstance(conditions, dict):\n        return False\n    for operator, entries in conditions.items():\n        if not isinstance(entries, dict):\n            continue\n        name = str(operator).strip().lower()\n        if name.startswith("foranyvalue:"):\n',
+        "replace": '    if not account_id:\n        return False\n    conditions = statement.get("Condition")\n    if not isinstance(conditions, dict):\n        return False\n    for operator, entries in conditions.items():\n        if not isinstance(entries, dict):\n            continue\n        name = str(operator).strip().lower().replace("forallvalues:", "foranyvalue:")\n        if name.startswith("foranyvalue:"):\n',
+    },
+    {
+        "name": "AC-48 credits a partial wildcard account segment",
+        "file": AGENTCORE,
+        "defect": "an aws:SourceArn account segment with a wildcard was credited",
+        "find": '            if key == "aws:sourcearn" and all(\n                _arn_account(value.strip()) == account_id for value in values\n            ):\n',
+        "replace": '            if key == "aws:sourcearn" and all(\n                account_id.startswith(_arn_account(value.strip()).rstrip("*")) and _arn_account(value.strip()) for value in values\n            ):\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -2104,6 +2125,9 @@ GROUPS: dict[str, str] = {
     "AC-51 shield: unread gateways dropped": "in the AgentCore verdict legs",
     "AC-51 shield: only the first distribution page read": "in the AgentCore verdict legs",
     "AC-51 shield: only the first protection page read": "in the AgentCore verdict legs",
+    "AC-48 credits an IfExists deputy guard": "in the AgentCore verdict legs",
+    "AC-48 credits a ForAllValues deputy guard": "in the AgentCore verdict legs",
+    "AC-48 credits a partial wildcard account segment": "in the AgentCore verdict legs",
 }
 
 

@@ -30866,6 +30866,96 @@ class TestAC48SourceArnRequired:
         assert not self._named(findings, "AgentCore Execution Role Trust Guard Missing")
         assert not self._named(findings, "AgentCore Execution Role Trust")
 
+    @pytest.mark.parametrize(
+        "condition, row",
+        [
+            (
+                {
+                    **_AC48_ACCOUNT_ONLY,
+                    "ForAllValues:ArnLike": {
+                        "aws:SourceArn": (
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:*"
+                        )
+                    },
+                },
+                "AgentCore Execution Role Trust Source ARN Missing",
+            ),
+            (
+                {
+                    **_AC48_ACCOUNT_ONLY,
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            "arn:aws:bedrock-agentcore:us-east-1:1234567890*:runtime/*"
+                        )
+                    },
+                },
+                "AgentCore Execution Role Trust Source ARN Missing",
+            ),
+            (
+                {
+                    "ArnLike": {
+                        "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:*:runtime/*"
+                    }
+                },
+                "AgentCore Execution Role Trust Guard Missing",
+            ),
+            (
+                {"ForAllValues:StringEquals": {"aws:SourceAccount": "123456789012"}},
+                "AgentCore Execution Role Trust Guard Missing",
+            ),
+            (
+                {"StringEqualsIfExists": {"aws:SourceAccount": "123456789012"}},
+                "AgentCore Execution Role Trust Guard Missing",
+            ),
+            (
+                {
+                    "ArnLikeIfExists": {
+                        "aws:SourceArn": (
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:*"
+                        )
+                    }
+                },
+                "AgentCore Execution Role Trust Guard Missing",
+            ),
+        ],
+        ids=[
+            "for-all-values-source-arn",
+            "partial-wildcard-account",
+            "wildcard-account-alone",
+            "for-all-values-source-account",
+            "if-exists-source-account",
+            "if-exists-source-arn-alone",
+        ],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_form_that_admits_an_absent_or_foreign_source_fails(
+        self, mock_ac, mock_iam, condition, row
+    ):
+        # Ruling for IAM-05, after the AgentCore devguide page
+        # cross-service-confused-deputy-prevention: IfExists and ForAllValues:
+        # forms hold when the key is absent, and a wildcard account segment
+        # admits another account's resource. A guarded role beside the loose
+        # one has to stay Passed.
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["GuardedRole", "LooseRole"],
+            trust={"LooseRole": _ac48_trust(condition)},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        failed = self._named(findings, row)
+        passed = self._named(findings, "AgentCore Execution Role Trust")
+
+        assert len(failed) == 1
+        assert failed[0]["Status"] == "Failed"
+        assert "LooseRole" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "GuardedRole" in passed[0]["Finding_Details"]
+
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
     def test_the_sharing_pass_names_its_region_scope(self, mock_ac, mock_iam):

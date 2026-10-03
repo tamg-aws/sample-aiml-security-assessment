@@ -32492,6 +32492,11 @@ def check_agentcore_execution_role_trust_and_sharing(
             for statement in statements
             if _statement_trusts_whole_account(statement)
         ]
+        # The AgentCore devguide recommends both keys and pairs StringEquals
+        # aws:SourceAccount with ArnLike aws:SourceArn:
+        # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/cross-service-confused-deputy-prevention.html
+        # An aws:SourceArn naming this account by value is required either
+        # way; IfExists and ForAllValues: forms are not credited.
         source_arn_missing = [
             statement
             for statement in statements
