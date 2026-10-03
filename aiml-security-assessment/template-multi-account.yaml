@@ -19,7 +19,6 @@ Metadata:
           - RequireBedrockZeroDataRetention
           - RequireMarketplaceEndpointCMK
           - RequireAgentCoreOnlineEvaluation
-          - RequireAgentRegistryManualApproval
           - RequireAgentRegistryCMK
           - AgentCoreTokenVaultId
           - ApprovedExternalAccountIds
@@ -69,12 +68,7 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: Fail AC-17 when no complete active online evaluation configuration is found.
-  RequireAgentRegistryManualApproval:
-    Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: Fail AR-03 when an Agent Registry automatically approves submitted records.
+    Description: Fail AC-17 in a region with no AgentCore runtime when no running online evaluation configuration is found. Every runtime is judged whatever this is set to.
   RequireAgentRegistryCMK:
     Type: String
     Default: "false"
@@ -210,6 +204,7 @@ Resources:
                 - iam:ListAttachedRolePolicies
                 - iam:ListRolePolicies
                 - iam:GetRolePolicy
+                - iam:GetRole # PermissionsBoundary is on GetRole only
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
             - Sid: IAMUserPolicyRead
               Effect: Allow
@@ -217,7 +212,16 @@ Resources:
                 - iam:ListAttachedUserPolicies
                 - iam:ListUserPolicies
                 - iam:GetUserPolicy
+                - iam:ListGroupsForUser # group policies apply to members
+                - iam:GetUser # PermissionsBoundary is on GetUser only
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+            - Sid: IAMGroupPolicyRead
+              Effect: Allow
+              Action:
+                - iam:ListAttachedGroupPolicies
+                - iam:ListGroupPolicies
+                - iam:GetGroupPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:group/*'
             - Sid: IAMManagedPolicyRead
               Effect: Allow
               Action:
@@ -279,6 +283,177 @@ Resources:
                 - s3:DeleteObject
               Resource: !Sub '${AIMLAssessmentBucket.Arn}/permissions_cache_*.json'
 
+  BedrockAssessmentReadsPolicy:
+    # Reads that do not fit the Bedrock function's 9000-byte inline policy
+    # budget. Attached only to BedrockSecurityAssessmentFunction through its
+    # Policies list. A managed policy document is limited to 6144 characters.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read-only grants for the Bedrock security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManagedReadsOnWildcard
+            # None of these actions has a resource type in the service
+            # authorization reference.
+            Effect: Allow
+            Action:
+              - aoss:ListAccessPolicies # BR-20
+              - aoss:GetAccessPolicy # BR-20
+              - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
+              - sagemaker:ListInferenceComponents # BR-02
+              - eks:ListClusters # BR-02
+              - sagemaker:ListDomains # BR-53
+              - bedrock-agentcore:ListCodeInterpreters # BR-53
+            Resource: '*'
+          - Sid: CloudTrailEventDataStoreRead
+            # BR-06 reads each event data store's Status and
+            # AdvancedEventSelectors. ListEventDataStores has no resource
+            # type and is granted on '*' in the function's inline policy.
+            Effect: Allow
+            Action:
+              - cloudtrail:GetEventDataStore # BR-06
+            Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
+          - Sid: BedrockIngestionJobList
+            # BR-46 reads when each knowledge base data source last ingested.
+            Effect: Allow
+            Action:
+              - bedrock:ListIngestionJobs # BR-46
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
+          - Sid: SageMakerTrainingJobRead
+            # BR-46, BR-47 and BR-52 resolve each training job's input
+            # channels and output path to the S3 buckets it reads and writes.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
+          - Sid: AgentCoreBrowserRead
+            # BR-47 and BR-52 read the recording bucket of each custom AgentCore
+            # browser. The service authorization reference lists the
+            # browser-custom resource type for GetBrowser.
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:GetBrowser # BR-47, BR-52
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
+          - Sid: AccountListRegions
+            # BR-51 lists the Regions enabled for this account and sweeps each
+            # for an IAM Identity Center instance.
+            Effect: Allow
+            Action:
+              - account:ListRegions # BR-51
+            Resource: !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
+          - Sid: EventBridgeRuleTargetList
+            # BR-33 names the targets of each default-bus rule that matches
+            # Inspector findings.
+            Effect: Allow
+            Action:
+              - events:ListTargetsByRule # BR-33
+            Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
+          - Sid: SageMakerEndpointRead
+            # BR-02 reads the configuration behind each SageMaker endpoint.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeEndpoint # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint/*'
+          - Sid: SageMakerEndpointConfigRead
+            # BR-02 reads the variants, execution role and VPC of each
+            # endpoint configuration.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeEndpointConfig # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint-config/*'
+          - Sid: SageMakerModelRead
+            # BR-02 reads the execution role and VPC of each endpoint model.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeModel # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model/*'
+          - Sid: SageMakerInferenceComponentRead
+            # BR-02 reads the model behind each inference component.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeInferenceComponent # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:inference-component/*'
+          - Sid: EKSClusterRead
+            # BR-02 reads each cluster's VPC and lists its pod identity
+            # associations.
+            Effect: Allow
+            Action:
+              - eks:DescribeCluster # BR-02
+              - eks:ListPodIdentityAssociations # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+          - Sid: EKSPodIdentityAssociationRead
+            # BR-02 reads the role each pod identity association gives.
+            Effect: Allow
+            Action:
+              - eks:DescribePodIdentityAssociation # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:podidentityassociation/*/*'
+          - Sid: ECSTaskRead
+            # BR-02 reads the task role and subnets of each task started
+            # outside a service.
+            Effect: Allow
+            Action:
+              - ecs:DescribeTasks # BR-02
+            Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/*'
+          - Sid: ECSTaskList
+            # BR-02 lists the tasks in each cluster. The service authorization
+            # reference gives ListTasks the container-instance resource type,
+            # which a listing by cluster does not name, so the grant takes '*'
+            # scoped by the ecs:cluster key, as the ECS developer guide's
+            # ListTasks example does.
+            Effect: Allow
+            Action:
+              - ecs:ListTasks # BR-02
+            Resource: '*'
+            Condition:
+              ArnLike:
+                ecs:cluster: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/*'
+          - Sid: SSOPermissionSetPolicyList
+            # BR-51 lists the AWS managed and customer managed policies of each
+            # permission set. The service authorization reference gives both
+            # actions the Instance and PermissionSet resource types.
+            Effect: Allow
+            Action:
+              - sso:ListManagedPoliciesInPermissionSet # BR-51
+              - sso:ListCustomerManagedPolicyReferencesInPermissionSet # BR-51
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
+              - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
+          - Sid: AWSManagedPolicyRead
+            # BR-51 reads the default version of each AWS managed policy
+            # attached to a permission set. Only AWS managed policies, which
+            # live under the aws account segment, are read.
+            Effect: Allow
+            Action:
+              - iam:GetPolicy # BR-51
+              - iam:GetPolicyVersion # BR-51
+            Resource: !Sub 'arn:${AWS::Partition}:iam::aws:policy/*'
+          - Sid: BedrockMantleProjectList
+            # BR-37 lists every bedrock-mantle project to read its data_retention
+            # mode. The service authorization reference gives ListProjects the
+            # project resource type.
+            Effect: Allow
+            Action:
+              - bedrock-mantle:ListProjects # BR-37
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-mantle:*:${AWS::AccountId}:project/*'
+          - Sid: BedrockMantleAccountRetentionRead
+            # BR-37 reads the bedrock-mantle account data-retention mode that a
+            # project set to inherit takes. The service authorization reference
+            # lists no resource type for GetAccountDataRetention, so the
+            # resource must be '*'.
+            Effect: Allow
+            Action:
+              - bedrock-mantle:GetAccountDataRetention # BR-37
+            Resource: '*'
+          - Sid: IAMAccountSummaryRead
+            # BR-50 reads AccountAccessKeysPresent to learn whether the root
+            # user has an access key. The service authorization reference lists
+            # no resource type for GetAccountSummary, so the resource must be
+            # '*'.
+            Effect: Allow
+            Action:
+              - iam:GetAccountSummary # BR-50
+            Resource: '*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -315,38 +490,101 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
-            - Sid: IAMServiceLastAccessResults
+            - Sid: AccountReadsOnWildcard
+              # Every statement in this role that had Effect Allow, Resource '*'
+              # and no Condition, folded into one to keep the rendered inline
+              # policy under the 9000-byte budget. Each group below names the
+              # Sid it came from. Six of these actions name a resource type in
+              # the service authorization reference (bedrock:ListGuardrails,
+              # ListPrompts, ListAutomatedReasoningPolicies; cloudtrail:GetTrail,
+              # GetEventSelectors, GetTrailStatus) and stay on '*' so the fold
+              # changes no grant. Every other action here has no resource type.
               Effect: Allow
               Action:
-                - iam:GetServiceLastAccessedDetails
-              Resource: '*'
-            # These account-level inventory/configuration APIs do not support
-            # resource-level authorization in IAM.
-            - Sid: BedrockAccountInventoryPermissions
-              Effect: Allow
-              Action:
-                - bedrock:ListModelInvocationJobs
-                - bedrock:GetModelInvocationLoggingConfiguration
-                - bedrock:ListAgents
-                - bedrock:ListCustomModels
-                - bedrock:ListFlows
-                - bedrock:ListKnowledgeBases
-                - bedrock:ListEvaluationJobs # BR-18
-                - bedrock:ListImportedModels # BR-30
-                - bedrock:ListInferenceProfiles
-                - bedrock:GetAccountDataRetention
-                - bedrock:ListMarketplaceModelEndpoints
-                - bedrock:ListEnforcedGuardrailsConfiguration
-                # These account-level enumerations do not support
-                # resource-level authorization in IAM.
-                - bedrock:ListGuardrails
-                - bedrock:ListPrompts
-                - bedrock:ListAutomatedReasoningPolicies
+                # Former Sid IAMServiceLastAccessResults.
+                - iam:GetServiceLastAccessedDetails # BR-14
+                # Former Sid AccountReadsOnWildcard.
+                - bedrock:GetModelInvocationLoggingConfiguration # BR-04, BR-06, BR-12, BR-32, BR-34, BR-42, BR-47, BR-52
+                - bedrock:ListAgents # BR-04, BR-05, BR-06, BR-08, BR-18, BR-21, BR-22, BR-26, BR-27, BR-28, BR-29, BR-32, BR-34, BR-53, BR-57
+                - bedrock:ListCustomModels # BR-04, BR-05, BR-06, BR-11, BR-17, BR-18, BR-22, BR-32, BR-43, BR-53
+                - bedrock:ListFlows # BR-04, BR-05, BR-06, BR-07, BR-13, BR-18, BR-19, BR-22, BR-26, BR-27, BR-32, BR-34, BR-53
+                - bedrock:ListKnowledgeBases # BR-04, BR-05, BR-06, BR-09, BR-18, BR-20, BR-22, BR-25, BR-26, BR-32, BR-34, BR-42, BR-46, BR-47, BR-52, BR-53
+                - bedrock:ListEvaluationJobs # BR-18, BR-25
+                - bedrock:ListImportedModels # BR-30, BR-53
+                - bedrock:ListProvisionedModelThroughputs # BR-53
+                - bedrock:ListModelInvocationJobs # BR-31, BR-42, BR-47, BR-52
+                - bedrock:ListModelCustomizationJobs # BR-42, BR-46, BR-47, BR-52
+                - bedrock:ListInferenceProfiles # BR-36, BR-43, BR-53
+                - bedrock:GetAccountDataRetention # BR-37
+                - bedrock:ListMarketplaceModelEndpoints # BR-39, BR-40
+                - bedrock:ListEnforcedGuardrailsConfiguration # BR-10, BR-15, BR-26, BR-27, BR-32, BR-34, BR-41
+                - bedrock:ListGuardrails # BR-04, BR-05, BR-06, BR-10, BR-16, BR-18, BR-22, BR-23, BR-24, BR-26, BR-27, BR-32, BR-34, BR-35, BR-53
+                - bedrock:ListPrompts # BR-04, BR-05, BR-06, BR-07, BR-18, BR-22, BR-32, BR-53
+                - bedrock:ListAutomatedReasoningPolicies # BR-38
+                - aoss:BatchGetCollection # BR-20
+                - comprehend:ListPiiEntitiesDetectionJobs # BR-26
+                - sso:ListInstances # BR-51
+                - bedrock-agentcore:ListAgentRuntimes # BR-42, BR-47, BR-52, BR-53, BR-57
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # BR-57
+                - bedrock-agentcore:ListMemories # BR-53
+                - bedrock-agentcore:ListGateways # BR-53
+                - bedrock-agentcore:ListBrowsers # BR-42, BR-47, BR-52, BR-53
+                - sagemaker:ListEndpoints # BR-02, BR-53
+                - sagemaker:ListModels # BR-53
+                - sagemaker:ListNotebookInstances # BR-02, BR-53
+                # Former Sid KMSKeyInventory.
+                - kms:ListKeys # BR-55
+                # Former Sid ServiceQuotasInventoryPermissions.
+                - servicequotas:ListServiceQuotas # BR-22
+                - servicequotas:GetAWSDefaultServiceQuota # BR-22
+                # Former Sid CloudWatchPermissions. BR-32 reads composite alarms.
+                # API_DescribeAlarms: "You can't return information about
+                # composite alarms if your cloudwatch:DescribeAlarms permission
+                # has a narrower scope." Under an alarm:* grant no composite
+                # alarm comes back.
+                - cloudwatch:DescribeAlarms # BR-32
+                # Former Sid OrganizationsInventoryPermissions.
+                - organizations:DescribeOrganization # BR-10, BR-15, BR-26, BR-27, BR-32, BR-34, BR-41, BR-43, BR-45, BR-48
+                - organizations:ListRoots # BR-15
+                - organizations:ListPolicies # BR-10, BR-15, BR-26, BR-27, BR-32, BR-34, BR-41, BR-43, BR-45, BR-48
+                # Former Sid MaciePermissions. DescribeBuckets returns the whole
+                # bucket inventory and names no required resource type.
+                - macie2:GetMacieSession # BR-46
+                - macie2:GetAutomatedDiscoveryConfiguration # BR-46
+                - macie2:DescribeBuckets # BR-46
+                - macie2:ListClassificationJobs # BR-46
+                # Former Sid BackupVaultInventory.
+                - backup:ListBackupVaults # BR-52
+                # Former Sid ResourceTagRead.
+                - tag:GetResources # BR-53
+                # Former Sid CloudTrailPermissions.
+                - cloudtrail:ListTrails # BR-06
+                - cloudtrail:GetTrail # BR-06
+                - cloudtrail:GetEventSelectors # BR-06
+                - cloudtrail:GetTrailStatus # BR-06
+                - cloudtrail:ListEventDataStores # BR-06
+                # Former Sid CloudTrailEventHistoryRead.
+                - cloudtrail:LookupEvents # BR-04, BR-06, BR-32, BR-43, BR-56
+                # Former Sid LambdaInventoryPermissions.
+                - lambda:ListFunctions # BR-02, BR-33, BR-54
+                - inspector2:BatchGetAccountStatus # BR-33
+                - inspector2:ListCoverage # BR-33
+                - events:ListRules # BR-33
+                # Former Sid EC2Permissions.
+                - ec2:DescribeVpcEndpoints # BR-02
+                - ec2:DescribeSubnets # BR-02, BR-39
+                - ec2:DescribeRouteTables # BR-39
+                - ec2:DescribeVpcs # BR-02
+                - ec2:DescribeInstances # BR-02
+                - ecs:ListClusters # BR-02
+                - ecs:ListServices # BR-02
+                - ecs:DescribeTaskDefinition # BR-02
               Resource: '*'
             - Sid: BedrockGuardrailRead
               Effect: Allow
               Action:
                 - bedrock:GetGuardrail
+                - bedrock:GetResourcePolicy # BR-41
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail/*'
             - Sid: BedrockPromptRead
               Effect: Allow
@@ -361,11 +599,27 @@ Resources:
                 - bedrock:GetAgent
                 - bedrock:ListAgentActionGroups
                 - bedrock:GetAgentActionGroup
+                - bedrock:ListAgentAliases # BR-26, BR-27, BR-34
+                - bedrock:GetAgentVersion # BR-26, BR-27, BR-34
+                - bedrock:ListAgentKnowledgeBases # BR-26, BR-34
+                - bedrock:ListAgentCollaborators # BR-57
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*'
+            - Sid: AgentCoreRuntimeRoleRead
+              # BR-57 reads the role each AgentCore runtime version runs as.
+              # ListAgentRuntimes and ListAgentRuntimeEndpoints have no
+              # resource type and are granted on '*' in
+              # AccountReadsOnWildcard.
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:GetAgentRuntime # BR-57
+              Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
             - Sid: BedrockCustomModelRead
+              # Holds the former Sid BedrockCustomModelPolicyRead, which had the
+              # same resource, to keep the rendered policy under 9000 bytes.
               Effect: Allow
               Action:
                 - bedrock:GetCustomModel
+                - bedrock:GetResourcePolicy # BR-43
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model/*'
             - Sid: BedrockCustomizationJobRead
               Effect: Allow
@@ -376,12 +630,52 @@ Resources:
               Effect: Allow
               Action:
                 - bedrock:GetFlow
+                - bedrock:ListFlowAliases # BR-07, BR-26, BR-27, BR-34
+                - bedrock:GetFlowVersion # BR-07, BR-26, BR-27, BR-34
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:flow/*'
             - Sid: BedrockKnowledgeBaseRead
+              # Holds the former Sid BedrockKnowledgeBaseDataSourceRead, which
+              # had the same resource. BR-46 resolves each knowledge base data
+              # source to the S3 bucket it ingests from; both data source
+              # operations authorize on the knowledge base.
               Effect: Allow
               Action:
                 - bedrock:GetKnowledgeBase
+                - bedrock:ListDataSources # BR-46
+                - bedrock:GetDataSource # BR-46
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
+            - Sid: S3VectorsKnowledgeBaseStoreRead
+              # BR-20 follows a knowledge base's s3VectorsConfiguration.vectorBucketArn
+              # to the vector bucket, and its indexArn/indexName to the one index that
+              # knowledge base uses. The region is wildcarded because a knowledge base
+              # can point at a vector bucket in another region. An index ARN is
+              # bucket/<name>/index/<name>, which this bucket/* resource covers:
+              # iam simulate-custom-policy returns allowed for s3vectors:GetIndex on
+              # an index ARN under it, and implicitDeny for another account's.
+              Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket # BR-20
+                - s3vectors:GetVectorBucketPolicy # BR-20
+                - s3vectors:GetIndex # BR-20
+              Resource: !Sub 'arn:${AWS::Partition}:s3vectors:*:${AWS::AccountId}:bucket/*'
+            - Sid: KnowledgeBaseVectorStoreKeyRead
+              # BR-20 follows a bring-your-own vector store to the key it is
+              # encrypted with, and a third-party store to its credentials
+              # secret. The region is wildcarded for the same reason as above.
+              # aoss:BatchGetCollection has no resource type and is granted on
+              # '*' in AccountReadsOnWildcard. ListAccessPolicies and
+              # GetAccessPolicy are in BedrockAssessmentReadsPolicy.
+              Effect: Allow
+              Action:
+                - rds:DescribeDBClusters # BR-20
+                - es:DescribeDomain # BR-20
+                - neptune-graph:GetGraph # BR-20
+                - secretsmanager:DescribeSecret # BR-20
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:cluster:*'
+                - !Sub 'arn:${AWS::Partition}:es:*:${AWS::AccountId}:domain/*'
+                - !Sub 'arn:${AWS::Partition}:neptune-graph:*:${AWS::AccountId}:graph/*'
+                - !Sub 'arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:*'
             - Sid: BedrockImportedModelRead
               Effect: Allow
               Action:
@@ -407,74 +701,205 @@ Resources:
             - Sid: KMSPermissions
               Effect: Allow
               Action:
-                - kms:DescribeKey # BR-40
+                - kms:DescribeKey # BR-40, BR-55, BR-12, BR-20, BR-11, BR-07, BR-17, BR-30, BR-38
+                - kms:GetKeyPolicy # BR-55
+                - kms:ListGrants # BR-55
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
-            - Sid: ServiceQuotasInventoryPermissions
-              Effect: Allow
-              Action:
-                - servicequotas:ListServiceQuotas # BR-22
-                - servicequotas:GetAWSDefaultServiceQuota # BR-22
-              Resource: '*'
             - Sid: BedrockServiceQuotaRead
               Effect: Allow
               Action:
                 - servicequotas:GetServiceQuota # BR-22
               Resource: !Sub 'arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:bedrock/*'
-            - Sid: CloudWatchPermissions
-              Effect: Allow
-              Action:
-                - cloudwatch:DescribeAlarms
-              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
-            - Sid: OrganizationsInventoryPermissions
-              Effect: Allow
-              Action:
-                - organizations:DescribeOrganization # BR-15
-                - organizations:ListRoots # BR-15
-                - organizations:ListPolicies # BR-15
-              Resource: '*'
             - Sid: OrganizationsPolicyTargetRead
               Effect: Allow
               Action:
-                - organizations:ListTargetsForPolicy # BR-15
+                - organizations:ListTargetsForPolicy # BR-15, BR-41, BR-43, BR-45, BR-48
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: OrganizationsAccountPathRead
+              # BR-41, BR-43 and BR-45 credit a service control policy, and BR-48
+              # an AI opt-out policy lock, only when it is attached to this
+              # account, an OU above it or the root, and ListParents walks that
+              # path. The account and OU ARNs carry the
+              # management account's ID, so only that segment is left open.
+              Effect: Allow
+              Action:
+                - organizations:ListParents # BR-41, BR-43, BR-45, BR-48
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
+                - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
+            - Sid: OrganizationsPolicyDocumentRead
+              # BR-41, BR-43, BR-45 and BR-48 read the policy document itself,
+              # which only DescribePolicy returns.
+              Effect: Allow
+              Action:
+                - organizations:DescribePolicy # BR-41, BR-43, BR-45, BR-48
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: OrganizationsEffectivePolicyRead
+              # BR-48 reads this account's effective AI services opt-out policy.
+              # The action authorizes on the account resource, whose ARN carries
+              # the management account's ID, so only that segment is left open.
+              Effect: Allow
+              Action:
+                - organizations:DescribeEffectivePolicy # BR-48
+              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
+            - Sid: BedrockApiKeyInventoryRead
+              # BR-45 lists the bedrock.amazonaws.com service-specific
+              # credentials of every IAM user (AllUsers), falling back to each
+              # cached IAM user when the account-wide listing is refused.
+              Effect: Allow
+              Action:
+                - iam:ListServiceSpecificCredentials # BR-45
+                - iam:ListAccessKeys # BR-50, BR-51
+                - iam:GetLoginProfile # BR-51
+                - iam:ListMFADevices # BR-51
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+            - Sid: AIRoleTrustPolicyRead
+              # BR-51 reads the trust policy of each role holding an AI write
+              # grant, to find users or accounts that can assume it without MFA.
+              # BR-57 reads every role's trust policy for edges from agent roles.
+              Effect: Allow
+              Action:
+                - iam:GetRole # BR-51, BR-57
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+            - Sid: EC2InstanceProfileRoleRead
+              # BR-02 resolves the role of each EC2 instance to the Bedrock
+              # surfaces it is granted. ec2:DescribeInstances has no resource
+              # type and is granted on '*' in AccountReadsOnWildcard.
+              Effect: Allow
+              Action:
+                - iam:GetInstanceProfile # BR-02
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
+            - Sid: BedrockInvocationLogInspection
+              # BR-04 reads the retention period of the invocation log group and
+              # BR-32 reads the metric and subscription filters defined on it.
+              Effect: Allow
+              Action:
+                - logs:DescribeLogGroups # BR-04
+                - logs:DescribeMetricFilters # BR-32
+                - logs:DescribeSubscriptionFilters # BR-32
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            - Sid: MacieClassificationJobRead
+              # BR-46 reads each job that names an AI source bucket for its
+              # schedule, sampling depth, data identifiers and scoping.
+              # DescribeClassificationJob authorizes on the classification-job.
+              Effect: Allow
+              Action:
+                - macie2:DescribeClassificationJob # BR-46
+              Resource: !Sub 'arn:${AWS::Partition}:macie2:*:${AWS::AccountId}:classification-job/*'
             - Sid: S3BucketEncryptionPermissions
               Effect: Allow
               Action:
                 - s3:GetEncryptionConfiguration
+                - s3:GetLifecycleConfiguration # BR-04
+                - s3:GetBucketPolicy # BR-47
+                - s3:GetBucketVersioning # BR-04, BR-52
+                - s3:GetBucketObjectLockConfiguration # BR-52, BR-04
+                - s3:GetReplicationConfiguration # BR-04
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
-            - Sid: CloudTrailPermissions
+            - Sid: BackupVaultLockRead
+              # BR-52 reads the Vault Lock mode, lock date and minimum retention
+              # of the vault holding a data path bucket's newest recovery point.
               Effect: Allow
               Action:
-                - cloudtrail:ListTrails
-                - cloudtrail:GetTrail
-                - cloudtrail:GetEventSelectors
-                - cloudtrail:GetTrailStatus
-              Resource: '*'
-            - Sid: LambdaInventoryPermissions
-              Effect: Allow
-              Action:
-                # BR-33 inventories Lambda functions before checking Inspector status.
-                - lambda:ListFunctions
-              Resource: '*'
+                - backup:DescribeBackupVault # BR-52
+              Resource: !Sub 'arn:${AWS::Partition}:backup:*:${AWS::AccountId}:backup-vault:*'
             - Sid: LambdaPermissions
               Effect: Allow
               Action:
                 - lambda:GetFunction
+                - lambda:ListFunctionUrlConfigs # BR-54
+                - lambda:GetPolicy # BR-54
+                - lambda:ListAliases # BR-54
+                - lambda:ListVersionsByFunction # BR-54
+                # GetFunction returns a function's tags only to a caller
+                # allowed lambda:ListTags; BR-33 reads the exclusion tag.
+                - lambda:ListTags # BR-33
               Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
-            - Sid: EC2Permissions
+            - Sid: ECSServiceRead
+              # BR-02 reads each ECS service's network configuration and task
+              # definition to find the VPC and role it runs in.
               Effect: Allow
               Action:
-                - ec2:DescribeVpcEndpoints
-                - ec2:DescribeVpcs
-              Resource: '*'
-            - Sid: InspectorPermissions
+                - ecs:DescribeServices # BR-02
+              Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:service/*'
+            - Sid: SageMakerNotebookRead
+              # BR-02 reads each notebook instance's subnet and execution role.
               Effect: Allow
               Action:
-                - inspector2:BatchGetAccountStatus # BR-33
-              Resource: '*'
-
+                - sagemaker:DescribeNotebookInstance # BR-02
+              Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:notebook-instance/*'
+            - Sid: SSOPermissionSetList
+              # BR-51 lists each Identity Center instance's permission sets.
+              # Identity Center ARNs carry no Region or account segment.
+              Effect: Allow
+              Action:
+                - sso:ListPermissionSets # BR-51
+              Resource: !Sub 'arn:${AWS::Partition}:sso:::instance/*'
+            - Sid: SSOPermissionSetRead
+              # BR-51 reads the inline policy of each permission set, which
+              # authorizes on both the instance and the permission set.
+              Effect: Allow
+              Action:
+                - sso:GetInlinePolicyForPermissionSet # BR-51
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
+                - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
+        - !Ref BedrockAssessmentReadsPolicy
+  SageMakerAssessmentReadsPolicy:
+    # Reads that do not fit the SageMaker function's 9000-byte inline policy
+    # budget. Attached only to SagemakerSecurityAssessmentFunction through its
+    # Policies list. A managed policy document is limited to 6144 characters.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read-only grants for the SageMaker security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManagedReadsOnWildcard
+            # None of these actions has a resource type in the service
+            # authorization reference.
+            Effect: Allow
+            Action:
+              - organizations:ListAWSServiceAccessForOrganization # SM-35
+              - ec2:DescribeManagedPrefixLists # SM-39
+            Resource: '*'
+          - Sid: PrefixListEntriesRead
+            # SM-39 judges the entries of each customer-managed prefix list a
+            # workload's rules name. The account segment is open because a
+            # list can be shared through AWS RAM from another account.
+            Effect: Allow
+            Action:
+              - ec2:GetManagedPrefixListEntries # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:prefix-list/*'
+          - Sid: IoTThingGroupThingsRead
+            # SM-41 lists the things of each thing group an IoT policy is
+            # attached to, child groups included.
+            Effect: Allow
+            Action:
+              - iot:ListThingsInThingGroup # SM-41
+            Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:thinggroup/*'
+          - Sid: IoTThingPrincipalsRead
+            # SM-41 lists the certificates attached to each of those things.
+            Effect: Allow
+            Action:
+              - iot:ListThingPrincipals # SM-41
+            Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:thing/*'
+          - Sid: MonitoringJobDefinitionRead
+            # SM-23 reads the baseline constraints file each named ModelQuality,
+            # ModelBias and ModelExplainability job definition names.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeModelQualityJobDefinition # SM-23
+              - sagemaker:DescribeModelBiasJobDefinition # SM-23
+              - sagemaker:DescribeModelExplainabilityJobDefinition # SM-23
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-quality-job-definition/*'
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-bias-job-definition/*'
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model-explainability-job-definition/*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -551,11 +976,13 @@ Resources:
                 - sagemaker:DescribeDomain
                 - sagemaker:DescribeTrainingJob
                 - sagemaker:ListModelPackages
+                - sagemaker:DescribeModelPackage # SM-22
                 - sagemaker:DescribeFeatureGroup
                 - sagemaker:DescribeProcessingJob
                 - sagemaker:DescribeMonitoringSchedule
                 - sagemaker:DescribeModel
                 - sagemaker:DescribeEndpoint
+                - sagemaker:DescribeEndpointConfig # SM-11
                 - sagemaker:DescribeDataQualityJobDefinition
                 - sagemaker:DescribeTransformJob
                 - sagemaker:DescribeHyperParameterTuningJob
@@ -563,6 +990,8 @@ Resources:
                 - sagemaker:DescribeAutoMLJob
                 - sagemaker:DescribeCluster
                 - sagemaker:GetModelPackageGroupPolicy
+                - sagemaker:DescribeUserProfile # SM-09
+                - sagemaker:DescribeInferenceComponent # SM-22
               Resource:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:notebook-instance/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:domain/*'
@@ -575,23 +1004,269 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:monitoring-schedule/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint/*'
+                - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint-config/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:data-quality-job-definition/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:transform-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:hyper-parameter-tuning-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:compilation-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:automl-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:cluster/*'
+                - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:user-profile/*/*'
+                - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:inference-component/*'
         - Statement:
             - Sid: GuardDutyInventoryPermissions
+              # SM-26 reads organization auto-enable from the delegated
+              # administrator. Neither action has a resource type in IAM.
               Effect: Allow
               Action:
                 - guardduty:ListDetectors
+                - guardduty:DescribeOrganizationConfiguration # SM-26
               Resource: '*'
             - Sid: GuardDutyDetectorRead
               Effect: Allow
               Action:
                 - guardduty:GetDetector
+                - guardduty:ListCoverage # SM-38
               Resource: !Sub 'arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*'
+            - Sid: EcsServiceRead
+              Effect: Allow
+              Action:
+                - ecs:DescribeServices # SM-39
+              Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:service/*'
+            - Sid: ConfigEvaluationRead
+              # SM-32 reads the recorder scope, the rule inventory and each
+              # rule's compliance summary. None of these three Config reads
+              # supports resource-level authorization in IAM.
+              Effect: Allow
+              Action:
+                - config:DescribeConfigurationRecorders # SM-32
+                - config:DescribeConfigRules # SM-09, SM-32
+                - config:DescribeComplianceByConfigRule # SM-32
+              Resource: '*'
+            - Sid: ConfigRecorderStatusRead
+              # SM-32 reads whether each customer-managed recorder is recording.
+              Effect: Allow
+              Action:
+                - config:DescribeConfigurationRecorderStatus # SM-32
+              Resource: !Sub 'arn:${AWS::Partition}:config:*:${AWS::AccountId}:configuration-recorder/*/*'
+            - Sid: ConformancePackRuleRead
+              # SM-32 reads which rules each conformance pack deploys.
+              Effect: Allow
+              Action:
+                - config:DescribeConformancePackCompliance # SM-32
+              Resource: !Sub 'arn:${AWS::Partition}:config:*:${AWS::AccountId}:conformance-pack/*/*'
+            - Sid: OrganizationsInventoryPermissions
+              # None of these three Organizations actions has a resource type in IAM.
+              # ListAWSServiceAccessForOrganization is in SageMakerAssessmentReadsPolicy.
+              Effect: Allow
+              Action:
+                - organizations:DescribeOrganization # SM-34, SM-35
+                - organizations:ListPolicies # SM-34
+                - organizations:ListDelegatedAdministrators # SM-35
+              Resource: '*'
+            - Sid: EC2SubnetExposureInventory
+              # SM-10, SM-11, SM-28 and SM-33 resolve whether a subnet routes to an
+              # internet gateway. Neither action has resource-level authorization.
+              Effect: Allow
+              Action:
+                - ec2:DescribeSubnets # SM-10, SM-11, SM-28, SM-33
+                - ec2:DescribeRouteTables # SM-10, SM-11, SM-28, SM-33
+              Resource: '*'
+            - Sid: OrganizationsPolicyDocumentRead
+              # SM-34 reads the policy document itself, which only
+              # DescribePolicy returns.
+              Effect: Allow
+              Action:
+                - organizations:DescribePolicy # SM-34
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: OrganizationsPolicyAttachmentRead
+              # SM-34 counts a service control policy only where it is attached on
+              # this account's path to the root.
+              Effect: Allow
+              Action:
+                - organizations:ListTargetsForPolicy # SM-34
+              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+            - Sid: OrganizationsAccountPathRead
+              # SM-34 walks from this account through each parent OU to the root.
+              Effect: Allow
+              Action:
+                - organizations:ListParents # SM-34
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
+                - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
+            - Sid: SecurityHubStandardsRead
+              Effect: Allow
+              Action:
+                - securityhub:GetEnabledStandards # SM-36
+                - securityhub:DescribeOrganizationConfiguration # SM-36
+                - securityhub:ListEnabledProductsForImport # SM-04
+              Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'
+            - Sid: NotebookApiTrailRead
+              # SM-09 reads whether a trail that records SageMaker API calls is
+              # logging to CloudWatch Logs. The account segment stays open because
+              # an organization trail's ARN names the management account.
+              Effect: Allow
+              Action:
+                - cloudtrail:GetTrailStatus # SM-09
+                - cloudtrail:GetEventSelectors # SM-09
+              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:*:trail/*'
+            - Sid: FlowLogMetricFilterRead
+              Effect: Allow
+              Action:
+                - logs:DescribeMetricFilters # SM-37
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            - Sid: CompositeAlarmRead
+              # SM-37 credits an alarm actioned through a composite alarm and reads
+              # whether a crediting alarm has entered ALARM. The CloudWatch API
+              # reference pages API_DescribeAlarms and API_DescribeAlarmHistory
+              # both say composite alarm information is returned only when the
+              # permission is scoped to '*'.
+              Effect: Allow
+              Action:
+                - cloudwatch:DescribeAlarms # SM-23, SM-31, SM-37
+                - cloudwatch:DescribeAlarmHistory # SM-37
+              Resource: '*'
+            - Sid: ModelImageRepositoryRead
+              # SM-43 reads tag mutability and image signing status of the ECR
+              # repositories endpoint containers run from.
+              Effect: Allow
+              Action:
+                - ecr:DescribeRepositories # SM-43
+                - ecr:DescribeImageSigningStatus # SM-43
+              Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
+            - Sid: TrainingFileSystemRead
+              # SM-03 reads the encryption of EFS file systems training jobs read.
+              Effect: Allow
+              Action:
+                - elasticfilesystem:DescribeFileSystems # SM-03
+              Resource: !Sub 'arn:${AWS::Partition}:elasticfilesystem:*:${AWS::AccountId}:file-system/*'
+            - Sid: GuardDutyAlertRuleTargetRead
+              Effect: Allow
+              Action:
+                - events:ListTargetsByRule # SM-04
+              Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
+            - Sid: AccountInventoryWithoutResourceType
+              # SM-39, SM-40 and SM-41 enumerate clusters, secrets and IoT policies,
+              # and SM-40 reads rotation events. None of these four actions has a
+              # resource type in IAM.
+              # SM-40 reads rotation metadata only, never a secret value.
+              Effect: Allow
+              Action:
+                - eks:ListClusters # SM-39
+                - secretsmanager:ListSecrets # SM-40
+                - iot:ListPolicies # SM-41
+                - cloudtrail:LookupEvents # SM-40
+              Resource: '*'
+            - Sid: ApprovedInventoryWithoutResourceType
+              # Read-only inventory approved for the SageMaker legs. None of these
+              # fourteen actions has a resource type in the service authorization
+              # reference, so each needs Resource '*'.
+              Effect: Allow
+              Action:
+                - events:ListRules # SM-04, SM-40
+                - cloudtrail:DescribeTrails # SM-09
+                - ram:ListResources # SM-22
+                - config:ListConfigurationRecorders # SM-32
+                - securityhub:GetConfigurationPolicyAssociation # SM-36
+                - inspector2:ListCoverage # SM-38
+                - ecs:ListClusters # SM-38, SM-39, SM-40
+                - ecs:ListServices # SM-39, SM-40
+                - ecs:DescribeTaskDefinition # SM-40
+                - iot:ListScheduledAudits # SM-41
+                - ecr:GetSigningConfiguration # SM-43
+                - fsx:DescribeFileSystems # SM-03
+                - sagemaker:ListInferenceComponents # SM-43
+                - sagemaker:ListUserProfiles # SM-09
+              Resource: '*'
+            - Sid: EC2NetworkPostureInventory
+              # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37
+              # reads flow logs, SM-39 reads workload security groups and SM-38
+              # compares running instances with Runtime Monitoring coverage. None
+              # of these four actions has a resource type in IAM.
+              Effect: Allow
+              Action:
+                - ec2:DescribeVpcEndpoints # SM-02, SM-11, SM-18, SM-33
+                - ec2:DescribeFlowLogs # SM-37
+                - ec2:DescribeSecurityGroups # SM-39
+                - ec2:DescribeInstances # SM-38
+              Resource: '*'
+            - Sid: ConformancePackInventory
+              # SM-32 lists conformance packs. The action has no resource type.
+              Effect: Allow
+              Action:
+                - config:DescribeConformancePacks # SM-32
+              Resource: '*'
+            - Sid: IoTDeviceDefenderAuditRead
+              # SM-41 reads the Device Defender audit configuration and its
+              # findings, and lists role aliases. None of these three actions
+              # has a resource type.
+              Effect: Allow
+              Action:
+                - iot:DescribeAccountAuditConfiguration # SM-41
+                - iot:ListAuditFindings # SM-41
+                - iot:ListRoleAliases # SM-41
+              Resource: '*'
+            - Sid: InspectorAccountStatusRead
+              # SM-38 reads whether Inspector Lambda scanning is enabled. The
+              # action has no resource type.
+              Effect: Allow
+              Action:
+                - inspector2:BatchGetAccountStatus # SM-38
+              Resource: '*'
+            - Sid: LambdaFunctionInventory
+              # SM-38, SM-39 and SM-40 enumerate Lambda functions. The action has
+              # no resource type.
+              Effect: Allow
+              Action:
+                - lambda:ListFunctions # SM-38, SM-39, SM-40
+              Resource: '*'
+            - Sid: EKSAddonRead
+              Effect: Allow
+              Action:
+                - eks:DescribeCluster # SM-39
+                - eks:ListAddons # SM-39
+                - eks:DescribeAddon # SM-39
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+                - !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:addon/*/*/*'
+            - Sid: IoTPolicyRead
+              Effect: Allow
+              Action:
+                - iot:GetPolicy # SM-41
+                - iot:ListTargetsForPolicy # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:policy/*'
+            - Sid: IoTCertificateThingRead
+              Effect: Allow
+              Action:
+                - iot:ListPrincipalThings # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:cert/*'
+            - Sid: IoTScheduledAuditRead
+              Effect: Allow
+              Action:
+                - iot:DescribeScheduledAudit # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:scheduledaudit/*'
+            - Sid: IoTRoleAliasRead
+              Effect: Allow
+              Action:
+                - iot:DescribeRoleAlias # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:rolealias/*'
+            - Sid: JobDataBucketProtectionRead
+              # SM-03 and SM-18 read the default encryption and bucket policy of the
+              # buckets training and transform jobs read from and write to; SM-43 reads
+              # the default encryption of the model artifact buckets endpoints load.
+              Effect: Allow
+              Action:
+                - s3:GetEncryptionConfiguration # SM-03, SM-18, SM-43
+                - s3:GetBucketPolicy # SM-03, SM-18
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+            - Sid: JobKeyManagerRead
+              Effect: Allow
+              Action:
+                - kms:DescribeKey # SM-03, SM-11, SM-18, SM-27
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+        - !Ref SageMakerAssessmentReadsPolicy
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
@@ -629,21 +1304,104 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
-            - Sid: IAMServiceLastAccessResults
+            - Sid: AgentCoreReadsWithoutResourceType
+              # Every Allow on Resource '*' with no condition, folded into one
+              # statement to keep the role under its inline-policy budget. Each
+              # group names the statement it came from.
               Effect: Allow
               Action:
-                - iam:GetServiceLastAccessedDetails
-              Resource: '*'
-            - Sid: AgentCoreAccountInventoryPermissions
-              Effect: Allow
-              Action:
-                - bedrock-agentcore:ListAgentRuntimes
-                - bedrock-agentcore:ListMemories
-                - bedrock-agentcore:ListGateways
-                - bedrock-agentcore:ListPolicyEngines
-                - bedrock-agentcore:ListCodeInterpreters
-                - bedrock-agentcore:ListBrowsers
-                - bedrock-agentcore:ListOnlineEvaluationConfigs
+                # Formerly IAMServiceLastAccessResults
+                - iam:GetServiceLastAccessedDetails # AC-03
+                # Formerly AgentCoreAccountInventoryPermissions
+                - bedrock-agentcore:ListAgentRuntimes # AC-01, AC-04, AC-08, AC-10, AC-17, AC-19, AC-30, AC-34, AC-45, AC-46, AC-47, AC-48, AC-49, AC-50, AC-52, AC-53
+                - bedrock-agentcore:ListMemories # AC-07, AC-19, AC-48
+                - bedrock-agentcore:ListGateways # AC-08, AC-10, AC-12, AC-13, AC-19, AC-24, AC-25, AC-27, AC-31, AC-34, AC-35, AC-37, AC-38, AC-48, AC-51, AC-52, AC-53
+                - bedrock-agentcore:ListPolicyEngines # AC-11, AC-36, AC-53
+                - bedrock-agentcore:ListCodeInterpreters # AC-01, AC-15, AC-45, AC-48, AC-49
+                - bedrock-agentcore:ListBrowsers # AC-01, AC-06, AC-16, AC-45, AC-48, AC-49
+                - bedrock-agentcore:ListOnlineEvaluationConfigs # AC-17, AC-39, AC-40, AC-41, AC-42, AC-43, AC-44
+                # AC-40 classifies the evaluators an online evaluation attaches
+                # against the account's catalogue. ListEvaluators has no
+                # resource-level authorization: its "Resource types" cell is
+                # empty in
+                # https://docs.aws.amazon.com/service-authorization/latest/reference/list_bedrock-agentcore.html
+                # while GetEvaluator in the same table carries evaluator*, so an
+                # ARN on this action denies the call.
+                - bedrock-agentcore:ListEvaluators # AC-40
+                # Formerly AgentCoreTokenVaultRead
+                # GetTokenVault authorizes against "*" at runtime despite the
+                # token-vault resource type documented for the action.
+                - bedrock-agentcore:GetTokenVault # AC-14
+                # Formerly EC2Permissions
+                - ec2:DescribeSubnets # AC-01, AC-08, AC-49
+                - ec2:DescribeRouteTables # AC-01, AC-49
+                - ec2:DescribeVpcEndpoints # AC-08
+                - ec2:DescribeVpcs # AC-08
+                # AC-08 reads the inbound rules of each AgentCore endpoint's
+                # security groups, and AC-01 the outbound rules of each VPC
+                # runtime and built-in tool group. DescribeSecurityGroups has no
+                # resource-level authorization.
+                - ec2:DescribeSecurityGroups # AC-01, AC-08
+                # Formerly DNSFirewallAssociationInventory
+                # ListFirewallRuleGroupAssociations and ListFirewallDomainLists
+                # have no resource-level authorization.
+                - route53resolver:ListFirewallRuleGroupAssociations # AC-49
+                - route53resolver:ListFirewallDomainLists # AC-49
+                # Formerly ECRRegistryScanningRead
+                # AC-50 reads the private registry's scanning configuration.
+                # GetRegistryScanningConfiguration acts on the registry, which has
+                # no resource type in the service authorization reference, so it
+                # takes '*'.
+                - ecr:GetRegistryScanningConfiguration # AC-50
+                # Formerly LogsPermissions
+                - logs:DescribeLogGroups # AC-04, AC-20, AC-26, AC-41
+                # Formerly CloudTrailTrailInventory
+                # ListTrails takes no resource.
+                - cloudtrail:ListTrails # AC-18, AC-26
+                # Formerly LogsDeliveryInventory
+                # AC-19 pairs each AgentCore delivery source with its delivery.
+                - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-26, AC-46
+                - logs:DescribeDeliveries # AC-04, AC-19, AC-20, AC-26, AC-46
+                # Formerly LogsAccountPolicyInventory
+                - logs:DescribeAccountPolicies # AC-20
+                # Formerly ObservabilitySinkInventory
+                - oam:ListSinks # AC-22
+                # Formerly OrganizationsInventoryPermissions
+                # ListPolicies takes no resource.
+                - organizations:ListPolicies # AC-26, AC-28, AC-29, AC-37
+                # Formerly AgentCoreCompositeAlarmRead
+                # AC-36, AC-40, AC-45, AC-46 and AC-53 credit an alarm actioned
+                # through a composite alarm. The CloudWatch API reference page
+                # API_DescribeAlarms says composite alarm information is returned
+                # only when the permission is scoped to '*'.
+                - cloudwatch:DescribeAlarms # AC-36, AC-40, AC-45, AC-46, AC-53
+                # Formerly AgentCoreApprovedReadsWithoutResourceType
+                # Read-only reads approved for the AgentCore legs. None of these
+                # has a resource type in the service authorization reference, so
+                # each needs Resource '*'.
+                - xray:GetTraceSegmentDestination # AC-19
+                - logs:DescribeDeliveryDestinations # AC-20, AC-26
+                - organizations:DescribeOrganization # AC-06, AC-22
+                - oam:ListLinks # AC-22
+                - s3:GetAccountPublicAccessBlock # AC-06
+                - events:ListRules # AC-36, AC-50
+                - inspector2:ListCoverage # AC-50
+                - bedrock-agentcore:ListPaymentManagers # AC-02, AC-48
+                - bedrock-agentcore:ListHarnesses # AC-34, AC-48
+                - bedrock-agentcore:ListBatchEvaluations # AC-41
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30, AC-34
+                - bedrock-agentcore:ListAgentRuntimeVersions # AC-01
+                - ec2:DescribeNatGateways # AC-49
+                - bedrock:GetModelInvocationLoggingConfiguration # AC-26
+                # Formerly AgentCoreApprovedEnumerations
+                # These three list every resource of their type and name none in
+                # the request. The service authorization reference gives each a
+                # resource type (firewall, dataset, anomalysubscription), but a
+                # request that names no resource is authorized against '*', so an
+                # ARN here would deny the call the way it does for GetTokenVault.
+                - network-firewall:ListFirewalls # AC-49
+                - cloudwatch:ListMetrics # AC-40, AC-53
+                - ce:GetAnomalySubscriptions # AC-46
               Resource: '*'
             - Sid: AgentCoreResourceReadPermissions
               Effect: Allow
@@ -657,6 +1415,21 @@ Resources:
                 - bedrock-agentcore:GetBrowser
                 - bedrock-agentcore:GetOnlineEvaluationConfig
                 - bedrock-agentcore:ListPolicies
+                # AC-24 and AC-25 read a gateway's rate limits and targets. The
+                # service authorization reference lists the gateway resource type
+                # for all three, so they stay inside this ARN-scoped statement.
+                - bedrock-agentcore:ListGatewayRateLimits
+                - bedrock-agentcore:ListGatewayTargets
+                - bedrock-agentcore:GetGatewayTarget
+                # AC-02 reads a payment manager's retrieval role when the list
+                # summary omits it, and AC-48 reads each harness's execution
+                # role. The service authorization reference lists the
+                # payment-manager and harness resource types for these.
+                - bedrock-agentcore:GetPaymentManager
+                - bedrock-agentcore:GetHarness
+                # AC-46 reads the capacity provider a runtime names. The service
+                # authorization reference lists the capacity-provider type.
+                - bedrock-agentcore:GetCapacityProvider
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -667,13 +1440,24 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:code-interpreter-custom/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:online-evaluation-config/*'
-            - Sid: AgentCoreTokenVaultRead
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:capacity-provider/*'
+            # AC-18 counts workload identities and credential providers to decide
+            # which identity data-event types are in use, and AC-14 reads the
+            # token vault each provider ARN names. The service authorization
+            # reference lists workload-identity-directory for
+            # ListWorkloadIdentities and token-vault for the three provider lists.
+            - Sid: AgentCoreIdentityInventory
               Effect: Allow
               Action:
-                # GetTokenVault authorizes against "*" at runtime despite the
-                # token-vault resource type documented for the action.
-                - bedrock-agentcore:GetTokenVault
-              Resource: '*'
+                - bedrock-agentcore:ListWorkloadIdentities
+                - bedrock-agentcore:ListOauth2CredentialProviders
+                - bedrock-agentcore:ListApiKeyCredentialProviders
+                - bedrock-agentcore:ListPaymentCredentialProviders
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:workload-identity-directory/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:token-vault/*'
             - Sid: IAMRolePermissions
               Effect: Allow
               Action:
@@ -684,24 +1468,134 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWSServiceRoleForBedrockAgentCoreNetwork'
                 # Once present, the AgentCore SLR has this service-linked path.
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/network.bedrock-agentcore.amazonaws.com/AWSServiceRoleForBedrockAgentCoreNetwork'
-            - Sid: EC2Permissions
+            # AC-27 reads the trust policy of each gateway's execution role. The
+            # role name is chosen by whoever created the gateway, so it cannot be
+            # enumerated in the template the way the service-linked role above is.
+            - Sid: AgentCoreGatewayRoleTrustRead
               Effect: Allow
               Action:
-                - ec2:DescribeSubnets
-                - ec2:DescribeRouteTables
-                - ec2:DescribeVpcEndpoints
-                - ec2:DescribeVpcs
-              Resource: '*'
+                - iam:GetRole
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+            - Sid: AgentCoreGatewayWebACLRead
+              # AG-39 reads the rules of the web ACL associated with a gateway,
+              # and AC-51 reads the same ACL for the Anti-DDoS rule group.
+              Effect: Allow
+              Action:
+                - wafv2:GetWebACL # AG-39, AC-51
+              Resource: !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
+            - Sid: DNSFirewallRuleRead
+              # AC-49 reads the rules of each rule group associated with an
+              # AgentCore VPC. A rule group can be shared through AWS RAM from
+              # another account, so the account segment stays open.
+              Effect: Allow
+              Action:
+                - route53resolver:ListFirewallRules # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:*:firewall-rule-group/*'
+            - Sid: DNSFirewallDomainRead
+              # AC-49 reads the domains of the list the terminal rule blocks. A
+              # domain list can be shared through AWS RAM, so the account
+              # segment stays open.
+              Effect: Allow
+              Action:
+                - route53resolver:ListFirewallDomains # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:*:firewall-domain-list/*'
+            - Sid: DNSFirewallConfigRead
+              # AC-49 reads whether DNS Firewall fails open for each VPC that
+              # hosts AgentCore.
+              Effect: Allow
+              Action:
+                - route53resolver:GetFirewallConfig # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:${AWS::AccountId}:firewall-config/*'
+            - Sid: AgentCoreMemoryKeyDecrypt
+              # AC-07 calls GetMemory, and for a memory encrypted with a customer
+              # managed key AgentCore decrypts its strategies with the caller's
+              # credentials. The condition confines the grant to that path.
+              Effect: Allow
+              Action:
+                - kms:Decrypt # AC-07
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+              Condition:
+                StringLike:
+                  kms:ViaService: 'bedrock-agentcore.*.amazonaws.com'
             - Sid: ECRPermissions
               Effect: Allow
               Action:
                 - ecr:DescribeRepositories
               Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
-            - Sid: LogsPermissions
+            - Sid: CognitoUserPoolRead
+              # AC-52 reads the user pools an AgentCore JWT authorizer names,
+              # and their app clients, in the account's own pools only.
               Effect: Allow
               Action:
-                - logs:DescribeLogGroups
-              Resource: '*'
+                - cognito-idp:DescribeUserPool # AC-52
+                - cognito-idp:ListUserPoolClients # AC-52
+                - cognito-idp:DescribeUserPoolClient # AC-52
+              Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:*:${AWS::AccountId}:userpool/*'
+            # AC-18 reads which trails select AgentCore resource types for data
+            # events. GetEventSelectors is scoped to the trail resource type.
+            - Sid: CloudTrailEventSelectorRead
+              Effect: Allow
+              Action:
+                - cloudtrail:GetEventSelectors
+                - cloudtrail:GetTrail # AC-26 log file validation, AC-18 trail region
+                - cloudtrail:GetTrailStatus # AC-18 IsLogging
+              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+            # AC-20 reads masking configuration at both scopes: an account-wide
+            # data-protection policy and a per-log-group one.
+            - Sid: LogsDataProtectionPolicyRead
+              Effect: Allow
+              Action:
+                - logs:GetDataProtectionPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            # AC-22 reads the cross-account observability sink policy.
+            - Sid: ObservabilitySinkPolicyRead
+              Effect: Allow
+              Action:
+                - oam:GetSinkPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:oam:*:${AWS::AccountId}:sink/*'
+            # AC-26 reads the key policy behind a log group's customer managed
+            # key to see who the key lets decrypt the log data.
+            - Sid: LogEncryptionKeyPolicyRead
+              Effect: Allow
+              Action:
+                - kms:GetKeyPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            # AC-07, AC-11 and AC-14 read a memory, policy engine or token vault
+            # key's manager and state, and AC-36 lists the key's grants to find
+            # the engine's management and evaluation grants.
+            - Sid: PolicyEngineKeyStateRead
+              Effect: Allow
+              Action:
+                - kms:DescribeKey
+                - kms:ListGrants
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            # AC-28 reads the organization's service control policies to see
+            # whether one denies creating a gateway with no inbound authorizer.
+            # DescribePolicy is scoped to the policy resource type, whose ARN
+            # carries the management account and the organization id, neither of
+            # which is known in this template.
+            - Sid: OrganizationsPolicyRead
+              Effect: Allow
+              Action:
+                - organizations:DescribePolicy
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            # AC-28 and AC-29 count an SCP only when it binds this account, so
+            # they walk this account's parents up to the root and read where
+            # each guarding policy is attached.
+            - Sid: OrganizationsPolicyAttachmentRead
+              Effect: Allow
+              Action:
+                - organizations:ListTargetsForPolicy # AC-28, AC-29, AC-37
+              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+            - Sid: OrganizationsParentRead
+              Effect: Allow
+              Action:
+                - organizations:ListParents # AC-28, AC-29, AC-37
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
+                - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
             - Sid: CloudWatchPermissions
               Effect: Allow
               Action:
@@ -710,6 +1604,72 @@ Resources:
               Condition:
                 StringEquals:
                   cloudwatch:namespace: AIMLSecurity/AgentCore
+            - Sid: NetworkFirewallRead
+              # AC-49 reads each firewall a hosting subnet routes to, in this
+              # account. A rule group can be shared through AWS RAM from another
+              # account, so its account segment stays open.
+              Effect: Allow
+              Action:
+                - network-firewall:DescribeFirewall # AC-49
+                - network-firewall:DescribeRuleGroup # AC-49
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall/*'
+                - !Sub 'arn:${AWS::Partition}:network-firewall:*:*:stateful-rulegroup/*'
+            - Sid: FirewallPolicyRead
+              # AC-49 reads the policy each such firewall names, in this account.
+              Effect: Allow
+              Action:
+                - network-firewall:DescribeFirewallPolicy # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall-policy/*'
+            - Sid: PrefixListEntryRead
+              # AC-01 and AC-08 resolve the prefix lists a security group rule
+              # names. AWS-managed lists carry the account segment aws, and a
+              # customer list can be shared through AWS RAM, so the account
+              # segment stays open.
+              Effect: Allow
+              Action:
+                - ec2:GetManagedPrefixListEntries # AC-01, AC-08
+              Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:prefix-list/*'
+            - Sid: AgentCoreEvaluationRead
+              # AC-41 and AC-44 read each custom evaluator and batch evaluation.
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:GetEvaluator # AC-41, AC-44
+                - bedrock-agentcore:GetBatchEvaluation # AC-41
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:evaluator/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:batch-evaluate/*'
+            - Sid: EventRuleTargetRead
+              # AC-50 reads the targets of each rule matching Inspector findings.
+              # rule/* covers rules on the default bus and on a custom bus.
+              Effect: Allow
+              Action:
+                - events:ListTargetsByRule # AC-50
+              Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
+            - Sid: MetricFilterRead
+              # AC-36 and AC-45 read the metric filters that feed an alarm.
+              Effect: Allow
+              Action:
+                - logs:DescribeMetricFilters # AC-36, AC-45
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            - Sid: CostAnomalyMonitorRead
+              # AC-46 reads the monitors its anomaly subscriptions name.
+              Effect: Allow
+              Action:
+                - ce:GetAnomalyMonitors # AC-46
+              Resource: !Sub 'arn:${AWS::Partition}:ce::${AWS::AccountId}:anomalymonitor/*'
+            - Sid: BrowserRecordingBucketRead
+              # AC-06 reads the configuration of each custom browser's recording
+              # bucket. The bucket name is customer-chosen, so it is not known at
+              # deploy time; every call also passes ExpectedBucketOwner.
+              Effect: Allow
+              Action:
+                - s3:GetEncryptionConfiguration
+                - s3:GetBucketPublicAccessBlock
+                - s3:GetBucketPolicy
+                - s3:GetLifecycleConfiguration
+                - s3:GetBucketVersioning
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
 
 
   AgentRegistrySecurityAssessmentFunction:
@@ -727,7 +1687,6 @@ Resources:
         Variables:
           AIML_ASSESSMENT_BUCKET_NAME: !Ref AIMLAssessmentBucket
           TARGET_REGIONS: !Ref TargetRegions
-          REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL: !Ref RequireAgentRegistryManualApproval
           REQUIRE_AGENT_REGISTRY_CMK: !Ref RequireAgentRegistryCMK
       Policies:
         - Statement:
@@ -764,6 +1723,21 @@ Resources:
                 - agent-registry:GetRegistry
                 - agent-registry:ListRegistryRecords
               Resource: !Sub 'arn:${AWS::Partition}:agent-registry:*:${AWS::AccountId}:registry/*'
+            - Sid: RegistryEventRuleInventory
+              # AR-10 lists the default event bus's rules, and those of a bus in
+              # this account and Region that a Registry rule forwards to.
+              # ListRules has no resource-level authorization.
+              Effect: Allow
+              Action:
+                - events:ListRules # AR-10
+              Resource: '*'
+            - Sid: RegistryEventRuleTargetRead
+              # AR-10 reads the targets of the rules that match Registry events.
+              # rule/* also covers custom-bus rules, rule/<bus-name>/<rule-name>.
+              Effect: Allow
+              Action:
+                - events:ListTargetsByRule # AR-10
+              Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
 
 
   ResponsibleAIGRCAssessmentFunction:

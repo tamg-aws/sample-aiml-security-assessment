@@ -529,6 +529,14 @@ then check the caching Lambda logs and confirm the execution-scoped object
 exists in the bucket. Correct the IAM or S3 error and rerun the complete
 assessment; do not reuse a cache from another execution.
 
+A cache that loaded can still be incomplete for some principals. The cache
+lists each role or user whose policy or permissions-boundary read failed under
+`principal_errors`, with the stage that failed and the error. A control that
+judges every role or user reports those principals as not read and does not
+report `Passed` while any of them is listed. A cache written before
+`cache_schema_version` 2 has no `principal_errors`, and the finding says the
+per-principal read errors were not recorded.
+
 ### Monitor AWS Step Functions Executions
 
 1. Navigate to **AWS Step Functions** in the target account
@@ -622,8 +630,8 @@ A: Minimal ongoing costs:
 
 **Q: Can I customize which security checks are included?**
 
-A: Currently, all 94 core checks (40 Bedrock, 29 SageMaker AI, 17 AgentCore,
-and 8 AWS Agent Registry) and 38 Agentic AI Security checks run by default to
+A: Currently, all 162 core checks (57 Bedrock, 42 SageMaker AI, 53 AgentCore,
+and 10 AWS Agent Registry) and 39 Agentic AI Security checks run by default to
 provide comprehensive coverage. If `EnableResponsibleAIGRCAssessment` is
 enabled, the 64 optional Responsible AI GRC checks also run. If
 `EnableOWASPAssessment` is enabled, the 12 optional OWASP Top 10 for LLM checks

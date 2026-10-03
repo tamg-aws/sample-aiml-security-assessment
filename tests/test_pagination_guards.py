@@ -60,6 +60,13 @@ BOUNDED_DIRECT_CALLS = {
         "detect_bedrock_regional_footprint",
         "list_guardrails",
     ): ("maxResults", 1),
+    # A member account probes whether it is a delegated administrator for
+    # policy management; the result of the read decides, not its content.
+    (
+        "bedrock_assessments/app.py",
+        "_organization_policy_context",
+        "list_policies",
+    ): ("MaxResults", 1),
     (
         "bedrock_assessments/app.py",
         "detect_bedrock_regional_footprint",
@@ -108,6 +115,13 @@ BOUNDED_DIRECT_CALLS = {
     (
         "agentcore_assessments/app.py",
         "lambda_handler",
+        "list_agent_runtimes",
+    ): ("maxResults", 1),
+    # AC-48 probes each other Region with the handler's availability call
+    # before it lists that Region's resources in full.
+    (
+        "agentcore_assessments/app.py",
+        "_agentcore_other_region_role_references",
         "list_agent_runtimes",
     ): ("maxResults", 1),
     (

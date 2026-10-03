@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Generate the per-module AISF compliance maps from the parity work ledger.
+
+Phase 2 of the AISF parity work tags *existing* producer findings with the AISF
+control they contribute to, so a reader of `bedrock_security_report_*.csv` can
+trace a row to a framework control. That is a different mechanism from phase 1,
+which derives eight standalone `AISF-NN` rows at consolidation time. Phase 1
+publishes a verdict under an AISF control id and therefore may only ever restate
+a `covered` control; phase 2 publishes no new verdict at all, only a reference on
+a row whose verdict the incumbent already earned. That is why phase 2 may tag a
+`tighten` control and phase 1 may not.
+
+One map per producer module, written into the module's own directory. The four
+producer Lambdas are packaged separately (each has its own `CodeUri` in
+template.yaml), so a single shared module would not be importable at runtime.
+The copies are generated rather than hand-maintained for exactly that reason.
+
+The tag vocabulary is load-bearing. Writing an unqualified control id on a check
+that only partly asserts the control is the same overclaim `check_ledger.py`
+gate 11 refuses in phase 1, so the qualifier carries the ledger verdict:
+
+    AISF <control>                  this check alone asserts the whole control
+    AISF <control> (1 of N checks)  the control is fully asserted, by this check
+                                    together with N-1 others
+    AISF <control> (partial)        this check asserts less than the control
+                                    requires; the tightening is still outstanding
+
+The maps are written from `aisf-work-ledger.json`, which is itself generated from
+the verdict table in `build_ledger.py`. `--check` therefore compares two things
+and not one: the shipped maps against a render of that verdict table, and the
+shipped json against the same table. Comparing the maps against the json alone
+measured nothing, because both are outputs of this generator -- see `--check`
+below.
+
+Run:  python3 aisf-parity/gen_compliance_maps.py          # write the maps
+      python3 aisf-parity/gen_compliance_maps.py --check   # exit 1 on drift
+"""
+
+import argparse
+import ast
+import collections
+import glob
+import importlib.util
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+MODULES = os.path.join(REPO, "aiml-security-assessment", "functions", "security")
+LEDGER = os.path.join(HERE, "aisf-work-ledger.json")
+
+# The row fields the verdict table in build_ledger.py decides, and so the fields
+# `--check` can compare the shipped json against. The other four (`question`,
+# `assert`, `workload_agnostic`, `source`) are read from the sibling AISF
+# repository by build_ledger.build(), which this module never calls.
+LEDGER_FIELDS = (
+    "verdict",
+    "disposition",
+    "target_modules",
+    "incumbents",
+    "incumbent_names",
+    "gap",
+    "extra_iam",
+    "phase",
+    "tier",
+)
+
+
+def generated_name(module):
+    """The map module's filename, which must be unique across the four producers.
+
+    Not a shared `aisf_compliance.py`. The producers are packaged separately, but
+    the test suite loads several of them into one interpreter and puts each module
+    directory on sys.path so that `from schema import create_finding` resolves
+    (tests/test_sagemaker_checks.py:22-31). A shared name is therefore cached in
+    sys.modules under its bare name and the first loader wins. Measured: with
+    both directories on sys.path, `aisf_compliance` resolves to whichever was
+    inserted last, and `aisf_frameworks("BR-10")` returns "" inside the bedrock
+    module. The failure is an empty tag, not an ImportError, so nothing raises.
+    The three producer schema.py files are byte-identical, which is why the
+    existing `schema` collision is harmless and this one would not be.
+    """
+    return f"aisf_compliance_{module.removesuffix('_assessments')}.py"
+
+
+# Only these two verdicts name an incumbent that already ships a verdict.
+#   new              - no incumbent exists to tag.
+#   not_implementable - nothing to tag, and nothing will be built.
+#   unassessed       - a row that has not had its dedup pass carries "incumbents"
+#                      that are candidates and not yet findings, so tagging one
+#                      would publish a mapping the ledger has not settled. No row
+#                      holds this verdict today; the FND block, which was the whole
+#                      population of it, is assessed. The verdict stays in the
+#                      vocabulary because the next control batch enters through it.
+TAGGABLE = ("covered", "tighten")
+
+
+def load_rows():
+    with open(LEDGER) as f:
+        return json.load(f)["rows"]
+
+
+def rows_from_source():
+    """The ledger rows as the verdict table in build_ledger.py declares them.
+
+    ROWS is imported; `build()` is never called. build() reads the sibling AISF
+    repository through load_aisf() and needs yaml, so a comparison built on it
+    would fail in any clone that does not have that working copy checked out,
+    which is not a property of the maps being gated. build_ledger.py writes
+    nothing at import: both writes live in build() and write_markdown(), reached
+    only under __main__.
+
+    Cached bytecode for build_ledger.py is dropped first. mtime has whole-second
+    resolution, so a verdict-table edit made in the same second as a previous run
+    can be served from a stale .pyc, and this function would then return the table
+    it was called to read from source.
+    """
+    sys.dont_write_bytecode = True
+    cached = importlib.util.cache_from_source(os.path.join(HERE, "build_ledger.py"))
+    if os.path.exists(cached):
+        os.remove(cached)
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    # The row mapping is imported, not re-derived here. This function carried its
+    # own copy of all eight fields -- its own `INCUMBENT_NAMES[i] for i in
+    # incumbents if i in INCUMBENT_NAMES` lookup, its own target_modules
+    # normalisation -- so the drift check compared one copy against the other and
+    # agreed. Two implementations of one rule agree on the wrong answer as
+    # readily as on the right one, and a defect confined to build()'s copy was
+    # measurably invisible: the mutation battery's fail-open entry went uncaught,
+    # 21 of 22, because nothing here read the line it edited.
+    from build_ledger import ROWS, table_fields
+
+    return [table_fields(row) for row in ROWS]
+
+
+def ledger_json_drift(source_rows):
+    """(drift, rows in the shipped json): where the json disagrees with the table.
+
+    Read, never written; build_ledger.py owns that file. A stale json is a defect
+    on its own, even when the maps and the verdict table agree, and after this
+    comparison exists nothing else measures it: check_ledger.py's gates 1-14 load
+    the json, and its gate 15 runs this generator.
+    """
+    if not os.path.exists(LEDGER):
+        return [f"{os.path.basename(LEDGER)} is missing; run build_ledger.py"], 0
+    shipped = {r["control"]: r for r in load_rows()}
+    source = {r["control"]: r for r in source_rows}
+    drift = [
+        f"{control} is in the verdict table, absent from the ledger json"
+        for control in sorted(set(source) - set(shipped))
+    ]
+    drift += [
+        f"{control} is in the ledger json, absent from the verdict table"
+        for control in sorted(set(shipped) - set(source))
+    ]
+    for control in sorted(set(source) & set(shipped)):
+        for field in LEDGER_FIELDS:
+            have, want = shipped[control].get(field), source[control][field]
+            if have != want:
+                drift.append(
+                    f"{control}.{field} is {have!r} in the ledger json, "
+                    f"{want!r} in the verdict table"
+                )
+    return drift, len(shipped)
+
+
+def shipped_entries(path):
+    """The AISF_COMPLIANCE_MAP a generated file declares, without importing it.
+
+    Parsed rather than imported, so that naming the drifting check ids cannot run
+    a file this command is in the middle of judging. A file that does not parse,
+    or that declares no map literal, returns None; the caller reads that as drift
+    and never as agreement.
+    """
+    try:
+        with open(path) as f:
+            tree = ast.parse(f.read(), path)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if any(
+            isinstance(t, ast.Name) and t.id == "AISF_COMPLIANCE_MAP"
+            for t in getattr(node, "targets", [])
+        ):
+            try:
+                return ast.literal_eval(node.value)
+            except ValueError:
+                return None
+    return None
+
+
+def entry_drift(path, mapping):
+    """Which check ids differ between a shipped map file and the rendered one.
+
+    `differs from the ledger` on its own leaves an operator no way to tell an
+    inserted verdict-table row from a hand-edited tag, so the ids are named.
+    """
+    have = shipped_entries(path)
+    if have is None:
+        return "its AISF_COMPLIANCE_MAP does not parse as a literal"
+    missing = sorted(set(mapping) - set(have))
+    extra = sorted(set(have) - set(mapping))
+    changed = sorted(k for k in set(have) & set(mapping) if have[k] != mapping[k])
+    parts = []
+    if missing:
+        parts.append(f"in the ledger, absent from the file: {missing}")
+    if extra:
+        parts.append(f"in the file, not in the ledger: {extra}")
+    if changed:
+        parts.append(f"tagged differently: {changed}")
+    return "; ".join(parts) or "same entries, different rendered text"
+
+
+def check_owners():
+    """check_id -> set of module dirs whose app.py emits it.
+
+    Two spellings, because the producers disagree: bedrock, sagemaker and
+    agentcore pass `check_id=` as a keyword, agent_registry passes it
+    positionally. A keyword-only scan silently resolves zero checks for
+    agent_registry, which would drop that module's map entirely while every
+    other gate still passed.
+    """
+    out = collections.defaultdict(set)
+    for path in sorted(glob.glob(os.path.join(MODULES, "*", "app.py"))):
+        mod = os.path.basename(os.path.dirname(path))
+        with open(path) as f:
+            src = f.read()
+        for pattern in (
+            r'check_id=["\']([A-Z]{2,3}-\d{2})["\']',
+            r'["\']([A-Z]{2,3}-\d{2})["\']\s*,',
+        ):
+            for cid in re.findall(pattern, src):
+                out[cid].add(mod)
+    return out
+
+
+def build_maps(rows, owners):
+    """(module -> {check_id: tag}), plus the pairs that went into them."""
+    per_check = collections.defaultdict(list)  # check_id -> [(control, tag)]
+    pairs = []
+    unresolved = []
+    for row in rows:
+        verdict = row.get("verdict")
+        if verdict not in TAGGABLE:
+            continue
+        incumbents = row.get("incumbents") or []
+        control = row["control"]
+        for cid in incumbents:
+            if verdict == "covered":
+                # A covered control asserted by several checks is fully covered,
+                # but not by any one of them alone. An unqualified tag on one leg
+                # would read as a complete assertion.
+                tag = (
+                    f"AISF {control}"
+                    if len(incumbents) == 1
+                    else f"AISF {control} (1 of {len(incumbents)} checks)"
+                )
+            else:
+                tag = f"AISF {control} (partial)"
+            mods = owners.get(cid) or set()
+            if len(mods) != 1:
+                unresolved.append((cid, sorted(mods)))
+                continue
+            per_check[cid].append((control, tag))
+            pairs.append((next(iter(mods)), cid, control, verdict))
+
+    if unresolved:
+        raise SystemExit(
+            "ERROR: cannot place these incumbents in exactly one module, so the "
+            "map they belong to is undecidable: "
+            + ", ".join(f"{c} -> {m}" for c, m in unresolved)
+        )
+
+    maps = collections.defaultdict(dict)
+    for cid, entries in per_check.items():
+        mod = next(iter(owners[cid]))
+        # Sort by control id so the generated file is byte-stable across runs.
+        maps[mod][cid] = " | ".join(tag for _, tag in sorted(entries))
+    return maps, pairs
+
+
+def render(module, mapping):
+    body = "".join(f'    "{cid}": "{mapping[cid]}",\n' for cid in sorted(mapping))
+    return f'''"""AISF control tags for {module} findings.
+
+GENERATED by aisf-parity/gen_compliance_maps.py from aisf-parity/aisf-work-ledger.json.
+Do not hand-edit: change the ledger, re-run the generator, and re-run
+aisf-parity/check_ledger.py, whose gate 14 compares this file against the ledger
+in both directions.
+
+The filename carries the module name because the test suite loads several
+producers into one interpreter with each module directory on sys.path. A shared
+`aisf_compliance.py` would be cached under that bare name and the first loader
+would win, silently returning "" for every other module's check ids.
+
+Qualifier vocabulary:
+    AISF <control>                  this check alone asserts the whole control
+    AISF <control> (1 of N checks)  the control is fully asserted, by this check
+                                    together with N-1 others
+    AISF <control> (partial)        this check asserts less than the control
+                                    requires; the tightening is still outstanding
+
+A tag is a traceability reference, not a statement that the control passed. The
+row's own Status column carries the verdict.
+"""
+
+AISF_COMPLIANCE_MAP = {{
+{body}}}
+
+
+def aisf_frameworks(check_id: str) -> str:
+    """The AISF tag for a check id, or "" when the ledger maps none to it."""
+    return AISF_COMPLIANCE_MAP.get(check_id, "")
+'''
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="compare the on-disk maps and the ledger json against the verdict "
+        "table in build_ledger.py; exit 1 on drift",
+    )
+    args = ap.parse_args()
+
+    # --check renders from the verdict table in build_ledger.ROWS, not from the
+    # generated json. Both the shipped maps and that json are outputs of this
+    # generator, so diffing one against the other compares a map against the file
+    # it was rendered from and agreement is guaranteed. Measured: inserting a row
+    # into ROWS without re-running build_ledger.py left --check printing "maps
+    # match the ledger", exit 0, with figures identical to a clean run. The one
+    # input that is not stale in that state is check_owners(), which greps the live
+    # app.py files, so a new check id is picked up while its verdict is not -- and a
+    # new id with no json row gets no tag at all, so it drifts in neither direction.
+    # The json is compared against the same table on its own leg below.
+    rows = rows_from_source() if args.check else load_rows()
+    owners = check_owners()
+    maps, pairs = build_maps(rows, owners)
+
+    drift = []
+    for module in sorted(maps):
+        name = generated_name(module)
+        path = os.path.join(MODULES, module, name)
+        want = render(module, maps[module])
+        have = None
+        if os.path.exists(path):
+            with open(path) as f:
+                have = f.read()
+        if args.check:
+            if have is None:
+                drift.append(f"{module}/{name} is missing")
+            elif have != want:
+                drift.append(
+                    f"{module}/{name} differs from the verdict table: "
+                    + entry_drift(path, maps[module])
+                )
+        elif have != want:
+            with open(path, "w") as f:
+                f.write(want)
+            print(f"wrote {module}/{name} ({len(maps[module])} checks)")
+        else:
+            print(f"unchanged {module}/{name} ({len(maps[module])} checks)")
+
+    total_checks = sum(len(m) for m in maps.values())
+    print(
+        f"{len(maps)} modules, {total_checks} checks, {len(pairs)} check-control pairs, "
+        f"{len({p[2] for p in pairs})} distinct controls"
+    )
+    if args.check:
+        json_drift, shipped_rows = ledger_json_drift(rows)
+        # A denominator on each leg. "maps match the ledger" over zero rows or
+        # zero map files reads exactly like the real pass, and an empty iterable
+        # makes every comparison above vacuously true.
+        print(
+            f"maps leg: {len(maps)} map file(s), {total_checks} tagged check(s), "
+            f"{len(pairs)} check-control pair(s), rendered from the "
+            f"{len(rows)} row(s) in build_ledger.ROWS"
+        )
+        print(
+            f"json leg: {shipped_rows} row(s) in {os.path.basename(LEDGER)} vs "
+            f"{len(rows)} in build_ledger.ROWS, {len(LEDGER_FIELDS)} field(s) "
+            "compared per row"
+        )
+        if not rows or not maps:
+            drift.append(
+                f"nothing to compare: {len(rows)} source row(s) produced "
+                f"{len(maps)} map(s)"
+            )
+        if drift or json_drift:
+            if drift:
+                print("DRIFT: " + "; ".join(drift))
+            if json_drift:
+                print("DRIFT (ledger json): " + "; ".join(json_drift))
+            return 1
+        print("maps match the ledger")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

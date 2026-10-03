@@ -28,7 +28,6 @@ Metadata:
           - RequireBedrockZeroDataRetention
           - RequireMarketplaceEndpointCMK
           - RequireAgentCoreOnlineEvaluation
-          - RequireAgentRegistryManualApproval
           - RequireAgentRegistryCMK
           - AgentCoreTokenVaultId
           - ApprovedExternalAccountIds
@@ -64,8 +63,6 @@ Metadata:
         default: Require Marketplace endpoint customer-managed keys
       RequireAgentCoreOnlineEvaluation:
         default: Require AgentCore online evaluation
-      RequireAgentRegistryManualApproval:
-        default: Require Agent Registry manual approval
       RequireAgentRegistryCMK:
         default: Require Agent Registry customer-managed keys
       AgentCoreTokenVaultId:
@@ -216,12 +213,6 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Fail AC-17 when no complete active online evaluation configuration is found.
-
-  RequireAgentRegistryManualApproval:
-    Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: Fail AR-03 when an Agent Registry automatically approves submitted records.
 
   RequireAgentRegistryCMK:
     Type: String
@@ -447,9 +438,25 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aiml-security-*"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aiml-sec-*"
                 Condition:
-                  ArnEquals:
+                  ArnLike:
                     iam:PolicyARN:
-                      !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                      - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/aiml-security-*"
+                      - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/aiml-sec-*"
+              - Sid: IAMManagedPolicyLifecycle
+                Action:
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:ListEntitiesForPolicy
+                Effect: Allow
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/aiml-security-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/aiml-sec-*"
               - Sid: IAMPassRole
                 Action:
                   - iam:PassRole
@@ -585,9 +592,6 @@ Resources:
             Type: PLAINTEXT
           - Name: REQUIRE_AGENTCORE_ONLINE_EVALUATION
             Value: !Ref RequireAgentCoreOnlineEvaluation
-            Type: PLAINTEXT
-          - Name: REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL
-            Value: !Ref RequireAgentRegistryManualApproval
             Type: PLAINTEXT
           - Name: REQUIRE_AGENT_REGISTRY_CMK
             Value: !Ref RequireAgentRegistryCMK

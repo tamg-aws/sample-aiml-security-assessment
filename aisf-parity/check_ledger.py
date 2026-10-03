@@ -1,0 +1,2317 @@
+#!/usr/bin/env python3
+"""Gate the AISF parity work ledger against the two repos it makes claims about.
+
+Every check here can fail. A check that cannot fail is not a gate, so each one
+prints its denominator beside its verdict.
+
+Run:  python3 aisf-parity/check_ledger.py
+Exit 0 = all gates pass. Exit 1 = at least one gate failed.
+"""
+
+import ast
+import collections
+import glob
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+import yaml
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+AISF_REPO = os.path.expanduser(
+    "~/WorkDocs/Builder/aws-ai-security-framework-assessment"
+)
+MODULES = os.path.join(REPO, "aiml-security-assessment", "functions", "security")
+TEMPLATE = os.path.join(REPO, "aiml-security-assessment", "template.yaml")
+REPORT_APP_DIR = os.path.join(MODULES, "generate_consolidated_report")
+README_DOC = os.path.join(REPO, "README.md")
+SECURITY_CHECKS_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS.md")
+AISF_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_AISF.md")
+OWASP_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_OWASP.md")
+GRC_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_RESPONSIBLE_AI_GRC.md")
+
+# Gates 11 and 12 read the shipped derived-standard map directly, not a copy of
+# it, so a drift between the map and the ledger cannot hide behind a transcription.
+#
+# Read it from source on every run. The platform python3 on macOS keeps its
+# bytecode cache outside the tree (sys.pycache_prefix points into
+# ~/Library/Caches/com.apple.python), and a stale entry there whose recorded
+# mtime and size match the edited file has already been observed serving the
+# previous text of report_template.py: gate 12 reported the old figure and
+# passed while the file on disk carried the new one. A gate that reads a stale
+# copy of the thing it is gating fails open, so drop any cache entry for these
+# two modules and write none.
+#
+# build_ledger is in the same list for the same reason: gate 10 renders the
+# markdown through it, so a stale copy of the renderer would compare the json
+# against yesterday's layout and pass. gen_compliance_maps likewise: gate 12
+# derives the catalog total through its check_owners(), and a stale copy would
+# count the ids the producers emitted the last time it was imported.
+sys.dont_write_bytecode = True
+for _dir, _name in (
+    (REPORT_APP_DIR, "report_template"),
+    (REPORT_APP_DIR, "aisf_mappings"),
+    (HERE, "build_ledger"),
+    (HERE, "gen_compliance_maps"),
+):
+    _cached = importlib.util.cache_from_source(os.path.join(_dir, _name + ".py"))
+    if os.path.exists(_cached):
+        os.remove(_cached)
+
+sys.path.insert(0, REPORT_APP_DIR)
+sys.path.insert(0, HERE)
+
+from aisf_mappings import (  # noqa: E402
+    AISF_COVERAGE_CHECK_ID,
+    AISF_DERIVED_MAP,
+    AISF_RISK_TO_SEVERITY,
+    SEVERITY_COLLAPSE_NOTE,
+    derive_aisf_findings,
+)
+from build_ledger import (  # noqa: E402
+    FOUNDATION,
+    ROWS,
+    SCOPE27,
+    TIERS,
+    render_markdown,
+)
+from gen_compliance_maps import check_owners  # noqa: E402
+from report_template import COMPLIANCE_STANDARDS  # noqa: E402
+
+# target_module directory -> the SAM function logical id that runs it
+MODULE_TO_FUNCTION = {
+    "bedrock_assessments": "BedrockSecurityAssessmentFunction",
+    "sagemaker_assessments": "SagemakerSecurityAssessmentFunction",
+    "agentcore_assessments": "AgentCoreSecurityAssessmentFunction",
+    "agent_registry_assessments": "AgentRegistrySecurityAssessmentFunction",
+    "responsible_ai_grc_assessments": "ResponsibleAIGRCAssessmentFunction",
+    "owasp_assessments": "OWASPSecurityAssessmentFunction",
+}
+
+results = []
+
+
+def gate(name, ok, detail):
+    results.append((name, ok, detail))
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+
+
+def load_ledger():
+    with open(os.path.join(HERE, "aisf-work-ledger.json")) as f:
+        return json.load(f)
+
+
+def load_aisf_classification():
+    path = os.path.join(AISF_REPO, "crosswalk", "classification-ledger.json")
+    with open(path) as f:
+        return json.load(f)["controls"]
+
+
+def load_granted_actions():
+    """logical function id -> set of iam actions granted in template.yaml."""
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    def multi(loader, suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    Loader.add_multi_constructor("!", multi)
+    with open(TEMPLATE) as f:
+        tpl = yaml.load(f, Loader=Loader)
+    out = {}
+    for name, res in tpl["Resources"].items():
+        if res.get("Type") != "AWS::Serverless::Function":
+            continue
+        blob = json.dumps(res.get("Properties", {}).get("Policies") or [])
+        out[name] = set(re.findall(r'"([a-z0-9-]{2,30}:[A-Za-z0-9*]{1,60})"', blob))
+    return out
+
+
+def figure_occurrences(text, patterns):
+    """label -> every value its pattern finds, over whitespace-flattened text.
+
+    Flattened for two independent reasons. A marker that hard-wraps is invisible
+    to a literal-space pattern: measured against the tag-column paragraph as
+    published, the patterns resolve 7 of 8 figures on the raw file and miss
+    `naming 36\\ndistinct controls`. And the agreement rule below has to count
+    copies on the same flattened text, or a hard-wrapped second copy carrying a
+    different number is not seen as a copy at all, which leaves exactly the hole
+    a first-match read left open.
+    """
+    flat = re.sub(r"\s+", " ", text)
+    return {label: re.findall(pattern, flat) for label, pattern in patterns}
+
+
+def agreed_figure(found):
+    """The integer every occurrence agrees on, or None for none or a disagreement.
+
+    A figure appearing more than once is not an error by itself: these figures
+    live in nine files and move together, and one file can restate a paragraph.
+    Two copies that *disagree* is the error, and taking the earliest match is how
+    it stayed invisible -- a correct copy earlier in the file returned the right
+    number while the published paragraph below it was wrong, and gate 12, gate 14
+    and the whole battery passed. So every copy has to agree and there has to be
+    at least one; zero is still a failure, exactly as it was.
+
+    Compared as integers and not as the strings matched, so a zero-padded copy is
+    not read as a second, different figure.
+    """
+    values = {int(v) for v in found}
+    if len(values) != 1:
+        return None
+    return values.pop()
+
+
+def agreed_mapping(found):
+    """The same rule for the per-module split, compared as a parsed mapping.
+
+    Parsed before comparing, so two copies listing the same modules in a
+    different order agree. The names are part of the published claim: a renamed
+    producer is how that sentence goes stale with no count moving.
+    """
+    parsed = [
+        {m.group(1): int(m.group(2)) for m in re.finditer(r"(\w+) (\d+)", sentence)}
+        for sentence in found
+    ]
+    if not parsed or any(p != parsed[0] for p in parsed):
+        return None
+    return parsed[0]
+
+
+def figure_problems(source, values, found):
+    """One message per figure `source` fails to publish once and consistently.
+
+    Absence and disagreement both arrive as a None value and are reported apart,
+    because they are different defects with different repairs: no match at all is
+    a reworded or deleted sentence, while two matches that differ is a stale
+    published paragraph masked by a correct copy elsewhere in the same file. The
+    occurrence list is the only thing that tells them apart, so it is what this
+    reads, and every value found is printed with the name of the figure.
+    """
+    problems = []
+    for label, value in sorted(values.items()):
+        if not found[label]:
+            problems.append(
+                f"{source} publishes no {label} figure these patterns can find"
+            )
+        elif value is None:
+            problems.append(
+                f"{source} publishes {len(found[label])} copies of {label} that "
+                f"disagree: {found[label]}"
+            )
+    return problems
+
+
+def figure_drift(source, values, found, computed):
+    """Absence, copies that disagree with each other, and a copy the gate refutes.
+
+    Three outcomes and not two. The middle one is the fail-open case: an earlier
+    copy carrying the right number answered for a wrong published paragraph while
+    the whole battery passed.
+
+    Used for both figure families gate 14 asserts, so the census messages cannot
+    drift in shape from the tag-column ones. Gate 12 keeps figure_problems() for
+    its scope figures: there the computed side is three separate legs printed
+    below it, so those messages have no single computed value to name. Its
+    coverage sentence does have one per figure, and uses this.
+
+    The computing side is named as "the ledger" and not by number. These three
+    strings are the only place a gate number reached the output, and once gate 14
+    printed under three names -- none of which is "gate 14" -- a failure line
+    titled `the SECURITY_CHECKS_AISF.md census paragraph is ...` carried a detail
+    pointing at a label no verdict in the run has. The numbers in this file's
+    comments stay: they are not printed, and the document cites them.
+    """
+    problems = []
+    for label, want in values.items():
+        if not found[label]:
+            problems.append(
+                f"{source} publishes no {label} figure these patterns can find; "
+                f"the ledger computes {computed[label]}"
+            )
+        elif want is None:
+            problems.append(
+                f"{source} publishes {len(found[label])} copies of {label} that "
+                f"disagree: {found[label]}; the ledger computes {computed[label]}"
+            )
+        elif want != computed[label]:
+            problems.append(
+                f"{source} publishes {label}={want}, "
+                f"the ledger computes {computed[label]}"
+            )
+    return problems
+
+
+def copies_note(found):
+    """`label xN` for every figure, for printing beside the values.
+
+    The count belongs in the verdict line and is not a debug aid: it is what says
+    how much the agreement rule had to compare. One copy asserts the agreement of
+    one, which is the whole of what the old first-match read ever checked.
+    """
+    return " ".join(f"{label} x{len(hits)}" for label, hits in sorted(found.items()))
+
+
+def scope_figures(text):
+    """The AISF coverage figures a piece of prose publishes, and all their copies.
+
+    The same three coverage figures are published twice, in the report section's
+    scope_text and in docs/SECURITY_CHECKS_AISF.md, so both are read with one
+    set of patterns and compared. Returns the figures beside every occurrence
+    found for each. A figure is the value all of its copies agree on; gate 12
+    reads None as a failure whether that is no copy or two that disagree, so a
+    reworded sentence that drops a figure also drops it from the gate.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("derivable", r"(\d+) of the \d+ in-scope AISF controls"),
+            ("in_scope", r"\d+ of the (\d+) in-scope AISF controls"),
+            ("remaining", r"remaining (\d+) are not yet"),
+            ("catalog", r"framework's (\d+)-check total"),
+        ),
+    )
+    return {label: agreed_figure(hits) for label, hits in found.items()}, found
+
+
+def scope_coverage_drift(text, summary, mapped_controls):
+    """The coverage sentence in the report section's scope_text, against the ledger.
+
+    Kept apart from scope_figures() because SECURITY_CHECKS_AISF.md does not
+    publish this sentence in these words: its copy of the same figures is the
+    coverage bullet, which gate 21 reads with its own patterns. Adding these
+    labels to scope_figures() would read them as absent from the doc, and gate
+    12's doc-versus-template comparison would then fail on a correct pair.
+
+    Three figures, and the middle one is not a restatement of the scope
+    sentence's in-scope total. It is a second copy, published inside the
+    coverage claim, and a copy nothing reads is free to go stale while the one
+    beside it stays gated. `covered_without_row` is counted over distinct
+    controls for the reason gate 21 records at its own copy.
+
+    Returns the published values, every copy found, the computed side, and one
+    message per figure that is absent, disagrees with itself, or with the ledger.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("covered", r"(?<![-\w])(\d+) of the \d+ are covered by checks"),
+            ("covered_in_scope", r"\d+ of the (\d+) are covered by checks"),
+            ("covered_without_row", r"the (\d+) covered controls without a row"),
+        ),
+    )
+    values = {label: agreed_figure(hits) for label, hits in found.items()}
+    computed = {
+        "covered": summary["covered"],
+        "covered_in_scope": summary["total"],
+        "covered_without_row": summary["covered"] - len(mapped_controls),
+    }
+    problems = figure_drift("the report section's scope_text", values, found, computed)
+    return values, found, computed, problems
+
+
+README_CATALOG_PATTERNS = (
+    ("run_checks_link", r"(\d+) checks\]\(docs/SECURITY_CHECKS\.md\)"),
+    ("security_checks_link", r"\[(\d+) Security Checks\]"),
+    ("standardized", r"Standardized (\d+)-check assessment"),
+    ("across_seven", r"\*\*(\d+) checks across seven areas"),
+    ("reference_for_all", r"reference for all (\d+) security checks"),
+    ("excluded_from", r"excluded from the (\d+)-check total"),
+)
+
+
+def readme_catalog_figures(text):
+    """The check total README publishes, every copy of it, and a message per dead
+    pattern.
+
+    README publishes the catalog total six times and gate 12 read none of them.
+    A badge line, a feature bullet, a positioning table row, the scope
+    paragraph, and twice in the documentation section -- one of which is the
+    same `reference for all N security checks` sentence the gate already reads
+    out of SECURITY_CHECKS.md, so the pattern was in the gate and the file was
+    not. Six copies in the most-read file in the repository, none of them under
+    a gate.
+
+    Pooled into one label for the value. They are six copies of one figure, so
+    the agreement rule carries it: a partial bump, the badge moved and the scope
+    paragraph left behind, resolves to None and reds gate 12 instead of shipping
+    two totals in one file. The pooled list is in the order of the tuple above,
+    so the position of the odd value in the failure message names which copy
+    moved without a second lookup.
+
+    Pooling alone cannot notice that the pool shrank, which is why each pattern
+    is also required to match on its own. Five copies agreeing is agreement:
+    rewording one sentence away leaves the figure resolvable, the gate green and
+    the verdict line reading `run_checks_link x0 readme_total x5`, asserting five
+    sixths of what the side claims to cover. Measured -- the copies note printed
+    it and nothing failed. The per-side zero-is-not-agreement guard further down
+    does not reach this, because the side is not empty.
+
+    Per-pattern absence is a failure here and is not one in census_figures(),
+    which is a difference in the documents and not an inconsistency. That pool
+    holds two spellings of one sentence and exactly one of them matches at any
+    ref, so a zero there is normal. These six are six different sentences, each
+    resolving exactly one hit at every ref measured: this base, this branch,
+    phase 3, phase 4, and both merge trees.
+
+    Six patterns and not one loose one, measured at four refs. A bare
+    `(\\d+) checks` reads ['208', '07', '208', '07'] here and the same shape at
+    phase 3's head, because `two native LLM07 checks` puts a check id's own
+    suffix in front of the word: the pooled figure would never agree and the
+    gate would red permanently on a correct README. Adding the `(?<![-\\w])`
+    anchor census_figures() uses does fix that one, and is still wrong for a
+    different reason -- it reads 2 of the 6 copies, so the four it cannot see
+    are the four a partial bump leaves behind.
+    """
+    found = figure_occurrences(text, README_CATALOG_PATTERNS)
+    found["readme_total"] = [
+        value for label, _ in README_CATALOG_PATTERNS for value in found[label]
+    ]
+    dead = [label for label, _ in README_CATALOG_PATTERNS if not found[label]]
+    problems = []
+    if dead:
+        problems.append(
+            f"README.md publishes the check total in {len(README_CATALOG_PATTERNS)} "
+            f"places and {len(dead)} of them no longer match: {dead}; the pooled "
+            "figure agrees across the copies that are left, so the side reads as "
+            "asserted while it is not"
+        )
+    return agreed_figure(found["readme_total"]), found, problems
+
+
+def tag_column_figures(text):
+    """The Compliance_Frameworks figures a piece of prose publishes, and their copies.
+
+    Whitespace is collapsed to single spaces over the whole text first. Measured
+    against the paragraph as published: these same patterns without the flatten
+    resolve 7 of the 8 figures and return one None. The miss is `controls`, because
+    the prose reads `naming 36\\ndistinct controls` and the break falls inside that
+    marker. The break in `sagemaker 7,\\nagentcore 12` costs nothing, because it
+    falls between two pairs the per-module pattern matches separately.
+
+    So a wrap only costs a figure when it lands inside a marker, and where it lands
+    moves with the digit count of the figures themselves. Two consequences. An
+    unflattened implementation reads as working, since seven figures and one None
+    look like a doc that published seven figures. And a control that re-wraps the
+    paragraph at some other width can leave the break inside the same marker and
+    pass for the wrong reason, so pick the width by checking which marker it splits.
+    Flattening removes the dependence on the wrap position altogether.
+
+    Same fail-closed contract as scope_figures(): the value is what every copy of
+    the figure agrees on, and gate 14 fails on None whether that is no copy at all
+    or two copies that disagree. A reworded sentence that drops a figure drops the
+    gate with it instead of quietly stopping the assertion.
+
+    The qualifier census is absent from here because it has its own extractor,
+    census_figures(), and its own sentence sixteen lines further down the file.
+
+    The pipe-joined paragraph's two figures are read here rather than sliced like
+    the census, and the difference is measured and not stylistic: both of its
+    phrases occur exactly once in the whole document, while the census spellings
+    collide with the coverage bullet's -- `(\\d+) `?covered`? controls` matches the
+    bullet's `the other 53 covered controls` as well as the census's 61, which is
+    the disagreement the census slice exists to separate. Nothing unique needs a
+    slice, and a slice around a unique phrase only adds an anchor that can rot.
+
+    The multi-control count is published twice, once as a statement and once as the
+    back-reference the next paragraph rests on (`14 of those 23`), and the two are
+    read as two required figures against one computed value instead of being pooled
+    into one. Pooling was the first shape and it failed a mutation: deleting the
+    statement sentence outright left the back-reference as the pool's only member,
+    which agreed with the maps, so the gate passed over a document publishing a
+    dangling `of those 23` with no antecedent. A pool asserts that the copies it
+    finds agree; it cannot assert that a copy exists in each sentence. So both
+    labels carry the same computed key, and either sentence going missing reds.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("pairs", r"(\d+) check-control pairs over \d+ tagged checks"),
+            ("tagged", r"\d+ check-control pairs over (\d+) tagged checks"),
+            ("modules", r"tagged checks in (\d+) modules"),
+            ("controls", r"naming (\d+) distinct controls"),
+            ("multi", r"(\d+) checks name more than one control"),
+            ("multi_restated", r"common case, \d+ of those (\d+),"),
+            ("mixing", r"common case, (\d+) of those \d+,"),
+            # The per-module split is read as a mapping and not as four numbers, so
+            # the module *names* are asserted too: a renamed producer is the way
+            # this sentence goes stale without any count changing.
+            ("per_module", r"Tagged checks per module are ([^.]+)\."),
+        ),
+    )
+    out = {
+        label: agreed_figure(hits)
+        for label, hits in found.items()
+        if label != "per_module"
+    }
+    out["per_module"] = agreed_mapping(found["per_module"])
+    return out, found
+
+
+CENSUS_ANCHOR = "Census at the current head"
+# Cut from the RAW file text and never from flattened text. figure_occurrences()
+# collapses whitespace, which destroys both delimiters this needs: `^` and the
+# `\n\n` terminator. Measured at four refs -- this base, this branch, phase 3's
+# head and the merge dry-run -- the pattern returns ONE paragraph from the raw
+# file and ZERO from the same text flattened, so a slice taken after the flatten
+# would leave the exactly-one rule below failing gate 14 forever on a correct
+# document. The anchor text is shared with the message, so a reworded sentence
+# cannot leave the two disagreeing about what was looked for.
+CENSUS_PARAGRAPH = re.compile(
+    r"^" + re.escape(CENSUS_ANCHOR) + r".*?(?=\n\n|\Z)", re.S | re.M
+)
+
+
+def census_paragraph(text):
+    """The census paragraph, the number found, and a message unless there is one.
+
+    Narrowing the census read to its own paragraph is what stops the five
+    patterns answering from anywhere else in a 23 KB file. Measured at phase 3's
+    head: the covered pattern matches a coverage bullet elsewhere in the
+    document as well, so the whole-file read returns the two disagreeing copies
+    ['20', '28'] and reds gate 14 over a census sentence that is correct.
+
+    Exactly one paragraph, fail-closed both ways. Zero means the anchor sentence
+    was reworded or deleted; two means the figures would be read across two
+    paragraphs that need not agree. Both return an empty slice rather than the
+    whole file, so every figure below also reports as absent, and the message
+    names the count and the anchor so the repair is the sentence, not the gate.
+
+    Spelled with findall and not two str.index calls, which is shorter and
+    wrong: a missing anchor raises ValueError mid-gate and takes every later
+    gate's verdict with it, and a paragraph at end of file has no `\\n\\n` for
+    the second index to find.
+    """
+    found = CENSUS_PARAGRAPH.findall(text)
+    if len(found) == 1:
+        return found[0], 1, []
+    return (
+        "",
+        len(found),
+        [
+            f"SECURITY_CHECKS_AISF.md holds {len(found)} paragraph(s) beginning "
+            f"{CENSUS_ANCHOR!r}, not 1; the census figures are read from "
+            "exactly one"
+        ],
+    )
+
+
+# Number words the jointly-covered-control count is allowed to be spelled as. A
+# digit is what every other figure pattern in this file requires, and requiring one
+# here would mean editing the published paragraph to suit the gate: this base spells
+# the count `the single control that carries all 3 joint legs`, so a digit-only
+# pattern reads the figure as absent and reds a correct document. `single` is the
+# word actually published. The numerals are here because the count reaches 16 at the
+# three-way merge, where `sixteen` is a spelling a maintainer may well reach for and
+# one this has to read rather than ignore. A token outside this table is reported by
+# name, so an unanticipated spelling is a red carrying the word and never a skip.
+CENSUS_COUNT_WORDS = {
+    word: value
+    for value, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve "
+        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
+    )
+}
+CENSUS_COUNT_WORDS["single"] = 1
+
+
+def census_count_tokens(tokens):
+    """(digit strings, the tokens this cannot read) for a count spelled either way.
+
+    Digits pass straight through, so agreed_figure() pools this count under the
+    same agreement rule as the other five and compares it as an integer. A word is
+    translated into that same form rather than admitted as a second kind of value.
+
+    The unreadable tokens are returned instead of dropped. Dropping them leaves the
+    pool empty, which figure_drift() reports as a paragraph publishing no such
+    figure -- a true statement about the pattern and a false one about the
+    document, and the repair for a word this table lacks is not the repair for a
+    deleted sentence.
+    """
+    digits, unreadable = [], []
+    for token in tokens:
+        if token.isdigit():
+            digits.append(token)
+        elif token.lower() in CENSUS_COUNT_WORDS:
+            digits.append(str(CENSUS_COUNT_WORDS[token.lower()]))
+        else:
+            unreadable.append(token)
+    return digits, unreadable
+
+
+def census_relations(values, found):
+    """One message per sum the census paragraph asserts and does not add up to.
+
+    The paragraph publishes six figures and then builds two claims out of them.
+    Asserting each figure against the computation leaves the claims themselves
+    ungated, which is how `the 40 bare tags plus the two jointly covered controls
+    ... account for the 56 `covered` controls` passes: every numeral in it is
+    gated and right, and the sentence says 40 + 2 = 56. Measured on the three-way
+    merge dry run, where a numerals-only update left the spelled-out `two` behind.
+
+    The two relations are not equally load-bearing, and the weaker one is the sum:
+
+    Gate 7 forbids a `covered` or `tighten` row without an incumbent, and gate 14a
+    fixes the tags to exactly one per (incumbent, control) pair with the qualifier
+    the verdict implies. Under those two, `bare + jointly covered == covered` is a
+    theorem about the computed side, so this leg can only fail together with a
+    figure that has already drifted from the computation. What it adds is the
+    sentence: the failure names the arithmetic a reader was given instead of naming
+    a transcription, and it is the line that makes the middle term worth reading
+    out of the document at all.
+
+    The one-tag-each leg does have its own catch, because it compares two figures
+    that count different populations and that nothing else here compares: partial
+    counts tag elements, tighten counts ROWS verdicts. A `tighten` row with two
+    incumbents carries two `(partial)` tags, which is legal, passes 14a, and makes
+    the claim false while both figures still match their own computation. That
+    state is not hypothetical -- it is this base, 29 partial tags over 28 tighten
+    controls, `AIR-BDR-MDL-02` carrying two.
+
+    Which is also why that leg is conditional on the clause being published. This
+    base does not claim one tag each, and asserting it unconditionally would red a
+    correct document. A conditional assertion is a skip when the condition is
+    false, so the condition is printed: copies_note() puts `one_tag_each x0` beside
+    the figures here and `x1` at phase 3's head, in the verdict line either way.
+    """
+    problems = []
+    sum_terms = ("bare", "joint_controls", "covered")
+    missing = [label for label in sum_terms if values[label] is None]
+    if missing:
+        problems.append(
+            f"the census sentence's sum cannot be checked: {missing} absent from "
+            "the paragraph or published in copies that disagree"
+        )
+    elif values["bare"] + values["joint_controls"] != values["covered"]:
+        problems.append(
+            f"the census sentence says {values['bare']} bare tags plus "
+            f"{values['joint_controls']} jointly covered control(s) account for the "
+            f"{values['covered']} `covered` controls, which sums to "
+            f"{values['bare'] + values['joint_controls']}"
+        )
+    if found["one_tag_each"]:
+        pair = [label for label in ("partial", "tighten") if values[label] is None]
+        if pair:
+            problems.append(
+                f"the census sentence claims one `(partial)` tag per `tighten` "
+                f"control and {pair} cannot be read to check it"
+            )
+        elif values["partial"] != values["tighten"]:
+            problems.append(
+                f"the census sentence claims one `(partial)` tag per `tighten` "
+                f"control, and publishes {values['partial']} tags over "
+                f"{values['tighten']} controls"
+            )
+    return problems
+
+
+def tagged_control_problems(tag_controls, verdict_controls):
+    """One message per control the tag maps and build_ledger.ROWS disagree about.
+
+    The census paragraph's two claims are set identities and not sums: the
+    controls a bare-or-joint tag names ARE the `covered` rows, and the controls a
+    `(partial)` tag names ARE the `tighten` rows. Equal counts satisfy neither.
+    Two sets of the same size over different members is the input that separates
+    a count from an identity, and it is what the test file for this uses.
+
+    Recorded here so the leg is not read as more independent than it is: inside
+    this battery it is entailed, and not by one leg alone. Gate 14a derives each
+    tag's expected qualifier from the ledger json verdict and reports both
+    directions of the check-control pair set, and gate 15 ties that json to ROWS
+    field by field while re-rendering the maps from ROWS itself. Measured: a
+    `covered` row flipped to `tighten` in ROWS reds this leg, 14c and gate 15
+    together, and a wrong qualifier reds 14a.
+
+    Two things are left over. The message is in the vocabulary of the claim --
+    which controls, which identity, which direction -- where 14a's is one line per
+    module:check:control with verdict, legs and qualifier fields. And this is the
+    only form of the claim CI can execute: every leg above runs inside main(),
+    which opens a path in a sibling AISF clone before it prints anything, and the
+    runner checks out this repository alone. So this function takes its two
+    populations as arguments and reads no file, and
+    tests/test_tagged_controls_match_the_verdict_rows.py runs it over the real
+    tree there.
+
+    Both directions of each identity are reported, because their repairs differ. A
+    control tagged and not `covered` is a map edit or a changed verdict; a
+    `covered` row no tag names is a map that was never regenerated.
+
+    The element count is deliberately NOT asserted against the set size. A
+    `tighten` control with two incumbents carries two `(partial)` tags, one per
+    incumbent: legal, and passes 14a. The base once stood at 29 elements over 28
+    controls with `AIR-BDR-MDL-02` carrying two, and exceeds it again
+    wherever a foundation `tighten` row names several incumbents. Asserting one tag per control
+    here would red a correct tree. Both numbers print beside the verdict, and the
+    document's own one-tag-each clause is asserted by census_relations() at the
+    refs that publish it.
+    """
+    problems = []
+    for kinds, verdict in ((("bare", "joint"), "covered"), (("partial",), "tighten")):
+        tagged = set().union(*(tag_controls[kind] for kind in kinds))
+        named = verdict_controls[verdict]
+        spelling = " or ".join(f"`{kind}`" for kind in kinds)
+        if tagged - named:
+            problems.append(
+                f"{sorted(tagged - named)} carry a {spelling} tag and are not "
+                f"`{verdict}` in build_ledger.ROWS"
+            )
+        if named - tagged:
+            problems.append(
+                f"{sorted(named - tagged)} are `{verdict}` in build_ledger.ROWS "
+                f"and no {spelling} tag names them"
+            )
+    return problems
+
+
+def census_figures(text):
+    """The qualifier and verdict census a piece of prose publishes, and its copies.
+
+    Six figures in one paragraph of docs/SECURITY_CHECKS_AISF.md, directly under
+    the tag-shape table: the bare/partial/joint qualifier counts, the number of
+    those joint tags' distinct controls, and the covered/tighten verdict counts the
+    sentence reconciles them against. Gate 14 computed the first three already and
+    printed them beside a parenthetical claiming no document published them, which
+    was false in the output of the gate the claim was meant to make trustworthy.
+
+    The text handed in is that paragraph alone, cut out of the raw file by
+    census_paragraph() before this flattens it.
+
+    Four things the occurrence counts forced, none of them guessable:
+
+    The digits carry a `(?<![-\\w])` anchor, which is inert on the slice and was
+    load-bearing while this read the whole file: unanchored over the whole
+    document, the example table sixteen lines above the paragraph
+    (`AISF AIR-BDR-MDL-02 (partial)`, `AISF AIR-SGM-TRN-05 (1 of 3 checks)`)
+    makes a check id's own suffix a second copy of the figure -- partial
+    resolves to ['02', '29'] and joint to ['05', '3'], and the 05 is the copy a
+    first-match read returns. Kept because the paragraph itself quotes suffixed
+    control ids: phase 3's head writes ``AIR-SGM-TRN-05`` over 3 inside it, one
+    rewording away from putting a suffix back in front of a figure pattern.
+    Measured on the slice at four refs, anchored and unanchored agree exactly.
+
+    The flatten is load-bearing for two of the five, not one. Both joint spellings
+    straddle a line break as published (`3\\n`(1 of 3 checks)`` and `all 3\\njoint
+    legs`), so raw extraction finds the joint figure zero times.
+
+    The joint figure is accepted under either spelling and the two are counted
+    separately, so the verdict line prints which one matched: this base writes
+    ``3 `(1 of 3 checks)``` and phase 3's head writes `5 joint`. The copies are
+    pooled and have to agree; none at all under either spelling is a failure, never
+    a skip. Backticks are optional throughout, being markdown and not the claim.
+
+    Tighten is pooled the same way, for the same reason and with the same rule.
+    `remaining (\\d+) are tighten` finds nothing at phase 3's head, where the
+    clause became ``the 18 `(partial)` tags are the 18 `tighten` controls``, so
+    the second spelling reads that one. Both spellings name the phrase they read
+    rather than the word alone: measured over the whole document, a bare
+    `(\\d+) tighten` matches three sentences at that head, one of them counting
+    tighten controls that carry no AISF- row. That is a different population
+    agreeing at 18 today, and a pattern that cannot tell the two apart publishes
+    the wrong one the day they diverge.
+
+    The sixth figure is the count of controls those joint tags name, which is not
+    the joint element count and must not be pooled with it: `joint` is what gate
+    14's `pairs` reconciliation adds up, and at this base the two are 3 and 1. It
+    is the middle term of the sentence's own sum, and it was the one term of that
+    sum no pattern could reach, so the sum was unassertable. Two spellings again,
+    pooled, each tight to the phrase published at the ref that writes it -- `plus
+    the single control that carries` here, `plus the two jointly covered controls`
+    at phase 3's head. Neither carries the `(?<![-\\w])` anchor the digits carry,
+    because the token slot is preceded by the literal `plus the ` and a check id's
+    suffix cannot reach it.
+
+    Adding it forced a trailing guard onto the joint element pattern, measured and
+    not foreseen: `(\\d+) joint` also matches `plus the 16 jointly covered
+    controls`, so the day the count is written as the digit the sum wants, the
+    joint pool reads ['36', '16'], resolves to None and reds gate 14 over a correct
+    paragraph. `joint(?![a-z])` is the narrowing. The word spellings hid it, which
+    is why the repaired-paragraph test in tests/test_census_paragraph_slice.py
+    writes the count as a digit rather than only asserting that a digit is read.
+
+    The one-tag-each clause is read for presence only and is not a figure: the two
+    numbers in it are already the partial and tighten figures above. What its
+    presence decides is whether census_relations() asserts that those two agree.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("bare", r"(?<![-\w])(\d+) bare"),
+            ("partial", r"(?<![-\w])(\d+) `?\(partial\)`?"),
+            ("joint_as_checks", r"(?<![-\w])(\d+) `?\(1 of \d+ checks\)`?"),
+            ("joint_as_word", r"(?<![-\w])(\d+) joint(?![a-z])"),
+            (
+                "joint_controls_as_carrier",
+                r"plus the ([a-z]+|\d+) control that carries",
+            ),
+            (
+                "joint_controls_as_jointly",
+                r"plus the ([a-z]+|\d+) jointly covered controls",
+            ),
+            ("covered", r"(?<![-\w])(\d+) `?covered`? controls"),
+            ("tighten_as_remaining", r"remaining (\d+) are `?tighten`?"),
+            ("tighten_as_controls", r"(?<![-\w])(\d+) `?tighten`? controls"),
+            ("one_tag_each", r"tags are the \d+ `?tighten`? controls, one tag each"),
+        ),
+    )
+    found["joint"] = found["joint_as_checks"] + found["joint_as_word"]
+    found["tighten"] = found["tighten_as_remaining"] + found["tighten_as_controls"]
+    found["joint_controls"], unreadable = census_count_tokens(
+        found["joint_controls_as_carrier"] + found["joint_controls_as_jointly"]
+    )
+    values = {
+        label: agreed_figure(found[label])
+        for label in (
+            "bare",
+            "partial",
+            "joint",
+            "joint_controls",
+            "covered",
+            "tighten",
+        )
+    }
+    problems = census_relations(values, found)
+    if unreadable:
+        problems.append(
+            "the census sentence spells the jointly covered control count "
+            f"{unreadable}, which is neither a digit nor a number word this reads"
+        )
+    return values, found, problems
+
+
+BULLET_ANCHOR = "- **Coverage:**"
+# Same two-step as the census: cut from raw text, match on flattened. Cut raw
+# because the `\n\n` terminator does not survive the flatten. Matched flattened
+# because the hard wrap lands inside the markers: at this head's wrapping 5 of the
+# 10 digit patterns below, plus the `unassessed` phrase, return zero copies on the
+# raw bullet and one copy flattened -- `covered`, `covered_without_row`,
+# `tighten_in_the_split`, `taggable` and `taggable_tighten` -- so a raw-matched
+# implementation reads as five working figures and five absent ones. Which five
+# they are moves with the wrapping, so the suite asserts that at least one pattern
+# splits that way and not the count.
+#
+# One slice covers both bullets: they sit in one blank-line-delimited block with
+# no blank line between them, measured at this head, and the Report location
+# bullet above the anchor is excluded. Terminating on `\n\n` rather than on the
+# next `\n- ` is deliberate -- a third bullet added to this block should be read,
+# not silently excluded.
+COVERAGE_BULLETS = re.compile(
+    r"^" + re.escape(BULLET_ANCHOR) + r".*?(?=\n\n|\Z)", re.S | re.M
+)
+
+
+def coverage_bullets(text):
+    """The Coverage and Traceability bullets, the count, and a message unless one.
+
+    Exactly one slice, fail-closed both ways, and an empty slice on failure so
+    every figure below reports as absent rather than being read from the rest of
+    the file. Identical contract to census_paragraph(), for the same reason.
+
+    Pinned by tests/test_coverage_bullet_slice.py, which carries the bd0ecb8 block
+    verbatim and asserts the call site as well as the contract. Twelve mutations of
+    the code below, twelve caught. Edit either side and run that suite.
+    """
+    found = COVERAGE_BULLETS.findall(text)
+    if len(found) == 1:
+        return found[0], 1, []
+    return (
+        "",
+        len(found),
+        [
+            f"SECURITY_CHECKS_AISF.md holds {len(found)} block(s) beginning "
+            f"{BULLET_ANCHOR!r}, not 1; the coverage figures are read from "
+            "exactly one"
+        ],
+    )
+
+
+def coverage_bullet_figures(text):
+    """The verdict figures the coverage and traceability bullets publish.
+
+    This extractor exists because these two bullets published eleven figure
+    instances over seven distinct values with no gate reading any of them, and ten
+    of those eleven instances were wrong for a whole phase under 20/20 green. Ten
+    of the eleven and not all eleven: `3 not_implementable` agreed with the ledger
+    at bd0ecb8 and went wrong only when AIR-ACR-MEM-07 was reclassified. The
+    mechanism is worth naming, because it is not a missing gate: 5ad07b5 narrowed
+    census_figures() to its own paragraph so that the scope label it prints would
+    be true, and before that slice the census `covered` pattern had been matching
+    this bullet as well. The disagreement it reported, ['20', '28'], was the
+    failure that motivated the slice. So the slice made one label honest and
+    removed the only reader the bullet ever had, and the commit message says as
+    much -- "a different population agreeing at 18 today". Narrowing a gate's
+    scope silently un-gates whatever the old scope was reaching by accident.
+
+    Ten labels over six computed values, not six patterns. Two reasons, both
+    measured. The word `covered` publishes two different populations eleven words
+    apart in the Coverage bullet -- 61 controls that are `covered` and the 53 of
+    them without a row -- so one `covered` pattern cannot be written that reads
+    either honestly; each label is tight to the phrase around it. And a figure
+    restated in a second sentence needs its own label rather than a pool with the
+    first: pooling was tried on the multi-control count in tag_column_figures()
+    and a mutation deleting one of the two sentences outright left the pool with a
+    single agreeing member and passed.
+
+    `unassessed` is not in the pattern list, because at this head it is published
+    as the words `with no control left `unassessed`` and not as a digit. A zero
+    stated in prose still has to be gated, so it is handled as a relation in the
+    gate: the phrase is required while the ledger computes zero, a digit is
+    required once it does not, and either form appearing when the other is the
+    true one is a failure. A pattern alone would have read the digit-free
+    sentence as an absent figure forever.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("covered", r"(?<![-\w])(\d+) of the \d+ are `covered`"),
+            ("covered_without_row", r"the other (\d+) `covered` controls"),
+            ("covered_without_row_restated", r"without a row are (\d+) `covered`"),
+            ("tighten", r"(?<![-\w])(\d+) controls are `tighten`"),
+            ("tighten_in_the_split", r"are \d+ `covered`, (\d+) `tighten`"),
+            ("new", r"`tighten`, (\d+) `new`"),
+            ("not_implementable", r"(?<![-\w])(\d+) `not_implementable`"),
+            ("taggable", r"all (\d+) taggable controls"),
+            ("taggable_covered", r"themselves, the (\d+) `covered`"),
+            ("taggable_tighten", r"the \d+ `covered` and the (\d+) `tighten`"),
+            ("unassessed_as_words", r"with no control left (`unassessed`)"),
+            # Position-independent, unlike a leading `and`. The one ref that did
+            # publish this as a digit wrote it mid-list, `18 `new`, 11
+            # `unassessed` and 3 `not_implementable``, where an `and (\d+)`
+            # pattern reads zero. Zero still fails the relation below, so the
+            # narrow form failed closed, but it failed naming the figure as
+            # absent when the document was publishing it -- a different repair
+            # from the one the message asked for.
+            ("unassessed_as_figure", r"(?<![-\w])(\d+) `unassessed`"),
+        ),
+    )
+    values = {
+        label: agreed_figure(found[label])
+        for label in found
+        if not label.startswith("unassessed")
+    }
+    return values, found
+
+
+def coverage_bullet_relations(values, computed, found):
+    """The arithmetic between the bullets' figures, and the prose zero.
+
+    Every figure in these bullets can be gated and right while the sentence adds
+    them up wrong, so the two sums the bullets state are asserted as sums.
+
+    Both look entailed by the figure legs above, and while the document is the only
+    thing moving they are: given doc taggable == computed taggable and doc
+    covered/tighten == computed covered/tighten, doc taggable == doc covered + doc
+    tighten follows. Measured, every one-file mutation reds on a figure leg first
+    and neither sum ever fires alone.
+
+    What each leg uniquely reads is a second computed expression that no figure leg
+    touches. `computed["taggable"]` is written here as covered + tighten and
+    `computed["without_row_total"]` as total - mapped controls; the figure legs
+    compare the document against whatever those two expressions say, so redefining
+    one and updating the document to match leaves all ten figure legs green.
+    Measured both ways: move the computing side to covered + tighten + 1 and the
+    document to 73, and only the traceability sum fires; move without_row_total to
+    71 and touch no prose, and only the partition sum fires. The partition leg
+    reaches further of the two, because the 70 it checks is a population gate 12
+    independently binds through `derivable + remaining == in_scope`, and because the
+    identity holding today needs summary["total"] to stay equal to the five verdict
+    populations -- add a sixth verdict and the document's split silently stops
+    covering the whole 70 with every figure still agreeing.
+    """
+    problems = []
+    parts = (
+        "covered_without_row",
+        "tighten",
+        "new",
+        "not_implementable",
+    )
+    if all(values[p] is not None for p in parts):
+        total = sum(values[p] for p in parts) + computed["unassessed"]
+        if total != computed["without_row_total"]:
+            problems.append(
+                "the coverage bullet's own split sums to "
+                f"{total} ({' + '.join(f'{p}={values[p]}' for p in parts)} "
+                f"+ unassessed={computed['unassessed']}), and the ledger leaves "
+                f"{computed['without_row_total']} controls without a row"
+            )
+    if values["taggable"] is not None and None not in (
+        values["covered"],
+        values["tighten"],
+    ):
+        if values["taggable"] != values["covered"] + values["tighten"]:
+            problems.append(
+                f"the traceability bullet's own sum {values['covered']} + "
+                f"{values['tighten']} does not reach the {values['taggable']} "
+                "taggable controls it claims"
+            )
+    # The prose zero. Each form is required exactly when it is the true one, so
+    # neither a stale digit nor a phrase left behind after the count moves off zero
+    # can stand, and the message names which form was expected.
+    words, figure = found["unassessed_as_words"], found["unassessed_as_figure"]
+    if computed["unassessed"] == 0:
+        if not words:
+            problems.append(
+                "the ledger leaves no control `unassessed` and the coverage "
+                "bullet does not say so; expected the words `with no control "
+                "left `unassessed``"
+            )
+        if figure:
+            problems.append(
+                f"the coverage bullet publishes {figure} `unassessed` while the "
+                "ledger computes 0"
+            )
+    else:
+        if words:
+            problems.append(
+                f"the ledger computes {computed['unassessed']} `unassessed` "
+                "control(s) and the coverage bullet says there are none"
+            )
+        if agreed_figure(figure) != computed["unassessed"]:
+            problems.append(
+                f"the coverage bullet publishes {figure} `unassessed`, the "
+                f"ledger computes {computed['unassessed']}"
+            )
+    return problems
+
+
+def load_aisf_control(rel_path, control_id):
+    """One control item as authored in the AISF repository, or None."""
+    with open(os.path.join(AISF_REPO, rel_path)) as f:
+        doc = yaml.safe_load(f)
+    for item in doc.get("items", []):
+        if item.get("id") == control_id:
+            return item
+    return None
+
+
+def load_compliance_maps():
+    """module dir -> the AISF_COMPLIANCE_MAP that module ships.
+
+    Loaded from source under the module's own unique name. The map modules are
+    deliberately not all called `aisf_compliance`: several producers get loaded
+    into one interpreter by the test suite, and a shared bare name resolves to
+    whichever directory reached sys.path last, which returns "" for every other
+    producer's check ids without raising. Any cached bytecode is dropped first,
+    for the reason given at the top of this file.
+    """
+    out = {}
+    for module_dir in sorted(MODULE_TO_FUNCTION):
+        suffix = module_dir.removesuffix("_assessments")
+        name = f"aisf_compliance_{suffix}"
+        path = os.path.join(MODULES, module_dir, name + ".py")
+        if not os.path.exists(path):
+            continue
+        cached = importlib.util.cache_from_source(path)
+        if os.path.exists(cached):
+            os.remove(cached)
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        out[module_dir] = module.AISF_COMPLIANCE_MAP
+    return out
+
+
+def foundation_tier_problems(scope27, ledger_rows, source_tiers, machine_checkable):
+    """One message per way SCOPE27 and the foundation-tier rows disagree.
+
+    Three populations are compared with SCOPE27, and each is decided somewhere
+    else, which is what lets the comparison fail. The json rows carry the tier
+    build_ledger.table_fields() wrote; `source_tiers` is build_ledger.TIERS,
+    decided by which of the two verdict tables a row sits in and never by SCOPE27;
+    and `machine_checkable` is every machine-checkable control in the AISF
+    classification ledger. The third leg is the completeness claim: a
+    machine-checkable control with no ai_subject row must be in SCOPE27, so the
+    ledger has a row for every one of them and not only for the ones SCOPE27
+    already lists.
+
+    Pure, so tests/test_foundation_tier_matches_scope27.py can run it in CI, where
+    main() cannot run for want of a sibling AISF clone.
+    """
+    problems = []
+    json_foundation = {r["control"] for r in ledger_rows if r["tier"] == FOUNDATION}
+    source_foundation = {c for c, tier in source_tiers.items() if tier == FOUNDATION}
+    ai_subject = {r["control"] for r in ledger_rows if r["tier"] != FOUNDATION}
+    unrowed = set(machine_checkable) - ai_subject
+    for label, found in (
+        ("the ledger json's foundation-tier rows", json_foundation),
+        ("build_ledger.FOUNDATION_ROWS", source_foundation),
+        ("machine-checkable controls with no ai_subject row", unrowed),
+    ):
+        if found - scope27:
+            problems.append(
+                f"{sorted(found - scope27)} are in {label} and not in SCOPE27"
+            )
+        if scope27 - found:
+            problems.append(
+                f"{sorted(scope27 - found)} are in SCOPE27 and not in {label}"
+            )
+    return problems
+
+
+def emitted_check_ids():
+    """check_id -> set of module dirs that emit it."""
+    out = {}
+    for path in glob.glob(os.path.join(MODULES, "*", "app.py")):
+        mod = os.path.basename(os.path.dirname(path))
+        with open(path) as f:
+            src = f.read()
+        for cid in re.findall(r'check_id=["\']([A-Z]{2,3}-\d{2})["\']', src):
+            out.setdefault(cid, set()).add(mod)
+        for cid in re.findall(r'["\']([A-Z]{2,3}-\d{2})["\']\s*,', src):
+            out.setdefault(cid, set()).add(mod)
+    return out
+
+
+CHECK_ID_SHAPE = re.compile(r"^[A-Z]{2,3}-\d{2}$")
+
+
+def emitted_finding_names():
+    """check_id -> set of finding names its findings publish.
+
+    Parsed, not grepped, because `finding_name=` is a bare literal at some call
+    sites and a variable at others -- a module-level constant in some modules and
+    a function-local in others. A regex over the literal form alone sees roughly
+    half the corpus and reads the rest as publishing nothing, which is the
+    direction that makes a name assertion pass for want of evidence.
+
+    `create_finding(check_id, finding_name, ...)` is called with keywords in some
+    modules and positionally in others, and agent_registry routes most of its
+    findings through wrappers (`_na`, `_inventory_start`, `_registry_errors`) that
+    forward the same two values at a different index -- `_inventory_start` takes
+    the inventory first, so the id is its second argument. Keying on a roster of
+    emitter function names would therefore have to be extended for every new
+    wrapper, and would read a module it does not know about as publishing nothing.
+    So this keys on the argument's VALUE shape instead: the first check-id-shaped
+    string constant in the call is the id, and the argument after it is the name.
+    A new wrapper is picked up without being listed.
+
+    An unresolvable name is recorded as an `UNRESOLVED<...>` sentinel rather than
+    dropped, so a call site this cannot read can never be mistaken for agreement.
+    """
+    out = {}
+    for path in glob.glob(os.path.join(MODULES, "*", "app.py")):
+        with open(path) as f:
+            src = f.read()
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+
+        def string_consts(body, known):
+            # `check_name = OBJECT_LOCK_FINDING` binds a local to a module
+            # constant, so a Name value resolves through the names already known.
+            found = {}
+            for node in body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                value = node.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    text = value.value
+                elif isinstance(value, ast.Name) and value.id in known:
+                    text = known[value.id]
+                else:
+                    continue
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        found[t.id] = text
+            return found
+
+        module_consts = string_consts(tree.body, {})
+        for fn in [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]:
+            scope = dict(module_consts)
+            scope.update(string_consts(list(ast.walk(fn)), module_consts))
+
+            def resolve(node):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    return node.value
+                if isinstance(node, ast.Name):
+                    return scope.get(node.id, f"UNRESOLVED<name {node.id}>")
+                return f"UNRESOLVED<{type(node).__name__}>"
+
+            for call in [n for n in ast.walk(fn) if isinstance(n, ast.Call)]:
+                kw = {k.arg: k.value for k in call.keywords}
+                cid_node, name_node = kw.get("check_id"), kw.get("finding_name")
+                if cid_node is None:
+                    for i, arg in enumerate(call.args):
+                        if (
+                            isinstance(arg, ast.Constant)
+                            and isinstance(arg.value, str)
+                            and CHECK_ID_SHAPE.match(arg.value)
+                        ):
+                            cid_node = arg
+                            if name_node is None and i + 1 < len(call.args):
+                                name_node = call.args[i + 1]
+                            break
+                if not (
+                    isinstance(cid_node, ast.Constant)
+                    and isinstance(cid_node.value, str)
+                    and CHECK_ID_SHAPE.match(cid_node.value)
+                ):
+                    continue
+                if name_node is None:
+                    value = "UNRESOLVED<finding_name absent>"
+                else:
+                    value = resolve(name_node)
+                    # A second id in the same call is a list of ids, not a name.
+                    if CHECK_ID_SHAPE.match(value):
+                        continue
+                out.setdefault(cid_node.value, set()).add(value)
+    return out
+
+
+def main():
+    doc = load_ledger()
+    rows = doc["rows"]
+    summary = doc["summary"]
+    classification = load_aisf_classification()
+    granted = load_granted_actions()
+    emitted = emitted_check_ids()
+
+    # ---- gate 1: forward. every row is a real machine-checkable AISF control.
+    bad = [
+        r["control"]
+        for r in rows
+        if not classification.get(r["control"], {}).get("machine_checkable")
+    ]
+    gate(
+        "rows are machine-checkable AISF controls",
+        not bad,
+        f"{len(rows) - len(bad)}/{len(rows)} valid" + (f", bad={bad}" if bad else ""),
+    )
+
+    # ---- gate 2: backward. no machine-checkable hosted control is missing a row.
+    # This is the check a scan over the ledger's own rows cannot perform.
+    hosted_areas = ("BDR", "SGM", "ACR")
+    expected = {
+        cid
+        for cid, flags in classification.items()
+        if flags.get("machine_checkable") and cid.split("-")[1] in hosted_areas
+    }
+    present = {r["control"] for r in rows if r["area"] in hosted_areas}
+    missing = sorted(expected - present)
+    extra = sorted(present - expected)
+    gate(
+        "every machine-checkable hosted control has a row",
+        not missing and not extra,
+        f"{len(present)}/{len(expected)} covered"
+        + (f", missing={missing}" if missing else "")
+        + (f", not-in-ledger={extra}" if extra else ""),
+    )
+
+    # ---- gate 3: the FND tier is machine-checkable AND workload-agnostic.
+    # ai_subject rows only. A foundation-tier FND row asserts over the account an
+    # AI workload runs in, and the AISF classification marks some of those
+    # workload-specific, which is why they were outside the first 78.
+    fnd = [r for r in rows if r["area"] == "FND" and r["tier"] != FOUNDATION]
+    wrong = [
+        r["control"]
+        for r in fnd
+        if not classification[r["control"]].get("workload_agnostic")
+    ]
+    gate(
+        "FND ai_subject rows are workload-agnostic",
+        not wrong,
+        f"{len(fnd) - len(wrong)}/{len(fnd)} agnostic"
+        + (f", workload-specific={wrong}" if wrong else ""),
+    )
+
+    # ---- gate 4: every incumbent named actually exists in the codebase, and the
+    # name the ledger prints for it is one that check really publishes.
+    #
+    # The second leg exists because the first one passed while 12 of 78 rows
+    # printed an incumbent id beside an empty name list. build_ledger looked the
+    # name up under `if i in INCUMBENT_NAMES`, so every check phase 3 added --
+    # BR-41..BR-46, SM-31..SM-34, plus BR-07 -- resolved to nothing and was
+    # dropped without a word. Existence and naming are asserted together here so
+    # that adding a check id to a row cannot outrun recording what it publishes.
+    named = sorted({i for r in rows for i in r["incumbents"]})
+    absent = [i for i in named if i not in emitted]
+
+    published = emitted_finding_names()
+    unnamed = sorted(
+        {i for r in rows for i in r["incumbents"] if not r["incumbent_names"]}
+    )
+    # Element type first, and as a gate rather than an exception. Several ids map
+    # to a tuple because they publish more than one name, and a lookup that forgets
+    # to flatten puts the tuple itself in the list. `name.startswith` then raises
+    # AttributeError mid-gate, exit 1 with zero [FAIL] lines printed and every
+    # later gate's verdict lost -- a failure that reads like a crash in the
+    # harness rather than a defect in the ledger.
+    mistyped = [
+        f"{r['control']}: {name!r} is {type(name).__name__}, not str"
+        for r in rows
+        for name in r["incumbent_names"]
+        if not isinstance(name, str)
+    ]
+    wrong_name = []
+    for r in rows:
+        for name in r["incumbent_names"]:
+            if not isinstance(name, str) or name.startswith("UNRESOLVED<"):
+                continue
+            if not any(name in published.get(i, set()) for i in r["incumbents"]):
+                wrong_name.append(
+                    f"{r['control']}: {name!r} published by none of {r['incumbents']}"
+                )
+    gate(
+        "every incumbent exists and is named as it publishes",
+        not absent and not unnamed and not mistyped and not wrong_name,
+        f"{len(named) - len(absent)}/{len(named)} found, "
+        f"{len(named) - len(unnamed)}/{len(named)} named"
+        + (f", absent={absent}" if absent else "")
+        + (f", unnamed={unnamed}" if unnamed else "")
+        + (f", mistyped={mistyped}" if mistyped else "")
+        + (f", wrong_name={wrong_name}" if wrong_name else ""),
+    )
+
+    # ---- gate 5: an incumbent must live in the row's target module.
+    # Catches filing a row against a check that runs somewhere else.
+    misfiled = []
+    for r in rows:
+        if not r["target_modules"]:
+            continue
+        for i in r["incumbents"]:
+            mods = emitted.get(i, set())
+            if mods and not (mods & set(r["target_modules"])):
+                misfiled.append(f"{r['control']}:{i} in {sorted(mods)}")
+    gate(
+        "incumbents live in the row's target module",
+        not misfiled,
+        f"{len(named)} incumbents checked"
+        + (f", misfiled={misfiled}" if misfiled else ""),
+    )
+
+    # ---- gate 6: a claimed new IAM action must not already be granted to that
+    # row's own function. Granted-to-some-other-function does not help.
+    overstated = []
+    checked = 0
+    for r in rows:
+        fns = [
+            MODULE_TO_FUNCTION[m]
+            for m in r["target_modules"]
+            if m in MODULE_TO_FUNCTION
+        ]
+        if not fns:
+            continue
+        for action in r["extra_iam"]:
+            checked += 1
+            holders = [fn for fn in fns if action in granted.get(fn, set())]
+            if len(holders) == len(fns):
+                overstated.append(f"{r['control']}:{action} already on {holders}")
+    gate(
+        "claimed new IAM actions are not already granted to that function",
+        not overstated,
+        f"{checked} action-claims checked"
+        + (f", overstated={overstated}" if overstated else ""),
+    )
+
+    # ---- gate 7: TIGHTEN rows carry a disposition and an incumbent; NEW rows do not.
+    shape = []
+    for r in rows:
+        if r["verdict"] == "tighten":
+            if r["disposition"] not in ("extend", "new_id"):
+                shape.append(f"{r['control']}: tighten without disposition")
+            if not r["incumbents"]:
+                shape.append(f"{r['control']}: tighten without an incumbent")
+        if r["verdict"] == "new" and r["incumbents"]:
+            shape.append(f"{r['control']}: new but names an incumbent")
+        if r["verdict"] == "covered" and not r["incumbents"]:
+            shape.append(f"{r['control']}: covered without an incumbent")
+    gate(
+        "verdict and disposition shapes agree",
+        not shape,
+        f"{len(rows)} rows checked" + (f", bad={shape}" if shape else ""),
+    )
+
+    # ---- gate 8: a new_id disposition must quote the incumbent's real name.
+    # The claim is about the name, so the name must be the published one.
+    unquoted = []
+    for r in rows:
+        if r["disposition"] != "new_id":
+            continue
+        if not any(
+            n.split()[-2:] and " ".join(n.split()[-2:]).lower() in r["gap"].lower()
+            for n in r["incumbent_names"]
+        ):
+            unquoted.append(r["control"])
+    n_newid = sum(1 for r in rows if r["disposition"] == "new_id")
+    gate(
+        "new_id rows quote the incumbent's published name",
+        not unquoted,
+        f"{n_newid - len(unquoted)}/{n_newid} quote it"
+        + (f", unquoted={unquoted}" if unquoted else ""),
+    )
+
+    # ---- gate 9: the partition sums, and the published totals match the rows.
+    # The partition covers EVERY row, not just the hosted ones. The earlier form
+    # summed four verdicts over all 78 rows and compared the total to the 67
+    # hosted rows, which reconciled only because all 11 FND rows happened to be
+    # `unassessed` and `unassessed` was not one of the four terms. Finishing the
+    # dedup pass would have turned a correct ledger red, and -- worse in the
+    # other direction -- an FND row left `covered` by mistake would have pushed
+    # the sum to 68 and been read as a partition error rather than as the
+    # verdict it is. The two population sizes are asserted on their own.
+    #
+    # Why mutate.py holds no entry for this gate, measured 2026-09-26. Every
+    # field it reads comes out of the shipped json, so the only way to break it
+    # is to break that artifact, and each route is already covered from another
+    # side: a hand edit to one summary field diverges from the markdown, which
+    # gate 10 renders out of the json and compares to the file on disk (driven
+    # on `extensions`, which no other gate reads: gate 10 alone, 20/21); a hand
+    # edit consistent across both leaves the rows contradicting the counts, and
+    # the partition leg below is what reads that (`covered` 61 -> 62 in the json
+    # and the markdown together: partition 79/78, and gate 21 behind it); a
+    # per-control verdict changed in the json alone reds gate 10 on the row it
+    # renders and gate 18's drift check inside the generator, in that order.
+    # What no
+    # gate reads at edit time is build_ledger's own summary arithmetic -- point
+    # new_check_functions at not_implementable, leave the artifacts alone, and
+    # all 21 gates pass while the next regeneration would publish 11 for 7. The
+    # relation below is its reader and fires at that regeneration, which is
+    # before the wrong figure can ship, and mutate.py regenerates nothing by
+    # design, since a battery that rewrites the artifact it gates cannot fail
+    # (the same reason stated at gate 10). So the entry would have to mutate a
+    # digit in a generated file, which the battery's find-strings exclude.
+    hosted = [r for r in rows if r["area"] in hosted_areas]
+    fnd = [r for r in rows if r["area"] == "FND" and r["tier"] != FOUNDATION]
+    foundation = [r for r in rows if r["tier"] == FOUNDATION]
+    part = (
+        summary["covered"]
+        + summary["tighten"]
+        + summary["new"]
+        + summary["not_implementable"]
+        + summary["unassessed"]
+    )
+    ok = (
+        part == summary["total"] == len(rows)
+        and len(hosted) == 67
+        and len(fnd) == summary["fnd_ai_subject"] == 11
+        and len(foundation) == summary["foundation"] == 27
+        and len(hosted) + len(fnd) + len(foundation) == len(rows) == 105
+        and summary["tighten_extend"] + summary["tighten_new_id"] == summary["tighten"]
+        and summary["new_check_functions"]
+        == summary["new"] + summary["tighten_new_id"] + summary["unassessed"]
+    )
+    gate(
+        "published totals reconcile against the rows",
+        ok,
+        f"partition {part}/{len(rows)} (hosted {len(hosted)}, FND {len(fnd)}, "
+        f"foundation {len(foundation)}), "
+        f"tighten {summary['tighten_extend']}+{summary['tighten_new_id']}"
+        f"={summary['tighten']}, "
+        f"new functions {summary['new_check_functions']}",
+    )
+
+    # ---- gate 10: the markdown view is the json, rendered.
+    # Content, not mtimes. The mtime version of this gate failed in every fresh
+    # clone and passed in the tree the ledger was built in, because a checkout
+    # writes both files inside the same second in git-index order, which puts
+    # uppercase AISF-WORK-LEDGER.md before lowercase aisf-work-ledger.json. It
+    # also passed for a `touch`, and failed for a regeneration that produced a
+    # byte-identical file. Nothing here writes the markdown: a gate that
+    # regenerates the artifact it is gating cannot fail.
+    md = os.path.join(HERE, "AISF-WORK-LEDGER.md")
+    expected = render_markdown(doc).split("\n")
+    if os.path.exists(md):
+        with open(md) as f:
+            actual = f.read().split("\n")
+    else:
+        actual = None
+    if actual is None:
+        detail = f"{os.path.basename(md)} is missing; run build_ledger.py"
+    elif actual == expected:
+        detail = f"{len(expected)} rendered line(s) identical to the file on disk"
+    else:
+        first = next(
+            (
+                i
+                for i in range(max(len(expected), len(actual)))
+                if expected[i : i + 1] != actual[i : i + 1]
+            ),
+            0,
+        )
+        detail = (
+            f"first difference at line {first + 1} of "
+            f"{len(actual)} on disk vs {len(expected)} rendered: "
+            f"disk={actual[first : first + 1] or ['<end of file>']!r} "
+            f"rendered={expected[first : first + 1] or ['<end of file>']!r}; "
+            "regenerate with build_ledger.py"
+        )
+    gate("markdown view renders from the json", actual == expected, detail)
+
+    # ---- gate 11: the shipped AISF framework view restates covered controls only,
+    # and names the same incumbents the ledger names.
+    # A `tighten` control must never reach the map: its incumbent asserts only part
+    # of the control, so republishing that incumbent's `Passed` under the AISF
+    # control id publishes a pass the assessment never earned.
+    by_control = {r["control"]: r for r in rows}
+    bad_map = []
+    bad_ids = set()
+    for m in AISF_DERIVED_MAP:
+        row = by_control.get(m["control"])
+        if row is None:
+            bad_map.append(f"{m['check_id']}:{m['control']} has no ledger row")
+            bad_ids.add(m["check_id"])
+            continue
+        if row["verdict"] != "covered":
+            bad_map.append(f"{m['check_id']}:{m['control']} verdict={row['verdict']}")
+            bad_ids.add(m["check_id"])
+        if len(set(m["sources"])) != len(m["sources"]) or set(m["sources"]) != set(
+            row["incumbents"]
+        ):
+            bad_map.append(
+                f"{m['check_id']}:{m['control']} sources={m['sources']} "
+                f"incumbents={row['incumbents']}"
+            )
+            bad_ids.add(m["check_id"])
+    n_covered = sum(1 for r in rows if r["verdict"] == "covered")
+    gate(
+        "derived AISF map restates covered controls only",
+        not bad_map,
+        f"{len(AISF_DERIVED_MAP) - len(bad_ids)}/{len(AISF_DERIVED_MAP)} mappings "
+        f"agree with the ledger, {len(AISF_DERIVED_MAP)}/{n_covered} covered "
+        "controls mapped" + (f", bad={bad_map}" if bad_map else ""),
+    )
+
+    # ---- gate 12: the control text baked into the map, and every figure the AISF
+    # report section publishes, still match the source they were taken from.
+    # The text is baked because the AISF repo is not on the Lambda's filesystem at
+    # runtime, so nothing at runtime can notice that it has drifted.
+    drift = []
+    for m in AISF_DERIVED_MAP:
+        row = by_control.get(m["control"])
+        if row is None:
+            continue  # already reported by gate 11
+        item = load_aisf_control(row["source"], m["control"])
+        if item is None:
+            drift.append(f"{m['check_id']}: control absent from {row['source']}")
+            continue
+        # Severity is the documented collapse of AISF's five risk bands onto this
+        # repository's four-level SeverityEnum, not an identity match: there is no
+        # `Critical` here (see the note on AISF_RISK_TO_SEVERITY). The map carries
+        # the pre-collapse band as data because the rows disclose it, so the band
+        # itself is compared against the source too: a control upgraded upstream
+        # from high to critical must change the note the rows carry, and only the
+        # `risk` comparison notices that while the collapsed severity holds still.
+        if m["risk"] != item["risk"]:
+            drift.append(
+                f"{m['check_id']}: risk={m['risk']} but the control is {item['risk']}"
+            )
+        expected_severity = AISF_RISK_TO_SEVERITY.get(item["risk"])
+        if expected_severity is None:
+            drift.append(f"{m['check_id']}: risk={item['risk']} has no severity band")
+        elif m["severity"] != expected_severity:
+            drift.append(
+                f"{m['check_id']}: severity={m['severity']} but risk="
+                f"{item['risk']} maps to {expected_severity}"
+            )
+        if m["resolution"] != item["rec"]:
+            drift.append(f"{m['check_id']}: resolution drifted from the control's rec")
+        if m["reference"] != item["src"][0]["u"]:
+            drift.append(
+                f"{m['check_id']}: reference={m['reference']} != {item['src'][0]['u']}"
+            )
+
+    # A risk band whose name does not survive the collapse is disclosed in every
+    # row it produces. Read off the derivation's output rather than the note
+    # constant: the constant being right is not the claim, the row carrying it is,
+    # and a change to how details are assembled could drop it while the constant
+    # still reads correctly. Both status branches are exercised, because an `N/A`
+    # row carries Informational and takes the other wording path.
+    collapsed = [m for m in AISF_DERIVED_MAP if m["risk"] in SEVERITY_COLLAPSE_NOTE]
+    for m in collapsed:
+        for status in ("Passed", "N/A"):
+            emitted = derive_aisf_findings(
+                [
+                    {
+                        "Check_ID": cid,
+                        "Status": status,
+                        "Region": "us-east-1",
+                        "Account_ID": "000000000000",
+                    }
+                    for cid in m["sources"]
+                ]
+            )
+            row_out = next((r for r in emitted if r["Check_ID"] == m["check_id"]), None)
+            if row_out is None:
+                drift.append(f"{m['check_id']}: no row derived for status={status}")
+            elif SEVERITY_COLLAPSE_NOTE[m["risk"]] not in row_out["Finding_Details"]:
+                drift.append(
+                    f"{m['check_id']}: {status} row does not disclose risk={m['risk']}"
+                )
+            elif row_out["Severity"] not in row_out["Finding_Details"]:
+                # The disclosure names a severity, so the row has to name the one
+                # it is actually carrying. On the N/A path those differ: the note
+                # says High and the row is Informational, and without this the
+                # gate would pass a row that reads as a claim about its own
+                # severity while contradicting the Severity column beside it.
+                drift.append(
+                    f"{m['check_id']}: {status} row carries "
+                    f"{row_out['Severity']} without naming it"
+                )
+
+    aisf_entry = next((s for s in COMPLIANCE_STANDARDS if s["slug"] == "aisf"), None)
+    figures, figure_hits = scope_figures((aisf_entry or {}).get("scope_text", ""))
+    with open(AISF_DOC) as f:
+        doc_figures, doc_hits = scope_figures(f.read())
+    # AISF-00 is the coverage marker row, never a control, so it is not in the map
+    # and must not be counted among the derivable controls.
+    allocated = [m["check_id"] for m in AISF_DERIVED_MAP]
+    if AISF_COVERAGE_CHECK_ID in allocated:
+        drift.append(f"{AISF_COVERAGE_CHECK_ID} is reserved but allocated to a control")
+    with open(SECURITY_CHECKS_DOC) as f:
+        sc_hits = figure_occurrences(
+            f.read(), (("sc_total", r"reference for all (\d+) security checks"),)
+        )
+    catalog_total = agreed_figure(sc_hits["sc_total"])
+    with open(README_DOC) as f:
+        readme_total, readme_hits, readme_dead = readme_catalog_figures(f.read())
+    # Each figure above is the value all of its copies agree on, and a figure whose
+    # copies disagree is a failure of its own, named here with every value found.
+    # These three reads used to take the earliest match over the whole file, so a
+    # correct copy above the published paragraph -- another section, a quoted
+    # example, a deliberately dated appendix -- answered for the paragraph below
+    # it. Reproduced: a duplicate tag-column sentence at the top of
+    # SECURITY_CHECKS_AISF.md carrying the right figures left the tag-column figure
+    # leg green and the whole battery green with exit 0 while the paragraph it
+    # publishes read one control too many.
+    drift += figure_problems("the report section's scope_text", figures, figure_hits)
+    # The coverage sentence two clauses later published 101 and 93 with nothing
+    # reading them: both were moved by hand when the ledger moved, and a missed
+    # bump would have shipped in the report with every gate green.
+    coverage_figures, coverage_hits, coverage_computed, coverage_drift = (
+        scope_coverage_drift(
+            (aisf_entry or {}).get("scope_text", ""),
+            summary,
+            {m["control"] for m in AISF_DERIVED_MAP},
+        )
+    )
+    drift += coverage_drift
+    drift += figure_problems("SECURITY_CHECKS_AISF.md", doc_figures, doc_hits)
+    drift += figure_problems("SECURITY_CHECKS.md", {"sc_total": catalog_total}, sc_hits)
+    drift += figure_problems("README.md", {"readme_total": readme_total}, readme_hits)
+    drift += readme_dead
+    if figures["derivable"] != len(AISF_DERIVED_MAP):
+        drift.append(
+            f"scope_text claims {figures['derivable']} derivable, map has "
+            f"{len(AISF_DERIVED_MAP)}"
+        )
+    if figures["in_scope"] != summary["total"]:
+        drift.append(
+            f"scope_text claims {figures['in_scope']} in scope, ledger totals "
+            f"{summary['total']}"
+        )
+    if None in (figures["derivable"], figures["remaining"], figures["in_scope"]) or (
+        figures["derivable"] + figures["remaining"] != figures["in_scope"]
+    ):
+        drift.append(f"scope_text figures do not partition: {figures}")
+    # The catalog total gets a third side, derived from the code that emits the
+    # ids. The other two are both prose -- report_template's scope_text and
+    # SECURITY_CHECKS.md line 3 -- so comparing only those two catches one copy
+    # drifting and never both copies being equally stale. That is the failure that
+    # already happened: the two read 208 to each other's satisfaction while the
+    # producers emitted 218, and ten check ids shipped undocumented.
+    #
+    # README is the fourth side and the most-read one, publishing the total six
+    # times over. Nothing is broken at this head -- all four sides read 208, and
+    # 218 on the branch that raises it -- but this drift has shipped: 80f9864
+    # dropped SECURITY_CHECKS.md to 51 in a BR-14 cleanup and left README at 52,
+    # where it stood for 46 days until an unrelated bump reset both to 116. The
+    # three README copies that existed then agreed with each other at 52
+    # throughout, so README's own agreement rule would have passed it and only a
+    # comparison against another side catches it.
+    #
+    # Derived through gen_compliance_maps.check_owners() and not a regex written
+    # here. It runs both call spellings, and agent_registry_assessments passes
+    # check_id positionally, so a `check_id=` keyword scan resolves 0 of that
+    # module's 9 ids while a scan loose enough to catch them also matches every
+    # quoted id in a comment or docstring (BR alone measured 62 against a true 47).
+    #
+    # The `XX-00` rows are excluded by name: they are the "no resource of this type
+    # in the account" markers, never a check, and the published total counts checks.
+    # The excluded count is printed so the exclusion is visible and arguable.
+    catalog_owners = check_owners()
+    marker_ids = sorted(c for c in catalog_owners if c.endswith("-00"))
+    emitted_catalog_ids = sorted(c for c in catalog_owners if not c.endswith("-00"))
+    catalog_sides = {
+        "emitted": len(emitted_catalog_ids),
+        "scope_text": figures["catalog"],
+        "SECURITY_CHECKS.md": catalog_total,
+        "README.md": readme_total,
+    }
+    if not emitted_catalog_ids:
+        # Zero is not agreement with a prose figure of zero either: it means the
+        # derivation resolved nothing, which would make the comparison below and
+        # gate 13's doc leg both vacuous.
+        drift.append(
+            f"check_owners() resolved no non-marker check id under {MODULES}, so "
+            "the derived side of the catalog total measures nothing"
+        )
+    elif len(set(catalog_sides.values())) != 1:
+        drift.append(
+            f"the catalog total disagrees across its {len(catalog_sides)} sides: "
+            f"{catalog_sides}"
+        )
+    if doc_figures != figures:
+        drift.append(
+            f"SECURITY_CHECKS_AISF.md publishes {doc_figures}, the report "
+            f"section publishes {figures}"
+        )
+    gate(
+        "baked AISF control text and published figures match their sources",
+        not drift,
+        f"{len(AISF_DERIVED_MAP)} mappings x 4 baked fields + "
+        f"{len(collapsed)} collapsed-band disclosures x 2 status paths + "
+        f"{len(figures)} figures in the report section + "
+        f"{len(coverage_figures)} in its coverage sentence + "
+        f"{len(doc_figures)} in SECURITY_CHECKS_AISF.md checked, "
+        f"figures={figures}, coverage={coverage_figures} vs "
+        f"computed={coverage_computed}, "
+        f"copies scope_text [{copies_note(figure_hits)}] "
+        f"coverage [{copies_note(coverage_hits)}] "
+        f"SECURITY_CHECKS_AISF.md [{copies_note(doc_hits)}] "
+        f"SECURITY_CHECKS.md [{copies_note(sc_hits)}] "
+        f"README.md [{copies_note(readme_hits)}], "
+        f"catalog {len(catalog_sides)} sides: emitted {len(emitted_catalog_ids)} "
+        f"({len(catalog_owners)} distinct ids minus {len(marker_ids)} "
+        f"{marker_ids} markers) vs scope_text {figures['catalog']} vs "
+        f"SECURITY_CHECKS.md {catalog_total} vs README.md {readme_total} over "
+        f"{len(readme_hits['readme_total'])} copies"
+        + (f", drift={drift}" if drift else ""),
+    )
+
+    # ---- gate 13: the published id shape. Every id carries the registered prefix
+    # and is documented. The prefix is four letters where every producing prefix is
+    # two, so an id spelled with a different prefix length still looks plausible;
+    # what it actually does is route to `else: service = "bedrock"` in both
+    # consolidators, filing the row under Bedrock with no error anywhere. The doc
+    # leg is here because a rename that misses the catalog leaves a published id
+    # undocumented, which is the same evidence gap as an unregistered prefix.
+    registered_prefix = (aisf_entry or {}).get("prefix", "")
+    with open(AISF_DOC) as f:
+        aisf_doc_text = f.read()
+    shape = []
+    all_ids = [m["check_id"] for m in AISF_DERIVED_MAP] + [AISF_COVERAGE_CHECK_ID]
+    if registered_prefix != "AISF-":
+        shape.append(f"registry prefix is {registered_prefix!r}, not 'AISF-'")
+    for cid in all_ids:
+        if not re.fullmatch(r"AISF-\d{2}", cid):
+            shape.append(f"{cid} does not match ^AISF-\\d{{2}}$")
+        if not cid.startswith(registered_prefix):
+            shape.append(f"{cid} does not carry the registered prefix")
+        if cid not in aisf_doc_text:
+            shape.append(f"{cid} is not documented in SECURITY_CHECKS_AISF.md")
+
+    # The same evidence gap, over the whole emitted catalog rather than the nine
+    # derived ids. Read against SECURITY_CHECKS.md plus the two per-framework
+    # catalogues, because the OW- and NR- ids are documented in their own files and
+    # not in the main one. Not against SECURITY_CHECKS_AISF.md: that file
+    # catalogues AISF-01..08 and has no per-service section, so `BR-01` has 0 hits
+    # in it while `AISF-01` has 3, and reading it here would flag all 208 ids.
+    #
+    # docs/DEVELOPER_GUIDE.md is excluded, and not because it is wrong. Its line
+    # 739 reads "Your new `Check_ID` (for example BR-41, SM-31, AR-09, AG-33,
+    # OW-13, or NR-01)": it names the *next* id a contributor would add, so five of
+    # those six do not exist here and the sentence is accurate as written. Counting
+    # it as a documentation source would mark an id documented the day it ships,
+    # from prose written before it existed, which is the drift this leg exists to
+    # catch. Of the six only AG-33 exists at this base, and SECURITY_CHECKS.md
+    # documents it properly, so the exclusion changes nothing here yet.
+    doc_sources = (SECURITY_CHECKS_DOC, OWASP_DOC, GRC_DOC)
+    catalogued = ""
+    for path in doc_sources:
+        with open(path) as f:
+            catalogued += f.read()
+    if not emitted_catalog_ids or not catalogued.strip():
+        shape.append(
+            f"{len(emitted_catalog_ids)} emitted id(s) against "
+            f"{len(catalogued)} character(s) of catalogue: one side is empty, so "
+            "the per-id loop below asserts nothing"
+        )
+    for cid in emitted_catalog_ids:
+        if cid not in catalogued:
+            shape.append(f"{cid} is emitted but documented in no catalogue")
+    gate(
+        "every derived id has the published AISF- shape, and every emitted id is "
+        "documented",
+        not shape,
+        f"{len(all_ids)} ids ({len(AISF_DERIVED_MAP)} mapped + the coverage marker) "
+        f"x 3 legs (^AISF-\\d{{2}}$, registered prefix {registered_prefix!r}, "
+        f"documented) checked; {len(emitted_catalog_ids)} emitted non-marker id(s) "
+        f"against {len(doc_sources)} catalogue(s) "
+        f"({', '.join(os.path.basename(p) for p in doc_sources)}), "
+        "DEVELOPER_GUIDE.md excluded as forward-looking"
+        + (f", bad={shape}" if shape else ""),
+    )
+
+    # ---- gate 14: the per-module AISF tag maps agree with the ledger, in both
+    # directions, and no tag overstates what its check asserts.
+    #
+    # This block emits four verdicts, 14a/14b/14c/14d, over four separate problem
+    # lists. One boolean under one name used to cover the first three, and four
+    # mutations with unrelated causes -- a dropped qualifier, a tag in the wrong
+    # module, a reworded documentation sentence -- all printed the same gate name
+    # as their first red, so the name told a reader nothing about which of the
+    # three broke. 14d is the two set identities the census paragraph states,
+    # compared code to code, where 14c compares the paragraph's numerals against
+    # the same computation. It had no verdict of its own before this; it was not
+    # unasserted, and tagged_control_problems() records what the gates that
+    # already run entail and what is left over.
+    #
+    # Lettered instead of renumbered: `docs/SECURITY_CHECKS_AISF.md` cites
+    # "gate 14" in seven places, and the four generated aisf_compliance_*.py
+    # headers and gen_compliance_maps.py cite it in five more. Renumbering would
+    # also move gates 15 and 16, so the letters keep every existing citation true
+    # while the printed names separate. No printed verdict is called "gate 14" once
+    # the legs have their own names, which is why figure_drift's messages stopped
+    # naming one.
+    #
+    # Phase 2 tags rows the producers already emit, so unlike the derived map in
+    # gate 11 it *may* reference a `tighten` control. What makes that sound is the
+    # qualifier: `(partial)` says the check asserts less than the control needs,
+    # and `(1 of N checks)` says the control is covered but not by this leg alone.
+    # Drop the qualifier and the row reads as a full pass against a control the
+    # assessment only partly checks, which is the same overclaim gate 11 exists to
+    # prevent. So the qualifier is derived from the ledger here rather than
+    # trusted, and the N is compared against the row's own incumbent count.
+    #
+    # Both directions, because a scan over the maps cannot see a control that was
+    # never written into one, and that is the direction a newly-added ledger row
+    # drifts.
+    taggable = ("covered", "tighten")
+    maps = load_compliance_maps()
+    # Called again rather than reusing `emitted` from the top of main(): gate 12
+    # rebinds that name to a list of derived findings, so by here it is no longer
+    # the check_id -> modules map.
+    emitting_modules = emitted_check_ids()
+    expected_pairs = set()
+    for r in rows:
+        if r["verdict"] in taggable:
+            for inc in r["incumbents"] or []:
+                expected_pairs.add((inc, r["control"]))
+    found_pairs = set()
+    tag_problems = []
+    element_re = re.compile(
+        r"AISF (AIR-[A-Z]+-[A-Z]+-\d+)(?: \((partial|1 of (\d+) checks)\))?$"
+    )
+    for module_dir, mapping in sorted(maps.items()):
+        for cid, tag in sorted(mapping.items()):
+            if module_dir not in emitting_modules.get(cid, set()):
+                tag_problems.append(f"{module_dir} maps {cid}, which it does not emit")
+            for element in tag.split(" | "):
+                m = element_re.fullmatch(element)
+                if not m:
+                    tag_problems.append(
+                        f"{module_dir}:{cid} unparseable tag {element!r}"
+                    )
+                    continue
+                control, qualifier, denominator = m.groups()
+                row = by_control.get(control)
+                if row is None or row["verdict"] not in taggable:
+                    verdict = None if row is None else row["verdict"]
+                    tag_problems.append(
+                        f"{module_dir}:{cid}:{control} verdict={verdict}"
+                    )
+                    continue
+                found_pairs.add((cid, control))
+                legs = len(row["incumbents"] or [])
+                want = (
+                    "partial"
+                    if row["verdict"] == "tighten"
+                    else (None if legs == 1 else f"1 of {legs} checks")
+                )
+                if qualifier != want:
+                    tag_problems.append(
+                        f"{module_dir}:{cid}:{control} verdict={row['verdict']} "
+                        f"legs={legs} qualifier={qualifier!r} want={want!r}"
+                    )
+                elif denominator is not None and int(denominator) != legs:
+                    tag_problems.append(
+                        f"{module_dir}:{cid}:{control} denominator={denominator} legs={legs}"
+                    )
+    missing = expected_pairs - found_pairs
+    extra = found_pairs - expected_pairs
+    if missing:
+        tag_problems.append(f"in the ledger, absent from every map: {sorted(missing)}")
+    if extra:
+        tag_problems.append(f"in a map, not taggable in the ledger: {sorted(extra)}")
+    # Every figure docs/SECURITY_CHECKS_AISF.md publishes about the tag column is
+    # computed here, and now asserted against the doc rather than only printed
+    # beside it. Printing was not enough: the eight figures in that paragraph are
+    # transcribed by hand, and adding one entry to any aisf_compliance_*.py moves
+    # four of them, so a stale paragraph shipped under a green gate that printed the
+    # right numbers two lines further down.
+    #
+    # Gate 14b reads `computed` rather than deriving its own copy: the values are
+    # what 14a's predicate already builds, and a second derivation could disagree
+    # with the line 14a prints. Separate verdict, one computation.
+    #
+    # The qualifier census is gate 14c, against the paragraph sixteen lines below
+    # the one above. It was printed unasserted under a parenthetical saying no
+    # document published it; the paragraph publishes six figures, and the two
+    # verdict counts among them have already drifted on phase 3's branch. 14c also
+    # asserts the two sums the paragraph builds out of those figures, which is a
+    # separate claim: every numeral in a sentence can be gated and right while the
+    # sentence adds them up wrong.
+    #
+    # 14d asserts the same two claims with no document in them, as set identities
+    # over the tag maps and build_ledger.ROWS. Counts are what 14c can read out of
+    # prose; membership is what the claim is, and two sets of one size can have
+    # different members. What it adds over the chain of 14a and gate 15, which is
+    # narrow, is in tagged_control_problems()'s docstring.
+    # The pipe-joined paragraph's two populations, computed in their own loop and
+    # not inside 14a's above. 14a `continue`s past an element whose row verdict is
+    # wrong, so recording forms there would make a verdict mutation move this
+    # figure too and leave a red here pointing at an unrelated cause. No
+    # unparseable-element guard: 14a already fails on one at :1469, and a second
+    # copy of that check here would be dead code.
+    #
+    # The predicate is the one the prose states -- at least one `(partial)` element
+    # and at least one element of another form -- and not the broader "two or more
+    # distinct forms". They agree at 14 today and are not the same population:
+    # `AC-19` carries bare plus joint and no partial at all, so the broad reading
+    # counts it while the sentence's own explanation ("a direct consequence of the
+    # FND block") does not describe it, AC-19 naming no FND control. A value whose
+    # every element is `(partial)` separates them the other way.
+    multi_tags = [v for m in maps.values() for v in m.values() if "|" in v]
+    mixing = 0
+    for tag in multi_tags:
+        forms = set()
+        for element in tag.split(" | "):
+            m = element_re.fullmatch(element)
+            if m:
+                forms.add(
+                    "bare"
+                    if m.group(2) is None
+                    else ("partial" if m.group(2) == "partial" else "joint")
+                )
+        if "partial" in forms and len(forms) > 1:
+            mixing += 1
+    computed = {
+        "pairs": len(found_pairs),
+        "tagged": sum(len(m) for m in maps.values()),
+        "modules": len(maps),
+        "controls": len({c for _, c in found_pairs}),
+        # Two keys, one number, deliberately: the paragraph states this count and
+        # the next one restates it as `of those 23`, and each sentence is required
+        # to publish it. See tag_column_figures() for the mutation that forced the
+        # two-figure shape over a pool.
+        "multi": len(multi_tags),
+        "multi_restated": len(multi_tags),
+        "mixing": mixing,
+        "per_module": {
+            d.removesuffix("_assessments"): len(m) for d, m in sorted(maps.items())
+        },
+    }
+    # Re-read rather than reusing gate 13's copy of the text: the gates above rebind
+    # names across blocks, and a figure gate that reads the wrong buffer fails open.
+    with open(AISF_DOC) as f:
+        published_text = f.read()
+    published, published_hits = tag_column_figures(published_text)
+    figure_problems_14b = figure_drift(
+        "SECURITY_CHECKS_AISF.md", published, published_hits, computed
+    )
+    per_module = " ".join(f"{k}={v}" for k, v in sorted(computed["per_module"].items()))
+    census = collections.Counter()
+    # The controls each qualifier names, not just how many elements carry it. The
+    # joint set's size is the sixth census figure -- one control can carry several
+    # joint legs, and at this base 3 legs sit on 1 control -- and it is the middle
+    # term of the sum the paragraph states, so it is computed here and read out of
+    # the document too. The sets themselves are what gate 14d compares.
+    tag_controls = collections.defaultdict(set)
+    for module_dir, mapping in maps.items():
+        for tag in mapping.values():
+            for element in tag.split(" | "):
+                m = element_re.fullmatch(element)
+                if m:
+                    kind = (
+                        "bare"
+                        if m.group(2) is None
+                        else ("partial" if m.group(2) == "partial" else "joint")
+                    )
+                    census[kind] += 1
+                    tag_controls[kind].add(m.group(1))
+    # The covered/tighten half of that sentence comes from build_ledger.ROWS, the
+    # hand-authored verdict table, and not from the ledger json rendered out of it:
+    # the json is a generated copy, and gate 15's --check leg is what keeps the two
+    # agreeing. Measured at this base, they do agree -- 78 rows, covered 8,
+    # tighten 28, from either side. ROWS is imported, never built: build() reads the
+    # sibling AISF repo and needs yaml, so a gate resting on it reds in any clone
+    # that lacks that working copy.
+    verdict_census = collections.Counter(r[1] for r in ROWS)
+    # The same table grouped rather than counted. A count cannot tell two sets of
+    # equal size apart, and what the paragraph claims about these two populations
+    # is membership: r[0] is the control, r[1] the verdict, measured against the
+    # tuples in build_ledger.ROWS rather than assumed from their order.
+    verdict_controls = collections.defaultdict(set)
+    for row in ROWS:
+        verdict_controls[row[1]].add(row[0])
+    computed_census = {
+        "bare": census["bare"],
+        "partial": census["partial"],
+        "joint": census["joint"],
+        "joint_controls": len(tag_controls["joint"]),
+        "covered": verdict_census["covered"],
+        "tighten": verdict_census["tighten"],
+    }
+    # Sliced here, on the raw text, because census_figures() flattens what it is
+    # given and the paragraph delimiters do not survive that. The count comes back
+    # for the verdict line: a census read from no paragraph, or from two, prints as
+    # such beside the figures instead of looking like figures nobody published.
+    census_slice, census_paragraphs, census_slice_problems = census_paragraph(
+        published_text
+    )
+    census_published, census_hits, census_sum_problems = census_figures(census_slice)
+    census_problems = (
+        census_slice_problems
+        + figure_drift(
+            "SECURITY_CHECKS_AISF.md's census paragraph",
+            census_published,
+            census_hits,
+            computed_census,
+        )
+        + census_sum_problems
+    )
+    tagged_problems = tagged_control_problems(tag_controls, verdict_controls)
+    # Printed whether or not it is zero. A union absorbs an overlap silently, and a
+    # control carrying both a bare and a joint tag is the one state where the set
+    # identity holds and the paragraph's sum does not: bare 2 + joint 2 over a
+    # 3-control union reconciles against 3 `covered` rows as a set and against 4 as
+    # a sum. It measured 0 here and 0 at the merge, so any other value is news.
+    overlap = tag_controls["bare"] & tag_controls["joint"]
+    # 14a first, so a defect that violates more than one of the three claims names
+    # the most specific one in mutate.py's first-red line. Deleting a map entry is
+    # the case, measured: it loses a pair here, moves the `tagged` figure 14b
+    # asserts, and moves 14c's bare/partial census, so all three red and all three
+    # are true. Dropping a qualifier reds 14a and 14c and not 14b, because the tag
+    # is still there to count.
+    gate(
+        "per-module AISF tag maps agree with the ledger both ways",
+        not tag_problems,
+        f"{len(found_pairs)}/{len(expected_pairs)} check-control pairs over "
+        f"{sum(len(m) for m in maps.values())} tagged checks in {len(maps)} modules, "
+        f"naming {len({c for _, c in found_pairs})} distinct controls; "
+        f"checks per module {per_module}; each checked for module ownership, ledger "
+        f"verdict and qualifier" + (f", bad={tag_problems}" if tag_problems else ""),
+    )
+    gate(
+        "the tag-column figures SECURITY_CHECKS_AISF.md publishes match the maps",
+        not figure_problems_14b,
+        f"{len(published) - 1} scalar figure(s) + "
+        f"{len(published['per_module'] or {})} per-module figure(s) asserted, "
+        f"doc={published} vs computed={computed}, "
+        f"copies [{copies_note(published_hits)}]"
+        + (f", bad={figure_problems_14b}" if figure_problems_14b else ""),
+    )
+    gate(
+        "the SECURITY_CHECKS_AISF.md census paragraph is one slice, six figures, "
+        "and its own arithmetic",
+        not census_problems,
+        f"census from {census_paragraphs} paragraph(s) matching {CENSUS_ANCHOR!r}, "
+        f"{len(census_published)} figure(s) asserted, doc={census_published} vs "
+        f"computed={computed_census}, the sentence's own sum "
+        f"{census_published['bare']}+{census_published['joint_controls']} vs "
+        f"covered {census_published['covered']}, "
+        f"copies [{copies_note(census_hits)}]"
+        + (f", bad={census_problems}" if census_problems else ""),
+    )
+    gate(
+        "the tagged controls are exactly the covered and tighten rows of "
+        "build_ledger.ROWS",
+        not tagged_problems,
+        f"{len(tag_controls['bare'] | tag_controls['joint'])} control(s) carry a "
+        f"bare or joint tag against {len(verdict_controls['covered'])} `covered` "
+        f"row(s), {len(tag_controls['partial'])} carry `(partial)` against "
+        f"{len(verdict_controls['tighten'])} `tighten` row(s); compared as sets, so "
+        f"two populations of one size over different members is a failure; "
+        f"bare/joint overlap {len(overlap)}{sorted(overlap) if overlap else ''}; "
+        f"partial {census['partial']} element(s) over "
+        f"{len(tag_controls['partial'])} control(s), which this leg counts and does "
+        f"not equate" + (f", bad={tagged_problems}" if tagged_problems else ""),
+    )
+
+    # ---- gate 15: the shipped maps are what the generator renders from the
+    # ledger. Gate 14 asserts the semantics independently of the generator; this
+    # one catches a hand-edit that happens to stay semantically legal, such as a
+    # reordered or duplicated entry.
+    gen = subprocess.run(
+        [sys.executable, os.path.join(HERE, "gen_compliance_maps.py"), "--check"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+    )
+    gate(
+        "shipped AISF tag maps match a fresh render of the ledger",
+        gen.returncode == 0 and "maps match the ledger" in gen.stdout,
+        f"generator --check exit {gen.returncode} over {len(maps)} modules"
+        + (
+            ""
+            if gen.returncode == 0
+            else f", output={(gen.stdout + gen.stderr).strip().splitlines()[-1:]}"
+        ),
+    )
+
+    # ---- gate 16: every generated map is wired into its own module's schema.py.
+    # A generated aisf_compliance_<module>.py that nothing imports stops tagging
+    # without failing: `Compliance_Frameworks` falls back to its Field(default="")
+    # while create_finding still fills it for the wired modules, so the column is
+    # present in every CSV and one producer's cells are empty. Deleting the import
+    # and keeping the call raises NameError, which is loud; the silent case is a
+    # new producer whose schema.py never wires the map at all.
+    #
+    # The list is globbed rather than taken from MODULE_TO_FUNCTION above, because
+    # a hardcoded module list is the thing this gate exists to close, and
+    # load_compliance_maps() `continue`s past a missing file, which is the same
+    # fail-open shape. A module that ships no map is simply not globbed: only
+    # four of the six producers carry one.
+    map_files = sorted(glob.glob(os.path.join(MODULES, "*", "aisf_compliance_*.py")))
+    unwired = []
+    for path in map_files:
+        module_dir = os.path.basename(os.path.dirname(path))
+        name = os.path.basename(path).removesuffix(".py")
+        schema_path = os.path.join(os.path.dirname(path), "schema.py")
+        if not os.path.exists(schema_path):
+            unwired.append(f"{module_dir} ships {name}.py but has no schema.py")
+            continue
+        with open(schema_path) as f:
+            schema_src = f.read()
+        pattern = rf"^\s*(?:from {re.escape(name)} import|import {re.escape(name)}\b)"
+        if not re.search(pattern, schema_src, re.M):
+            unwired.append(f"{module_dir}/schema.py does not import {name}")
+        elif "aisf_frameworks(" not in schema_src:
+            unwired.append(f"{module_dir}/schema.py imports {name} but never calls it")
+    gate(
+        "every generated AISF map is imported and called by its own schema.py",
+        # Fail closed on zero. An empty glob makes the loop above vacuously clean,
+        # and "0/0 wired" would print beside a PASS.
+        bool(map_files) and not unwired,
+        f"{len(map_files) - len(unwired)}/{len(map_files)} map(s) wired into the "
+        f"schema.py beside them"
+        + (
+            ""
+            if map_files
+            else "; no aisf_compliance_*.py exists at all, which is "
+            "not a pass -- an empty set satisfies every per-file check above"
+        )
+        + (f", unwired={unwired}" if unwired else ""),
+    )
+
+    # ---- gate 20: the mutation-battery figures SECURITY_CHECKS_AISF.md publishes
+    # match mutate.py's own entry list. Step 7 of that procedure quotes the entry
+    # count twice and then splits it by group, and nothing read the two together:
+    # the sentence said 17 while the battery had grown to 21, so a reader following
+    # the procedure would have accepted a run four entries short as complete. The
+    # precedent is worse than drift -- AISF-PARITY-PROPOSAL.md at 7be56d4 published
+    # "all 10 gates were mutation-tested with 6 deliberate corruptions, all 6
+    # caught" in a commit made four hours before mutate.py's first commit existed.
+    #
+    # Scoped to step 7 alone, by slicing on its anchor before any matching. Two
+    # reasons. The proposal doc holds a dated stale copy of these figures on
+    # purpose and must not be gated, and within this doc a bare `21` or a `5` is
+    # ordinary prose -- the census gate above already reds on a correct paragraph
+    # once for exactly that reason. The slice is taken on the raw text and the
+    # whitespace flattened afterwards, because every one of these figures wraps
+    # across a line break in the rendered markdown.
+    #
+    # The leg that catches something the per-figure comparison cannot: each group
+    # phrase must appear EXACTLY once in the slice. A new group added to mutate.py
+    # and left out of the sentence matches zero times, which the equality check
+    # would never see, because a figure that is absent cannot disagree.
+    mut_bad = []
+    mut_detail = "not read"
+    battery, want_groups = [], {}
+    # SystemExit is caught alongside Exception on purpose. mutate.py's own
+    # population check calls die(), which raises SystemExit, and SystemExit is a
+    # BaseException: a bare `except Exception` would let it terminate this harness
+    # at exit 2 with no [FAIL] line and every later gate's verdict lost. A
+    # traceback is not a gate catching a defect.
+    try:
+        mut_path = os.path.join(HERE, "mutate.py")
+        cached = importlib.util.cache_from_source(mut_path)
+        if os.path.exists(cached):
+            os.remove(cached)
+        spec = importlib.util.spec_from_file_location("mutate", mut_path)
+        mutate_mod = importlib.util.module_from_spec(spec)
+        sys.modules["mutate"] = mutate_mod
+        spec.loader.exec_module(mutate_mod)
+        battery = mutate_mod.resolve_mutations(pathlib.Path(REPO))
+        want_groups = mutate_mod.group_counts(pathlib.Path(REPO))
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - reported, never raised
+        mut_bad.append(f"mutate.py could not be read for its entry list: {exc!r}")
+        battery, want_groups = [], {}
+    if not mut_bad:
+        with open(AISF_DOC) as f:
+            mut_text = f.read()
+        anchor = "Run `.venv/bin/python aisf-parity/mutate.py`"
+        starts = [m.start() for m in re.finditer(re.escape(anchor), mut_text)]
+        if len(starts) != 1:
+            mut_bad.append(
+                f"the step-7 anchor {anchor!r} occurs {len(starts)} time(s) in "
+                "SECURITY_CHECKS_AISF.md; the slice this gate reads is undecidable, "
+                "which is a failure and not a skip"
+            )
+        else:
+            end = mut_text.find("\n8. ", starts[0])
+            if end == -1:
+                mut_bad.append(
+                    "no '8. ' step follows the mutate.py step, so step 7 has no end "
+                    "and the slice would run to the end of the document"
+                )
+        if not mut_bad:
+            step = " ".join(mut_text[starts[0] : end].split())
+            total = len(battery)
+            validated = re.findall(r"entries (\d+)/(\d+) find-strings validated", step)
+            if len(validated) != 1:
+                mut_bad.append(
+                    f"the 'entries N/N find-strings validated' line occurs "
+                    f"{len(validated)} time(s) in step 7"
+                )
+            elif [int(n) for n in validated[0]] != [total, total]:
+                mut_bad.append(
+                    f"step 7 quotes 'entries {validated[0][0]}/{validated[0][1]} "
+                    f"find-strings validated'; mutate.py defines {total}"
+                )
+            ways = re.findall(r"breaks the code (\d+) ways", step)
+            if len(ways) != 1:
+                mut_bad.append(
+                    f"the 'breaks the code N ways' phrase occurs {len(ways)} "
+                    "time(s) in step 7"
+                )
+            elif int(ways[0]) != total:
+                mut_bad.append(
+                    f"step 7 says it breaks the code {ways[0]} ways; mutate.py "
+                    f"defines {total} entries"
+                )
+            for phrase, count in want_groups.items():
+                hits = re.findall(r"(\d+) " + re.escape(phrase), step)
+                if len(hits) != 1:
+                    mut_bad.append(
+                        f"the group {phrase!r} is counted {count} time(s) by "
+                        f"mutate.py but its figure occurs {len(hits)} time(s) in "
+                        "step 7"
+                    )
+                elif int(hits[0]) != count:
+                    mut_bad.append(
+                        f"step 7 says {hits[0]} {phrase}; mutate.py counts {count}"
+                    )
+            mut_detail = (
+                f"{total} entry(ies) in mutate.py over {len(want_groups)} group(s), "
+                f"2 total-count figure(s) + {len(want_groups)} group figure(s) "
+                f"asserted against step 7 of SECURITY_CHECKS_AISF.md, "
+                f"computed={want_groups}"
+            )
+    gate(
+        "the mutation-battery figures SECURITY_CHECKS_AISF.md publishes match "
+        "mutate.py's entries",
+        # Fail closed on an empty battery: zero entries over zero groups makes
+        # every comparison above vacuously true, and "0 entries asserted" would
+        # print beside a PASS.
+        bool(battery) and bool(want_groups) and not mut_bad,
+        mut_detail
+        + (
+            ""
+            if battery and want_groups
+            else f"; {len(battery)} entry(ies) and {len(want_groups)} group(s) is "
+            "not a pass -- an empty battery satisfies every figure check above"
+        )
+        + (f", bad={mut_bad}" if mut_bad else ""),
+    )
+
+    # ---- gate 21: the coverage and traceability bullets. Ten digit figures over
+    # six ledger populations asserted here plus `unassessed` as prose, none of which
+    # any gate read until this one. The block published eleven figure instances at
+    # bd0ecb8, the eleventh being an `unassessed` digit, and ten of the eleven were
+    # wrong for a whole phase while every other gate passed.
+    # coverage_bullet_figures() records how that happened.
+    #
+    # Appended rather than placed beside the other two document-figure gates, which
+    # would read better: the gates above are numbered in comments and cited by
+    # number in the document's own prose, so inserting one renumbers the citations.
+    with open(AISF_DOC) as f:
+        bullet_text = f.read()
+    bullet_slice, bullet_blocks, bullet_bad = coverage_bullets(bullet_text)
+    bullet_published, bullet_hits = coverage_bullet_figures(bullet_slice)
+    # Counted as distinct controls and not as mappings. The bullet's claim is about
+    # controls -- "the other 53 `covered` controls" -- and the two are 8 either way
+    # here, but nothing asserts they must be: gate 11 checks each mapping's control
+    # against a row and gate 13 checks the ids are well-formed, and neither would
+    # fail if one control were mapped twice. On the day that happens this leg reds
+    # on the split sum while gate 12's partition stays green, and the repair is the
+    # duplicate mapping rather than either figure.
+    mapped_controls = {m["control"] for m in AISF_DERIVED_MAP}
+    bullet_computed = {
+        "covered": summary["covered"],
+        "covered_without_row": summary["covered"] - len(mapped_controls),
+        "covered_without_row_restated": summary["covered"] - len(mapped_controls),
+        "tighten": summary["tighten"],
+        "tighten_in_the_split": summary["tighten"],
+        "new": summary["new"],
+        "not_implementable": summary["not_implementable"],
+        "taggable": summary["covered"] + summary["tighten"],
+        "taggable_covered": summary["covered"],
+        "taggable_tighten": summary["tighten"],
+        "unassessed": summary["unassessed"],
+        "without_row_total": summary["total"] - len(mapped_controls),
+    }
+    bullet_bad += figure_drift(
+        "SECURITY_CHECKS_AISF.md's coverage bullets",
+        bullet_published,
+        bullet_hits,
+        bullet_computed,
+    )
+    bullet_bad += coverage_bullet_relations(
+        bullet_published, bullet_computed, bullet_hits
+    )
+    gate(
+        "the SECURITY_CHECKS_AISF.md coverage and traceability bullets match the "
+        "ledger, and their own two sums add up",
+        not bullet_bad,
+        f"bullets from {bullet_blocks} block(s) matching {BULLET_ANCHOR!r}, "
+        f"{len(bullet_published)} figure(s) asserted plus `unassessed` as prose, "
+        f"doc={bullet_published} vs computed={bullet_computed}, "
+        f"the split {bullet_computed['without_row_total']} without a row and "
+        f"taggable {bullet_computed['covered']}+{bullet_computed['tighten']}, "
+        f"copies [{copies_note(bullet_hits)}]"
+        + (f", bad={bullet_bad}" if bullet_bad else ""),
+    )
+
+    # ---- gate 22: SCOPE27 is the foundation tier, in the json, in the verdict
+    # tables, and in the AISF classification. Appended for the reason gate 21 was.
+    machine_checkable = {
+        cid for cid, flags in classification.items() if flags.get("machine_checkable")
+    }
+    tier_bad = foundation_tier_problems(SCOPE27, rows, TIERS, machine_checkable)
+    gate(
+        "SCOPE27 is the foundation tier, and every machine-checkable control has a row",
+        not tier_bad,
+        f"SCOPE27 {len(SCOPE27)}, json foundation "
+        f"{sum(1 for r in rows if r['tier'] == FOUNDATION)}, FOUNDATION_ROWS "
+        f"{sum(1 for t in TIERS.values() if t == FOUNDATION)}, machine-checkable "
+        f"{len(machine_checkable)} over {len(rows)} rows"
+        + (f", bad={tier_bad}" if tier_bad else ""),
+    )
+
+    failed = [n for n, ok, _ in results if not ok]
+    print()
+    print(f"{len(results) - len(failed)}/{len(results)} gates passed")
+    if failed:
+        print("FAILED: " + ", ".join(failed))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
