@@ -923,10 +923,9 @@ def check_guardduty_enabled(
                     finding_details=(
                         "The GuardDuty detector in this region has Status ENABLED. "
                         "Only the detector status was read here: the AI Protection "
-                        "plan is reported by SM-26. Security Hub records each "
-                        "finding's review in its Workflow.Status, which this check "
-                        "does not read, so whether the findings are reviewed was "
-                        "not assessed."
+                        "plan is reported by SM-26, and whether the findings are "
+                        "reviewed is reported by the "
+                        f"'{GUARDDUTY_REVIEW_FINDING}' row."
                     ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html",
@@ -935,8 +934,12 @@ def check_guardduty_enabled(
                     region=region,
                 )
             )
-            findings["csv_data"].append(_guardduty_security_hub_routing_finding(region))
+            routing = _guardduty_security_hub_routing_finding(region)
+            findings["csv_data"].append(routing)
             findings["csv_data"].append(_guardduty_eventbridge_routing_finding(region))
+            findings["csv_data"].append(
+                _guardduty_finding_review_finding(region, routing)
+            )
         else:
             findings["csv_data"].append(
                 create_finding(
@@ -1036,6 +1039,111 @@ def _guardduty_security_hub_routing_finding(region: str) -> Dict[str, Any]:
         "Enable the GuardDuty integration in Security Hub for this region.",
         "Medium",
         "Failed",
+    )
+
+
+GUARDDUTY_REVIEW_FINDING = "GuardDuty Findings Reviewed in Security Hub"
+GUARDDUTY_REVIEW_REFERENCE = (
+    "https://docs.aws.amazon.com/securityhub/latest/userguide/"
+    "finding-workflow-status.html"
+)
+# The control asks for review on a defined cadence and names none, so this
+# check uses a 30-day window and says so in every row.
+GUARDDUTY_REVIEW_WINDOW_DAYS = 30
+
+
+def _guardduty_finding_review_finding(
+    region: str, routing: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    SM-04: an ACTIVE GuardDuty finding in Security Hub whose Workflow.Status is
+    still NEW past the review window was never reviewed (AIR-FND-DET-02).
+    """
+
+    def _row(details, resolution, severity, status, name=GUARDDUTY_REVIEW_FINDING):
+        return create_finding(
+            check_id="SM-04",
+            finding_name=name,
+            finding_details=details,
+            resolution=resolution,
+            reference=GUARDDUTY_REVIEW_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if routing.get("Status") != "Passed":
+        return _row(
+            "Security Hub in this region does not import GuardDuty findings, or "
+            "whether it does was not read (see the "
+            f"'{GUARDDUTY_ROUTING_FINDING}' row), so their review in Security "
+            "Hub was not judged.",
+            "Enable the GuardDuty integration in Security Hub for this region.",
+            "Informational",
+            "N/A",
+            name=f"{GUARDDUTY_REVIEW_FINDING} Incomplete",
+        )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=GUARDDUTY_REVIEW_WINDOW_DAYS)
+    filters = {
+        "ProductName": [{"Value": "GuardDuty", "Comparison": "EQUALS"}],
+        "RecordState": [{"Value": "ACTIVE", "Comparison": "EQUALS"}],
+        "WorkflowStatus": [{"Value": "NEW", "Comparison": "EQUALS"}],
+        "CreatedAt": [
+            {
+                "Start": "1970-01-01T00:00:00Z",
+                "End": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        ],
+    }
+    stale = []
+    try:
+        client = boto3.client("securityhub", config=boto3_config, region_name=region)
+        for page in client.get_paginator("get_findings").paginate(
+            Filters=filters,
+            SortCriteria=[{"Field": "CreatedAt", "SortOrder": "asc"}],
+        ):
+            stale.extend(page.get("Findings", []))
+            if stale:
+                break
+    except Exception as error:
+        return _row(
+            "Whether GuardDuty findings in Security Hub are reviewed was not "
+            "read: securityhub:GetFindings failed. "
+            + build_could_not_assess_detail(error, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{GUARDDUTY_REVIEW_FINDING} Incomplete",
+        )
+    window = (
+        f"The control names no review cadence, so this check uses "
+        f"{GUARDDUTY_REVIEW_WINDOW_DAYS} days; findings created more recently are "
+        "not judged."
+    )
+    if stale:
+        oldest = stale[0]
+        kinds = sorted({str((f.get("Types") or ["no type"])[0]) for f in stale})
+        return _row(
+            f"At least {len(stale)} ACTIVE GuardDuty finding(s) in Security Hub "
+            "still have Workflow.Status NEW more than "
+            f"{GUARDDUTY_REVIEW_WINDOW_DAYS} days after they were created, so "
+            f"nobody has reviewed them. The oldest, {oldest.get('Id')}, was "
+            f"created {oldest.get('CreatedAt')}; types: {', '.join(kinds[:3])}. "
+            f"{window}",
+            "Review each GuardDuty finding in Security Hub and set its workflow "
+            "status to NOTIFIED, RESOLVED or SUPPRESSED, and assign an owner and "
+            "cadence for that review.",
+            "Medium",
+            "Failed",
+        )
+    return _row(
+        "No ACTIVE GuardDuty finding in Security Hub in this region has "
+        f"Workflow.Status NEW more than {GUARDDUTY_REVIEW_WINDOW_DAYS} days after "
+        "it was created, so every older active finding has been moved to "
+        f"NOTIFIED, RESOLVED or SUPPRESSED. {window}",
+        "No action required",
+        "Medium",
+        "Passed",
     )
 
 
@@ -9268,18 +9376,28 @@ RISING_COMPARISONS = ("GreaterThanThreshold", "GreaterThanOrEqualToThreshold")
 
 
 def _actionable_metric_alarms(region: str) -> List[Dict[str, Any]]:
-    """Every metric alarm in the region that is enabled and has an alarm action."""
+    """
+    Every metric alarm in the region whose ALARM state reaches an enabled alarm
+    action: its own, or that of a composite alarm whose rule ORs it in, as
+    SM-37 resolves composite routing (AIR-SGM-EP-06).
+    """
     cloudwatch_client = boto3.client(
         "cloudwatch", config=boto3_config, region_name=region
     )
-    alarms = []
+    metric_alarms = []
+    composite_alarms = []
     for page in cloudwatch_client.get_paginator("describe_alarms").paginate(
-        AlarmTypes=["MetricAlarm"]
+        AlarmTypes=["MetricAlarm", "CompositeAlarm"]
     ):
-        for alarm in page.get("MetricAlarms", []):
-            if alarm.get("ActionsEnabled") and alarm.get("AlarmActions"):
-                alarms.append(alarm)
-    return alarms
+        metric_alarms.extend(page.get("MetricAlarms", []))
+        composite_alarms.extend(page.get("CompositeAlarms", []))
+    actioned = _actioned_alarms(metric_alarms, composite_alarms)
+    return [
+        alarm
+        for alarm in metric_alarms
+        if (alarm.get("ActionsEnabled") and alarm.get("AlarmActions"))
+        or (alarm.get("AlarmName") and actioned.get(alarm["AlarmName"]))
+    ]
 
 
 def _alarm_metric_dimensions(alarm: Dict[str, Any]) -> List[tuple]:
@@ -9634,7 +9752,8 @@ def _monitor_report_and_alarm_findings(
                 check_id="SM-23",
                 finding_name=MONITOR_ALARM_FINDING,
                 finding_details=(
-                    "No enabled CloudWatch alarm with an action evaluates a "
+                    "No CloudWatch alarm whose ALARM state reaches an enabled "
+                    "action, its own or an OR composite alarm's, evaluates a "
                     f"{schedule.get('type') or 'Model Monitor'} metric of schedule "
                     f"'{schedule['name']}' on endpoint '{schedule['endpoint']}' "
                     "under that schedule's namespace and both its endpoint and "
@@ -9664,8 +9783,9 @@ def _monitor_report_and_alarm_findings(
                 check_id="SM-23",
                 finding_name=MONITOR_ALARM_FINDING,
                 finding_details=(
-                    f"All {len(schedules)} monitoring schedule(s) have an enabled "
-                    "alarm with an action on a metric of their own monitoring "
+                    f"All {len(schedules)} monitoring schedule(s) have an alarm "
+                    "whose ALARM state reaches an enabled action, its own or an "
+                    "OR composite alarm's, on a metric of their own monitoring "
                     "type, endpoint and schedule. A DataQuality alarm reads a "
                     "feature_baseline_drift_ metric, and a single-metric one "
                     "rises past a threshold below 1. For ModelQuality, ModelBias "
@@ -11117,8 +11237,9 @@ def _capture_disk_alarm_findings(
                 check_id="SM-31",
                 finding_name=CAPTURE_DISK_ALARM_FINDING,
                 finding_details=(
-                    f"Capturing variant '{label}' has no enabled alarm with an "
-                    "action on /aws/sagemaker/Endpoints DiskUtilization at a "
+                    f"Capturing variant '{label}' has no alarm whose ALARM state "
+                    "reaches an enabled action, its own or an OR composite "
+                    "alarm's, on /aws/sagemaker/Endpoints DiskUtilization at a "
                     f"threshold of {CAPTURE_DISK_ALARM_MAX_THRESHOLD:g}% or lower, so "
                     "Data Capture can stop at high disk usage without notice."
                 ),
@@ -11150,9 +11271,11 @@ def _capture_disk_alarm_findings(
                 check_id="SM-31",
                 finding_name=CAPTURE_DISK_ALARM_FINDING,
                 finding_details=(
-                    f"All {checked} instance-backed capturing variant(s) have an "
-                    "enabled DiskUtilization alarm with an action at "
-                    f"{CAPTURE_DISK_ALARM_MAX_THRESHOLD:g}% or lower. Serverless "
+                    f"All {checked} instance-backed capturing variant(s) have a "
+                    "DiskUtilization alarm at "
+                    f"{CAPTURE_DISK_ALARM_MAX_THRESHOLD:g}% or lower whose ALARM "
+                    "state reaches an enabled action, its own or an OR composite "
+                    "alarm's. Serverless "
                     "variants report no disk metric and are not counted."
                 ),
                 resolution="No action required",
@@ -12184,8 +12307,9 @@ def _training_vpc_endpoint_findings(
     """
     AIR-SGM-TRN-01: every VPC a training job ran in needs an available endpoint
     for each service in TRAINING_REQUIRED_ENDPOINT_SERVICES. An interface
-    endpoint counts only with private DNS on, since the job resolves the
-    service's default hostname; S3 counts as a gateway or interface endpoint.
+    endpoint counts only with private DNS on, and not inbound-only, since the
+    job resolves the service's default hostname; S3 counts as a gateway
+    endpoint or an interface endpoint under that rule.
     AIR-SGM-EP-08 calls it for transform job models with S3 only, and with
     judge_s3_policy each S3 endpoint's policy must not grant object reads and
     writes on every bucket to any principal.
@@ -12233,10 +12357,16 @@ def _training_vpc_endpoint_findings(
                     ):
                         continue
                     short = service[len(prefix) :]
-                    if (
-                        vpce.get("VpcEndpointType") == "Interface"
-                        and vpce.get("PrivateDnsEnabled") is not True
-                        and short != "s3"
+                    # Without private DNS the job resolves the default hostname
+                    # to the public service, S3 included. Inbound-only private
+                    # DNS sends traffic from inside the VPC to the gateway
+                    # endpoint instead.
+                    if vpce.get("VpcEndpointType") == "Interface" and (
+                        vpce.get("PrivateDnsEnabled") is not True
+                        or (vpce.get("DnsOptions") or {}).get(
+                            "PrivateDnsOnlyForInboundResolverEndpoint"
+                        )
+                        is True
                     ):
                         continue
                     present[vpce["VpcId"]].add(short)
@@ -12977,11 +13107,15 @@ SAGEMAKER_CREATION_GUARDRAILS = (
             ("sagemaker:CreateTransformJob", ("sagemaker:OutputKmsKeyArn",)),
         ),
     ),
+    # The control asks for approved subnets and approved security groups, so
+    # each key is its own requirement: a guard on one admits any value of the
+    # other.
     (
         "approved network",
         tuple(
-            (action, ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"))
+            (action, (key,))
             for action in SAGEMAKER_NETWORK_CREATE_ACTIONS
+            for key in ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")
         ),
     ),
     (
@@ -13048,10 +13182,8 @@ NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE = (
 NOTEBOOK_ACCESS_GUARDRAILS = (
     ("sagemaker:CreateNotebookInstance", ("sagemaker:RootAccess",)),
     ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
-    (
-        "sagemaker:CreateNotebookInstance",
-        ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"),
-    ),
+    ("sagemaker:CreateNotebookInstance", ("sagemaker:VpcSubnets",)),
+    ("sagemaker:CreateNotebookInstance", ("sagemaker:VpcSecurityGroupIds",)),
     ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
     (
         "sagemaker:CreatePresignedNotebookInstanceUrl",
@@ -13312,6 +13444,15 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     if not matched:
         return None
     if len(entries) > 1:
+        # Conditions that all name keys of the group deny only when every key
+        # is outside its approved values, so any one approved key admits the
+        # request, which is what a group asks. Each must enforce on its own.
+        if len(matched) == len(entries) and all(
+            _deny_guard_strength({"Condition": {operator: {key: values}}}, keys)
+            == "enforced"
+            for operator, key, values in entries
+        ):
+            return "enforced"
         return "conjunctive"
     operator, key, values = matched[0]
     prefix, base, if_exists = _condition_operator_parts(operator)
@@ -14083,8 +14224,9 @@ def check_sagemaker_notebook_access_guardrails(
                     resolution=(
                         "Deny sagemaker:CreateNotebookInstance in a service control "
                         "policy attached above this account when RootAccess or "
-                        "DirectInternetAccess is not Disabled, or VpcSubnets or "
-                        "VolumeKmsKeyArn is absent, and deny "
+                        "DirectInternetAccess is not Disabled, or VpcSubnets, "
+                        "VpcSecurityGroupIds or VolumeKmsKeyArn is not an "
+                        "approved value, and deny "
                         "CreatePresignedNotebookInstanceUrl and "
                         "CreatePresignedDomainUrl outside the approved aws:SourceIp "
                         "range or aws:SourceVpce. An Allow condition on the key in "
@@ -14748,7 +14890,8 @@ def _central_configuration_association_finding(region: str, row) -> Dict[str, An
         "the AI Security Best Practices standard was not read: the configuration "
         "policy's enabled standards and controls are returned only by "
         "securityhub:GetConfigurationPolicy, which only the Security Hub delegated "
-        "administrator can call, from its home Region.",
+        "administrator can call, from its home Region, and which this assessment "
+        "does not call.",
         f"From the Security Hub delegated administrator in its home Region, "
         f"confirm that configuration policy {policy_id or 'not returned'} lists "
         "the AI Security Best Practices standard among its enabled standards.",
@@ -20235,13 +20378,28 @@ IOT_DEVICE_POLICY_REFERENCE = (
     "https://docs.aws.amazon.com/iot/latest/developerguide/thing-policy-variables.html"
 )
 IOT_DEVICE_POLICY_RESOLUTION = (
-    "Scope the Publish, Subscribe and Receive resources to topics that embed "
-    "${iot:Connection.Thing.ThingName}, scope Connect to that thing's client ID, "
+    "Scope the Publish, RetainPublish, Subscribe and Receive resources to topics "
+    "that embed ${iot:Connection.Thing.ThingName} or a thing attribute variable "
+    "whose value no two things share, scope Connect to that thing's client ID, "
     "and add a Bool condition requiring iot:Connection.Thing.IsAttached to be "
     "true on Connect."
 )
-IOT_DEVICE_ACTIONS = ("iot:publish", "iot:subscribe", "iot:receive", "iot:connect")
+# iot:RetainPublish is a topic action of its own in the iot service-reference
+# JSON (read 2026-10-03), so iot:Publish does not cover it.
+IOT_DEVICE_ACTIONS = (
+    "iot:publish",
+    "iot:retainpublish",
+    "iot:subscribe",
+    "iot:receive",
+    "iot:connect",
+)
+IOT_DEVICE_ACTION_NAMES = {"iot:retainpublish": "RetainPublish"}
 IOT_THING_NAME_VARIABLE = "${iot:Connection.Thing.ThingName}"
+# The thing name, or a thing attribute, bounds a resource to one device. An
+# attribute does so only while no two things share its value.
+IOT_THING_VARIABLE_PATTERN = re.compile(
+    r"\$\{iot:Connection\.Thing\.(?:ThingName|Attributes\[([^\]]+)\])\}"
+)
 IOT_UNIQUE_CERTIFICATE_FINDING = "AWS IoT Unique Device Certificate"
 IOT_UNIQUE_CERTIFICATE_REFERENCE = (
     "https://docs.aws.amazon.com/iot/latest/developerguide/x509-client-certs.html"
@@ -20280,14 +20438,15 @@ def _iot_statement_actions(statement: Dict[str, Any]) -> List[str]:
 
 def _iot_resource_bounded_to_thing(resource: str) -> bool:
     """
-    True when the thing-name variable fills a whole path segment.
+    True when the thing-name or a thing-attribute variable fills a whole path
+    segment.
 
     A resource without the variable reaches every device's topic, and a
     wildcard or other text right after it (topic/${ThingName}*) reaches the
     topics of every thing whose name starts with this one. Right before it
     (topic/*${ThingName}) it reaches every thing whose name ends with this one.
     """
-    parts = resource.split(IOT_THING_NAME_VARIABLE)
+    parts = IOT_THING_VARIABLE_PATTERN.split(resource)[::2]
     if len(parts) < 2:
         return False
     # A wildcard before the variable (topic/*/${ThingName}) matches across
@@ -20329,6 +20488,43 @@ def _iot_requires_attached_thing(statement: Dict[str, Any]) -> bool:
     return False
 
 
+def _iot_action_name(action: str) -> str:
+    return IOT_DEVICE_ACTION_NAMES.get(action, action.split(":")[1].capitalize())
+
+
+def _iot_policy_attributes(document: Any) -> List[str]:
+    """Return the thing attributes that bound a device action's resource."""
+    names = set()
+    for statement in _sm_policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if not _iot_statement_actions(statement):
+            continue
+        for resource in _policy_values(statement.get("Resource")):
+            names.update(IOT_THING_VARIABLE_PATTERN.findall(str(resource)))
+    return sorted(name for name in names if name)
+
+
+def _iot_shared_attribute_values(
+    things: List[Dict[str, Any]], attributes: List[str]
+) -> List[str]:
+    """Name each attribute value that two or more things share."""
+    shared = []
+    for attribute in attributes:
+        holders = {}
+        for thing in things:
+            value = (thing.get("attributes") or {}).get(attribute)
+            if value is not None:
+                holders.setdefault(value, []).append(str(thing.get("thingName")))
+        for value, names in sorted(holders.items()):
+            if len(names) > 1:
+                shared.append(
+                    f"thing attribute '{attribute}' holds '{value}' on things "
+                    f"{', '.join(sorted(names)[:5])}"
+                )
+    return shared
+
+
 def _iot_policy_problems(document: Any) -> List[str]:
     problems = []
     for statement in _sm_policy_statements(document):
@@ -20340,9 +20536,9 @@ def _iot_policy_problems(document: Any) -> List[str]:
         resource = _iot_broad_resource(statement)
         if resource:
             problems.append(
-                f"allows {', '.join(a.split(':')[1].capitalize() for a in actions)} on "
-                f"'{resource}' without the thing-name policy variable bounding a "
-                "path segment"
+                f"allows {', '.join(_iot_action_name(a) for a in actions)} on "
+                f"'{resource}' without the thing-name or a thing-attribute policy "
+                "variable bounding a path segment"
             )
         if "iot:connect" in actions and not _iot_requires_attached_thing(statement):
             problems.append(
@@ -20575,6 +20771,9 @@ def check_iot_device_scoped_policies(
         return findings
 
     failed, passed, errors = [], [], []
+    attribute_scoped = []
+    attribute_unread = []
+    things = None
     certificates = set()
     thing_groups = set()
     for policy in policies:
@@ -20595,13 +20794,37 @@ def check_iot_device_scoped_policies(
             errors.append((name, error))
             continue
         problems = _iot_policy_problems(document)
+        attributes = _iot_policy_attributes(document)
+        if attributes and not problems:
+            # AIR-PHY-EDG-01: an attribute bounds one device only while no
+            # other thing holds the same value.
+            try:
+                if things is None:
+                    things = []
+                    for page in iot_client.get_paginator("list_things").paginate():
+                        things.extend(page.get("things") or [])
+            except Exception as error:
+                things = None
+                attribute_unread.append(
+                    f"AWS IoT policy '{name}' scopes devices by thing attribute(s) "
+                    f"{', '.join(attributes)}, but iot:ListThings failed "
+                    f"({get_assessment_error_label(error)}), so whether two things "
+                    "share a value was not read."
+                )
+                continue
+            problems = [
+                f"scopes devices by {shared}, so each reaches the others' topics"
+                for shared in _iot_shared_attribute_values(things, attributes)
+            ]
+            if not problems:
+                attribute_scoped.append((name, attributes))
         if problems:
             failed.append((name, problems))
         else:
             passed.append(name)
 
     role_alias_rows = _iot_role_alias_findings(iot_client, region, permission_cache)
-    if not failed and not passed and not errors:
+    if not failed and not passed and not errors and not attribute_unread:
         findings["csv_data"].append(
             _row(
                 f"None of the {len(policies)} AWS IoT policies in this region is "
@@ -20638,9 +20861,21 @@ def check_iot_device_scoped_policies(
         findings["csv_data"].append(
             _row(
                 f"{len(passed)} attached AWS IoT policies scope device actions to "
-                "the thing-name policy variable and require an attached thing: "
-                f"{', '.join(sorted(passed)[:5])}. Whether each device holds a "
-                "unique certificate is not read by this check.",
+                "the thing-name or a thing-attribute policy variable and require "
+                f"an attached thing: {', '.join(sorted(passed)[:5])}."
+                + (
+                    " Each thing attribute they scope by holds a distinct value on "
+                    "every thing that carries it, across the "
+                    f"{len(things or [])} thing(s) iot:ListThings returned: "
+                    + "; ".join(
+                        f"'{n}' by {', '.join(a)}" for n, a in attribute_scoped[:5]
+                    )
+                    + "."
+                    if attribute_scoped
+                    else ""
+                )
+                + " Whether each device holds a unique certificate is reported in "
+                f"the '{IOT_UNIQUE_CERTIFICATE_FINDING}' row.",
                 "No action required",
                 "High",
                 "Passed",
@@ -20654,6 +20889,10 @@ def check_iot_device_scoped_policies(
                 "Informational",
                 "N/A",
             )
+        )
+    for details in attribute_unread[:5]:
+        findings["csv_data"].append(
+            _row(details, COULD_NOT_ASSESS_RESOLUTION, "Informational", "N/A")
         )
     findings["csv_data"].extend(role_alias_rows)
     findings["csv_data"].append(

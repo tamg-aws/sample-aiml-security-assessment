@@ -844,6 +844,90 @@ MUTATIONS = [
         "find": '        if "NotResource" in statement:\n            excluded = ',
         "replace": "        if False:\n            excluded = ",
     },
+    # ------------------------------------------ the SageMaker verdict legs
+    # Each entry reverts one round-7 verdict leg in sagemaker_assessments to the
+    # behaviour the regrade graded partial. Each was killed by hand on a byte
+    # backup on 2026-10-03 before it was added here.
+    {
+        "name": "SM-34 lets either network key stand for both",
+        "file": SAGEMAKER,
+        "defect": "the control asks for approved subnets and approved security "
+        "groups. Read as one key group, a Deny on the security groups alone "
+        "passes the approved network category, and a job runs in any subnet",
+        "find": "            (action, (key,))\n",
+        "replace": (
+            '            (action, ("sagemaker:VpcSubnets", '
+            '"sagemaker:VpcSecurityGroupIds"))\n'
+        ),
+    },
+    {
+        "name": "SM-09 credits a key-group Deny with a weak half",
+        "file": SAGEMAKER,
+        "defect": "a Deny on aws:SourceIp and aws:SourceVpce together fires only "
+        "when both are outside their approved values, so each condition must "
+        "enforce on its own. Crediting a 0.0.0.0/0 range or a ForAnyValue half "
+        "passes a presigned URL guard that admits every caller",
+        "find": (
+            '            == "enforced"\n            for operator, key, values in entries\n'
+        ),
+        "replace": (
+            '            in ("enforced", "presence", "absent-open", "value")\n'
+            "            for operator, key, values in entries\n"
+        ),
+    },
+    {
+        "name": "SM-33 exempts S3 interface endpoints from private DNS",
+        "file": SAGEMAKER,
+        "defect": "without private DNS a job resolves the default S3 hostname to "
+        "the public service, so the interface endpoint carries none of its "
+        "traffic. The exemption credits it as the private S3 path for training "
+        "and transform jobs alike",
+        "find": (
+            '                    if vpce.get("VpcEndpointType") == "Interface" and (\n'
+        ),
+        "replace": (
+            '                    if vpce.get("VpcEndpointType") == "Interface" '
+            'and short != "s3" and (\n'
+        ),
+    },
+    {
+        "name": "SM-04 passes GuardDuty findings nobody reviewed",
+        "file": SAGEMAKER,
+        "defect": "an ACTIVE GuardDuty finding still in Workflow.Status NEW past "
+        "the review window was never reviewed. Skipping the branch passes the "
+        "review row over the stale findings GetFindings returned",
+        "find": "    if stale:\n        oldest = stale[0]\n",
+        "replace": "    if False:\n        oldest = stale[0]\n",
+    },
+    {
+        "name": "SM-41 drops iot:RetainPublish from the device actions",
+        "file": SAGEMAKER,
+        "defect": "RetainPublish is a topic action of its own, so iot:Publish "
+        "does not cover it. Without it a fleet-wide RetainPublish on topic/* "
+        "passes as device-scoped",
+        "find": '    "iot:retainpublish",\n',
+        "replace": "",
+    },
+    {
+        "name": "SM-41 credits a thing attribute two things share",
+        "file": SAGEMAKER,
+        "defect": "a thing attribute bounds a topic to one device only while no "
+        "two things hold the same value. Ignoring the shared value passes a "
+        "policy under which each of those devices reaches the others' topics",
+        "find": "            if len(names) > 1:\n                shared.append(\n",
+        "replace": "            if len(names) > 99:\n                shared.append(\n",
+    },
+    {
+        "name": "SM-23 and SM-31 ignore composite alarm routing",
+        "file": SAGEMAKER,
+        "defect": "a drift or capture-disk alarm with no action of its own pages "
+        "through a composite alarm whose rule ORs it in. Dropping the composite "
+        "leg fails an endpoint whose alarms do reach an action",
+        "find": (
+            '        or (alarm.get("AlarmName") and actioned.get(alarm["AlarmName"]))\n'
+        ),
+        "replace": "        or False\n",
+    },
     # ------------------------------------------ the AgentCore verdict legs
     # Each entry reverts one round-6 verdict leg in agentcore_assessments to the
     # behaviour the regrade graded partial. The catcher is the test that pins the
@@ -2350,6 +2434,13 @@ GROUPS: dict[str, str] = {
     "SM-43 ignores an execution role's NotResource grant": (
         "in `SM-43`'s artifact reads"
     ),
+    "SM-34 lets either network key stand for both": "in the SageMaker verdict legs",
+    "SM-09 credits a key-group Deny with a weak half": "in the SageMaker verdict legs",
+    "SM-33 exempts S3 interface endpoints from private DNS": "in the SageMaker verdict legs",
+    "SM-04 passes GuardDuty findings nobody reviewed": "in the SageMaker verdict legs",
+    "SM-41 drops iot:RetainPublish from the device actions": "in the SageMaker verdict legs",
+    "SM-41 credits a thing attribute two things share": "in the SageMaker verdict legs",
+    "SM-23 and SM-31 ignore composite alarm routing": "in the SageMaker verdict legs",
     "AC-37 reads an allow-list SCP's omission as an Allow": "in the AgentCore verdict legs",
     "AC-37 passes when the organization's SCPs could not be listed": "in the AgentCore verdict legs",
     "AC-42 passes the population beside an unread configuration": "in the AgentCore verdict legs",

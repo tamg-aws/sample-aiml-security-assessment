@@ -343,7 +343,7 @@ AI_SUBJECT_ROWS = [
         ["SM-33", "SM-34"],
         "SM-34 is the approved-exception leg: its approved network and no direct "
         "internet access verdicts require sagemaker:CreateTrainingJob to be bound "
-        "on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on "
+        "on sagemaker:VpcSubnets and sagemaker:VpcSecurityGroupIds and on "
         "sagemaker:NetworkIsolation by a Deny in an attached service control "
         "policy. A condition held only in identity policies fails, because the "
         "account root user is bound by none",

@@ -331,6 +331,8 @@ _EXPECTED_ACTIONS = {
         "iot:ListAuditTasks",
         "iot:ListThingPrincipals",
         "iot:ListThingsInThingGroup",
+        "iot:ListThings",
+        "securityhub:GetFindings",
         "organizations:ListAWSServiceAccessForOrganization",
         "sagemaker:DescribeModelBiasJobDefinition",
         "sagemaker:DescribeModelExplainabilityJobDefinition",
@@ -1041,6 +1043,8 @@ _SAGEMAKER_MANAGED_GRANTS = [
     ("Allow", "ec2:DescribeManagedPrefixLists", '"*"'),
     ("Allow", "iot:ListAuditTasks", '"*"'),
     ("Allow", "iot:DescribeAuditTask", '"*"'),
+    # SM-41: ListThings has no resource type in the iot service reference.
+    ("Allow", "iot:ListThings", '"*"'),
     ("Allow", "sagemaker:ListMonitoringExecutions", '"*"'),
     ("Allow", "ec2:DescribeVpcs", '"*"'),
     ("Allow", "ec2:DescribeDhcpOptions", '"*"'),
@@ -1157,6 +1161,22 @@ _SAGEMAKER_MANAGED_GRANTS = [
                 "Fn::Sub": "arn:${AWS::Partition}:securityhub:*:"
                 "${AWS::AccountId}:hub/default"
             }
+        ),
+    ),
+    (
+        "Allow",
+        "securityhub:GetFindings",
+        json.dumps(
+            [
+                {
+                    "Fn::Sub": "arn:${AWS::Partition}:securityhub:*:"
+                    "${AWS::AccountId}:hub/default"
+                },
+                {
+                    "Fn::Sub": "arn:${AWS::Partition}:securityhub:*:"
+                    "${AWS::AccountId}:hubv2/*"
+                },
+            ]
         ),
     ),
     (

@@ -53,7 +53,7 @@ Generated 2026-10-03 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-SGM-EP-08` | covered | — | `sagemaker_assessments` | `SM-18`, `SM-42` | — |
 | `AIR-SGM-GOV-01` | covered | — | `sagemaker_assessments` | `SM-22` | — |
 | `AIR-SGM-GOV-10` | covered | — | `sagemaker_assessments` | `SM-32` | — |
-| `AIR-SGM-TRN-01` | covered | — | `sagemaker_assessments` | `SM-33`, `SM-34` | SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation by a Deny in an attached service control policy. A condition held only in identity policies fails, because the account root user is bound by none |
+| `AIR-SGM-TRN-01` | covered | — | `sagemaker_assessments` | `SM-33`, `SM-34` | SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets and sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation by a Deny in an attached service control policy. A condition held only in identity policies fails, because the account root user is bound by none |
 | `AIR-SGM-TRN-02` | covered | — | `sagemaker_assessments` | `SM-03`, `SM-34` | SM-34 is the preventive leg: it requires sagemaker:CreateTrainingJob to be bound on sagemaker:VolumeKmsKeyArn by a Deny in an attached service control policy, and fails a binding held only in identity policies because the account root user is bound by none |
 | `AIR-SGM-TRN-05` | covered | — | `sagemaker_assessments` | `SM-09`, `SM-01`, `SM-03` | all three legs present |
 | `AIR-SGM-TRN-08` | covered | — | `sagemaker_assessments` | `SM-34` | — |

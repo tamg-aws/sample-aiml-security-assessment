@@ -697,7 +697,7 @@
         "Training Job Network Boundary",
         "SageMaker Creation Guardrail"
       ],
-      "gap": "SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation by a Deny in an attached service control policy. A condition held only in identity policies fails, because the account root user is bound by none",
+      "gap": "SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets and sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation by a Deny in an attached service control policy. A condition held only in identity policies fails, because the account root user is bound by none",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",

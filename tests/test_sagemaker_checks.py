@@ -369,7 +369,11 @@ class TestSM04SecurityHubRouting:
             client.get_paginator.side_effect = error
         else:
             client.get_paginator.side_effect = _pager(
-                {"list_enabled_products_for_import": pages, "list_rules": []}
+                {
+                    "list_enabled_products_for_import": pages,
+                    "list_rules": [],
+                    "get_findings": [{"Findings": []}],
+                }
             )
         mock_client.return_value = client
         inventory = {
@@ -387,12 +391,11 @@ class TestSM04SecurityHubRouting:
         assert rows[0]["Status"] == "Passed"
         assert "monitoring for security threats" not in rows[0]["Finding_Details"]
         assert "Status ENABLED" in rows[0]["Finding_Details"]
-        # AIR-FND-DET-02: Security Hub Workflow.Status does record review.
+        # AIR-FND-DET-02: Security Hub Workflow.Status does record review, and
+        # the review row judges it.
         assert "not recorded by any" not in rows[0]["Finding_Details"]
-        assert (
-            "Workflow.Status, which this check does not read"
-            in (rows[0]["Finding_Details"])
-        )
+        assert "which this check does not read" not in rows[0]["Finding_Details"]
+        assert sagemaker_app.GUARDDUTY_REVIEW_FINDING in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_guardduty_integration_on_a_later_page_passes(self, mock_client):
@@ -411,6 +414,7 @@ class TestSM04SecurityHubRouting:
             "GuardDuty Enabled",
             sagemaker_app.GUARDDUTY_ROUTING_FINDING,
             sagemaker_app.GUARDDUTY_EVENTBRIDGE_FINDING,
+            sagemaker_app.GUARDDUTY_REVIEW_FINDING,
         ]
         assert rows[1]["Status"] == "Passed"
 
@@ -4732,7 +4736,9 @@ class TestSM31EndpointDataCapture:
         return alarm
 
     @classmethod
-    def _endpoints(cls, mock_client, endpoints, alarms=None, alarm_error=None):
+    def _endpoints(
+        cls, mock_client, endpoints, alarms=None, alarm_error=None, composites=()
+    ):
         mock_sm = MagicMock()
         mock_client.return_value = mock_sm
         for detail in endpoints.values():
@@ -4748,7 +4754,10 @@ class TestSM31EndpointDataCapture:
         def alarm_pages(**kwargs):
             if alarm_error:
                 raise _make_client_error(alarm_error, "DescribeAlarms")
-            return [{"MetricAlarms": alarms}]
+            page = {"MetricAlarms": alarms}
+            if "CompositeAlarm" in kwargs.get("AlarmTypes", ()):
+                page["CompositeAlarms"] = list(composites)
+            return [page]
 
         alarm_pager.paginate.side_effect = alarm_pages
         mock_sm.get_paginator.side_effect = lambda name: (
@@ -4994,6 +5003,7 @@ class TestSM23MonitorReportAndAlarm:
         endpoints=("ep",),
         job_definitions=None,
         executions=None,
+        composites=(),
     ):
         """executions maps a schedule to its ListMonitoringExecutions summaries,
         newest first, or to an error code; an unnamed schedule is denied."""
@@ -5032,7 +5042,10 @@ class TestSM23MonitorReportAndAlarm:
                     ]
                 if name == "list_monitoring_schedules":
                     return [{"MonitoringScheduleSummaries": schedules}]
-                return [{"MetricAlarms": list(alarms)}]
+                page = {"MetricAlarms": list(alarms)}
+                if "CompositeAlarm" in kwargs.get("AlarmTypes", ()):
+                    page["CompositeAlarms"] = list(composites)
+                return [page]
 
             p.paginate.side_effect = paginate
             return p
@@ -6443,6 +6456,14 @@ SCP_NETWORK_DENIES = [
         "sagemaker:VpcSubnets",
         ["subnet-1"],
     ),
+    # AIR-SGM-TRN-08: approved security groups are a requirement of their own.
+    _scp_deny("sagemaker:Create*", "Null", "sagemaker:VpcSecurityGroupIds", "true"),
+    _scp_deny(
+        "sagemaker:Create*",
+        "ForAnyValue:StringNotEquals",
+        "sagemaker:VpcSecurityGroupIds",
+        ["sg-1"],
+    ),
 ]
 SCP_INTERNET_DENIES = [
     _scp_deny(
@@ -6477,8 +6498,14 @@ GUARDED_CREATE_ALLOWS = [
                 "sagemaker:InterContainerTrafficEncryption": "true",
                 "sagemaker:NetworkIsolation": "true",
             },
-            "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
-            "Null": {"sagemaker:VpcSubnets": "false"},
+            "ForAllValues:StringEquals": {
+                "sagemaker:VpcSubnets": ["subnet-1"],
+                "sagemaker:VpcSecurityGroupIds": ["sg-1"],
+            },
+            "Null": {
+                "sagemaker:VpcSubnets": "false",
+                "sagemaker:VpcSecurityGroupIds": "false",
+            },
         },
     },
     {
@@ -6488,8 +6515,14 @@ GUARDED_CREATE_ALLOWS = [
         "Condition": {
             "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
             "Bool": {"sagemaker:NetworkIsolation": "true"},
-            "ForAllValues:StringEquals": {"sagemaker:VpcSecurityGroupIds": ["sg-1"]},
-            "Null": {"sagemaker:VpcSecurityGroupIds": "false"},
+            "ForAllValues:StringEquals": {
+                "sagemaker:VpcSubnets": ["subnet-1"],
+                "sagemaker:VpcSecurityGroupIds": ["sg-1"],
+            },
+            "Null": {
+                "sagemaker:VpcSubnets": "false",
+                "sagemaker:VpcSecurityGroupIds": "false",
+            },
         },
     },
     {
@@ -6499,8 +6532,14 @@ GUARDED_CREATE_ALLOWS = [
         "Condition": {
             "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
             "StringEquals": {"sagemaker:DirectInternetAccess": "Disabled"},
-            "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
-            "Null": {"sagemaker:VpcSubnets": "false"},
+            "ForAllValues:StringEquals": {
+                "sagemaker:VpcSubnets": ["subnet-1"],
+                "sagemaker:VpcSecurityGroupIds": ["sg-1"],
+            },
+            "Null": {
+                "sagemaker:VpcSubnets": "false",
+                "sagemaker:VpcSecurityGroupIds": "false",
+            },
         },
     },
     {
@@ -6509,8 +6548,14 @@ GUARDED_CREATE_ALLOWS = [
         "Resource": "*",
         "Condition": {
             "Bool": {"sagemaker:NetworkIsolation": "true"},
-            "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
-            "Null": {"sagemaker:VpcSubnets": "false"},
+            "ForAllValues:StringEquals": {
+                "sagemaker:VpcSubnets": ["subnet-1"],
+                "sagemaker:VpcSecurityGroupIds": ["sg-1"],
+            },
+            "Null": {
+                "sagemaker:VpcSubnets": "false",
+                "sagemaker:VpcSecurityGroupIds": "false",
+            },
         },
     },
     {
@@ -6707,7 +6752,8 @@ class TestSM34CreationGuardrails:
                             "StringEquals",
                             "sagemaker:VpcSubnets",
                             "subnet-legacy",
-                        )
+                        ),
+                        *SCP_NETWORK_DENIES[2:],
                     ],
                 )
             )
@@ -6919,7 +6965,8 @@ class TestSM34CreationGuardrails:
                                     ["subnet-1"] if operator != "Null" else "true",
                                 )
                                 for operator in operators
-                            ],
+                            ]
+                            + SCP_NETWORK_DENIES[2:],
                         )
                     )
                 )
@@ -6949,6 +6996,12 @@ class TestSM34CreationGuardrails:
         self, operator, values, key
     ):
         # IAM defines a multivalued key only under ForAllValues or ForAnyValue.
+        # The other key's documented pair meets its own requirement.
+        other = (
+            SCP_NETWORK_DENIES[2:]
+            if key == "sagemaker:VpcSubnets"
+            else SCP_NETWORK_DENIES[:2]
+        )
         for statements in (
             [_scp_deny("sagemaker:Create*", operator, key, values)],
             [
@@ -6957,7 +7010,7 @@ class TestSM34CreationGuardrails:
             ],
         ):
             row = self._by_category(
-                self._run(self._inventory(self._scp("BareNegated", statements)))
+                self._run(self._inventory(self._scp("BareNegated", statements + other)))
             )["approved network"]
             assert row["Status"] == "N/A"
             assert (
@@ -7002,7 +7055,11 @@ class TestSM34CreationGuardrails:
         )
         for statement in (conjunctive, narrow):
             row = self._by_category(
-                self._run(self._inventory(self._scp("Scoped", [statement])))
+                self._run(
+                    self._inventory(
+                        self._scp("Scoped", [statement] + SCP_NETWORK_DENIES[2:])
+                    )
+                )
             )["approved network"]
             assert row["Status"] == "N/A"
             assert "alongside other conditions" in row["Finding_Details"]
@@ -8873,6 +8930,8 @@ class TestSM36SecurityHubAIStandard:
         details = row["Finding_Details"]
         assert "enabled standards and controls" in details
         assert "only the Security Hub delegated administrator can call" in details
+        # AIR-FND-DET-02: the text names the call as one this run does not make.
+        assert "which this assessment does not call" in details
         assert "not granted" not in details
         assert not row["Resolution"].startswith("Grant")
         assert "configuration policy a1b2" in row["Resolution"]
@@ -13099,9 +13158,11 @@ class TestSM41IoTDeviceScopedPolicies:
         group_things=None,
         thing_principals=None,
         audit_tasks=None,
+        things=None,
     ):
         client = MagicMock()
         errors = errors or {}
+        things = things or []
         # {taskId: DescribeAuditTask}; by default one run of "daily" completed
         # the shared-certificate check.
         audit_tasks = (
@@ -13184,6 +13245,10 @@ class TestSM41IoTDeviceScopedPolicies:
                     [{"tasks": []}, {"tasks": [{"taskId": t} for t in audit_tasks]}],
                 ),
                 "list_role_aliases": [{"roleAliases": []}],
+                # Two pages, so a reader that keeps only the first misses one.
+                "list_things": raising(
+                    "list_things", [{"things": things[:1]}, {"things": things[1:]}]
+                ),
             }
         )
 
@@ -13302,7 +13367,10 @@ class TestSM41IoTDeviceScopedPolicies:
         assert "'broad' allows Publish on '" + _IOT_TOPIC + "*'" in failed[0]
         assert "'no-attach-condition'" in failed[1]
         assert "without requiring the certificate to be attached" in failed[1]
-        assert "'not-action' allows Publish, Subscribe, Receive, Connect" in failed[2]
+        assert (
+            "'not-action' allows Publish, RetainPublish, Subscribe, Receive, Connect"
+            in failed[2]
+        )
         assert len(passed) == 1 and "scoped" in passed[0]
         assert len(na) == 1 and "'broken'" in na[0]
         assert "unattached" not in " ".join(failed + passed + na)
@@ -17953,6 +18021,18 @@ SCP_NOTEBOOK_ACCESS_DENIES = [
     ),
     _scp_deny(
         "sagemaker:CreateNotebookInstance",
+        "ForAnyValue:StringNotEquals",
+        "sagemaker:VpcSecurityGroupIds",
+        ["sg-1"],
+    ),
+    _scp_deny(
+        "sagemaker:CreateNotebookInstance",
+        "Null",
+        "sagemaker:VpcSecurityGroupIds",
+        "true",
+    ),
+    _scp_deny(
+        "sagemaker:CreateNotebookInstance",
         "ArnNotEquals",
         "sagemaker:VolumeKmsKeyArn",
         [APPROVED_KEY],
@@ -17984,13 +18064,13 @@ class TestSM09NotebookAccessGuardrails:
                 )
             )
 
-    def test_attached_scp_holding_all_six_passes(self):
+    def test_attached_scp_holding_all_seven_passes(self):
         rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES)
         assert [r["Status"] for r in rows] == ["Passed"]
-        assert "All 6 notebook access requirements" in rows[0]["Finding_Details"]
+        assert "All 7 notebook access requirements" in rows[0]["Finding_Details"]
         assert rows[0]["Check_ID"] == "SM-09"
 
-    @pytest.mark.parametrize("dropped", range(6))
+    @pytest.mark.parametrize("dropped", range(len(SCP_NOTEBOOK_ACCESS_DENIES)))
     def test_each_missing_deny_fails_with_an_open_principal(self, dropped):
         statements = [
             s for i, s in enumerate(SCP_NOTEBOOK_ACCESS_DENIES) if i != dropped
@@ -19185,6 +19265,13 @@ class TestSM34ValuePinning:
                 "sagemaker:VpcSubnets",
                 ["subnet-1"],
             ),
+            _scp_deny(three_actions, "Null", "sagemaker:VpcSecurityGroupIds", "true"),
+            _scp_deny(
+                three_actions,
+                "ForAnyValue:StringNotEquals",
+                "sagemaker:VpcSecurityGroupIds",
+                ["sg-1"],
+            ),
             _scp_deny(
                 ["sagemaker:CreateTrainingJob", "sagemaker:CreateEndpointConfig"],
                 "BoolIfExists",
@@ -19201,8 +19288,9 @@ class TestSM34ValuePinning:
         assert "CreateTransformJob on sagemaker:OutputKmsKeyArn" in encryption
         network = rows["approved network"]["Finding_Details"]
         assert rows["approved network"]["Status"] == "Failed"
-        assert "1 of 4 approved network requirements" in network
+        assert "2 of 8 approved network requirements" in network
         assert "CreateModel on sagemaker:VpcSubnets" in network
+        assert "CreateModel on sagemaker:VpcSecurityGroupIds" in network
         internet = rows["no direct internet access"]["Finding_Details"]
         assert rows["no direct internet access"]["Status"] == "Failed"
         assert "CreateModel on sagemaker:NetworkIsolation" in internet
@@ -19354,7 +19442,7 @@ class TestSM34ValuePinning:
     @pytest.mark.parametrize(
         "scp_statements, status",
         [
-            ([], "Failed"),
+            (SCP_NETWORK_DENIES[2:], "Failed"),
             (
                 [
                     _scp_deny(
@@ -19362,7 +19450,8 @@ class TestSM34ValuePinning:
                         "StringEquals",
                         "sagemaker:VpcSubnets",
                         "subnet-bad",
-                    )
+                    ),
+                    *SCP_NETWORK_DENIES[2:],
                 ],
                 "N/A",
             ),
@@ -19389,7 +19478,9 @@ class TestSM34ValuePinning:
     def test_only_conditioned_principals_never_read_as_unconditioned(self):
         cache = self._wording_cache()
         del cache["role_permissions"]["Open"]
-        details = self._rows([], cache=cache)["approved network"]["Finding_Details"]
+        details = self._rows(SCP_NETWORK_DENIES[2:], cache=cache)["approved network"][
+            "Finding_Details"
+        ]
         assert "with no condition on that key" not in details
         assert "that does not enforce it" in details
 
@@ -19427,6 +19518,13 @@ BATCH_SCP_DENIES = [
         "ForAnyValue:StringNotEquals",
         "sagemaker:VpcSubnets",
         ["subnet-1"],
+    ),
+    _scp_deny("sagemaker:CreateModel", "Null", "sagemaker:VpcSecurityGroupIds", "true"),
+    _scp_deny(
+        "sagemaker:CreateModel",
+        "ForAnyValue:StringNotEquals",
+        "sagemaker:VpcSecurityGroupIds",
+        ["sg-1"],
     ),
     _scp_deny(
         "sagemaker:CreateModel",
@@ -19547,7 +19645,7 @@ class TestSM42BatchCreationGuardrails:
                 requirements
             )
         assert len(batch["encryption"]) == 2
-        assert len(batch["approved network"]) == 1
+        assert len(batch["approved network"]) == 2
         assert len(batch["no direct internet access"]) == 1
 
     def test_rows_carry_the_scanned_region(self):
@@ -22532,3 +22630,572 @@ class TestSM39WorkloadEgress:
         )
         assert [r["Status"] for r in rows] == ["N/A", "N/A"]
         assert all("AccessDenied" in r["Finding_Details"] for r in rows)
+
+
+# ===================================================================
+# Round 7: AIR-SGM-TRN-08 and AIR-SGM-TRN-05 network and key-group guards
+# ===================================================================
+SCP_SG_DENIES = SCP_NETWORK_DENIES[2:]
+
+
+class TestSM34ApprovedNetworkNeedsSubnetsAndGroups:
+    """AIR-SGM-TRN-08: approved subnets and approved security groups are two
+    requirements; a guard on either alone admits the other."""
+
+    _sm34 = TestSM34CreationGuardrails()
+
+    def _network(self, statements, cache=OPEN_CACHE):
+        inventory = self._sm34._inventory(self._sm34._scp("Net", statements))
+        return self._sm34._by_category(self._sm34._run(inventory, cache=cache))[
+            "approved network"
+        ]
+
+    def test_a_security_group_only_guard_does_not_pass(self):
+        row = self._network(SCP_SG_DENIES)
+        assert row["Status"] == "Failed"
+        assert "4 of 8 approved network requirements" in row["Finding_Details"]
+        assert "CreateTrainingJob on sagemaker:VpcSubnets" in row["Finding_Details"]
+        assert "on sagemaker:VpcSubnets or" not in row["Finding_Details"]
+
+    def test_a_subnet_only_guard_does_not_pass(self):
+        row = self._network(SCP_NETWORK_DENIES[:2])
+        assert row["Status"] == "Failed"
+        assert "4 of 8 approved network requirements" in row["Finding_Details"]
+        assert "on sagemaker:VpcSecurityGroupIds" in row["Finding_Details"]
+
+    def test_both_guards_pass(self):
+        row = self._network(SCP_NETWORK_DENIES[:2] + SCP_SG_DENIES)
+        assert row["Status"] == "Passed"
+        assert "All 8 approved network requirements" in row["Finding_Details"]
+
+    def test_one_deny_naming_both_keys_fires_only_when_both_are_bad(self):
+        both = _scp_deny(
+            "sagemaker:Create*",
+            "ForAnyValue:StringNotEquals",
+            "sagemaker:VpcSubnets",
+            ["subnet-1"],
+        )
+        both["Condition"]["ForAnyValue:StringNotEquals"][
+            "sagemaker:VpcSecurityGroupIds"
+        ] = ["sg-1"]
+        row = self._network([both, SCP_NETWORK_DENIES[0], SCP_SG_DENIES[0]])
+        assert row["Status"] != "Passed"
+        assert "alongside other conditions" in row["Finding_Details"]
+
+    def test_an_allow_pinning_subnets_only_leaves_the_groups_open(self):
+        subnets_only = {
+            "Effect": "Allow",
+            "Action": "sagemaker:CreateModel",
+            "Resource": "*",
+            "Condition": {
+                "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
+                "Null": {"sagemaker:VpcSubnets": "false"},
+            },
+        }
+        cache = _creation_cache({"Modeler": [subnets_only]})
+        # Every requirement but the CreateModel security groups is held by
+        # the SCP, so the Allow alone decides that one.
+        groups_but_model = _scp_deny(
+            [
+                "sagemaker:CreateTrainingJob",
+                "sagemaker:CreateEndpointConfig",
+                "sagemaker:CreateNotebookInstance",
+            ],
+            "ForAnyValue:StringNotEquals",
+            "sagemaker:VpcSecurityGroupIds",
+            ["sg-1"],
+        )
+        row = self._network(
+            SCP_NETWORK_DENIES[:3] + [groups_but_model],
+            cache=cache,
+        )
+        assert row["Status"] == "Failed"
+        assert "1 of 8 approved network requirements" in row["Finding_Details"]
+        assert "CreateModel on sagemaker:VpcSecurityGroupIds" in row["Finding_Details"]
+        assert "Role 'Modeler'" in row["Finding_Details"]
+
+
+class TestSM09PresignedSourceIpOrVpce:
+    """AIR-SGM-TRN-05: a Deny that fires only when the caller is outside both
+    the approved range and the approved endpoint enforces the presigned-URL
+    guard, because either key satisfies it."""
+
+    _sm09 = TestSM09NotebookAccessGuardrails()
+
+    @staticmethod
+    def _ip_or_vpce(ip_operator="NotIpAddress", ranges=None, vpce_operator=None):
+        deny = _scp_deny(
+            [
+                "sagemaker:CreatePresignedNotebookInstanceUrl",
+                "sagemaker:CreatePresignedDomainUrl",
+            ],
+            ip_operator,
+            "aws:SourceIp",
+            ranges or ["203.0.113.0/24"],
+        )
+        deny["Condition"][vpce_operator or "StringNotEquals"] = {
+            "aws:SourceVpce": ["vpce-1"]
+        }
+        return deny
+
+    def test_ip_or_vpce_in_one_deny_passes(self):
+        rows = self._sm09._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [self._ip_or_vpce()])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_an_unbounded_range_beside_the_vpce_does_not_pass(self):
+        rows = self._sm09._run(
+            SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [self._ip_or_vpce(ranges=["0.0.0.0/0"])]
+        )
+        assert [r["Status"] for r in rows] != ["Passed"]
+
+    def test_a_for_any_value_vpce_half_does_not_pass(self):
+        rows = self._sm09._run(
+            SCP_NOTEBOOK_ACCESS_DENIES[:-1]
+            + [self._ip_or_vpce(vpce_operator="ForAnyValue:StringNotEquals")]
+        )
+        assert [r["Status"] for r in rows] != ["Passed"]
+
+    def test_a_key_outside_the_group_still_makes_it_conjunctive(self):
+        deny = self._ip_or_vpce()
+        deny["Condition"]["Bool"] = {"aws:ViaAWSService": "false"}
+        rows = self._sm09._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [deny])
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+
+# ===================================================================
+# Round 7: AIR-SGM-TRN-01 and AIR-SGM-EP-08 S3 interface endpoints
+# ===================================================================
+def _s3_interface(vpc_id, dns, inbound_only=None, suffix=""):
+    vpce = _vpce(vpc_id, "s3", dns=dns)
+    vpce["VpcEndpointId"] += suffix
+    vpce["PolicyDocument"] = _s3_endpoint_policy("arn:aws:s3:::data/*")
+    if inbound_only is not None:
+        vpce["DnsOptions"] = {"PrivateDnsOnlyForInboundResolverEndpoint": inbound_only}
+    return vpce
+
+
+def _training_vpces_with_s3(*s3_endpoints):
+    return [
+        v for v in _full_training_vpces("vpc-1") if "s3" not in v["ServiceName"]
+    ] + list(s3_endpoints)
+
+
+class TestSM33S3InterfaceEndpointNeedsPrivateDns:
+    """AIR-SGM-TRN-01: without private DNS the job resolves the default S3
+    hostname to the public service, so the interface endpoint carries none
+    of its traffic."""
+
+    def _endpoints(self, *s3_endpoints):
+        rows = _sm33_rows(
+            {"a": _in_vpc_job("subnet-a")},
+            vpces=_training_vpces_with_s3(*s3_endpoints),
+        )
+        return _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+
+    def test_an_s3_interface_endpoint_without_private_dns_fails(self):
+        rows = self._endpoints(_s3_interface("vpc-1", dns=False))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "com.amazonaws.us-east-1.s3" in rows[0]["Finding_Details"]
+
+    def test_an_s3_interface_endpoint_with_private_dns_passes(self):
+        rows = self._endpoints(_s3_interface("vpc-1", dns=True))
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "vpc-1" in rows[0]["Finding_Details"]
+
+    def test_inbound_resolver_only_dns_serves_no_job_in_the_vpc(self):
+        rows = self._endpoints(_s3_interface("vpc-1", dns=True, inbound_only=True))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "com.amazonaws.us-east-1.s3" in rows[0]["Finding_Details"]
+
+    def test_one_good_s3_endpoint_beside_one_without_dns_passes(self):
+        rows = self._endpoints(
+            _s3_interface("vpc-1", dns=False, suffix="-nodns"),
+            _s3_interface("vpc-1", dns=True, inbound_only=False),
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+
+class TestSM18S3InterfaceEndpointNeedsPrivateDns:
+    """AIR-SGM-EP-08: the transform path gets the same private DNS rule."""
+
+    def _row(self, *vpces):
+        rows = _sm18_rows({"j": _transform_job()}, vpces=list(vpces))
+        return _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+
+    def test_an_s3_interface_endpoint_without_private_dns_fails(self):
+        row = self._row(_s3_interface("vpc-1", dns=False))
+        assert [r["Status"] for r in row] == ["Failed"]
+        assert "com.amazonaws.us-east-1.s3" in row[0]["Finding_Details"]
+
+    def test_an_s3_interface_endpoint_with_private_dns_passes(self):
+        row = self._row(_s3_interface("vpc-1", dns=True))
+        assert [r["Status"] for r in row] == ["Passed"]
+
+    def test_inbound_resolver_only_dns_beside_a_gateway_is_judged_by_the_gateway(
+        self,
+    ):
+        row = self._row(
+            _s3_interface("vpc-1", dns=True, inbound_only=True),
+            _scoped_s3_gateway("vpc-1"),
+        )
+        assert [r["Status"] for r in row] == ["Passed"]
+        row = self._row(_s3_interface("vpc-1", dns=True, inbound_only=True))
+        assert [r["Status"] for r in row] == ["Failed"]
+
+
+# ===================================================================
+# Round 7: AIR-FND-DET-02 GuardDuty finding review in Security Hub
+# ===================================================================
+class TestSM04GuardDutyFindingReview:
+    """AIR-FND-DET-02: an ACTIVE GuardDuty finding still NEW past the review
+    window was never reviewed."""
+
+    GUARDDUTY = TestSM04SecurityHubRouting.GUARDDUTY
+
+    def _rows(self, mock_client, findings=None, error=None, products=None):
+        calls = {}
+
+        def get_findings(**kwargs):
+            calls.setdefault("get_findings", []).append(kwargs)
+            if error is not None:
+                raise error
+            return findings if findings is not None else [{"Findings": []}]
+
+        client = MagicMock()
+        client.get_paginator.side_effect = _pager(
+            {
+                "list_enabled_products_for_import": [
+                    {"ProductSubscriptions": products or [self.GUARDDUTY]}
+                ],
+                "list_rules": [],
+                "get_findings": get_findings,
+            }
+        )
+        mock_client.return_value = client
+        inventory = {"detector_id": "d-1", "detail": {"Status": "ENABLED"}}
+        rows = extract_csv_data(
+            sagemaker_app.check_guardduty_enabled("us-east-1", inventory)
+        )
+        review = [
+            r
+            for r in rows
+            if r["Finding"].startswith(sagemaker_app.GUARDDUTY_REVIEW_FINDING)
+        ]
+        assert len(review) == 1
+        assert review[0]["Check_ID"] == "SM-04"
+        return review[0], calls, rows
+
+    @staticmethod
+    def _finding(created, kind="TTPs/Impact/Impact:IAMUser-AnomalousModelInvocation"):
+        return {
+            "Id": f"gd-{created}",
+            "CreatedAt": created,
+            "Types": [kind],
+            "Workflow": {"Status": "NEW"},
+            "RecordState": "ACTIVE",
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unreviewed_finding_past_the_window_fails(self, mock_client):
+        row, calls, _ = self._rows(
+            mock_client,
+            [
+                {"Findings": []},
+                {"Findings": [self._finding("2026-08-01T00:00:00Z")]},
+            ],
+        )
+        assert row["Status"] == "Failed"
+        assert "2026-08-01T00:00:00Z" in row["Finding_Details"]
+        assert "AnomalousModelInvocation" in row["Finding_Details"]
+        assert "30 days" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_the_query_holds_product_state_workflow_and_age(self, mock_client):
+        _, calls, _ = self._rows(mock_client)
+        filters = calls["get_findings"][0]["Filters"]
+        assert filters["ProductName"] == [
+            {"Value": "GuardDuty", "Comparison": "EQUALS"}
+        ]
+        assert filters["RecordState"] == [{"Value": "ACTIVE", "Comparison": "EQUALS"}]
+        assert filters["WorkflowStatus"] == [{"Value": "NEW", "Comparison": "EQUALS"}]
+        window = filters["CreatedAt"][0]
+        end = datetime.strptime(window["End"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        age = datetime.now(timezone.utc) - end
+        assert timedelta(days=29, hours=23) < age < timedelta(days=30, hours=1)
+        assert window["Start"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_unreviewed_finding_past_the_window_passes(self, mock_client):
+        row, _, rows = self._rows(mock_client, [{"Findings": []}, {"Findings": []}])
+        assert row["Status"] == "Passed"
+        assert "30 days" in row["Finding_Details"]
+        assert "names no review cadence" in row["Finding_Details"]
+        enabled = rows[0]["Finding_Details"]
+        assert "Workflow.Status, which this check does not read" not in enabled
+        assert sagemaker_app.GUARDDUTY_REVIEW_FINDING in enabled
+
+    @pytest.mark.parametrize(
+        "code", ["AccessDeniedException", "InvalidAccessException", "Throttling"]
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_failed_read_is_not_passed(self, mock_client, code):
+        row, _, _ = self._rows(mock_client, error=_make_client_error(code))
+        assert row["Status"] == "N/A"
+        assert row["Finding"].endswith("Incomplete")
+        assert "securityhub:GetFindings" in row["Finding_Details"]
+        assert code in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_findings_not_imported_are_not_judged_in_security_hub(self, mock_client):
+        row, calls, _ = self._rows(
+            mock_client,
+            products=[self.GUARDDUTY.replace("aws/guardduty", "aws/inspector")],
+        )
+        assert row["Status"] == "N/A"
+        assert "get_findings" not in calls
+        assert "does not import GuardDuty findings" in row["Finding_Details"]
+
+
+# ===================================================================
+# Round 7: AIR-PHY-EDG-01 RetainPublish and thing-attribute variables
+# ===================================================================
+_IOT_SERIAL = "${iot:Connection.Thing.Attributes[serial]}"
+
+
+class TestSM41RetainPublishAndThingAttributes:
+    """AIR-PHY-EDG-01: RetainPublish is a device action, and a thing-attribute
+    variable scopes a topic to one device when no two things share the value."""
+
+    _sm41 = TestSM41IoTDeviceScopedPolicies()
+    CERT = [
+        "arn:aws:iot:us-east-1:123456789012:cert/"
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    ]
+
+    def _rows(self, documents, **kwargs):
+        client = self._sm41._client(
+            [{"policies": [{"policyName": name} for name in documents]}],
+            {name: [{"targets": self.CERT}] for name in documents},
+            documents,
+            **kwargs,
+        )
+        with patch("sagemaker_app.boto3.client", return_value=client):
+            rows = extract_csv_data(
+                sagemaker_app.check_iot_device_scoped_policies("us-east-1")
+            )
+        return client, [
+            r for r in rows if r["Finding"] == sagemaker_app.IOT_DEVICE_POLICY_FINDING
+        ]
+
+    @staticmethod
+    def _document(topic_resource, actions=("iot:Publish", "iot:Receive")):
+        return _iot_document(
+            {
+                "Effect": "Allow",
+                "Action": "iot:Connect",
+                "Resource": _IOT_CLIENT + "${iot:Connection.Thing.ThingName}",
+                "Condition": _ATTACHED,
+            },
+            {
+                "Effect": "Allow",
+                "Action": list(actions),
+                "Resource": topic_resource,
+            },
+        )
+
+    @staticmethod
+    def _thing(name, **attributes):
+        return {"thingName": name, "attributes": attributes}
+
+    def test_a_fleet_wide_retain_publish_fails(self):
+        _, rows = self._rows(
+            {
+                "scoped": _scoped_iot_document(),
+                "retain": _iot_document(
+                    json.loads(_scoped_iot_document())["Statement"][0],
+                    {
+                        "Effect": "Allow",
+                        "Action": "iot:RetainPublish",
+                        "Resource": _IOT_TOPIC + "*",
+                    },
+                ),
+            }
+        )
+        by_status = {r["Status"]: r["Finding_Details"] for r in rows}
+        assert set(by_status) == {"Failed", "Passed"}
+        assert "'retain'" in by_status["Failed"]
+        assert "RetainPublish" in by_status["Failed"]
+        assert "scoped" in by_status["Passed"]
+
+    def test_a_retain_publish_held_to_the_thing_name_passes(self):
+        _, rows = self._rows(
+            {
+                "retain": self._document(
+                    _IOT_TOPIC + "devices/${iot:Connection.Thing.ThingName}/*",
+                    actions=("iot:Publish", "iot:RetainPublish"),
+                )
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_distinct_thing_attribute_scopes_the_device(self):
+        client, rows = self._rows(
+            {"attr": self._document(_IOT_TOPIC + f"devices/{_IOT_SERIAL}/*")},
+            things=[
+                self._thing("cam-1", serial="s-1"),
+                self._thing("cam-2", serial="s-2"),
+                self._thing("hub-1"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "thing attribute" in rows[0]["Finding_Details"]
+        assert "serial" in rows[0]["Finding_Details"]
+
+    def test_a_thing_attribute_two_things_share_fails(self):
+        _, rows = self._rows(
+            {"attr": self._document(_IOT_TOPIC + f"devices/{_IOT_SERIAL}/*")},
+            things=[
+                self._thing("cam-1", serial="s-1"),
+                self._thing("cam-2", serial="s-1"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "serial" in details
+        assert "cam-1" in details and "cam-2" in details
+
+    def test_a_wildcard_after_the_attribute_still_fails(self):
+        _, rows = self._rows(
+            {"attr": self._document(_IOT_TOPIC + f"devices/{_IOT_SERIAL}*")},
+            things=[self._thing("cam-1", serial="s-1")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_an_unread_thing_list_is_not_passed(self):
+        _, rows = self._rows(
+            {"attr": self._document(_IOT_TOPIC + f"devices/{_IOT_SERIAL}/*")},
+            errors={"list_things": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "iot:ListThings" in rows[0]["Finding_Details"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+
+    def test_a_thing_name_policy_does_not_need_the_thing_list(self):
+        _, rows = self._rows(
+            {"scoped": _scoped_iot_document()},
+            errors={"list_things": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+
+# ===================================================================
+# Round 7: AIR-SGM-EP-06 alarms routed through a composite alarm
+# ===================================================================
+def _composite(name, rule, actions=True):
+    composite = {"AlarmName": name, "AlarmRule": rule, "ActionsEnabled": actions}
+    if actions:
+        composite["AlarmActions"] = ["arn:aws:sns:us-east-1:123456789012:ops"]
+    return composite
+
+
+def _actionless(alarm, name):
+    alarm = dict(alarm, AlarmName=name, ActionsEnabled=False)
+    alarm.pop("AlarmActions", None)
+    return alarm
+
+
+class TestSM23DriftAlarmThroughComposite:
+    """AIR-SGM-EP-06: a drift alarm with no action of its own reaches one when
+    an OR composite alarm carries the action."""
+
+    _sm23 = TestSM23MonitorReportAndAlarm()
+
+    def _alarm_rows(self, mock_client, composites):
+        sm23 = self._sm23
+        return sm23._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=sm23._two(),
+            details={"dq": sm23._detail(1), "mq": sm23._detail(1)},
+            alarms=[
+                _actionless(sm23._alarm("dq"), "dq-drift"),
+                sm23._alarm("mq", "aws/sagemaker/Endpoints/model-metrics"),
+            ],
+            composites=composites,
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_or_composite_with_an_action_credits_the_child(self, mock_client):
+        rows = self._alarm_rows(
+            mock_client, [_composite("drift-page", 'ALARM("dq-drift") OR ALARM(x)')]
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "composite" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "composite",
+        [
+            _composite("drift-page", 'ALARM("dq-drift") AND ALARM(x)'),
+            _composite("drift-page", 'ALARM("dq-drift")', actions=False),
+            _composite("drift-page", 'ALARM("other")'),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_composite_that_cannot_page_on_the_child_does_not(
+        self, mock_client, composite
+    ):
+        rows = self._alarm_rows(mock_client, [composite])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'dq'" in rows[0]["Finding_Details"]
+        assert "'mq'" not in rows[0]["Finding_Details"]
+
+
+class TestSM31DiskAlarmThroughComposite:
+    """AIR-SGM-EP-06: the capture-disk alarm may page through a composite."""
+
+    _sm31 = TestSM31EndpointDataCapture
+
+    CAPTURE = {
+        "DataCaptureConfig": {
+            "EnableCapture": True,
+            "CaptureStatus": "Started",
+            "DestinationS3Uri": "s3://audit/capture",
+            "CurrentSamplingPercentage": 100,
+        }
+    }
+
+    def _disk(self, mock_client, composites):
+        self._sm31._endpoints(
+            mock_client,
+            {
+                "a": json.loads(json.dumps(self.CAPTURE)),
+                "b": json.loads(json.dumps(self.CAPTURE)),
+            },
+            alarms=[
+                _actionless(self._sm31._disk_alarm("a"), "a-disk"),
+                self._sm31._disk_alarm("b"),
+            ],
+            composites=composites,
+        )
+        return [
+            f
+            for f in extract_csv_data(
+                sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+            )
+            if f["Finding"].startswith(sagemaker_app.CAPTURE_DISK_ALARM_FINDING)
+        ]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_or_composite_with_an_action_credits_the_disk_alarm(self, mock_client):
+        rows = self._disk(mock_client, [_composite("disk-page", "ALARM(a-disk)")])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_without_the_composite_the_actionless_alarm_fails(self, mock_client):
+        rows = self._disk(
+            mock_client, [_composite("disk-page", "ALARM(a-disk)", actions=False)]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'a/AllTraffic'" in rows[0]["Finding_Details"]
