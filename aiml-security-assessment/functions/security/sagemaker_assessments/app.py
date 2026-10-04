@@ -16486,7 +16486,8 @@ ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "GuardDuty foundational flow-log analysis covers EC2 network interfaces, not "
     "SageMaker endpoints, so the customer flow log is the only network telemetry "
     "for an endpoint, and AgentCore Runtime yields none either, so each runtime in "
-    "VPC network mode is judged like an endpoint and one in PUBLIC mode fails. The "
+    "VPC network mode is judged like an endpoint and one in PUBLIC mode fails, for "
+    "its latest version and every version a runtime endpoint serves. The "
     "state "
     "named for each alarm is its current StateValue, and its last entry into "
     "ALARM comes from the metric alarm's own StateUpdate history. An alarm with "
@@ -16744,7 +16745,13 @@ def _alarm_cannot_fire(
 def _agentcore_runtime_subnets(
     region: str,
 ) -> Tuple[Dict[str, List[str]], List[str]]:
-    """The subnets of each AgentCore runtime; an empty list for PUBLIC mode."""
+    """The subnets of each AgentCore runtime version an endpoint serves, by
+    label; an empty list for PUBLIC mode.
+
+    GetAgentRuntime without a version returns the latest version only, and
+    each version carries its own networkConfiguration, so every liveVersion
+    and targetVersion ListAgentRuntimeEndpoints names is read as well.
+    """
     try:
         client = boto3.client(
             "bedrock-agentcore-control", config=boto3_config, region_name=region
@@ -16757,22 +16764,60 @@ def _agentcore_runtime_subnets(
             f"bedrock-agentcore:ListAgentRuntimes ({get_assessment_error_label(error)})"
         ]
     subnets, unread = {}, []
-    for runtime in runtimes:
-        name = runtime.get("agentRuntimeName") or runtime.get("agentRuntimeId")
-        try:
-            detail = client.get_agent_runtime(agentRuntimeId=runtime["agentRuntimeId"])
-        except Exception as error:
-            unread.append(
-                f"AgentCore runtime '{name}' "
-                f"(bedrock-agentcore:GetAgentRuntime: {get_assessment_error_label(error)})"
-            )
-            continue
+
+    def _network_subnets(detail: Dict[str, Any]) -> List[str]:
         network = detail.get("networkConfiguration") or {}
-        subnets[name] = (
+        return (
             sorted((network.get("networkModeConfig") or {}).get("subnets") or [])
             if network.get("networkMode") == "VPC"
             else []
         )
+
+    for runtime in runtimes:
+        runtime_id = runtime["agentRuntimeId"]
+        name = runtime.get("agentRuntimeName") or runtime_id
+        label = f"AgentCore runtime '{name}'"
+        try:
+            detail = client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            unread.append(
+                f"{label} "
+                f"(bedrock-agentcore:GetAgentRuntime: {get_assessment_error_label(error)})"
+            )
+            continue
+        subnets[label] = _network_subnets(detail)
+        latest = str(
+            detail.get("agentRuntimeVersion")
+            or runtime.get("agentRuntimeVersion")
+            or ""
+        )
+        served = set()
+        try:
+            for page in client.get_paginator("list_agent_runtime_endpoints").paginate(
+                agentRuntimeId=runtime_id
+            ):
+                for endpoint in page.get("runtimeEndpoints", []):
+                    for field in ("liveVersion", "targetVersion"):
+                        if endpoint.get(field):
+                            served.add(str(endpoint[field]))
+        except Exception as error:
+            unread.append(
+                f"the endpoints of {label}, so the versions they serve "
+                "(bedrock-agentcore:ListAgentRuntimeEndpoints: "
+                f"{get_assessment_error_label(error)})"
+            )
+        for version in sorted(served - {latest}):
+            try:
+                detail = client.get_agent_runtime(
+                    agentRuntimeId=runtime_id, agentRuntimeVersion=version
+                )
+            except Exception as error:
+                unread.append(
+                    f"{label} version {version} (bedrock-agentcore:GetAgentRuntime: "
+                    f"{get_assessment_error_label(error)})"
+                )
+                continue
+            subnets[f"{label} version {version}"] = _network_subnets(detail)
     return subnets, unread
 
 
@@ -16844,8 +16889,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             endpoint_subnets[f"endpoint '{endpoint['name']}'"] = sorted(subnets)
     runtime_subnets, runtime_unread = _agentcore_runtime_subnets(region)
     unread.extend(runtime_unread)
-    for name, subnets in runtime_subnets.items():
-        endpoint_subnets[f"AgentCore runtime '{name}'"] = subnets
+    endpoint_subnets.update(runtime_subnets)
 
     if not inventory["endpoints"] and not runtime_subnets and not unread:
         findings["csv_data"].append(

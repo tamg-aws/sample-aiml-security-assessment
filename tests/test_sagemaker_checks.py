@@ -10000,10 +10000,17 @@ class TestSM37EndpointFlowLogAlerting:
         composites=None,
         history=None,
         runtimes=None,
+        served=None,
+        targeted=(),
     ):
-        """runtimes: {name: subnets, None for PUBLIC mode, or an exception}."""
+        """runtimes: {name: subnets, None for PUBLIC mode, or an exception},
+        the latest version "1"; served: {name: {version: same spec}} for
+        versions an endpoint serves besides it, and errors["list_agent_runtime_endpoints"]
+        fails ListAgentRuntimeEndpoints. A version in targeted is an
+        endpoint's targetVersion while it still serves "1" live."""
         errors = errors or {}
         runtimes = runtimes or {}
+        served = served or {}
         composites = composites or []
         history = history or {}
         self.history_calls = []
@@ -10156,22 +10163,53 @@ class TestSM37EndpointFlowLogAlerting:
                 for n in runtimes
             ]
 
+        def list_agent_runtime_endpoints(agentRuntimeId):
+            if "list_agent_runtime_endpoints" in errors:
+                raise errors["list_agent_runtime_endpoints"]
+            name = agentRuntimeId[len("id-") :]
+            # DEFAULT serves the latest version; each further version is
+            # live on its own endpoint, one endpoint per page.
+            return [{"runtimeEndpoints": [{"name": "DEFAULT", "liveVersion": "1"}]}] + [
+                {
+                    "runtimeEndpoints": [
+                        {
+                            "name": f"e{version}",
+                            "liveVersion": "1",
+                            "targetVersion": version,
+                        }
+                        if version in targeted
+                        else {"name": f"e{version}", "liveVersion": version}
+                    ]
+                }
+                for version in served.get(name, {})
+            ]
+
         agentcore = MagicMock()
         agentcore.get_paginator.side_effect = _pager(
-            {"list_agent_runtimes": list_agent_runtimes}
+            {
+                "list_agent_runtimes": list_agent_runtimes,
+                "list_agent_runtime_endpoints": list_agent_runtime_endpoints,
+            }
         )
 
-        def get_agent_runtime(agentRuntimeId):
-            spec = runtimes[agentRuntimeId[len("id-") :]]
+        def get_agent_runtime(agentRuntimeId, agentRuntimeVersion=None):
+            name = agentRuntimeId[len("id-") :]
+            spec = (
+                served[name][agentRuntimeVersion]
+                if agentRuntimeVersion
+                else runtimes[name]
+            )
             if isinstance(spec, Exception):
                 raise spec
+            version = {"agentRuntimeVersion": agentRuntimeVersion or "1"}
             if spec is None:
-                return {"networkConfiguration": {"networkMode": "PUBLIC"}}
+                return {"networkConfiguration": {"networkMode": "PUBLIC"}, **version}
             return {
                 "networkConfiguration": {
                     "networkMode": "VPC",
                     "networkModeConfig": {"subnets": spec, "securityGroups": ["sg-1"]},
-                }
+                },
+                **version,
             }
 
         agentcore.get_agent_runtime.side_effect = get_agent_runtime
@@ -10225,6 +10263,94 @@ class TestSM37EndpointFlowLogAlerting:
         details = rows[0]["Finding_Details"]
         assert "AgentCore runtime 'rt-public' runs outside any customer VPC" in details
         assert "rt-vpc" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_endpoint_served_version_in_public_mode_fails(self, mock_client):
+        # AIR-FND-NET-07 round 9: the latest version is in a covered VPC, an
+        # older version live on another endpoint is PUBLIC.
+        rows = self._run(
+            mock_client,
+            runtimes={"rt-1": ["subnet-3"], "rt-2": ["subnet-1"]},
+            served={"rt-1": {"3": None}, "rt-2": {"2": ["subnet-1"]}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "AgentCore runtime 'rt-1' version 3 runs outside any customer VPC"
+            in details
+        )
+        assert "rt-2" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_endpoints_target_version_is_read(self, mock_client):
+        rows = self._run(
+            mock_client,
+            runtimes={"rt-1": ["subnet-3"]},
+            served={"rt-1": {"4": None}},
+            targeted={"4"},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "AgentCore runtime 'rt-1' version 4 runs outside any customer VPC"
+            in rows[0]["Finding_Details"]
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_endpoint_served_version_on_an_uncovered_subnet_fails(self, mock_client):
+        rows = self._run(
+            mock_client,
+            runtimes={"rt-1": ["subnet-1"]},
+            served={"rt-1": {"2": ["subnet-2"]}},
+            flow_logs=[self._flow_log("vpc-1")],
+            endpoints={},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "AgentCore runtime 'rt-1' version 2: no ACTIVE flow log" in details
+        assert "covers subnet-2" in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_covered_served_versions_pass_and_are_named(self, mock_client):
+        rows = self._run(
+            mock_client,
+            runtimes={"rt-1": ["subnet-3"]},
+            served={"rt-1": {"2": ["subnet-1"]}},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "All 4 endpoint(s) and AgentCore runtime(s)" in rows[0]["Finding_Details"]
+        )
+        assert "AgentCore runtime 'rt-1' version 2 (" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "errors, served, named",
+        [
+            (
+                {
+                    "list_agent_runtime_endpoints": _make_client_error(
+                        "AccessDeniedException"
+                    )
+                },
+                {},
+                "the endpoints of AgentCore runtime 'rt-1', so the versions they "
+                "serve (bedrock-agentcore:ListAgentRuntimeEndpoints",
+            ),
+            (
+                {},
+                {"rt-1": {"2": _make_client_error("AccessDeniedException")}},
+                "AgentCore runtime 'rt-1' version 2 (bedrock-agentcore:GetAgentRuntime",
+            ),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unread_served_version_withholds_the_pass(
+        self, mock_client, errors, served, named
+    ):
+        rows = self._run(
+            mock_client, errors=errors, runtimes={"rt-1": ["subnet-3"]}, served=served
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert named in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_covered_endpoints_and_runtimes_pass(self, mock_client):

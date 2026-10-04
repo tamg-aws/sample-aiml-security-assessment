@@ -1313,12 +1313,14 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Sid: WorkloadReadsOnWildcard
-            # Neither action has a resource type in the service authorization
-            # reference.
+            # None of these actions has a resource type in the service
+            # authorization reference. SM-37 lists each AgentCore runtime's
+            # endpoints for the versions they serve.
             Effect: Allow
             Action:
               - lambda:ListMicrovms # SM-39
               - ec2:DescribeNetworkInterfaces # SM-39
+              - bedrock-agentcore:ListAgentRuntimeEndpoints # SM-37
             Resource: '*'
           - Sid: TransitGatewayEgressRead
             # SM-39 follows a workload subnet's internet route through a transit

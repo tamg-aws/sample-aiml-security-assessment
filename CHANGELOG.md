@@ -477,6 +477,11 @@ section.
   functions an agent action group or gateway target named were in scope
   before. A target `ListFunctions` does not return, a failed listing, or a
   missing IAM cache holds the `Passed` row.
+- `SM-37` judges every AgentCore runtime version a runtime endpoint serves as
+  `liveVersion` or `targetVersion`, read with a version-qualified
+  `GetAgentRuntime`, beside the latest version. Each version carries its own
+  `networkConfiguration`, so an older version an endpoint serves on other
+  subnets or in `PUBLIC` mode passed unseen.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
@@ -1836,6 +1841,13 @@ denied action.
 service authorization reference, and all are read-only. Until the stack is
 updated, the `SM-41` audit row reads as incomplete, and so does an `SM-23`
 schedule whose latest execution is still running.
+
+**SageMaker AgentCore runtime endpoint reads.**
+`SageMakerAssessmentReadsPolicy2` gains
+`bedrock-agentcore:ListAgentRuntimeEndpoints` on `'*'` (`SM-37`), which has
+no resource type in the service authorization reference and is read-only.
+Until the stack is updated, each AgentCore runtime reads `N/A` in the `SM-37`
+row, naming its endpoints as unread.
 
 **SageMaker Macie and Detective administrator reads.**
 `SageMakerAssessmentReadsPolicy2` gains `macie2:GetAdministratorAccount`,
