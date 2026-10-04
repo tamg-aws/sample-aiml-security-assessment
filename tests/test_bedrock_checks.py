@@ -8617,9 +8617,12 @@ class TestBedrockHandlerMultiRegion:
         Returns {check_function_name: region_passed} plus whether BR-15 ran."""
         recorded = {}
 
+        self.spy_calls = {}
+
         def make_spy(name):
             def spy(*args, region="", **kwargs):
                 recorded[name] = region
+                self.spy_calls.setdefault(name, []).append(kwargs)
                 return {
                     "check_name": name,
                     "status": "PASS",
@@ -8744,6 +8747,24 @@ class TestBedrockHandlerMultiRegion:
             recorded.get("check_bedrock_knowledge_base_source_classification")
             == "us-east-1"
         )
+
+    def test_br44_gets_both_br42_results_and_br42_org_leg_runs_once(self):
+        resp, _ = self._run_handler_with_check_spies(
+            _bedrock_event(region="us-east-1", region_index=0)
+        )
+        assert resp["statusCode"] == 200
+        (br44,) = self.spy_calls["check_bedrock_marketplace_model_control"]
+        assert br44["allow_list_findings"]["check_name"] == (
+            "check_bedrock_model_allow_list"
+        )
+        assert br44["org_allow_list_findings"]["check_name"] == (
+            "check_bedrock_approved_model_control"
+        )
+        legs = [
+            call.get("check_id", "BR-43")
+            for call in self.spy_calls["check_bedrock_approved_model_control"]
+        ]
+        assert sorted(legs) == ["BR-42", "BR-43"]
 
     @pytest.mark.parametrize(
         "targets, index, expected",
@@ -10587,6 +10608,22 @@ class TestBR42ModelAllowList:
     MODEL_ARN = (
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
     )
+
+    def test_br42_lists_the_identities_that_can_invoke_any_model(self):
+        # BR-44 reads invocation_open to judge whether invocation is blocked.
+        result = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "Scoped": [("S", _allow("bedrock:InvokeModel", self.MODEL_ARN))],
+                    "Open": [("O", _allow("bedrock:InvokeModel", "*"))],
+                },
+                users={"Reader": [("R", _allow("bedrock:ListFoundationModels", "*"))]},
+            ),
+            region="Global",
+            training_data={"buckets": {}, "errors": [], "regions": []},
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert result["invocation_open"] == ["role 'Open'"]
 
     NO_TRAINING_DATA = {
         "buckets": {},
@@ -13658,9 +13695,18 @@ class TestBR44MarketplaceModelControl:
 
     PRODUCT_ID = "prod-abcdefghijklm"
 
-    def _run(self, cache):
+    # BR-42 results that block unapproved models at invocation. BR-44 passes
+    # only beside one, so tests of the subscription leg supply both.
+    BLOCKED = {
+        "allow_list_findings": {"invocation_open": [], "csv_data": []},
+        "org_allow_list_findings": {"csv_data": [{"Status": "Passed"}]},
+    }
+
+    def _run(self, cache, **kwargs):
         return extract_csv_data(
-            bedrock_app.check_bedrock_marketplace_model_control(cache, region="Global")
+            bedrock_app.check_bedrock_marketplace_model_control(
+                cache, region="Global", **{**self.BLOCKED, **kwargs}
+            )
         )
 
     def test_br44_product_condition_passes_while_bare_subscribe_fails(self):
@@ -14069,6 +14115,7 @@ class TestBR44MarketplaceModelControl:
             bedrock_app.check_bedrock_marketplace_model_control(
                 cache,
                 region="Global",
+                **self.BLOCKED,
                 scp_inventory=self._scp(self.SCP_ALLOW_LIST, self.SCP_NO_PRODUCT_DENY),
             )
         )
@@ -14086,7 +14133,10 @@ class TestBR44MarketplaceModelControl:
         )
         findings = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_model_control(
-                cache, region="Global", scp_inventory=self._scp(self.SCP_ALLOW_LIST)
+                cache,
+                region="Global",
+                scp_inventory=self._scp(self.SCP_ALLOW_LIST),
+                **self.BLOCKED,
             )
         )
 
@@ -14104,6 +14154,7 @@ class TestBR44MarketplaceModelControl:
                 ),
                 region="Global",
                 scp_inventory=inventory,
+                **self.BLOCKED,
             )
         )
 
@@ -14121,7 +14172,10 @@ class TestBR44MarketplaceModelControl:
         for statement in (deny_list, subscribe_only):
             findings = extract_csv_data(
                 bedrock_app.check_bedrock_marketplace_model_control(
-                    cache, region="Global", scp_inventory=self._scp(statement)
+                    cache,
+                    region="Global",
+                    scp_inventory=self._scp(statement),
+                    **self.BLOCKED,
                 )
             )
             assert [f["Status"] for f in findings] == ["Failed"]
@@ -14179,7 +14233,10 @@ class TestBR44MarketplaceModelControl:
         )
         findings = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_model_control(
-                cache, region="Global", scp_inventory=self._scp(self.OUTRIGHT_DENY)
+                cache,
+                region="Global",
+                scp_inventory=self._scp(self.OUTRIGHT_DENY),
+                **self.BLOCKED,
             )
         )
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -14192,7 +14249,10 @@ class TestBR44MarketplaceModelControl:
         )
         narrowed = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_model_control(
-                cache, region="Global", scp_inventory=self._scp(conditioned)
+                cache,
+                region="Global",
+                scp_inventory=self._scp(conditioned),
+                **self.BLOCKED,
             )
         )
         assert [f["Status"] for f in narrowed] == ["Failed", "Failed"]
@@ -14205,6 +14265,7 @@ class TestBR44MarketplaceModelControl:
                 _identity_cache(roles={"Scoped": [("S", self._scoped())]}),
                 region="Global",
                 scp_inventory=inventory,
+                **self.BLOCKED,
             )
         )
 
@@ -14245,10 +14306,157 @@ class TestBR44MarketplaceModelControl:
         details = findings[0]["Finding_Details"]
         assert "no cached identity can change the account's Marketplace" in details
         assert (
-            "this row does not establish that unapproved models cannot be used"
-            in details
+            "this row passes only when BR-42 also blocks unapproved models at "
+            "invocation" in details
         )
         assert "including the subscription Bedrock makes" not in details
+
+    # MDL-04: the Bedrock user guide says "Denying aws-marketplace:Subscribe
+    # alone will not block the first model invocation", so a Subscribe bound
+    # passes only beside a BR-42 block on invocation.
+    OPEN_BR42 = {
+        "allow_list_findings": {"invocation_open": ["role 'Invoker'"], "csv_data": []},
+        "org_allow_list_findings": {"csv_data": [{"Status": "Failed"}]},
+    }
+
+    def _deny_only_cache(self):
+        return _identity_cache(
+            roles={
+                "Guarded": [
+                    (
+                        "G",
+                        {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "aws-marketplace:*",
+                                    "Resource": "*",
+                                },
+                                dict(self.SCP_ALLOW_LIST),
+                                dict(self.SCP_NO_PRODUCT_DENY),
+                            ],
+                        },
+                    )
+                ]
+            }
+        )
+
+    def test_br44_a_subscribe_deny_alone_fails_without_an_invocation_block(self):
+        findings = self._run(self._deny_only_cache(), **self.OPEN_BR42)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "role 'Guarded'" in details
+        assert bedrock_app.MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE in details
+        assert "role 'Invoker' can invoke any model" in details
+        assert "no attached service control policy denies invoking" in details
+        assert findings[0]["Severity"] == "High"
+        assert "bedrock:InvokeModel" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "leg, blocked",
+        [
+            (
+                "allow_list_findings",
+                {"invocation_open": [], "csv_data": []},
+            ),
+            (
+                "org_allow_list_findings",
+                {"csv_data": [{"Status": "Passed"}, {"Status": "Passed"}]},
+            ),
+        ],
+    )
+    def test_br44_either_br42_leg_blocking_invocation_passes(self, leg, blocked):
+        findings = self._run(
+            self._deny_only_cache(), **{**self.OPEN_BR42, leg: blocked}
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "Unapproved models are also blocked at invocation"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "BR-42 identity allow-list" in findings[0]["Finding_Details"] or (
+            "BR-42 organization allow-list" in findings[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "org_rows",
+        [
+            [{"Status": "Passed"}, {"Status": "Failed"}],
+            [{"Status": "Passed"}, {"Status": "N/A"}],
+        ],
+    )
+    def test_br44_an_org_leg_with_any_non_passed_row_does_not_block(self, org_rows):
+        findings = self._run(
+            self._deny_only_cache(),
+            **{**self.OPEN_BR42, "org_allow_list_findings": {"csv_data": org_rows}},
+        )
+        assert [f["Status"] for f in findings] != ["Passed"]
+
+    def test_br44_an_unread_br42_leg_is_na_not_passed_or_failed(self):
+        for unread in (
+            {"allow_list_findings": None},
+            {"allow_list_findings": {"csv_data": []}},
+            {"org_allow_list_findings": None},
+            {"org_allow_list_findings": {"csv_data": [{"Status": "N/A"}]}},
+        ):
+            findings = self._run(
+                self._deny_only_cache(), **{**self.OPEN_BR42, **unread}
+            )
+            assert [f["Status"] for f in findings] == ["N/A"], unread
+            assert (
+                "blocked at invocation was not read" in (findings[0]["Finding_Details"])
+            )
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                self._deny_only_cache(), region="Global"
+            )
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_br44_the_no_grant_row_is_gated_on_br42_too(self):
+        cache = _identity_cache(
+            roles={"Reader": [("R", _allow("bedrock:ListFoundationModels", "*"))]}
+        )
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = []
+        findings = self._run(cache, **self.OPEN_BR42)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            bedrock_app.MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE
+            in (findings[0]["Finding_Details"])
+        )
+
+    def test_br44_credits_a_product_test_on_subscribe_per_the_user_guide(self):
+        # The service authorization reference lists no condition key on
+        # Subscribe; the Bedrock user guide says aws-marketplace:ProductId
+        # restricts it, and that is followed.
+        for statement, bound in (
+            (dict(self.SCP_ALLOW_LIST, Action="aws-marketplace:Subscribe"), True),
+            (
+                _allow(
+                    "aws-marketplace:Subscribe",
+                    "*",
+                    {
+                        "ForAnyValue:StringEquals": {
+                            "aws-marketplace:ProductId": [self.PRODUCT_ID]
+                        }
+                    },
+                )["Statement"][0],
+                True,
+            ),
+            (_allow("aws-marketplace:Subscribe", "*")["Statement"][0], False),
+        ):
+            binding = bedrock_app._marketplace_statement_binding(statement, True)
+            assert binding["bound"] is bound, statement
+
+    def test_br44_view_subscriptions_text_says_why_it_is_not_judged(self):
+        findings = self._run(_identity_cache(roles={"Scoped": [("S", self._scoped())]}))
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "aws-marketplace:ViewSubscriptions is not judged: it lists "
+            "subscriptions and grants no model" in findings[0]["Finding_Details"]
+        )
 
     def test_br44_schema_valid(self):
         findings = self._run(

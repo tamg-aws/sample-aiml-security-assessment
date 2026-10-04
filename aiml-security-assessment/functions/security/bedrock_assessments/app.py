@@ -25463,6 +25463,8 @@ def check_bedrock_model_allow_list(
 
         unrestricted = []
         scoped = []
+        # BR-44 reads this list: the identities that can invoke any model.
+        findings["invocation_open"] = []
 
         identities = [
             ("role", name, permissions)
@@ -25475,6 +25477,8 @@ def check_bedrock_model_allow_list(
         for identity_type, identity_name, permissions in identities:
             access = _identity_model_access(permissions, training_buckets)
             reasons = []
+            if access["unrestricted"] or access["mantle"]:
+                findings["invocation_open"].append(f"{identity_type} '{identity_name}'")
             if access["unrestricted"]:
                 reasons.append(
                     "can invoke any foundation model because "
@@ -27683,6 +27687,15 @@ MARKETPLACE_PRODUCT_CONDITION_KEY = "aws-marketplace:productid"
 
 MARKETPLACE_MODEL_CONTROL_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html#security-iam-awsmanpol-bedrock-marketplace"
 
+# Bedrock user guide, model-access.html, "Grant IAM permissions to request
+# access to Amazon Bedrock foundation models with a product ID".
+MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE = (
+    "Denying aws-marketplace:Subscribe alone will not block the first model "
+    "invocation, because Amazon Bedrock auto-initiates the subscription in the "
+    "background. To block model access from the start, apply Deny policies on "
+    "bedrock:InvokeModel."
+)
+
 
 # Subscribe and Unsubscribe change which Marketplace models the account can use,
 # so both must be bounded by product. ViewSubscriptions only reads.
@@ -27744,6 +27757,13 @@ def _marketplace_statement_binding(
 ) -> Dict[str, Any]:
     """
     Judge how one statement bounds Marketplace subscription by product.
+
+    The service authorization reference declares aws-marketplace:ProductId only
+    on AcceptAgreementRequest and CreateAgreementRequest, but the Bedrock user
+    guide (model-access.html) says "For the aws-marketplace:Subscribe action
+    only, you can use the aws-marketplace:ProductId condition key to restrict
+    subscription to specific models." The user guide is followed, so a product
+    test on Subscribe is credited.
 
     An Allow is bound by a positive test on aws-marketplace:ProductId whose
     values each name a product. ForAllValues: is true when the key is absent, so
@@ -27897,10 +27917,57 @@ def _marketplace_scp_bounds(
     return observed
 
 
+def _marketplace_invocation_block(
+    allow_list_findings: Optional[Dict[str, Any]],
+    org_allow_list_findings: Optional[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """
+    Read BR-42's verdicts on whether an unapproved model is blocked at invocation.
+
+    The identity leg blocks it when no cached identity can invoke any model
+    (its invocation_open list is empty). The organization leg blocks it when
+    its rows are Passed with no Failed or N/A row. A leg not supplied, errored
+    or with an N/A row is named as unread.
+    """
+    state = {"blocked_by": [], "open": [], "unread": []}
+    if allow_list_findings is None or "invocation_open" not in allow_list_findings:
+        state["unread"].append("the BR-42 identity model allow-list")
+    elif allow_list_findings["invocation_open"]:
+        state["open"].append(
+            "{} can invoke any model (BR-42 identity allow-list)".format(
+                ", ".join(allow_list_findings["invocation_open"][:5])
+            )
+        )
+    else:
+        state["blocked_by"].append(
+            "no cached identity can invoke a model outside named ARNs (BR-42 "
+            "identity allow-list)"
+        )
+    statuses = {
+        row.get("Status")
+        for row in (org_allow_list_findings or {}).get("csv_data") or []
+    }
+    if not statuses or "N/A" in statuses:
+        state["unread"].append("the BR-42 organization model allow-list")
+    elif statuses == {"Passed"}:
+        state["blocked_by"].append(
+            "an attached service control policy denies invoking any model "
+            "outside a named list (BR-42 organization allow-list)"
+        )
+    else:
+        state["open"].append(
+            "no attached service control policy denies invoking a model outside "
+            "a named list (BR-42 organization allow-list)"
+        )
+    return state
+
+
 def check_bedrock_marketplace_model_control(
     permission_cache,
     region: str = "",
     scp_inventory: Optional[Dict[str, Any]] = None,
+    allow_list_findings: Optional[Dict[str, Any]] = None,
+    org_allow_list_findings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-44: Verify Marketplace model subscription is restricted to approved
@@ -27911,9 +27978,10 @@ def check_bedrock_marketplace_model_control(
     policies and the permissions boundary. A grant is bounded by an
     aws-marketplace:ProductId test naming products, by a negated product Deny on
     the identity or its boundary, or by an attached service control policy
-    carrying that Deny. Bedrock subscribes on first invocation, so the model-ARN
-    allow-list on invocation is the companion control, asserted by BR-42 and the
-    organization leg of BR-43.
+    carrying that Deny. Bedrock subscribes on first invocation, so a row passes
+    only when BR-42 also blocks unapproved models at invocation, through its
+    identity or organization leg (_marketplace_invocation_block). Otherwise a
+    would-be Passed row is Failed, or N/A when a BR-42 leg was not read.
     """
     logger.debug("Starting check for Marketplace model subscription control")
     check_name = "Marketplace Model Subscription Control"
@@ -27926,6 +27994,51 @@ def check_bedrock_marketplace_model_control(
         }
 
         scp = _marketplace_scp_bounds(scp_inventory)
+        invocation = _marketplace_invocation_block(
+            allow_list_findings, org_allow_list_findings
+        )
+
+        def gated(details, resolution, severity):
+            """Return the Passed row fields, or Failed or N/A without a BR-42 block."""
+            if invocation["blocked_by"]:
+                return (
+                    "{} Unapproved models are also blocked at invocation: {}.".format(
+                        details, "; ".join(invocation["blocked_by"])
+                    ),
+                    resolution,
+                    severity,
+                    "Passed",
+                )
+            if invocation["unread"]:
+                return (
+                    "{} This is not reported as Passed because whether unapproved "
+                    "models are blocked at invocation was not read: {}.".format(
+                        details, "; ".join(invocation["unread"])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            findings["status"] = "WARN"
+            return (
+                (
+                    "{} Amazon Bedrock subscribes to a Marketplace model on its first "
+                    'invocation, and the Bedrock user guide says: "{}" Unapproved '
+                    "models are not blocked at invocation: {}.".format(
+                        details,
+                        MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE,
+                        "; ".join(invocation["open"]),
+                    )
+                ),
+                (
+                    "Deny bedrock:InvokeModel on every model outside the approved list, "
+                    "in identity policies (BR-42) or in a service control policy "
+                    "attached in this account's path (BR-42 organization leg)."
+                ),
+                "High",
+                "Failed",
+            )
+
         deficient = []
         scoped = []
         scp_bounded = []
@@ -28116,45 +28229,50 @@ def check_bedrock_marketplace_model_control(
             )
 
         if scoped or scp_bounded:
+            details, resolution, severity, status = gated(
+                (
+                    "{} identity policy grant(s) restrict Marketplace "
+                    "subscription by product: {}.{} The approved product list "
+                    "is workload-specific, so confirm these identifiers are the "
+                    "models your use case approved. "
+                    "aws-marketplace:ViewSubscriptions is not judged: it lists "
+                    "subscriptions and grants no model ({} identity/identities "
+                    "hold it).{}".format(
+                        len(scoped),
+                        "; ".join(scoped[:5]) or "none",
+                        " {} identity/identities with an unbounded grant are "
+                        "bounded by {}: {}.".format(
+                            len(scp_bounded),
+                            "; ".join(
+                                sorted(
+                                    {
+                                        policy
+                                        for policies in scp["bounded"].values()
+                                        for policy in policies
+                                    }
+                                )[:3]
+                            ),
+                            ", ".join(scp_bounded[:10]),
+                        )
+                        if scp_bounded
+                        else "",
+                        len(viewers),
+                        scp_note,
+                    )
+                ),
+                "No action required. Update the product identifiers whenever the "
+                "approved model list changes.",
+                "Medium",
+            )
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-44",
                     finding_name=check_name,
-                    finding_details=(
-                        "{} identity policy grant(s) restrict Marketplace "
-                        "subscription by product: {}.{} The approved product list "
-                        "is workload-specific, so confirm these identifiers are the "
-                        "models your use case approved. Subscription scoping does "
-                        "not prevent invocation of an already-subscribed model, "
-                        "which BR-42 asserts. aws-marketplace:ViewSubscriptions only "
-                        "reads and is not judged ({} identity/identities hold "
-                        "it).{}".format(
-                            len(scoped),
-                            "; ".join(scoped[:5]) or "none",
-                            " {} identity/identities with an unbounded grant are "
-                            "bounded by {}: {}.".format(
-                                len(scp_bounded),
-                                "; ".join(
-                                    sorted(
-                                        {
-                                            policy
-                                            for policies in scp["bounded"].values()
-                                            for policy in policies
-                                        }
-                                    )[:3]
-                                ),
-                                ", ".join(scp_bounded[:10]),
-                            )
-                            if scp_bounded
-                            else "",
-                            len(viewers),
-                            scp_note,
-                        )
-                    ),
-                    resolution="No action required. Update the product identifiers whenever the approved model list changes.",
+                    finding_details=details,
+                    resolution=resolution,
                     reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
-                    severity="Medium",
-                    status="Passed",
+                    severity=severity,
+                    status=status,
                     region=region,
                 )
             )
@@ -28163,33 +28281,42 @@ def check_bedrock_marketplace_model_control(
             version = permission_cache.get("cache_schema_version")
             complete = isinstance(version, int) and version >= IAM_CACHE_SCHEMA_VERSION
             findings["details"] = "No cached identity grants Marketplace subscription"
+            details = (
+                "No role or user in the IAM permissions cache allows "
+                f"{MARKETPLACE_SUBSCRIBE_ACTION} or "
+                "aws-marketplace:unsubscribe, so no cached identity can "
+                "change the account's Marketplace subscriptions. A model "
+                "the account already subscribes to stays invocable by any "
+                "identity granted bedrock:InvokeModel without Marketplace "
+                "permissions, so this row passes only when BR-42 also blocks "
+                "unapproved models at invocation."
+                "{}{}".format(
+                    ""
+                    if complete
+                    else " This is not reported as Passed because "
+                    + IAM_CACHE_V1_NOTE[0].lower()
+                    + IAM_CACHE_V1_NOTE[1:],
+                    scp_note,
+                )
+            )
+            resolution, severity, status = (
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+            if complete:
+                details, resolution, severity, status = gated(
+                    details, resolution, severity
+                )
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-44",
                     finding_name=check_name,
-                    finding_details=(
-                        "No role or user in the IAM permissions cache allows "
-                        f"{MARKETPLACE_SUBSCRIBE_ACTION} or "
-                        "aws-marketplace:unsubscribe, so no cached identity can "
-                        "change the account's Marketplace subscriptions. A model "
-                        "the account already subscribes to stays invocable by any "
-                        "identity granted bedrock:InvokeModel without Marketplace "
-                        "permissions, so this row does not establish that "
-                        "unapproved models cannot be used; the model-ARN "
-                        "allow-list judged by BR-42 and BR-43 does."
-                        "{}{}".format(
-                            ""
-                            if complete
-                            else " This is not reported as Passed because "
-                            + IAM_CACHE_V1_NOTE[0].lower()
-                            + IAM_CACHE_V1_NOTE[1:],
-                            scp_note,
-                        )
-                    ),
-                    resolution="No action required",
+                    finding_details=details,
+                    resolution=resolution,
                     reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
-                    severity="Informational",
-                    status="Passed" if complete else "N/A",
+                    severity=severity,
+                    status=status,
                     region=region,
                 )
             )
@@ -38963,6 +39090,7 @@ def lambda_handler(event, context):
         # regional availability gate so they are still emitted even if Bedrock is
         # not available in the primary region.
         scp_inventory = None
+        org_allow_list_findings = None
         if is_primary_region:
             if permission_cache is None:
                 all_findings.extend(
@@ -39003,11 +39131,10 @@ def lambda_handler(event, context):
                 )
 
                 logger.info("Running foundation model allow-list check (BR-42)")
-                all_findings.append(
-                    check_bedrock_model_allow_list(
-                        permission_cache, region=GLOBAL_REGION_LABEL
-                    )
+                allow_list_findings = check_bedrock_model_allow_list(
+                    permission_cache, region=GLOBAL_REGION_LABEL
                 )
+                all_findings.append(allow_list_findings)
 
                 logger.info(
                     "Running Marketplace model subscription control check (BR-44)"
@@ -39016,11 +39143,21 @@ def lambda_handler(event, context):
                 # control policy documents, so the organization-wide pass is
                 # made once and reused below.
                 scp_inventory = get_service_control_policy_inventory()
+                # BR-44 passes only when BR-42 blocks unapproved models at
+                # invocation, so BR-42's organization leg is read here and its
+                # result is appended at its own place below.
+                org_allow_list_findings = check_bedrock_approved_model_control(
+                    region=GLOBAL_REGION_LABEL,
+                    scp_inventory=scp_inventory,
+                    check_id="BR-42",
+                )
                 all_findings.append(
                     check_bedrock_marketplace_model_control(
                         permission_cache,
                         region=GLOBAL_REGION_LABEL,
                         scp_inventory=scp_inventory,
+                        allow_list_findings=allow_list_findings,
+                        org_allow_list_findings=org_allow_list_findings,
                     )
                 )
 
@@ -39242,7 +39379,9 @@ def lambda_handler(event, context):
 
             logger.info("Running organization model allow-list check (BR-42)")
             all_findings.append(
-                check_bedrock_approved_model_control(
+                org_allow_list_findings
+                if org_allow_list_findings is not None
+                else check_bedrock_approved_model_control(
                     region=GLOBAL_REGION_LABEL,
                     scp_inventory=scp_inventory,
                     check_id="BR-42",

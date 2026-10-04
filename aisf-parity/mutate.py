@@ -1525,6 +1525,41 @@ MUTATIONS = [
         "replace": "",
     },
     {
+        "name": "BR-44 passes a Subscribe bound with no invocation block",
+        "file": BEDROCK,
+        "defect": "BR-44 passes a Subscribe Deny alone, which Bedrock's auto-subscription bypasses",
+        "find": '            if invocation["blocked_by"]:\n',
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "BR-44 credits an organization leg with a failed row",
+        "file": BEDROCK,
+        "defect": "BR-44 reads one Passed row of BR-42's organization leg as a block",
+        "find": '    elif statuses == {"Passed"}:\n',
+        "replace": '    elif "Passed" in statuses:\n',
+    },
+    {
+        "name": "BR-44 fails over an unread BR-42 leg",
+        "file": BEDROCK,
+        "defect": "BR-44 reports Failed when a BR-42 leg was not read",
+        "find": '            if invocation["unread"]:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-42 lists no identity that can invoke any model",
+        "file": BEDROCK,
+        "defect": "BR-42's invocation_open stays empty, so BR-44 reads every account as blocked",
+        "find": '            if access["unrestricted"] or access["mantle"]:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-44 is not given the BR-42 identity leg",
+        "file": BEDROCK,
+        "defect": "the handler drops BR-42's identity leg from BR-44",
+        "find": "                        allow_list_findings=allow_list_findings,\n",
+        "replace": "",
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -3428,6 +3463,11 @@ GROUPS: dict[str, str] = {
     "BR-06 misses a Security Lake CloudTrail table": "in the Bedrock inference trace",
     "BR-06 fails centralization over an unread Glue catalog": "in the Bedrock inference trace",
     "BR-06 drops the trace rows from the handler": "in the Bedrock inference trace",
+    "BR-44 passes a Subscribe bound with no invocation block": "in the Bedrock Marketplace invocation gate",
+    "BR-44 credits an organization leg with a failed row": "in the Bedrock Marketplace invocation gate",
+    "BR-44 fails over an unread BR-42 leg": "in the Bedrock Marketplace invocation gate",
+    "BR-42 lists no identity that can invoke any model": "in the Bedrock Marketplace invocation gate",
+    "BR-44 is not given the BR-42 identity leg": "in the Bedrock Marketplace invocation gate",
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),
