@@ -1745,12 +1745,14 @@ class TestBR02WorkloadConnectivity:
         container_instances=None,
         iam_roles=None,
         lambda_pages=None,
+        describe_instances_error=None,
     ):
         """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired.
 
         `container_instances` maps a container instance ARN to (EC2 instance id,
         subnet), `iam_roles` is what iam:ListRoles returns (or an error), and
-        `lambda_pages` the ListFunctions pages.
+        `lambda_pages` the ListFunctions pages. `describe_instances_error` is
+        raised by ec2:DescribeInstances.
 
         `describe_failures` names services DescribeServices returns as failures.
         `tasks` maps a cluster to the tasks ListTasks returns, `endpoint_configs`
@@ -1787,6 +1789,8 @@ class TestBR02WorkloadConnectivity:
             else:
 
                 def describe_instances(InstanceIds=()):
+                    if describe_instances_error:
+                        raise describe_instances_error
                     found = [
                         {"InstanceId": instance, "SubnetId": subnet}
                         for instance, subnet in container_instances.values()
@@ -2581,6 +2585,40 @@ class TestBR02WorkloadConnectivity:
             call.kwargs["cluster"] == self.CLUSTER_A
             for call in self.ecs.describe_container_instances.call_args_list
         )
+
+    # Round 9 (NET-01): a failed instance read left the container instance's
+    # EC2 instance id behind, so the next workload on that instance was told
+    # it was not read with only an instance id for a reason.
+    def test_br02_a_failed_instance_read_is_named_for_every_workload_on_it(self):
+        ci = "arn:aws:ecs:us-east-1:123456789012:container-instance/a/ci-1"
+        tasks = []
+        for task_id, group in (("b1", "service:first"), ("b2", "service:second")):
+            task = self._task(task_id, group, subnet=None)
+            task["containerInstanceArn"] = ci
+            tasks.append(task)
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A],
+            services={
+                self.CLUSTER_A: [
+                    self._service("first", "td-api:1", subnets=None),
+                    self._service("second", "td-api:1", subnets=None),
+                ]
+            },
+            tasks={self.CLUSTER_A: tasks},
+            task_roles={"td-api:1": "arn:aws:iam::123456789012:role/ApiTask"},
+            container_instances={ci: ("i-1", "subnet-1")},
+            describe_instances_error=_make_client_error("UnauthorizedOperation"),
+        )
+
+        # The EC2 instance listing reads ec2:DescribeInstances too.
+        assert inventory["workloads"] == []
+        assert [e for e in inventory["errors"] if e.startswith("ECS")] == [
+            f"ECS service '{name}' uses no awsvpc subnets, and the VPC of the "
+            "container instances its tasks run on was not read: container "
+            f"instance {ci} was not read with ecs:DescribeContainerInstances and "
+            "ec2:DescribeInstances (UnauthorizedOperation)"
+            for name in ("first", "second")
+        ]
 
     # Round 9 (NET-01, NET-02): ListFunctions ran without FunctionVersion ALL,
     # so a published version an alias routes to, with its own VpcConfig and

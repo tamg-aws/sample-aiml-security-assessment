@@ -2744,11 +2744,14 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                         f"{arn} returned no subnet from ec2:DescribeInstances"
                     )
         except (ClientError, BotoCoreError) as error:
-            return (
-                "container instance(s) {} were not read with "
-                "ecs:DescribeContainerInstances and ec2:DescribeInstances "
-                "({})".format(", ".join(wanted), get_assessment_error_label(error))
-            )
+            # Kept per instance, so a later workload on the same instance is
+            # told why it was not read, not handed a half-read instance id.
+            for arn in wanted:
+                instance_subnets[arn] = (
+                    f"container instance {arn} was not read with "
+                    "ecs:DescribeContainerInstances and ec2:DescribeInstances "
+                    f"({get_assessment_error_label(error)})"
+                )
         unread = [
             instance_subnets[arn]
             for arn in container_instances
