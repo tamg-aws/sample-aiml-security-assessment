@@ -412,11 +412,18 @@ Resources:
             Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:podidentityassociation/*/*'
           - Sid: ECSTaskRead
             # BR-02 reads the task role and subnets of each task started
-            # outside a service.
+            # outside a service. BR-33 resolves the EC2 instance behind a task
+            # that has no task role, to judge it by that instance's role. The
+            # service authorization reference gives DescribeTasks the task
+            # resource type and DescribeContainerInstances the
+            # container-instance resource type.
             Effect: Allow
             Action:
               - ecs:DescribeTasks # BR-02
-            Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/*'
+              - ecs:DescribeContainerInstances # BR-33
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/*'
+              - !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:container-instance/*'
           - Sid: ECSTaskList
             # BR-02 lists the tasks in each cluster. The service authorization
             # reference gives ListTasks the container-instance resource type,
@@ -680,7 +687,7 @@ Resources:
                 - ec2:DescribeSubnets # BR-02, BR-39
                 - ec2:DescribeRouteTables # BR-39
                 - ec2:DescribeVpcs # BR-02
-                - ec2:DescribeInstances # BR-02
+                - ec2:DescribeInstances # BR-02, BR-33
                 - ecs:ListClusters # BR-02
                 - ecs:ListServices # BR-02
                 - ecs:DescribeTaskDefinition # BR-02
@@ -876,7 +883,7 @@ Resources:
               # type and is granted on '*' in AccountReadsOnWildcard.
               Effect: Allow
               Action:
-                - iam:GetInstanceProfile # BR-02
+                - iam:GetInstanceProfile # BR-02, BR-33
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
             - Sid: BedrockInvocationLogInspection
               # BR-04 reads the retention period of the invocation log group and

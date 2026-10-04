@@ -154,6 +154,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:GetEvaluationJob",
         "bedrock:ListIngestionJobs",
         "cloudtrail:GetEventDataStore",
+        "ecs:DescribeContainerInstances",
         "ecs:DescribeTasks",
         "ecs:ListTasks",
         "eks:DescribeCluster",
@@ -878,7 +879,25 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "eks:DescribePodIdentityAssociation",
                 "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
             ),
-            scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:ecs:*:"
+                                "${AWS::AccountId}:task/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:ecs:*:"
+                                "${AWS::AccountId}:container-instance/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in ("ecs:DescribeTasks", "ecs:DescribeContainerInstances")
+            ),
             scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
             scoped("kendra:DescribeIndex", "kendra:*:${AWS::AccountId}:index/*"),
             scoped("logs:DescribeLogStreams", "logs:*:${AWS::AccountId}:log-group:*"),

@@ -820,6 +820,14 @@ MUTATIONS = [
         "replace": '    for side in ("output",):\n        if not side_regexes[side]:\n',
     },
     {
+        "name": "BR-33 drops a task with no task role",
+        "file": BEDROCK,
+        "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
+        "container instance role holds Bedrock is never judged",
+        "find": '                if not role_arn and task.get("containerInstanceArn"):\n',
+        "replace": "                if False:\n",
+    },
+    {
         "name": "an unread list read lets the BR-53 sweep summary pass",
         "file": BEDROCK,
         "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
@@ -2530,6 +2538,7 @@ GROUPS: dict[str, str] = {
     "BR-33 judges another account's image by this account's coverage": (
         "in the Bedrock container image scanning"
     ),
+    "BR-33 drops a task with no task role": ("in the Bedrock container image scanning"),
     "BR-34 credits a detected prompt attack the guardrail let through": (
         "in the Bedrock invocation log guardrail evidence"
     ),

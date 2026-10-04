@@ -38521,10 +38521,13 @@ class TestBR33ContainerWorkloadImageScanning:
         cache_errors=None,
         list_tasks_error=None,
         coverage_error=None,
+        container_instances=None,
+        container_instance_error=None,
     ):
         definitions = (
             {"td-bedrock": "bedrock-task"} if definitions is None else definitions
         )
+        container_instances = container_instances or {}
         roles = {"bedrock-task": self.BEDROCK} if roles is None else roles
         endpoints = endpoints or {}
         ecs = MagicMock()
@@ -38599,8 +38602,54 @@ class TestBR33ContainerWorkloadImageScanning:
             }
 
         inspector.list_coverage.side_effect = list_coverage
-        clients = {"ecs": ecs, "sagemaker": sagemaker, "inspector2": inspector}
+
+        def describe_container_instances(cluster, containerInstances):
+            if container_instance_error is not None:
+                raise container_instance_error
+            return {
+                "containerInstances": [
+                    {"ec2InstanceId": f"i-{arn.rsplit('/', 1)[-1]}"}
+                    for arn in containerInstances
+                    if arn in container_instances
+                ]
+            }
+
+        ecs.describe_container_instances.side_effect = describe_container_instances
+        hosts = {
+            f"i-{arn.rsplit('/', 1)[-1]}": role
+            for arn, role in container_instances.items()
+        }
+        ec2 = MagicMock()
+        ec2.describe_instances.side_effect = lambda InstanceIds: {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "IamInstanceProfile": {
+                                "Arn": f"arn:aws:iam::1:instance-profile/p/{role}"
+                            }
+                        }
+                        if role
+                        else {}
+                        for instance_id in InstanceIds
+                        for role in [hosts[instance_id]]
+                    ]
+                }
+            ]
+        }
+        iam = MagicMock()
+        iam.get_instance_profile.side_effect = lambda InstanceProfileName: {
+            "InstanceProfile": {"Roles": [{"RoleName": InstanceProfileName}]}
+        }
+        clients = {
+            "ecs": ecs,
+            "sagemaker": sagemaker,
+            "inspector2": inspector,
+            "ec2": ec2,
+            "iam": iam,
+        }
         self.inspector = inspector
+        self.ecs = ecs
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
@@ -38699,6 +38748,69 @@ class TestBR33ContainerWorkloadImageScanning:
 
         assert [row["Status"] for row in rows] == ["Failed"]
         assert "has scan frequency SCAN_ON_PUSH" in rows[0]["Finding_Details"]
+
+    # CMP-01: a task with no task role dropped out of scope silently, so an EC2
+    # task whose container instance role holds Bedrock was never judged.
+    def _host_task(self, task_id, repo, instance):
+        task = self._task(task_id, repo=repo, definition="td-none")
+        task["containerInstanceArn"] = (
+            f"arn:aws:ecs:us-east-1:123456789012:container-instance/main/{instance}"
+        )
+        return task
+
+    def _host_run(self, coverage, **kwargs):
+        prefix = "arn:aws:ecs:us-east-1:123456789012:container-instance/main/"
+        return self._run(
+            tasks=[
+                self._host_task("t-host", "tools", "ci-1"),
+                self._host_task("t-plain", "unscanned", "ci-2"),
+                self._host_task("t-bare", "unscanned", "ci-3"),
+            ],
+            definitions={"td-none": None},
+            roles={"bedrock-host": self.BEDROCK, "s3-host": ["s3:GetObject"]},
+            container_instances={
+                prefix + "ci-1": "bedrock-host",
+                prefix + "ci-2": "s3-host",
+                prefix + "ci-3": None,
+            },
+            coverage=coverage,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("scanned, status", [(False, "Failed"), (True, "Passed")])
+    def test_a_task_without_a_task_role_is_judged_by_its_instance_role(
+        self, scanned, status
+    ):
+        rows = self._host_run(
+            self._scanned("tools") if scanned else [self._repository("tools")]
+        )
+
+        assert [row["Status"] for row in rows] == [status]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "ECS task 'main/t-host', which has no task role, on container "
+            "instance 'ci-1'" in detail
+        )
+        assert "t-plain" not in detail
+        assert "t-bare" not in detail
+
+    def test_an_unread_container_instance_withholds_the_pass(self):
+        rows = self._host_run(
+            self._scanned("tools"),
+            container_instance_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "DescribeContainerInstances",
+            ),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "ECS task 'main/t-host' has no task role and runs on container instance "
+            "arn:aws:ecs:us-east-1:123456789012:container-instance/main/ci-1, whose "
+            "EC2 instance role was not read" in detail
+        )
+        assert self.ecs.describe_container_instances.call_count == 3
 
     def test_an_overridden_task_role_is_read_before_the_definition_role(self):
         rows = self._run(

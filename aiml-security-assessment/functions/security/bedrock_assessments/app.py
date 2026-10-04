@@ -20418,8 +20418,9 @@ CONTAINER_IMAGE_SCAN_FINDING = "Bedrock Container Workload Image Scanning"
 
 CONTAINER_IMAGE_SCAN_CEILING = (
     "Running ECS tasks, standalone or in a service, and SageMaker endpoint "
-    "variants and inference components are read. A stopped task has no image "
-    "digest to judge. EKS pods are not read: the EKS API returns no pod or "
+    "variants and inference components are read. A task with no task role on "
+    "an EC2 container instance is judged by the instance profile role of that "
+    "instance. A stopped task has no image digest to judge. EKS pods are not read: the EKS API returns no pod or "
     "container image, and the images live in the Kubernetes API, which this "
     "assessment does not call. No AWS API records whether a deployment pipeline "
     "blocks on an Inspector finding."
@@ -20496,6 +20497,76 @@ def _bedrock_container_images(region: str, roles: Dict[str, Any]) -> Dict[str, A
         )
         clusters = []
     task_roles: Dict[str, Any] = {}
+    instance_roles: Dict[str, tuple] = {}
+
+    def instance_role(cluster, container_instance):
+        """
+        Return (role name, None) for the instance profile role of the EC2
+        instance behind a container instance, ("", None) when the instance has
+        no instance profile or role, or (None, what was not read).
+        """
+        if container_instance in instance_roles:
+            return instance_roles[container_instance]
+        try:
+            found = (
+                ecs_client.describe_container_instances(
+                    cluster=cluster, containerInstances=[container_instance]
+                ).get("containerInstances")
+                or []
+            )
+            instance_id = found[0].get("ec2InstanceId") if found else None
+            if not instance_id:
+                result = (
+                    None,
+                    f"container instance {container_instance}, for which "
+                    "ecs:DescribeContainerInstances returned no EC2 instance",
+                )
+            else:
+                reservations = (
+                    boto3.client("ec2", config=boto3_config, region_name=region)
+                    .describe_instances(InstanceIds=[instance_id])
+                    .get("Reservations")
+                    or []
+                )
+                instances = [
+                    instance
+                    for reservation in reservations
+                    for instance in reservation.get("Instances") or []
+                ]
+                profile = (
+                    (instances[0].get("IamInstanceProfile") or {}).get("Arn")
+                    if instances
+                    else None
+                )
+                if not instances:
+                    result = (
+                        None,
+                        f"container instance {container_instance}, whose EC2 "
+                        f"instance {instance_id} ec2:DescribeInstances did not return",
+                    )
+                elif not profile:
+                    result = ("", None)
+                else:
+                    roles = (
+                        boto3.client("iam", config=boto3_config)
+                        .get_instance_profile(
+                            InstanceProfileName=str(profile).rsplit("/", 1)[-1]
+                        )["InstanceProfile"]
+                        .get("Roles")
+                        or []
+                    )
+                    result = (roles[0]["RoleName"] if roles else "", None)
+        except (ClientError, BotoCoreError, KeyError, TypeError) as error:
+            result = (
+                None,
+                f"container instance {container_instance}, whose EC2 instance "
+                "role was not read with ecs:DescribeContainerInstances, "
+                "ec2:DescribeInstances and iam:GetInstanceProfile "
+                f"({get_assessment_error_label(error)})",
+            )
+        instance_roles[container_instance] = result
+        return result
+
     for cluster in clusters:
         try:
             task_arns = _list_all_items(
@@ -20559,6 +20630,18 @@ def _bedrock_container_images(region: str, roles: Dict[str, Any]) -> Dict[str, A
                             )
                         )
                         continue
+                if not role_arn and task.get("containerInstanceArn"):
+                    role_arn, missing = instance_role(
+                        cluster, task["containerInstanceArn"]
+                    )
+                    if missing:
+                        unread.append(f"{label} has no task role and runs on {missing}")
+                        continue
+                    label += (
+                        ", which has no task role, on container instance '{}'".format(
+                            str(task["containerInstanceArn"]).rsplit("/", 1)[-1]
+                        )
+                    )
                 if not in_scope(label, role_arn):
                     continue
                 account = (task_arn.split(":") + [""] * 5)[4]
