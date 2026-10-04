@@ -343,7 +343,7 @@ def test_agentcore_payload_carries_every_resolved_region(asl_parsed):
     branches = scan_regions["ItemProcessor"]["States"]["Run Security Assessments"][
         "Branches"
     ]
-    matches = [b for b in branches if b["StartAt"] == "AgentCore Security Assessment"]
+    matches = [b for b in branches if "AgentCore Security Assessment" in b["States"]]
     assert len(matches) == 1
     payload = matches[0]["States"]["AgentCore Security Assessment"]["Parameters"][
         "Payload"
