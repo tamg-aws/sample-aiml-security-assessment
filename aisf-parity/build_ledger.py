@@ -835,7 +835,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-01", "AC-08", "AC-10", "AC-47"],
+        ["AC-01", "AC-08", "AC-10", "AC-47", "AC-27", "AC-48"],
         "AC-47 passes the network leg only on a resource policy Deny that refuses the "
         "invoke action to every principal outside a bounded aws:SourceVpc or "
         "aws:SourceVpce value. A Deny keyed on aws:SourceIp or aws:VpcSourceIp, alone "
@@ -862,7 +862,12 @@ AI_SUBJECT_ROWS = [
         "bedrock-agentcore interface endpoint whose policy does not allow "
         "GetRuntimeProtectedResourceMetadata to Principal '*' on that runtime with only "
         "network conditions, because the OAuth discovery call carries no SigV4 "
-        "identity, and a Deny reaching it on any non-network key blocks it. "
+        "identity, and a Deny reaching it on any non-network key blocks it. The "
+        "trust-policy hardening the gateway-role restriction requires is judged on "
+        "each gateway's execution role: AC-27 fails a service or wildcard statement "
+        "whose aws:SourceArn does not name a gateway, or admits another gateway that "
+        "runs with a different role, and AC-48 fails a missing deputy guard, another "
+        "service principal and an account-root principal on it. "
         "AC-10 fails an Allow that opens the runtime to any principal without binding "
         "the caller's account or organization. AC-01's VPC Placement Guardrail fails "
         "unless an attached SCP denies CreateAgentRuntime, UpdateAgentRuntime, "
@@ -1369,7 +1374,14 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-31", "AC-32"],
+        ["AC-31", "AC-32", "AC-30"],
+        "AC-30 asks the allow-list layer of each runtime, since a runtime invoked "
+        "directly passes no gateway authorizer: a customJWTAuthorizer that pins "
+        "neither allowedAudience nor allowedClients fails, a blank or * value does "
+        "not count, a discoveryUrl that is not https fails, and a runtime with no "
+        "authorizer passes because it accepts no bearer token. It reads the version "
+        "GetAgentRuntime returns by default and each other version an endpoint "
+        "serves, on its own row. "
         "AC-31 reads each gateway JWT authorizer's allow-lists and fails a gateway "
         "that pins neither allowedAudience nor allowedClients, because it then honours "
         "any token its issuer minted for any application registered there; a list "
@@ -2001,18 +2013,24 @@ AI_SUBJECT_ROWS = [
         "not read. A gateway whose wafConfiguration failureMode is FAIL_OPEN "
         "fails, because it allows a request when AWS WAF cannot be evaluated, and one "
         "that reports no failureMode is Not Applicable. The subject is AgentCore gateways. "
-        "Every AG-27 and AG-39 row says that API Gateway APIs, Application Load "
-        "Balancers and CloudFront distributions fronting an AI workload are not read: "
-        "finding them and their web ACLs takes wafv2:ListWebACLs and "
+        "A CloudFront distribution whose origin is an AgentCore gateway is an AI "
+        "front door too: AG-39's AgentCore Front Door WAF Rule Coverage row judges "
+        "the global web ACL its WebACLId names by the same five filters, with the "
+        "CLOUDFRONT body inspection limit and no failure mode, and fails a "
+        "distribution with no web ACL. Every AG-27 and AG-39 row says that API "
+        "Gateway APIs and Application Load Balancers fronting an AI workload are not "
+        "read: finding them and their web ACLs takes wafv2:ListWebACLs and "
         "wafv2:ListResourcesForWebACL, whose grant was declined for this assessment. "
         "AC-49's AgentCore Network Firewall Threat Inspection row is the egress IPS leg: "
         "each AWS Network Firewall a VPC hosting AgentCore reaches by its default route "
-        "must run the AWS managed ThreatSignatures rule group and a malware or botnet "
-        "domain group, neither overridden to DROP_TO_ALERT, and must send its ALERT "
-        "log, which records each detection, to a destination; a firewall whose "
-        "logging configuration is not read makes the row Not Applicable. The "
-        "detections in that log are not read, and VPCs hosting no AgentCore "
-        "resource are not read",
+        "must drop on every AWS managed ThreatSignatures category ListRuleGroups lists "
+        "and on each of MalwareDomains, BotNetCommandAndControlDomains and "
+        "AbusedLegitMalwareDomains, none overridden to DROP_TO_ALERT, and must send its "
+        "ALERT log, which records each detection, to a destination; a firewall whose "
+        "logging configuration or category list is not read makes the row Not "
+        "Applicable. The Passed text reports the newest detection in a CloudWatch Logs "
+        "ALERT group, read with DescribeLogStreams, and names an S3 or Firehose "
+        "destination as not read. VPCs hosting no AgentCore resource are not read",
         [],
         5,
     ),
@@ -2807,6 +2825,9 @@ FOUNDATION_ROWS = [
         "Medium; with no active subscription the row is Not Applicable, because "
         "the control asks for Shield Advanced where availability is "
         "business-critical. A distribution fronting no gateway gives no row. "
+        "AC-51's AgentCore Front Door Anti-DDoS Protection row judges the global "
+        "web ACL such a distribution's WebACLId names by the rules the gateway's "
+        "own ACL is judged by, and fails a distribution with no web ACL. "
         "AC-51's Gateway Firewall Manager Enrollment row fails a gateway with no "
         "web ACL, or whose web ACL GetWebACL reports with neither "
         "ManagedByFirewallManager nor RetrofittedByFirewallManager true; the "
