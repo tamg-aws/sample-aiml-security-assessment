@@ -15521,7 +15521,9 @@ def _regional_admin(
     get_administrator returns (administrator id, relationship status), or
     (None, None). Only an Enabled relationship counts. A caller with no
     administrator is its own when read_self_admin succeeds, because only an
-    administrator can read its organization configuration.
+    administrator can read its organization configuration. read_self_admin
+    returns a string when the service answered that the caller is not the
+    administrator, naming how it answered.
     """
     try:
         administrator, status = get_administrator()
@@ -15536,7 +15538,7 @@ def _regional_admin(
             None,
         )
     try:
-        read_self_admin()
+        answer = read_self_admin()
     except ClientError as error:
         if error.response.get("Error", {}).get("Code", "") in (
             ACCESS_DENIED_ERROR_CODES
@@ -15549,6 +15551,8 @@ def _regional_admin(
         )
     except Exception as error:
         return None, None, get_assessment_error_label(error)
+    if isinstance(answer, str):
+        return None, f"not the administrator ({answer})", None
     return (
         account_id,
         "is this account, which reads the organization configuration",
@@ -15556,13 +15560,123 @@ def _regional_admin(
     )
 
 
+# Live answers of account 178113193057 on 2026-10-04, a member with Macie
+# enabled in us-east-1 and not in us-west-1 or eu-north-1: GetAdministratorAccount
+# raised ResourceNotFoundException where Macie had no administrator and
+# AccessDeniedException "Macie is not enabled" where Macie was off, and
+# DescribeOrganizationConfiguration raised AccessDeniedException "...you must be
+# the Macie administrator for an organization..." in all three. An IAM denial
+# names the action instead, so the message tells them apart.
+MACIE_NOT_ENABLED_MESSAGE = "macie is not enabled"
+MACIE_NOT_ADMINISTRATOR_MESSAGE = "must be the macie administrator"
+
+
+def _client_error_message(error: ClientError) -> str:
+    return str(error.response.get("Error", {}).get("Message", "")).lower()
+
+
+def _macie_regional_admin(region: str, account_id: str):
+    """(administrator, how, unread reason) for Macie, or None when Macie is not
+    enabled for this account in this Region."""
+    macie = boto3.client("macie2", config=boto3_config, region_name=region)
+    try:
+        response = macie.get_administrator_account()
+    except ClientError as error:
+        response = error
+    if (
+        isinstance(response, ClientError)
+        and response.response.get("Error", {}).get("Code", "")
+        in ACCESS_DENIED_ERROR_CODES
+        and MACIE_NOT_ENABLED_MESSAGE in _client_error_message(response)
+    ):
+        return None
+
+    def _administrator():
+        if isinstance(response, ClientError):
+            if response.response.get("Error", {}).get("Code", "") == (
+                "ResourceNotFoundException"
+            ):
+                return None, None
+            raise response
+        return _account_and_status(
+            response, "administrator", "accountId", "relationshipStatus"
+        )
+
+    def _self():
+        try:
+            macie.describe_organization_configuration()
+        except ClientError as error:
+            if MACIE_NOT_ADMINISTRATOR_MESSAGE in _client_error_message(error):
+                return (
+                    "Macie answers DescribeOrganizationConfiguration only for "
+                    "the Macie administrator for an organization"
+                )
+            raise
+        return None
+
+    return _regional_admin(_administrator, _self, account_id)
+
+
+def _detective_regional_admin(region: str, account_id: str):
+    """(administrator, how, unread reason) for Detective.
+
+    A member reads the organization behavior graph's administrator from its
+    ListInvitations memberships, where the organization graph is the one whose
+    InvitationType is ORGANIZATION. A graph this account administers is the
+    organization graph only when DescribeOrganizationConfiguration answers for
+    it, because any account that enables Detective administers its own graph.
+    """
+    detective = boto3.client("detective", config=boto3_config, region_name=region)
+
+    def _pages(operation, key):
+        items, token = [], None
+        while True:
+            page = operation(**({"NextToken": token} if token else {}))
+            items.extend(page.get(key) or [])
+            token = page.get("NextToken")
+            if not token:
+                return items
+
+    def _administrator():
+        for membership in _pages(detective.list_invitations, "Invitations"):
+            if membership.get("InvitationType") == "ORGANIZATION":
+                return membership.get("AdministratorId"), membership.get("Status")
+        return None, None
+
+    def _self():
+        graphs = _pages(detective.list_graphs, "GraphList")
+        if not graphs:
+            return "it administers no behavior graph in this Region"
+        for graph in graphs:
+            try:
+                detective.describe_organization_configuration(GraphArn=graph["Arn"])
+            except ClientError as error:
+                # Live on 2026-10-04 (account 178113193057, us-east-1), a
+                # graph that is not the organization graph answered
+                # ValidationException "...a delegated administrator account
+                # has not been enabled".
+                if error.response.get("Error", {}).get("Code", "") != (
+                    "ValidationException"
+                ):
+                    raise
+                continue
+            return None
+        return (
+            "its behavior graph is not the organization behavior graph: "
+            "DescribeOrganizationConfiguration did not answer for it"
+        )
+
+    return _regional_admin(_administrator, _self, account_id)
+
+
 def check_regional_security_admin(
     region: str = "", detector_inventory: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    SM-35: Verify GuardDuty, Security Hub and Amazon Inspector are administered
-    in this Region from one delegated administrator that is not the
-    organization management account (AIR-FND-ACC-09).
+    SM-35: Verify GuardDuty, Security Hub, Amazon Inspector, Amazon Macie and
+    Amazon Detective are administered in this Region from one delegated
+    administrator that is not the organization management account
+    (AIR-FND-ACC-09).
 
     Each of these services designates its administrator per Region, so the
     organization-wide delegated administrator list does not show a Region
@@ -15671,6 +15785,15 @@ def check_regional_security_admin(
     admins["Amazon Inspector"] = _regional_admin(
         _inspector_admin, _inspector_self, account_id
     )
+    macie_admin = _macie_regional_admin(region, account_id)
+    if macie_admin is None:
+        problems.append(
+            "Amazon Macie is not enabled for this account in this Region, so no "
+            "administrator administers it here"
+        )
+    else:
+        admins["Amazon Macie"] = macie_admin
+    admins["Amazon Detective"] = _detective_regional_admin(region, account_id)
 
     dedicated = {}
     for service, (administrator, how, reason) in admins.items():
@@ -15705,8 +15828,9 @@ def check_regional_security_admin(
             _row(
                 f"In {region}, " + "; ".join(problems) + ".",
                 "Designate the same dedicated security tooling account as the "
-                "delegated administrator of GuardDuty, Security Hub and Amazon "
-                "Inspector in every Region, and enroll this account as a member.",
+                "delegated administrator of GuardDuty, Security Hub, Amazon "
+                "Inspector, Amazon Macie and Amazon Detective in every Region, "
+                "and enroll this account as a member.",
                 "High",
                 "Failed",
             )

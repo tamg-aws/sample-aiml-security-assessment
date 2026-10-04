@@ -8814,10 +8814,24 @@ class TestSM35RegionalAdministrator:
     MGMT = "999999999999"
     TOOLING = "222222222222"
 
-    def _run(self, guardduty=None, securityhub=None, inspector=None, detector="d-1"):
+    def _run(
+        self,
+        guardduty=None,
+        securityhub=None,
+        inspector=None,
+        detector="d-1",
+        macie="same",
+        detective="same",
+    ):
         """Each service spec: an admin account id (member, Enabled), "self",
         (admin id, status), None for no administrator, or an exception the
-        administrator read raises."""
+        administrator read raises. Macie also takes "off" (not enabled here)
+        and Detective "standalone" (this account administers a graph that is
+        not the organization graph). "same" is "self" when GuardDuty is, and
+        the tooling account otherwise."""
+        same = "self" if guardduty == "self" else self.TOOLING
+        macie = same if macie == "same" else macie
+        detective = same if detective == "same" else detective
 
         def not_admin():
             raise _make_client_error("BadRequestException", "not the admin")
@@ -8873,6 +8887,75 @@ class TestSM35RegionalAdministrator:
             }
 
         inspector2.get_delegated_admin_account.side_effect = delegated_admin
+        macie2 = MagicMock()
+
+        def macie_admin():
+            if isinstance(macie, Exception):
+                raise macie
+            if macie == "off":
+                raise _make_client_error(
+                    "AccessDeniedException", "Macie is not enabled"
+                )
+            if macie in (None, "self"):
+                raise _make_client_error(
+                    "ResourceNotFoundException",
+                    "The request failed because there isn't a delegated Macie "
+                    "administrator account for your account",
+                )
+            account, status = macie if isinstance(macie, tuple) else (macie, "Enabled")
+            return {
+                "administrator": {"accountId": account, "relationshipStatus": status}
+            }
+
+        def macie_organization():
+            if macie == "self":
+                return {"autoEnable": True}
+            raise _make_client_error(
+                "AccessDeniedException",
+                "The request failed because you must be the Macie administrator "
+                "for an organization to perform this operation",
+            )
+
+        macie2.get_administrator_account.side_effect = macie_admin
+        macie2.describe_organization_configuration.side_effect = macie_organization
+        detective_client = MagicMock()
+        graph = f"arn:aws:detective:us-west-2:{self.ME}:graph:g1"
+
+        def memberships(**_):
+            if isinstance(detective, Exception):
+                raise detective
+            if detective == "standalone":
+                own = {"AdministratorId": self.ME, "Status": "ENABLED"}
+                return {"Invitations": [own]}
+            if detective in (None, "self"):
+                return {"Invitations": []}
+            account, status = (
+                detective if isinstance(detective, tuple) else (detective, "ENABLED")
+            )
+            organization = {
+                "InvitationType": "ORGANIZATION",
+                "AdministratorId": account,
+                "Status": status,
+            }
+            return {"Invitations": [organization]}
+
+        def detective_organization(GraphArn):
+            assert GraphArn == graph
+            if detective == "self":
+                return {"AutoEnable": True}
+            raise _make_client_error(
+                "ValidationException",
+                "The request failed because a delegated administrator account "
+                "has not been enabled.",
+            )
+
+        detective_client.list_invitations.side_effect = memberships
+        detective_client.list_graphs.side_effect = lambda **_: {
+            "GraphList": [{"Arn": graph}] if detective in ("self", "standalone") else []
+        }
+        detective_client.describe_organization_configuration.side_effect = (
+            detective_organization
+        )
         sts = MagicMock()
         sts.get_caller_identity.return_value = {"Account": self.ME}
         orgs = MagicMock()
@@ -8885,6 +8968,8 @@ class TestSM35RegionalAdministrator:
             "guardduty": gd,
             "securityhub": sh,
             "inspector2": inspector2,
+            "macie2": macie2,
+            "detective": detective_client,
         }
         with patch(
             "sagemaker_app.boto3.client", side_effect=lambda svc, **_: clients[svc]
@@ -8911,9 +8996,11 @@ class TestSM35RegionalAdministrator:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert f"account {self.ME}" in rows[0]["Finding_Details"]
 
-    @pytest.mark.parametrize("missing", ["guardduty", "securityhub", "inspector"])
+    SERVICES = ("guardduty", "securityhub", "inspector", "macie", "detective")
+
+    @pytest.mark.parametrize("missing", SERVICES)
     def test_a_region_with_no_administrator_for_one_service_fails(self, missing):
-        specs = {k: self.TOOLING for k in ("guardduty", "securityhub", "inspector")}
+        specs = {k: self.TOOLING for k in self.SERVICES}
         specs[missing] = None
         rows = self._run(**specs)
         assert [r["Status"] for r in rows] == ["Failed"]
@@ -8922,6 +9009,8 @@ class TestSM35RegionalAdministrator:
             "guardduty": "Amazon GuardDuty",
             "securityhub": "AWS Security Hub",
             "inspector": "Amazon Inspector",
+            "macie": "Amazon Macie",
+            "detective": "Amazon Detective",
         }[missing]
         assert f"{name} has no delegated administrator" in details
         assert details.count("has no delegated administrator") == 1
@@ -26727,3 +26816,113 @@ class TestRound9GuardedPopulationFromTheServiceReference:
                 _denies_except([]) + [SCP_NOTEBOOK_ACCESS_DENIES[-1]]
             )
         ] == ["Passed"]
+
+
+class TestSM35RegionalMacieAndDetective:
+    """AIR-FND-ACC-09: Macie and Detective designate their administrator per
+    Region too, so the regional row reads both."""
+
+    suite = TestSM35RegionalAdministrator()
+    TOOLING = TestSM35RegionalAdministrator.TOOLING
+    MGMT = TestSM35RegionalAdministrator.MGMT
+    ME = TestSM35RegionalAdministrator.ME
+
+    def _run(self, **specs):
+        return self.suite._run(self.TOOLING, self.TOOLING, self.TOOLING, **specs)
+
+    def test_all_five_on_the_tooling_account_pass_and_are_named(self):
+        rows = self._run()
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Amazon GuardDuty, AWS Security Hub, Amazon Inspector, Amazon Macie, "
+            f"Amazon Detective are all administered from account {self.TOOLING}"
+        ) in rows[0]["Finding_Details"]
+
+    def test_this_account_as_administrator_of_all_five_passes(self):
+        rows = self.suite._run("self", "self", "self")
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Amazon Macie, Amazon Detective" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("service", ["macie", "detective"])
+    def test_the_management_account_as_administrator_fails(self, service):
+        rows = self._run(**{service: self.MGMT})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        name = {"macie": "Amazon Macie", "detective": "Amazon Detective"}[service]
+        assert (
+            f"{name} is administered from the organization management account "
+            f"{self.MGMT}"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("service", ["macie", "detective"])
+    def test_a_third_account_splits_the_administration(self, service):
+        rows = self._run(**{service: "333333333333"})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "2 different accounts" in rows[0]["Finding_Details"]
+
+    def test_macie_off_in_this_region_fails(self):
+        rows = self._run(macie="off")
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "Amazon Macie is not enabled for this account in this Region"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_non_administrator_macie_answer_fails_and_says_why(self):
+        rows = self._run(macie=None)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "only for the Macie administrator for an organization"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_iam_denial_of_the_macie_read_withholds_the_pass(self):
+        denied = _make_client_error(
+            "AccessDeniedException",
+            "User: arn:aws:sts::111111111111:assumed-role/r/s is not authorized "
+            "to perform: macie2:GetAdministratorAccount",
+        )
+        rows = self._run(macie=denied)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "Amazon Macie (AccessDeniedException)" in rows[0]["Finding_Details"]
+
+    def test_a_standalone_detective_graph_is_not_the_organization_graph(self):
+        rows = self._run(detective="standalone")
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "Amazon Detective has no delegated administrator" in details
+        assert "is not the organization behavior graph" in details
+
+    @pytest.mark.parametrize("status", ["INVITED", "ACCEPTED_BUT_DISABLED"])
+    def test_a_detective_membership_that_is_not_enabled_fails(self, status):
+        rows = self._run(detective=(self.TOOLING, status))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"relationship status {status}" in rows[0]["Finding_Details"]
+
+    def test_a_denied_detective_read_withholds_the_pass(self):
+        rows = self._run(detective=_make_client_error("AccessDeniedException"))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "Amazon Detective (AccessDeniedException)" in (rows[0]["Finding_Details"])
+        )
+
+    def test_detective_memberships_are_paged(self):
+        client = MagicMock()
+        pages = [
+            {"Invitations": [{"AdministratorId": self.ME}], "NextToken": "t"},
+            {
+                "Invitations": [
+                    {
+                        "InvitationType": "ORGANIZATION",
+                        "AdministratorId": self.TOOLING,
+                        "Status": "ENABLED",
+                    }
+                ]
+            },
+        ]
+        client.list_invitations.side_effect = pages
+        with patch("sagemaker_app.boto3.client", return_value=client):
+            administrator, how, reason = sagemaker_app._detective_regional_admin(
+                "us-west-2", self.ME
+            )
+        assert (administrator, reason) == (self.TOOLING, None)
+        assert client.list_invitations.call_args_list[1].kwargs == {"NextToken": "t"}

@@ -446,6 +446,16 @@ section.
   `UpdateNotebookInstance`, the two domain actions and the two user profile
   actions. An SCP on `CreateTrainingJob` alone no longer passes, because a
   tuning or processing job launches compute on its own keys.
+- `SM-35`'s `Security Service Regional Delegated Administrator` row reads
+  Amazon Macie and Amazon Detective beside GuardDuty, Security Hub and
+  Inspector, because both designate their administrator per Region. Macie's
+  administrator comes from `GetAdministratorAccount`, Detective's from the
+  `ORGANIZATION` membership `ListInvitations` returns. A Region where Macie is
+  not enabled, where either service has no administrator, or where the
+  management account or a second account administers it fails. A behavior
+  graph this account administers counts only when
+  `DescribeOrganizationConfiguration` answers for it, so a standalone graph is
+  not taken for the organization graph.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
@@ -1805,6 +1815,14 @@ denied action.
 service authorization reference, and all are read-only. Until the stack is
 updated, the `SM-41` audit row reads as incomplete, and so does an `SM-23`
 schedule whose latest execution is still running.
+
+**SageMaker Macie and Detective administrator reads.**
+`SageMakerAssessmentReadsPolicy2` gains `macie2:GetAdministratorAccount`,
+`macie2:DescribeOrganizationConfiguration`, `detective:ListInvitations` and
+`detective:ListGraphs` on `'*'`, since none has a resource type, and
+`detective:DescribeOrganizationConfiguration` on this account's `graph:*`
+(`SM-35`). All are read-only. Until the stack is updated, the regional
+administrator row reads `N/A` naming Macie and Detective as unread.
 
 **SageMaker VPC and DHCP option reads.** `SageMakerAssessmentReadsPolicy`
 gains `ec2:DescribeVpcs` and `ec2:DescribeDhcpOptions` on `'*'` (`SM-37`);
