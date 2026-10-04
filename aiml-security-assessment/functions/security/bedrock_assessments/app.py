@@ -3747,9 +3747,18 @@ def _principal_is_bounded(principal: Any) -> bool:
     )
 
 
-def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
+def _vpc_endpoint_policy_scope(
+    document: Any,
+    action: str = "bedrock:invokemodel",
+    service_label: str = "Bedrock",
+    resource_is_named: Optional[Callable[[Any], bool]] = None,
+) -> Dict[str, Any]:
     """
     Describe the network scope a Bedrock interface endpoint policy grants.
+
+    ``action`` is the call a scoping Deny must cover. With ``resource_is_named``,
+    an Allow whose every Resource that test accepts is bounded too, which is how
+    an S3 or DynamoDB endpoint policy names the buckets or tables it carries.
 
     The default endpoint policy allows Principal "*" every action on every
     resource, so any principal whose traffic reaches the endpoint inherits full
@@ -3791,7 +3800,7 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
                 str(resource).strip() != "*"
                 for resource in _as_list(statement.get("Resource", "*"))
             )
-            or not _statement_matches_action(statement, "bedrock:invokemodel")
+            or not _statement_matches_action(statement, action)
         ):
             continue
         operator, key, values = conditions[0]
@@ -3841,6 +3850,21 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
             )
         elif scope_keys:
             bounded.append(f"statement '{label}' requires {', '.join(scope_keys)}")
+        elif (
+            resource_is_named is not None
+            and "NotResource" not in statement
+            and _as_list(statement.get("Resource"))
+            and all(
+                resource_is_named(resource)
+                for resource in _as_list(statement.get("Resource"))
+            )
+        ):
+            bounded.append(
+                "statement '{}' names only {}".format(
+                    label,
+                    ", ".join(map(str, _as_list(statement.get("Resource"))[:3])),
+                )
+            )
         elif _principal_is_bounded(statement.get("Principal")):
             bounded.append(
                 "statement '{}' names {} principal(s)".format(
@@ -3890,7 +3914,7 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
         "scoped": True,
         "detail": (
             "its endpoint policy carries no Allow statement, so no principal can "
-            "reach Bedrock through it"
+            f"reach {service_label} through it"
         ),
     }
 
@@ -4081,6 +4105,177 @@ def _vpc_endpoint_hardening_findings(
     return rows
 
 
+DATA_PATH_ENDPOINT_POLICY_FINDING = "AI Data Path VPC Endpoint Policy Scope"
+
+# The call a Deny in each data path endpoint's policy must cover to scope it.
+DATA_PATH_ENDPOINT_PROBE_ACTIONS = {
+    "s3": "s3:getobject",
+    "dynamodb": "dynamodb:getitem",
+    "sagemaker.api": "sagemaker:createendpoint",
+    "sagemaker.runtime": "sagemaker:invokeendpoint",
+}
+
+
+def _data_path_resource_is_named(resource: Any) -> bool:
+    """
+    True when a Resource entry names one bucket, table or endpoint.
+
+    A wildcard in the partition, service, Region or account segment, or in the
+    resource name, widens it. A trailing /* below a named bucket or table (its
+    objects, or a table's indexes and streams) does not. Every resource type
+    other than an S3 bucket carries its name after a "/", so "table/*" names
+    no table.
+    """
+    if not isinstance(resource, str):
+        return False
+    parts = resource.strip().split(":", 5)
+    if len(parts) < 6 or parts[0] != "arn":
+        return False
+    if any(_resource_has_wildcard(part) for part in parts[1:5]):
+        return False
+    name = parts[5][:-2] if parts[5].endswith("/*") else parts[5]
+    if not name or _resource_has_wildcard(name):
+        return False
+    return parts[2] == "s3" or "/" in name
+
+
+def _ai_vpcs(
+    permission_cache: Dict[str, Any],
+    endpoints: List[Dict[str, Any]],
+    workload_inventory: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Return the VPCs that hold a Bedrock or AgentCore endpoint or a workload
+    whose role is granted an AI surface, and the parts of the population that
+    could not be classified.
+    """
+    vpcs = {endpoint.get("vpc_id") for endpoint in endpoints if endpoint.get("vpc_id")}
+    unread = list(workload_inventory.get("errors") or [])
+    roles = permission_cache.get("role_permissions") or {}
+    for workload in workload_inventory.get("workloads") or []:
+        role = workload.get("role")
+        if not role or not workload.get("vpc_id"):
+            continue
+        if role not in roles:
+            unread.append(
+                "{} '{}' runs as role '{}', which the IAM cache does not hold".format(
+                    workload["kind"], workload["name"], role
+                )
+            )
+            continue
+        try:
+            if _granted_bedrock_surfaces(roles[role], AI_WORKLOAD_SURFACES):
+                vpcs.add(workload["vpc_id"])
+        except (ValueError, TypeError, AttributeError):
+            unread.append(
+                "{} '{}' runs as role '{}', whose policies could not be parsed".format(
+                    workload["kind"], workload["name"], role
+                )
+            )
+    return {"vpcs": vpcs, "unread": unread}
+
+
+def _data_path_endpoint_policy_findings(
+    endpoints: List[Dict[str, Any]], ai_vpcs: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Judge the endpoint policy of every S3, DynamoDB and SageMaker endpoint in a
+    VPC that holds an AI workload or a Bedrock or AgentCore endpoint. A policy is
+    least privilege when it bounds the principals or source network, or names
+    the buckets, tables or endpoints it carries.
+    """
+    prefix = f"com.amazonaws.{region}."
+    judged = [
+        endpoint
+        for endpoint in endpoints
+        if endpoint.get("vpc_id") in ai_vpcs["vpcs"]
+        and str(endpoint.get("service", "")).startswith(prefix)
+        and str(endpoint["service"])[len(prefix) :] in DATA_PATH_ENDPOINT_PROBE_ACTIONS
+    ]
+    unscoped = []
+    scoped = []
+    unreadable = []
+    for endpoint in judged:
+        surface = str(endpoint["service"])[len(prefix) :]
+        verdict = _vpc_endpoint_policy_scope(
+            endpoint.get("policy"),
+            action=DATA_PATH_ENDPOINT_PROBE_ACTIONS[surface],
+            service_label=surface,
+            resource_is_named=_data_path_resource_is_named,
+        )
+        entry = f"{_endpoint_label(endpoint)}: {verdict['detail']}"
+        if not verdict["readable"]:
+            unreadable.append(entry)
+        elif verdict["scoped"]:
+            scoped.append(entry)
+        else:
+            unscoped.append(entry)
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-02",
+            finding_name=DATA_PATH_ENDPOINT_POLICY_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=VPC_ENDPOINT_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    rows = []
+    total = len(judged)
+    if unscoped:
+        rows.append(
+            row(
+                "{} of {} S3, DynamoDB or SageMaker endpoint(s) in a VPC holding an "
+                "AI workload or a Bedrock or AgentCore endpoint carry a policy that "
+                "bounds neither the principals nor the source network and names "
+                "no specific bucket, table or endpoint: {}.".format(
+                    len(unscoped), total, "; ".join(unscoped[:5])
+                ),
+                "Attach an endpoint policy that names the buckets, tables or "
+                "endpoints the workloads use, or conditions access on "
+                "aws:PrincipalOrgID, aws:PrincipalArn or aws:SourceVpc.",
+                "Medium",
+                "Failed",
+            )
+        )
+    if scoped:
+        rows.append(
+            row(
+                "{} of {} S3, DynamoDB or SageMaker endpoint(s) in a VPC holding an "
+                "AI workload or a Bedrock or AgentCore endpoint carry a policy that "
+                "bounds who may use it or what it reaches: {}.{}".format(
+                    len(scoped),
+                    total,
+                    "; ".join(scoped[:5]),
+                    " This is not reported as Passed because part of the workload "
+                    "population was not read, so an endpoint in another AI VPC may "
+                    "be missing: {}.".format("; ".join(ai_vpcs["unread"][:5]))
+                    if ai_vpcs["unread"]
+                    else "",
+                ),
+                "No action required for the endpoint policy.",
+                "Medium",
+                "N/A" if ai_vpcs["unread"] else "Passed",
+            )
+        )
+    if unreadable:
+        rows.append(
+            row(
+                "{} of {} S3, DynamoDB or SageMaker endpoint(s) have no readable "
+                "endpoint policy: {}.".format(
+                    len(unreadable), total, "; ".join(unreadable[:5])
+                ),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    return rows
+
+
 def check_bedrock_access_and_vpc_endpoints(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
@@ -4194,6 +4389,19 @@ def check_bedrock_access_and_vpc_endpoints(
         if any(row["Status"] == "Failed" for row in workload_rows):
             findings["status"] = "WARN"
         findings["csv_data"].extend(workload_rows)
+        data_path_rows = _data_path_endpoint_policy_findings(
+            vpc_endpoint_check.get("data_path_endpoints", []),
+            _ai_vpcs(
+                permission_cache,
+                vpc_endpoint_check["found_endpoints"]
+                + vpc_endpoint_check.get("agentcore_endpoints", []),
+                workload_inventory,
+            ),
+            region,
+        )
+        if any(row["Status"] == "Failed" for row in data_path_rows):
+            findings["status"] = "WARN"
+        findings["csv_data"].extend(data_path_rows)
         if not bedrock_access_found:
             findings["details"] = "No Bedrock access found in roles or users"
 
@@ -9925,12 +10133,20 @@ INVOCATION_LOG_ARCHIVE_RESOLUTION = (
 
 
 def _invocation_log_bucket_lock(
-    s3_client, bucket: str, lock_cache: Dict[str, Tuple[str, Any]]
+    s3_client,
+    bucket: str,
+    lock_cache: Dict[str, Tuple[str, Any]],
+    account: Optional[str] = None,
 ) -> Tuple[str, str]:
     """
     Judge one bucket's Object Lock default retention: ("ok", text), ("bad",
     text) or ("unread", text). Only COMPLIANCE mode holds against a principal
     with s3:BypassGovernanceRetention.
+
+    A COMPLIANCE bucket must also sit in a separate Log Archive account. The
+    lock read is repeated with ExpectedBucketOwner set to ``account``: S3
+    answers it when this account owns the bucket and denies it otherwise, so
+    a denial after the plain read succeeded means another account owns it.
     """
     if bucket not in lock_cache:
         try:
@@ -9975,8 +10191,43 @@ def _invocation_log_bucket_lock(
         if retention.get("Days")
         else f"{retention.get('Years')} year(s)"
     )
-    return "ok", (
+    locked = (
         f"bucket '{bucket}', whose default retention is COMPLIANCE mode for {period}"
+    )
+    if not account:
+        return "unread", (
+            f"{locked}; the owner of bucket '{bucket}' was not compared with this "
+            "account, because sts:GetCallerIdentity returned no account"
+        )
+    owner_key = f"owner:{bucket}"
+    if owner_key not in lock_cache:
+        try:
+            s3_client.get_object_lock_configuration(
+                Bucket=bucket, ExpectedBucketOwner=account
+            )
+            lock_cache[owner_key] = ("read", "same")
+        except ClientError as error:
+            label = get_assessment_error_label(error)
+            lock_cache[owner_key] = (
+                ("read", "other") if label == "AccessDenied" else ("error", label)
+            )
+        except BotoCoreError as error:
+            lock_cache[owner_key] = ("error", get_assessment_error_label(error))
+    state, owner = lock_cache[owner_key]
+    if state == "error":
+        return "unread", (
+            f"{locked}; the owner of bucket '{bucket}' was not compared with this "
+            f"account ({owner})"
+        )
+    if owner == "same":
+        return "bad", (
+            f"{locked}, but which this account {account} owns, not a separate Log "
+            "Archive account, so this account's administrator controls the bucket "
+            "that holds the copy"
+        )
+    return "ok", (
+        f"{locked}, and which another account owns: S3 denied the read naming "
+        f"this account {account} as ExpectedBucketOwner"
     )
 
 
@@ -10071,7 +10322,9 @@ def _invocation_log_subscription_archive(
             )
             continue
         bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
-        state, text = _invocation_log_bucket_lock(s3_client, bucket, lock_cache)
+        state, text = _invocation_log_bucket_lock(
+            s3_client, bucket, lock_cache, account
+        )
         verdicts.append((state, f"{stream_label}, which delivers to {text}"))
     if not verdicts:
         return "bad", f"{stream_label} reports no destination"
@@ -10093,8 +10346,9 @@ def _invocation_log_archive_findings(
     a WORM copy. Log events in CloudWatch Logs have no WORM storage of their
     own, so the log group must be forwarded by a subscription filter through
     Firehose to a bucket with Object Lock in COMPLIANCE mode; an S3 destination
-    is itself judged on its Object Lock default retention. Whether a bucket is
-    in a separate Log Archive account is not read.
+    is itself judged on its Object Lock default retention, and a COMPLIANCE
+    bucket this account owns fails, because the control prescribes a separate
+    Log Archive account.
     """
 
     def row(details: str, resolution: str, severity: str, status: str):
@@ -10111,14 +10365,21 @@ def _invocation_log_archive_findings(
 
     lock_cache: Dict[str, Tuple[str, Any]] = {}
     rows = []
+    try:
+        account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+    except (ClientError, BotoCoreError, KeyError, TypeError):
+        account = None
     for bucket in buckets:
-        state, text = _invocation_log_bucket_lock(s3_client, bucket, lock_cache)
+        state, text = _invocation_log_bucket_lock(
+            s3_client, bucket, lock_cache, account
+        )
         if state == "ok":
             rows.append(
                 row(
                     f"Invocation log {text}, so the records written to it cannot be "
-                    "deleted or overwritten until it expires. Whether the bucket "
-                    "is in a separate Log Archive account is not read.",
+                    "deleted or overwritten until it expires.",
                     "No action required",
                     "Medium",
                     "Passed",
@@ -10127,7 +10388,7 @@ def _invocation_log_archive_findings(
         elif state == "unread":
             rows.append(
                 row(
-                    f"Object Lock on the invocation log bucket was not read: {text}.",
+                    f"The invocation log bucket was not judged in full: {text}.",
                     COULD_NOT_ASSESS_RESOLUTION,
                     "Informational",
                     "N/A",
@@ -10194,8 +10455,7 @@ def _invocation_log_archive_findings(
         rows.append(
             row(
                 f"Invocation log group '{log_group_name}' forwards every event by "
-                f"{passed[0]}. Whether the bucket is in a separate Log Archive "
-                "account is not read.",
+                f"{passed[0]}.",
                 "No action required",
                 "Medium",
                 "Passed",
@@ -24246,6 +24506,200 @@ def check_bedrock_job_vpc(
     return findings
 
 
+AI_WORKLOAD_SUBNET_FINDING = "AI Workload Subnet Privacy"
+
+
+def check_ai_workload_subnet_privacy(
+    permission_cache: Dict[str, Any],
+    region: str = "",
+    workload_inventory: Optional[Dict[str, Any]] = None,
+    ec2_client: Any = None,
+) -> Dict[str, Any]:
+    """
+    BR-39: Require every workload whose role is granted a Bedrock, AgentCore or
+    SageMaker runtime surface to run in a VPC on subnets that route to no
+    internet gateway.
+
+    The population is BR-02's workload inventory: every Lambda function, ECS
+    service and standalone task, EC2 instance, SageMaker notebook instance and
+    endpoint, EKS pod identity association and VPC-mode AgentCore runtime
+    version. A workload is AI compute when its role is granted one of those
+    surfaces, the test BR-02 applies.
+    """
+    findings = {"csv_data": []}
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-39",
+            finding_name=AI_WORKLOAD_SUBNET_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=VPC_ENDPOINT_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        inventory = workload_inventory or get_bedrock_vpc_workload_inventory(region)
+        roles = permission_cache.get("role_permissions") or {}
+        unread = list(inventory.get("errors") or [])
+        in_vpc = []
+        failed = []
+        for workload in inventory.get("workloads") or []:
+            label = "{} '{}'".format(workload["kind"], workload["name"])
+            role = workload.get("role")
+            if not role:
+                continue
+            if role not in roles:
+                unread.append(
+                    f"{label} runs as role '{role}', which the IAM cache does not hold"
+                )
+                continue
+            try:
+                granted = _granted_bedrock_surfaces(roles[role], AI_WORKLOAD_SURFACES)
+            except (ValueError, TypeError, AttributeError):
+                unread.append(
+                    f"{label} runs as role '{role}', whose policies could not be parsed"
+                )
+                continue
+            if not granted:
+                continue
+            if not workload.get("vpc_id"):
+                failed.append(
+                    f"{label} (role '{role}') is not attached to a VPC, so it runs "
+                    "outside any private network boundary"
+                )
+            elif not workload.get("subnets"):
+                unread.append(
+                    f"the subnets of {label} in {workload['vpc_id']} were not read"
+                )
+            else:
+                in_vpc.append((label, role, workload))
+
+        subnets = sorted(
+            {subnet for _, _, workload in in_vpc for subnet in workload["subnets"]}
+        )
+        privacy = (
+            _subnet_route_privacy(region, subnets, ec2_client)
+            if subnets
+            else {"public": {}, "private": [], "unresolved": {}, "error": ""}
+        )
+        private = []
+        for label, role, workload in in_vpc:
+            if privacy["error"]:
+                unread.append(
+                    f"the subnets of {label} were not resolved to a route table "
+                    f"({privacy['error']})"
+                )
+                continue
+            public = [
+                f"{subnet} ({privacy['public'][subnet]})"
+                for subnet in workload["subnets"]
+                if subnet in privacy["public"]
+            ]
+            if public:
+                failed.append(
+                    "{} in {} (role '{}') runs on subnet(s) that route to an "
+                    "internet gateway: {}".format(
+                        label, workload["vpc_id"], role, "; ".join(public[:5])
+                    )
+                )
+                continue
+            unresolved = [
+                f"{subnet} ({privacy['unresolved'].get(subnet, 'not resolved')})"
+                for subnet in workload["subnets"]
+                if subnet not in privacy["private"]
+            ]
+            if unresolved:
+                unread.append(
+                    "the subnet(s) of {} were not resolved: {}".format(
+                        label, "; ".join(unresolved[:5])
+                    )
+                )
+                continue
+            private.append(f"{label} in {workload['vpc_id']}")
+
+        if failed:
+            findings["csv_data"].append(
+                row(
+                    "{} AI workload(s) run outside a private network boundary: "
+                    "{}.".format(len(failed), "; ".join(failed[:10])),
+                    "Run each workload granted Bedrock, AgentCore or SageMaker "
+                    "runtime access in a VPC on subnets whose route tables carry no "
+                    "internet gateway route, and reach AWS services from them "
+                    "through VPC endpoints or a NAT gateway.",
+                    "High",
+                    "Failed",
+                )
+            )
+        if private:
+            findings["csv_data"].append(
+                row(
+                    "{} AI workload(s) run in a VPC on subnets whose route tables "
+                    "carry no internet gateway route: {}.{}".format(
+                        len(private),
+                        "; ".join(private[:10]),
+                        " This is not reported as Passed because part of the "
+                        "workload population was not read."
+                        if unread
+                        else "",
+                    ),
+                    "No action required",
+                    "High",
+                    "N/A" if unread else "Passed",
+                )
+            )
+        if unread:
+            findings["csv_data"].append(
+                row(
+                    "{} part(s) of the AI workload population were not read, so "
+                    "their subnets were not judged: {}.".format(
+                        len(unread), "; ".join(unread[:10])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if not findings["csv_data"]:
+            findings["csv_data"].append(
+                row(
+                    "No Lambda function, ECS service or task, EC2 instance, "
+                    "SageMaker notebook instance or endpoint, EKS pod identity "
+                    "association or AgentCore runtime in "
+                    f"{region or 'this Region'} runs as a role granted a Bedrock, "
+                    "AgentCore or SageMaker runtime surface.",
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        return _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-39",
+            AI_WORKLOAD_SUBNET_FINDING,
+            VPC_ENDPOINT_REFERENCE,
+            region,
+            principal_types=("role",),
+        )
+    except Exception as error:
+        logger.error(
+            f"Error in check_ai_workload_subnet_privacy: {str(error)}", exc_info=True
+        )
+        return {
+            "csv_data": [
+                row(
+                    build_could_not_assess_detail(error, region),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            ]
+        }
+
+
 def check_bedrock_marketplace_endpoint_cmk(
     region: str = "",
     endpoint_inventory: Dict[str, Any] = None,
@@ -25767,6 +26221,64 @@ def _region_probe(service: str) -> str:
     return f"{service}:{REGION_SERVICE_PROBE}"
 
 
+def _pattern_reaches_service(pattern: str, service: str) -> bool:
+    """
+    Return True when an IAM action pattern matches some action of ``service``.
+
+    The pattern is walked over ``service:`` one character at a time, keeping
+    every position it can be at, so a wildcard in the service segment
+    ("sage*:Describe*", "*:List*") is caught as well as a literal one. Runs of
+    * are collapsed first, so the walk stays linear in the pattern's length.
+    """
+    pattern = re.sub(r"\*+", "*", pattern.strip().lower())
+    states = {0}
+    for char in service + ":":
+        expanded = set()
+        for index in states:
+            while index < len(pattern) and pattern[index] == "*":
+                expanded.add(index)
+                index += 1
+            expanded.add(index)
+        states = set()
+        for index in expanded:
+            if index < len(pattern):
+                if pattern[index] == "*":
+                    states.add(index)
+                elif pattern[index] in ("?", char):
+                    states.add(index + 1)
+        if not states:
+            return False
+    return any(index < len(pattern) for index in states)
+
+
+# The S3 actions the Control Tower Region deny (CT.MULTISERVICE.PV.1 and the
+# landing zone control) exempts by default, as its published SCP artifact lists
+# them. Each acts on an account-level or Multi-Region Access Point resource, not
+# on a bucket in a Region, so keeping them open does not let a bucket be created
+# outside the approved Regions. Matched literally; any other exemption counts.
+CONTROL_TOWER_REGION_DENY_EXEMPTIONS = frozenset(
+    (
+        "s3:createmultiregionaccesspoint",
+        "s3:deletemultiregionaccesspoint",
+        "s3:describemultiregionaccesspointoperation",
+        "s3:getaccountpublicaccessblock",
+        "s3:getbucketlocation",
+        "s3:getbucketpolicystatus",
+        "s3:getbucketpublicaccessblock",
+        "s3:getmultiregionaccesspoint",
+        "s3:getmultiregionaccesspointpolicy",
+        "s3:getmultiregionaccesspointpolicystatus",
+        "s3:getstoragelensconfiguration",
+        "s3:getstoragelensdashboard",
+        "s3:listallmybuckets",
+        "s3:listmultiregionaccesspoints",
+        "s3:liststoragelensconfigurations",
+        "s3:putaccountpublicaccessblock",
+        "s3:putmultiregionaccesspointpolicy",
+    )
+)
+
+
 def _region_action_label(action: str) -> str:
     """Name an action for finding text, writing a service probe as service:*."""
     if action.endswith(":" + REGION_SERVICE_PROBE):
@@ -26000,11 +26512,36 @@ def _scp_region_controls(
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "DENY":
             continue
-        covered = [
-            action_name
-            for action_name in actions
-            if _statement_matches_action(statement, action_name)
-        ]
+        # A probe stands for every action of its service, so a NotAction entry
+        # that names any action of that service leaves the prefix uncovered.
+        covered = []
+        exempted = []
+        open_prefixes = []
+        default_exempted = []
+        for action_name in actions:
+            if not _statement_matches_action(statement, action_name):
+                continue
+            if action_name.endswith(":" + REGION_SERVICE_PROBE):
+                service = action_name.split(":", 1)[0]
+                reaching = [
+                    pattern.strip()
+                    for pattern in _as_list(statement.get("NotAction"))
+                    if isinstance(pattern, str)
+                    and _pattern_reaches_service(pattern, service)
+                ]
+                open_patterns = [
+                    pattern
+                    for pattern in reaching
+                    if pattern.lower() not in CONTROL_TOWER_REGION_DENY_EXEMPTIONS
+                ]
+                if open_patterns:
+                    exempted.extend(p for p in open_patterns if p not in exempted)
+                    open_prefixes.append(action_name)
+                    continue
+                default_exempted.extend(
+                    p for p in reaching if p not in default_exempted
+                )
+            covered.append(action_name)
         if not covered:
             continue
         conditions = _condition_keys_by_operator(statement)
@@ -26095,6 +26632,9 @@ def _scp_region_controls(
                 "exemptions": exemptions,
                 "gaps": list(gaps),
                 "profile_scope": profile_scope,
+                "exempted": exempted,
+                "open_prefixes": open_prefixes,
+                "default_exempted": default_exempted,
             }
             if negated:
                 if str(operator).lower().startswith("foranyvalue:"):
@@ -26170,6 +26710,18 @@ def _describe_region_control(policy_name: str, control: Dict[str, Any]) -> str:
         text += ", but it is not credited because " + " and ".join(control["gaps"])
     if control["exemptions"]:
         text += "; it exempts principals matching " + "; ".join(control["exemptions"])
+    if control["exempted"]:
+        text += "; its NotAction exempts {}, so it does not deny all of {}".format(
+            ", ".join(control["exempted"]),
+            ", ".join(map(_region_action_label, control["open_prefixes"])),
+        )
+    if control["default_exempted"]:
+        text += (
+            "; it keeps the Control Tower default exemptions {}, which act on "
+            "account-level and Multi-Region Access Point resources".format(
+                ", ".join(control["default_exempted"])
+            )
+        )
     return text
 
 
@@ -34093,8 +34645,8 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
     """
     List the ARN of every Bedrock agent, knowledge base, flow, prompt,
     guardrail, custom and imported model, provisioned throughput, application
-    inference profile, and batch inference, model customization and evaluation
-    job in the Region.
+    inference profile, batch inference, model customization and evaluation
+    job, and Marketplace model endpoint in the Region.
 
     The population comes from the Bedrock list APIs, never from a tag query,
     because a tag query cannot return a resource that was never tagged.
@@ -34178,6 +34730,14 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
             "jobArn",
             None,
         ),
+        (
+            "marketplace model endpoint",
+            bedrock_client,
+            "list_marketplace_model_endpoints",
+            "marketplaceModelEndpoints",
+            "endpointArn",
+            None,
+        ),
     )
     resource_types = {"agent": "agent", "knowledge base": "knowledge-base"}
     for label, client, operation, result_key, arn_field, id_field in legs:
@@ -34214,8 +34774,8 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
     """
     BR-53: Verify every Bedrock agent, knowledge base, flow, prompt, guardrail,
     custom and imported model, provisioned throughput, application inference
-    profile and batch inference, customization and evaluation job carries an
-    owner tag whose value names someone.
+    profile, batch inference, customization and evaluation job, and Marketplace
+    model endpoint carries an owner tag whose value names someone.
     """
     logger.debug("Starting check for Bedrock resource owner tags")
     check_name = RESOURCE_OWNER_FINDING
@@ -34258,8 +34818,9 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
                 row(
                     "No Bedrock agent, knowledge base, flow, prompt, guardrail, custom "
                     "or imported model, provisioned throughput, application "
-                    "inference profile, or batch inference, model customization or "
-                    "evaluation job was listed in {}.".format(region or "this region"),
+                    "inference profile, batch inference, model customization or "
+                    "evaluation job, or Marketplace model endpoint was listed in "
+                    "{}.".format(region or "this region"),
                     "No action required",
                     "Informational",
                     "N/A",
@@ -34526,6 +35087,17 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         {},
     ),
     (
+        "sagemaker",
+        "SageMaker",
+        "transform job",
+        "sagemaker",
+        "list_transform_jobs",
+        "TransformJobSummaries",
+        "TransformJobArn",
+        "sagemaker:ListTransformJobs",
+        {},
+    ),
+    (
         "bedrock-agentcore",
         "AgentCore",
         "agent runtime",
@@ -34598,9 +35170,9 @@ RESOURCE_OWNER_SWEEP_LISTS = (
 RESOURCE_OWNER_SWEEP_GAP = (
     "SageMaker and AgentCore resource types other than endpoints, models, "
     "notebook instances, training jobs, domains, inference components, "
-    "pipelines, processing jobs, agent runtimes, memories, gateways, custom "
-    "browsers, custom code interpreters and workload identities are read only "
-    "through GetResources, which returns only resources that are or were "
+    "pipelines, processing jobs, transform jobs, agent runtimes, memories, "
+    "gateways, custom browsers, custom code interpreters and workload identities "
+    "are read only through GetResources, which returns only resources that are or were "
     "tagged, so a resource never tagged is not listed "
     "(https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/"
     "API_GetResources.html)."
@@ -39600,6 +40172,15 @@ def lambda_handler(event, context):
 
         logger.info("Running Bedrock job VPC check (BR-39)")
         all_findings.append(check_bedrock_job_vpc(region=region))
+
+        logger.info("Running AI workload subnet privacy check (BR-39)")
+        all_findings.append(
+            _permission_cache_unavailable_result(
+                "BR-39", AI_WORKLOAD_SUBNET_FINDING, region
+            )
+            if permission_cache is None
+            else check_ai_workload_subnet_privacy(permission_cache, region=region)
+        )
 
         logger.info("Running Marketplace endpoint CMK check (BR-40)")
         all_findings.append(

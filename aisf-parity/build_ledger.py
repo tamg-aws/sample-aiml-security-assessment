@@ -1700,10 +1700,13 @@ AI_SUBJECT_ROWS = [
         "gateway. SM-11 also reads every Lambda function a Bedrock agent action "
         "group (actionGroupExecutor.lambda, every agent version) or an AgentCore "
         "gateway target (mcp.lambda.lambdaArn) names, fails one outside a VPC and "
-        "resolves the subnets of one inside. Ceiling: Lambda GetFunctionConfiguration "
-        "and ECS DescribeServices return no field that marks a function or service as "
-        "AI inference, so a Lambda function no agent or gateway names, and ECS "
-        "compute, are not in the population",
+        "resolves the subnets of one inside. BR-39's AI Workload Subnet Privacy row "
+        "takes BR-02's workload inventory (every Lambda function, ECS service and "
+        "standalone task, EC2 instance, SageMaker notebook instance and endpoint, "
+        "EKS pod identity association and VPC-mode AgentCore runtime version), "
+        "treats one as AI compute when its role is granted a Bedrock, AgentCore or "
+        "SageMaker runtime surface, and fails one outside a VPC or on a subnet "
+        "routed to an igw- gateway; an unread listing or role withholds Passed",
         [],
         5,
     ),
@@ -1743,7 +1746,12 @@ AI_SUBJECT_ROWS = [
         "workload only when its RouteTableIds hold the route table of each of the "
         "workload's subnets (ec2:DescribeRouteTables: the subnet's association, else "
         "the main table); unread subnets or route tables, which include every EKS pod "
-        "identity workload, withhold Passed. Partial, "
+        "identity workload, withhold Passed. BR-02 also judges the endpoint policy "
+        "of every S3, DynamoDB and SageMaker API and runtime endpoint in a VPC that "
+        "holds an AI workload or a Bedrock or AgentCore endpoint, whether or not "
+        "an AgentCore endpoint is there: scoped on exact principal or network "
+        "values as above, or by naming only specific buckets, tables or endpoints "
+        "with no wildcard outside a trailing /*. Partial, "
         "ceiling reached for IAM roles for service accounts (IRSA): a pod that takes "
         "its role through IRSA is not read, because which service account a pod runs "
         "as, and the role annotation on it, are held by the Kubernetes API, which "
@@ -1865,7 +1873,12 @@ FOUNDATION_ROWS = [
         "bedrock-agentcore, s3, s3vectors, aoss and the knowledge base vector "
         "stores es, rds, neptune-graph and kendra, read through a probe action "
         "only a whole-prefix Deny covers, so a Deny that names just the listed "
-        "actions fails",
+        "actions fails. A NotAction Deny covers a prefix only when no NotAction "
+        "entry, wildcards included, names an action of that service, so one "
+        "exempting es:CreateDomain or sagemaker:CreateFeatureGroup fails; the "
+        "Control Tower Region deny's default S3 exemptions, which act on "
+        "account-level and Multi-Region Access Point resources, are credited and "
+        "named",
         [],
         6,
     ),
@@ -1974,7 +1987,11 @@ FOUNDATION_ROWS = [
         "aws:PrincipalArn exemption. Converse and ConverseStream have "
         "no IAM action of their own and are authorized by those two, so the leg "
         "matches only them. A Deny written with NotAction is read as covering "
-        "those actions, and arn:aws:bedrock:*::foundation-model/* counts as no "
+        "those actions, and covers a probed prefix only when no NotAction entry, "
+        "wildcards included, names an action of that service; the Control Tower "
+        "Region deny's default S3 exemptions, which act on account-level and "
+        "Multi-Region Access Point resources, are credited and named. "
+        "arn:aws:bedrock:*::foundation-model/* counts as no "
         "list. The leg asserts that a model list exists and never which models "
         "are approved. Its AI Service Region Control row requires the same "
         "Region Deny over SageMaker endpoint, notebook, training, processing, "
@@ -2066,8 +2083,11 @@ FOUNDATION_ROWS = [
         "the same way, and an unread trail or bucket is N/A. BR-12 applies the same "
         "subscription-filter, Firehose and Object Lock test to the Bedrock "
         "invocation log group, and judges each invocation log bucket on its own "
-        "Object Lock default retention; whether a bucket is in a separate Log "
-        "Archive account is not read",
+        "Object Lock default retention. BR-12 repeats each COMPLIANCE bucket's "
+        "Object Lock read with ExpectedBucketOwner set to the assessed account, "
+        "and fails the bucket when S3 answers it, because the bucket is then in "
+        "this account and not a separate Log Archive account; a denial after the "
+        "plain read succeeded shows another account owns it",
         [],
         6,
     ),
@@ -2369,7 +2389,8 @@ FOUNDATION_ROWS = [
         ["BR-53"],
         "BR-53 passes the ARNs the module inventories from the Bedrock list APIs "
         "(agents, knowledge bases, flows, prompts, guardrails, custom and imported "
-        "models, provisioned throughput, application inference profiles) to "
+        "models, provisioned throughput, application inference profiles, "
+        "Marketplace model endpoints) to "
         "GetResources in batches of 100, reads the tags of each batch inference, "
         "model customization and evaluation job with bedrock:ListTagsForResource, "
         "and fails each resource with no owner tag "
@@ -2384,7 +2405,8 @@ FOUNDATION_ROWS = [
         "resources are read through a ResourceTypeFilters sweep: each returned "
         "resource without an owner tag fails. SageMaker "
         "endpoints, models, notebook instances, training jobs, domains, inference "
-        "components, pipelines and processing jobs, and agent runtimes, memories, "
+        "components, pipelines, processing jobs and transform jobs, and agent "
+        "runtimes, memories, "
         "gateways, custom browsers, custom code interpreters and workload "
         "identities, "
         "listed by their SageMaker and AgentCore list APIs and absent from the "
