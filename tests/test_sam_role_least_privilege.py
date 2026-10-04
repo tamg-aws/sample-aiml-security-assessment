@@ -141,6 +141,10 @@ _EXPECTED_ACTIONS = {
         "s3:ListBucket",
         "s3:PutObject",
     },
+    "BedrockAssessmentReadsPolicy2": {
+        "lambda:GetMicrovm",
+        "lambda:ListMicrovms",
+    },
     "BedrockAssessmentReadsPolicy": {
         "account:ListRegions",
         "aoss:GetAccessPolicy",
@@ -1224,6 +1228,7 @@ def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(templat
     assert managed == {
         "AgentCoreAssessmentReadsPolicy",
         "BedrockAssessmentReadsPolicy",
+        "BedrockAssessmentReadsPolicy2",
         "SageMakerAssessmentReadsPolicy",
     }
     properties = data["Resources"]["BedrockAssessmentReadsPolicy"]["Properties"]
@@ -1242,6 +1247,110 @@ def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(templat
     references = [p for p in policies if _references(p, "BedrockAssessmentReadsPolicy")]
     assert references == [{"Fn::Ref": "BedrockAssessmentReadsPolicy"}]
     assert not _references(data.get("Outputs", {}), "BedrockAssessmentReadsPolicy")
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+@pytest.mark.parametrize("partition", ["aws", "aws-us-gov"])
+def test_bedrock_second_managed_policy_renders_within_its_budget(template, partition):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    document = data["Resources"]["BedrockAssessmentReadsPolicy2"]["Properties"][
+        "PolicyDocument"
+    ]
+    rendered = json.dumps(
+        _render_policy_intrinsics(document, partition), separators=(",", ":")
+    )
+    assert partition + ":" in rendered
+    assert len(rendered) <= _MANAGED_POLICY_BUDGET, (
+        f"{os.path.basename(template)} BedrockAssessmentReadsPolicy2 renders to "
+        f"{len(rendered):,} characters in {partition}; keep it below the "
+        f"{_MANAGED_POLICY_BUDGET:,}-character project budget and never exceed "
+        f"IAM's {_MANAGED_POLICY_LIMIT:,}-character managed policy limit."
+    )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(template):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    resource = data["Resources"]["BedrockAssessmentReadsPolicy2"]
+    assert resource["Type"] == "AWS::IAM::ManagedPolicy"
+    document = resource["Properties"]["PolicyDocument"]
+    assert all(
+        set(statement) == {"Sid", "Effect", "Action", "Resource"}
+        for statement in document["Statement"]
+    )
+    grants = sorted(
+        (
+            statement["Sid"],
+            statement["Effect"],
+            action,
+            json.dumps(statement["Resource"], sort_keys=True),
+        )
+        for statement in document["Statement"]
+        for action in statement["Action"]
+    )
+    # ListMicrovms has no resource type; GetMicrovm authorizes on microvmImage,
+    # in this account or the AWS-managed "aws" account.
+    assert grants == sorted(
+        [
+            ("ManagedReadsOnWildcard2", "Allow", "lambda:ListMicrovms", '"*"'),
+            (
+                "MicrovmRead",
+                "Allow",
+                "lambda:GetMicrovm",
+                json.dumps(
+                    [
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:lambda:*:"
+                            "${AWS::AccountId}:microvm-image:*"
+                        },
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:lambda:*:aws:microvm-image:*"
+                        },
+                    ],
+                    sort_keys=True,
+                ),
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_bedrock_second_managed_policy_is_attached_only_to_the_bedrock_function(
+    template,
+):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    properties = data["Resources"]["BedrockAssessmentReadsPolicy2"]["Properties"]
+    assert not {"Roles", "Users", "Groups"} & set(properties)
+    referencing = {
+        logical_id
+        for logical_id, resource in data["Resources"].items()
+        if logical_id != "BedrockAssessmentReadsPolicy2"
+        and _references(resource, "BedrockAssessmentReadsPolicy2")
+    }
+    assert referencing == {"BedrockSecurityAssessmentFunction"}
+    policies = data["Resources"]["BedrockSecurityAssessmentFunction"]["Properties"][
+        "Policies"
+    ]
+    references = [
+        p for p in policies if _references(p, "BedrockAssessmentReadsPolicy2")
+    ]
+    assert references == [{"Fn::Ref": "BedrockAssessmentReadsPolicy2"}]
+    assert not _references(data.get("Outputs", {}), "BedrockAssessmentReadsPolicy2")
+
+
+def test_bedrock_second_managed_policy_is_identical_in_both_templates():
+    documents = []
+    for template in _SAM_TEMPLATES:
+        with open(template, encoding="utf-8") as template_file:
+            data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+        documents.append(data["Resources"]["BedrockAssessmentReadsPolicy2"])
+    assert documents[0] == documents[1]
 
 
 _SAGEMAKER_MONITORING_JOB_DEFINITIONS = json.dumps(

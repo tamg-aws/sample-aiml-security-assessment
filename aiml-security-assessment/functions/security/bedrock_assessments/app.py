@@ -36763,12 +36763,15 @@ AGENT_HANDOFF_REFERENCE = (
 
 AGENT_HANDOFF_CEILING = (
     "Agent roles are the Bedrock agent roles (GetAgent and GetAgentVersion "
-    "agentResourceRoleArn) and the AgentCore runtime roles (GetAgentRuntime "
-    "roleArn) of this Region. No AWS API marks which ECS task roles, Lambda "
-    "execution roles or other roles host an agent, so they are not read. A "
-    "runtime's JWT authorizer names the tokens it accepts, not which agent "
+    "agentResourceRoleArn), the AgentCore runtime roles (GetAgentRuntime "
+    "roleArn) and the Lambda MicroVM execution roles (GetMicrovm "
+    "executionRoleArn) of this Region. No AWS API marks which ECS task roles, "
+    "Lambda function roles or other roles host an agent, so they are not read. "
+    "A runtime's JWT authorizer names the tokens it accepts, not which agent "
     "presented one, so a JWT caller's identity is not read; a role in another "
-    "account that trusts an agent role is not read either."
+    "account that trusts an agent role is not read either. Which ports a "
+    "MicroVM auth token allows is not read, because CreateMicrovmAuthToken "
+    "returns the token and no lambda-microvms API lists issued tokens."
 )
 
 # Condition keys that bind the caller's source identity into an AssumeRole
@@ -36903,6 +36906,58 @@ def _identity_allows_assume_role(permissions: Dict[str, Any], role_arn: str) -> 
     return False
 
 
+# ListMicrovms also returns MicroVMs that no longer run; only these hold a role.
+MICROVM_LIVE_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED")
+
+# The Lambda MicroVMs guide: create-microvm-shell-auth-token works only on a
+# MicroVM run with the connector ...:network-connector:aws-network-connector:SHELL_INGRESS.
+MICROVM_SHELL_CONNECTOR = "network-connector:aws-network-connector:SHELL_INGRESS"
+
+
+def _microvm_agent_roles(region: str) -> Dict[str, Any]:
+    """
+    Read the executionRoleArn and ingressNetworkConnectors of every live Lambda
+    MicroVM. A MicroVM holds exactly one execution role, so each one is an agent
+    identity; ``shell`` names each MicroVM run with the SHELL_INGRESS connector.
+    """
+    result = {"microvms": [], "shell": [], "errors": []}
+    client = boto3.client("lambda-microvms", config=boto3_config, region_name=region)
+    try:
+        items = _list_all_items(client, "list_microvms", "items", max_results=50)
+    except (ClientError, BotoCoreError, TypeError) as error:
+        result["errors"].append(
+            "Lambda MicroVMs were not listed with lambda:ListMicrovms "
+            f"({get_assessment_error_label(error)})"
+        )
+        return result
+    for item in items:
+        microvm_id = item.get("microvmId")
+        if item.get("state") not in MICROVM_LIVE_STATES:
+            continue
+        try:
+            detail = client.get_microvm(microvmIdentifier=microvm_id)
+        except (ClientError, BotoCoreError, TypeError) as error:
+            result["errors"].append(
+                f"Lambda MicroVM {microvm_id} was not read with lambda:GetMicrovm "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        if detail.get("state") not in MICROVM_LIVE_STATES:
+            continue
+        label = "Lambda MicroVM image {} version {} (MicroVM {})".format(
+            detail.get("imageArn") or item.get("imageArn"),
+            detail.get("imageVersion") or item.get("imageVersion"),
+            microvm_id,
+        )
+        result["microvms"].append((detail.get("executionRoleArn"), label))
+        if any(
+            str(connector).endswith(":" + MICROVM_SHELL_CONNECTOR)
+            for connector in detail.get("ingressNetworkConnectors") or []
+        ):
+            result["shell"].append(label)
+    return result
+
+
 def get_agent_role_inventory(region: str) -> Dict[str, Any]:
     """
     Read the roles Bedrock agents and AgentCore runtimes run as, and the
@@ -36915,6 +36970,8 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
     ``runtime_gates`` holds each runtime version's authorizerConfiguration, and
     ``runtime_policies`` the resource policy of each runtime and endpoint ARN
     (None when it has none), with ``gate_errors`` naming each one not read.
+    Each live Lambda MicroVM's execution role is an agent role too, and
+    ``microvm_shell`` names each MicroVM run with the SHELL_INGRESS connector.
     """
     inventory = {
         "roles": {},
@@ -36926,6 +36983,8 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
         "runtime_gates": [],
         "runtime_policies": {},
         "gate_errors": [],
+        "microvm_count": 0,
+        "microvm_shell": [],
     }
 
     def add_role(role_arn, label):
@@ -37049,6 +37108,13 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
                         else None,
                     }
                 )
+
+    microvms = _microvm_agent_roles(region)
+    inventory["errors"] += microvms["errors"]
+    inventory["microvm_count"] = len(microvms["microvms"])
+    inventory["microvm_shell"] = microvms["shell"]
+    for role_arn, label in microvms["microvms"]:
+        add_role(role_arn, label)
 
     runtime_client = boto3.client(
         "bedrock-agentcore-control", config=boto3_config, region_name=region
@@ -37333,6 +37399,12 @@ def check_agent_handoff_source_identity(
             )
 
         failures += _runtime_inbound_gate_failures(inventory)
+        failures += [
+            f"{label} was run with the SHELL_INGRESS network connector, so any "
+            "principal allowed lambda:CreateMicrovmShellAuthToken on its image "
+            "gets an interactive shell in it"
+            for label in inventory.get("microvm_shell") or []
+        ]
         unread += inventory.get("gate_errors") or []
 
         role_cache = (permission_cache or {}).get("role_permissions") or {}
@@ -37429,17 +37501,19 @@ def check_agent_handoff_source_identity(
                     "Give each agent and each collaborator its own role, and add a "
                     "StringEquals sts:SourceIdentity condition naming the calling "
                     "agent, with sts:SetSourceIdentity allowed, to every trust "
-                    "statement an agent role can assume.",
+                    "statement an agent role can assume. Run Lambda MicroVMs "
+                    "without the SHELL_INGRESS connector.",
                     "High",
                     "Failed",
                 )
             )
 
-        if not agent_roles and not unread:
+        if not agent_roles and not unread and not failures:
             findings["status"] = "N/A"
             findings["csv_data"].append(
                 row(
-                    "No Bedrock agent or AgentCore runtime with a role exists in "
+                    "No Bedrock agent, AgentCore runtime or Lambda MicroVM with a "
+                    "role exists in "
                     f"{region or 'this Region'}, so no agent handoff exists.",
                     "No action required",
                     "Informational",
@@ -37478,6 +37552,10 @@ def check_agent_handoff_source_identity(
                         ).values()
                         if document is not None
                     ),
+                )
+                + " {} Lambda MicroVM(s) were read, and none was run with the "
+                "SHELL_INGRESS network connector.".format(
+                    inventory.get("microvm_count", 0)
                 )
                 + " "
                 + AGENT_HANDOFF_SCOPE_NOTE

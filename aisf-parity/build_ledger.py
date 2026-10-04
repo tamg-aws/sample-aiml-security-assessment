@@ -2622,13 +2622,19 @@ FOUNDATION_ROWS = [
         "GetResourcePolicy is read on the runtime and every endpoint, failing an "
         "Allow on an invoke action to every principal with no condition naming the "
         "runtime's account or an organization, or to another account's principals. "
-        "An unread agent, runtime, "
+        "Every live Lambda MicroVM, listed with ListMicrovms and read with "
+        "GetMicrovm, is an agent too: its executionRoleArn joins the agent roles, "
+        "the MicroVMs of one image counting as one agent, and a MicroVM whose "
+        "ingressNetworkConnectors include the SHELL_INGRESS connector fails, "
+        "because only such a MicroVM accepts a shell token. "
+        "An unread agent, runtime, MicroVM, "
         "collaborator alias, trust policy, runtime resource policy or cached "
         "principal reports N/A, never "
         "Passed. Partial, ceiling reached: no AWS API marks which ECS task or "
-        "Lambda execution roles host an agent, a JWT authorizer names the tokens a "
-        "runtime accepts and not which agent presented one, and a role in another "
-        "account that trusts an agent role is not read",
+        "Lambda function roles host an agent, a JWT authorizer names the tokens a "
+        "runtime accepts and not which agent presented one, no lambda-microvms API "
+        "lists the auth tokens CreateMicrovmAuthToken issued or their allowedPorts, "
+        "and a role in another account that trusts an agent role is not read",
         [],
         6,
     ),

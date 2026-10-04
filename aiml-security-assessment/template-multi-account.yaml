@@ -641,6 +641,33 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:s3:::*/*AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/*'
               - !Sub 'arn:${AWS::Partition}:s3:::*/*.metadata.json'
+  BedrockAssessmentReadsPolicy2:
+    # Further reads for the Bedrock function, beyond the budget of
+    # BedrockAssessmentReadsPolicy. Attached only to
+    # BedrockSecurityAssessmentFunction through its Policies list.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Further read-only grants for the Bedrock security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManagedReadsOnWildcard2
+            # ListMicrovms has no resource type in the service authorization
+            # reference.
+            Effect: Allow
+            Action:
+              - lambda:ListMicrovms # BR-57
+            Resource: '*'
+          - Sid: MicrovmRead
+            # GetMicrovm authorizes on the microvmImage resource type. A
+            # MicroVM may run an AWS-managed image, whose ARN has the account
+            # segment "aws".
+            Effect: Allow
+            Action:
+              - lambda:GetMicrovm # BR-57
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
+              - !Sub 'arn:${AWS::Partition}:lambda:*:aws:microvm-image:*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1036,6 +1063,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
                 - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
         - !Ref BedrockAssessmentReadsPolicy
+        - !Ref BedrockAssessmentReadsPolicy2
   SageMakerAssessmentReadsPolicy:
     # Reads that do not fit the SageMaker function's 9000-byte inline policy
     # budget. Attached only to SagemakerSecurityAssessmentFunction through its

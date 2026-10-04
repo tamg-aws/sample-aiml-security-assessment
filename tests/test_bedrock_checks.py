@@ -40389,6 +40389,91 @@ class TestBR57AgentHandoffSourceIdentity:
         assert "'c'" not in detail
         assert not self._status(rows, "Passed")
 
+    MICROVM_IMAGE = "arn:aws:lambda:us-east-1:123456789012:microvm-image:"
+
+    @classmethod
+    def _microvm_label(cls, image, microvm_id, version="1"):
+        return (
+            f"Lambda MicroVM image {cls.MICROVM_IMAGE}{image} version {version} "
+            f"(MicroVM {microvm_id})"
+        )
+
+    def test_a_shell_ingress_microvm_fails_beside_one_without(self):
+        shell = self._microvm_label("coder", "mv-2")
+        inventory = self._inventory(
+            {
+                "planner-role": [self._microvm_label("planner", "mv-1")],
+                "coder-role": [shell],
+            }
+        )
+        inventory["microvm_count"] = 2
+        inventory["microvm_shell"] = [shell]
+        cache = self._cache({"planner-role": _identity(), "coder-role": _identity()})
+        result, rows, _ = self._run(cache, inventory, {})
+        failed = self._status(rows, "Failed")
+        assert result["status"] == "WARN" and len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert (
+            f"{shell} was run with the SHELL_INGRESS network connector, so any "
+            "principal allowed lambda:CreateMicrovmShellAuthToken on its image "
+            "gets an interactive shell in it"
+        ) in detail
+        assert "mv-1" not in detail
+
+    def test_a_roleless_shell_ingress_microvm_still_fails(self):
+        shell = self._microvm_label("coder", "mv-9")
+        inventory = self._inventory({})
+        inventory["microvm_count"] = 1
+        inventory["microvm_shell"] = [shell]
+        result, rows, _ = self._run(self._cache({}), inventory, {})
+        assert result["status"] == "WARN"
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert shell in rows[0]["Finding_Details"]
+
+    def test_microvms_of_one_image_share_a_role_and_two_images_do_not(self):
+        cache = self._cache({"planner-role": _identity(), "pair-role": _identity()})
+        planner = self._role_arn("planner-role")
+        pair = self._role_arn("pair-role")
+        inventory = self._inventory(
+            {
+                "planner-role": [
+                    self._microvm_label("planner", "mv-1"),
+                    self._microvm_label("planner", "mv-2"),
+                    self._microvm_label("planner", "mv-3", version="2"),
+                ],
+                "pair-role": [
+                    self._microvm_label("coder", "mv-4"),
+                    self._microvm_label("tester", "mv-5"),
+                ],
+            }
+        )
+        inventory["microvm_count"] = 5
+        inventory["microvm_shell"] = []
+        result, rows, _ = self._run(cache, inventory, {})
+        failed = self._status(rows, "Failed")
+        assert len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert f"role {pair} is run by 2 agents" in detail
+        assert f"role {planner}" not in detail
+
+    def test_passed_names_the_microvms_read_and_the_ceiling_names_their_roles(self):
+        inventory = self._inventory(
+            {"planner-role": [self._microvm_label("planner", "mv-1")]}
+        )
+        inventory["microvm_count"] = 1
+        inventory["microvm_shell"] = []
+        cache = self._cache({"planner-role": _identity()})
+        result, rows, _ = self._run(cache, inventory, {})
+        passed = self._status(rows, "Passed")
+        assert result["status"] == "PASS" and len(passed) == 1
+        detail = passed[0]["Finding_Details"]
+        assert (
+            "1 Lambda MicroVM(s) were read, and none was run with the "
+            "SHELL_INGRESS network connector."
+        ) in detail
+        assert "Lambda MicroVM execution roles (GetMicrovm executionRoleArn)" in detail
+        assert "Lambda execution roles" not in detail
+
     def test_one_agent_across_versions_on_one_role_is_not_sharing(self):
         cache = self._cache({"agent-a": _identity()})
         result, rows, _ = self._run(
@@ -40487,8 +40572,13 @@ class TestBR57AgentRoleInventory:
         runtime_error=None,
         collaborators=None,
         policies=None,
+        microvms=None,
+        microvm_error=None,
     ):
-        """agents: id -> {"name", "versions": {v: (role, collab)}, "aliases": {id: [v]}}"""
+        """agents: id -> {"name", "versions": {v: (role, collab)}, "aliases": {id: [v]}}
+
+        microvms: pages of ListMicrovms items, each item carrying the GetMicrovm
+        "detail" (or an Exception) beside its summary fields."""
         agent = MagicMock()
         agent.list_agents.return_value = {
             "agentSummaries": [
@@ -40587,14 +40677,154 @@ class TestBR57AgentRoleInventory:
 
         control.get_resource_policy.side_effect = get_resource_policy
 
+        microvm = MagicMock()
+        pages = microvms if microvms is not None else [[]]
+        details = {
+            item["microvmId"]: item.get("detail") for page in pages for item in page
+        }
+
+        def list_microvms(**kwargs):
+            if microvm_error is not None:
+                raise microvm_error
+            index = int(kwargs.get("nextToken") or 0)
+            response = {
+                "items": [
+                    {key: value for key, value in item.items() if key != "detail"}
+                    for item in pages[index]
+                ]
+            }
+            if index + 1 < len(pages):
+                response["nextToken"] = str(index + 1)
+            return response
+
+        def get_microvm(microvmIdentifier):
+            outcome = details[microvmIdentifier]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return dict(outcome, microvmId=microvmIdentifier)
+
+        microvm.list_microvms.side_effect = list_microvms
+        microvm.get_microvm.side_effect = get_microvm
+
         def client(service, **kwargs):
-            return {"bedrock-agent": agent, "bedrock-agentcore-control": control}[
-                service
-            ]
+            return {
+                "bedrock-agent": agent,
+                "bedrock-agentcore-control": control,
+                "lambda-microvms": microvm,
+            }[service]
 
         with patch("boto3.client", side_effect=client):
             inventory = bedrock_app.get_agent_role_inventory("us-east-1")
+        self.microvm = microvm
         return inventory, agent, control
+
+    SHELL = "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:SHELL_INGRESS"
+    ALL = "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:ALL_INGRESS"
+
+    @classmethod
+    def _image(cls, name):
+        return f"arn:aws:lambda:us-east-1:{cls.ACCOUNT}:microvm-image:{name}"
+
+    @classmethod
+    def _microvm(
+        cls, microvm_id, image, role, state="RUNNING", ingress=(), version="1"
+    ):
+        return {
+            "microvmId": microvm_id,
+            "state": state,
+            "imageArn": cls._image(image),
+            "imageVersion": version,
+            "detail": {
+                "state": state,
+                "imageArn": cls._image(image),
+                "imageVersion": version,
+                "executionRoleArn": cls._role(role) if role else None,
+                "ingressNetworkConnectors": list(ingress),
+            },
+        }
+
+    def test_microvm_execution_roles_join_the_agent_roles_on_every_page(self):
+        inventory, _, _ = self._run(
+            {},
+            microvms=[
+                [
+                    self._microvm("mv-1", "planner", "planner-role"),
+                    self._microvm("mv-2", "planner", "planner-role", "SUSPENDED"),
+                ],
+                [
+                    self._microvm("mv-3", "coder", "coder-role", version="4"),
+                    self._microvm("mv-4", "old", "old-role", "TERMINATED"),
+                ],
+            ],
+        )
+        assert inventory["roles"] == {
+            self._role("planner-role"): [
+                f"Lambda MicroVM image {self._image('planner')} version 1 "
+                "(MicroVM mv-1)",
+                f"Lambda MicroVM image {self._image('planner')} version 1 "
+                "(MicroVM mv-2)",
+            ],
+            self._role("coder-role"): [
+                f"Lambda MicroVM image {self._image('coder')} version 4 (MicroVM mv-3)"
+            ],
+        }
+        assert inventory["microvm_count"] == 3
+        assert not inventory["errors"] and inventory["microvm_shell"] == []
+        called = {
+            c.kwargs["microvmIdentifier"]
+            for c in self.microvm.get_microvm.call_args_list
+        }
+        assert called == {"mv-1", "mv-2", "mv-3"}
+
+    def test_only_a_shell_ingress_microvm_is_recorded_as_shell_reachable(self):
+        inventory, _, _ = self._run(
+            {},
+            microvms=[
+                [
+                    self._microvm(
+                        "mv-1", "planner", "planner-role", ingress=[self.ALL]
+                    ),
+                    self._microvm(
+                        "mv-2", "coder", "coder-role", ingress=[self.ALL, self.SHELL]
+                    ),
+                ]
+            ],
+        )
+        assert inventory["microvm_shell"] == [
+            f"Lambda MicroVM image {self._image('coder')} version 1 (MicroVM mv-2)"
+        ]
+
+    def test_unread_microvm_listing_and_detail_are_named_outside_bedrock(self):
+        denied = _client_error("AccessDeniedException", "denied", "ListMicrovms")
+        inventory, _, _ = self._run({}, microvm_error=denied)
+        assert inventory["errors"] == [
+            "Lambda MicroVMs were not listed with lambda:ListMicrovms "
+            "(AccessDeniedException)"
+        ]
+        assert inventory["roles"] == {}
+
+        bad = self._microvm("mv-2", "coder", "coder-role")
+        bad["detail"] = _client_error("AccessDeniedException", "denied", "GetMicrovm")
+        inventory, _, _ = self._run(
+            {},
+            microvms=[[self._microvm("mv-1", "planner", "planner-role"), bad]],
+        )
+        assert inventory["errors"] == [
+            "Lambda MicroVM mv-2 was not read with lambda:GetMicrovm "
+            "(AccessDeniedException)"
+        ]
+        assert list(inventory["roles"]) == [self._role("planner-role")]
+
+    def test_microvms_are_read_when_runtimes_cannot_be_listed(self):
+        inventory, _, _ = self._run(
+            {},
+            runtime_error=_client_error(
+                "AccessDeniedException", "d", "ListAgentRuntimes"
+            ),
+            microvms=[[self._microvm("mv-1", "planner", "planner-role")]],
+        )
+        assert list(inventory["roles"]) == [self._role("planner-role")]
+        assert inventory["runtime_error"]
 
     def test_routed_versions_and_runtime_endpoint_versions_are_read(self):
         inventory, agent, control = self._run(
