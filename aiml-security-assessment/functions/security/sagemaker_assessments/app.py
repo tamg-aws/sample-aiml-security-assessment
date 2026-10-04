@@ -15875,13 +15875,18 @@ def _detective_regional_admin(region: str, account_id: str):
     detective = boto3.client("detective", config=boto3_config, region_name=region)
 
     def _pages(operation, key):
-        items, token = [], None
+        items, token, seen = [], None, set()
         while True:
             page = operation(**({"NextToken": token} if token else {}))
             items.extend(page.get(key) or [])
             token = page.get("NextToken")
             if not token:
                 return items
+            # A repeated token would page forever, and the pages read so far
+            # are not the whole population.
+            if token in seen:
+                raise RuntimeError(f"{key} paging repeated a NextToken")
+            seen.add(token)
 
     def _administrator():
         for membership in _pages(detective.list_invitations, "Invitations"):
@@ -19319,7 +19324,7 @@ def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
         client = boto3.client(
             "cloudtrail", config=boto3_config, region_name=store_region
         )
-        stores, token = [], None
+        stores, token, seen = [], None, set()
         try:
             while True:
                 response = client.list_event_data_stores(
@@ -19329,6 +19334,9 @@ def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
                 token = response.get("NextToken")
                 if not token:
                     break
+                if token in seen:
+                    raise RuntimeError("ListEventDataStores repeated a NextToken")
+                seen.add(token)
         except Exception as error:
             coverage["unread"].append(
                 f"event data stores in {store_region} (cloudtrail:ListEventDataStores: "

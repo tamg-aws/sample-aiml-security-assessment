@@ -12425,8 +12425,10 @@ class TestRound9SM38MicrovmTier:
         stores=None,
         regions=("us-east-1", "us-west-2"),
         errors=None,
+        looping=(),
     ):
-        """microvms maps an id to its egress connectors, connectors a connector
+        """looping names the Regions whose store listing repeats its NextToken.
+        microvms maps an id to its egress connectors, connectors a connector
         to its subnets, subnets a subnet to its VPC, stores a Region to its
         event data stores; errors maps a read to the exception it raises."""
         errors = errors or {}
@@ -12522,6 +12524,8 @@ class TestRound9SM38MicrovmTier:
                 def list_event_data_stores(NextToken=None):
                     raise_for(f"stores:{region_name}")
                     self.store_reads.append(region_name)
+                    if region_name in looping:
+                        return {"EventDataStores": [], "NextToken": "same"}
                     listed = [
                         {"EventDataStoreArn": s["EventDataStoreArn"], "Name": s["Name"]}
                         for s in stores.get(region_name, [])
@@ -12722,6 +12726,15 @@ class TestRound9SM38MicrovmTier:
         )
         assert self._statuses(rows) == ["N/A"]
         assert text in rows[0]["Finding_Details"]
+
+    def test_a_repeated_store_token_ends_the_read_as_unread(self):
+        rows = self._run(trails=[], looping=("us-west-2",))
+        assert self._statuses(rows) == ["N/A"]
+        assert (
+            "event data stores in us-west-2 (cloudtrail:ListEventDataStores: "
+            "RuntimeError)"
+        ) in rows[0]["Finding_Details"]
+        assert self.store_reads == ["us-east-1", "us-west-2", "us-west-2"]
 
     def test_the_coverage_check_runs_the_microvm_leg(self):
         row = {"Status": "Failed", "Finding": "sentinel"}
@@ -28455,6 +28468,16 @@ class TestSM35RegionalMacieAndDetective:
             )
         assert (administrator, reason) == (self.TOOLING, None)
         assert client.list_invitations.call_args_list[1].kwargs == {"NextToken": "t"}
+
+    def test_a_repeated_detective_token_ends_the_read_as_unread(self):
+        client = MagicMock()
+        client.list_invitations.return_value = {"Invitations": [], "NextToken": "t"}
+        with patch("sagemaker_app.boto3.client", return_value=client):
+            administrator, how, reason = sagemaker_app._detective_regional_admin(
+                "us-west-2", self.ME
+            )
+        assert (administrator, how, reason) == (None, None, "RuntimeError")
+        assert client.list_invitations.call_count == 2
 
 
 class TestSM31CaptureModes:

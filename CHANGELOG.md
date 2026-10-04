@@ -517,6 +517,10 @@ section.
   `ListFunctions` `FunctionVersion` `ALL`. A version keeps the `VpcConfig` it
   was published with, so an alias could run a version in subnets whose egress
   was never judged.
+- `SM-35`'s Detective membership read and `SM-38`'s event data store
+  listing stop when a `NextToken` repeats and report the read as incomplete.
+  Both looped forever on a repeated token, which hung the SageMaker
+  assessment's handler.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
