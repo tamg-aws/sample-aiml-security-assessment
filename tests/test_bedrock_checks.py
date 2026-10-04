@@ -46715,6 +46715,23 @@ class TestBR57AgentRoleScope:
                 "bedrock:InvokeModel",
                 "arn:aws:bedrock:*::foundation-model/anthropic.claude-v2",
             ),
+            (
+                "dynamodb:Query",
+                "arn:aws:dynamodb:us-east-1:123456789012:table/orders/index/*",
+            ),
+            (
+                "bedrock:InvokeAgent",
+                "arn:aws:bedrock:us-east-1:123456789012:agent-alias/AGENT1234/*",
+            ),
+            (
+                "logs:PutLogEvents",
+                "arn:aws:logs:us-east-1:123456789012:log-group:/aws/app/tool:*",
+            ),
+            ("s3:GetObject", "arn:aws:s3:::kb-docs/team/*"),
+            (
+                "s3:GetObject",
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/kb/object/*",
+            ),
             ("ec2:DescribeInstances", "*"),
             (["xray:PutTraceSegments", "sts:GetCallerIdentity"], "*"),
         ],
@@ -46765,6 +46782,20 @@ class TestBR57AgentRoleScope:
             "arn:aws:s3:::kb-*/*",
             "arn:aws:lambda:us-east-1:123456789012:function:tool-*",
             "arn:aws:bedrock:*::foundation-model/anthropic.*",
+            # Round 9 (IAM-05): a path wildcard inside a name that may hold
+            # "/" was credited, because the first "/" was read as the end of
+            # the name. These types publish no sub-resource, so the name runs
+            # to the end of the ARN.
+            "arn:aws:iam::123456789012:role/service-role/*",
+            "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/*",
+            # A log group publishes a sub-resource after ":", not "/", so a
+            # name with no leading "/" still runs past its first "/".
+            "arn:aws:logs:us-east-1:123456789012:log-group:app/prod/*",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/*",
+            "arn:aws:ssm:us-east-1:123456789012:parameter/app/*",
+            "arn:aws:kms:us-east-1:123456789012:alias/aws/*",
+            # The access point, not the bucket, is the parent here.
+            "arn:aws:s3:us-east-1:123456789012:accesspoint/*/object/report.csv",
         ],
     )
     def test_a_wildcard_in_any_arn_segment_fails(self, resource):
@@ -46790,6 +46821,65 @@ class TestBR57AgentRoleScope:
         detail = rows[0]["Finding_Details"]
         assert self._role("wide") in detail and resource in detail
         assert self._role("tight") not in detail
+
+    # Round 9 (IAM-05): the sub-resource table is generated from the service
+    # authorization reference, and AC-45 reads the same file, so the two
+    # helpers apply one rule.
+    def test_the_sub_resource_table_is_shared_and_names_no_path_types(self):
+        security = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "aiml-security-assessment",
+            "functions",
+            "security",
+        )
+        with (
+            open(
+                os.path.join(security, "bedrock_assessments", "arn_sub_resources.json"),
+                "rb",
+            ) as bedrock,
+            open(
+                os.path.join(
+                    security, "agentcore_assessments", "arn_sub_resources.json"
+                ),
+                "rb",
+            ) as agentcore,
+        ):
+            assert bedrock.read() == agentcore.read()
+        table = bedrock_app.ARN_SUB_RESOURCES
+        assert table["dynamodb"]["table/"] == "/"
+        assert table["logs"]["log-group:"] == ":"
+        assert table["s3"][""] == "/"
+        assert "role/" not in table["iam"]
+        assert "secretsmanager" not in table and "kms" not in table
+
+    # Round 9 (IAM-05): one role holds a path wildcard and a sub-resource
+    # wildcard of the same shape. Only the path wildcard may fail, so a rule
+    # that fails every "/*" and a rule that credits every "/*" are both red.
+    def test_a_path_wildcard_fails_beside_a_sub_resource_wildcard(self):
+        path = "arn:aws:iam::123456789012:role/service-role/*"
+        index = "arn:aws:dynamodb:us-east-1:123456789012:table/orders/index/*"
+        _, rows = self._run(
+            {
+                "agent": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(
+                                self._allow("iam:GetRole", path, sid="Path"),
+                                self._allow("dynamodb:Query", index, sid="Index"),
+                            ),
+                        }
+                    ]
+                )
+            },
+            {"agent": ["Bedrock agent 'a' version 1"]},
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "statement 'Path'" in detail and path in detail
+        assert "statement 'Index'" not in detail and index not in detail
 
     # Round 9 (IAM-05): the scope population kept only labels starting
     # "Bedrock agent ", so a Lambda MicroVM agent role was never judged and a

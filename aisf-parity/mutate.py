@@ -1325,22 +1325,22 @@ MUTATIONS = [
         "name": "BR-57 credits an S3 wildcard bucket name as scoped",
         "file": BEDROCK,
         "defect": "BR-57 reads no wildcard in the resource name as unscoped, so arn:aws:s3:::* passes",
-        "find": '    return not name or "*" in name or "?" in name\n',
-        "replace": "    return not name\n",
+        "find": '    return not parent or "*" in parent or "?" in parent\n',
+        "replace": "    return not parent\n",
     },
     {
         "name": "BR-57 credits a wildcard resource type such as tab*/orders",
         "file": BEDROCK,
-        "defect": "BR-57 ignores a wildcard in the resource type segment of an ARN",
-        "find": "        for component in components[:name_index]\n",
-        "replace": "        for component in components[:0]\n",
+        "defect": "BR-57 credits a wildcard in an ARN that no published sub-resource format matches, such as tab*/orders or role/service-role/*",
+        "find": "    if prefix is None:\n        return True\n",
+        "replace": "    if prefix is None:\n        return False\n",
     },
     {
         "name": "BR-57 reads a bucket-named S3 key wildcard as unscoped",
         "file": BEDROCK,
         "defect": "BR-57 treats arn:aws:s3:::bucket/* as every bucket, so a scoped data grant fails",
-        "find": "        0 if service in ARN_WITHOUT_TYPE_PREFIX_SERVICES or len(components) == 1 else 1\n",
-        "replace": "        0 if len(components) == 1 else 1\n",
+        "find": "    prefixes = ARN_SUB_RESOURCES.get(service, {})\n",
+        "replace": "    prefixes = {}\n",
     },
     {
         "name": "BR-57 credits a NotResource grant as scoped",
@@ -4566,6 +4566,20 @@ MUTATIONS = [
         "replace": "",
     },
     {
+        "name": "BR-57 credits a path wildcard inside a name that may hold /",
+        "file": BEDROCK,
+        "defect": "BR-57 ends a name at its first / when the type publishes no sub-resource, so role/service-role/* passes",
+        "find": "    if end < 0:\n        return True\n    parent = rest[:end]\n",
+        "replace": '    if end < 0:\n        end = rest.find("/") if "/" in rest else len(rest)\n    parent = rest[:end]\n',
+    },
+    {
+        "name": "BR-57 reads an ARN against the shortest matching type prefix",
+        "file": BEDROCK,
+        "defect": "BR-57 reads accesspoint/*/object/x as bucket accesspoint, so a wildcard access point passes",
+        "find": "        key=len,\n        default=None,\n",
+        "replace": "        key=lambda prefix: -len(prefix),\n        default=None,\n",
+    },
+    {
         "name": "BR-02 hands a half-read container instance to the next workload",
         "file": BEDROCK,
         "defect": "BR-02 keeps the EC2 instance id of a container instance whose instance read failed, so the next workload on it is told only that id",
@@ -5580,6 +5594,8 @@ GROUPS: dict[str, str] = {
     "the data path is handed out uncopied": "in the Bedrock data path inventory",
     "the data path memo outlives its invocation": "in the Bedrock data path inventory",
     "BR-02 hands a half-read container instance to the next workload": "in the Bedrock workload route tables",
+    "BR-57 credits a path wildcard inside a name that may hold /": "in the Bedrock agent role scope",
+    "BR-57 reads an ARN against the shortest matching type prefix": "in the Bedrock agent role scope",
 }
 
 
