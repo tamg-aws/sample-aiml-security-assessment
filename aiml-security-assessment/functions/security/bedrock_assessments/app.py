@@ -40843,6 +40843,9 @@ with open(
     ARN_SUB_RESOURCES: Dict[str, Dict[str, str]] = json.load(_sub_resources)["services"]
 
 
+SECRET_SUFFIX_PATTERN = re.compile(r"secret:[^*?]+-\?{6}")
+
+
 def _arn_covers_every_resource(resource: Any) -> bool:
     """
     Return True when a Resource entry reaches more than the resources it names.
@@ -40860,8 +40863,10 @@ def _arn_covers_every_resource(resource: Any) -> bool:
     (table/*, function:tool-*, anthropic.*) and a path inside a name that may
     hold "/" (role/service-role/*, log-group:/aws/lambda/*, secret:prod/*,
     parameter/app/*), because a type with no published sub-resource has a name
-    that runs to the end of the ARN. A short ARN with any wildcard is
-    unbounded.
+    that runs to the end of the ARN. One exception is scoped: a Secrets Manager
+    secret:name-?????? with no other wildcard, which matches the six-character
+    suffix of the one secret named "name"; secret:name-* still widens. A short
+    ARN with any wildcard is unbounded.
     """
     if not isinstance(resource, str):
         return False
@@ -40881,6 +40886,11 @@ def _arn_covers_every_resource(resource: Any) -> bool:
     if not resource_part:
         return True
     if "*" not in resource_part and "?" not in resource_part:
+        return False
+    # Secrets Manager ends a secret's ARN in "-" and six random characters, so
+    # secret:name-?????? matches only the secret named "name": a secret named
+    # name-x has a longer ARN.
+    if service == "secretsmanager" and SECRET_SUFFIX_PATTERN.fullmatch(resource_part):
         return False
     prefixes = ARN_SUB_RESOURCES.get(service, {})
     prefix = max(

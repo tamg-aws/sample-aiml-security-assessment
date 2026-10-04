@@ -46729,6 +46729,10 @@ class TestBR57AgentRoleScope:
             ),
             ("s3:GetObject", "arn:aws:s3:::kb-docs/team/*"),
             (
+                "secretsmanager:GetSecretValue",
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-??????",
+            ),
+            (
                 "s3:GetObject",
                 "arn:aws:s3:us-east-1:123456789012:accesspoint/kb/object/*",
             ),
@@ -46796,6 +46800,10 @@ class TestBR57AgentRoleScope:
             "arn:aws:kms:us-east-1:123456789012:alias/aws/*",
             # The access point, not the bucket, is the parent here.
             "arn:aws:s3:us-east-1:123456789012:accesspoint/*/object/report.csv",
+            # Only six "?" after the name's last "-" match one secret's suffix.
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-*",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-?????",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/*-??????",
         ],
     )
     def test_a_wildcard_in_any_arn_segment_fails(self, resource):

@@ -4580,6 +4580,27 @@ MUTATIONS = [
         "replace": "        key=lambda prefix: -len(prefix),\n        default=None,\n",
     },
     {
+        "name": "BR-57 fails a secret ARN pinned to its six-character suffix",
+        "file": BEDROCK,
+        "defect": "BR-57 reads secret:name-?????? as a wildcard, although it matches only the secret named name",
+        "find": '    if service == "secretsmanager" and SECRET_SUFFIX_PATTERN.fullmatch(resource_part):\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-57 credits a secret suffix wildcard of any length",
+        "file": BEDROCK,
+        "defect": "BR-57 credits secret:name-????? as one secret, although fewer than six ? match other secrets' names",
+        "find": 'SECRET_SUFFIX_PATTERN = re.compile(r"secret:[^*?]+-\\?{6}")\n',
+        "replace": 'SECRET_SUFFIX_PATTERN = re.compile(r"secret:[^*?]+-\\?+")\n',
+    },
+    {
+        "name": "BR-57 credits a secret suffix pin after a wildcard name",
+        "file": BEDROCK,
+        "defect": "BR-57 credits secret:*-?????? as one secret, although its name wildcard matches every secret",
+        "find": 'SECRET_SUFFIX_PATTERN = re.compile(r"secret:[^*?]+-\\?{6}")\n',
+        "replace": 'SECRET_SUFFIX_PATTERN = re.compile(r"secret:.+-\\?{6}")\n',
+    },
+    {
         "name": "BR-02 hands a half-read container instance to the next workload",
         "file": BEDROCK,
         "defect": "BR-02 keeps the EC2 instance id of a container instance whose instance read failed, so the next workload on it is told only that id",
@@ -5596,6 +5617,9 @@ GROUPS: dict[str, str] = {
     "BR-02 hands a half-read container instance to the next workload": "in the Bedrock workload route tables",
     "BR-57 credits a path wildcard inside a name that may hold /": "in the Bedrock agent role scope",
     "BR-57 reads an ARN against the shortest matching type prefix": "in the Bedrock agent role scope",
+    "BR-57 fails a secret ARN pinned to its six-character suffix": "in the Bedrock agent role scope",
+    "BR-57 credits a secret suffix wildcard of any length": "in the Bedrock agent role scope",
+    "BR-57 credits a secret suffix pin after a wildcard name": "in the Bedrock agent role scope",
 }
 
 
