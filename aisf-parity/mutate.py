@@ -820,6 +820,34 @@ MUTATIONS = [
         "replace": '    for side in ("output",):\n        if not side_regexes[side]:\n',
     },
     {
+        "name": "BR-42 credits an IfExists or ForAllValues bound on an open training grant",
+        "file": BEDROCK,
+        "defect": "BR-42 reads an IfExists or ForAllValues: account test as limiting an every-principal training bucket grant, though either is true when the key is absent",
+        "find": '    if operator.startswith("forallvalues:") or operator.endswith("ifexists"):\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-42 ignores a training grant to another account",
+        "file": BEDROCK,
+        "defect": "BR-42 skips a training bucket grant to another account's principals, so that account's own IAM decides who reads the training data",
+        "find": "            foreign = [other for other in named if other != account]\n",
+        "replace": "            foreign = []\n",
+    },
+    {
+        "name": "BR-42 credits a bound naming another account",
+        "file": BEDROCK,
+        "defect": "BR-42 credits an every-principal training bucket grant whose aws:PrincipalAccount test also names another account",
+        "find": '        inside = [text for text, accounts in bounds if accounts <= {account, "org"}]\n',
+        "replace": "        inside = [text for text, accounts in bounds]\n",
+    },
+    {
+        "name": "BR-42 credits any condition on an open training grant",
+        "file": BEDROCK,
+        "defect": "BR-42 passes an every-principal training bucket grant under any condition, such as aws:SourceVpce, that names no account of the caller",
+        "find": '        else:\n            grants["failed"].append(\n                f"{label} allows s3:GetObject to every principal under a "\n',
+        "replace": '        elif False:\n            grants["failed"].append(\n                f"{label} allows s3:GetObject to every principal under a "\n',
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2539,6 +2567,18 @@ GROUPS: dict[str, str] = {
         "in the Bedrock container image scanning"
     ),
     "BR-33 drops a task with no task role": ("in the Bedrock container image scanning"),
+    "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
+        "in the Bedrock training bucket policies"
+    ),
+    "BR-42 ignores a training grant to another account": (
+        "in the Bedrock training bucket policies"
+    ),
+    "BR-42 credits a bound naming another account": (
+        "in the Bedrock training bucket policies"
+    ),
+    "BR-42 credits any condition on an open training grant": (
+        "in the Bedrock training bucket policies"
+    ),
     "BR-34 credits a detected prompt attack the guardrail let through": (
         "in the Bedrock invocation log guardrail evidence"
     ),

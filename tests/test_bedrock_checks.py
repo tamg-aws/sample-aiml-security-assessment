@@ -10032,10 +10032,43 @@ class TestBR42ModelAllowList:
         ) in failed[0]["Finding_Details"]
         assert [f["Status"] for f in findings].count("Passed") == 1
 
+    ACCOUNT = "123456789012"
+    NONE_OUTSIDE = (
+        "The bucket policies of the 1 training data bucket(s) were read; none "
+        "allows s3:GetObject to every principal with no condition, to every "
+        "principal under a condition that names no account or organization of "
+        "the caller, or to another account's principals."
+    )
+
+    def _bucket_run(self, *statements, training_data=None, account=ACCOUNT):
+        policies = {
+            bucket: json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "Read",
+                            "Effect": "Allow",
+                            "Action": "s3:GetObject",
+                            "Resource": f"arn:aws:s3:::{bucket}/*",
+                            **statement,
+                        }
+                    ],
+                }
+            )
+            for bucket, statement in statements
+        }
+        return self._run(
+            self._scoped_cache(),
+            training_data=training_data or self.ONE_TRAINING_BUCKET,
+            bucket_policies={"policies": policies, "errors": [], "account": account},
+        )
+
     @pytest.mark.parametrize(
         "statement",
         [
             {"Principal": {"AWS": "arn:aws:iam::123456789012:role/Trainer"}},
+            {"Principal": {"AWS": "123456789012"}},
             {"Principal": "*", "Effect": "Deny"},
             {"Principal": "*", "Action": "s3:PutObject"},
             {"Principal": "*", "Resource": "arn:aws:s3:::other-bucket/*"},
@@ -10043,40 +10076,161 @@ class TestBR42ModelAllowList:
         ],
     )
     def test_br42_a_bucket_policy_naming_its_readers_passes(self, statement):
-        findings = self._run(
-            self._scoped_cache(),
-            training_data=self.ONE_TRAINING_BUCKET,
-            bucket_policies={
-                "policies": {"train-a": self._policy(**statement)},
-                "errors": [],
-            },
-        )
+        findings = self._bucket_run(("train-a", statement))
         assert [f["Status"] for f in findings] == ["Passed"]
-        assert (
-            "The bucket policies of the 1 training data bucket(s) were read; "
-            "none allows s3:GetObject to every principal with no condition."
-        ) in findings[0]["Finding_Details"]
+        assert self.NONE_OUTSIDE in findings[0]["Finding_Details"]
 
-    def test_br42_a_conditioned_open_bucket_grant_is_named_not_judged(self):
-        findings = self._run(
-            self._scoped_cache(),
-            training_data=self.ONE_TRAINING_BUCKET,
-            bucket_policies={
-                "policies": {
-                    "train-a": self._policy(
-                        Principal="*",
-                        Condition={"StringEquals": {"aws:SourceVpce": "vpce-1"}},
-                    )
+    # IAM-01: a conditioned every-principal grant was listed as "not evaluated"
+    # and the row passed, and a grant to another account was never judged.
+    @pytest.mark.parametrize(
+        "condition, shown",
+        [
+            (
+                {"StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+                "StringEquals aws:principalaccount 123456789012",
+            ),
+            (
+                {"StringEquals": {"aws:PrincipalOrgID": "o-abcdefghij"}},
+                "StringEquals aws:principalorgid o-abcdefghij",
+            ),
+            (
+                {
+                    "ArnLike": {
+                        "aws:PrincipalArn": "arn:aws:iam::123456789012:role/Train*"
+                    },
+                    "StringEquals": {"aws:SourceVpce": "vpce-1"},
                 },
-                "errors": [],
-            },
+                "ArnLike aws:principalarn arn:aws:iam::123456789012:role/Train*",
+            ),
+        ],
+    )
+    def test_br42_an_open_grant_bounded_to_this_account_passes(self, condition, shown):
+        findings = self._bucket_run(
+            ("train-a", {"Principal": "*", "Condition": condition})
         )
         assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert self.NONE_OUTSIDE in details
         assert (
-            "Statement 'Read' on bucket 'train-a' allows s3:GetObject to every "
-            "principal under a StringEquals aws:SourceVpce condition, which is "
-            "not evaluated."
-        ) in findings[0]["Finding_Details"]
+            f"Statement 'Read' on bucket 'train-a' allows s3:GetObject to every "
+            f"principal only under {shown}, which limits it to this account or its "
+            "organization."
+        ).lower() in details.lower()
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+            {"StringEqualsIfExists": {"aws:PrincipalAccount": "123456789012"}},
+            {"ForAllValues:StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+            {"StringNotEquals": {"aws:PrincipalAccount": "999999999999"}},
+            {"StringLike": {"aws:PrincipalAccount": "12345678901*"}},
+            {"ArnLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Trainer"}},
+            {"StringLike": {"aws:PrincipalOrgID": "o-*"}},
+        ],
+    )
+    def test_br42_an_open_grant_under_a_condition_naming_no_account_fails(
+        self, condition
+    ):
+        findings = self._bucket_run(
+            ("train-a", {"Principal": "*", "Condition": condition})
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "Training data bucket 'train-a' (the training data of customization "
+            "job 'j1') has bucket policy grants that let principals outside this "
+            "account's identity policies read the training data: Statement 'Read' "
+            "on bucket 'train-a' allows s3:GetObject to every principal under a "
+        ) in failed[0]["Finding_Details"]
+        assert (
+            "condition that names no account or organization of the caller"
+            in failed[0]["Finding_Details"]
+        )
+        assert self.NONE_OUTSIDE not in findings[-1]["Finding_Details"]
+        assert (
+            "the Failed rows name the grants on 'train-a' of them"
+            in findings[-1]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "statement, foreign",
+        [
+            (
+                {
+                    "Principal": {
+                        "AWS": [
+                            "arn:aws:iam::123456789012:role/Trainer",
+                            "arn:aws:iam::999999999999:root",
+                        ]
+                    }
+                },
+                "principals of account(s) 999999999999, outside this account",
+            ),
+            (
+                {"Principal": {"AWS": "999999999999"}},
+                "principals of account(s) 999999999999, outside this account",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalAccount": ["123456789012", "999999999999"]
+                        }
+                    },
+                },
+                "admits the principals of account(s) 999999999999 outside this account",
+            ),
+        ],
+    )
+    def test_br42_a_grant_to_another_account_fails(self, statement, foreign):
+        findings = self._bucket_run(("train-a", statement))
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert foreign in failed[0]["Finding_Details"]
+        assert "account(s) 123456789012" not in failed[0]["Finding_Details"]
+
+    def test_br42_only_the_bad_bucket_of_two_is_named(self):
+        two = {
+            "buckets": {
+                "train-a": ["the training data of customization job 'j1'"],
+                "train-b": ["the training data of customization job 'j2'"],
+            },
+            "errors": [],
+            "truncated": [],
+            "regions": ["us-east-1"],
+        }
+        findings = self._bucket_run(
+            ("train-a", {"Principal": {"AWS": "arn:aws:iam::123456789012:root"}}),
+            ("train-b", {"Principal": {"AWS": "arn:aws:iam::999999999999:root"}}),
+            training_data=two,
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "'train-b'" in failed[0]["Finding_Details"]
+        assert "'train-a'" not in failed[0]["Finding_Details"]
+        assert (
+            "the Failed rows name the grants on 'train-b' of them"
+            in findings[-1]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Principal": {"AWS": "arn:aws:iam::123456789012:role/Trainer"}},
+            {
+                "Principal": "*",
+                "Condition": {"StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+            },
+        ],
+    )
+    def test_br42_an_unread_account_id_withholds_the_pass(self, statement):
+        findings = self._bucket_run(("train-a", statement), account=None)
+        assert "Passed" not in [f["Status"] for f in findings]
+        assert "this account's ID was not read" in " ".join(
+            f["Finding_Details"] for f in findings
+        )
 
     def test_br42_an_unread_training_bucket_policy_withholds_passed(self):
         findings = self._run(
@@ -10107,6 +10261,7 @@ class TestBR42ModelAllowList:
             return {"Policy": '{"Statement": []}'}
 
         s3.get_bucket_policy.side_effect = get_policy
+        s3.get_caller_identity.return_value = {"Account": "123456789012"}
         with patch.object(bedrock_app.boto3, "client", return_value=s3):
             result = bedrock_app._training_bucket_policies(
                 {"read": [], "no-policy": [], "denied": []}
@@ -10114,6 +10269,20 @@ class TestBR42ModelAllowList:
         assert result["policies"] == {"read": '{"Statement": []}', "no-policy": None}
         assert result["errors"] == [
             "bucket 'denied' policy was not read with s3:GetBucketPolicy (AccessDenied)"
+        ]
+        assert result["account"] == "123456789012"
+
+    def test_br42_an_unread_caller_identity_is_an_error_not_an_account(self):
+        client = MagicMock()
+        client.get_caller_identity.side_effect = _client_error(
+            "ExpiredToken", operation="GetCallerIdentity"
+        )
+        client.get_bucket_policy.return_value = {"Policy": '{"Statement": []}'}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            result = bedrock_app._training_bucket_policies({"read": []})
+        assert result["account"] is None
+        assert result["errors"] == [
+            "this account's ID was not read with sts:GetCallerIdentity (ExpiredToken)"
         ]
 
     def test_br42_named_arn_passes_while_wildcard_fails(self):

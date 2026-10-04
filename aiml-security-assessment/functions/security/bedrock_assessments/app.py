@@ -23149,9 +23149,24 @@ def _training_bucket_policies(training_buckets: Dict[str, List[str]]) -> Dict[st
     """
     Read the bucket policy of each training data bucket. A bucket with no
     policy maps to None; a read that fails is an error, never an empty policy.
+    ``account`` is this account's ID, which tells a grant to another account's
+    principals apart, or None when it was not read.
     """
     policies: Dict[str, Optional[str]] = {}
     errors = []
+    account = None
+    if training_buckets:
+        try:
+            account = str(
+                boto3.client("sts", config=boto3_config).get_caller_identity()[
+                    "Account"
+                ]
+            )
+        except (ClientError, BotoCoreError, KeyError) as error:
+            errors.append(
+                "this account's ID was not read with sts:GetCallerIdentity "
+                f"({get_assessment_error_label(error)})"
+            )
     s3_client = boto3.client("s3", config=boto3_config)
     for bucket in sorted(training_buckets):
         try:
@@ -23169,46 +23184,165 @@ def _training_bucket_policies(training_buckets: Dict[str, List[str]]) -> Dict[st
                 f"bucket '{bucket}' policy was not read with s3:GetBucketPolicy "
                 f"({get_assessment_error_label(error)})"
             )
-    return {"policies": policies, "errors": errors}
+    return {"policies": policies, "errors": errors, "account": account}
 
 
-def _open_training_bucket_grants(bucket: str, document: Any) -> Dict[str, List[str]]:
+# Condition keys that limit an every-principal grant to the accounts or the
+# organization of the caller. Each is tested only under a positive operator: an
+# IfExists form or a ForAllValues: prefix is true when the key is absent, and a
+# negated test admits every account but the one named.
+TRAINING_BUCKET_BOUNDING_KEYS = {
+    "aws:principalaccount": ("stringequals", "stringlike"),
+    "aws:sourceaccount": ("stringequals", "stringlike"),
+    "aws:principalorgid": ("stringequals", "stringlike"),
+    "aws:principalarn": ("arnequals", "arnlike", "stringequals", "stringlike"),
+    "aws:sourcearn": ("arnequals", "arnlike", "stringequals", "stringlike"),
+}
+
+
+def _bounding_condition_accounts(
+    operator: str, key: str, values: List[Any]
+) -> Optional[set]:
     """
-    Name the Allow statements of a bucket policy that let every principal
-    s3:GetObject the bucket's objects, split by whether a Condition limits them.
+    Return the accounts one condition test limits a grant to, with "org" for an
+    organization ID, or None when the test does not name each account exactly.
     """
-    grants: Dict[str, List[str]] = {"open": [], "conditioned": []}
+    if key not in TRAINING_BUCKET_BOUNDING_KEYS or not values:
+        return None
+    if operator.startswith("forallvalues:") or operator.endswith("ifexists"):
+        return None
+    if (
+        _strip_condition_set_operator(operator)
+        not in TRAINING_BUCKET_BOUNDING_KEYS[key]
+    ):
+        return None
+    accounts = set()
+    for value in values:
+        text = str(value)
+        if key == "aws:principalorgid":
+            if not LAMBDA_ORGANIZATION_ID_PATTERN.fullmatch(text):
+                return None
+            accounts.add("org")
+            continue
+        if key in ("aws:principalarn", "aws:sourcearn"):
+            text = (text.split(":") + [""] * 5)[4]
+        if not LAMBDA_ACCOUNT_ID_PATTERN.fullmatch(text):
+            return None
+        accounts.add(text)
+    return accounts
+
+
+def _open_training_bucket_grants(
+    bucket: str, document: Any, account: Optional[str]
+) -> Dict[str, List[str]]:
+    """
+    Judge the Allow statements of a bucket policy that let a principal outside
+    this account's identity policies s3:GetObject the bucket's objects.
+
+    ``open`` names the every-principal statements with no condition, ``failed``
+    describes an every-principal statement whose condition names no account of
+    this account or its organization, and a grant to another account's
+    principals, ``bounded`` describes the every-principal statements a condition
+    limits to this account or its organization, and ``unread`` what could not be
+    judged without this account's ID.
+    """
+    grants: Dict[str, List[str]] = {
+        "open": [],
+        "failed": [],
+        "bounded": [],
+        "unread": [],
+    }
     for index, statement in enumerate(_policy_statements(document), start=1):
         if str(statement.get("Effect", "")).upper() != "ALLOW":
-            continue
-        if not _deny_principal_reach(statement)["all_principals"] and (
-            "NotPrincipal" not in statement
-        ):
             continue
         reach = _training_data_reach([statement], bucket)
         if not (reach["open"] or reach["named"]):
             continue
         sid = str(statement.get("Sid") or f"statement {index}")
+        label = f"Statement '{sid}' on bucket '{bucket}'"
+        tests = _condition_keys_by_operator(statement)
         condition = statement.get("Condition")
-        keys = sorted(
-            {
-                f"{operator} {key}"
-                for operator, block in (
-                    condition.items() if isinstance(condition, dict) else []
-                )
-                for key in (block if isinstance(block, dict) else {"": None})
-            }
-        )
+        keys = sorted({f"{operator} {key}" for operator, key, _ in tests})
         if condition and not keys:
             keys = ["unreadable"]
-        if keys:
-            grants["conditioned"].append(
-                f"Statement '{sid}' on bucket '{bucket}' allows s3:GetObject to "
-                f"every principal under a {', '.join(keys)} condition, which is "
-                "not evaluated."
+        everyone = _deny_principal_reach(statement)["all_principals"] or (
+            "NotPrincipal" in statement
+        )
+        if not everyone:
+            principal = statement.get("Principal")
+            owners = set()
+            for value in _as_list(
+                principal.get("AWS") if isinstance(principal, dict) else None
+            ):
+                text = str(value)
+                owner = (
+                    (text.split(":") + [""] * 5)[4] if text.startswith("arn:") else text
+                )
+                if LAMBDA_ACCOUNT_ID_PATTERN.fullmatch(owner):
+                    owners.add(owner)
+            named = sorted(owners)
+            if not named:
+                continue
+            if account is None:
+                grants["unread"].append(
+                    f"{label} names principals of account(s) {', '.join(named)}, "
+                    "and this account's ID was not read to tell whether they are "
+                    "outside it"
+                )
+                continue
+            foreign = [other for other in named if other != account]
+            if foreign:
+                grants["failed"].append(
+                    "{} allows s3:GetObject to principals of account(s) {}, outside "
+                    "this account, so that account's own IAM policies decide who "
+                    "reads the training data{}.".format(
+                        label,
+                        ", ".join(foreign),
+                        f" (under a {', '.join(keys)} condition, which is not "
+                        "evaluated)"
+                        if keys
+                        else "",
+                    )
+                )
+            continue
+        if not keys:
+            grants["open"].append(sid)
+            continue
+        bounds = [
+            (f"{operator} {key} {', '.join(map(str, values))}", accounts)
+            for operator, key, values in tests
+            for accounts in [_bounding_condition_accounts(operator, key, values)]
+            if accounts is not None
+        ]
+        if bounds and account is None:
+            grants["unread"].append(
+                f"{label} allows s3:GetObject to every principal under "
+                f"{bounds[0][0]}, and this account's ID was not read to tell "
+                "whether it names this account"
+            )
+            continue
+        inside = [text for text, accounts in bounds if accounts <= {account, "org"}]
+        if inside:
+            grants["bounded"].append(
+                f"{label} allows s3:GetObject to every principal only under "
+                f"{inside[0]}, which limits it to this account or its organization."
+            )
+        elif bounds:
+            grants["failed"].append(
+                "{} allows s3:GetObject to every principal under {}, which admits "
+                "the principals of account(s) {} outside this account.".format(
+                    label,
+                    bounds[0][0],
+                    ", ".join(sorted(bounds[0][1] - {account, "org"})),
+                )
             )
         else:
-            grants["open"].append(sid)
+            grants["failed"].append(
+                f"{label} allows s3:GetObject to every principal under a "
+                f"{', '.join(keys)} condition that names no account or organization "
+                "of the caller, so a principal of any account that meets it can "
+                "read the training data."
+            )
     return grants
 
 
@@ -23459,20 +23593,54 @@ def check_bedrock_model_allow_list(
                 )
             )
 
-        conditioned_grants = []
+        bounded_grants = []
+        failed_buckets = []
         for bucket, document in sorted(bucket_policies["policies"].items()):
             if document is None or bucket not in training_buckets:
                 continue
             try:
-                grants = _open_training_bucket_grants(bucket, document)
+                grants = _open_training_bucket_grants(
+                    bucket, document, bucket_policies.get("account")
+                )
             except (ValueError, TypeError) as error:
                 training_errors.append(
                     f"bucket '{bucket}' policy could not be parsed ({error})"
                 )
                 continue
-            conditioned_grants.extend(grants["conditioned"])
+            bounded_grants.extend(grants["bounded"])
+            training_errors.extend(grants["unread"])
+            if grants["failed"]:
+                failed_buckets.append(bucket)
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-42",
+                        finding_name=check_name,
+                        finding_details=(
+                            "Training data bucket '{}' ({}) has bucket policy "
+                            "grants that let principals outside this account's "
+                            "identity policies read the training data: {}".format(
+                                bucket,
+                                "; ".join(training_buckets[bucket][:2]),
+                                " ".join(grants["failed"]),
+                            )
+                        ),
+                        resolution=(
+                            "Name the principals of this account that may read the "
+                            "training data in the bucket policy, or limit an "
+                            "every-principal grant with aws:PrincipalAccount or "
+                            "aws:PrincipalOrgID under StringEquals."
+                        ),
+                        reference=MODEL_ALLOW_LIST_REFERENCE,
+                        severity="High",
+                        status="Failed",
+                        region=region,
+                    )
+                )
             if not grants["open"]:
                 continue
+            if bucket not in failed_buckets:
+                failed_buckets.append(bucket)
             findings["status"] = "WARN"
             findings["csv_data"].append(
                 create_finding(
@@ -23525,12 +23693,19 @@ def check_bedrock_model_allow_list(
                 "bucket(s) of model customization and SageMaker training jobs in "
                 "{} assessed Region(s); "
                 "statement conditions on those grants are not evaluated. The bucket "
-                "policies of the {} training data bucket(s) were read; none allows "
-                "s3:GetObject to every principal with no condition.{}".format(
+                "policies of the {} training data bucket(s) were read; {}{}".format(
                     len(training_buckets),
                     len(training_data.get("regions") or []),
                     len(training_buckets),
-                    "".join(f" {grant}" for grant in conditioned_grants[:5]),
+                    "the Failed rows name the grants on {} of them that let "
+                    "principals outside this account's identity policies read the "
+                    "training data.".format(", ".join(f"'{b}'" for b in failed_buckets))
+                    if failed_buckets
+                    else "none allows s3:GetObject to every principal with no "
+                    "condition, to every principal under a condition that names no "
+                    "account or organization of the caller, or to another "
+                    "account's principals.",
+                    "".join(f" {grant}" for grant in bounded_grants),
                 )
             )
         else:
