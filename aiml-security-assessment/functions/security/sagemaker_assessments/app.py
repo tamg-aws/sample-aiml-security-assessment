@@ -18672,6 +18672,14 @@ RUNTIME_UNSUPPORTED_NOTE = (
     "EKS on Fargate, EKS Hybrid Nodes and ECS Managed Instances are not "
     "supported by Runtime Monitoring and fall to task- and network-level telemetry"
 )
+MICROVM_RUNTIME_TIER_FINDING = "Lambda MicroVM Runtime Detection Tier"
+MICROVM_RUNTIME_TIER_REFERENCE = (
+    "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/"
+    "logging-data-events-with-cloudtrail.html"
+)
+# The CloudTrail data-event table lists "API activity on
+# AWS::Lambda::MicrovmImage resources". Data events are not logged by default.
+MICROVM_DATA_EVENT_TYPE = "AWS::Lambda::MicrovmImage"
 
 
 def _runtime_coverage_findings(
@@ -19207,13 +19215,299 @@ def _lambda_runtime_tier_findings(
     return rows
 
 
+def _microvm_data_event_selectors(selectors: Any) -> Tuple[bool, List[str]]:
+    """
+    Whether advanced event selectors record every AWS::Lambda::MicrovmImage data
+    event, and the fields that narrow any selector naming the type.
+
+    A selector is credited only with eventCategory Equals Data, resources.type
+    Equals the type and no other field: eventName, readOnly, resources.ARN and
+    the rest each keep a subset of the calls.
+    """
+    narrowed = set()
+    for selector in selectors if isinstance(selectors, list) else []:
+        if not isinstance(selector, dict):
+            continue
+        fields = {
+            str(field.get("Field")): field
+            for field in selector.get("FieldSelectors") or []
+            if isinstance(field, dict)
+        }
+        if "Data" not in ((fields.get("eventCategory") or {}).get("Equals") or []):
+            continue
+        types = (fields.get("resources.type") or {}).get("Equals") or []
+        if MICROVM_DATA_EVENT_TYPE not in types:
+            continue
+        extra = set(fields) - {"eventCategory", "resources.type"}
+        if not extra:
+            return True, []
+        narrowed |= extra
+    return False, sorted(narrowed)
+
+
+def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
+    """
+    The logging trails covering this Region, then the ENABLED CloudTrail Lake
+    event data stores (this Region's, and multi-Region stores homed in every
+    other Region enabled for the account), that record every
+    AWS::Lambda::MicrovmImage data event. Stores are read only when no trail
+    is credited.
+    """
+    coverage: Dict[str, List[str]] = {"credited": [], "gaps": [], "unread": []}
+    try:
+        trails = (
+            boto3.client("cloudtrail", config=boto3_config, region_name=region)
+            .describe_trails(includeShadowTrails=True)
+            .get("trailList", [])
+        )
+    except Exception as error:
+        coverage["unread"].append(
+            f"cloudtrail:DescribeTrails ({get_assessment_error_label(error)})"
+        )
+        trails = []
+    for trail in trails:
+        name = trail.get("Name") or trail.get("TrailARN")
+        trail_id = trail.get("TrailARN") or name
+        if not trail.get("IsMultiRegionTrail") and trail.get("HomeRegion") != region:
+            continue
+        home_client = boto3.client(
+            "cloudtrail",
+            config=boto3_config,
+            region_name=trail.get("HomeRegion") or region,
+        )
+        try:
+            status = home_client.get_trail_status(Name=trail_id)
+            selectors = home_client.get_event_selectors(TrailName=trail_id)
+        except Exception as error:
+            coverage["unread"].append(
+                f"trail '{name}' ({get_assessment_error_label(error)})"
+            )
+            continue
+        credited, narrowed = _microvm_data_event_selectors(
+            selectors.get("AdvancedEventSelectors")
+        )
+        if status.get("IsLogging") is not True:
+            if credited:
+                coverage["gaps"].append(f"trail '{name}' is not logging")
+        elif credited:
+            coverage["credited"].append(f"trail '{name}'")
+        elif narrowed:
+            coverage["gaps"].append(
+                f"trail '{name}' narrows its {MICROVM_DATA_EVENT_TYPE} selector by "
+                f"{', '.join(narrowed)}"
+            )
+    if coverage["credited"]:
+        return coverage
+    regions = [region]
+    try:
+        for page in (
+            boto3.client("account", config=boto3_config)
+            .get_paginator("list_regions")
+            .paginate(RegionOptStatusContains=["ENABLED", "ENABLED_BY_DEFAULT"])
+        ):
+            regions.extend(
+                r["RegionName"]
+                for r in page.get("Regions") or []
+                if r.get("RegionName") and r["RegionName"] not in regions
+            )
+    except Exception as error:
+        coverage["unread"].append(
+            "the Regions where a multi-Region event data store may be homed "
+            f"(account:ListRegions: {get_assessment_error_label(error)})"
+        )
+    for store_region in regions:
+        client = boto3.client(
+            "cloudtrail", config=boto3_config, region_name=store_region
+        )
+        stores, token = [], None
+        try:
+            while True:
+                response = client.list_event_data_stores(
+                    **({"NextToken": token} if token else {})
+                )
+                stores.extend(response.get("EventDataStores") or [])
+                token = response.get("NextToken")
+                if not token:
+                    break
+        except Exception as error:
+            coverage["unread"].append(
+                f"event data stores in {store_region} (cloudtrail:ListEventDataStores: "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        for store in stores:
+            arn = store.get("EventDataStoreArn")
+            name = f"event data store '{store.get('Name') or arn}' in {store_region}"
+            try:
+                detail = client.get_event_data_store(EventDataStore=arn)
+            except Exception as error:
+                coverage["unread"].append(
+                    f"{name} (cloudtrail:GetEventDataStore: "
+                    f"{get_assessment_error_label(error)})"
+                )
+                continue
+            if store_region != region and detail.get("MultiRegionEnabled") is not True:
+                continue
+            credited, narrowed = _microvm_data_event_selectors(
+                detail.get("AdvancedEventSelectors")
+            )
+            if detail.get("Status") != "ENABLED":
+                if credited:
+                    coverage["gaps"].append(
+                        f"{name} is {detail.get('Status') or 'of unreported status'}"
+                    )
+            elif credited:
+                coverage["credited"].append(name)
+            elif narrowed:
+                coverage["gaps"].append(
+                    f"{name} narrows its {MICROVM_DATA_EVENT_TYPE} selector by "
+                    f"{', '.join(narrowed)}"
+                )
+    return coverage
+
+
+def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
+    """
+    Runtime Monitoring does not cover Lambda MicroVMs, so their tier is VPC Flow
+    Logs on every egress connector subnet plus CloudTrail data events on the
+    AWS::Lambda::MicrovmImage resource type.
+    """
+    microvms, connectors, unread = _microvm_networks(region)
+    if not microvms and not unread:
+        return []
+    problems = []
+    subnet_users: Dict[str, List[str]] = {}
+    no_egress = []
+    for microvm in microvms:
+        if not microvm["egress"]:
+            no_egress.append(microvm["id"])
+        for connector in microvm["egress"]:
+            for subnet in (connectors.get(connector) or {}).get("SubnetIds") or []:
+                subnet_users.setdefault(subnet, []).append(microvm["id"])
+    if subnet_users:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        subnets = sorted(subnet_users)
+        subnet_vpc: Dict[str, str] = {}
+        flow_logs = []
+        try:
+            for batch in _chunked(subnets, SUBNET_LOOKUP_BATCH_SIZE):
+                for page in ec2_client.get_paginator("describe_subnets").paginate(
+                    Filters=[{"Name": "subnet-id", "Values": batch}]
+                ):
+                    for subnet in page.get("Subnets", []):
+                        if subnet.get("SubnetId") and subnet.get("VpcId"):
+                            subnet_vpc[subnet["SubnetId"]] = subnet["VpcId"]
+            resource_ids = sorted(set(subnets) | set(subnet_vpc.values()))
+            for batch in _chunked(resource_ids, SUBNET_LOOKUP_BATCH_SIZE):
+                for page in ec2_client.get_paginator("describe_flow_logs").paginate(
+                    Filter=[{"Name": "resource-id", "Values": batch}]
+                ):
+                    flow_logs.extend(page.get("FlowLogs", []))
+        except Exception as error:
+            unread.append(
+                "the egress connector subnets' flow logs "
+                f"({get_assessment_error_label(error)})"
+            )
+            subnets = []
+        logged = {
+            flow_log.get("ResourceId")
+            for flow_log in flow_logs
+            if flow_log.get("FlowLogStatus") == "ACTIVE"
+            and flow_log.get("TrafficType") == "ALL"
+        }
+        for subnet in subnets:
+            users = ", ".join(sorted(set(subnet_users[subnet])))
+            if subnet not in subnet_vpc:
+                unread.append(
+                    f"egress subnet {subnet} of MicroVM(s) {users} "
+                    "(DescribeSubnets did not return it)"
+                )
+            elif subnet not in logged and subnet_vpc[subnet] not in logged:
+                problems.append(
+                    f"egress subnet {subnet} of MicroVM(s) {users} has no ACTIVE "
+                    f"flow log recording ALL traffic on it or on {subnet_vpc[subnet]}"
+                )
+    events = _microvm_data_event_coverage(region)
+    unread.extend(events["unread"])
+    if not events["credited"] and not events["unread"]:
+        problems.append(
+            "no logging trail covering this Region, and no ENABLED event data store "
+            "read in any Region enabled for the account, records "
+            f"{MICROVM_DATA_EVENT_TYPE} data events with a selector narrowed by no "
+            "field but eventCategory and resources.type"
+            + (f" ({'; '.join(events['gaps'][:5])})" if events["gaps"] else "")
+        )
+    no_egress_note = (
+        f" MicroVM(s) {', '.join(no_egress)} have no egress network connector, so "
+        "no VPC Flow Log is expected for them."
+        if no_egress
+        else ""
+    )
+    rows = []
+    for problem in problems:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=MICROVM_RUNTIME_TIER_FINDING,
+                finding_details=(
+                    f"Lambda MicroVM runtime tier: {problem}. Runtime Monitoring "
+                    "does not cover MicroVMs, so flow logs and data events are "
+                    "their detection tier."
+                ),
+                resolution=(
+                    "Create an ACTIVE VPC Flow Log with TrafficType ALL on each "
+                    "egress connector subnet or its VPC, and add an advanced event "
+                    "selector with eventCategory Equals Data and resources.type "
+                    f"Equals {MICROVM_DATA_EVENT_TYPE}, and no other field, to a "
+                    "logging trail or event data store."
+                ),
+                reference=MICROVM_RUNTIME_TIER_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-38",
+                MICROVM_RUNTIME_TIER_FINDING,
+                unread,
+                f"{len(microvms)} running MicroVM(s) were read.{no_egress_note}",
+                MICROVM_RUNTIME_TIER_REFERENCE,
+                region,
+            )
+        )
+    elif not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=MICROVM_RUNTIME_TIER_FINDING,
+                finding_details=(
+                    f"All {len(subnet_users)} egress connector subnet(s) of the "
+                    f"{len(microvms)} MicroVM(s) that have not ended have an ACTIVE "
+                    "flow log recording ALL traffic on the subnet or its VPC, and "
+                    f"{', '.join(events['credited'])} record(s) every "
+                    f"{MICROVM_DATA_EVENT_TYPE} data event.{no_egress_note}"
+                ),
+                resolution="No action required",
+                reference=MICROVM_RUNTIME_TIER_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_guardduty_runtime_monitoring_coverage(
     region: str = "", detector_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
     """
     SM-38: Read Runtime Monitoring coverage per resource against the EKS and ECS
-    cluster population, EKS audit log monitoring where EKS clusters exist, and
-    the Lambda tier that stands in for a runtime agent.
+    cluster population, EKS audit log monitoring where EKS clusters exist, the
+    Lambda tier that stands in for a runtime agent, and the flow-log and
+    data-event tier of Lambda MicroVMs, which Runtime Monitoring does not cover.
     A detector with every agent-management option off and no manual agent
     fails here, where the feature flag alone reads as enabled.
     """
@@ -19235,6 +19529,7 @@ def check_guardduty_runtime_monitoring_coverage(
             )
         findings["csv_data"].extend(_eks_audit_log_findings(region, detail))
         findings["csv_data"].extend(_lambda_runtime_tier_findings(region, detail))
+        findings["csv_data"].extend(_microvm_runtime_tier_findings(region))
     except Exception as error:
         findings["csv_data"].append(
             create_finding(

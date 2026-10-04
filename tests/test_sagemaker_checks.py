@@ -12349,6 +12349,399 @@ class TestSM38RuntimeCoverageAndLambdaTier:
         assert_could_not_assess_finding(rows[0])
 
 
+_SM38_NARROWED = {
+    "Name": "narrowed",
+    "FieldSelectors": [
+        {"Field": "eventCategory", "Equals": ["Data"]},
+        {"Field": "resources.type", "Equals": ["AWS::Lambda::MicrovmImage"]},
+        {"Field": "eventName", "Equals": ["RunMicrovm"]},
+    ],
+}
+_SM38_OTHER_TYPE = {
+    "Name": "functions",
+    "FieldSelectors": [
+        {"Field": "eventCategory", "Equals": ["Data"]},
+        {"Field": "resources.type", "Equals": ["AWS::Lambda::Function"]},
+    ],
+}
+
+
+class TestRound9SM38MicrovmTier:
+    """AIR-SLF-RT-04: Lambda MicroVMs, which Runtime Monitoring does not cover,
+    are judged on flow logs over their egress subnets and on
+    AWS::Lambda::MicrovmImage data events."""
+
+    TYPE = sagemaker_app.MICROVM_DATA_EVENT_TYPE
+
+    @classmethod
+    def _selector(cls, *extra, types=None):
+        fields = [
+            {"Field": "eventCategory", "Equals": ["Data"]},
+            {"Field": "resources.type", "Equals": types or [cls.TYPE]},
+        ]
+        fields.extend({"Field": name, "Equals": ["x"]} for name in extra)
+        return {"Name": "microvm", "FieldSelectors": fields}
+
+    @classmethod
+    def _trail(
+        cls, name="org", multi=True, home="us-east-1", logging=True, selectors=None
+    ):
+        return {
+            "trail": {
+                "Name": name,
+                "TrailARN": f"arn:aws:cloudtrail:{home}:111122223333:trail/{name}",
+                "IsMultiRegionTrail": multi,
+                "HomeRegion": home,
+            },
+            "status": {"IsLogging": logging},
+            "selectors": {
+                "AdvancedEventSelectors": (
+                    [cls._selector()] if selectors is None else selectors
+                )
+            },
+        }
+
+    @classmethod
+    def _store(cls, name="lake", status="ENABLED", multi=True, selectors=None):
+        return {
+            "EventDataStoreArn": f"arn:aws:cloudtrail:us-east-1:111122223333:eventdatastore/{name}",
+            "Name": name,
+            "detail": {
+                "Status": status,
+                "MultiRegionEnabled": multi,
+                "AdvancedEventSelectors": (
+                    [cls._selector()] if selectors is None else selectors
+                ),
+            },
+        }
+
+    def _run(
+        self,
+        microvms=None,
+        connectors=None,
+        subnets=None,
+        flow_logs=None,
+        trails=None,
+        stores=None,
+        regions=("us-east-1", "us-west-2"),
+        errors=None,
+    ):
+        """microvms maps an id to its egress connectors, connectors a connector
+        to its subnets, subnets a subnet to its VPC, stores a Region to its
+        event data stores; errors maps a read to the exception it raises."""
+        errors = errors or {}
+        microvms = {"mv-1": ["nc-1"]} if microvms is None else microvms
+        connectors = {"nc-1": ["subnet-a"]} if connectors is None else connectors
+        subnets = {"subnet-a": "vpc-1"} if subnets is None else subnets
+        flow_logs = (
+            [{"ResourceId": "vpc-1", "FlowLogStatus": "ACTIVE", "TrafficType": "ALL"}]
+            if flow_logs is None
+            else flow_logs
+        )
+        trails = [self._trail()] if trails is None else trails
+        stores = stores or {}
+        self.store_reads = []
+        by_arn = {t["trail"]["TrailARN"]: t for t in trails}
+
+        def raise_for(key):
+            if key in errors:
+                raise errors[key]
+
+        def factory(service, region_name=None, **kwargs):
+            client = MagicMock()
+            if service == "lambda-microvms":
+
+                def list_microvms(**kw):
+                    raise_for("microvms")
+                    return [
+                        {"items": [{"microvmId": m, "state": "RUNNING"}]}
+                        for m in microvms
+                    ]
+
+                client.get_paginator.side_effect = _pager(
+                    {"list_microvms": list_microvms}
+                )
+                client.get_microvm.side_effect = lambda microvmIdentifier: {
+                    "microvmId": microvmIdentifier,
+                    "state": "RUNNING",
+                    "egressNetworkConnectors": microvms[microvmIdentifier],
+                }
+            elif service == "lambda-core":
+                client.get_network_connector.side_effect = lambda Identifier: {
+                    "Configuration": {
+                        "VpcEgressConfiguration": {"SubnetIds": connectors[Identifier]}
+                    }
+                }
+            elif service == "ec2":
+
+                def describe_subnets(Filters):
+                    raise_for("subnets")
+                    wanted = Filters[0]["Values"]
+                    return [
+                        {
+                            "Subnets": [
+                                {"SubnetId": s, "VpcId": v}
+                                for s, v in subnets.items()
+                                if s in wanted
+                            ]
+                        }
+                    ]
+
+                def describe_flow_logs(Filter):
+                    raise_for("flow")
+                    wanted = Filter[0]["Values"]
+                    return [
+                        {
+                            "FlowLogs": [
+                                f for f in flow_logs if f["ResourceId"] in wanted
+                            ]
+                        }
+                    ]
+
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "describe_subnets": describe_subnets,
+                        "describe_flow_logs": describe_flow_logs,
+                    }
+                )
+            elif service == "cloudtrail":
+
+                def describe_trails(includeShadowTrails):
+                    raise_for("trails")
+                    assert includeShadowTrails is True
+                    return {"trailList": [t["trail"] for t in trails]}
+
+                def get_trail_status(Name):
+                    raise_for("status")
+                    return by_arn[Name]["status"]
+
+                def get_event_selectors(TrailName):
+                    raise_for("selectors")
+                    return by_arn[TrailName]["selectors"]
+
+                def list_event_data_stores(NextToken=None):
+                    raise_for(f"stores:{region_name}")
+                    self.store_reads.append(region_name)
+                    listed = [
+                        {"EventDataStoreArn": s["EventDataStoreArn"], "Name": s["Name"]}
+                        for s in stores.get(region_name, [])
+                    ]
+                    if NextToken is None and len(listed) > 1:
+                        return {"EventDataStores": listed[:1], "NextToken": "t"}
+                    return {"EventDataStores": listed[1:] if NextToken else listed}
+
+                def get_event_data_store(EventDataStore):
+                    raise_for("store")
+                    for store in stores.get(region_name, []):
+                        if store["EventDataStoreArn"] == EventDataStore:
+                            return store["detail"]
+                    raise AssertionError(EventDataStore)
+
+                client.describe_trails.side_effect = describe_trails
+                client.get_trail_status.side_effect = get_trail_status
+                client.get_event_selectors.side_effect = get_event_selectors
+                client.list_event_data_stores.side_effect = list_event_data_stores
+                client.get_event_data_store.side_effect = get_event_data_store
+            elif service == "account":
+
+                def list_regions(RegionOptStatusContains):
+                    raise_for("regions")
+                    assert set(RegionOptStatusContains) == {
+                        "ENABLED",
+                        "ENABLED_BY_DEFAULT",
+                    }
+                    return [{"Regions": [{"RegionName": r} for r in regions]}]
+
+                client.get_paginator.side_effect = _pager(
+                    {"list_regions": list_regions}
+                )
+            return client
+
+        with patch("sagemaker_app.boto3.client", side_effect=factory):
+            return sagemaker_app._microvm_runtime_tier_findings("us-east-1")
+
+    @staticmethod
+    def _statuses(rows):
+        return [r["Status"] for r in rows]
+
+    @pytest.mark.parametrize("logged", ["vpc-1", "subnet-a"])
+    def test_a_logged_subnet_and_a_credited_trail_pass(self, logged):
+        rows = self._run(
+            flow_logs=[
+                {"ResourceId": logged, "FlowLogStatus": "ACTIVE", "TrafficType": "ALL"}
+            ]
+        )
+        assert self._statuses(rows) == ["Passed"]
+        assert (
+            "trail 'org' record(s) every AWS::Lambda::MicrovmImage"
+            in rows[0]["Finding_Details"]
+        )
+        assert rows[0]["Finding"] == sagemaker_app.MICROVM_RUNTIME_TIER_FINDING
+        assert self.store_reads == []
+
+    def test_no_microvm_emits_nothing(self):
+        assert self._run(microvms={}) == []
+
+    def test_a_failed_microvm_listing_is_na(self):
+        rows = self._run(
+            errors={"microvms": _make_client_error("AccessDeniedException")}
+        )
+        assert self._statuses(rows) == ["N/A"]
+        assert (
+            "lambda:ListMicrovms (AccessDeniedException)" in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "flow_log",
+        [
+            {"ResourceId": "vpc-1", "FlowLogStatus": "ACTIVE", "TrafficType": "ACCEPT"},
+            {"ResourceId": "vpc-1", "FlowLogStatus": "INACTIVE", "TrafficType": "ALL"},
+            {"ResourceId": "vpc-2", "FlowLogStatus": "ACTIVE", "TrafficType": "ALL"},
+        ],
+    )
+    def test_an_unlogged_egress_subnet_fails_and_names_only_its_microvm(self, flow_log):
+        rows = self._run(
+            microvms={"mv-1": ["nc-1"], "mv-2": ["nc-2"]},
+            connectors={"nc-1": ["subnet-a"], "nc-2": ["subnet-b"]},
+            subnets={"subnet-a": "vpc-1", "subnet-b": "vpc-2"},
+            flow_logs=[
+                flow_log,
+                {
+                    "ResourceId": "subnet-b",
+                    "FlowLogStatus": "ACTIVE",
+                    "TrafficType": "ALL",
+                },
+            ]
+            if flow_log["ResourceId"] != "vpc-2"
+            else [flow_log],
+        )
+        assert self._statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "egress subnet subnet-a of MicroVM(s) mv-1 has no ACTIVE flow log"
+            in details
+        )
+        assert "mv-2" not in details
+
+    def test_a_microvm_without_egress_is_noted_not_failed(self):
+        rows = self._run(microvms={"mv-1": ["nc-1"], "mv-9": []})
+        assert self._statuses(rows) == ["Passed"]
+        assert (
+            "MicroVM(s) mv-9 have no egress network connector"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_a_subnet_describe_subnets_omits_is_unread(self):
+        rows = self._run(subnets={})
+        assert self._statuses(rows) == ["N/A"]
+        assert (
+            "egress subnet subnet-a of MicroVM(s) mv-1 (DescribeSubnets did not return it)"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "trail, gap",
+        [
+            (
+                {"selectors": [_SM38_NARROWED]},
+                "narrows its AWS::Lambda::MicrovmImage selector by eventName",
+            ),
+            ({"selectors": [_SM38_OTHER_TYPE]}, None),
+            ({"logging": False}, "trail 'org' is not logging"),
+            ({"multi": False, "home": "us-west-2"}, None),
+        ],
+    )
+    def test_an_uncredited_trail_with_no_store_fails(self, trail, gap):
+        rows = self._run(trails=[self._trail(**trail)])
+        assert self._statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "no logging trail covering this Region" in details
+        if gap:
+            assert gap in details
+        else:
+            assert "narrows" not in details and "not logging" not in details
+        assert self.store_reads == ["us-east-1", "us-west-2"]
+
+    @pytest.mark.parametrize("home", ["us-east-1", "us-west-2"])
+    def test_an_enabled_store_stands_in_for_a_trail(self, home):
+        rows = self._run(
+            trails=[],
+            stores={home: [self._store("other", selectors=[]), self._store("lake")]},
+        )
+        assert self._statuses(rows) == ["Passed"]
+        assert (
+            f"event data store 'lake' in {home} record(s)" in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "store, gap",
+        [
+            (
+                {"status": "STOPPED_INGESTION"},
+                "event data store 'lake' in us-east-1 is STOPPED_INGESTION",
+            ),
+            (
+                {"selectors": [_SM38_NARROWED]},
+                "narrows its AWS::Lambda::MicrovmImage selector by eventName",
+            ),
+        ],
+    )
+    def test_an_uncredited_store_fails(self, store, gap):
+        rows = self._run(trails=[], stores={"us-east-1": [self._store(**store)]})
+        assert self._statuses(rows) == ["Failed"]
+        assert gap in rows[0]["Finding_Details"]
+
+    def test_a_single_region_store_elsewhere_does_not_count(self):
+        rows = self._run(trails=[], stores={"us-west-2": [self._store(multi=False)]})
+        assert self._statuses(rows) == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "key, text",
+        [
+            ("trails", "cloudtrail:DescribeTrails (AccessDeniedException)"),
+            ("selectors", "trail 'org' (AccessDeniedException)"),
+            ("regions", "account:ListRegions: AccessDeniedException"),
+            (
+                "stores:us-west-2",
+                "event data stores in us-west-2 (cloudtrail:ListEventDataStores: AccessDeniedException)",
+            ),
+            (
+                "store",
+                "event data store 'lake' in us-east-1 (cloudtrail:GetEventDataStore: AccessDeniedException)",
+            ),
+            ("flow", "the egress connector subnets' flow logs (AccessDeniedException)"),
+        ],
+    )
+    def test_a_failed_read_withholds_both_verdicts(self, key, text):
+        trails = None if key in ("trails", "selectors", "flow") else []
+        stores = {"us-east-1": [self._store(selectors=[])]}
+        rows = self._run(
+            trails=trails,
+            stores=stores,
+            errors={key: _make_client_error("AccessDeniedException")},
+        )
+        assert self._statuses(rows) == ["N/A"]
+        assert text in rows[0]["Finding_Details"]
+
+    def test_the_coverage_check_runs_the_microvm_leg(self):
+        row = {"Status": "Failed", "Finding": "sentinel"}
+        with (
+            patch.object(sagemaker_app, "_eks_audit_log_findings", return_value=[]),
+            patch.object(
+                sagemaker_app, "_lambda_runtime_tier_findings", return_value=[]
+            ),
+            patch.object(
+                sagemaker_app, "_microvm_runtime_tier_findings", return_value=[row]
+            ) as leg,
+        ):
+            result = sagemaker_app.check_guardduty_runtime_monitoring_coverage(
+                region="us-east-1",
+                detector_inventory={"detector_id": None, "detail": {}, "error": None},
+            )
+        leg.assert_called_once_with("us-east-1")
+        assert result["csv_data"] == [row]
+
+
 class TestSM39EksVpcCniNetworkPolicy:
     """AIR-SLF-RT-05: enableNetworkPolicy in the managed vpc-cni add-on."""
 

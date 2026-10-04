@@ -434,6 +434,9 @@ _EXPECTED_ACTIONS = {
         "detective:ListGraphs",
         "detective:DescribeOrganizationConfiguration",
         "bedrock-agentcore:ListAgentRuntimeEndpoints",
+        "cloudtrail:ListEventDataStores",
+        "cloudtrail:GetEventDataStore",
+        "account:ListRegions",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -1833,6 +1836,23 @@ _SAGEMAKER_MANAGED_GRANTS_2 = [
     # ListAgentRuntimeEndpoints has no resource type in the service
     # authorization reference (2026-10-04).
     ("Allow", "bedrock-agentcore:ListAgentRuntimeEndpoints", '"*"', None),
+    # SM-38 reads the event data stores that may record MicroVM data events.
+    # ListEventDataStores has no resource type in the service authorization
+    # reference (2026-10-04); GetEventDataStore has eventdatastore and
+    # ListRegions has account.
+    ("Allow", "cloudtrail:ListEventDataStores", '"*"', None),
+    (
+        "Allow",
+        "cloudtrail:GetEventDataStore",
+        _sagemaker_policy2_arn("cloudtrail:*:ACCOUNT:eventdatastore/*"),
+        None,
+    ),
+    (
+        "Allow",
+        "account:ListRegions",
+        _sagemaker_policy2_arn("account::ACCOUNT:account"),
+        None,
+    ),
 ]
 
 

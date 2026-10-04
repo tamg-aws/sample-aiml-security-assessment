@@ -495,6 +495,16 @@ section.
   its not-read row, as a lower bound when the run's 50-page counting budget
   ends first. The code comment records the live latency both caps were set
   from (account 178113193057, us-east-1, 2026-10-04).
+- `SM-38` adds a `Lambda MicroVM Runtime Detection Tier` row for each Region
+  with a MicroVM that has not ended. Runtime Monitoring does not cover
+  MicroVMs, so they were outside `SM-38` before. The row fails an egress
+  connector subnet with no `ACTIVE` flow log recording `ALL` traffic on the
+  subnet or its VPC, and fails when no logging trail covering the Region and
+  no `ENABLED` CloudTrail Lake event data store (this Region's, or a
+  multi-Region store homed in any Region enabled for the account) records
+  `AWS::Lambda::MicrovmImage` data events through a selector narrowed by no
+  field but `eventCategory` and `resources.type`. A failed read holds the row
+  at `N/A`.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
@@ -1861,6 +1871,16 @@ schedule whose latest execution is still running.
 no resource type in the service authorization reference and is read-only.
 Until the stack is updated, each AgentCore runtime reads `N/A` in the `SM-37`
 row, naming its endpoints as unread.
+
+**SageMaker MicroVM data-event store reads.**
+`SageMakerAssessmentReadsPolicy2` gains `cloudtrail:ListEventDataStores` on
+`'*'`, which has no resource type in the service authorization reference,
+`cloudtrail:GetEventDataStore` on
+`arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*` and
+`account:ListRegions` on `arn:${AWS::Partition}:account::${AWS::AccountId}:account`
+(all `SM-38`, all read-only). Until the stack is updated, a Region with a
+Lambda MicroVM and no trail recording its data events reads `N/A` in the
+`SM-38` MicroVM tier row, naming the event data stores as unread.
 
 **SageMaker Macie and Detective administrator reads.**
 `SageMakerAssessmentReadsPolicy2` gains `macie2:GetAdministratorAccount`,
