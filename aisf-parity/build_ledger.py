@@ -1577,7 +1577,18 @@ AI_SUBJECT_ROWS = [
         "bedrock.amazonaws.com statement without both a positive aws:SourceAccount "
         "and aws:SourceArn test naming the role's own account, fails a role two "
         "agents share, and fails an execution role that two action group Lambda "
-        "functions of those versions run as",
+        "functions of those versions run as, or that a Lambda function outside every "
+        "action group runs as (ListFunctions with FunctionVersion ALL). It scopes "
+        "each agent and action group role from the IAM permissions cache: an "
+        "unconditioned Allow of bedrock:InvokeModel, "
+        "bedrock:InvokeModelWithResponseStream, bedrock:Retrieve, "
+        "bedrock:InvokeAgent, s3:GetObject, s3:PutObject, dynamodb:GetItem, "
+        "dynamodb:PutItem, secretsmanager:GetSecretValue, lambda:InvokeFunction or "
+        "execute-api:Invoke on every resource of its type, or through NotResource, "
+        "fails unless the permissions boundary denies or scopes it; a conditioned "
+        "one, a role missing from the cache or with a policy read error, or an unread "
+        "agent or function is Not Applicable. Actions outside that probe set, Deny "
+        "statements and service control policies are not judged",
         [],
         5,
     ),

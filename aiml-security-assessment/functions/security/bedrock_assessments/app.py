@@ -1670,9 +1670,13 @@ def _boundary_document(permissions: Dict[str, Any]) -> Any:
     return boundary or None
 
 
-def _boundary_allowance(permissions: Dict[str, Any], action: str) -> str:
+def _boundary_allowance(
+    permissions: Dict[str, Any], action: str, unscoped: Any = None
+) -> str:
     """
     Say how a principal's permissions boundary treats one lowercase action.
+    ``unscoped`` judges each boundary Resource entry and defaults to
+    _resource_is_unscoped.
 
     Returns "none" when no boundary is set, "denied" when the boundary allows the
     action nowhere or denies it outright, "scoped" when every allowing boundary
@@ -1708,7 +1712,7 @@ def _boundary_allowance(permissions: Dict[str, Any], action: str) -> str:
     if any(
         "NotResource" in statement
         or any(
-            _resource_is_unscoped(resource)
+            (unscoped or _resource_is_unscoped)(resource)
             for resource in _as_list(statement.get("Resource"))
         )
         for statement in allowing
@@ -36521,8 +36525,50 @@ def _action_group_function_roles(region: str) -> Dict[str, Any]:
     return found
 
 
+def _unqualified_function_arn(function_arn: str) -> str:
+    """Drop the version or alias qualifier from a Lambda function ARN."""
+    return ":".join(str(function_arn).split(":")[:7])
+
+
+def _functions_outside_action_groups(
+    region: str, watched_roles: set, inside: set
+) -> Dict[str, Any]:
+    """
+    List every Lambda function version in the Region and return the ones that
+    run as a watched role but are not an action group function.
+
+    Returns {"roles": {role ARN: [function ARN]}, "errors": [what was not
+    read]}. ``inside`` holds unqualified action group function ARNs, so another
+    version of an action group function is not counted as outside.
+    """
+    found = {"roles": {}, "errors": []}
+    lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+    try:
+        for page in lambda_client.get_paginator("list_functions").paginate(
+            FunctionVersion="ALL"
+        ):
+            for function in page.get("Functions") or []:
+                role_arn = function.get("Role")
+                arn = function.get("FunctionArn") or ""
+                if role_arn not in watched_roles:
+                    continue
+                if _unqualified_function_arn(arn) in inside:
+                    continue
+                arns = found["roles"].setdefault(role_arn, [])
+                if arn not in arns:
+                    arns.append(arn)
+    except (ClientError, BotoCoreError, TypeError) as error:
+        found["errors"].append(
+            "Lambda functions were not listed with lambda:ListFunctions "
+            f"({get_assessment_error_label(error)})"
+        )
+    return found
+
+
 def check_bedrock_agent_workload_identity(
-    region: str = "", agent_inventory: Optional[Dict[str, Any]] = None
+    region: str = "",
+    agent_inventory: Optional[Dict[str, Any]] = None,
+    function_roles: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-57 IAM-05 legs. Fail each Bedrock agent role whose bedrock.amazonaws.com
@@ -36530,8 +36576,9 @@ def check_bedrock_agent_workload_identity(
     aws:SourceArn naming the role's own account; the roles are the
     agentResourceRoleArn of every agent's DRAFT and alias-routed versions, and
     each trust policy is read with iam:GetRole. Fail each execution role that
-    two or more action group Lambda functions run as. Distinct roles per agent
-    are judged by BR-57's handoff rows.
+    two or more action group Lambda functions run as, and each agent or action
+    group role that a Lambda function outside every action group also runs as.
+    Distinct roles per agent are judged by BR-57's handoff rows.
     """
     check_name = AGENT_ROLE_DEPUTY_FINDING
     findings = {"check_name": check_name, "status": "PASS", "csv_data": []}
@@ -36664,7 +36711,11 @@ def check_bedrock_agent_workload_identity(
                     "Passed",
                 )
             )
-        functions = _action_group_function_roles(region)
+        functions = (
+            function_roles
+            if function_roles is not None
+            else _action_group_function_roles(region)
+        )
         shared = {
             role_arn: arns
             for role_arn, arns in sorted(functions["roles"].items())
@@ -36695,27 +36746,59 @@ def check_bedrock_agent_workload_identity(
                     "Failed",
                 )
             )
-        if functions["errors"]:
+        outside = (
+            _functions_outside_action_groups(
+                region,
+                set(functions["roles"]) | set(agent_roles),
+                {
+                    _unqualified_function_arn(arn)
+                    for arns in functions["roles"].values()
+                    for arn in arns
+                },
+            )
+            if functions["roles"] or agent_roles
+            else {"roles": {}, "errors": []}
+        )
+        for role_arn, arns in sorted(outside["roles"].items()):
+            runs = (agent_roles.get(role_arn) or [])[:3] + [
+                f"action group function {arn}"
+                for arn in (functions["roles"].get(role_arn) or [])[:3]
+            ]
+            findings["csv_data"].append(
+                function_row(
+                    "Role {}, which {} run(s) as, is also the execution role of "
+                    "{} Lambda function(s) outside every action group: {}, so "
+                    "code the agent never calls holds the agent's grants and its "
+                    "calls carry the same identity in CloudTrail.".format(
+                        role_arn, ", ".join(runs), len(arns), ", ".join(arns[:5])
+                    ),
+                    "Give each agent and each action group function a role that "
+                    "no other function runs as.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        function_errors = functions["errors"] + outside["errors"]
+        if function_errors:
             findings["csv_data"].append(
                 function_row(
                     "{} part(s) of the action group function population were not "
                     "read: {}.".format(
-                        len(functions["errors"]), "; ".join(functions["errors"][:10])
+                        len(function_errors), "; ".join(function_errors[:10])
                     ),
                     COULD_NOT_ASSESS_RESOLUTION,
                     "Informational",
                     "N/A",
                 )
             )
-        elif not shared and functions["functions"]:
+        elif not shared and not outside["roles"] and functions["functions"]:
             findings["csv_data"].append(
                 function_row(
                     "Each of the {} action group Lambda function(s) runs as an "
-                    "execution role no other action group function runs as. "
-                    "Whether a role is shared with a function outside an action "
-                    "group, and what each role may do, are not judged here.".format(
-                        functions["functions"]
-                    ),
+                    "execution role no other action group function runs as, and "
+                    "no Lambda function outside an action group runs as an agent "
+                    "or action group role. What each role may do is judged on the "
+                    "{} rows.".format(functions["functions"], AGENT_ROLE_SCOPE_FINDING),
                     "No action required",
                     "Medium",
                     "Passed",
@@ -36723,9 +36806,9 @@ def check_bedrock_agent_workload_identity(
             )
         findings["status"] = (
             "WARN"
-            if gaps or shared
+            if gaps or shared or outside["roles"]
             else "N/A"
-            if unread or functions["errors"] or not agent_roles
+            if unread or function_errors or not agent_roles
             else "PASS"
         )
         return findings
@@ -36745,6 +36828,293 @@ def check_bedrock_agent_workload_identity(
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=AGENT_ROLE_DEPUTY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+AGENT_ROLE_SCOPE_FINDING = "Bedrock Agent Role Resource Scope"
+
+AGENT_ROLE_SCOPE_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/agents-permissions.html\n"
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html"
+)
+
+# Actions that each have a resource type in the Service Authorization
+# Reference, one per kind of thing an agent role reaches: a model, a knowledge
+# base, another agent, data, and an API. A grant of one on every resource of
+# its type is wider than any one agent needs.
+AGENT_ROLE_SCOPE_PROBE_ACTIONS = (
+    "bedrock:invokemodel",
+    "bedrock:invokemodelwithresponsestream",
+    "bedrock:retrieve",
+    "bedrock:invokeagent",
+    "s3:getobject",
+    "s3:putobject",
+    "dynamodb:getitem",
+    "dynamodb:putitem",
+    "secretsmanager:getsecretvalue",
+    "lambda:invokefunction",
+    "execute-api:invoke",
+)
+
+# Services whose ARN resource segment starts with the resource name, not a
+# resource type: arn:aws:s3:::bucket/key and arn:aws:execute-api:...:api-id/...
+ARN_WITHOUT_TYPE_PREFIX_SERVICES = frozenset({"s3", "execute-api"})
+
+
+def _arn_covers_every_resource(resource: Any) -> bool:
+    """
+    Return True when a Resource entry names no particular resource of its type:
+    "*", an ARN whose resource name starts with a wildcard (such as
+    arn:aws:s3:::*, table/*, function:* or secret:*), a pattern covering every
+    foundation model or inference profile, or a short ARN ending in a wildcard.
+    """
+    if not isinstance(resource, str):
+        return False
+    resource = resource.strip()
+    if resource == "*" or _pattern_covers_every_model(resource):
+        return True
+    parts = resource.split(":", 5)
+    if len(parts) < 6:
+        return resource.endswith("*")
+    name = parts[5]
+    if not name or name[0] in "*?":
+        return True
+    if parts[2] in ARN_WITHOUT_TYPE_PREFIX_SERVICES:
+        return False
+    cut = min(
+        (index for index in (name.find("/"), name.find(":")) if index >= 0),
+        default=-1,
+    )
+    return cut >= 0 and name[cut + 1 : cut + 2] in ("*", "?", "")
+
+
+def check_bedrock_agent_role_scope(
+    permission_cache: Dict[str, Any],
+    region: str = "",
+    agent_inventory: Optional[Dict[str, Any]] = None,
+    function_roles: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    BR-57 IAM-05 scope leg. Fail each Bedrock agent role, and each role an
+    action group Lambda function runs as, whose cached identity policies Allow
+    an AGENT_ROLE_SCOPE_PROBE_ACTIONS action on every resource of its type with
+    no Condition, unless the role's permissions boundary denies the action or
+    allows it only on named resources.
+    """
+    findings = {
+        "check_name": AGENT_ROLE_SCOPE_FINDING,
+        "status": "PASS",
+        "csv_data": [],
+    }
+
+    def row(details, resolution, severity, status):
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-57",
+                finding_name=AGENT_ROLE_SCOPE_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=AGENT_ROLE_SCOPE_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
+
+    try:
+        inventory = (
+            agent_inventory
+            if agent_inventory is not None
+            else get_agent_role_inventory(region)
+        )
+        functions = (
+            function_roles
+            if function_roles is not None
+            else _action_group_function_roles(region)
+        )
+        population: Dict[str, List[str]] = {}
+        for role_arn, labels in inventory["roles"].items():
+            for label in labels:
+                if label.startswith("Bedrock agent "):
+                    population.setdefault(role_arn, []).append(label)
+        for role_arn, arns in functions["roles"].items():
+            population.setdefault(role_arn, []).extend(
+                f"action group function {arn}" for arn in arns
+            )
+        unread = [
+            error for error in inventory["errors"] if error.startswith("Bedrock")
+        ] + list(functions["errors"])
+        errored = {
+            str(error.get("name"))
+            for error in permission_cache.get("principal_errors") or []
+            if isinstance(error, dict) and error.get("type") == "role"
+        }
+        roles = permission_cache.get("role_permissions") or {}
+        failed, conditioned, scoped = [], [], []
+        for role_arn, labels in sorted(population.items()):
+            name = role_arn.rsplit("/", 1)[-1]
+            permissions = roles.get(name)
+            if permissions is None:
+                unread.append(f"role {role_arn} is not in the IAM permissions cache")
+                continue
+            if name in errored:
+                unread.append(
+                    f"role {role_arn} had a policy read fail in the IAM permissions "
+                    "cache"
+                )
+            wide, held = [], []
+            for source, policy in _cached_identity_policies(permissions):
+                policy_name = (
+                    policy.get("policy_name") or policy.get("name") or "unnamed"
+                )
+                try:
+                    statements = _policy_statements(policy.get("document"))
+                except (ValueError, TypeError) as error:
+                    unread.append(
+                        f"{source} '{policy_name}' of role {role_arn} "
+                        f"({get_assessment_error_label(error)})"
+                    )
+                    continue
+                for statement in statements:
+                    if str(statement.get("Effect", "")).upper() != "ALLOW":
+                        continue
+                    resources = _as_list(statement.get("Resource"))
+                    if "NotResource" not in statement and not any(
+                        _arn_covers_every_resource(resource) for resource in resources
+                    ):
+                        continue
+                    actions = [
+                        action
+                        for action in AGENT_ROLE_SCOPE_PROBE_ACTIONS
+                        if _statement_matches_action(statement, action)
+                        and _boundary_allowance(
+                            permissions, action, _arn_covers_every_resource
+                        )
+                        in ("none", "unscoped")
+                    ]
+                    if not actions:
+                        continue
+                    label = "statement '{}' of {} '{}' allows {} on {}".format(
+                        statement.get("Sid") or "unnamed",
+                        source,
+                        policy_name,
+                        ", ".join(actions),
+                        "everything but its NotResource"
+                        if "NotResource" in statement
+                        else ", ".join(str(resource) for resource in resources[:3]),
+                    )
+                    if statement.get("Condition"):
+                        held.append(label)
+                    else:
+                        wide.append(label)
+            runs = ", ".join(labels[:3])
+            if wide:
+                failed.append(
+                    f"role {role_arn} (run by {runs}): " + "; ".join(wide[:3])
+                )
+            elif held:
+                conditioned.append(
+                    f"role {role_arn} (run by {runs}): " + "; ".join(held[:3])
+                )
+            else:
+                scoped.append(role_arn)
+
+        for gap in failed[:MAX_REPORTED_UNOWNED_RESOURCES]:
+            row(
+                f"Bedrock agent or action group {gap}, so the role reaches every "
+                "resource of that type, not only the models, data and APIs its "
+                "agent needs. Deny statements and service control policies are not "
+                "subtracted, so this may overstate the effective grant.",
+                "Scope each Allow on the role to the ARNs of the models, knowledge "
+                "bases, buckets, tables, secrets, functions and APIs the agent "
+                "uses.",
+                "Medium",
+                "Failed",
+            )
+        if len(failed) > MAX_REPORTED_UNOWNED_RESOURCES:
+            row(
+                "{} further Bedrock agent or action group role(s) allow a probed "
+                "action on every resource of its type.".format(
+                    len(failed) - MAX_REPORTED_UNOWNED_RESOURCES
+                ),
+                "Scope each Allow to the ARNs the agent uses.",
+                "Medium",
+                "Failed",
+            )
+        if conditioned:
+            row(
+                "{} Bedrock agent or action group role(s) allow a probed action on "
+                "every resource of its type only under a Condition, which is not "
+                "judged: {}.".format(len(conditioned), "; ".join(conditioned[:5])),
+                "Scope each Allow to the ARNs the agent uses, so the grant does not "
+                "rest on a condition key.",
+                "Informational",
+                "N/A",
+            )
+        if unread:
+            row(
+                "{} part(s) of the Bedrock agent role population were not read: "
+                "{}.".format(len(unread), "; ".join(unread[:10])),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        if not population and not unread:
+            row(
+                "No Bedrock agent or action group function role exists in "
+                f"{region or 'this Region'}.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        elif population and not failed and not conditioned and not unread:
+            version_note = (
+                f" {IAM_CACHE_V1_NOTE}"
+                if _cache_principal_errors(permission_cache, ("role",)) is None
+                else ""
+            )
+            row(
+                "None of the {} Bedrock agent and action group role(s) allows {} on "
+                "every resource of its type in its attached or inline policies, "
+                "after its permissions boundary: {}. Actions outside this set are "
+                "not judged.{}".format(
+                    len(scoped),
+                    ", ".join(AGENT_ROLE_SCOPE_PROBE_ACTIONS),
+                    ", ".join(scoped[:5]),
+                    version_note,
+                ),
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        findings["status"] = (
+            "WARN"
+            if failed
+            else "N/A"
+            if conditioned or unread or not population
+            else "PASS"
+        )
+        return findings
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_agent_role_scope: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": AGENT_ROLE_SCOPE_FINDING,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-57",
+                    finding_name=AGENT_ROLE_SCOPE_FINDING,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AGENT_ROLE_SCOPE_REFERENCE,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -38732,6 +39102,11 @@ def lambda_handler(event, context):
         except Exception as error:
             logger.warning(f"Agent role inventory failed in {region}: {error}")
             agent_inventory = None
+        try:
+            function_roles = _action_group_function_roles(region)
+        except Exception as error:
+            logger.warning(f"Action group function roles failed in {region}: {error}")
+            function_roles = None
         all_findings.append(
             _permission_cache_unavailable_result("BR-57", AGENT_HANDOFF_FINDING, region)
             if permission_cache is None
@@ -38741,7 +39116,21 @@ def lambda_handler(event, context):
         )
         all_findings.append(
             check_bedrock_agent_workload_identity(
-                region=region, agent_inventory=agent_inventory
+                region=region,
+                agent_inventory=agent_inventory,
+                function_roles=function_roles,
+            )
+        )
+        all_findings.append(
+            _permission_cache_unavailable_result(
+                "BR-57", AGENT_ROLE_SCOPE_FINDING, region
+            )
+            if permission_cache is None
+            else check_bedrock_agent_role_scope(
+                permission_cache,
+                region=region,
+                agent_inventory=agent_inventory,
+                function_roles=function_roles,
             )
         )
         assessed_regions = _assessed_regions(region)

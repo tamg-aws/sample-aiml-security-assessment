@@ -8539,6 +8539,7 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_llm_jacking_activity": "BR-56",
         "check_agent_handoff_source_identity": "BR-57",
         "check_bedrock_agent_workload_identity": "BR-57",
+        "check_bedrock_agent_role_scope": "BR-57",
     }
 
     # Checks that read a global surface (the IAM permissions cache or the
@@ -38654,9 +38655,12 @@ class TestBR57AgentRoleConfusedDeputy:
             "ArnLike": {"aws:SourceArn": cls.AGENT_ARN},
         }
 
-    def _run(self, roles, trusts, errors=(), agents=None, function_roles=None):
+    def _run(
+        self, roles, trusts, errors=(), agents=None, function_roles=None, listed=()
+    ):
         """`agents` is {agent id: {"aliases": [versions], version: [function
-        ARNs]}}; `function_roles` maps a function ARN to its role or an error."""
+        ARNs]}}; `function_roles` maps a function ARN to its role or an error;
+        `listed` is the ListFunctions pages, or an error."""
         agents = agents or {}
         function_roles = function_roles or {}
         agent_client = MagicMock()
@@ -38699,6 +38703,13 @@ class TestBR57AgentRoleConfusedDeputy:
             return {"Configuration": {"Role": outcome}}
 
         lambda_client.get_function.side_effect = get_function
+        if isinstance(listed, Exception):
+            lambda_client.get_paginator.return_value.paginate.side_effect = listed
+        else:
+            lambda_client.get_paginator.return_value.paginate.return_value = [
+                {"Functions": list(page)} for page in listed
+            ]
+        self.lambda_client = lambda_client
         self.agent_client = agent_client
         inventory = {
             "roles": {self._role(name): labels for name, labels in roles.items()},
@@ -38924,6 +38935,50 @@ class TestBR57AgentRoleConfusedDeputy:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert result["status"] == "N/A"
         iam.get_role.assert_not_called()
+
+    def test_a_function_outside_every_action_group_on_a_watched_role_fails(self):
+        """The second page holds the outsider; another version of an action
+        group function and a function on an unwatched role are not counted."""
+        result, _, _ = self._run(
+            {"a": ["Bedrock agent 'a' version DRAFT"]},
+            {"a": [self._statement(self._bound())]},
+            agents={"ag1": {"DRAFT": [self.FN.format("one") + ":live"]}},
+            function_roles={self.FN.format("one") + ":live": self.ROLE_A},
+            listed=[
+                [
+                    {"FunctionArn": self.FN.format("one") + ":3", "Role": self.ROLE_A},
+                    {"FunctionArn": self.FN.format("other"), "Role": self.ROLE_SHARED},
+                ],
+                [
+                    {"FunctionArn": self.FN.format("cron"), "Role": self.ROLE_A},
+                    {"FunctionArn": self.FN.format("etl"), "Role": self._role("a")},
+                ],
+            ],
+        )
+        assert [r["Status"] for r in self.function_rows] == ["Failed", "Failed"]
+        details = " ".join(r["Finding_Details"] for r in self.function_rows)
+        assert self.FN.format("cron") in details and self.FN.format("etl") in details
+        assert self.FN.format("other") not in details
+        assert self.FN.format("one") + ":3" not in details
+        assert "Bedrock agent 'a' version DRAFT" in details
+        assert result["status"] == "WARN"
+        self.lambda_client.get_paginator.return_value.paginate.assert_called_with(
+            FunctionVersion="ALL"
+        )
+
+    def test_unlisted_lambda_functions_keep_the_function_row_from_passing(self):
+        self._run(
+            {},
+            {},
+            agents={"ag1": {"DRAFT": [self.FN.format("one")]}},
+            function_roles={self.FN.format("one"): self.ROLE_A},
+            listed=_client_error("AccessDenied", "d", "ListFunctions"),
+        )
+        assert [r["Status"] for r in self.function_rows] == ["N/A"]
+        assert (
+            "lambda:ListFunctions (AccessDenied)"
+            in self.function_rows[0]["Finding_Details"]
+        )
 
 
 class TestBR57AgentHandoffSourceIdentity:
@@ -42327,3 +42382,311 @@ class TestBR34GuardDutyPromptInjection:
 
         assert [row["Status"] for row in rows] == ["N/A"]
         assert "AccessDenied" in rows[0]["Finding_Details"]
+
+
+class TestBR57AgentRoleScope:
+    """AIR-FND-IAM-05: each Bedrock agent and action group role is scoped to
+    the model, data and API ARNs it needs."""
+
+    ACCOUNT = "123456789012"
+    FN = "arn:aws:lambda:us-east-1:123456789012:function:{}"
+
+    @classmethod
+    def _role(cls, name):
+        return f"arn:aws:iam::{cls.ACCOUNT}:role/{name}"
+
+    @staticmethod
+    def _allow(action, resource, sid="s", **extra):
+        return {
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": action,
+            "Resource": resource,
+            **extra,
+        }
+
+    def _run(
+        self, roles, agent_roles, function_roles=None, cache_extra=None, errors=()
+    ):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": roles,
+            "user_permissions": {},
+        }
+        cache.update(cache_extra or {})
+        inventory = {
+            "roles": {self._role(name): labels for name, labels in agent_roles.items()},
+            "errors": list(errors),
+        }
+        functions = {"roles": {}, "functions": 0, "errors": []}
+        for arn, role in (function_roles or {}).items():
+            functions["roles"].setdefault(self._role(role), []).append(arn)
+            functions["functions"] += 1
+        result = bedrock_app.check_bedrock_agent_role_scope(
+            cache,
+            region="us-east-1",
+            agent_inventory=inventory,
+            function_roles=functions,
+        )
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-57"
+        return result, rows
+
+    def test_one_wide_role_fails_beside_a_scoped_one(self):
+        roles = {
+            "agent-wide": _identity(
+                attached=[
+                    _customer_policy(
+                        "wide",
+                        self._allow("bedrock:InvokeModel", "*", sid="AnyModel"),
+                    )
+                ]
+            ),
+            "agent-tight": _identity(
+                inline=[
+                    {
+                        "name": "tight",
+                        "document": _policy(
+                            self._allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*::foundation-model/anthropic.claude-v2",
+                            ),
+                            self._allow("s3:GetObject", "arn:aws:s3:::kb-docs/*"),
+                            self._allow("bedrock:ListFoundationModels", "*"),
+                        ),
+                    }
+                ]
+            ),
+        }
+        result, rows = self._run(
+            roles,
+            {
+                "agent-wide": ["Bedrock agent 'w' version DRAFT"],
+                "agent-tight": ["Bedrock agent 't' version 1"],
+                "runtime": ["AgentCore runtime 'r' version 1"],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert self._role("agent-wide") in detail
+        assert "statement 'AnyModel'" in detail and "bedrock:invokemodel on *" in detail
+        assert self._role("agent-tight") not in detail
+        assert result["status"] == "WARN"
+
+    @pytest.mark.parametrize(
+        "action, resource",
+        [
+            ("s3:*", "arn:aws:s3:::*"),
+            ("s3:GetObject", "arn:aws:s3:::*/*"),
+            ("dynamodb:GetItem", "arn:aws:dynamodb:us-east-1:123456789012:table/*"),
+            ("secretsmanager:*", "arn:aws:secretsmanager:*:*:secret:*"),
+            (
+                "lambda:InvokeFunction",
+                "arn:aws:lambda:us-east-1:123456789012:function:*",
+            ),
+            ("bedrock:Invoke*", "arn:aws:bedrock:*::foundation-model/*"),
+            ("bedrock:Retrieve", "arn:aws:bedrock:us-east-1:123456789012:*"),
+            ("execute-api:Invoke", "arn:aws:execute-api:*"),
+            ("*", "*"),
+        ],
+    )
+    def test_a_probed_action_on_every_resource_of_its_type_fails(
+        self, action, resource
+    ):
+        _, rows = self._run(
+            {
+                "role": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(self._allow(action, resource)),
+                        }
+                    ]
+                )
+            },
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "action, resource",
+        [
+            ("s3:GetObject", "arn:aws:s3:::kb-docs/*"),
+            ("s3:GetObject", "arn:aws:s3:::kb-*/*"),
+            ("dynamodb:GetItem", "arn:aws:dynamodb:*:123456789012:table/orders"),
+            ("lambda:InvokeFunction", "arn:aws:lambda:*:*:function:tool-*"),
+            (
+                "execute-api:Invoke",
+                "arn:aws:execute-api:us-east-1:123456789012:abc123/*",
+            ),
+            ("bedrock:InvokeModel", "arn:aws:bedrock:*::foundation-model/anthropic.*"),
+            ("ec2:DescribeInstances", "*"),
+        ],
+    )
+    def test_a_named_resource_or_an_unprobed_action_passes(self, action, resource):
+        _, rows = self._run(
+            {
+                "role": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(self._allow(action, resource)),
+                        }
+                    ]
+                )
+            },
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Actions outside this set are not judged" in rows[0]["Finding_Details"]
+
+    def test_an_action_group_function_role_is_judged(self):
+        _, rows = self._run(
+            {
+                "fn-role": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(self._allow("s3:PutObject", "*")),
+                        }
+                    ]
+                )
+            },
+            {},
+            function_roles={self.FN.format("tool"): "fn-role"},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"action group function {self.FN.format('tool')}"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_not_resource_counts_as_unscoped(self):
+        statement = {
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "NotResource": "arn:aws:s3:::secret/*",
+        }
+        _, rows = self._run(
+            {"role": _identity(inline=[{"name": "p", "document": _policy(statement)}])},
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "everything but its NotResource" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "boundary, status",
+        [
+            (
+                _policy(
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:GetObject",
+                        "Resource": "arn:aws:s3:::kb/*",
+                    }
+                ),
+                "Passed",
+            ),
+            (
+                _policy({"Effect": "Allow", "Action": "ec2:*", "Resource": "*"}),
+                "Passed",
+            ),
+            (_policy({"Effect": "Allow", "Action": "s3:*", "Resource": "*"}), "Failed"),
+        ],
+    )
+    def test_a_boundary_bounds_the_grant_only_when_it_scopes_it(self, boundary, status):
+        permissions = _identity(
+            inline=[
+                {"name": "p", "document": _policy(self._allow("s3:GetObject", "*"))}
+            ]
+        )
+        permissions["permissions_boundary"] = {"document": boundary}
+        _, rows = self._run(
+            {"role": permissions}, {"role": ["Bedrock agent 'a' version DRAFT"]}
+        )
+        assert [r["Status"] for r in rows] == [status]
+
+    def test_a_conditioned_wide_grant_is_not_passed(self):
+        statement = self._allow(
+            "s3:GetObject",
+            "*",
+            Condition={"StringEquals": {"aws:ResourceTag/agent": "a"}},
+        )
+        _, rows = self._run(
+            {"role": _identity(inline=[{"name": "p", "document": _policy(statement)}])},
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "only under a Condition, which is not judged" in rows[0]["Finding_Details"]
+        )
+
+    def test_an_unread_role_keeps_the_row_from_passing(self):
+        tight = _identity(
+            inline=[
+                {
+                    "name": "p",
+                    "document": _policy(
+                        self._allow("s3:GetObject", "arn:aws:s3:::kb/*")
+                    ),
+                }
+            ]
+        )
+        _, rows = self._run(
+            {"tight": tight, "errored": tight},
+            {
+                "tight": ["Bedrock agent 'a' version DRAFT"],
+                "errored": ["Bedrock agent 'b' version DRAFT"],
+                "missing": ["Bedrock agent 'c' version DRAFT"],
+            },
+            cache_extra={
+                "principal_errors": [
+                    {
+                        "type": "role",
+                        "name": "errored",
+                        "stage": "inline_policies",
+                        "error": "x",
+                    }
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            f"role {self._role('missing')} is not in the IAM permissions cache"
+            in detail
+        )
+        assert f"role {self._role('errored')} had a policy read fail" in detail
+
+    def test_an_unread_inventory_keeps_the_row_from_passing(self):
+        _, rows = self._run(
+            {},
+            {},
+            errors=[
+                "Bedrock agents were not read with bedrock:ListAgents (AccessDenied)"
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "bedrock:ListAgents (AccessDenied)" in rows[0]["Finding_Details"]
+
+    def test_a_version_one_cache_says_errors_were_not_recorded(self):
+        tight = _identity(
+            inline=[
+                {
+                    "name": "p",
+                    "document": _policy(
+                        self._allow("s3:GetObject", "arn:aws:s3:::kb/*")
+                    ),
+                }
+            ]
+        )
+        _, rows = self._run(
+            {"role": tight},
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+            cache_extra={"cache_schema_version": 1},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert bedrock_app.IAM_CACHE_V1_NOTE in rows[0]["Finding_Details"]
