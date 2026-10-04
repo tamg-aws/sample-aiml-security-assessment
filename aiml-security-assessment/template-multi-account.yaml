@@ -1561,6 +1561,15 @@ Resources:
             Action:
               - ecr:DescribeImages # AC-50
             Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
+          - Sid: LogArchiveDestinationRead
+            # AC-26 follows a subscription filter that targets a CloudWatch Logs
+            # destination to the stream behind it. DescribeDestinations has no
+            # resource type in the service authorization reference, so it
+            # takes '*'.
+            Effect: Allow
+            Action:
+              - logs:DescribeDestinations # AC-26
+            Resource: '*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

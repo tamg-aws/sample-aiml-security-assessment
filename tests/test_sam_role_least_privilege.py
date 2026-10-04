@@ -317,6 +317,7 @@ _EXPECTED_ACTIONS = {
         "cloudfront:ListDistributions",
         "ecr:DescribeImages",
         "firehose:DescribeDeliveryStream",
+        "logs:DescribeDestinations",
         "logs:DescribeSubscriptionFilters",
         "s3:GetBucketObjectLockConfiguration",
         "s3:GetBucketOwnershipControls",
@@ -1373,6 +1374,8 @@ _AGENTCORE_MANAGED_GRANTS = [
             {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
         ),
     ),
+    # No resource type in the service authorization reference (2026-10-03).
+    ("Allow", "logs:DescribeDestinations", json.dumps("*")),
 ]
 
 

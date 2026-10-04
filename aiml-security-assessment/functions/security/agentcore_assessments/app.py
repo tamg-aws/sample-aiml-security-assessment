@@ -318,6 +318,7 @@ LOGS_SUBSCRIPTION_REFERENCE_URL = (
     "API_PutSubscriptionFilter.html"
 )
 AGENTCORE_LOG_ARCHIVE_FINDING = "AgentCore Log Archive Forwarding"
+AGENTCORE_LOG_ARCHIVE_DESTINATION_FINDING = "AgentCore Log Archive Destination"
 S3_OBJECT_LOCK_REFERENCE_URL = (
     "https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html"
 )
@@ -6667,10 +6668,8 @@ BROWSER_RECORDING_BUCKET_READS = (
 BROWSER_RECORDING_WRITE_ACTION = "s3:putobject"
 BROWSER_RECORDING_READ_ACTION = "s3:getobject"
 BROWSER_RECORDING_WRITE_CEILING = (
-    "Service control policies on this write are judged in the separate "
-    "AgentCore Browser Recording Write SCP row. The kms:Decrypt a multipart "
-    "upload also needs is not judged, so this leg can report a write the "
-    "account would block."
+    "Service control and resource control policies on this write are judged in "
+    "the separate AgentCore Browser Recording Write SCP row."
 )
 
 
@@ -6827,6 +6826,19 @@ def _recording_bucket_key_ids(reads: Dict[str, Tuple[str, Any]]) -> List[str]:
 # account as kms:CallerAccount and s3.<region>.amazonaws.com as kms:ViaService.
 RECORDING_KEY_USE_CONDITION_KEYS = {"kms:calleraccount", "kms:viaservice"}
 RECORDING_KEY_USE_ACTION = "kms:generatedatakey"
+RECORDING_KEY_DECRYPT_ACTION = "kms:decrypt"
+RECORDING_KEY_WRITE_ACTIONS = (
+    (
+        "kms:GenerateDataKey",
+        RECORDING_KEY_USE_ACTION,
+        "S3 cannot encrypt its recordings",
+    ),
+    (
+        "kms:Decrypt",
+        RECORDING_KEY_DECRYPT_ACTION,
+        "a multipart upload of a recording fails",
+    ),
+)
 
 
 def _recording_key_condition_admits(statement: Dict[str, Any], account: str) -> bool:
@@ -6860,7 +6872,7 @@ def _recording_key_condition_admits(statement: Dict[str, Any], account: str) -> 
     return True
 
 
-def _recording_key_use_verdict(
+def _recording_key_action_verdict(
     role_arn: str,
     role_name: str,
     key_arn: str,
@@ -6870,8 +6882,11 @@ def _recording_key_use_verdict(
     boundary_statements: List[Dict[str, Any]],
     account: str,
     partition: str,
+    spelling: str = "kms:GenerateDataKey",
+    action: str = RECORDING_KEY_USE_ACTION,
+    consequence: str = "S3 cannot encrypt its recordings",
 ) -> Tuple[str, str]:
-    """Judge whether the execution role may use the recording key for a write.
+    """Judge whether the execution role may use the recording key for one action.
 
     S3 encrypts each recording with a data key it requests from KMS as the
     writer, so the role needs kms:GenerateDataKey on the key. The key policy
@@ -6886,7 +6901,7 @@ def _recording_key_use_verdict(
 
     def reaches(statement: Dict[str, Any]) -> bool:
         return _statement_matches_action(
-            statement, RECORDING_KEY_USE_ACTION
+            statement, action
         ) and _statement_resource_covers(statement, [key_arn])
 
     def names(statement: Dict[str, Any], principals: Set[str]) -> bool:
@@ -6906,8 +6921,7 @@ def _recording_key_use_verdict(
         if not statement.get("Condition"):
             return "failed", (
                 f"a Deny in {source} refuses execution role {role_name} "
-                f"kms:GenerateDataKey on recording key {key_arn}, so S3 cannot "
-                "encrypt its recordings"
+                f"{spelling} on recording key {key_arn}, so {consequence}"
             )
         conditional.append(f"a Deny in {source} on key {key_arn}")
 
@@ -6942,7 +6956,7 @@ def _recording_key_use_verdict(
         return "failed", (
             f"neither the policy of recording key {key_arn} nor, through the "
             f"account root, an identity policy of execution role {role_name} "
-            "allows kms:GenerateDataKey, so S3 cannot encrypt its recordings"
+            f"allows {spelling}, so {consequence}"
         )
     before = len(conditional)
     if (
@@ -6952,7 +6966,7 @@ def _recording_key_use_verdict(
     ):
         return "failed", (
             f"the permissions boundary of execution role {role_name} does not "
-            f"allow kms:GenerateDataKey on recording key {key_arn}"
+            f"allow {spelling} on recording key {key_arn}"
         )
     if conditional or not (direct or identity_allows):
         return "unread", (
@@ -6961,9 +6975,48 @@ def _recording_key_use_verdict(
             "not evaluated"
         )
     return "granted", (
-        f"use key {key_arn} for kms:GenerateDataKey through "
+        f"use key {key_arn} for {spelling} through "
         + ("its key policy" if direct else "an identity policy the key delegates to")
     )
+
+
+def _recording_key_use_verdict(
+    role_arn: str,
+    role_name: str,
+    key_arn: str,
+    key_policy: Any,
+    identity: List[Dict[str, Any]],
+    boundary: Any,
+    boundary_statements: List[Dict[str, Any]],
+    account: str,
+    partition: str,
+) -> Tuple[str, str]:
+    """Judge both key actions a recording write needs from the execution role.
+
+    kms:GenerateDataKey encrypts each object. A multipart upload also needs
+    kms:Decrypt, because S3 decrypts the data key to encrypt each part, so a
+    role holding only the first can fail a large recording.
+    """
+    notes: List[str] = []
+    for spelling, action, consequence in RECORDING_KEY_WRITE_ACTIONS:
+        verdict, text = _recording_key_action_verdict(
+            role_arn,
+            role_name,
+            key_arn,
+            key_policy,
+            identity,
+            boundary,
+            boundary_statements,
+            account,
+            partition,
+            spelling,
+            action,
+            consequence,
+        )
+        if verdict != "granted":
+            return verdict, text
+        notes.append(text)
+    return "granted", "; ".join(notes)
 
 
 def _recording_key_gaps(
@@ -7876,7 +7929,8 @@ def check_browser_tool_recording(
                         problems.append(text)
                         fixes.append(
                             "Allow the execution role s3:PutObject on the recording "
-                            "prefix and kms:GenerateDataKey on the bucket's key in "
+                            "prefix and kms:GenerateDataKey and kms:Decrypt on the "
+                            "bucket's key in "
                             "its identity policy, key policy and permissions "
                             "boundary, and remove the Deny that refuses it."
                         )
@@ -7997,14 +8051,19 @@ RECORDING_SCP_STRING_OPERATORS = {
 
 
 def _recording_write_condition_holds(
-    statement: Dict[str, Any], role_arn: str, account: str
+    statement: Dict[str, Any],
+    role_arn: str,
+    account: str,
+    known: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[bool], List[str]]:
     """Return whether an SCP statement's condition holds for a recording write.
 
     The request is the execution role's s3:PutObject, or the kms:GenerateDataKey
     S3 makes for it, over TLS. Only aws:PrincipalArn, aws:PrincipalAccount and
-    aws:SecureTransport have a value known here; an entry on any other key
-    leaves the statement conditional and is named. IfExists suffixes and
+    aws:SecureTransport have a value known here, plus the entries `known`
+    carries, such as the resource account and organization a resource control
+    policy reads; an entry on any other key leaves the statement conditional
+    and is named. IfExists suffixes and
     ForAllValues:/ForAnyValue: prefixes are stripped, which is exact for these
     single-valued keys, all present on the request. Returns True, False or
     None, with the entries that were not evaluated.
@@ -8018,6 +8077,7 @@ def _recording_write_condition_holds(
         "aws:principalarn": role_arn,
         "aws:principalaccount": account,
         "aws:securetransport": "true",
+        **(known or {}),
     }
     failed = False
     unevaluated: List[str] = []
@@ -8122,9 +8182,11 @@ def check_browser_recording_write_scp(
     named execution role; the Browser Session Recording row reports the rest.
     A browser fails when a service control policy attached to its account, an
     organizational unit above it or the root denies the role s3:PutObject on
-    the recording prefix or kms:GenerateDataKey on the bucket's key, or when
-    some level of that chain has no attached SCP allowing either, since an
-    action no SCP at a level allows is denied below it. The management account
+    the recording prefix or kms:GenerateDataKey or kms:Decrypt on the bucket's
+    key, or when some level of that chain has no attached SCP allowing each,
+    since an action no SCP at a level allows is denied below it. A resource
+    control policy attached to the same levels that denies one of them fails
+    the browser too. The management account
     and an account in no organization are bound by no SCP. A policy, an
     attachment or a condition that could not be judged is N/A, never Passed.
     """
@@ -8249,40 +8311,78 @@ def check_browser_recording_write_scp(
         )
 
     unread_policies: List[str] = []
-    documents: List[Tuple[str, List[Dict[str, Any]], Optional[Set[str]]]] = []
-    for policy in policies:
-        name = str(policy.get("Name", policy.get("Id", "unknown")))
-        try:
-            detail = organizations_client.describe_policy(PolicyId=policy["Id"])
-        except Exception as error:
-            unread_policies.append(
-                f"service control policy '{name}' (organizations:DescribePolicy "
-                f"{_assessment_error_label(error)})"
-            )
-            continue
-        statements = _document_statements(
-            (detail.get("Policy") or {}).get("Content", "")
-        )
-        try:
-            targets: Optional[Set[str]] = {
-                str(target.get("TargetId", ""))
-                for target in _paginate_aws_list(
-                    organizations_client,
-                    "list_targets_for_policy",
-                    "Targets",
-                    token_request_key="NextToken",
-                    token_response_key="NextToken",
-                    PolicyId=policy["Id"],
+
+    def read_documents(
+        listed: List[Dict[str, Any]], kind: str
+    ) -> List[Tuple[str, List[Dict[str, Any]], Optional[Set[str]]]]:
+        read: List[Tuple[str, List[Dict[str, Any]], Optional[Set[str]]]] = []
+        for policy in listed:
+            name = str(policy.get("Name", policy.get("Id", "unknown")))
+            try:
+                detail = organizations_client.describe_policy(PolicyId=policy["Id"])
+            except Exception as error:
+                unread_policies.append(
+                    f"{kind} '{name}' (organizations:DescribePolicy "
+                    f"{_assessment_error_label(error)})"
                 )
-            }
-        except Exception as error:
-            targets = None
-            unread_policies.append(
-                f"the attachment targets of service control policy '{name}' "
-                f"(organizations:ListTargetsForPolicy "
-                f"{_assessment_error_label(error)})"
+                continue
+            statements = _document_statements(
+                (detail.get("Policy") or {}).get("Content", "")
             )
-        documents.append((name, statements, targets))
+            try:
+                targets: Optional[Set[str]] = {
+                    str(target.get("TargetId", ""))
+                    for target in _paginate_aws_list(
+                        organizations_client,
+                        "list_targets_for_policy",
+                        "Targets",
+                        token_request_key="NextToken",
+                        token_response_key="NextToken",
+                        PolicyId=policy["Id"],
+                    )
+                }
+            except Exception as error:
+                targets = None
+                unread_policies.append(
+                    f"the attachment targets of {kind} '{name}' "
+                    f"(organizations:ListTargetsForPolicy "
+                    f"{_assessment_error_label(error)})"
+                )
+            read.append((name, statements, targets))
+        return read
+
+    documents = read_documents(policies, "service control policy")
+    # A resource control policy binds the bucket and the key, whichever
+    # principal calls them. Only its Deny statements are read: RCPFullAWSAccess
+    # cannot be detached, so every level already allows the call.
+    try:
+        rcp_documents = read_documents(
+            _paginate_aws_list(
+                organizations_client,
+                "list_policies",
+                "Policies",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                Filter="RESOURCE_CONTROL_POLICY",
+            ),
+            "resource control policy",
+        )
+    except Exception as error:
+        rcp_documents = []
+        unread_policies.append(
+            "the resource control policies (organizations:ListPolicies "
+            f"{_assessment_error_label(error)})"
+        )
+    organization_id = ""
+    if rcp_documents:
+        try:
+            organization_id = str(
+                organizations_client.describe_organization()
+                .get("Organization", {})
+                .get("Id", "")
+            )
+        except Exception:
+            organization_id = ""
 
     chains: Dict[str, Any] = {}
     key_cache: Dict[str, Any] = {}
@@ -8320,8 +8420,9 @@ def check_browser_recording_write_scp(
                 ("s3:PutObject", BROWSER_RECORDING_WRITE_ACTION, recorder["object_arn"])
             ]
             legs += [
-                ("kms:GenerateDataKey", RECORDING_KEY_USE_ACTION, arn)
+                (spelling, action, arn)
                 for arn in key_arns
+                for spelling, action, _ in RECORDING_KEY_WRITE_ACTIONS
             ]
             for spelling, action, resource in legs:
                 allowed: Dict[str, Tuple[str, ...]] = {
@@ -8372,6 +8473,47 @@ def check_browser_recording_write_scp(
                                 allowed[node] = ("allowed",)
                             elif allowed[node] == ("none",):
                                 allowed[node] = ("conditional", name, ", ".join(keys))
+                resource_account = _arn_account(resource) or account
+                if rcp_documents and resource_account != account:
+                    unread.append(
+                        "the resource control policies above account "
+                        f"{resource_account}, which holds {resource}"
+                    )
+                known = {"aws:resourceaccount": resource_account}
+                if organization_id:
+                    known["aws:principalorgid"] = organization_id
+                for name, statements, targets in (
+                    rcp_documents if resource_account == account else []
+                ):
+                    where = ", ".join(
+                        labels[node] for node in labels if targets and node in targets
+                    )
+                    if not where:
+                        continue
+                    for statement in statements:
+                        if statement.get("Effect") != "Deny":
+                            continue
+                        if not (
+                            _statement_reaches_object(statement, action, resource)
+                            if action == BROWSER_RECORDING_WRITE_ACTION
+                            else _statement_matches_action(statement, action)
+                            and _statement_resource_covers(statement, [resource])
+                        ):
+                            continue
+                        holds, keys = _recording_write_condition_holds(
+                            statement, recorder["role"], account, known
+                        )
+                        if holds:
+                            problems.append(
+                                f"resource control policy '{name}', attached to "
+                                f"{where}, denies {spelling} on {resource}"
+                            )
+                        elif holds is None:
+                            conditional.append(
+                                f"whether resource control policy '{name}', "
+                                f"attached to {where}, denies {spelling} on "
+                                f"{resource} under {', '.join(keys)}"
+                            )
                 for node, state in allowed.items():
                     if state == ("none",) and not unread_policies:
                         problems.append(
@@ -8403,9 +8545,9 @@ def check_browser_recording_write_scp(
                     ),
                     resolution=(
                         "Exempt the browser execution role by aws:PrincipalArn from "
-                        "the service control policy Deny, or attach a policy that "
-                        "allows s3:PutObject and kms:GenerateDataKey at each level "
-                        "named."
+                        "the service control or resource control policy Deny, or "
+                        "attach a service control policy that allows s3:PutObject, "
+                        "kms:GenerateDataKey and kms:Decrypt at each level named."
                     ),
                     reference=SERVICE_CONTROL_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -8432,7 +8574,7 @@ def check_browser_recording_write_scp(
             )
         else:
             keys_text = (
-                f" or kms:GenerateDataKey on key {', '.join(key_arns)}"
+                f" or kms:GenerateDataKey or kms:Decrypt on key {', '.join(key_arns)}"
                 if key_arns
                 else ""
             )
@@ -8446,7 +8588,8 @@ def check_browser_recording_write_scp(
                         f"denies the role s3:PutObject on {recorder['object_arn']}"
                         f"{keys_text}, and an attached policy allows each at all "
                         f"{len(chain)} levels from the account to the root. "
-                        "Resource control policies are not judged."
+                        "No resource control policy attached to those levels "
+                        "denies either."
                     ),
                     resolution="No action required",
                     reference=SERVICE_CONTROL_POLICY_REFERENCE_URL,
@@ -15126,6 +15269,282 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
     return findings + link_findings
 
 
+# The monitoring account's cross-account viewing path: reading log events, Logs
+# Insights results, traces and metrics a source account shared through a link.
+TELEMETRY_VIEW_ACTIONS = (
+    "logs:startquery",
+    "logs:getqueryresults",
+    "logs:filterlogevents",
+    "logs:getlogevents",
+    "xray:batchgettraces",
+    "xray:gettracesummaries",
+    "cloudwatch:getmetricdata",
+)
+# The view actions the service reference scopes to a log-group or log-stream
+# resource, so a Resource of "*" on them reads every shared log group.
+TELEMETRY_VIEW_LOG_ACTIONS = (
+    "logs:startquery",
+    "logs:getqueryresults",
+    "logs:filterlogevents",
+    "logs:getlogevents",
+)
+TELEMETRY_VIEW_SERVICES = ("logs", "cloudwatch", "xray", "oam")
+TELEMETRY_WRITE_VERBS = (
+    "associate",
+    "create",
+    "delete",
+    "disassociate",
+    "put",
+    "tag",
+    "untag",
+    "update",
+)
+TELEMETRY_VIEW_RULE = (
+    "A statement granting a view action fails when it carries NotAction, an "
+    "Action wildcard, or a named create, put, update, delete, tag, untag, "
+    "associate or disassociate action of logs, cloudwatch, xray or oam, or when "
+    "it grants a log read on Resource '*', NotResource or a log-group name that "
+    "is only a wildcard."
+)
+
+
+def _log_resource_reads_every_group(resource: str) -> bool:
+    """Return whether a log Resource is "*" or names a wildcard-only group."""
+    resource = str(resource).strip()
+    if resource == "*":
+        return True
+    _, marker, group = resource.partition(":log-group:")
+    return bool(marker) and not group.split(":", 1)[0].strip("*")
+
+
+def _telemetry_viewer_defects(permissions: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Return whether one principal views shared telemetry, and its defects.
+
+    A principal is a viewer when a view action survives its own Deny statements
+    and boundary. Every Allow statement reaching a view action is then read
+    under TELEMETRY_VIEW_RULE. A document that cannot be parsed raises, so the
+    caller reports the principal as unread.
+    """
+    documents = [
+        _policy_document(policy) for policy in _principal_policies(permissions)
+    ]
+    viewer = any(
+        _principal_holds_action(permissions, action)
+        for action in TELEMETRY_VIEW_ACTIONS
+    )
+    if not viewer:
+        return False, []
+    defects: List[str] = []
+    for document in documents:
+        for statement in _document_statements(document, effect="Allow"):
+            reached = [
+                action
+                for action in TELEMETRY_VIEW_ACTIONS
+                if _statement_matches_action(statement, action)
+            ]
+            if not reached:
+                continue
+            if "NotAction" in statement:
+                defects.append("NotAction")
+            wildcards = [
+                a for a in _statement_actions(statement) if "*" in a or "?" in a
+            ]
+            if wildcards:
+                defects.append(f"Action {', '.join(wildcards)}")
+            writes = [
+                action
+                for action in _statement_actions(statement)
+                if action not in wildcards
+                and action.split(":", 1)[0] in TELEMETRY_VIEW_SERVICES
+                and action.split(":", 1)[-1].startswith(TELEMETRY_WRITE_VERBS)
+            ]
+            if writes:
+                defects.append(f"write action {', '.join(writes)}")
+            if any(action in TELEMETRY_VIEW_LOG_ACTIONS for action in reached):
+                resources = _statement_resources(statement)
+                if "NotResource" in statement:
+                    defects.append("NotResource on a log read")
+                elif any(
+                    _log_resource_reads_every_group(resource) for resource in resources
+                ):
+                    defects.append("a log read on every log group")
+    return True, sorted(set(defects))
+
+
+def check_agentcore_monitoring_account_controls(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-22: Judge a monitoring account's data protection and viewing IAM.
+
+    An account that owns an observability sink views the telemetry its source
+    accounts share. Its own account-wide data-protection policy has to mask
+    credentials and personal or health data, as AC-20 requires of each source
+    account's AgentCore log groups, and each cached role or user that can view
+    the shared telemetry is read under TELEMETRY_VIEW_RULE. An account with no
+    sink is a source account at most, which AC-20 and the link rows judge.
+    """
+    if oam_client is None:
+        return []
+    try:
+        sinks = _paginate_aws_list(
+            oam_client,
+            "list_sinks",
+            "Items",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except (BotoCoreError, ClientError):
+        # check_agentcore_telemetry_sink_scope reports the failed ListSinks.
+        return []
+    if not sinks:
+        return []
+    findings: List[Dict[str, Any]] = []
+
+    try:
+        identifiers = _account_masking_data_identifiers()
+    except (BotoCoreError, ClientError) as error:
+        findings.append(
+            create_finding(
+                check_id="AC-22",
+                finding_name="Monitoring Account Data Protection",
+                finding_details=(
+                    "This account owns an observability sink, and its account-wide "
+                    "data-protection policy was not read: "
+                    f"logs:DescribeAccountPolicies failed with "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution="Grant logs:DescribeAccountPolicies and retry.",
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    else:
+        gaps = _masking_category_gaps(identifiers)
+        findings.append(
+            create_finding(
+                check_id="AC-22",
+                finding_name="Monitoring Account Data Protection",
+                finding_details=(
+                    "This account owns an observability sink, and its account-wide "
+                    "data-protection policy masks no "
+                    f"{' or '.join(gaps)} data identifier, so a log group this "
+                    "account holds, a centralized copy of source telemetry "
+                    "included, keeps those values readable."
+                    if gaps
+                    else "This account owns an observability sink, and its "
+                    "account-wide data-protection policy masks a credentials "
+                    "identifier and a personal or health identifier in every log "
+                    "group it holds. The source accounts' AgentCore log groups are "
+                    "judged by AC-20 in those accounts."
+                ),
+                resolution=(
+                    "Attach an account-wide data-protection policy with a "
+                    "Deidentify statement naming credentials and personal or "
+                    "health data identifiers."
+                    if gaps
+                    else "No action required."
+                ),
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED if gaps else StatusEnum.PASSED,
+            )
+        )
+
+    gap_rows, v1_note = _cache_read_gap_findings(
+        permission_cache,
+        "AC-22",
+        "Monitoring Account Viewing Access",
+        OAM_CROSS_ACCOUNT_REFERENCE_URL,
+    )
+    findings.extend(gap_rows)
+    defective: List[str] = []
+    clean: List[str] = []
+    unreadable: List[str] = []
+    for kind, key in (("role", "role_permissions"), ("user", "user_permissions")):
+        for name, permissions in (permission_cache.get(key) or {}).items():
+            if not isinstance(permissions, dict):
+                continue
+            if kind == "role" and str(name).startswith("AWSServiceRoleFor"):
+                continue
+            label = f"{kind} {name}"
+            try:
+                viewer, defects = _telemetry_viewer_defects(permissions)
+            except (TypeError, ValueError):
+                unreadable.append(label)
+                continue
+            if defects:
+                defective.append(f"{label} ({'; '.join(defects)})")
+            elif viewer:
+                clean.append(label)
+    if unreadable:
+        findings.append(
+            create_finding(
+                check_id="AC-22",
+                finding_name="Monitoring Account Viewing Access Incomplete",
+                finding_details=(
+                    "A policy of these principals could not be parsed, so whether "
+                    "they view the shared telemetry was not judged and no Passed "
+                    f"result is reported for the population: {', '.join(sorted(unreadable))}."
+                ),
+                resolution=(
+                    "Correct the named policy documents and rerun the assessment."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    if defective:
+        findings.append(
+            create_finding(
+                check_id="AC-22",
+                finding_name="Monitoring Account Viewing Access",
+                finding_details=(
+                    "This account owns an observability sink, and these principals "
+                    "can view the telemetry its source accounts share through a "
+                    f"statement that grants more than viewing: {', '.join(sorted(defective))}. "
+                    f"{TELEMETRY_VIEW_RULE} Service-linked roles are not judged. "
+                    f"{IAM_CACHE_SCP_NOTE}"
+                ),
+                resolution=(
+                    "Grant the viewing actions by name in a statement of their own, "
+                    "scope log reads to the log groups the principal investigates, "
+                    "and move write actions to a separate role."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+    elif not gap_rows and not unreadable:
+        findings.append(
+            create_finding(
+                check_id="AC-22",
+                finding_name="Monitoring Account Viewing Access",
+                finding_details=(
+                    "This account owns an observability sink, and "
+                    + (
+                        f"each cached role or user that can view the shared "
+                        f"telemetry, {', '.join(sorted(clean))}, grants it through "
+                        "statements that pass this rule. "
+                        if clean
+                        else "no cached role or user, after its own Deny statements "
+                        "and boundary, can view the shared telemetry. "
+                    )
+                    + f"{TELEMETRY_VIEW_RULE} Service-linked roles are not judged. "
+                    "Whether each viewer needs that access is the owner's "
+                    f"decision and is not read.{v1_note}"
+                ),
+                resolution="No action required.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+    return findings
+
+
 def _telemetry_stale_link_findings(
     sink_arn: str,
     sink_name: str,
@@ -16987,6 +17406,7 @@ def _subscription_filter_archive(
     account: str,
     stream_cache: Dict[str, Any],
     lock_cache: Dict[str, Tuple[str, Any]],
+    label: str = "",
 ) -> Tuple[str, str]:
     """Follow one subscription filter to its archive and judge the copy.
 
@@ -16999,7 +17419,7 @@ def _subscription_filter_archive(
     Kinesis stream, a Lambda function or another account's stream is not
     followed.
     """
-    label = f"subscription filter '{subscription.get('filterName') or '?'}'"
+    label = label or f"subscription filter '{subscription.get('filterName') or '?'}'"
     pattern = str(subscription.get("filterPattern") or "").strip()
     if pattern:
         return "bad", (
@@ -17017,6 +17437,12 @@ def _subscription_filter_archive(
         )
     destination = str(subscription.get("destinationArn") or "")
     parts = destination.split(":", 5)
+    if len(parts) == 6 and parts[2] == "logs" and parts[5].startswith("destination:"):
+        return "unread", (
+            f"{label} sends to CloudWatch Logs destination {destination}, whose "
+            "Firehose stream and bucket AC-26 judges in account "
+            f"{parts[4]}, the account that owns it"
+        )
     if (
         len(parts) != 6
         or parts[2] != "firehose"
@@ -17199,12 +17625,47 @@ def check_agentcore_log_archive_forwarding() -> List[Dict[str, Any]]:
     """AC-26 archive leg: every judged log group is forwarded to a locked bucket.
 
     The population is the retention leg's, the AgentCore prefixes and the
-    groups an AgentCore delivery writes to, plus the aws/spans group when it
-    exists. A failed inventory read is incomplete as a whole, because a group
-    that was not listed may be the one with no archive.
+    groups an AgentCore delivery writes to, plus the aws/spans group and this
+    Region's Bedrock model invocation log group when they exist. A failed
+    inventory read is incomplete as a whole, because a group that was not
+    listed may be the one with no archive. Each CloudWatch Logs destination
+    this account owns is judged too, since a source account's filter that
+    sends to it can only be followed here.
     """
     if logs_client is None:
         return []
+    findings: List[Dict[str, Any]] = []
+    invocation_names: Set[str] = set()
+    if bedrock_client is not None:
+        try:
+            config = bedrock_client.get_model_invocation_logging_configuration()
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-26",
+                    finding_name=AGENTCORE_LOG_ARCHIVE_FINDING,
+                    finding_details=(
+                        "The archive leg of the Bedrock model invocation log group in "
+                        f"Region '{bedrock_client.meta.region_name}' was not judged: "
+                        "bedrock:GetModelInvocationLoggingConfiguration "
+                        f"failed with {_assessment_error_label(error)}, so which "
+                        "log group holds the invocation records is unknown."
+                    ),
+                    resolution=(
+                        "Grant bedrock:GetModelInvocationLoggingConfiguration and "
+                        "retry."
+                    ),
+                    reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            name = (
+                (config.get("loggingConfig") or {}).get("cloudWatchConfig") or {}
+            ).get("logGroupName")
+            if name:
+                invocation_names.add(str(name))
     try:
         log_groups = _agentcore_log_groups()
         known_names = {group.get("logGroupName") for group in log_groups}
@@ -17212,6 +17673,7 @@ def check_agentcore_log_archive_forwarding() -> List[Dict[str, Any]]:
             (
                 _agentcore_delivery_log_group_names()
                 | {TRANSACTION_SEARCH_SPANS_LOG_GROUP}
+                | invocation_names
             )
             - known_names
         ):
@@ -17236,7 +17698,7 @@ def check_agentcore_log_archive_forwarding() -> List[Dict[str, Any]]:
         ]
     stream_cache: Dict[str, Any] = {}
     lock_cache: Dict[str, Tuple[str, Any]] = {}
-    return [
+    findings.extend(
         _agentcore_log_archive_finding(
             group["logGroupName"],
             _arn_account(group.get("arn")),
@@ -17245,7 +17707,89 @@ def check_agentcore_log_archive_forwarding() -> List[Dict[str, Any]]:
         )
         for group in log_groups
         if group.get("logGroupName")
-    ]
+    )
+    return findings + _log_archive_destination_findings(stream_cache, lock_cache)
+
+
+def _log_archive_destination_findings(
+    stream_cache: Dict[str, Any], lock_cache: Dict[str, Tuple[str, Any]]
+) -> List[Dict[str, Any]]:
+    """AC-26 archive leg in the account that owns a CloudWatch Logs destination.
+
+    A source account's subscription filter that sends to a destination in a
+    Log Archive account reads N/A there, because that account cannot describe
+    the stream behind it. Here the destination's target is followed as a
+    filter with no pattern would be, so the stream and its bucket are judged
+    where they live. Which source groups subscribe to the destination is read
+    in each source account.
+    """
+    try:
+        destinations = _paginate_aws_list(
+            logs_client, "describe_destinations", "destinations"
+        )
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-26",
+                finding_name=AGENTCORE_LOG_ARCHIVE_DESTINATION_FINDING,
+                finding_details=(
+                    "The CloudWatch Logs destinations this account owns in Region "
+                    f"'{logs_client.meta.region_name}' could not be listed: "
+                    f"{_assessment_error_label(error)}, so whether one "
+                    "receives agent logs from a source account without a WORM "
+                    "copy is unknown."
+                ),
+                resolution="Grant logs:DescribeDestinations and retry.",
+                reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    findings: List[Dict[str, Any]] = []
+    for destination in destinations:
+        name = destination.get("destinationName") or destination.get("arn") or "?"
+        label = f"CloudWatch Logs destination '{name}'"
+        state, text = _subscription_filter_archive(
+            {"destinationArn": destination.get("targetArn")},
+            _arn_account(destination.get("arn")),
+            stream_cache,
+            lock_cache,
+            label=label,
+        )
+        if state == "ok":
+            details = (
+                f"{text}. Every log group a source account subscribes to it with "
+                "an empty filter pattern is archived there; the filters "
+                "themselves are judged in each source account."
+            )
+            status, severity = StatusEnum.PASSED, SeverityEnum.MEDIUM
+        elif state == "bad":
+            details = (
+                f"{text}, so an agent log group a source account subscribes to "
+                "this destination has no WORM copy."
+            )
+            status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
+        else:
+            details = f"Whether {label} archives what it receives was not read: {text}."
+            status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+        findings.append(
+            create_finding(
+                check_id="AC-26",
+                finding_name=AGENTCORE_LOG_ARCHIVE_DESTINATION_FINDING,
+                finding_details=details,
+                resolution=(
+                    "No action required."
+                    if status == StatusEnum.PASSED
+                    else "Point the destination at a Firehose stream in this account "
+                    "that delivers, with no Lambda record processor, to an S3 bucket "
+                    "with Object Lock default retention in COMPLIANCE mode."
+                ),
+                reference=LOGS_SUBSCRIPTION_REFERENCE_URL,
+                severity=severity,
+                status=status,
+            )
+        )
+    return findings
 
 
 AGENTCORE_TRAIL_VALIDATION_FINDING_NAME = "AgentCore Trail Log File Validation"
@@ -24708,20 +25252,54 @@ CEDAR_AUTHORIZATION_REFERENCE_URL = (
     "https://docs.cedarpolicy.com/auth/authorization.html"
 )
 AGENTCORE_POLICY_INPUT_GUARD_FINDING = "AgentCore Policy Input Guard"
+# A read is the whole attribute chain below context.input, so
+# context.input.payee.iban reads payee and payee.iban. A segment followed by
+# "(" is a method call such as .contains(, not an attribute.
 CEDAR_INPUT_READ_PATTERN = re.compile(
-    r"\bcontext\s*\.\s*input\s*(?:\.\s*([A-Za-z_]\w*)|\[\s*\"([^\"]+)\"\s*\])"
+    r"\bcontext\s*\.\s*input"
+    r"((?:\s*\.\s*[A-Za-z_]\w*\b(?!\s*\()|\s*\[\s*\"[^\"]+\"\s*\])+)"
 )
+# `context.input has a`, `context.input.a has b`, `context.input has a.b` and
+# `context has input.a` all test a path below context.input.
 CEDAR_INPUT_HAS_PATTERN = re.compile(
-    r"\bcontext\s*\.\s*input\s+has\s+(?:([A-Za-z_]\w*)|\"([^\"]+)\")"
-    r"|\bcontext\s+has\s+input\s*\.\s*([A-Za-z_]\w*)"
+    r"\bcontext((?:\s*\.\s*[A-Za-z_]\w*|\s*\[\s*\"[^\"]+\"\s*\])*)\s+has\s+"
+    r"((?:[A-Za-z_]\w*|\"[^\"]+\")(?:\s*\.\s*[A-Za-z_]\w*)*)"
 )
+CEDAR_ATTRIBUTE_SEGMENT = re.compile(r'\.\s*([A-Za-z_]\w*)|\[\s*"([^"]+)"\s*\]')
+
+
+def _cedar_segments(chain: str) -> List[str]:
+    """Split `.a["b c"].d` into its attribute names."""
+    return [
+        dotted or quoted for dotted, quoted in CEDAR_ATTRIBUTE_SEGMENT.findall(chain)
+    ]
+
+
+def _cedar_read_paths(match: "re.Match[str]") -> List[str]:
+    """Return every path one context.input read needs present, shortest first."""
+    segments = _cedar_segments(match.group(1))
+    return [".".join(segments[:index]) for index in range(1, len(segments) + 1)]
+
+
+def _cedar_has_paths(match: "re.Match[str]") -> List[str]:
+    """Return the context.input paths one `has` test proves present."""
+    base = _cedar_segments(match.group(1))
+    target = [
+        segment.strip().strip('"') for segment in match.group(2).split(".") if segment
+    ]
+    full = base + target
+    if not full or full[0] != "input":
+        return []
+    rest = full[1:]
+    return [".".join(rest[:index]) for index in range(max(1, len(base)), len(rest) + 1)]
 
 
 def _cedar_input_has_tests(expression: str) -> Set[str]:
-    """Return the context.input fields an expression tests with `has`."""
+    """Return the context.input paths an expression tests with `has`."""
     return {
-        next(group for group in match.groups() if group)
+        path
         for match in CEDAR_INPUT_HAS_PATTERN.finditer(expression)
+        for path in _cedar_has_paths(match)
     }
 
 
@@ -24756,14 +25334,18 @@ def _cedar_unguarded_input_reads(expression: str, guarded: Set[str]) -> Set[str]
         return unguarded
     blanked = re.sub(r'"(?:[^"\\]|\\.)*"', lambda m: " " * len(m.group(0)), expression)
     tests = [
-        (match.start(), next(group for group in match.groups() if group))
+        (match.start(), field)
         for match in CEDAR_INPUT_HAS_PATTERN.finditer(expression)
+        for field in _cedar_has_paths(match)
     ]
     unguarded = set()
-    for match in CEDAR_INPUT_READ_PATTERN.finditer(expression):
+    for match, field in (
+        (match, field)
+        for match in CEDAR_INPUT_READ_PATTERN.finditer(expression)
+        for field in _cedar_read_paths(match)
+    ):
         if blanked[match.start()] == " ":
             continue
-        field = match.group(1) or match.group(2)
         if field in guarded or any(
             start < match.start() and tested == field for start, tested in tests
         ):
@@ -24800,18 +25382,150 @@ def _cedar_scope_actions(scope: List[str]) -> Optional[List[str]]:
     return names
 
 
+OPENAPI_OPERATION_METHODS = (
+    "get",
+    "put",
+    "post",
+    "delete",
+    "options",
+    "head",
+    "patch",
+    "trace",
+)
+SMITHY_REQUIRED_TRAIT = "smithy.api#required"
+SCHEMA_DEPTH_LIMIT = 32
+
+
+def _schema_required_paths(
+    schema: Any, prefix: str = "", resolve: Any = None, depth: int = 0
+) -> Set[str]:
+    """Return every input path a JSON schema guarantees present.
+
+    A property is guaranteed when it is listed in `required` and so is every
+    property above it, so a required field of an optional object is not.
+    `resolve` follows a local $ref of an OpenAPI document.
+    """
+    if resolve is not None:
+        schema = resolve(schema)
+    if not isinstance(schema, dict) or depth > SCHEMA_DEPTH_LIMIT:
+        return set()
+    properties = schema.get("properties") or {}
+    paths: Set[str] = set()
+    for name in schema.get("required") or []:
+        path = f"{prefix}{name}"
+        paths.add(path)
+        if isinstance(properties, dict):
+            paths |= _schema_required_paths(
+                properties.get(name), f"{path}.", resolve, depth + 1
+            )
+    return paths
+
+
+def _openapi_required_inputs(document: Dict[str, Any]) -> Dict[str, Set[str]]:
+    """Map each OpenAPI operationId to the inputs its schema marks required.
+
+    The devguide names operationId as the tool name. A required parameter and
+    each required property of a required application/json body count; how the
+    gateway places them in context.input is not documented, so the caller
+    reads these paths as unproven. Raises ValueError on an operation with no
+    operationId or a $ref that does not resolve inside the document.
+    """
+
+    def resolve(node: Any) -> Any:
+        seen = 0
+        while isinstance(node, dict) and "$ref" in node:
+            reference = str(node["$ref"])
+            if not reference.startswith("#/") or seen > SCHEMA_DEPTH_LIMIT:
+                raise ValueError(f"unresolved $ref {reference}")
+            node = document
+            for part in reference[2:].split("/"):
+                part = part.replace("~1", "/").replace("~0", "~")
+                if not isinstance(node, dict) or part not in node:
+                    raise ValueError(f"unresolved $ref {reference}")
+                node = node[part]
+            seen += 1
+        return node
+
+    if "openapi" not in document or not isinstance(document.get("paths"), dict):
+        raise ValueError("no openapi version or paths object")
+    operations: Dict[str, Set[str]] = {}
+    for item in document["paths"].values():
+        item = resolve(item)
+        if not isinstance(item, dict):
+            continue
+        shared = item.get("parameters") or []
+        for method in OPENAPI_OPERATION_METHODS:
+            operation = item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            operation_id = operation.get("operationId")
+            if not operation_id:
+                raise ValueError("an operation with no operationId")
+            required: Set[str] = set()
+            for parameter in list(shared) + list(operation.get("parameters") or []):
+                parameter = resolve(parameter)
+                if isinstance(parameter, dict) and parameter.get("required") is True:
+                    required.add(str(parameter.get("name")))
+            body = resolve(operation.get("requestBody"))
+            if isinstance(body, dict) and body.get("required") is True:
+                media = (body.get("content") or {}).get("application/json") or {}
+                required |= _schema_required_paths(media.get("schema"), resolve=resolve)
+            operations[str(operation_id)] = required
+    return operations
+
+
+def _smithy_required_inputs(model: Dict[str, Any]) -> Dict[str, Set[str]]:
+    """Map each Smithy operation's shape name to its required input members.
+
+    A member carries smithy.api#required in the JSON AST. Which name the
+    gateway gives the tool and how members reach context.input are not
+    documented, so the caller reads these paths as unproven.
+    """
+    if "smithy" not in model or not isinstance(model.get("shapes"), dict):
+        raise ValueError("no smithy version or shapes object")
+    shapes = model["shapes"]
+
+    def members(shape_id: Any, prefix: str, depth: int) -> Set[str]:
+        shape = shapes.get(shape_id) if isinstance(shape_id, str) else None
+        if not isinstance(shape, dict) or depth > SCHEMA_DEPTH_LIMIT:
+            return set()
+        paths: Set[str] = set()
+        for name, member in (shape.get("members") or {}).items():
+            if not isinstance(member, dict):
+                continue
+            if SMITHY_REQUIRED_TRAIT in (member.get("traits") or {}):
+                path = f"{prefix}{name}"
+                paths.add(path)
+                paths |= members(member.get("target"), f"{path}.", depth + 1)
+        return paths
+
+    return {
+        str(shape_id).rsplit("#", 1)[-1]: members(
+            (shape.get("input") or {}).get("target"), "", 0
+        )
+        for shape_id, shape in shapes.items()
+        if isinstance(shape, dict) and shape.get("type") == "operation"
+    }
+
+
 def _gateway_tool_required_inputs(
     gateway_id: str,
-) -> Tuple[Dict[str, Optional[Set[str]]], Dict[str, str]]:
-    """Map each tool of a gateway's targets to its required input fields.
+) -> Tuple[Dict[str, Set[str]], Dict[str, str], Dict[str, Set[str]]]:
+    """Map each tool of a gateway's targets to its required input paths.
 
-    Returns `{target___tool: required fields}` for every tool an inline Lambda
-    tool schema defines, and `{target name: reason}` for every target whose tool
-    schemas were not read: an S3 tool schema, an OpenAPI, Smithy, MCP server,
-    API Gateway or connector target, or a target that could not be read.
+    Returns `{target___tool: required paths}` for every tool an inline Lambda
+    tool schema defines, nested required properties included, and `{target
+    name: reason}` for every target whose tool schemas were not read: an S3
+    tool schema, an MCP server, API Gateway or connector target, an OpenAPI
+    or Smithy payload in S3 or not in JSON, or a target that could not be
+    read. An inline OpenAPI or Smithy target's tools go in the third map, the
+    paths its schema marks required: those are unproven, because how the
+    gateway exposes them in context.input is not documented, so only a read
+    the schema does not mark required is judged on them.
     """
-    tools: Dict[str, Optional[Set[str]]] = {}
+    tools: Dict[str, Set[str]] = {}
     unread: Dict[str, str] = {}
+    unproven: Dict[str, Set[str]] = {}
     for target in _agentcore_list_all(
         "list_gateway_targets", ["items", "targets"], gatewayIdentifier=gateway_id
     ):
@@ -24828,20 +25542,42 @@ def _gateway_tool_required_inputs(
             continue
         name = str(detail.get("name") or name)
         mcp = (detail.get("targetConfiguration") or {}).get("mcp") or {}
-        schema = (mcp.get("lambda") or {}).get("toolSchema") or {}
-        if "inlinePayload" not in schema:
-            unread[name] = (
-                "its tool schema is in S3"
-                if schema.get("s3")
-                else "it is not a Lambda target with an inline tool schema"
-            )
-            continue
-        for tool in schema.get("inlinePayload") or []:
-            input_schema = tool.get("inputSchema") or {}
-            tools[f"{name}___{tool.get('name')}"] = {
-                str(field) for field in input_schema.get("required") or []
-            }
-    return tools, unread
+        for kind, reader, label in (
+            ("openApiSchema", _openapi_required_inputs, "OpenAPI"),
+            ("smithyModel", _smithy_required_inputs, "Smithy"),
+        ):
+            if kind not in mcp:
+                continue
+            payload = (mcp.get(kind) or {}).get("inlinePayload")
+            if payload is None:
+                unread[name] = f"its {label} schema is in S3"
+                break
+            try:
+                document = json.loads(payload)
+                if not isinstance(document, dict):
+                    raise ValueError("not a JSON object")
+                operations = reader(document)
+            except (TypeError, ValueError) as error:
+                unread[name] = f"its inline {label} schema was not read ({error})"
+                break
+            for operation, required in operations.items():
+                unproven[f"{name}___{operation}"] = required
+            break
+        else:
+            schema = (mcp.get("lambda") or {}).get("toolSchema") or {}
+            if "inlinePayload" not in schema:
+                unread[name] = (
+                    "its tool schema is in S3"
+                    if schema.get("s3")
+                    else "it is not a Lambda, OpenAPI or Smithy target with an "
+                    "inline schema"
+                )
+                continue
+            for tool in schema.get("inlinePayload") or []:
+                tools[f"{name}___{tool.get('name')}"] = _schema_required_paths(
+                    tool.get("inputSchema") or {}
+                )
+    return tools, unread, unproven
 
 
 def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
@@ -24931,11 +25667,14 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                 if fields:
                     forbids.append((policy_name, _cedar_scope_actions(scope), fields))
 
-        tools: Dict[str, Optional[Set[str]]] = {}
+        tools: Dict[str, Set[str]] = {}
         unread_targets: Dict[str, str] = {}
+        unproven: Dict[str, Set[str]] = {}
         if forbids:
             try:
-                tools, unread_targets = _gateway_tool_required_inputs(gateway_id)
+                tools, unread_targets, unproven = _gateway_tool_required_inputs(
+                    gateway_id
+                )
             except Exception as error:
                 findings.append(
                     row(
@@ -24959,14 +25698,19 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                     f"forbid {policy_name}, whose head names an action group"
                 )
                 continue
+            schema_targets = {action.split("___", 1)[0] for action in unproven}
             if not actions:
-                in_scope = sorted(tools)
+                in_scope = sorted(tools) + sorted(unproven)
                 not_judged.extend(
                     f"forbid {policy_name} on target {target}'s tools ({reason})"
                     for target, reason in sorted(unread_targets.items())
                 )
             else:
-                in_scope = [action for action in actions if action in tools]
+                in_scope = [
+                    action
+                    for action in actions
+                    if action in tools or action in unproven
+                ]
                 not_judged.extend(
                     f"forbid {policy_name} on {action} "
                     f"({unread_targets[action.split('___', 1)[0]]})"
@@ -24974,13 +25718,40 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                     if action not in tools
                     and action.split("___", 1)[0] in unread_targets
                 )
+                not_judged.extend(
+                    f"forbid {policy_name} on {action}, which no operation of the "
+                    "target's schema is read as"
+                    for action in actions
+                    if action not in unproven
+                    and action.split("___", 1)[0] in schema_targets
+                )
             for action in in_scope:
-                optional = sorted(fields - tools[action])
+                missing = fields - tools.get(action, set())
+                # Report a path only when the path above it is present, so a
+                # read of payee.iban with payee optional names payee.
+                missing = {
+                    path
+                    for path in missing
+                    if not any(
+                        path.startswith(f"{other}.")
+                        for other in missing
+                        if other != path
+                    )
+                }
+                held = unproven.get(action, set())
+                if missing & held:
+                    not_judged.append(
+                        f"forbid {policy_name} on {action} reads context.input."
+                        f"{', context.input.'.join(sorted(missing & held))}, which "
+                        "its schema marks required, and how the gateway places "
+                        "a schema input in context.input is not documented"
+                    )
+                optional = sorted(missing - held)
                 if optional:
                     failures.append(
                         f"forbid {policy_name} reads context.input."
                         f"{', context.input.'.join(optional)} on {action}, whose "
-                        "inputSchema does not list "
+                        f"{'inputSchema' if action in tools else 'schema'} does not list "
                         f"{'it' if len(optional) == 1 else 'them'} as required, "
                         "with no has() test before the read"
                     )
@@ -25015,10 +25786,9 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                 row(
                     StatusEnum.PASSED,
                     f"enforces policy engine {policy_engine_id}, and every "
-                    "enforcing forbid reads context.input only for fields its "
-                    "tools' inputSchema lists as required, or after a has() test "
-                    "on the field. Fields nested below a top-level input are not "
-                    "judged.",
+                    "enforcing forbid reads a context.input path only when its "
+                    "tools' inline Lambda inputSchema lists that path and every "
+                    "path above it as required, or after a has() test on it.",
                     "No action required",
                 )
             )
@@ -27456,6 +28226,187 @@ def check_agentcore_policy_session_binding(
             )
         findings.append(token_grant)
 
+    return findings
+
+
+TEMPORAL_RESPONSE_EVENT_PATTERN = re.compile(
+    r'AgentCore::Action::"((?:[^"\\]|\\.)*)"\s*::\s*response\s*\{'
+)
+PREREQUISITE_FINDING_NAME = "AgentCore Policy Session Prerequisite"
+
+
+def _cedar_head_reaches(
+    scope: List[str], action_name: str, gateway_arn: str
+) -> Optional[bool]:
+    """Return whether a policy head reaches one tool action on one gateway.
+
+    None means the head names an action group or another form not read here.
+    A head naming gateways by ARN reaches only those gateways.
+    """
+    if len(scope) != len(CEDAR_SCOPE_POSITIONS):
+        return None
+    resource = scope[CEDAR_SCOPE_POSITIONS.index("resource")]
+    gateways = re.findall(r'AgentCore::Gateway::"((?:[^"\\]|\\.)*)"', resource)
+    if gateways and gateway_arn not in gateways:
+        return False
+    actions = _cedar_scope_actions(scope)
+    if actions is None:
+        return None
+    return not actions or action_name in actions
+
+
+def check_agentcore_temporal_prerequisite_permits() -> List[Dict[str, Any]]:
+    """AC-38: each prior action a temporal rule reads must itself be permitted.
+
+    The AIR-ACR-POL-07 recommendation states a prior action is recorded as a
+    response only if it was permitted, so a temporal predicate matching
+    `AgentCore::Action::"<tool>"::response{...}` never matches unless an
+    enforcing permit without a temporal condition reaches that tool on the
+    gateway, and an unconditioned forbid on it blocks the response for good.
+    The when and unless conditions of the crediting permit are not evaluated.
+    """
+    if agentcore_client is None:
+        return []
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception:
+        # check_agentcore_policy_session_binding reports the failed list.
+        return []
+    policy_cache: Dict[str, List[Dict[str, Any]]] = {}
+    findings: List[Dict[str, Any]] = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        label = f"Gateway '{gateway.get('name', gateway_id)}' ({gateway_id})"
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+            engine_id = _gateway_policy_engine_id(detail)
+            policies = _enforcing_policies(engine_id, policy_cache) if engine_id else []
+        except Exception:
+            # The session binding row names the unread gateway.
+            continue
+        gateway_arn = str(detail.get("gatewayArn") or gateway.get("gatewayArn") or "")
+        prerequisites: Dict[str, Set[str]] = {}
+        permits: List[Tuple[str, List[str]]] = []
+        forbids: List[Tuple[str, List[str]]] = []
+        unread_policies: List[str] = []
+        for policy in policies:
+            policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
+            text = _policy_statement_text(policy)
+            parsed = _cedar_policies(text)
+            if not parsed:
+                unread_policies.append(policy_name)
+                continue
+            for effect, scope, conditions in parsed:
+                temporal = CEDAR_TEMPORAL_QUALIFIER in _cedar_condition_qualifiers(
+                    conditions
+                )
+                if temporal and effect in CEDAR_AUTHORIZING_EFFECTS:
+                    for match in TEMPORAL_RESPONSE_EVENT_PATTERN.finditer(conditions):
+                        prerequisites.setdefault(match.group(1), set()).add(policy_name)
+                elif effect == "permit":
+                    permits.append((policy_name, scope))
+                elif effect == "forbid" and not _cedar_condition_blocks(conditions):
+                    forbids.append((policy_name, scope))
+        if not prerequisites:
+            continue
+        missing: List[str] = []
+        blocked: List[str] = []
+        unjudged: List[str] = []
+        crediting: Set[str] = set()
+        for action_name, readers in sorted(prerequisites.items()):
+            named = f"{action_name} (read by {', '.join(sorted(readers))})"
+            blockers = [
+                name
+                for name, scope in forbids
+                if _cedar_head_reaches(scope, action_name, gateway_arn)
+            ]
+            if blockers:
+                blocked.append(f"{named}, forbidden by {', '.join(sorted(blockers))}")
+                continue
+            reaches = {
+                name: _cedar_head_reaches(scope, action_name, gateway_arn)
+                for name, scope in permits
+            }
+            granting = [name for name, verdict in reaches.items() if verdict]
+            if granting:
+                crediting.update(granting)
+            elif any(verdict is None for verdict in reaches.values()):
+                unjudged.append(f"{named}, which only an action-group permit may reach")
+            else:
+                missing.append(named)
+        if missing or blocked:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name=f"{PREREQUISITE_FINDING_NAME} Unpermitted",
+                    finding_details=(
+                        f"{label} enforces a temporal rule that matches a prior "
+                        "response of a tool no enforcing policy lets through, so "
+                        "the response is never recorded and the rule never matches: "
+                        + "; ".join(
+                            [
+                                f"{entry} has no permit without a temporal condition"
+                                for entry in missing
+                            ]
+                            + blocked
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "Add a permit without a temporal condition for each tool a "
+                        "temporal rule reads as a prior response, and remove the "
+                        "unconditioned forbid that blocks it."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unjudged or unread_policies:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name=f"{PREREQUISITE_FINDING_NAME} Incomplete",
+                    finding_details=(
+                        f"{label}: whether each tool a temporal rule reads as a prior "
+                        "response is permitted was not judged: "
+                        + "; ".join(
+                            unjudged
+                            + [
+                                f"policy {name} has no readable Cedar head"
+                                for name in sorted(unread_policies)
+                            ]
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "Name the prerequisite tools in a permit head, or confirm the "
+                        "action group contains them."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name=PREREQUISITE_FINDING_NAME,
+                    finding_details=(
+                        f"{label}: each tool a temporal rule reads as a prior "
+                        f"response, {', '.join(sorted(prerequisites))}, is reached "
+                        "on this gateway by an enforcing permit without a temporal "
+                        f"condition ({', '.join(sorted(crediting))}), and no "
+                        "unconditioned forbid names it. The when and unless "
+                        "conditions of those permits are not evaluated."
+                    ),
+                    resolution="No action required.",
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
     return findings
 
 
@@ -38249,6 +39200,11 @@ def lambda_handler(event, context):
                 check_agentcore_telemetry_sink_scope,
             ),
             (
+                ["AC-22"],
+                "Monitoring Account Controls",
+                lambda: check_agentcore_monitoring_account_controls(permission_cache),
+            ),
+            (
                 ["AG-24", "AG-25", "AG-26", "AG-27"],
                 "Agentic Gateway Security",
                 check_agentcore_gateway_agentic_security,
@@ -38332,6 +39288,11 @@ def lambda_handler(event, context):
                 ["AC-38"],
                 "Policy Session Binding",
                 lambda: check_agentcore_policy_session_binding(permission_cache),
+            ),
+            (
+                ["AC-38"],
+                "Policy Session Prerequisites",
+                check_agentcore_temporal_prerequisite_permits,
             ),
             (
                 ["AC-39"],

@@ -3674,11 +3674,16 @@ class TestAC06RecordingKeyPolicy:
         mock_kms.describe_key.side_effect = describe_key
         mock_kms.get_key_policy.side_effect = get_key_policy
         # The key policy delegates to the account root, so since RT-09 the role
-        # needs its own kms:GenerateDataKey grant to encrypt a recording.
+        # needs its own kms:GenerateDataKey grant to encrypt a recording, and
+        # since round 7 kms:Decrypt for a multipart upload.
         cache = _recorder_cache(
             statements=[
                 {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"},
-                {"Effect": "Allow", "Action": "kms:GenerateDataKey", "Resource": "*"},
+                {
+                    "Effect": "Allow",
+                    "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+                    "Resource": "*",
+                },
             ]
         )
         return _record(
@@ -50875,13 +50880,43 @@ class TestAC26LogArchiveForwarding:
             config["Rule"] = rule
         return {"ObjectLockConfiguration": config}
 
-    def _run(self, groups, filters, stream=None, locks=None, spans=False):
+    def _run(
+        self,
+        groups,
+        filters,
+        stream=None,
+        locks=None,
+        spans=False,
+        invocation=None,
+        destinations=None,
+    ):
         """Run the archive leg over `groups`, each with its `filters` list or
-        an exception, one Firehose description and a lock per bucket."""
+        an exception, one Firehose description and a lock per bucket.
+        `invocation` is the Bedrock invocation log group name, or an exception
+        the logging configuration read raises; `destinations` is this
+        account's CloudWatch Logs destinations, or an exception."""
         mock_logs = MagicMock()
         listed = {"/aws/bedrock-agentcore/": [self._group(name) for name in groups]}
         if spans:
             listed["aws/spans"] = [self._group("aws/spans")]
+        bedrock = None
+        if invocation is not None:
+            bedrock = MagicMock()
+            if isinstance(invocation, Exception):
+                bedrock.get_model_invocation_logging_configuration.side_effect = (
+                    invocation
+                )
+            else:
+                bedrock.get_model_invocation_logging_configuration.return_value = {
+                    "loggingConfig": {"cloudWatchConfig": {"logGroupName": invocation}}
+                }
+                listed[invocation] = [self._group(invocation)]
+        if isinstance(destinations, Exception):
+            mock_logs.describe_destinations.side_effect = destinations
+        else:
+            mock_logs.describe_destinations.return_value = {
+                "destinations": destinations or []
+            }
 
         def describe_log_groups(logGroupNamePrefix=None, **_):
             return {"logGroups": listed.get(logGroupNamePrefix, [])}
@@ -50916,6 +50951,7 @@ class TestAC26LogArchiveForwarding:
         with (
             patch("agentcore_app.logs_client", mock_logs),
             patch("agentcore_app.s3_client", mock_s3),
+            patch("agentcore_app.bedrock_client", bedrock),
             patch(
                 "agentcore_app._agentcore_delivery_log_group_names", return_value=set()
             ),
@@ -50924,11 +50960,100 @@ class TestAC26LogArchiveForwarding:
             findings = agentcore_app.check_agentcore_log_archive_forwarding()
         for finding in findings:
             assert finding["Check_ID"] == "AC-26"
-            assert finding["Finding"] == "AgentCore Log Archive Forwarding"
+            assert finding["Finding"] in (
+                "AgentCore Log Archive Forwarding",
+                "AgentCore Log Archive Destination",
+            )
             assert_finding_schema(finding)
         self.firehose = firehose
         self.s3 = mock_s3
         return {f["Finding_Details"].split("'")[1]: f for f in findings}
+
+    def test_the_bedrock_invocation_log_group_is_judged(self):
+        # Before round 7 the invocation log group was outside the population,
+        # so a group with no archive produced no row.
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)],
+                "bedrock-invocations": [],
+            },
+            invocation="bedrock-invocations",
+        )
+        assert rows["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Passed"
+        assert rows["bedrock-invocations"]["Status"] == "Failed"
+        assert (
+            "has no subscription filter"
+            in (rows["bedrock-invocations"]["Finding_Details"])
+        )
+
+    def test_an_unread_invocation_configuration_is_na(self):
+        findings = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {"/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)]},
+            invocation=_make_client_error("AccessDeniedException", "denied"),
+        )
+        (row,) = [
+            f
+            for f in findings.values()
+            if "GetModelInvocationLoggingConfiguration" in f["Finding_Details"]
+        ]
+        assert row["Status"] == "N/A"
+        assert findings["/aws/bedrock-agentcore/runtimes/a"]["Status"] == "Passed"
+
+    def test_a_filter_to_a_logs_destination_names_the_owner(self):
+        destination = "arn:aws:logs:us-east-1:444455556666:destination:archive"
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a"],
+            {"/aws/bedrock-agentcore/runtimes/a": [self._filter(destination)]},
+        )
+        row = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert row["Status"] == "N/A"
+        assert (
+            f"CloudWatch Logs destination {destination}, whose Firehose stream and "
+            "bucket AC-26 judges in account 444455556666" in row["Finding_Details"]
+        )
+
+    @staticmethod
+    def _destination(name, target):
+        return {
+            "destinationName": name,
+            "arn": f"arn:aws:logs:us-east-1:123456789012:destination:{name}",
+            "targetArn": target,
+        }
+
+    def test_each_owned_destination_is_followed_to_its_bucket(self):
+        # Before round 7 a destination was never followed in the account that
+        # owns it, so its archive was judged nowhere.
+        rows = self._run(
+            [],
+            {},
+            locks={"archive-bucket": self._lock(mode="GOVERNANCE")},
+            destinations=[
+                self._destination("locked", self._STREAM),
+                self._destination(
+                    "kinesis", "arn:aws:kinesis:us-east-1:123456789012:stream/s"
+                ),
+            ],
+        )
+        assert rows["locked"]["Status"] == "Failed"
+        assert "GOVERNANCE mode" in rows["locked"]["Finding_Details"]
+        assert rows["kinesis"]["Status"] == "N/A"
+        rows = self._run(
+            [], {}, destinations=[self._destination("locked", self._STREAM)]
+        )
+        assert rows["locked"]["Status"] == "Passed"
+        assert rows["locked"]["Finding"] == "AgentCore Log Archive Destination"
+
+    def test_an_unlisted_destination_set_is_na(self):
+        findings = self._run(
+            [],
+            {},
+            destinations=_make_client_error("AccessDeniedException", "denied"),
+        )
+        (row,) = findings.values()
+        assert row["Status"] == "N/A"
+        assert "logs:DescribeDestinations" in row["Resolution"]
 
     def test_a_locked_archive_passes_and_a_group_with_no_filter_fails(self):
         rows = self._run(
@@ -51454,7 +51579,13 @@ class TestAC06RecordingKeyUse:
         "Resource": "*",
     }
     _WRITE = {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}
-    _USE = {"Effect": "Allow", "Action": "kms:GenerateDataKey", "Resource": "*"}
+    # Since round 7 a recording write needs kms:Decrypt beside
+    # kms:GenerateDataKey, for the multipart upload.
+    _USE = {
+        "Effect": "Allow",
+        "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+        "Resource": "*",
+    }
 
     def _run(self, other_policy, identity, boundary=None, other_key=True, rows=False):
         """Bucket `recordings` encrypts with a key whose policy names the role;
@@ -51533,7 +51664,10 @@ class TestAC06RecordingKeyUse:
         failed = self._run([self._ROOT], [self._WRITE])
         assert failed["Status"] == "Failed"
         assert "allows kms:GenerateDataKey" in failed["Finding_Details"]
-        assert "kms:GenerateDataKey on the bucket's key" in failed["Resolution"]
+        assert (
+            "kms:GenerateDataKey and kms:Decrypt on the bucket's key"
+            in failed["Resolution"]
+        )
         passed = self._run([self._ROOT], [self._WRITE, self._USE])
         assert passed["Status"] == "Passed"
         assert "an identity policy the key delegates to" in passed["Finding_Details"]
@@ -51635,6 +51769,26 @@ class TestAC06RecordingKeyUse:
                 "allow kms:GenerateDataKey" in row["Finding_Details"]
             )
 
+    @pytest.mark.parametrize("via", ["identity", "key-policy"])
+    def test_a_role_without_kms_decrypt_fails_the_multipart_write(self, via):
+        generate_only = {
+            "Effect": "Allow",
+            "Action": "kms:GenerateDataKey",
+            "Resource": "*",
+        }
+        if via == "identity":
+            row = self._run([self._ROOT], [self._WRITE, generate_only])
+        else:
+            row = self._run(
+                [dict(generate_only, Principal={"AWS": _RECORDER_ROLE})],
+                [self._WRITE],
+            )
+        assert row["Status"] == "Failed"
+        assert (
+            "allows kms:Decrypt, so a multipart upload of a recording fails"
+            in row["Finding_Details"]
+        )
+
     def test_the_aws_managed_key_needs_no_grant(self):
         passed = self._run([], [self._WRITE], other_key=False)
         assert passed["Status"] == "Passed"
@@ -51653,29 +51807,51 @@ class TestAC06RecordingWriteScp:
     _FULL = {"Effect": "Allow", "Action": "*", "Resource": "*"}
     _KEY = "arn:aws:kms:us-east-1:123456789012:key/good"
 
-    def _run(self, policies, targets=None, chain_error=None, keyed=("recordings",)):
+    def _run(
+        self,
+        policies,
+        targets=None,
+        chain_error=None,
+        keyed=("recordings",),
+        rcps=None,
+    ):
         """`policies` maps a policy id to its statements; p-full is attached
         to every level and each other policy to the root, unless `targets`
-        names its target ids or an exception. Bucket
+        names its target ids or an exception. `rcps` maps resource control
+        policy ids the same way, or is an exception ListPolicies raises. Bucket
         `recordings` encrypts with a customer managed key, `other` with S3
         managed keys unless named in `keyed`."""
         mock_orgs = MagicMock()
-        mock_orgs.list_policies.return_value = {
-            "Policies": [
-                {
-                    "Id": policy_id,
-                    "Name": f"scp-{policy_id}",
-                    "Arn": (
-                        "arn:aws:organizations::999988887777:policy/o-a1b2/"
-                        f"service_control_policy/{policy_id}"
-                    ),
-                }
-                for policy_id in policies
-            ]
+
+        def listed(ids, kind):
+            return {
+                "Policies": [
+                    {
+                        "Id": policy_id,
+                        "Name": f"{kind}-{policy_id}",
+                        "Arn": (
+                            "arn:aws:organizations::999988887777:policy/o-a1b2/"
+                            f"{kind}/{policy_id}"
+                        ),
+                    }
+                    for policy_id in ids
+                ]
+            }
+
+        def list_policies(Filter, **_):
+            if Filter == "SERVICE_CONTROL_POLICY":
+                return listed(policies, "scp")
+            assert Filter == "RESOURCE_CONTROL_POLICY"
+            if isinstance(rcps, Exception):
+                raise rcps
+            return listed(rcps or {}, "rcp")
+
+        mock_orgs.list_policies.side_effect = list_policies
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-a1b2"}
         }
-        mock_orgs.describe_policy.side_effect = lambda PolicyId: _scp(
-            policies[PolicyId]
-        )
+        every = {**policies, **(rcps if isinstance(rcps, dict) else {})}
+        mock_orgs.describe_policy.side_effect = lambda PolicyId: _scp(every[PolicyId])
         parents = {
             self._ACCOUNT: {"Id": self._OU, "Type": "ORGANIZATIONAL_UNIT"},
             self._OU: {"Id": self._ROOT, "Type": "ROOT"},
@@ -51751,17 +51927,94 @@ class TestAC06RecordingWriteScp:
         statement.update(overrides)
         return statement
 
+    @pytest.mark.parametrize(
+        "rcp, br2",
+        [
+            ({"Principal": "*"}, "Failed"),
+            (
+                {
+                    "Principal": "*",
+                    "Condition": {
+                        "StringNotEqualsIfExists": {"aws:PrincipalOrgID": "o-a1b2"}
+                    },
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Condition": {
+                        "StringNotEquals": {"aws:ResourceAccount": "123456789012"}
+                    },
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+                },
+                "N/A",
+            ),
+        ],
+        ids=["unconditioned", "own-org", "own-account", "unread-key"],
+    )
+    def test_an_attached_resource_control_policy_is_judged(self, rcp, br2):
+        # Before round 7 no resource control policy was read, so the
+        # unconditioned Deny passed both browsers.
+        rows = self._run({"p-full": [self._FULL]}, rcps={"r-1": [self._deny(**rcp)]})
+        assert rows["br-1"]["Status"] == "Passed"
+        assert rows["br-2"]["Status"] == br2
+        if br2 == "Failed":
+            assert (
+                "resource control policy 'rcp-r-1', attached to root r-a1b2, "
+                "denies s3:PutObject on arn:aws:s3:::other/rec/*"
+                in rows["br-2"]["Finding_Details"]
+            )
+
+    def test_an_unattached_resource_control_policy_binds_nothing(self):
+        rows = self._run(
+            {"p-full": [self._FULL]},
+            targets={"r-1": ["ou-a1b2-22222222"]},
+            rcps={"r-1": [self._deny(Principal="*")]},
+        )
+        assert {row["Status"] for row in rows.values()} == {"Passed"}
+
+    def test_a_resource_control_policy_on_the_key_decrypt_fails(self):
+        deny = {
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "kms:Decrypt",
+            "Resource": "*",
+        }
+        rows = self._run({"p-full": [self._FULL]}, rcps={"r-1": [deny]})
+        assert rows["br-1"]["Status"] == "Failed"
+        assert "denies kms:Decrypt on " + self._KEY in rows["br-1"]["Finding_Details"]
+        assert rows["br-2"]["Status"] == "Passed"
+
+    def test_an_unlisted_resource_control_policy_set_is_na(self):
+        rows = self._run(
+            {"p-full": [self._FULL]},
+            rcps=_make_client_error("AccessDeniedException", "denied"),
+        )
+        assert {row["Status"] for row in rows.values()} == {"N/A"}
+        assert (
+            "the resource control policies (organizations:ListPolicies"
+            in rows["br-1"]["Finding_Details"]
+        )
+
     def test_full_access_alone_passes_both_browsers(self):
         rows = self._run({"p-full": [self._FULL]})
         assert {row["Status"] for row in rows.values()} == {"Passed"}
         assert (
-            "kms:GenerateDataKey on key arn:aws:kms:us-east-1:123456789012:key/good"
+            "kms:GenerateDataKey or kms:Decrypt on key "
+            "arn:aws:kms:us-east-1:123456789012:key/good"
             in rows["br-1"]["Finding_Details"]
         )
         assert "kms:GenerateDataKey" not in rows["br-2"]["Finding_Details"]
         assert "all 3 levels" in rows["br-1"]["Finding_Details"]
         assert (
-            "Resource control policies are not judged"
+            "No resource control policy attached to those levels denies either"
             in (rows["br-1"]["Finding_Details"])
         )
 
@@ -52268,6 +52521,298 @@ class TestAC35PolicyInputGuards:
         with patch("agentcore_app.agentcore_client", mock_ac):
             assert agentcore_app.check_agentcore_policy_input_guards() == []
 
+    _NESTED_TARGET = {
+        "t-bank": {
+            "name": "bank",
+            "targetConfiguration": {
+                "mcp": {
+                    "lambda": {
+                        "lambdaArn": "arn:aws:lambda:us-east-1:123456789012:function:b",
+                        "toolSchema": {
+                            "inlinePayload": [
+                                {
+                                    "name": "wire",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "payee": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "name": {"type": "string"},
+                                                    "iban": {"type": "string"},
+                                                },
+                                                "required": ["name"],
+                                            },
+                                            "meta": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "id": {"type": "string"}
+                                                },
+                                                "required": ["id"],
+                                            },
+                                        },
+                                        "required": ["payee"],
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                }
+            },
+        }
+    }
+    _WIRE = 'action == AgentCore::Action::"bank___wire"'
+
+    @pytest.mark.parametrize(
+        "condition, status, named",
+        [
+            (
+                'when { context.input.payee.iban like "GB*" }',
+                "Failed",
+                "context.input.payee.iban on bank___wire",
+            ),
+            # meta is optional, so its required id is not guaranteed; the
+            # report names the shallowest missing path.
+            (
+                'when { context.input.meta.id == "x" }',
+                "Failed",
+                "context.input.meta on bank___wire",
+            ),
+            ('when { context.input.payee.name == "x" }', "Passed", None),
+            (
+                "when { context.input.payee has iban && "
+                'context.input.payee.iban like "GB*" }',
+                "Passed",
+                None,
+            ),
+        ],
+    )
+    def test_a_nested_read_is_judged_by_its_path(self, condition, status, named):
+        rows = self._run(
+            [
+                _input_forbid(condition, action=self._WIRE),
+                _input_forbid(
+                    'when { context.input.payee.name == "x" }', action=self._WIRE
+                ),
+            ],
+            targets=self._NESTED_TARGET,
+        )
+        assert rows["gw-a"]["Status"] == status
+        assert rows["gw-b"]["Status"] == "Passed"
+        if named:
+            assert named in rows["gw-a"]["Finding_Details"]
+            assert "context.input.meta.id" not in rows["gw-a"]["Finding_Details"]
+
+    _OPENAPI = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/send": {
+                "parameters": [{"name": "to", "in": "query", "required": True}],
+                "post": {
+                    "operationId": "send",
+                    "parameters": [{"name": "trace", "in": "header"}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Send"}
+                            }
+                        },
+                    },
+                },
+            }
+        },
+        "components": {
+            "schemas": {
+                "Send": {
+                    "type": "object",
+                    "properties": {
+                        "amount": {"type": "number"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["amount"],
+                }
+            }
+        },
+    }
+
+    def _openapi_target(self, payload):
+        return {
+            "t-api": {
+                "name": "api",
+                "targetConfiguration": {
+                    "mcp": {"openApiSchema": {"inlinePayload": payload}}
+                },
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "condition, status, named",
+        [
+            (
+                'when { context.input.note == "x" }',
+                "Failed",
+                "context.input.note on api___send, whose schema does not list",
+            ),
+            (
+                'when { context.input.trace == "x" }',
+                "Failed",
+                "context.input.trace on api___send",
+            ),
+            ("when { context.input.amount > 500 }", "N/A", "marks required"),
+            ('when { context.input.to == "x" }', "N/A", "marks required"),
+            (
+                'when { context.input has note && context.input.note == "x" }',
+                "Passed",
+                None,
+            ),
+        ],
+    )
+    def test_an_inline_openapi_operation_is_judged(self, condition, status, named):
+        send = 'action == AgentCore::Action::"api___send"'
+        rows = self._run(
+            [
+                _input_forbid(condition, action=send),
+                _input_forbid('when { context.input.note == "x" }', action=send),
+            ],
+            targets=self._openapi_target(json.dumps(self._OPENAPI)),
+        )
+        assert rows["gw-a"]["Status"] == status
+        assert rows["gw-b"]["Status"] == "Failed"
+        if named:
+            assert named in rows["gw-a"]["Finding_Details"]
+
+    def test_a_forbid_on_an_unlisted_openapi_operation_is_na(self):
+        rows = self._run(
+            [
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action='action == AgentCore::Action::"api___cancel"',
+                ),
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action='action == AgentCore::Action::"api___send"',
+                ),
+            ],
+            targets=self._openapi_target(json.dumps(self._OPENAPI)),
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert "api___cancel, which no operation" in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "payload, reason",
+        [
+            ("openapi: 3.0.0\npaths: {}\n", "not read"),
+            (
+                json.dumps({"openapi": "3.0.0", "paths": {"/x": {"get": {}}}}),
+                "operationId",
+            ),
+            (
+                json.dumps(
+                    {
+                        "openapi": "3.0.0",
+                        "paths": {"/x": {"$ref": "#/components/pathItems/missing"}},
+                    }
+                ),
+                "unresolved $ref",
+            ),
+        ],
+    )
+    def test_an_unreadable_openapi_schema_is_na(self, payload, reason):
+        rows = self._run(
+            [
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action='action == AgentCore::Action::"api___send"',
+                ),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=self._openapi_target(payload),
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert "OpenAPI schema was not read" in rows["gw-a"]["Finding_Details"]
+        assert reason in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    def test_an_s3_openapi_schema_is_na(self):
+        target = {
+            "t-api": {
+                "name": "api",
+                "targetConfiguration": {
+                    "mcp": {"openApiSchema": {"s3": {"uri": "s3://schemas/api.json"}}}
+                },
+            }
+        }
+        rows = self._run(
+            [
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action='action == AgentCore::Action::"api___send"',
+                ),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=target,
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert (
+            "api___send (its OpenAPI schema is in S3)"
+            in rows["gw-a"]["Finding_Details"]
+        )
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    _SMITHY = {
+        "smithy": "2.0",
+        "shapes": {
+            "example#Send": {
+                "type": "operation",
+                "input": {"target": "example#SendInput"},
+            },
+            "example#SendInput": {
+                "type": "structure",
+                "members": {
+                    "to": {
+                        "target": "smithy.api#String",
+                        "traits": {"smithy.api#required": {}},
+                    },
+                    "note": {"target": "smithy.api#String"},
+                },
+            },
+        },
+    }
+
+    @pytest.mark.parametrize(
+        "condition, status, named",
+        [
+            (
+                'when { context.input.note == "x" }',
+                "Failed",
+                "context.input.note on svc___Send",
+            ),
+            ('when { context.input.to == "x" }', "N/A", "marks required"),
+        ],
+    )
+    def test_an_inline_smithy_operation_is_judged(self, condition, status, named):
+        target = {
+            "t-svc": {
+                "name": "svc",
+                "targetConfiguration": {
+                    "mcp": {"smithyModel": {"inlinePayload": json.dumps(self._SMITHY)}}
+                },
+            }
+        }
+        send = 'action == AgentCore::Action::"svc___Send"'
+        rows = self._run(
+            [
+                _input_forbid(condition, action=send),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=target,
+        )
+        assert rows["gw-a"]["Status"] == status
+        assert named in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
 
 class TestGatewayWafUnreadFrontDoors:
     """AIR-FND-NET-04: the WAF rows judge AgentCore gateways only, because the
@@ -52322,3 +52867,338 @@ class TestGatewayWafUnreadFrontDoors:
         waf_rows = [f for f in findings if f["Check_ID"] in ("AG-27", "AG-39")]
         assert len(waf_rows) == 2
         assert all(self._SENTENCE in f["Finding_Details"] for f in waf_rows)
+
+
+class TestAC22MonitoringAccountControls:
+    """AIR-ACR-OBS-06: a monitoring account's own data-protection policy and the
+    IAM of the principals that view the telemetry its sources share. Before
+    round 7 neither leg was read."""
+
+    _SINK = {"Arn": "arn:aws:oam:us-east-1:123456789012:sink/s-1", "Name": "central"}
+    _MASKED = [
+        "arn:aws:dataprotection::aws:data-identifier/AwsSecretKey",
+        "arn:aws:dataprotection::aws:data-identifier/EmailAddress",
+    ]
+
+    @staticmethod
+    def _account_policy(identifiers):
+        return {
+            "accountPolicies": [
+                {
+                    "policyName": "acct",
+                    "policyType": "DATA_PROTECTION_POLICY",
+                    "policyDocument": json.dumps(
+                        {
+                            "Statement": [
+                                {
+                                    "DataIdentifier": identifiers,
+                                    "Operation": {"Audit": {"FindingsDestination": {}}},
+                                },
+                                {
+                                    "DataIdentifier": identifiers,
+                                    "Operation": {"Deidentify": {"MaskConfig": {}}},
+                                },
+                            ]
+                        }
+                    ),
+                }
+            ]
+        }
+
+    @staticmethod
+    def _principal(statements):
+        return {
+            "attached_policies": [
+                {"name": "p", "document": {"Statement": statements}},
+            ],
+            "inline_policies": [],
+        }
+
+    _VIEW = {
+        "Effect": "Allow",
+        "Action": ["logs:StartQuery", "logs:GetQueryResults"],
+        "Resource": "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*",
+    }
+
+    def _run(self, mock_oam, mock_logs, roles, sinks=True, identifiers=None):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK] if sinks else []}
+        mock_logs.describe_account_policies.return_value = self._account_policy(
+            self._MASKED if identifiers is None else identifiers
+        )
+        findings = agentcore_app.check_agentcore_monitoring_account_controls(
+            {"role_permissions": roles, "user_permissions": {}}
+        )
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-22"
+            assert_finding_schema(finding)
+        return {f["Finding"]: f for f in findings}
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_account_with_no_sink_gets_no_row(self, mock_oam, mock_logs):
+        assert self._run(mock_oam, mock_logs, {}, sinks=False) == {}
+
+    @pytest.mark.parametrize(
+        "identifiers, status",
+        [
+            (None, "Passed"),
+            (["arn:aws:dataprotection::aws:data-identifier/AwsSecretKey"], "Failed"),
+            ([], "Failed"),
+        ],
+        ids=["both-categories", "credentials-only", "none"],
+    )
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.oam_client")
+    def test_the_monitoring_account_masks_its_own_logs(
+        self, mock_oam, mock_logs, identifiers, status
+    ):
+        rows = self._run(mock_oam, mock_logs, {}, identifiers=identifiers)
+        assert rows["Monitoring Account Data Protection"]["Status"] == status
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_unread_account_policy_is_na(self, mock_oam, mock_logs):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_logs.describe_account_policies.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        findings = agentcore_app.check_agentcore_monitoring_account_controls(
+            {"role_permissions": {}, "user_permissions": {}}
+        )
+        (row,) = [
+            f for f in findings if f["Finding"] == "Monitoring Account Data Protection"
+        ]
+        assert row["Status"] == "N/A"
+        assert "logs:DescribeAccountPolicies" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement, defect",
+        [
+            ({"Effect": "Allow", "Action": "logs:*", "Resource": "*"}, "Action logs:*"),
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": ["logs:StartQuery", "logs:DeleteLogGroup"],
+                    "Resource": "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*",
+                },
+                "write action logs:deleteloggroup",
+            ),
+            (
+                {"Effect": "Allow", "Action": "logs:StartQuery", "Resource": "*"},
+                "a log read on every log group",
+            ),
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": "logs:FilterLogEvents",
+                    "Resource": "arn:aws:logs:us-east-1:111122223333:log-group:*",
+                },
+                "a log read on every log group",
+            ),
+            (
+                {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"},
+                "NotAction",
+            ),
+            ({"Effect": "Allow", "Action": "*", "Resource": "*"}, "Action *"),
+        ],
+        ids=[
+            "service-wildcard",
+            "named-delete",
+            "resource-star",
+            "group-wildcard",
+            "not-action",
+            "bare-star",
+        ],
+    )
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_viewing_statement_is_judged_by_value(
+        self, mock_oam, mock_logs, statement, defect
+    ):
+        rows = self._run(
+            mock_oam,
+            mock_logs,
+            {
+                "scoped-viewer": self._principal([self._VIEW]),
+                "wide-viewer": self._principal([statement]),
+            },
+        )
+        row = rows["Monitoring Account Viewing Access"]
+        assert row["Status"] == "Failed"
+        assert f"role wide-viewer ({defect}" in row["Finding_Details"]
+        assert "scoped-viewer" not in row["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.oam_client")
+    def test_viewers_granted_by_name_on_named_groups_pass(self, mock_oam, mock_logs):
+        rows = self._run(
+            mock_oam,
+            mock_logs,
+            {
+                "scoped-viewer": self._principal(
+                    [
+                        self._VIEW,
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "xray:BatchGetTraces",
+                                "cloudwatch:GetMetricData",
+                            ],
+                            "Resource": "*",
+                        },
+                    ]
+                ),
+                "builder": self._principal(
+                    [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+                ),
+                "AWSServiceRoleForCloudWatchCrossAccount": self._principal(
+                    [{"Effect": "Allow", "Action": "logs:*", "Resource": "*"}]
+                ),
+            },
+        )
+        row = rows["Monitoring Account Viewing Access"]
+        assert row["Status"] == "Passed"
+        assert "role scoped-viewer" in row["Finding_Details"]
+        assert "builder" not in row["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_denied_view_is_not_a_viewer(self, mock_oam, mock_logs):
+        rows = self._run(
+            mock_oam,
+            mock_logs,
+            {
+                "denied": self._principal(
+                    [
+                        {"Effect": "Allow", "Action": "logs:*", "Resource": "*"},
+                        {"Effect": "Deny", "Action": "logs:*", "Resource": "*"},
+                    ]
+                ),
+            },
+        )
+        row = rows["Monitoring Account Viewing Access"]
+        assert row["Status"] == "Passed"
+        assert "no cached role or user" in row["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_unparsable_policy_withholds_the_pass(self, mock_oam, mock_logs):
+        rows = self._run(
+            mock_oam,
+            mock_logs,
+            {
+                "scoped-viewer": self._principal([self._VIEW]),
+                "broken": {
+                    "attached_policies": [{"name": "p", "document": "{not json"}],
+                    "inline_policies": [],
+                },
+            },
+        )
+        assert rows["Monitoring Account Viewing Access Incomplete"]["Status"] == "N/A"
+        assert "Monitoring Account Viewing Access" not in rows
+
+
+class TestAC38TemporalPrerequisitePermits:
+    """AIR-ACR-POL-07: a prior action is recorded as a response only when it was
+    permitted, so each tool a temporal rule reads as a prior response needs an
+    enforcing permit without a temporal condition. Before round 7 no check read
+    the prerequisite."""
+
+    _GW_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+
+    @staticmethod
+    def _permit(tools=("verifyPayee",), resource="resource is AgentCore::Gateway"):
+        names = ", ".join(f'AgentCore::Action::"payments___{tool}"' for tool in tools)
+        return f"permit(principal, action in [{names}], {resource});"
+
+    def _run(self, mock_ac, statements_by_gateway):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": g} for g in statements_by_gateway]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: (
+            _policy_engine_gateway(
+                arn=f"{_ENGINE_ARN}-{gatewayIdentifier}",
+                gatewayArn=self._GW_ARN.replace("gw-1", gatewayIdentifier),
+            )
+        )
+        mock_ac.list_policies.side_effect = lambda policyEngineId, **kwargs: {
+            "policies": [
+                _cedar_policy(f"p{index}", statement)
+                for index, statement in enumerate(
+                    statements_by_gateway[policyEngineId.split("pe-1-", 1)[1]]
+                )
+            ]
+        }
+        findings = agentcore_app.check_agentcore_temporal_prerequisite_permits()
+        rows = {}
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-38"
+            assert_finding_schema(finding)
+            rows[finding["Finding_Details"].split("(", 2)[1].split(")")[0]] = finding
+        return rows
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_needs_a_plain_permit_for_its_prerequisite(self, mock_ac):
+        rule = _temporal_statement(_SCOPED_EVENT)
+        rows = self._run(
+            mock_ac,
+            {
+                "gw-1": [rule, self._permit()],
+                "gw-2": [rule, self._permit(tools=("lookup",))],
+            },
+        )
+        assert rows["gw-1"]["Status"] == "Passed"
+        assert "payments___verifyPayee" in rows["gw-1"]["Finding_Details"]
+        assert rows["gw-2"]["Status"] == "Failed"
+        assert (
+            "payments___verifyPayee (read by p0) has no permit without a temporal "
+            "condition" in rows["gw-2"]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "other, status",
+        [
+            ("permit(principal, action, resource);", "Passed"),
+            (
+                'permit(principal, action == AgentCore::Action::"payments___verifyPayee",'
+                " resource) when temporal { true };",
+                "Failed",
+            ),
+            (
+                'permit(principal, action == AgentCore::Action::"payments___verifyPayee",'
+                ' resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-east-1:'
+                '123456789012:gateway/other");',
+                "Failed",
+            ),
+            (
+                'permit(principal, action in AgentCore::ActionGroup::"reads", resource);',
+                "N/A",
+            ),
+        ],
+        ids=["bare-action", "temporal-permit", "other-gateway", "action-group"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_crediting_permit_is_judged_by_value(self, mock_ac, other, status):
+        rows = self._run(mock_ac, {"gw-1": [_temporal_statement(_SCOPED_EVENT), other]})
+        assert rows["gw-1"]["Status"] == status
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unconditioned_forbid_blocks_the_prerequisite(self, mock_ac):
+        forbid = 'forbid(principal, action == AgentCore::Action::"payments___verifyPayee", resource);'
+        guarded = forbid.replace(";", ' when { principal.id == "x" };')
+        rows = self._run(
+            mock_ac,
+            {
+                "gw-1": [_temporal_statement(_SCOPED_EVENT), self._permit(), forbid],
+                "gw-2": [_temporal_statement(_SCOPED_EVENT), self._permit(), guarded],
+            },
+        )
+        assert rows["gw-1"]["Status"] == "Failed"
+        assert "forbidden by p2" in rows["gw-1"]["Finding_Details"]
+        assert rows["gw-2"]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_request_pattern_needs_no_permit(self, mock_ac):
+        request = ("verifyPayee", "request", "eventResource: resource")
+        rows = self._run(mock_ac, {"gw-1": [_temporal_statement(request)]})
+        assert rows == {}

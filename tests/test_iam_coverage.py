@@ -1308,6 +1308,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "s3:GetBucketObjectLockConfiguration",
 }
 
+# AC-26 follows a subscription filter to a CloudWatch Logs destination.
+# validate-policy on 2026-10-03 reported INVALID_ACTION only at Action index 1,
+# the negative control logs:DescribeDestinationz, and nothing at index 0. The
+# name is in the logs service reference JSON with no resource type.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"logs:DescribeDestinations"}
+
 # AC-06 names s3:PutObject in the fix text of its recording write SCP row.
 # validate-policy on 2026-10-03 reported nothing at Action index 0 and
 # INVALID_ACTION for the negative control s3:PutObjectz at index 1 of the same
