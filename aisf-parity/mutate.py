@@ -1003,19 +1003,6 @@ MUTATIONS = [
         "replace": "            pass\n",
     },
     {
-        "name": "SM-26 passes active prompt-injection findings",
-        "file": SAGEMAKER,
-        "defect": "an unarchived Impact:IAMUser/PromptInjection.Direct finding is "
-        "a detected attempt nobody closed. Passing on the listing alone hides it",
-        "find": (
-            "    if not ids:\n        return _row(\n"
-            '            f"No active (unarchived)'
-        ),
-        "replace": (
-            '    if True:\n        return _row(\n            f"No active (unarchived)'
-        ),
-    },
-    {
         "name": "SM-33 and SM-11 credit private DNS in a VPC with DNS off",
         "file": SAGEMAKER,
         "defect": "private DNS creates no record for the default hostname in a "
@@ -2803,7 +2790,6 @@ GROUPS: dict[str, str] = {
     "SM-02 lets a stage span a slash": "in the SageMaker verdict legs",
     "SM-39 does not count an agent Lambda outside a VPC": "in the SageMaker verdict legs",
     "SM-39 drops EKS cluster subnets": "in the SageMaker verdict legs",
-    "SM-26 passes active prompt-injection findings": "in the SageMaker verdict legs",
     "SM-33 and SM-11 credit private DNS in a VPC with DNS off": "in the SageMaker verdict legs",
     "SM-33 passes a VPC whose DNS attributes were not read": "in the SageMaker verdict legs",
     "SM-33 reads only the first VPC's DNS attributes": "in the SageMaker verdict legs",

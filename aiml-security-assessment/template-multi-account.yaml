@@ -973,8 +973,6 @@ Resources:
               - route53resolver:ListFirewallDomainLists # SM-39
               - ec2:DescribeNatGateways # SM-39
               - lambda:ListMicrovmImages # SM-40
-              - guardduty:ListFindings # SM-26
-              - guardduty:GetFindings # SM-26
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a
