@@ -16997,6 +16997,33 @@ def _invoke_allow(condition=None, resource="*"):
     return _identity_policy("sagemaker:InvokeEndpoint", resource, condition)
 
 
+def _invoke_scp(statements=(), attached=True, state="read"):
+    """An SM-34 SCP state for account 111122223333 under ou-1 and r-1, holding
+    one policy 'VpcePin' with statements, attached to the root or to nothing."""
+    path = ["111122223333", "ou-1", "r-1"]
+    return {
+        "state": state,
+        "detail": f"organization {state}",
+        "resolution": "",
+        "account": "111122223333",
+        "management": False,
+        "path": path,
+        "unread_policies": [],
+        "items": [
+            {
+                "name": "VpcePin",
+                "id": "p-1",
+                "content": json.dumps(
+                    {"Version": "2012-10-17", "Statement": list(statements)}
+                ),
+                "targets": [{"TargetId": "r-1"}] if attached else [],
+            }
+        ]
+        if statements
+        else [],
+    }
+
+
 def _invoke_deny(operator, key="aws:SourceVpce", value="vpce-1", **extra):
     statement = {
         "Effect": "Deny",
@@ -17015,15 +17042,30 @@ class TestSM11InvokeSourceNetwork:
 
     INVENTORY = {"endpoints": [{"name": "ep-1"}]}
     PINNED = {"StringEquals": {"aws:SourceVpce": "vpce-1"}}
+    ROOT_OPEN = "the root user can call the public runtime endpoint from any network"
+    PRINCIPALS_OPEN = "can call sagemaker:InvokeEndpoint from any network"
 
-    def _rows(self, cache, inventory=None):
+    def _rows(self, cache, inventory=None, scp=None):
         return _rows(
             {
                 "csv_data": sagemaker_app._invoke_source_network_findings(
-                    cache, inventory or self.INVENTORY, "us-east-1"
+                    cache,
+                    inventory or self.INVENTORY,
+                    "us-east-1",
+                    scp=scp if scp is not None else _invoke_scp(),
                 )
             }
         )
+
+    def _held_but_root_open(self, rows, *held):
+        """Every role and user is held, so the one Failed row is the root
+        user's, and it names the held principals."""
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert self.ROOT_OPEN in details
+        assert self.PRINCIPALS_OPEN not in details
+        for label in held:
+            assert label in details
 
     def test_open_role_fails_beside_a_pinned_one(self):
         rows = self._rows(
@@ -17038,6 +17080,7 @@ class TestSM11InvokeSourceNetwork:
         assert rows[0]["Check_ID"] == "SM-11"
         assert "Role 'Open' (policy 'OpenInvoke')" in rows[0]["Finding_Details"]
         assert "Pinned" not in rows[0]["Finding_Details"]
+        assert self.PRINCIPALS_OPEN in rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "condition",
@@ -17048,10 +17091,9 @@ class TestSM11InvokeSourceNetwork:
             {"ForAnyValue:StringEquals": {"aws:SourceVpce": "vpce-1"}},
         ],
     )
-    def test_pinned_allow_passes(self, condition):
+    def test_pinned_allow_holds_the_role_and_leaves_the_root_user(self, condition):
         rows = self._rows(_v2_cache({"R": [("P", _invoke_allow(condition))]}))
-        assert [r["Status"] for r in rows] == ["Passed"]
-        assert "Role 'R'" in rows[0]["Finding_Details"]
+        self._held_but_root_open(rows, "Role 'R'")
 
     @pytest.mark.parametrize(
         "condition",
@@ -17067,6 +17109,8 @@ class TestSM11InvokeSourceNetwork:
     def test_allow_that_admits_a_public_call_fails(self, condition):
         rows = self._rows(_v2_cache({"R": [("P", _invoke_allow(condition))]}))
         assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Role 'R' (policy 'P')" in rows[0]["Finding_Details"]
+        assert self.PRINCIPALS_OPEN in rows[0]["Finding_Details"]
 
     def test_second_unpinned_statement_fails_the_principal(self):
         rows = self._rows(
@@ -17081,6 +17125,7 @@ class TestSM11InvokeSourceNetwork:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "policy 'Async'" in rows[0]["Finding_Details"]
+        assert self.PRINCIPALS_OPEN in rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "deny",
@@ -17093,11 +17138,11 @@ class TestSM11InvokeSourceNetwork:
             ),
         ],
     )
-    def test_identity_deny_outside_the_vpce_passes(self, deny):
+    def test_identity_deny_outside_the_vpce_holds_the_role(self, deny):
         policy = _invoke_allow()
         policy["Statement"].append(deny)
         rows = self._rows(_v2_cache({"R": [("P", policy)]}))
-        assert [r["Status"] for r in rows] == ["Passed"]
+        self._held_but_root_open(rows, "Role 'R'")
 
     @pytest.mark.parametrize(
         "deny",
@@ -17120,6 +17165,7 @@ class TestSM11InvokeSourceNetwork:
         policy["Statement"].append(deny)
         rows = self._rows(_v2_cache({"R": [("P", policy)]}))
         assert [r["Status"] for r in rows] == ["Failed"]
+        assert self.PRINCIPALS_OPEN in rows[0]["Finding_Details"]
 
     def test_group_grant_is_read(self):
         rows = self._rows(
@@ -17137,8 +17183,7 @@ class TestSM11InvokeSourceNetwork:
             },
         )
         rows = self._rows(cache)
-        assert [r["Status"] for r in rows] == ["Passed"]
-        assert "1 principal(s)" in rows[0]["Finding_Details"]
+        self._held_but_root_open(rows, "1 principal(s)", "Role 'Bounded'")
         assert "NoInvoke" not in rows[0]["Finding_Details"]
 
     def test_unread_principal_holds_back_passed(self):
@@ -17195,6 +17240,124 @@ class TestSM11InvokeSourceNetwork:
             "check_sagemaker_model_network_isolation(\n"
             "            region=region, permission_cache=permission_cache"
         ) in handler
+
+
+class TestRound9SM11InvokeSourceScp:
+    """AIR-SGM-EP-01 round 9: the account root user is bound by no identity
+    policy, so only an attached SCP Deny on every invoke action passes the
+    private-path leg."""
+
+    _leg = TestSM11InvokeSourceNetwork()
+    ACTIONS = (
+        "sagemaker:InvokeEndpoint",
+        "sagemaker:InvokeEndpointAsync",
+        "sagemaker:InvokeEndpointWithResponseStream",
+    )
+    OPEN = _v2_cache({"Open": [("OpenInvoke", _invoke_allow())]})
+    HELD = _v2_cache(
+        {"R": [("P", _invoke_allow({"StringEquals": {"aws:SourceVpce": "vpce-1"}}))]}
+    )
+
+    def _deny(self, actions=ACTIONS, resource="*", operator="StringNotEquals"):
+        return {
+            "Effect": "Deny",
+            "Action": list(actions),
+            "Resource": resource,
+            "Condition": {operator: {"aws:SourceVpce": "vpce-1"}},
+        }
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            {
+                "Effect": "Deny",
+                "Action": "sagemaker:InvokeEndpoint*",
+                "Resource": "*",
+                "Condition": {"StringNotEquals": {"aws:SourceVpc": "vpc-1"}},
+            },
+            {
+                "Effect": "Deny",
+                "Action": list(ACTIONS),
+                "Resource": "arn:aws:sagemaker:*:*:endpoint/*",
+                "Condition": {"StringNotEqualsIfExists": {"aws:SourceVpce": "v"}},
+            },
+        ],
+    )
+    def test_an_attached_scp_on_every_invoke_action_passes_over_an_open_role(
+        self, deny
+    ):
+        rows = self._leg._rows(self.OPEN, scp=_invoke_scp([deny]))
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "Service control policy 'VpcePin'" in details
+        assert "the root user included" in details
+        assert "account 111122223333" in details
+
+    def test_an_scp_missing_one_invoke_action_leaves_the_root_user(self):
+        rows = self._leg._rows(
+            self.HELD, scp=_invoke_scp([self._deny(actions=self.ACTIONS[:1])])
+        )
+        self._leg._held_but_root_open(rows, "Role 'R'")
+        details = rows[0]["Finding_Details"]
+        assert "InvokeEndpointAsync: no service control policy Deny" in details
+        assert "InvokeEndpointWithResponseStream: no service control" in details
+        assert "InvokeEndpoint: " not in details
+
+    def test_an_unattached_scp_leaves_the_root_user(self):
+        rows = self._leg._rows(
+            self.HELD, scp=_invoke_scp([self._deny()], attached=False)
+        )
+        self._leg._held_but_root_open(rows, "Role 'R'")
+        assert "is not attached to this account" in rows[0]["Finding_Details"]
+
+    def test_an_scp_on_a_named_endpoint_only_leaves_the_root_user(self):
+        rows = self._leg._rows(
+            self.HELD,
+            scp=_invoke_scp(
+                [
+                    self._deny(
+                        resource="arn:aws:sagemaker:us-east-1:111122223333:endpoint/a"
+                    )
+                ]
+            ),
+        )
+        self._leg._held_but_root_open(rows, "Role 'R'")
+        assert "on named resources only" in rows[0]["Finding_Details"]
+
+    def test_an_scp_the_check_could_not_read_holds_the_leg_at_na(self):
+        rows = self._leg._rows(self.HELD, scp=_invoke_scp(state="unread"))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Finding"].endswith("Incomplete")
+        assert "was not established" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("state", ["exempt", "none"])
+    def test_no_scp_can_apply_so_the_root_user_fails(self, state):
+        rows = self._leg._rows(self.HELD, scp=_invoke_scp(state=state))
+        self._leg._held_but_root_open(rows, "Role 'R'")
+        assert f"organization {state}" in rows[0]["Finding_Details"]
+
+    def test_an_open_role_names_the_missing_scp(self):
+        rows = self._leg._rows(self.OPEN)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "No attached service control policy holds every invoke action"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_the_check_reads_the_scp_state_when_given_none(self):
+        with patch(
+            "sagemaker_app._creation_scp_state",
+            return_value=_invoke_scp([self._deny()]),
+        ) as state:
+            rows = _rows(
+                {
+                    "csv_data": sagemaker_app._invoke_source_network_findings(
+                        self.OPEN, {"endpoints": [{"name": "ep-1"}]}, "us-east-1"
+                    )
+                }
+            )
+        state.assert_called_once_with(None)
+        assert [r["Status"] for r in rows] == ["Passed"]
 
 
 # ===================================================================
@@ -21506,7 +21669,10 @@ class TestGroupPoliciesContract:
         rows = _rows(
             {
                 "csv_data": sagemaker_app._invoke_source_network_findings(
-                    cache, {"endpoints": [{"name": "ep-1"}]}, "us-east-1"
+                    cache,
+                    {"endpoints": [{"name": "ep-1"}]},
+                    "us-east-1",
+                    scp=_invoke_scp(),
                 )
             }
         )

@@ -6141,12 +6141,22 @@ def _runtime_private_path_findings(
 
 INVOKE_SOURCE_NETWORK_FINDING = "SageMaker Endpoint Invocation Source Network"
 INVOKE_SOURCE_NETWORK_KEYS = ("aws:sourcevpce", "aws:sourcevpc")
+# AIR-SGM-EP-01: the account root user is bound by no identity policy, so only
+# an attached SCP Deny on these actions, as SM-34 reads one, holds it to the
+# private path.
+INVOKE_SOURCE_SCP_ACTIONS = (
+    "sagemaker:InvokeEndpoint",
+    "sagemaker:InvokeEndpointAsync",
+    "sagemaker:InvokeEndpointWithResponseStream",
+)
+INVOKE_SOURCE_SCP_UNDETERMINED = ("unread", "documents-unread", "attachment-unread")
 INVOKE_SOURCE_NETWORK_RESOLUTION = (
     "Condition each sagemaker:InvokeEndpoint Allow on aws:SourceVpce (the "
     "sagemaker.runtime interface endpoint IDs) or aws:SourceVpc with "
     "StringEquals, or add an identity Deny on sagemaker:InvokeEndpoint for "
     "every endpoint with StringNotEquals on aws:SourceVpce, so a call from "
-    "outside the private path is refused."
+    "outside the private path is refused. Only the same Deny in a service "
+    "control policy attached above this account binds the account root user."
 )
 
 
@@ -6204,16 +6214,43 @@ def _deny_pins_invoke_source(statement: Dict[str, Any]) -> bool:
 
 
 def _invoke_source_network_findings(
-    permission_cache: Optional[Dict[str, Any]], inventory: Dict[str, Any], region: str
+    permission_cache: Optional[Dict[str, Any]],
+    inventory: Dict[str, Any],
+    region: str,
+    scp: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     AIR-SGM-EP-01: an interface endpoint gives callers a private path but does
     not stop a caller elsewhere from using the public runtime endpoint. Only an
     IAM condition on aws:SourceVpce or aws:SourceVpc does, so each principal
-    that can invoke an endpoint must be held to one.
+    that can invoke an endpoint must be held to one. The account root user is
+    bound by no identity policy, so an attached SCP Deny on every invoke action
+    passes on its own, and without one the root user fails the leg.
     """
     if not inventory["endpoints"]:
         return []
+    if scp is None:
+        try:
+            scp = _creation_scp_state(None)
+        except Exception as error:
+            scp = {
+                "state": "unread",
+                "detail": (
+                    "service control policies were not read "
+                    f"({get_assessment_error_label(error)})"
+                ),
+            }
+    scp_legs = {
+        action: _creation_scp_leg(scp, action, INVOKE_SOURCE_NETWORK_KEYS)
+        for action in INVOKE_SOURCE_SCP_ACTIONS
+    }
+    scp_open = {
+        action: leg for action, leg in scp_legs.items() if leg["state"] != "enforced"
+    }
+    scp_text = "; ".join(
+        f"{action.split(':', 1)[1]}: {_creation_scp_reason(leg, scp)}"
+        for action, leg in scp_open.items()
+    )
 
     def _row(details, resolution, severity, status, name=None):
         return create_finding(
@@ -6227,12 +6264,32 @@ def _invoke_source_network_findings(
             region=region,
         )
 
+    if not scp_open:
+        policies = sorted(
+            {name for leg in scp_legs.values() for name in leg["policies"]}
+        )
+        return [
+            _row(
+                "Service control policy "
+                f"{', '.join(repr(n) for n in policies[:3])}, attached above "
+                f"account {scp.get('account') or 'unknown'}, denies "
+                f"{', '.join(INVOKE_SOURCE_SCP_ACTIONS)} on every endpoint unless "
+                "the call arrives through a named VPC endpoint or VPC "
+                "(aws:SourceVpce or aws:SourceVpc), which binds every principal "
+                "in the account, the root user included.",
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        ]
+
     if permission_cache is None:
         return [
             _row(
                 "The IAM permissions cache was not available, so whether "
                 "sagemaker:InvokeEndpoint grants are held to aws:SourceVpce or "
-                "aws:SourceVpc was not read.",
+                "aws:SourceVpc was not read, and no attached service control "
+                f"policy holds every invoke action to it ({scp_text}).",
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
                 "N/A",
@@ -6298,7 +6355,8 @@ def _invoke_source_network_findings(
                 f"{len(open_principals)} principal(s) can call "
                 "sagemaker:InvokeEndpoint from any network: no Allow condition "
                 "on aws:SourceVpce or aws:SourceVpc and no identity Deny holds the "
-                f"call to a VPC endpoint or VPC: {shown}. {SCP_NOT_EVALUATED_NOTE}",
+                f"call to a VPC endpoint or VPC: {shown}. No attached service "
+                f"control policy holds every invoke action to it ({scp_text}).",
                 INVOKE_SOURCE_NETWORK_RESOLUTION,
                 "Medium",
                 "Failed",
@@ -6320,11 +6378,30 @@ def _invoke_source_network_findings(
                 region,
             )
         )
-    elif not open_principals and pinned:
-        details = read_details
+    elif not open_principals and any(
+        leg["state"] in INVOKE_SOURCE_SCP_UNDETERMINED for leg in scp_open.values()
+    ):
+        rows.append(
+            _row(
+                f"{read_details} The account root user is bound by no identity "
+                "policy, and whether an attached service control policy holds it "
+                f"to the private path was not established: {scp_text}.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+                name=f"{INVOKE_SOURCE_NETWORK_FINDING} Incomplete",
+            )
+        )
+    elif not open_principals:
+        details = (
+            f"{read_details} The account root user is bound by no identity "
+            "policy, and no attached service control policy holds every invoke "
+            f"action to a VPC endpoint or VPC ({scp_text}), so the root user can "
+            "call the public runtime endpoint from any network."
+        )
         if _principal_read_errors(permission_cache) is None:
             details += " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE
-        rows.append(_row(details, "No action required", "Medium", "Passed"))
+        rows.append(_row(details, INVOKE_SOURCE_NETWORK_RESOLUTION, "Medium", "Failed"))
     return rows
 
 
@@ -14224,6 +14301,7 @@ GUARDED_ACTION_RESOURCE_TYPES = {
     **dict(SAGEMAKER_GUARDED_CREATE_ACTIONS),
     "sagemaker:CreatePresignedNotebookInstanceUrl": "notebook-instance",
     "sagemaker:CreatePresignedDomainUrl": "user-profile",
+    **{action: "endpoint" for action in INVOKE_SOURCE_SCP_ACTIONS},
     "lambda:CreateFunction": "lambda:function",
     "lambda:UpdateFunctionConfiguration": "lambda:function",
     "lambda:CreateNetworkConnector": "lambda:network-connector",

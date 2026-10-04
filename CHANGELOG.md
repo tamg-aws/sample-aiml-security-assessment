@@ -482,6 +482,14 @@ section.
   `GetAgentRuntime`, beside the latest version. Each version carries its own
   `networkConfiguration`, so an older version an endpoint serves on other
   subnets or in `PUBLIC` mode passed unseen.
+- `SM-11`'s `SageMaker Endpoint Invocation Source Network` row reads the
+  service control policies `SM-34` reads. An attached SCP Deny on
+  `InvokeEndpoint`, `InvokeEndpointAsync` and
+  `InvokeEndpointWithResponseStream` outside `aws:SourceVpce` or
+  `aws:SourceVpc` passes on its own. Without one the row fails, even when
+  every role and user is held by an identity condition, because the account
+  root user is bound by no identity policy. It passed on roles and users
+  before. An SCP the check could not read holds the row at `N/A`.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
