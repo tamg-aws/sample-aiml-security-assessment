@@ -1209,38 +1209,38 @@ def _action_patterns_overlap(first: str, second: str) -> bool:
     """Return whether two IAM action patterns match at least one common action.
 
     Both patterns use the IAM grammar, where `*` matches any run of characters
-    and `?` matches one. The table is indexed by position in each pattern, so the
-    cost is the product of the two lengths.
+    and `?` matches one. The table is indexed by position in each pattern and
+    filled from the ends backwards one row at a time, so the cost is the product
+    of the two lengths and no input deepens the stack: a policy can carry a
+    pattern thousands of characters long.
     """
     first = first.lower()
     second = second.lower()
-    memo: Dict[Tuple[int, int], bool] = {}
-
-    def overlap(i: int, j: int) -> bool:
-        key = (i, j)
-        if key in memo:
-            return memo[key]
-        memo[key] = False
-        result = False
-        if i == len(first) and j == len(second):
-            result = True
-        elif i < len(first) and first[i] == "*" and overlap(i + 1, j):
-            result = True
-        elif j < len(second) and second[j] == "*" and overlap(i, j + 1):
-            result = True
-        elif i < len(first) and j < len(second):
-            left, right = first[i], second[j]
-            if left == "*" and right != "*":
-                result = overlap(i, j + 1)
-            elif right == "*" and left != "*":
-                result = overlap(i + 1, j)
-            elif left != "*" and right != "*":
-                if left == "?" or right == "?" or left == right:
-                    result = overlap(i + 1, j + 1)
-        memo[key] = result
-        return result
-
-    return overlap(0, 0)
+    # below[j] answers whether first[i + 1:] overlaps second[j:]; row[j] is the
+    # same for first[i:].
+    below = bytearray(len(second) + 1)
+    for i in range(len(first), -1, -1):
+        row = bytearray(len(second) + 1)
+        for j in range(len(second), -1, -1):
+            if i == len(first) and j == len(second):
+                row[j] = 1
+                continue
+            left = first[i] if i < len(first) else ""
+            right = second[j] if j < len(second) else ""
+            if left == "*" and below[j]:
+                row[j] = 1
+            elif right == "*" and row[j + 1]:
+                row[j] = 1
+            elif left and right:
+                if left == "*" and right != "*":
+                    row[j] = row[j + 1]
+                elif right == "*" and left != "*":
+                    row[j] = below[j]
+                elif left != "*" and right != "*":
+                    if left == "?" or right == "?" or left == right:
+                        row[j] = below[j + 1]
+        below = row
+    return bool(below[0])
 
 
 def _action_pattern_covers(outer: str, inner: str) -> bool:

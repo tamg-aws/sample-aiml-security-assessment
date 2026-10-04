@@ -357,6 +357,12 @@ section.
     `StartBrowserSession` on the tool's ARN) lacks one of the tool role's
     grants, because that principal runs code with the role. No IAM change:
     the row reads the IAM permission cache.
+  - AgentCore checks no longer crash on a long action pattern. The helper
+    that tests whether two IAM action patterns overlap recursed once per
+    character, so a cached policy holding a pattern of about 1,000 characters
+    raised RecursionError out of `AC-45` and every other caller. It now fills
+    the same table iteratively; two 2,001-character patterns take under half a
+    second.
 
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.

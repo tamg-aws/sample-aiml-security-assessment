@@ -3642,6 +3642,13 @@ MUTATIONS = [
         "find": "        if hosting_errors:\n",
         "replace": "        if False:\n",
     },
+    {
+        "name": "AC-45 shell: a matching character pair ends the pattern overlap",
+        "file": AGENTCORE,
+        "defect": "a principal granted bedrock-agentcore:InvokeAgentRuntimeCommand* was read as not reaching the shell action",
+        "find": "                        row[j] = below[j + 1]\n",
+        "replace": "                        row[j] = 0\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -4437,6 +4444,7 @@ GROUPS: dict[str, str] = {
     "AC-45 invoker: an invoker whose Deny removes the start grant is held to the role": "in the AgentCore verdict legs",
     "AC-08 data path: a hosting VPC's endpoints are not judged": "in the AgentCore verdict legs",
     "AC-08 data path: an unresolved hosting VPC is not reported": "in the AgentCore verdict legs",
+    "AC-45 shell: a matching character pair ends the pattern overlap": "in the AgentCore verdict legs",
 }
 
 

@@ -44440,6 +44440,116 @@ class TestAC45ServiceExecutionRoles:
         assert "AWS managed policy" not in row["Finding_Details"]
 
 
+class TestActionPatternOverlapLength:
+    """A long action pattern in a cached policy must not crash a check.
+
+    _action_patterns_overlap recursed once per character, so a 2000-character
+    pattern raised RecursionError out of AC-45 and every check calling it.
+    """
+
+    @staticmethod
+    def _recursive_overlap(first, second):
+        """The recursive form the helper had, kept as the exactness oracle."""
+        first, second = first.lower(), second.lower()
+        memo = {}
+
+        def overlap(i, j):
+            if (i, j) in memo:
+                return memo[(i, j)]
+            memo[(i, j)] = False
+            result = False
+            if i == len(first) and j == len(second):
+                result = True
+            elif i < len(first) and first[i] == "*" and overlap(i + 1, j):
+                result = True
+            elif j < len(second) and second[j] == "*" and overlap(i, j + 1):
+                result = True
+            elif i < len(first) and j < len(second):
+                left, right = first[i], second[j]
+                if left == "*" and right != "*":
+                    result = overlap(i, j + 1)
+                elif right == "*" and left != "*":
+                    result = overlap(i + 1, j)
+                elif left != "*" and right != "*":
+                    if left == "?" or right == "?" or left == right:
+                        result = overlap(i + 1, j + 1)
+            memo[(i, j)] = result
+            return result
+
+        return overlap(0, 0)
+
+    def test_the_result_matches_the_recursive_form(self):
+        import random
+
+        rng = random.Random(20261004)
+        alphabet = "ab*?"
+        for _ in range(4000):
+            first = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 7)))
+            second = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 7)))
+            assert agentcore_app._action_patterns_overlap(
+                first, second
+            ) is self._recursive_overlap(first, second), (first, second)
+
+    @pytest.mark.parametrize(
+        "pattern, expected",
+        [
+            ("bedrock-agentcore:" + "*" * 1977 + "shell", True),
+            ("bedrock-agentcore:" + "*a" * 991, False),
+        ],
+        ids=["reaches", "does-not-reach"],
+    )
+    def test_a_2000_character_pattern_is_judged(self, pattern, expected):
+        assert len(pattern) >= 2000
+        assert (
+            agentcore_app._action_patterns_overlap(
+                pattern, "bedrock-agentcore:invokeagentruntimecommandshell"
+            )
+            is expected
+        )
+
+    def test_a_2000_character_pattern_does_not_crash_the_shell_leg(self):
+        def holder(action):
+            return {
+                "attached_policies": [
+                    _tool_policy(
+                        "Policy",
+                        {
+                            "Statement": [
+                                {"Effect": "Allow", "Action": action, "Resource": "*"}
+                            ]
+                        },
+                    )
+                ],
+                "inline_policies": [],
+            }
+
+        unbounded, named, unreadable = agentcore_app._command_shell_holders(
+            {
+                "LongShell": holder("bedrock-agentcore:" + "*" * 1977 + "shell"),
+                "LongOther": holder("bedrock-agentcore:" + "*a" * 991),
+            },
+            "role",
+        )
+
+        assert [entry.split(" (")[0] for entry in unbounded] == ["role LongShell"]
+        assert named == [] and unreadable == []
+
+    def test_a_long_pattern_against_a_long_pattern_stays_fast(self):
+        import time
+
+        hostile = "*a" * 1000 + "Z"
+        start = time.perf_counter()
+        assert agentcore_app._action_patterns_overlap(hostile, "*b" * 1000) is False
+        assert (
+            agentcore_app._resource_pattern_covers(hostile, "arn:" + "a" * 80) is False
+        )
+        assert (
+            agentcore_app._statement_reaches_arn({"Resource": hostile}, "a" * 80)
+            is False
+        )
+        assert time.perf_counter() - start < 10
+
+
 class TestAC45ShellAlarmEveryRegion:
     """AIR-ACR-RT-03: a metric filter and its alarm are regional, so a runtime
     outside the primary region is watched only by an alarm in its own region."""
