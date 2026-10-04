@@ -19111,6 +19111,19 @@ class TestAC33CheckRegistration:
 _SECRET_VALUE = "wJalrXUtnFEMI-K7MDENG-bPxRfiCY"  # pragma: allowlist secret - synthetic
 
 
+# A made-up access key id in the 20-character shape. AWS's documented ids end
+# in EXAMPLE, and AC-34 does not report that form.
+_FAKE_ACCESS_KEY_ID = "AKIAQ3EGUOWZT7XK4M2P"  # pragma: allowlist secret - a made-up id in the access key shape
+# A made-up private key block: header, two 64-character base64 lines, a short
+# padded line and the matching footer, the least AC-34 reports as a key.
+_FAKE_PRIVATE_KEY_BLOCK = (
+    "-----BEGIN RSA PRIVATE KEY-----\n"  # pragma: allowlist secret - made up
+    + ("MIIEowIBAAKCAQEAq" + "Zx9kP2mQ7rT4vW1y" * 2 + "q" * 15 + "\n") * 2
+    + "AB==\n"
+    + "-----END RSA PRIVATE KEY-----\n"
+)
+
+
 class TestAC34RuntimeInlineCredentials:
     """AC-34: a credential pasted into a runtime's definition never reaches a vault."""
 
@@ -19205,15 +19218,21 @@ class TestAC34RuntimeInlineCredentials:
     @pytest.mark.parametrize(
         "value",
         [
-            "AKIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret - AWS's documented example id
-            "ASIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret - the same id, STS prefix
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",  # pragma: allowlist secret - a 4-character body, not a key
+            _FAKE_ACCESS_KEY_ID,
+            "ASIA" + _FAKE_ACCESS_KEY_ID[4:],
+            # EXAMPLE elsewhere than the last seven of the 20 characters is
+            # not AWS's placeholder form.
+            "AKIAEXAMPLE123456789",  # pragma: allowlist secret - a made-up id in the access key shape
+            "AKIAIOSFODNNEXAMPLE7",  # pragma: allowlist secret - a made-up id in the access key shape
+            _FAKE_PRIVATE_KEY_BLOCK,
+            # The same block as a JSON or .env value, its line breaks escaped.
+            _FAKE_PRIVATE_KEY_BLOCK.replace("\n", "\\n"),
         ],
     )
     @patch("agentcore_app.agentcore_client")
     def test_a_credential_shape_fails_under_an_innocent_name(self, mock_ac, value):
-        # The name leg cannot catch these: nothing in BUILD_USER or PEM_BLOB
-        # names a credential, and both values are credential material.
+        # The name leg cannot catch these: nothing in BUILD_USER names a
+        # credential, and each value is credential material.
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [self._RUNTIMES[0]]
         }
@@ -19229,18 +19248,30 @@ class TestAC34RuntimeInlineCredentials:
     @pytest.mark.parametrize(
         "value",
         [
-            "AKIAIOSFODNN7EXAMPL",
-            "AKIAIOSFODNN7EXAMPLE1",
-            "AKIAiosfodnn7example",
-            "AKIA-OSFODNN7EXAMPLE",
-            "BKIAIOSFODNN7EXAMPLE",
+            _FAKE_ACCESS_KEY_ID[:-1],
+            _FAKE_ACCESS_KEY_ID + "1",
+            _FAKE_ACCESS_KEY_ID[:4] + _FAKE_ACCESS_KEY_ID[4:].lower(),
+            _FAKE_ACCESS_KEY_ID[:4] + "-" + _FAKE_ACCESS_KEY_ID[5:],
+            "B" + _FAKE_ACCESS_KEY_ID[1:],
             "-----BEGIN CERTIFICATE-----",
+            # Formerly Failed: AWS's documented placeholder ids, in the
+            # 20-character form ending EXAMPLE.
+            "AKIAIOSFODNN7EXAMPLE",
+            "ASIAI44QH8DHBEXAMPLE",
+            # Formerly Failed: a header is a string any PEM parser holds.
+            "-----BEGIN RSA PRIVATE KEY-----",  # pragma: allowlist secret - a header alone
+            # Formerly Failed: a 4-character body is not a key.
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",  # pragma: allowlist secret - not a key
+            # One base64 line, and a footer naming another key type.
+            "\n".join(_FAKE_PRIVATE_KEY_BLOCK.split("\n")[i] for i in (0, 1, 4)),
+            _FAKE_PRIVATE_KEY_BLOCK.replace("-----END RSA", "-----END EC"),
         ],
     )
     @patch("agentcore_app.agentcore_client")
     def test_a_near_miss_on_the_key_shape_is_not_a_credential(self, mock_ac, value):
         # Wrong length, lowercase body, a punctuation character, the wrong
-        # prefix, and a PEM block that is a certificate and not a key.
+        # prefix, a PEM block that is a certificate and not a key, AWS's
+        # placeholder ids, and private key text short of a whole block.
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [self._RUNTIMES[0]]
         }
@@ -19377,9 +19408,7 @@ class TestAC34RuntimeInlineCredentials:
 
 
 _AWS_EXAMPLE_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret - AWS's documented example secret key
-_ACCESS_KEY_ID = (
-    "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret - AWS's documented example id
-)
+_ACCESS_KEY_ID = _FAKE_ACCESS_KEY_ID
 
 
 def _ac34_gateways(mock_ac, targets_by_gateway, details):
@@ -19692,8 +19721,7 @@ class TestAC34GatewayTargets:
                                         {"name": "ok", "description": "clean"},
                                         {
                                             "name": "leak",
-                                            "description": "-----BEGIN PRIVATE "
-                                            "KEY-----",
+                                            "description": _FAKE_PRIVATE_KEY_BLOCK,
                                         },
                                     ]
                                 }
@@ -20045,7 +20073,7 @@ class TestAC34Harnesses:
 class TestAC34RuntimeCode:
     """AC-34: a credential written into a runtime's code archive in S3."""
 
-    _ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret - AWS doc example
+    _ACCESS_KEY = _FAKE_ACCESS_KEY_ID
 
     @staticmethod
     def _zip(files):
@@ -20171,6 +20199,54 @@ class TestAC34RuntimeCode:
         assert details.count("big.py in s3://code-bucket/b.zip") == 1
         assert "small.py" not in details
         assert self._ACCESS_KEY not in details
+
+    # A block the size of a 4096-bit RSA key's: 49 base64 lines of 64 and one
+    # short line, 3.2 KiB in all.
+    _LARGE_PRIVATE_KEY_BLOCK = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"  # pragma: allowlist secret - made up
+        + ("MIIJKAIBAAKCAgEAq" + "Zx9kP2mQ7rT4vW1y" * 2 + "q" * 15 + "\n") * 49
+        + "Zx9kP2mQ7rT4vW1yZx9kP2mQ7rT4vW1yZx9kP2mQ7rT4vW1y\n"
+        + "-----END RSA PRIVATE KEY-----\n"
+    )
+
+    @pytest.mark.parametrize("chunk_bytes", [None, 1024], ids=["one-chunk", "four"])
+    def test_a_private_key_block_is_found_whole_across_chunks(self, chunk_bytes):
+        """A private key is reported only as a whole block, so the overlap a
+        chunk carries must hold one. With 1 KiB chunks the block spans four
+        of them, and only the 64 KiB overlap carries its header to the footer.
+        """
+        source = "x = 1\n" * 100 + f'KEY = """{self._LARGE_PRIVATE_KEY_BLOCK}"""\n'
+        with patch.object(
+            agentcore_app,
+            "AC34_SCAN_CHUNK_BYTES",
+            chunk_bytes or agentcore_app.AC34_SCAN_CHUNK_BYTES,
+        ):
+            rows = self._run(
+                {"rt-a": "a.zip", "rt-b": "b.zip"},
+                {
+                    "code-bucket/a.zip": self._zip({"small.py": "x = 1\n"}),
+                    "code-bucket/b.zip": self._zip({"keys.py": source}),
+                },
+            )
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        details = rows[1]["Finding_Details"]
+        assert "keys.py in s3://code-bucket/b.zip" in details
+        assert "MIIJ" not in details
+
+    def test_a_private_key_header_alone_in_code_is_not_a_key(self):
+        """Formerly Failed: cryptography's serialization/ssh.py holds the
+        OpenSSH header as a constant, and a live archive in 178113193057
+        failed on it. The header with no base64 body is not a key.
+        """
+        source = (
+            '_SK_START = b"-----BEGIN OPENSSH PRIVATE KEY-----"\n'  # pragma: allowlist secret - a header alone
+            '_SK_END = b"-----END OPENSSH PRIVATE KEY-----"\n'
+        )
+        rows = self._run(
+            {"rt-a": "a.zip"},
+            {"code-bucket/a.zip": self._zip({"ssh.py": source})},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
 
     @pytest.mark.parametrize(
         "source, name, secret",
@@ -20356,7 +20432,7 @@ class TestAC34RuntimeImages:
 
     _ACCOUNT = "111122223333"
     _URI = f"{_ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/agents/rt"
-    _ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret - AWS doc example
+    _ACCESS_KEY = _FAKE_ACCESS_KEY_ID
 
     @classmethod
     def _detail(cls, runtime_id, uri, version="1"):
@@ -20909,7 +20985,7 @@ class TestAC34RuntimeImages:
         "files, named",
         [
             (
-                {"app/settings.py": b"KEY = 'AKIAIOSFODNN7EXAMPLE'\n"},
+                {"app/settings.py": f"KEY = '{_FAKE_ACCESS_KEY_ID}'\n".encode()},
                 "app/settings.py in layer lyr-bad",
             ),
             (
@@ -20917,7 +20993,7 @@ class TestAC34RuntimeImages:
                 "app/.env variable API_KEY in layer lyr-bad",
             ),
             (
-                {"root/.ssh/id_rsa": b"-----BEGIN RSA PRIVATE KEY-----\nx\n"},
+                {"root/.ssh/id_rsa": _FAKE_PRIVATE_KEY_BLOCK.encode()},
                 "root/.ssh/id_rsa in layer lyr-bad",
             ),
         ],
@@ -20965,7 +21041,9 @@ class TestAC34RuntimeImages:
                 "cfg-sha256:arm": self._config(env=["A=1"]),
             },
             index={"multi": ["sha256:amd", "sha256:arm"]},
-            layers={"lyr-sha256:arm": self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"})},
+            layers={
+                "lyr-sha256:arm": self._layer({"k.txt": _FAKE_ACCESS_KEY_ID.encode()})
+            },
         )
 
         rows = self._image_rows(
@@ -20986,7 +21064,9 @@ class TestAC34RuntimeImages:
             {"rt-a": f"{self._URI}:bad"},
             {"cfg-bad": self._config(env=["A=1"])},
             layers={
-                "lyr-bad": self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"}, gzip=False)
+                "lyr-bad": self._layer(
+                    {"k.txt": _FAKE_ACCESS_KEY_ID.encode()}, gzip=False
+                )
             },
         )
 
@@ -21015,7 +21095,7 @@ class TestAC34RuntimeImages:
     ):
         # The other image's layer holds a credential, so a bound or a read
         # failure that skipped the layer would read as Passed on rt-a.
-        bad = self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"})
+        bad = self._layer({"k.txt": _FAKE_ACCESS_KEY_ID.encode()})
         self._wire(
             mock_ac,
             mock_ecr,
@@ -21076,7 +21156,9 @@ class TestAC34RuntimeImages:
                 "lyr-big": self._layer(
                     {
                         "small.py": b"x = 1\n",
-                        "big.bin": b"y" * 30 + b" AKIAIOSFODNN7EXAMPLE " + b"z" * 30,
+                        "big.bin": b"y" * 30
+                        + f" {_FAKE_ACCESS_KEY_ID} ".encode()
+                        + b"z" * 30,
                     }
                 )
             },

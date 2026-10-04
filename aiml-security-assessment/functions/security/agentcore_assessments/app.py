@@ -24462,11 +24462,28 @@ CREDENTIAL_HEADER_NAMES = ("authorization", "proxy_authorization", "cookie")
 # Such a value can hold a slash and still be the credential.
 BASE64_CREDENTIAL_PATTERN = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 
+# A line break inside a PEM block, written out or escaped as in a JSON or code
+# string literal, with the quotes and indentation a multi-line literal adds:
+# at least one newline, real or escaped, amid any run of those characters.
+_PEM_LINE_BREAK = r"""(?:[ \t"'\r]|\\r)*(?:\n|\\n)(?:[ \t"'\r\n]|\\r|\\n)*"""
 # Credential material found anywhere in free text, such as an inline schema or a
-# system prompt: an access key id or a PEM private key header.
+# system prompt: an access key id, or a PEM private key block. AWS documents
+# its placeholder ids in the 20-character form ending EXAMPLE
+# (AKIAIOSFODNN7EXAMPLE); botocore and boto3 ship them in their examples, so
+# that form is not a credential. A private key needs its BEGIN header, at
+# least two base64 lines of 40 or more characters and the matching END
+# footer: the header alone is a string any PEM parser holds, such as
+# cryptography's serialization/ssh.py. The base64 lines and the line breaks
+# share no character, so the match is linear in the text.
 CREDENTIAL_TEXT_PATTERN = re.compile(
-    r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"(?<![A-Z0-9])(?:AKIA|ASIA)(?![A-Z0-9]{9}EXAMPLE(?![A-Z0-9]))[A-Z0-9]{16}"
+    r"(?![A-Z0-9])"
+    r"|-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY-----"
+    rf"(?:{_PEM_LINE_BREAK}[A-Za-z][A-Za-z-]*:[^\r\n\\]*)*"
+    rf"{_PEM_LINE_BREAK}"
+    rf"(?:[A-Za-z0-9+/]{{40,}}{_PEM_LINE_BREAK}){{2,}}"
+    rf"(?:[A-Za-z0-9+/]+={{0,2}}{_PEM_LINE_BREAK})?"
+    r"-----END \1PRIVATE KEY-----"
 )
 
 # An identifier assigned a quoted literal in code or config: api_key = "...",
@@ -24518,7 +24535,8 @@ AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
 # is scanned, whatever its size, in chunks of AC34_SCAN_CHUNK_BYTES, each
 # matched together with the last AC34_SCAN_OVERLAP_CHARS characters of the
 # chunk before, so a credential that straddles two chunks is still found and
-# memory holds one chunk.
+# memory holds one chunk. A PEM private key block must be read whole to match;
+# a 4096-bit RSA key's block is about 3.2 KiB, well inside the 64 KiB overlap.
 #
 # The bounds are set from measurement on 2026-10-04. Download: s3:GetObject in
 # account 178113193057, us-east-1, of two runtime code archives there (39.8
@@ -24569,21 +24587,19 @@ ECR_IMAGE_LAYER_TIMEOUT_SECONDS = 30
 def _value_is_a_credential_literal(value: str) -> bool:
     """Return whether a value is credential material on its own shape alone.
 
-    An access key id, a PEM private key, and a URL that carries a password in its
-    user info or a credential-named query parameter all qualify, whatever the
-    variable holding them is called.
+    An access key id, a whole PEM private key block, and a URL that carries a
+    password in its user info or a credential-named query parameter all
+    qualify, whatever the variable holding them is called. The id and the
+    block are judged by CREDENTIAL_TEXT_PATTERN, so AWS's EXAMPLE placeholder
+    id and a PEM header alone do not qualify.
     """
     if len(value) == AWS_ACCESS_KEY_ID_LENGTH and value.startswith(
         AWS_ACCESS_KEY_ID_PREFIXES
     ):
-        if all(
-            character.isdigit() or (character.isalpha() and character.isupper())
-            for character in value[len(AWS_ACCESS_KEY_ID_PREFIXES[0]) :]
-        ):
-            return True
+        return CREDENTIAL_TEXT_PATTERN.fullmatch(value) is not None
     if value.lower().startswith(("http://", "https://")):
         return _url_carries_a_credential(value)
-    return value.startswith("-----BEGIN") and "PRIVATE KEY" in value
+    return value.startswith("-----BEGIN") and _text_holds_a_credential(value)
 
 
 def _url_carries_a_credential(url: str) -> bool:
