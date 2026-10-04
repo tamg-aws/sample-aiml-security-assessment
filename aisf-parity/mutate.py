@@ -844,6 +844,263 @@ MUTATIONS = [
         "find": '        if "NotResource" in statement:\n            excluded = ',
         "replace": "        if False:\n            excluded = ",
     },
+    # ------------------------------------------ the SageMaker verdict legs
+    # Each entry reverts one round-7 verdict leg in sagemaker_assessments to the
+    # behaviour the regrade graded partial. Each was killed by hand on a byte
+    # backup on 2026-10-03 before it was added here.
+    {
+        "name": "SM-34 lets either network key stand for both",
+        "file": SAGEMAKER,
+        "defect": "the control asks for approved subnets and approved security "
+        "groups. Read as one key group, a Deny on the security groups alone "
+        "passes the approved network category, and a job runs in any subnet",
+        "find": "            (action, (key,))\n",
+        "replace": (
+            '            (action, ("sagemaker:VpcSubnets", '
+            '"sagemaker:VpcSecurityGroupIds"))\n'
+        ),
+    },
+    {
+        "name": "SM-09 credits a key-group Deny with a weak half",
+        "file": SAGEMAKER,
+        "defect": "a Deny on aws:SourceIp and aws:SourceVpce together fires only "
+        "when both are outside their approved values, so each condition must "
+        "enforce on its own. Crediting a 0.0.0.0/0 range or a ForAnyValue half "
+        "passes a presigned URL guard that admits every caller",
+        "find": (
+            '            == "enforced"\n            for operator, key, values in entries\n'
+        ),
+        "replace": (
+            '            in ("enforced", "presence", "absent-open", "value")\n'
+            "            for operator, key, values in entries\n"
+        ),
+    },
+    {
+        "name": "SM-33 exempts S3 interface endpoints from private DNS",
+        "file": SAGEMAKER,
+        "defect": "without private DNS a job resolves the default S3 hostname to "
+        "the public service, so the interface endpoint carries none of its "
+        "traffic. The exemption credits it as the private S3 path for training "
+        "and transform jobs alike",
+        "find": (
+            '                    if vpce.get("VpcEndpointType") == "Interface" and (\n'
+        ),
+        "replace": (
+            '                    if vpce.get("VpcEndpointType") == "Interface" '
+            'and short != "s3" and (\n'
+        ),
+    },
+    {
+        "name": "SM-04 passes GuardDuty findings nobody reviewed",
+        "file": SAGEMAKER,
+        "defect": "an ACTIVE GuardDuty finding still in Workflow.Status NEW past "
+        "the review window was never reviewed. Skipping the branch passes the "
+        "review row over the stale findings GetFindings returned",
+        "find": "    if stale:\n        oldest = stale[0]\n",
+        "replace": "    if False:\n        oldest = stale[0]\n",
+    },
+    {
+        "name": "SM-41 drops iot:RetainPublish from the device actions",
+        "file": SAGEMAKER,
+        "defect": "RetainPublish is a topic action of its own, so iot:Publish "
+        "does not cover it. Without it a fleet-wide RetainPublish on topic/* "
+        "passes as device-scoped",
+        "find": '    "iot:retainpublish",\n',
+        "replace": "",
+    },
+    {
+        "name": "SM-41 credits a thing attribute two things share",
+        "file": SAGEMAKER,
+        "defect": "a thing attribute bounds a topic to one device only while no "
+        "two things hold the same value. Ignoring the shared value passes a "
+        "policy under which each of those devices reaches the others' topics",
+        "find": "            if len(names) > 1:\n                shared.append(\n",
+        "replace": "            if len(names) > 99:\n                shared.append(\n",
+    },
+    {
+        "name": "SM-23 and SM-31 ignore composite alarm routing",
+        "file": SAGEMAKER,
+        "defect": "a drift or capture-disk alarm with no action of its own pages "
+        "through a composite alarm whose rule ORs it in. Dropping the composite "
+        "leg fails an endpoint whose alarms do reach an action",
+        "find": (
+            '        or (alarm.get("AlarmName") and actioned.get(alarm["AlarmName"]))\n'
+        ),
+        "replace": "        or False\n",
+    },
+    {
+        "name": "SM-43 lets an IMDSv1 instance read the weights",
+        "file": SAGEMAKER,
+        "defect": "an EC2 instance whose role can read the artifact bucket and "
+        "whose metadata service still answers without a session token hands the "
+        "role's credentials to any request it serves. Skipping every instance "
+        "passes the endpoint beside it",
+        "find": (
+            '            if options.get("HttpTokens") == "required":\n'
+            "                continue\n"
+        ),
+        "replace": (
+            '            if options.get("HttpTokens") != "never":\n'
+            "                continue\n"
+        ),
+    },
+    {
+        "name": "SM-43 reads only the first instance",
+        "file": SAGEMAKER,
+        "defect": "the instance population is the whole DescribeInstances "
+        "listing. Judging only the first instance passes an IMDSv1 instance that "
+        "sorts after a compliant one",
+        "find": "        for instance in instances:\n            profile_arn = str(",
+        "replace": "        for instance in instances[:1]:\n            profile_arn = str(",
+    },
+    {
+        "name": "SM-40 ignores the MicroVM resume hook",
+        "file": SAGEMAKER,
+        "defect": "a MicroVM resumed from a suspended state runs only its /resume "
+        "hook, so an image version without one never re-fetches a rotated "
+        "secret. Ignoring the hook passes every MicroVM image",
+        "find": '        if hooks.get("resume") != "ENABLED":\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "SM-02 leaves IAM-authorized methods unjudged",
+        "file": SAGEMAKER,
+        "defect": "the execute-api:Invoke grants that split read from write are "
+        "in the IAM cache. Sending IAM methods to the not-judged row hides a "
+        "grant whose one pattern reaches both the read and the write method",
+        "find": '        elif kind == "AWS_IAM" and permission_cache is not None:\n',
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "SM-02 lets a stage span a slash",
+        "file": SAGEMAKER,
+        "defect": "no stage name holds a slash, so a GET/* grant reaches no POST "
+        "method. Letting the stage token take a slash reads a read-only grant as "
+        "reaching the write method and fails it",
+        "find": (
+            '                here == "?" or token == EXECUTE_API_REST or here != "/"\n'
+        ),
+        "replace": "                True\n",
+    },
+    {
+        "name": "SM-39 does not count an agent Lambda outside a VPC",
+        "file": SAGEMAKER,
+        "defect": "an agent Lambda function outside a VPC egresses with no DNS "
+        "Firewall or Network Firewall in its path. Not counting it reports the "
+        "Region as having no workload VPC to judge",
+        "find": (
+            '        elif not (function.get("VpcConfig") or {}).get("SubnetIds"):\n'
+            "            open_functions.append("
+        ),
+        "replace": "        elif False:\n            open_functions.append(",
+    },
+    {
+        "name": "SM-39 drops EKS cluster subnets",
+        "file": SAGEMAKER,
+        "defect": "an agent on EKS egresses from its cluster's subnets. Dropping "
+        "them leaves the cluster's VPC without a DNS or Network Firewall row",
+        "find": '            references.append((f"EKS cluster {cluster}", subnet_id))\n',
+        "replace": "            pass\n",
+    },
+    {
+        "name": "SM-26 passes active prompt-injection findings",
+        "file": SAGEMAKER,
+        "defect": "an unarchived Impact:IAMUser/PromptInjection.Direct finding is "
+        "a detected attempt nobody closed. Passing on the listing alone hides it",
+        "find": (
+            "    if not ids:\n        return _row(\n"
+            '            f"No active (unarchived)'
+        ),
+        "replace": (
+            '    if True:\n        return _row(\n            f"No active (unarchived)'
+        ),
+    },
+    {
+        "name": "SM-33 and SM-11 credit private DNS in a VPC with DNS off",
+        "file": SAGEMAKER,
+        "defect": "private DNS creates no record for the default hostname in a "
+        "VPC with enableDnsSupport or enableDnsHostnames false, so the job "
+        "reaches the public service while the endpoint is credited",
+        "find": "            if value is False:\n                dns_off",
+        "replace": "            if False:\n                dns_off",
+    },
+    {
+        "name": "SM-33 passes a VPC whose DNS attributes were not read",
+        "file": SAGEMAKER,
+        "defect": "a VPC whose DescribeVpcAttribute read failed is counted "
+        "complete, so a failed read yields Passed",
+        "find": (
+            "        elif vpc_id in dns_unread:\n"
+            "            unread.extend(dns_unread[vpc_id])"
+        ),
+        "replace": "        elif False:\n            unread.extend(dns_unread[vpc_id])",
+    },
+    {
+        "name": "SM-33 reads only the first VPC's DNS attributes",
+        "file": SAGEMAKER,
+        "defect": "only the first VPC holding an interface endpoint is read, so "
+        "a second VPC with DNS off passes",
+        "find": "[vpc_id for vpc_id in sorted(present) if dns_served(vpc_id)]",
+        "replace": "[vpc_id for vpc_id in sorted(present) if dns_served(vpc_id)][:1]",
+    },
+    {
+        "name": "SM-18 holds a gateway-served S3 to the DNS attributes",
+        "file": SAGEMAKER,
+        "defect": "a service a gateway endpoint serves is reached by route, so "
+        "failing its interface endpoint on the VPC DNS attributes is a false "
+        "Failed",
+        "find": (
+            '            if not any(v.get("VpcEndpointType") == "Gateway" '
+            "for v in vpces)\n"
+        ),
+        "replace": "            if True\n",
+    },
+    {
+        "name": "SM-40 judges a DELETED MicroVM image",
+        "file": SAGEMAKER,
+        "defect": "an image in DELETED state is judged, so its versions fail a "
+        "workload that was removed",
+        "find": 'if i.get("state") != "DELETED"',
+        "replace": "if True",
+    },
+    {
+        "name": "SM-40 skips a DELETING MicroVM image",
+        "file": SAGEMAKER,
+        "defect": "an image still DELETING may hold ACTIVE versions RunMicrovm "
+        "launches, so skipping it narrows the population",
+        "find": 'i.get("state") != "DELETED"\n',
+        "replace": 'i.get("state") not in ("DELETING", "DELETED")\n',
+    },
+    {
+        "name": "SM-11 passes a runtime endpoint in a VPC with DNS off",
+        "file": SAGEMAKER,
+        "defect": "a sagemaker.runtime interface endpoint in a VPC with a DNS "
+        "attribute false is credited, though no record maps the runtime "
+        "hostname to it",
+        "find": "    if dns_off:\n        off = [",
+        "replace": "    if False:\n        off = [",
+    },
+    {
+        "name": "SM-11 passes when a DNS attribute was not read",
+        "file": SAGEMAKER,
+        "defect": "a failed DescribeVpcAttribute read yields Passed",
+        "find": (
+            "    if dns_unread:\n        return [\n            "
+            '_unread_resources_finding(\n                "SM-11"'
+        ),
+        "replace": (
+            "    if False:\n        return [\n            "
+            '_unread_resources_finding(\n                "SM-11"'
+        ),
+    },
+    {
+        "name": "SM-11 reads only the first VPC's DNS attributes",
+        "file": SAGEMAKER,
+        "defect": "only the first VPC holding a runtime endpoint is read, so a "
+        "second VPC with DNS off passes",
+        "find": "sorted({vpc for _, vpc in private if vpc not in gateway_vpcs}),",
+        "replace": "sorted({vpc for _, vpc in private if vpc not in gateway_vpcs})[:1],",
+    },
     # ------------------------------------------ the AgentCore verdict legs
     # Each entry reverts one round-6 verdict leg in agentcore_assessments to the
     # behaviour the regrade graded partial. The catcher is the test that pins the
@@ -2350,6 +2607,30 @@ GROUPS: dict[str, str] = {
     "SM-43 ignores an execution role's NotResource grant": (
         "in `SM-43`'s artifact reads"
     ),
+    "SM-34 lets either network key stand for both": "in the SageMaker verdict legs",
+    "SM-09 credits a key-group Deny with a weak half": "in the SageMaker verdict legs",
+    "SM-33 exempts S3 interface endpoints from private DNS": "in the SageMaker verdict legs",
+    "SM-04 passes GuardDuty findings nobody reviewed": "in the SageMaker verdict legs",
+    "SM-41 drops iot:RetainPublish from the device actions": "in the SageMaker verdict legs",
+    "SM-41 credits a thing attribute two things share": "in the SageMaker verdict legs",
+    "SM-23 and SM-31 ignore composite alarm routing": "in the SageMaker verdict legs",
+    "SM-43 lets an IMDSv1 instance read the weights": "in the SageMaker verdict legs",
+    "SM-43 reads only the first instance": "in the SageMaker verdict legs",
+    "SM-40 ignores the MicroVM resume hook": "in the SageMaker verdict legs",
+    "SM-02 leaves IAM-authorized methods unjudged": "in the SageMaker verdict legs",
+    "SM-02 lets a stage span a slash": "in the SageMaker verdict legs",
+    "SM-39 does not count an agent Lambda outside a VPC": "in the SageMaker verdict legs",
+    "SM-39 drops EKS cluster subnets": "in the SageMaker verdict legs",
+    "SM-26 passes active prompt-injection findings": "in the SageMaker verdict legs",
+    "SM-33 and SM-11 credit private DNS in a VPC with DNS off": "in the SageMaker verdict legs",
+    "SM-33 passes a VPC whose DNS attributes were not read": "in the SageMaker verdict legs",
+    "SM-33 reads only the first VPC's DNS attributes": "in the SageMaker verdict legs",
+    "SM-18 holds a gateway-served S3 to the DNS attributes": "in the SageMaker verdict legs",
+    "SM-40 judges a DELETED MicroVM image": "in the SageMaker verdict legs",
+    "SM-40 skips a DELETING MicroVM image": "in the SageMaker verdict legs",
+    "SM-11 passes a runtime endpoint in a VPC with DNS off": "in the SageMaker verdict legs",
+    "SM-11 passes when a DNS attribute was not read": "in the SageMaker verdict legs",
+    "SM-11 reads only the first VPC's DNS attributes": "in the SageMaker verdict legs",
     "AC-37 reads an allow-list SCP's omission as an Allow": "in the AgentCore verdict legs",
     "AC-37 passes when the organization's SCPs could not be listed": "in the AgentCore verdict legs",
     "AC-42 passes the population beside an unread configuration": "in the AgentCore verdict legs",

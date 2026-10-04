@@ -343,7 +343,7 @@ AI_SUBJECT_ROWS = [
         ["SM-33", "SM-34"],
         "SM-34 is the approved-exception leg: its approved network and no direct "
         "internet access verdicts require sagemaker:CreateTrainingJob to be bound "
-        "on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on "
+        "on sagemaker:VpcSubnets and sagemaker:VpcSecurityGroupIds and on "
         "sagemaker:NetworkIsolation by a Deny in an attached service control "
         "policy. A condition held only in identity policies fails, because the "
         "account root user is bound by none",
@@ -1466,7 +1466,9 @@ AI_SUBJECT_ROWS = [
         "logging is off or has textDataDeliveryEnabled not true, since the text output "
         "body is the record of a guardrail intervention, and reports an unread or absent "
         "flag as Not Applicable. SM-26 reads each GuardDuty detector's AI_PROTECTION "
-        "feature, which raises the prompt-injection finding. BR-41 reads ListEnforcedGuardrailsConfiguration, including "
+        "feature, which raises the prompt-injection finding, and fails a detector "
+        "with an active (unarchived) Impact:IAMUser/PromptInjection.Direct finding. "
+        "BR-41 reads ListEnforcedGuardrailsConfiguration, including "
         "modelEnforcement.includedModels and excludedModels, where ALL with an empty "
         "excludedModels is every model and a non-empty excludedModels leaves holes, and "
         "selectiveContentGuarding, where SELECTIVE on either the system or the messages "
@@ -1758,7 +1760,8 @@ FOUNDATION_ROWS = [
         "plus every ECS service and Lambda function, since no API field marks a task "
         "or function as agent code. SM-39 fails an ECS service or Lambda function "
         "whose security groups together allow egress to any destination. For each "
-        "VPC an ECS awsvpc service or a VPC-attached Lambda function runs in, it "
+        "VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS cluster "
+        "or an EC2 instance runs in, it "
         "fails a DNS Firewall whose first rule in force over every name is not a "
         "BLOCK, or that fails open, and fails an internet route that reaches an "
         "internet gateway, on its own or through a NAT gateway, without passing a "
@@ -1766,7 +1769,8 @@ FOUNDATION_ROWS = [
         "TLS_SNI and HTTP_HOST. Its Global leg requires an attached SCP that denies "
         "lambda:CreateFunction and lambda:UpdateFunctionConfiguration outside "
         "approved lambda:VpcIds, lambda:SubnetIds or lambda:SecurityGroupIds. "
-        "Agents hosted on EKS or EC2 get no DNS or Network Firewall leg. AC-01 unions the outbound "
+        "A Lambda function an agent action group or AgentCore gateway target names "
+        "fails both legs when it runs outside a VPC. AC-01 unions the outbound "
         "ranges of every security group on each resource and fails one whose groups "
         "together allow 0.0.0.0/0 or ::/0 or name a public range of /16 or wider, "
         "fails a tool in PUBLIC or SANDBOX network "
@@ -1898,9 +1902,12 @@ FOUNDATION_ROWS = [
         "names a Bedrock, AgentCore or SageMaker runtime, or a Lambda function an "
         "agent action group or AgentCore gateway target names. It fails such a "
         "method with no authorization, and read and write methods of one API that "
-        "share a token authorizer and its scopes; an IAM or Lambda authorizer is "
-        "not judged, because the split sits in execute-api:Invoke grants or "
-        "authorizer code. Verified Permissions policy stores are not read: no "
+        "share a token authorizer and its scopes. For an IAM authorizer it fails "
+        "an execute-api:Invoke Resource pattern of an identity in the IAM cache "
+        "that reaches both a read and a write AI method of one API, after "
+        "account-wide Denies and the permissions boundary; API resource policies "
+        "are not read. A Lambda authorizer is not judged, because the split sits "
+        "in authorizer code. Verified Permissions policy stores are not read: no "
         "field ties a policy store to an AI workload",
         [],
         6,
@@ -2311,9 +2318,12 @@ FOUNDATION_ROWS = [
         "SecretsManager.4. It fails an ECS secret that rotates while no "
         "EventBridge rotation rule has a target, an ECS secret injected from "
         "Parameter Store, and a credential-named plaintext environment variable "
-        "in an ECS container, a Lambda function or a SageMaker model container. "
-        "A Lambda function is not graded on propagation, because no API shows "
-        "whether it re-fetches a secret per invocation",
+        "in an ECS container, a Lambda function, a SageMaker model container or "
+        "a Lambda MicroVM image version. It fails an ACTIVE Lambda MicroVM image "
+        "version whose hooks.microvmHooks.resume is not ENABLED; the image's "
+        "code artifact is not read, so what the hook runs is not judged. "
+        "A Lambda function is not graded on propagation: its code is not read, "
+        "so whether it re-fetches a secret per invocation is not judged",
         [],
         6,
     ),
@@ -2414,8 +2424,12 @@ FOUNDATION_ROWS = [
         "whether SageMaker or the container compared it with the object at load "
         "time; no SageMaker container or S3ModelDataSource member records a SHA256 "
         "digest, and ProductionVariant has no instance metadata option, so IMDSv2 "
-        "is not readable on endpoint instances. Weights fetched by container "
-        "startup code, and models loaded on ECS, EKS or EC2, are not read",
+        "is not readable on endpoint instances. An EC2 instance, EKS node or ECS "
+        "container instance whose instance profile role is allowed s3:GetObject "
+        "in an artifact bucket fails when its MetadataOptions HttpTokens is not "
+        "required and its metadata endpoint is enabled. Weights fetched by "
+        "container startup code, and which model a workload on ECS, EKS or EC2 "
+        "loads, are not read",
         [],
         6,
     ),
