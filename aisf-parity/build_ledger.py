@@ -1886,7 +1886,16 @@ FOUNDATION_ROWS = [
         "service-enforced expiry, with no claim that deletion ran, and an unread list "
         "or memory is N/A naming the action. The field is required and bounded 1 to "
         "365 days, so a readable memory has no Failed outcome, and no retention "
-        "threshold is assumed",
+        "threshold is assumed. Every Bedrock agent is read at DRAFT and at each "
+        "alias-routed version: a version whose memoryConfiguration enables memory "
+        "is Passed with its storageDays named, and an absent storageDays, a period "
+        "of 0, or an unread agent is N/A. Every SageMaker endpoint's data capture "
+        "destination (with capture enabled) and asynchronous inference output and "
+        "failure paths get the same lifecycle, versioning, Object Lock and replica "
+        "test, with the URI's key path as the root a rule must cover. A replicated "
+        "destination is N/A, because s3:GetObject is not granted on its objects, so "
+        "their ReplicationStatus is not read, and an unread endpoint keeps the "
+        "SageMaker row off Passed",
         [],
         6,
     ),

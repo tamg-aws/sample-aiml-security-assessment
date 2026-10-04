@@ -4405,7 +4405,12 @@ def _lifecycle_rule_prefix(rule: Dict[str, Any]) -> Optional[str]:
 
 
 def _bucket_expiration_rules(
-    bucket_name: str, region: str, key_prefix: Optional[str] = None
+    bucket_name: str,
+    region: str,
+    key_prefix: Optional[str] = None,
+    root: Optional[str] = None,
+    records: str = "logs",
+    objects: str = "log objects",
 ) -> Dict[str, Any]:
     """Describe how the bucket's enabled lifecycle rules expire invocation logs.
 
@@ -4414,7 +4419,9 @@ def _bucket_expiration_rules(
     current object leaves a noncurrent version behind, so a rule that expires
     noncurrent versions is required as well. Returns ``expirations`` (the rules
     that count), ``deficiency`` (why the bucket keeps logs forever) and
-    ``undetermined`` (why that could not be read).
+    ``undetermined`` (why that could not be read). ``root`` replaces the
+    AWSLogs/ root for data another service writes under its own prefix, and
+    ``records`` and ``objects`` name that data in the text.
     """
     s3_client = boto3.client("s3", config=boto3_config, region_name=region)
     try:
@@ -4426,6 +4433,8 @@ def _bucket_expiration_rules(
 
     stripped_prefix = (key_prefix or "").strip("/")
     log_root = f"{stripped_prefix}/AWSLogs/" if stripped_prefix else "AWSLogs/"
+    if root is not None:
+        log_root = root
 
     expirations = []
     noncurrent_expirations = []
@@ -4473,7 +4482,7 @@ def _bucket_expiration_rules(
             "expirations": [],
             "deficiency": (
                 "has no enabled lifecycle rule that expires objects under "
-                f"'{log_root}', so logs are kept indefinitely{uncovered_note}"
+                f"'{log_root}', so {records} are kept indefinitely{uncovered_note}"
             ),
             "undetermined": None,
         }
@@ -4496,7 +4505,7 @@ def _bucket_expiration_rules(
             "deficiency": (
                 f"has versioning {versioning_status} and no enabled lifecycle rule "
                 f"that expires noncurrent versions under '{log_root}', so "
-                "overwritten and expired log objects are kept indefinitely as "
+                f"overwritten and expired {objects} are kept indefinitely as "
                 f"noncurrent versions{uncovered_note}"
             ),
             "undetermined": None,
@@ -4617,16 +4626,28 @@ def _judge_log_bucket_retention(
     retained: List[str],
     unretained: List[str],
     undetermined: List[str],
+    root: Optional[str] = None,
 ) -> None:
     """
     Judge one invocation log bucket's lifecycle, its Object Lock default
     retention, and the lifecycle of every bucket it replicates to (AIR-FND-DAT-08).
 
     A replica is a second copy of every prompt and response, so a source rule
-    that expires objects deletes nothing at the destination.
+    that expires objects deletes nothing at the destination. With ``root``, the
+    bucket holds SageMaker inference data under that prefix, whose objects
+    s3:GetObject is not granted on, so their ReplicationStatus is not read.
     """
+    wording = (
+        {}
+        if root is None
+        else {
+            "root": root,
+            "records": "captured requests and responses",
+            "objects": "captured objects",
+        }
+    )
     try:
-        lifecycle = _bucket_expiration_rules(bucket_name, region, key_prefix)
+        lifecycle = _bucket_expiration_rules(bucket_name, region, key_prefix, **wording)
     except Exception as error:
         logger.warning(
             f"Unable to read lifecycle configuration for bucket {bucket_name}: {error}"
@@ -4673,7 +4694,15 @@ def _judge_log_bucket_retention(
         retained.append(
             f"{label} '{bucket_name}' lifecycle: {'; '.join(lifecycle['expirations'])}"
         )
-    if replicas:
+    if replicas and root is not None:
+        undetermined.append(
+            f"{label} '{bucket_name}': an enabled replication rule copies it to "
+            f"{', '.join(repr(r) for r in replicas)}, S3 Lifecycle takes no action "
+            "on an object whose replication status is PENDING or FAILED, and the "
+            f"ReplicationStatus of the objects under '{root}' was not read, "
+            "because s3:GetObject is granted only on invocation log records"
+        )
+    elif replicas:
         held = _replication_held_log_objects(s3_client, bucket_name, key_prefix)
         copies = (
             f"{label} '{bucket_name}': an enabled replication rule copies it to "
@@ -4700,7 +4729,9 @@ def _judge_log_bucket_retention(
     for replica in replicas:
         replica_label = f"Replica S3 bucket (copied from '{bucket_name}')"
         try:
-            replica_lifecycle = _bucket_expiration_rules(replica, region, key_prefix)
+            replica_lifecycle = _bucket_expiration_rules(
+                replica, region, key_prefix, **wording
+            )
         except Exception as error:
             undetermined.append(
                 f"{replica_label} '{replica}': "
@@ -5069,6 +5100,263 @@ def _agentcore_memory_expiry_findings(region: str) -> List[Dict[str, Any]]:
             row(
                 f"No AgentCore memory is listed in {region}, so there is no "
                 "memory event retention to judge.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+    return rows
+
+
+BEDROCK_AGENT_MEMORY_FINDING = "Bedrock Agent Memory Retention"
+
+BEDROCK_AGENT_MEMORY_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/APIReference/"
+    "API_agent_MemoryConfiguration.html"
+)
+
+
+def _bedrock_agent_memory_findings(region: str) -> List[Dict[str, Any]]:
+    """Report the Bedrock agent memory leg of AIR-FND-DAT-08, one row per version.
+
+    Every agent is read at DRAFT (GetAgent) and at every version an alias
+    routes to (GetAgentVersion). A version whose memoryConfiguration enables a
+    memory type keeps session summaries for storageDays, which botocore bounds
+    0 to 365.
+    """
+
+    def row(details: str, resolution: str, severity: str, status: str):
+        return create_finding(
+            check_id="BR-04",
+            finding_name=BEDROCK_AGENT_MEMORY_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=BEDROCK_AGENT_MEMORY_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    unread_resolution = (
+        "Grant bedrock:ListAgents, bedrock:GetAgent, bedrock:ListAgentAliases and "
+        "bedrock:GetAgentVersion and re-run the assessment."
+    )
+    client = boto3.client("bedrock-agent", config=boto3_config, region_name=region)
+    try:
+        agents = _list_all_items(client, "list_agents", "agentSummaries")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return [
+            row(
+                f"The Bedrock agents in {region} were not listed with "
+                f"bedrock:ListAgents ({get_assessment_error_label(error)}), so the "
+                "memory retention of an agent was not read.",
+                unread_resolution,
+                "Informational",
+                "N/A",
+            )
+        ]
+
+    rows = []
+    read = 0
+    for agent in agents:
+        agent_id = agent.get("agentId")
+        name = agent.get("agentName") or agent_id
+        try:
+            configurations = [
+                (
+                    "DRAFT",
+                    (client.get_agent(agentId=agent_id).get("agent") or {}).get(
+                        "memoryConfiguration"
+                    ),
+                )
+            ]
+            aliases = _list_all_items(
+                client, "list_agent_aliases", "agentAliasSummaries", agentId=agent_id
+            )
+            versions = sorted(
+                {
+                    str(route.get("agentVersion"))
+                    for alias in aliases
+                    for route in alias.get("routingConfiguration") or []
+                    if route.get("agentVersion")
+                    and route.get("agentVersion") != "DRAFT"
+                }
+            )
+            for version in versions:
+                detail = (
+                    client.get_agent_version(
+                        agentId=agent_id, agentVersion=version
+                    ).get("agentVersion")
+                    or {}
+                )
+                configurations.append(
+                    (f"version {version}", detail.get("memoryConfiguration"))
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            rows.append(
+                row(
+                    f"The memory configuration of Bedrock agent '{name}' was not "
+                    "read at DRAFT and at every alias-routed version with "
+                    "bedrock:GetAgent, bedrock:ListAgentAliases and "
+                    f"bedrock:GetAgentVersion ({get_assessment_error_label(error)}).",
+                    unread_resolution,
+                    "Informational",
+                    "N/A",
+                )
+            )
+            continue
+        read += 1
+        for label, memory in configurations:
+            if not isinstance(memory, dict) or not memory.get("enabledMemoryTypes"):
+                continue
+            days = memory.get("storageDays")
+            subject = f"Bedrock agent '{name}' ({agent_id}) {label}"
+            if not isinstance(days, int) or isinstance(days, bool):
+                rows.append(
+                    row(
+                        f"{subject} enables memory "
+                        f"({', '.join(map(str, memory['enabledMemoryTypes']))}), "
+                        "but its memoryConfiguration returned no storageDays, so "
+                        "how long session summaries are kept was not read.",
+                        "Set memoryConfiguration.storageDays on the agent and "
+                        "re-run the assessment.",
+                        "Informational",
+                        "N/A",
+                    )
+                )
+            elif days == 0:
+                rows.append(
+                    row(
+                        f"{subject} enables memory with storageDays 0. The API "
+                        "reference does not state what a period of 0 days keeps, "
+                        "so this is not reported as Passed.",
+                        "Set memoryConfiguration.storageDays to the period your "
+                        "record-retention policy names.",
+                        "Informational",
+                        "N/A",
+                    )
+                )
+            else:
+                rows.append(
+                    row(
+                        f"{subject} keeps session summaries for {days} days "
+                        "(memoryConfiguration.storageDays, which the service "
+                        "bounds at 365). This is a service-set period; whether "
+                        "deletion has run is not read by this check. Confirm the "
+                        "period meets your own record-retention policy.",
+                        "No action required",
+                        "Medium",
+                        "Passed",
+                    )
+                )
+
+    if not rows:
+        rows.append(
+            row(
+                f"No Bedrock agent version in {region} enables memory ({read} "
+                "agent(s) read at DRAFT and at every alias-routed version), so "
+                "there is no agent memory retention to judge.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+    return rows
+
+
+SAGEMAKER_INFERENCE_RETENTION_FINDING = "SageMaker Inference Data Retention"
+
+SAGEMAKER_INFERENCE_RETENTION_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-data-capture.html"
+)
+
+
+def _sagemaker_inference_retention_findings(region: str) -> List[Dict[str, Any]]:
+    """Judge the S3 retention of every SageMaker endpoint's inference data.
+
+    Data capture and asynchronous inference write each request and response
+    under their S3 URI, so the lifecycle there is judged the way an invocation
+    log bucket's is, with the URI's key path as the root a rule must cover.
+    """
+    located = _sagemaker_endpoint_locations(region)
+    retained: List[str] = []
+    unretained: List[str] = []
+    undetermined: List[str] = list(located["errors"])
+    seen = set()
+    for uri, label in located["uris"]:
+        bucket, _, key = uri[len("s3://") :].partition("/")
+        root = f"{key.strip('/')}/" if key.strip("/") else ""
+        if (bucket, root, label) in seen:
+            continue
+        seen.add((bucket, root, label))
+        _judge_log_bucket_retention(
+            bucket,
+            None,
+            f"S3 bucket for {label}",
+            region,
+            retained,
+            unretained,
+            undetermined,
+            root=root,
+        )
+
+    def row(details: str, resolution: str, severity: str, status: str):
+        return create_finding(
+            check_id="BR-04",
+            finding_name=SAGEMAKER_INFERENCE_RETENTION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=SAGEMAKER_INFERENCE_RETENTION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    rows = [
+        row(
+            f"SageMaker inference data retention is not set by a lifecycle rule "
+            f"alone: {deficiency}.",
+            "Add an enabled S3 lifecycle rule that expires current and noncurrent "
+            "objects under the data capture or asynchronous inference S3 URI, and "
+            "keep any write-once copy in a separate bucket.",
+            "Medium",
+            "Failed",
+        )
+        for deficiency in unretained
+    ]
+    if retained:
+        rows.append(
+            row(
+                f"SageMaker inference data retention is stated on {len(retained)} "
+                f"destination(s): {'; '.join(retained)}. Whether lifecycle "
+                "deletion has run is not read by this check."
+                + (
+                    " This is not reported as Passed, because not every "
+                    "destination was read."
+                    if undetermined
+                    else ""
+                ),
+                COULD_NOT_ASSESS_RESOLUTION if undetermined else "No action required",
+                "Medium",
+                "N/A" if undetermined else "Passed",
+            )
+        )
+    rows.extend(
+        row(
+            f"SageMaker inference data retention could not be assessed: {gap}.",
+            "Grant the assessment role the action named above and re-run the "
+            "assessment.",
+            "Informational",
+            "N/A",
+        )
+        for gap in undetermined
+    )
+    if not rows:
+        rows.append(
+            row(
+                f"No SageMaker endpoint in {region} captures data or writes "
+                "asynchronous inference output to S3, so there is no inference "
+                "data retention to judge.",
                 "No action required",
                 "Informational",
                 "N/A",
@@ -31372,9 +31660,10 @@ def _sagemaker_endpoint_locations(region: str = "") -> Dict[str, Any]:
     DataCaptureConfig.DestinationS3Uri of an endpoint with capture enabled,
     and the AsyncInferenceConfig.OutputConfig S3OutputPath and S3FailurePath
     of its endpoint configuration. Every page is listed. Returns
-    {"locations": [(bucket, label)], "errors"}.
+    {"locations": [(bucket, label)], "uris": [(uri, label)], "errors"}.
     """
     locations = []
+    uris = []
     errors = []
     client = boto3.client("sagemaker", config=boto3_config, region_name=region)
     try:
@@ -31388,6 +31677,7 @@ def _sagemaker_endpoint_locations(region: str = "") -> Dict[str, Any]:
     except (ClientError, BotoCoreError, TypeError) as error:
         return {
             "locations": [],
+            "uris": [],
             "errors": [
                 "endpoints were not listed with sagemaker:ListEndpoints "
                 f"({get_assessment_error_label(error)})"
@@ -31426,7 +31716,8 @@ def _sagemaker_endpoint_locations(region: str = "") -> Dict[str, Any]:
                         f"the {role} of SageMaker endpoint '{name}'",
                     )
                 )
-    return {"locations": locations, "errors": errors}
+                uris.append((str(uri), f"the {role} of SageMaker endpoint '{name}'"))
+    return {"locations": locations, "uris": uris, "errors": errors}
 
 
 def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
@@ -37226,9 +37517,16 @@ def lambda_handler(event, context):
         logger.info("Running Bedrock logging findings check")
         bedrock_logging_findings = check_bedrock_logging_configuration(region=region)
         # AIR-FND-DAT-08 also covers AgentCore Memory retention, so BR-04
-        # carries one row per memory for that leg.
+        # carries one row per memory for that leg, and the same for Bedrock
+        # agent memory and SageMaker inference data.
         bedrock_logging_findings["csv_data"].extend(
             _agentcore_memory_expiry_findings(region)
+        )
+        bedrock_logging_findings["csv_data"].extend(
+            _bedrock_agent_memory_findings(region)
+        )
+        bedrock_logging_findings["csv_data"].extend(
+            _sagemaker_inference_retention_findings(region)
         )
         all_findings.append(bedrock_logging_findings)
 

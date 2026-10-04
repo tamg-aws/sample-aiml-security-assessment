@@ -1049,6 +1049,41 @@ MUTATIONS = [
         "replace": "                elif False and (\n",
     },
     {
+        "name": "BR-04 reads agent memory at DRAFT only",
+        "file": BEDROCK,
+        "defect": "BR-04 judges a Bedrock agent's memory retention at DRAFT and never at the versions its aliases route to",
+        "find": '                configurations.append(\n                    (f"version {version}", detail.get("memoryConfiguration"))\n',
+        "replace": '                [].append(\n                    (f"version {version}", detail.get("memoryConfiguration"))\n',
+    },
+    {
+        "name": "BR-04 passes an agent memory of 0 days",
+        "file": BEDROCK,
+        "defect": "BR-04 passes an agent memory whose storageDays is 0, a period the API reference does not define",
+        "find": "            elif days == 0:\n",
+        "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-04 judges inference data at the AWSLogs root",
+        "file": BEDROCK,
+        "defect": "BR-04 requires a SageMaker capture bucket's lifecycle rule to cover AWSLogs/ and not the capture URI's own path",
+        "find": "    if root is not None:\n        log_root = root\n",
+        "replace": "    if False:\n        log_root = root\n",
+    },
+    {
+        "name": "BR-04 probes replicated inference data it cannot read",
+        "file": BEDROCK,
+        "defect": "BR-04 runs the invocation log ReplicationStatus probe on a replicated SageMaker capture bucket, whose objects it has no s3:GetObject grant on",
+        "find": "    if replicas and root is not None:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-04 passes inference data beside an unread endpoint",
+        "file": BEDROCK,
+        "defect": "BR-04 reports SageMaker inference data retention Passed while an endpoint was not read",
+        "find": '                "N/A" if undetermined else "Passed",\n',
+        "replace": '                "Passed",\n',
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2835,6 +2870,21 @@ GROUPS: dict[str, str] = {
     ),
     "BR-46 fails an unread discovery state": (
         "in the Bedrock Macie discovery requirement"
+    ),
+    "BR-04 reads agent memory at DRAFT only": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 passes an agent memory of 0 days": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 judges inference data at the AWSLogs root": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 probes replicated inference data it cannot read": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 passes inference data beside an unread endpoint": (
+        "in the Bedrock agent and SageMaker retention legs"
     ),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"

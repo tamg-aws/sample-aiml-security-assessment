@@ -386,14 +386,14 @@ Resources:
             # BR-02 reads the configuration behind each SageMaker endpoint.
             Effect: Allow
             Action:
-              - sagemaker:DescribeEndpoint # BR-02
+              - sagemaker:DescribeEndpoint # BR-02, BR-04
             Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint/*'
           - Sid: SageMakerEndpointConfigRead
             # BR-02 reads the variants, execution role and VPC of each
             # endpoint configuration.
             Effect: Allow
             Action:
-              - sagemaker:DescribeEndpointConfig # BR-02
+              - sagemaker:DescribeEndpointConfig # BR-02, BR-04
             Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint-config/*'
           - Sid: SageMakerModelRead
             # BR-02 reads the execution role and VPC of each endpoint model.
@@ -648,7 +648,7 @@ Resources:
                 - bedrock-agentcore:ListMemories # BR-04, BR-53
                 - bedrock-agentcore:ListGateways # BR-53
                 - bedrock-agentcore:ListBrowsers # BR-42, BR-47, BR-52, BR-53
-                - sagemaker:ListEndpoints # BR-02, BR-53
+                - sagemaker:ListEndpoints # BR-02, BR-04, BR-53
                 - sagemaker:ListModels # BR-53
                 - sagemaker:ListNotebookInstances # BR-02, BR-53
                 # Former Sid KMSKeyInventory.
@@ -715,11 +715,11 @@ Resources:
             - Sid: BedrockAgentRead
               Effect: Allow
               Action:
-                - bedrock:GetAgent
+                - bedrock:GetAgent # BR-04
                 - bedrock:ListAgentActionGroups
                 - bedrock:GetAgentActionGroup
-                - bedrock:ListAgentAliases # BR-26, BR-27, BR-34
-                - bedrock:GetAgentVersion # BR-26, BR-27, BR-34
+                - bedrock:ListAgentAliases # BR-04, BR-26, BR-27, BR-34
+                - bedrock:GetAgentVersion # BR-04, BR-26, BR-27, BR-34
                 - bedrock:ListAgentKnowledgeBases # BR-26, BR-34
                 - bedrock:ListAgentCollaborators # BR-57
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*'

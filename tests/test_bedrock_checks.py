@@ -41079,3 +41079,308 @@ class TestInvocationLogGuardrailEvidence:
         )
 
         assert [row["Status"] for row in rows] == ["N/A"]
+
+
+class TestBR04AgentMemoryRetention:
+    """AIR-FND-DAT-08: Bedrock agent memory storageDays at DRAFT and every routed version."""
+
+    @staticmethod
+    def _client(agents, drafts, aliases=None, versions=None, list_error=None):
+        client = MagicMock()
+        if list_error is not None:
+            client.list_agents.side_effect = list_error
+        else:
+            client.list_agents.return_value = {"agentSummaries": agents}
+
+        def get_agent(agentId):
+            value = drafts[agentId]
+            if isinstance(value, Exception):
+                raise value
+            return {"agent": {"agentId": agentId, "memoryConfiguration": value}}
+
+        def get_agent_version(agentId, agentVersion):
+            value = (versions or {})[(agentId, agentVersion)]
+            if isinstance(value, Exception):
+                raise value
+            return {"agentVersion": {"memoryConfiguration": value}}
+
+        client.get_agent.side_effect = get_agent
+        client.list_agent_aliases.side_effect = lambda agentId, **_: {
+            "agentAliasSummaries": [
+                {"routingConfiguration": [{"agentVersion": v} for v in routed]}
+                for routed in (aliases or {}).get(agentId, [])
+            ]
+        }
+        client.get_agent_version.side_effect = get_agent_version
+        return client
+
+    @staticmethod
+    def _rows(client):
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            rows = bedrock_app._bedrock_agent_memory_findings("us-east-1")
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-04"
+        return rows
+
+    MEMORY_30 = {"enabledMemoryTypes": ["SESSION_SUMMARY"], "storageDays": 30}
+
+    def test_every_routed_version_is_judged_and_a_memoryless_agent_is_skipped(self):
+        client = self._client(
+            [
+                {"agentId": "AG1", "agentName": "support"},
+                {"agentId": "AG2", "agentName": "plain"},
+            ],
+            {"AG1": self.MEMORY_30, "AG2": None},
+            aliases={"AG1": [["2", "DRAFT"], ["3"]], "AG2": [["1"]]},
+            versions={
+                ("AG1", "2"): {"enabledMemoryTypes": ["SESSION_SUMMARY"]},
+                ("AG1", "3"): {
+                    "enabledMemoryTypes": ["SESSION_SUMMARY"],
+                    "storageDays": 365,
+                },
+                ("AG2", "1"): {"enabledMemoryTypes": []},
+            },
+        )
+        rows = self._rows(client)
+        assert [(r["Status"], r["Finding_Details"][:41]) for r in rows] == [
+            ("Passed", "Bedrock agent 'support' (AG1) DRAFT keeps"),
+            ("N/A", "Bedrock agent 'support' (AG1) version 2 e"),
+            ("Passed", "Bedrock agent 'support' (AG1) version 3 k"),
+        ]
+        assert "keeps session summaries for 30 days" in rows[0]["Finding_Details"]
+        assert "returned no storageDays" in rows[1]["Finding_Details"]
+        assert "for 365 days" in rows[2]["Finding_Details"]
+        assert sorted(
+            call.kwargs["agentVersion"]
+            for call in client.get_agent_version.call_args_list
+        ) == ["1", "2", "3"]
+
+    def test_zero_storage_days_is_not_passed(self):
+        rows = self._rows(
+            self._client(
+                [{"agentId": "AG1", "agentName": "support"}],
+                {"AG1": {"enabledMemoryTypes": ["SESSION_SUMMARY"], "storageDays": 0}},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "storageDays 0" in rows[0]["Finding_Details"]
+
+    def test_an_unread_agent_is_named_beside_a_read_one(self):
+        rows = self._rows(
+            self._client(
+                [
+                    {"agentId": "AG1", "agentName": "support"},
+                    {"agentId": "AG2", "agentName": "locked"},
+                ],
+                {"AG1": self.MEMORY_30, "AG2": self.MEMORY_30},
+                aliases={"AG2": [["4"]]},
+                versions={("AG2", "4"): _make_client_error("AccessDeniedException")},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert (
+            "The memory configuration of Bedrock agent 'locked' was not read"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_an_unlisted_agent_population_is_na(self):
+        rows = self._rows(
+            self._client([], {}, list_error=_make_client_error("AccessDeniedException"))
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "were not listed with bedrock:ListAgents" in rows[0]["Finding_Details"]
+
+    def test_no_memory_anywhere_is_said_so(self):
+        rows = self._rows(
+            self._client([{"agentId": "AG1", "agentName": "plain"}], {"AG1": None})
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "No Bedrock agent version in us-east-1 enables memory (1 agent(s) read"
+            in rows[0]["Finding_Details"]
+        )
+
+
+class TestBR04SageMakerInferenceRetention:
+    """AIR-FND-DAT-08: the lifecycle of every SageMaker data capture and async output URI."""
+
+    @staticmethod
+    def _s3(buckets):
+        """buckets: name -> {"rules", "versioning", "replicas", "error"}."""
+        client = MagicMock()
+
+        def lifecycle(Bucket):
+            spec = buckets[Bucket]
+            if spec.get("error"):
+                raise spec["error"]
+            if spec.get("rules") is None:
+                raise _make_client_error("NoSuchLifecycleConfiguration")
+            return {"Rules": spec["rules"]}
+
+        def replication(Bucket):
+            replicas = buckets[Bucket].get("replicas")
+            if not replicas:
+                raise _make_client_error("ReplicationConfigurationNotFoundError")
+            return {
+                "ReplicationConfiguration": {
+                    "Rules": [
+                        {
+                            "Status": "Enabled",
+                            "Destination": {"Bucket": f"arn:aws:s3:::{r}"},
+                        }
+                        for r in replicas
+                    ]
+                }
+            }
+
+        client.get_bucket_lifecycle_configuration.side_effect = lifecycle
+        client.get_bucket_versioning.side_effect = lambda Bucket: (
+            {"Status": buckets[Bucket]["versioning"]}
+            if buckets[Bucket].get("versioning")
+            else {}
+        )
+        client.get_object_lock_configuration.side_effect = lambda Bucket: (
+            _ for _ in ()
+        ).throw(_make_client_error("ObjectLockConfigurationNotFoundError"))
+        client.get_bucket_replication.side_effect = replication
+        return client
+
+    def _rows(self, uris, buckets, errors=()):
+        located = {
+            "locations": [],
+            "uris": [(uri, label) for uri, label in uris],
+            "errors": list(errors),
+        }
+        with (
+            patch.object(
+                bedrock_app, "_sagemaker_endpoint_locations", return_value=located
+            ),
+            patch.object(bedrock_app.boto3, "client", return_value=self._s3(buckets)),
+        ):
+            rows = bedrock_app._sagemaker_inference_retention_findings("us-east-1")
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-04"
+        return rows
+
+    @staticmethod
+    def _rule(prefix, noncurrent=False, **extra):
+        rule = {
+            "ID": f"rule-{prefix or 'root'}",
+            "Status": "Enabled",
+            "Filter": {"Prefix": prefix},
+            "Expiration": {"Days": 30},
+            **extra,
+        }
+        if noncurrent:
+            rule["NoncurrentVersionExpiration"] = {"NoncurrentDays": 7}
+        return rule
+
+    CAPTURE = (
+        "s3://capture-a/capture/ep1",
+        "the data capture destination of SageMaker endpoint 'ep1'",
+    )
+    ASYNC = (
+        "s3://async-b/out/",
+        "the asynchronous inference output of SageMaker endpoint 'ep2'",
+    )
+
+    def test_a_rule_must_cover_the_uri_path_on_every_destination(self):
+        rows = self._rows(
+            [self.CAPTURE, self.ASYNC],
+            {
+                "capture-a": {"rules": [self._rule("capture/")]},
+                "async-b": {"rules": [self._rule("other/")]},
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "rule-other/ applies to prefix 'other/', which does not cover 'out/'"
+            in rows[0]["Finding_Details"]
+        )
+        assert (
+            "captured requests and responses are kept indefinitely"
+            in rows[0]["Finding_Details"]
+        )
+        assert (
+            "'capture-a' lifecycle: rule-capture/ expires objects after 30 day(s)"
+            in rows[1]["Finding_Details"]
+        )
+        assert "async-b" not in rows[1]["Finding_Details"]
+
+    def test_a_versioned_destination_needs_a_noncurrent_expiration(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {"capture-a": {"rules": [self._rule("")], "versioning": "Enabled"}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "overwritten and expired captured objects are kept indefinitely"
+            in rows[0]["Finding_Details"]
+        )
+        rows = self._rows(
+            [self.CAPTURE],
+            {
+                "capture-a": {
+                    "rules": [self._rule("", noncurrent=True)],
+                    "versioning": "Enabled",
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_replicated_destination_is_held_and_its_replica_judged(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {
+                "capture-a": {"rules": [self._rule("")], "replicas": ["copy-c"]},
+                "copy-c": {"rules": None},
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert (
+            "Replica S3 bucket (copied from 'capture-a') 'copy-c'"
+            in rows[0]["Finding_Details"]
+        )
+        assert (
+            "the ReplicationStatus of the objects under 'capture/ep1/' was not read"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_an_unread_endpoint_withholds_the_pass(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {"capture-a": {"rules": [self._rule("")]}},
+            errors=["endpoint 'ep9' was not read with sagemaker:DescribeEndpoint"],
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "This is not reported as Passed" in rows[0]["Finding_Details"]
+        assert "endpoint 'ep9' was not read" in rows[1]["Finding_Details"]
+
+    def test_no_inference_destination_is_said_so(self):
+        rows = self._rows([], {})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "No SageMaker endpoint in us-east-1 captures data"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_the_collector_records_each_enabled_capture_uri(self):
+        client = MagicMock()
+        client.list_endpoints.return_value = {
+            "Endpoints": [{"EndpointName": "on"}, {"EndpointName": "off"}]
+        }
+        client.describe_endpoint.side_effect = lambda EndpointName: {
+            "EndpointConfigName": f"{EndpointName}-config",
+            "DataCaptureConfig": {
+                "EnableCapture": EndpointName == "on",
+                "DestinationS3Uri": f"s3://cap/{EndpointName}",
+            },
+        }
+        client.describe_endpoint_config.return_value = {}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            located = bedrock_app._sagemaker_endpoint_locations("us-east-1")
+        assert located["uris"] == [
+            ("s3://cap/on", "the data capture destination of SageMaker endpoint 'on'")
+        ]
