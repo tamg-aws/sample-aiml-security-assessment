@@ -4630,8 +4630,9 @@ def _bucket_expiration_rules(
     covers that root counts. On a bucket that is or was versioned, expiring the
     current object leaves a noncurrent version behind, so a rule that expires
     noncurrent versions is required as well. Returns ``expirations`` (the rules
-    that count), ``deficiency`` (why the bucket keeps logs forever) and
-    ``undetermined`` (why that could not be read). ``root`` replaces the
+    that count), ``schedules`` (each counted rule's Days or Date),
+    ``deficiency`` (why the bucket keeps logs forever) and ``undetermined``
+    (why that could not be read). ``root`` replaces the
     AWSLogs/ root for data another service writes under its own prefix, and
     ``records`` and ``objects`` name that data in the text.
     """
@@ -4649,6 +4650,7 @@ def _bucket_expiration_rules(
         log_root = root
 
     expirations = []
+    schedules: List[Any] = []
     noncurrent_expirations = []
     uncovering = []
     for rule in response.get("Rules", []):
@@ -4680,8 +4682,10 @@ def _bucket_expiration_rules(
             expirations.append(
                 f"{rule_id} expires objects after {expiration['Days']} day(s)"
             )
+            schedules.append(expiration["Days"])
         elif expiration.get("Date"):
             expirations.append(f"{rule_id} expires objects on {expiration['Date']}")
+            schedules.append(expiration["Date"])
         if noncurrent.get("NoncurrentDays"):
             noncurrent_expirations.append(
                 f"{rule_id} expires noncurrent versions after "
@@ -4692,6 +4696,7 @@ def _bucket_expiration_rules(
     if not expirations:
         return {
             "expirations": [],
+            "schedules": [],
             "deficiency": (
                 "has no enabled lifecycle rule that expires objects under "
                 f"'{log_root}', so {records} are kept indefinitely{uncovered_note}"
@@ -4706,6 +4711,7 @@ def _bucket_expiration_rules(
     except Exception as error:
         return {
             "expirations": expirations,
+            "schedules": schedules,
             "deficiency": None,
             "undetermined": describe_api_error(error, "s3:GetBucketVersioning", region),
         }
@@ -4714,6 +4720,7 @@ def _bucket_expiration_rules(
     if versioning_status in ("Enabled", "Suspended") and not noncurrent_expirations:
         return {
             "expirations": expirations,
+            "schedules": schedules,
             "deficiency": (
                 f"has versioning {versioning_status} and no enabled lifecycle rule "
                 f"that expires noncurrent versions under '{log_root}', so "
@@ -4724,6 +4731,7 @@ def _bucket_expiration_rules(
         }
     return {
         "expirations": expirations + noncurrent_expirations,
+        "schedules": schedules,
         "deficiency": None,
         "undetermined": None,
     }
@@ -4808,6 +4816,7 @@ def _replication_held_log_objects(
                     return {
                         "failed": failed,
                         "read": read,
+                        "capped": True,
                         "error": (
                             f"objects under s3://{bucket_name}/{root} past the first "
                             f"{REPLICATION_STATUS_HEAD_CAP} were not read"
@@ -4825,9 +4834,158 @@ def _replication_held_log_objects(
         return {
             "failed": failed,
             "read": read,
+            "capped": False,
             "error": f"{action}, {get_assessment_error_label(error)}",
         }
-    return {"failed": failed, "read": read, "error": ""}
+    return {"failed": failed, "read": read, "capped": False, "error": ""}
+
+
+# S3 Lifecycle rounds an object's expiry up to the next midnight UTC and runs
+# once a day, so an object is overdue only this many days past its rule.
+LIFECYCLE_DELETION_GRACE_DAYS = 2
+
+# ListObjectsV2 calls one search for a bucket's oldest object may make.
+OLDEST_OBJECT_LIST_CAP = 200
+
+DATE_FOLDER_PATTERN = re.compile(r"\d{4}|\d{2}")
+
+
+def _oldest_object_under(s3_client: Any, bucket_name: str, root: str) -> Dict[str, Any]:
+    """
+    Find the least recently written object under ``root`` with ListObjectsV2.
+
+    Each level is listed with Delimiter '/'. Keys are returned in key order, so
+    at a level whose every folder is a date component (yyyy, mm, dd or hh) the
+    first folder holds the oldest objects and only it is entered. Every other
+    folder (a Region, an endpoint, a variant) is entered. Returns ``oldest``
+    (the ListObjectsV2 item, or None when no object exists) and ``error``.
+    """
+    oldest = None
+    calls = 0
+    pending = [root]
+    while pending:
+        prefix = pending.pop()
+        folders: List[str] = []
+        token = None
+        while True:
+            if calls >= OLDEST_OBJECT_LIST_CAP:
+                return {
+                    "oldest": oldest,
+                    "error": (
+                        f"the listing under s3://{bucket_name}/{root} stopped "
+                        f"after {OLDEST_OBJECT_LIST_CAP} ListObjectsV2 calls"
+                    ),
+                }
+            request = {"Bucket": bucket_name, "Prefix": prefix, "Delimiter": "/"}
+            if token:
+                request["ContinuationToken"] = token
+            page = s3_client.list_objects_v2(**request)
+            calls += 1
+            for item in page.get("Contents") or []:
+                if oldest is None or item["LastModified"] < oldest["LastModified"]:
+                    oldest = item
+            folders.extend(
+                common["Prefix"] for common in page.get("CommonPrefixes") or []
+            )
+            token = page.get("NextContinuationToken")
+            if not page.get("IsTruncated") or not token:
+                break
+        if folders and all(
+            DATE_FOLDER_PATTERN.fullmatch(folder[len(prefix) :].rstrip("/"))
+            for folder in folders
+        ):
+            pending.append(min(folders))
+        else:
+            pending.extend(folders)
+    return {"oldest": oldest, "error": ""}
+
+
+def _lifecycle_deletion_evidence(
+    s3_client: Any,
+    bucket_name: str,
+    key_prefix: Optional[str],
+    root: Optional[str],
+    schedules: List[Any],
+    region: str,
+) -> Dict[str, Any]:
+    """
+    Judge whether lifecycle deletion has run from the age of the oldest object
+    under the bucket's record root (AIR-FND-DAT-08). Every counted rule covers
+    the whole root, so an object kept past the earliest of their expiries,
+    plus the daily run, was not deleted on schedule. Without ``root`` the root
+    is <keyPrefix>/AWSLogs/<account>/BedrockModelInvocationLogs/. Returns
+    ``overdue`` (the Failed text), ``evidence`` (the text a retained line
+    carries) and ``error``.
+    """
+    action = "s3:ListBucket"
+    try:
+        if root is None:
+            action = "sts:GetCallerIdentity"
+            stripped_prefix = (key_prefix or "").strip("/")
+            account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+                "Account"
+            ]
+            root = (
+                f"{stripped_prefix + '/' if stripped_prefix else ''}AWSLogs/"
+                f"{account}/BedrockModelInvocationLogs/"
+            )
+            action = "s3:ListBucket"
+        found = _oldest_object_under(s3_client, bucket_name, root)
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "overdue": None,
+            "evidence": "",
+            "error": describe_api_error(error, action, region),
+        }
+    if found["error"]:
+        return {"overdue": None, "evidence": "", "error": found["error"]}
+    oldest = found["oldest"]
+    if oldest is None:
+        return {
+            "overdue": None,
+            "evidence": (
+                f"ListObjectsV2 returns no object under '{root}', so no deletion "
+                "is yet due"
+            ),
+            "error": "",
+        }
+    written = oldest["LastModified"]
+    dues = []
+    for schedule in schedules:
+        if isinstance(schedule, datetime):
+            date = (
+                schedule if schedule.tzinfo else schedule.replace(tzinfo=timezone.utc)
+            )
+            dues.append((max(date, written), f"expiry date {date.date().isoformat()}"))
+        else:
+            dues.append((written + timedelta(days=schedule), f"{schedule}-day rule"))
+    due, named = min(dues, key=lambda pair: pair[0])
+    now = datetime.now(timezone.utc)
+    age = int((now - written).total_seconds() // 86400)
+    stated = (
+        f"the oldest object under '{root}', '{oldest['Key']}', was written "
+        f"{age} day(s) ago"
+    )
+    allowance = (
+        f"plus {LIFECYCLE_DELETION_GRACE_DAYS} day(s) for the daily lifecycle run"
+    )
+    if now > due + timedelta(days=LIFECYCLE_DELETION_GRACE_DAYS):
+        return {
+            "overdue": (
+                f"{stated}, past its {named} {allowance}, so lifecycle deletion "
+                "has not removed it on schedule"
+            ),
+            "evidence": "",
+            "error": "",
+        }
+    return {
+        "overdue": None,
+        "evidence": (
+            f"{stated} and is not past its {named} {allowance}, so no object is "
+            "held past it"
+        ),
+        "error": "",
+    }
 
 
 def _judge_log_bucket_retention(
@@ -4902,9 +5060,21 @@ def _judge_log_bucket_retention(
             f"{describe_api_error(error, 's3:GetReplicationConfiguration', region)}"
         )
         return
-    if not lock and not replicas:
+    deletion = _lifecycle_deletion_evidence(
+        s3_client, bucket_name, key_prefix, root, lifecycle["schedules"], region
+    )
+    if deletion["overdue"]:
+        unretained.append(f"{label} '{bucket_name}': {deletion['overdue']}")
+    if deletion["error"]:
+        undetermined.append(
+            f"{label} '{bucket_name}': whether lifecycle deletion has run was not "
+            f"read ({deletion['error']})"
+        )
+    on_schedule = not deletion["overdue"] and not deletion["error"]
+    if not lock and not replicas and on_schedule:
         retained.append(
-            f"{label} '{bucket_name}' lifecycle: {'; '.join(lifecycle['expirations'])}"
+            f"{label} '{bucket_name}' lifecycle: "
+            f"{'; '.join(lifecycle['expirations'])}; {deletion['evidence']}"
         )
     if replicas and root is not None:
         undetermined.append(
@@ -4928,15 +5098,24 @@ def _judge_log_bucket_retention(
                 f"object(s) read, so they are held back from expiry: "
                 f"{', '.join(held['failed'][:5])}"
             )
-        if held["error"]:
+        if held["capped"] and not held["failed"] and on_schedule:
+            # An object a FAILED status holds back past the rule would be
+            # older than the rule, and the oldest object is not.
+            retained.append(
+                f"{copies}; HeadObject reports no ReplicationStatus FAILED on the "
+                f"first {held['read']} invocation log object(s), and the objects "
+                f"past them were not read, but {deletion['evidence']}"
+            )
+        elif held["error"]:
             undetermined.append(
                 f"{copies}, and the ReplicationStatus of every invocation log "
                 f"object was not read: {held['error']}"
             )
-        elif not held["failed"]:
+        elif not held["failed"] and on_schedule:
             retained.append(
                 f"{copies}; HeadObject reports no ReplicationStatus FAILED on any "
-                f"of the {held['read']} invocation log object(s)"
+                f"of the {held['read']} invocation log object(s); "
+                f"{deletion['evidence']}"
             )
     for replica in replicas:
         replica_label = f"Replica S3 bucket (copied from '{bucket_name}')"
@@ -4959,10 +5138,29 @@ def _judge_log_bucket_retention(
                 f"{replica_label} '{replica}' {replica_lifecycle['deficiency']}"
             )
         else:
-            retained.append(
-                f"{replica_label} '{replica}' lifecycle: "
-                f"{'; '.join(replica_lifecycle['expirations'])}"
+            replica_deletion = _lifecycle_deletion_evidence(
+                s3_client,
+                replica,
+                key_prefix,
+                root,
+                replica_lifecycle["schedules"],
+                region,
             )
+            if replica_deletion["overdue"]:
+                unretained.append(
+                    f"{replica_label} '{replica}': {replica_deletion['overdue']}"
+                )
+            elif replica_deletion["error"]:
+                undetermined.append(
+                    f"{replica_label} '{replica}': whether lifecycle deletion has "
+                    f"run was not read ({replica_deletion['error']})"
+                )
+            else:
+                retained.append(
+                    f"{replica_label} '{replica}' lifecycle: "
+                    f"{'; '.join(replica_lifecycle['expirations'])}; "
+                    f"{replica_deletion['evidence']}"
+                )
 
 
 def _invocation_log_retention_findings(
@@ -5048,9 +5246,10 @@ def _invocation_log_retention_findings(
                     "Invocation log retention is stated on "
                     f"{len(retained)} destination(s): {'; '.join(retained)}. "
                     "Confirm the stated period meets your own record-retention "
-                    "policy. Whether lifecycle deletion has run, and any legal "
-                    "hold on an individual object version, are not read by this "
-                    "check."
+                    "policy. On an S3 destination, lifecycle deletion is judged "
+                    "from the age of the oldest current object; noncurrent "
+                    "versions are not listed, and any legal hold on an individual "
+                    "object version is not read by this check."
                 ),
                 resolution="No action required",
                 reference=INVOCATION_LOG_RETENTION_REFERENCE,
@@ -5540,8 +5739,9 @@ def _sagemaker_inference_retention_findings(region: str) -> List[Dict[str, Any]]
         rows.append(
             row(
                 f"SageMaker inference data retention is stated on {len(retained)} "
-                f"destination(s): {'; '.join(retained)}. Whether lifecycle "
-                "deletion has run is not read by this check."
+                f"destination(s): {'; '.join(retained)}. Lifecycle deletion is "
+                "judged from the age of the oldest current object; noncurrent "
+                "versions are not listed by this check."
                 + (
                     " This is not reported as Passed, because not every "
                     "destination was read."

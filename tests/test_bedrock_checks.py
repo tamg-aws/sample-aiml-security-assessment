@@ -3129,8 +3129,16 @@ class TestBR04LoggingConfiguration:
             mock_s3.get_bucket_lifecycle_configuration.return_value = lifecycle
         # A bucket that was never versioned returns no Status key.
         mock_s3.get_bucket_versioning.return_value = versioning or {}
+        mock_s3.list_objects_v2.return_value = {"Contents": [], "IsTruncated": False}
+        mock_sts = MagicMock()
+        mock_sts.get_caller_identity.return_value = {"Account": "111122223333"}
 
-        clients = {"bedrock": mock_bedrock, "logs": mock_logs, "s3": mock_s3}
+        clients = {
+            "bedrock": mock_bedrock,
+            "logs": mock_logs,
+            "s3": mock_s3,
+            "sts": mock_sts,
+        }
         return (lambda service_name, **kwargs: clients[service_name]), clients
 
     def _retention_findings(self, findings):
@@ -37299,10 +37307,15 @@ class TestBR04RetentionDepth:
         replication=None,
         objects=None,
         head_error=None,
+        written=None,
+        list_error=None,
+        page_size=None,
     ):
         """
         lifecycles, locks, replication: {bucket: response or exception}.
         objects: {bucket: {key: ReplicationStatus or None}}.
+        written: {bucket: {key: LastModified}}; an object not named was
+        written now.
         """
 
         def per_bucket(table, missing_code, operation):
@@ -37353,8 +37366,49 @@ class TestBR04RetentionDepth:
             status = listed[Bucket][Key]
             return {"ReplicationStatus": status} if status else {}
 
+        stamps = written or {}
+        now = _dt.now(_tz.utc)
+
+        def list_objects_v2(
+            Bucket, Prefix, Delimiter=None, ContinuationToken=None, **kwargs
+        ):
+            if list_error is not None:
+                raise list_error
+            entries = []
+            for key in sorted(listed.get(Bucket) or {}):
+                if not key.startswith(Prefix):
+                    continue
+                rest = key[len(Prefix) :]
+                if Delimiter and Delimiter in rest:
+                    folder = Prefix + rest.split(Delimiter)[0] + Delimiter
+                    if ("folder", folder) not in entries:
+                        entries.append(("folder", folder))
+                else:
+                    entries.append(("key", key))
+            start = int(ContinuationToken or 0)
+            end = len(entries) if page_size is None else start + page_size
+            chunk = entries[start:end]
+            page = {
+                "Contents": [
+                    {
+                        "Key": key,
+                        "LastModified": (stamps.get(Bucket) or {}).get(key, now),
+                    }
+                    for kind, key in chunk
+                    if kind == "key"
+                ],
+                "CommonPrefixes": [
+                    {"Prefix": folder} for kind, folder in chunk if kind == "folder"
+                ],
+                "IsTruncated": end < len(entries),
+            }
+            if end < len(entries):
+                page["NextContinuationToken"] = str(end)
+            return page
+
         s3.get_paginator.return_value.paginate.side_effect = paginate
         s3.head_object.side_effect = head_object
+        s3.list_objects_v2.side_effect = list_objects_v2
         bedrock = MagicMock()
         bedrock.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": logging_config
@@ -37404,7 +37458,10 @@ class TestBR04RetentionDepth:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "3 destination(s)" in rows[0]["Finding_Details"]
         assert "Large-data S3 bucket 'large' lifecycle" in rows[0]["Finding_Details"]
-        assert "Whether lifecycle deletion has run" in rows[0]["Finding_Details"]
+        assert (
+            "lifecycle deletion is judged from the age of the oldest current "
+            "object; noncurrent versions are not listed"
+        ) in rows[0]["Finding_Details"]
 
     def test_large_data_bucket_equal_to_the_log_bucket_is_read_once(self):
         config = {
@@ -37582,6 +37639,8 @@ class TestBR04RetentionDepth:
         )
 
     def test_the_head_object_cap_leaves_the_rest_unread(self, monkeypatch):
+        # An overdue object is the one a FAILED replication status would hold,
+        # so past the cap only an object older than the rule withholds the pass.
         monkeypatch.setattr(bedrock_app, "REPLICATION_STATUS_HEAD_CAP", 1)
         rows, _ = self._rows(
             {"s3Config": {"bucketName": "logs"}},
@@ -37593,10 +37652,168 @@ class TestBR04RetentionDepth:
                     self.LOG_KEY + "b.json.gz": "FAILED",
                 }
             },
+            written={
+                "logs": {self.LOG_KEY + "a.json.gz": _dt.now(_tz.utc) - _td(days=40)}
+            },
         )
-        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A", "Passed"]
         na = [r for r in rows if r["Status"] == "N/A"][0]
         assert "past the first 1 were not read" in na["Finding_Details"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]
+        assert "past its 30-day rule" in failed["Finding_Details"]
+        assert (
+            "S3 bucket 'logs'"
+            not in ([r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"])
+        )
+
+    def test_the_head_object_cap_with_no_overdue_object_is_retained(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "REPLICATION_STATUS_HEAD_CAP", 1)
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "a.json.gz": "COMPLETED",
+                    self.LOG_KEY + "b.json.gz": "FAILED",
+                }
+            },
+            written={
+                "logs": {self.LOG_KEY + "a.json.gz": _dt.now(_tz.utc) - _td(days=20)}
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "no ReplicationStatus FAILED on the first 1 invocation log" in detail
+        assert "the objects past them were not read" in detail
+        assert "written 20 day(s) ago and is not past its 30-day rule" in detail
+
+    def test_an_overdue_log_object_fails_beside_an_on_schedule_bucket(self):
+        rows, _ = self._rows(
+            self.LARGE,
+            {"logs": EXPIRING, "large": EXPIRING},
+            objects={
+                "logs": {self.LOG_KEY + "09/01/00/old.json.gz": None},
+                "large": {"big/" + self.LOG_KEY + "09/20/00/new.json.gz": None},
+            },
+            written={
+                "logs": {
+                    self.LOG_KEY + "09/01/00/old.json.gz": _dt.now(_tz.utc)
+                    - _td(days=40)
+                },
+                "large": {
+                    "big/" + self.LOG_KEY + "09/20/00/new.json.gz": _dt.now(_tz.utc)
+                    - _td(days=31)
+                },
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]["Finding_Details"]
+        passed = [r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"]
+        assert (
+            "S3 bucket 'logs': the oldest object under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/', "
+            f"'{self.LOG_KEY}09/01/00/old.json.gz', was written 40 day(s) ago, "
+            "past its 30-day rule plus 2 day(s) for the daily lifecycle run, so "
+            "lifecycle deletion has not removed it on schedule" in failed
+        )
+        assert "'large'" not in failed
+        assert "S3 bucket 'logs' lifecycle" not in passed
+        assert (
+            "Large-data S3 bucket 'large' lifecycle: expire expires objects after "
+            "30 day(s); the oldest object under "
+            "'big/AWSLogs/111122223333/BedrockModelInvocationLogs/', "
+            f"'big/{self.LOG_KEY}09/20/00/new.json.gz', was written 31 day(s) "
+            "ago and is not past its 30-day rule plus 2 day(s)" in passed
+        )
+        assert "Whether lifecycle deletion has run" not in passed
+
+    def test_the_oldest_object_is_found_in_every_region_and_the_earliest_date(self):
+        old = "AWSLogs/111122223333/BedrockModelInvocationLogs/us-west-2/2025/12/31/23/x.json.gz"
+        keys = [
+            self.LOG_KEY + "01/01/00/a.json.gz",
+            self.LOG_KEY + "02/01/00/b.json.gz",
+            old,
+            "AWSLogs/111122223333/BedrockModelInvocationLogs/us-west-2/2026/01/01/00/y.json.gz",
+        ]
+        now = _dt.now(_tz.utc)
+        rows, s3 = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            objects={"logs": {key: None for key in keys}},
+            written={
+                "logs": {key: now - _td(days=10) for key in keys}
+                | {old: now - _td(days=50)}
+            },
+            page_size=1,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"'{old}', was written 50 day(s) ago" in rows[0]["Finding_Details"]
+        listed = [c.kwargs["Prefix"] for c in s3.list_objects_v2.call_args_list]
+        # Only the earliest month of a year is entered; both Regions are.
+        assert not any(p.endswith("/2026/02/") for p in listed)
+        assert any(p.endswith("/us-east-1/2026/01/01/00/") for p in listed)
+
+    def test_an_unread_listing_withholds_the_pass(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            list_error=_make_client_error("AccessDenied"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "S3 bucket 'logs': whether lifecycle deletion has run was not read"
+            in rows[0]["Finding_Details"]
+        )
+        assert "s3:ListBucket" in rows[0]["Finding_Details"]
+
+    def test_an_empty_log_root_has_no_deletion_due(self):
+        rows, _ = self._rows({"s3Config": {"bucketName": "logs"}}, {"logs": EXPIRING})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "ListObjectsV2 returns no object under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/', so no deletion is "
+            "yet due" in rows[0]["Finding_Details"]
+        )
+
+    def test_a_date_rule_past_its_date_with_an_object_left_fails(self):
+        dated = {
+            "Rules": [
+                {
+                    "ID": "dated",
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": ""},
+                    "Expiration": {"Date": _dt(2026, 1, 1, tzinfo=_tz.utc)},
+                }
+            ]
+        }
+        key = self.LOG_KEY + "01/01/00/a.json.gz"
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": dated},
+            objects={"logs": {key: None}},
+            written={"logs": {key: _dt.now(_tz.utc) - _td(days=3)}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "past its expiry date 2026-01-01 plus 2 day(s)"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_overdue_object_in_a_replica_fails_the_replica(self):
+        key = self.LOG_KEY + "01/01/00/a.json.gz"
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={"logs": {key: "COMPLETED"}, "replica": {key: None}},
+            written={"replica": {key: _dt.now(_tz.utc) - _td(days=60)}},
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]["Finding_Details"]
+        assert "Replica S3 bucket (copied from 'logs') 'replica': the oldest" in failed
+        passed = [r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"]
+        assert "'replica' lifecycle" not in passed
 
     def test_a_replicated_or_unread_replication_bucket_is_not_passed(self):
         # The source bucket's own expiry is held back for objects whose
@@ -43258,6 +43475,33 @@ class TestBR04SageMakerInferenceRetention:
             _ for _ in ()
         ).throw(_make_client_error("ObjectLockConfigurationNotFoundError"))
         client.get_bucket_replication.side_effect = replication
+
+        def list_objects_v2(Bucket, Prefix, Delimiter, ContinuationToken=None):
+            # objects: {key: days since written}.
+            objects = buckets.get(Bucket, {}).get("objects") or {}
+            contents, folders = [], []
+            for key in sorted(objects):
+                if not key.startswith(Prefix):
+                    continue
+                rest = key[len(Prefix) :]
+                if Delimiter in rest:
+                    folder = Prefix + rest.split(Delimiter)[0] + Delimiter
+                    if folder not in folders:
+                        folders.append(folder)
+                else:
+                    contents.append(
+                        {
+                            "Key": key,
+                            "LastModified": _dt.now(_tz.utc) - _td(days=objects[key]),
+                        }
+                    )
+            return {
+                "Contents": contents,
+                "CommonPrefixes": [{"Prefix": f} for f in folders],
+                "IsTruncated": False,
+            }
+
+        client.list_objects_v2.side_effect = list_objects_v2
         return client
 
     def _rows(self, uris, buckets, errors=()):
@@ -43360,6 +43604,55 @@ class TestBR04SageMakerInferenceRetention:
         assert (
             "the ReplicationStatus of the objects under 'capture/ep1/' was not read"
             in rows[1]["Finding_Details"]
+        )
+
+    def test_an_overdue_capture_object_fails_beside_an_on_schedule_one(self):
+        rows = self._rows(
+            [self.CAPTURE, self.ASYNC],
+            {
+                "capture-a": {
+                    "rules": [self._rule("capture/")],
+                    "objects": {
+                        "capture/ep1/AllTraffic/2026/08/01/00/a.jsonl": 45,
+                        "capture/ep1/AllTraffic/2026/09/01/00/b.jsonl": 5,
+                        "capture/ep1/Shadow/2026/09/20/00/c.jsonl": 3,
+                    },
+                },
+                "async-b": {
+                    "rules": [self._rule("out/")],
+                    "objects": {"out/0f1e.out": 31, "out/9a2b.out": 2},
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "the oldest object under 'capture/ep1/', "
+            "'capture/ep1/AllTraffic/2026/08/01/00/a.jsonl', was written 45 "
+            "day(s) ago, past its 30-day rule" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "the oldest object under 'out/', 'out/0f1e.out', was written 31 "
+            "day(s) ago and is not past its 30-day rule"
+        ) in rows[1]["Finding_Details"]
+        assert "capture-a" not in rows[1]["Finding_Details"]
+
+    def test_the_oldest_capture_object_is_found_under_every_variant(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {
+                "capture-a": {
+                    "rules": [self._rule("capture/")],
+                    "objects": {
+                        "capture/ep1/AllTraffic/2026/09/01/00/b.jsonl": 5,
+                        "capture/ep1/Shadow/2026/07/20/00/c.jsonl": 70,
+                    },
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "Shadow/2026/07/20/00/c.jsonl', was written 70"
+            in (rows[0]["Finding_Details"])
         )
 
     def test_an_unread_endpoint_withholds_the_pass(self):
