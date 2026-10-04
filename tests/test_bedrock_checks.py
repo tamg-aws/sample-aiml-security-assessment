@@ -43249,6 +43249,10 @@ class TestInvocationLogGuardrailEvidence:
             "blocks and were not judged, because a guardContent block cannot wrap "
             "a tool result." in detail
         )
+        assert (
+            "Per-turn InvokeGuardrailChecks calls are not judged, because "
+            "CloudTrail does not record them as management events." in detail
+        )
 
     def test_every_guarded_converse_turn_marked_passes(self):
         rows = self._prompt(
@@ -43267,6 +43271,10 @@ class TestInvocationLogGuardrailEvidence:
         assert "counts as guarded only when" in detail
         assert "0 user turn(s) of the guarded Converse calls held only toolResult" in (
             detail
+        )
+        assert (
+            "Per-turn InvokeGuardrailChecks calls are not judged, because "
+            "CloudTrail does not record them as management events." in detail
         )
 
     def test_a_latest_tool_result_turn_is_not_judged_beside_a_tagged_call(self):

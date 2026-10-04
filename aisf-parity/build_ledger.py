@@ -147,11 +147,12 @@ AI_SUBJECT_ROWS = [
         "guardContent cannot wrap a tool result, and the row counts those turns. "
         "A Converse call counts"
         " as guarded only when its logged request names guardrailConfig or its "
-        "response carries a guardrail trace or intervention. No row reads whether "
-        "an agent calls InvokeGuardrailChecks each turn, a runtime call that takes "
-        "its checks inline and leaves no stored configuration, and whether an "
-        "application screens toolUse input and toolResult content, which the filter"
-        " never evaluates, is runtime behaviour no API reports",
+        "response carries a guardrail trace or intervention. BR-34's rows say "
+        "per-turn InvokeGuardrailChecks calls are not judged: a live call in "
+        "us-east-1 on 2026-10-04 did not appear in CloudTrail LookupEvents, so it "
+        "is not a management event, and the call leaves no stored configuration. "
+        "Whether an application screens toolUse input and toolResult content, "
+        "which the filter never evaluates, is runtime behaviour no API reports",
         [],
         3,
     ),

@@ -20478,7 +20478,10 @@ def check_guardrail_prompt_attack_invocation_evidence(
         tool_result_note = (
             " {} user turn(s) of the guarded Converse calls held only toolResult "
             "blocks and were not judged, because a guardContent block cannot wrap "
-            "a tool result.".format(tool_result_turns[0])
+            "a tool result. Per-turn InvokeGuardrailChecks calls are not judged, "
+            "because CloudTrail does not record them as management events.".format(
+                tool_result_turns[0]
+            )
         )
         if untagged or converse_untagged or converse_partial:
             findings["status"] = "FAIL"
@@ -20538,8 +20541,8 @@ def check_guardrail_prompt_attack_invocation_evidence(
             findings["status"] = "N/A"
             row(
                 "No guarded InvokeModel or Converse call read in {} sent untagged "
-                "input, but the records were not all read. {}{}".format(
-                    where, catch_note, unread_note
+                "input, but the records were not all read.{} {}{}".format(
+                    where, tool_result_note, catch_note, unread_note
                 ),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
