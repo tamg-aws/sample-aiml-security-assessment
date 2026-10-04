@@ -3401,7 +3401,11 @@ class TestAC06BrowserToolRecording:
         assert findings[0]["Check_ID"] == "AC-06"
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Finding_Details"] == "No custom AgentCore browsers found"
-        mock_ac.list_browsers.assert_called_once_with(type="CUSTOM")
+        # The other call lists the AWS managed browser.
+        assert [c.kwargs for c in mock_ac.list_browsers.call_args_list] == [
+            {"type": "SYSTEM"},
+            {"type": "CUSTOM"},
+        ]
 
     @patch("agentcore_app.agentcore_client")
     def test_ac06_exception_returns_error_finding(self, mock_ac):
@@ -29795,9 +29799,14 @@ class TestAC01EgressFiltering:
 
         egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
 
-        assert len(egress) == 1
-        assert egress[0]["Status"] == "N/A"
-        assert "ListCodeInterpreters" in egress[0]["Resolution"]
+        # One row for the custom list and one for the AWS managed list.
+        assert len(egress) == 2
+        assert {finding["Status"] for finding in egress} == {"N/A"}
+        assert all("ListCodeInterpreters" in f["Resolution"] for f in egress)
+        assert sorted(f["Finding_Details"].split(" could")[0] for f in egress) == [
+            "The list of AWS managed Code Interpreters",
+            "The list of custom Code Interpreters",
+        ]
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
@@ -29869,7 +29878,590 @@ class TestAC01EgressFiltering:
 
         assert len(egress) == 1
         assert "br-9" in egress[0]["Finding_Details"]
-        assert mock_ac.list_browsers.call_count == 0
+        # Only the AWS managed browser is listed, never the custom ones again.
+        assert [c.kwargs for c in mock_ac.list_browsers.call_args_list] == [
+            {"type": "SYSTEM"}
+        ]
+
+
+class TestManagedToolSessionHolders:
+    """AC-01 and AC-06 hold the AWS managed tools to the principals that use them.
+
+    RT-08 and RT-09 left aws.browser.v1 and aws.codeinterpreter.v1 out of the
+    population, so an agent on the managed browser was never judged for open
+    egress or for an unrecorded session. GetBrowser and GetCodeInterpreter
+    return neither networkConfiguration nor recording for them (live,
+    178113193057, us-east-1, 2026-10-04), which is the shape used here.
+    """
+
+    _BR_ARN = "arn:aws:bedrock-agentcore:us-east-1:aws:browser/aws.browser.v1"
+    _CI_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:aws:code-interpreter/"
+        "aws.codeinterpreter.v1"
+    )
+    _BR_START = "bedrock-agentcore:StartBrowserSession"
+    _CI_START = "bedrock-agentcore:StartCodeInterpreterSession"
+
+    def _wire(self, mock_ac, browser=None, interpreter=None, custom_arn=False):
+        browser = {} if browser is None else browser
+        interpreter = {} if interpreter is None else interpreter
+        browser_arn = (
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:browser-custom/br-1"
+            if custom_arn
+            else self._BR_ARN
+        )
+
+        def list_browsers(**kwargs):
+            if kwargs.get("type") != "SYSTEM":
+                return {"browserSummaries": []}
+            return {
+                "browserSummaries": [
+                    {
+                        "browserId": "aws.browser.v1",
+                        "browserArn": browser_arn,
+                        "name": "AgentCore Browser Tool",
+                    }
+                ]
+            }
+
+        def list_interpreters(**kwargs):
+            if kwargs.get("type") != "SYSTEM":
+                return {"codeInterpreterSummaries": []}
+            return {
+                "codeInterpreterSummaries": [
+                    {
+                        "codeInterpreterId": "aws.codeinterpreter.v1",
+                        "codeInterpreterArn": self._CI_ARN,
+                        "name": "AgentCore Code Interpreter",
+                    }
+                ]
+            }
+
+        mock_ac.list_browsers.side_effect = list_browsers
+        mock_ac.list_code_interpreters.side_effect = list_interpreters
+        mock_ac.get_browser.side_effect = lambda browserId: {
+            "browserId": browserId,
+            "browserArn": browser_arn,
+            **browser,
+        }
+        mock_ac.get_code_interpreter.side_effect = lambda codeInterpreterId: {
+            "codeInterpreterId": codeInterpreterId,
+            "codeInterpreterArn": self._CI_ARN,
+            **interpreter,
+        }
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+
+    def _principal(self, *statements, boundary=None):
+        permissions = {
+            "attached_policies": [
+                _tool_policy("Policy", {"Statement": list(statements)})
+            ],
+            "inline_policies": [],
+        }
+        if boundary is not None:
+            permissions["permissions_boundary"] = boundary
+        return permissions
+
+    def _cache(self, roles=None, users=None, **extra):
+        return {
+            "cache_schema_version": agentcore_app.IAM_CACHE_SCHEMA_VERSION,
+            "role_permissions": roles or {},
+            "user_permissions": users or {},
+            **extra,
+        }
+
+    def _allow(self, action, resource):
+        return {"Effect": "Allow", "Action": action, "Resource": resource}
+
+    def _egress(self, cache, managed):
+        with patch("agentcore_app.ec2_client"):
+            findings = extract_csv_data(
+                agentcore_app.check_agentcore_vpc_configuration(permission_cache=cache)
+            )
+        rows = [
+            f
+            for f in findings
+            if f["Finding"].startswith("AgentCore Egress")
+            and f"AWS managed {managed}" in f["Finding_Details"]
+        ]
+        for row in rows:
+            assert row["Check_ID"] == "AC-01"
+            assert_finding_schema(row)
+        return rows
+
+    def _recording(self, cache):
+        findings = extract_csv_data(
+            agentcore_app.check_browser_tool_recording(permission_cache=cache)
+        )
+        rows = [f for f in findings if "AWS managed browser" in f["Finding_Details"]]
+        for row in rows:
+            assert row["Check_ID"] == "AC-06"
+            assert_finding_schema(row)
+        return rows
+
+    @pytest.mark.parametrize(
+        "statement, holds",
+        [
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": _BR_ARN,
+                },
+                True,
+            ),
+            (
+                {"Action": "bedrock-agentcore:StartBrowserSession", "Resource": "*"},
+                True,
+            ),
+            ({"Action": "bedrock-agentcore:Start*", "Resource": "*"}, True),
+            ({"Action": "*", "Resource": "*"}, True),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": "arn:*:bedrock-agentcore:us-east-1:aws:browser/*",
+                },
+                True,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": "arn:aws:bedrock-agentcore:*:aws:browser/*",
+                },
+                True,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": "arn:aws:bedrock-agentcore:us-east-1:*:browser/*",
+                },
+                True,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": "arn:aws:bedrock-agentcore:us-east-1:aws:*",
+                },
+                True,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "NotResource": "arn:aws:bedrock-agentcore:*:*:browser-custom/*",
+                },
+                True,
+            ),
+            (
+                {
+                    "NotAction": "bedrock-agentcore:StartCodeInterpreterSession",
+                    "Resource": "*",
+                },
+                True,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": "arn:aws:bedrock-agentcore:us-east-1:123456789012:browser-custom/*",
+                },
+                False,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": "arn:aws:bedrock-agentcore:us-west-2:aws:browser/*",
+                },
+                False,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "NotResource": "arn:aws:bedrock-agentcore:*:aws:browser/*",
+                },
+                False,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartCodeInterpreterSession",
+                    "Resource": "*",
+                },
+                False,
+            ),
+            ({"NotAction": "bedrock-agentcore:Start*", "Resource": "*"}, False),
+        ],
+        ids=[
+            "exact-arn",
+            "star-resource",
+            "action-wildcard",
+            "star-star",
+            "partition-wildcard",
+            "region-wildcard",
+            "account-wildcard",
+            "resource-type-wildcard",
+            "not-resource-custom-only",
+            "not-action-other",
+            "custom-browsers-only",
+            "other-region",
+            "not-resource-managed",
+            "other-tool-action",
+            "not-action-start",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_that_can_start_the_managed_browser_fails_both_legs(
+        self, mock_ac, statement, holds
+    ):
+        # The managed tools were outside both populations, so a holder of
+        # StartBrowserSession on aws.browser.v1 was never reported.
+        self._wire(mock_ac)
+        cache = self._cache(
+            roles={"Agent": self._principal({"Effect": "Allow", **statement})},
+            users={"reader": self._principal(self._allow("s3:GetObject", "*"))},
+        )
+
+        egress = self._egress(cache, "browser")
+        recording = self._recording(cache)
+
+        assert len(egress) == 1 and len(recording) == 1
+        if holds:
+            assert egress[0]["Status"] == "Failed"
+            assert egress[0]["Finding"] == "AgentCore Egress Unrestricted"
+            assert egress[0]["Severity"] == "High"
+            assert "reports no networkConfiguration" in egress[0]["Finding_Details"]
+            assert recording[0]["Status"] == "Failed"
+            assert "reports no session recording" in recording[0]["Finding_Details"]
+            for row in (egress[0], recording[0]):
+                assert row["Finding_Details"].count("role Agent") == 1
+                assert "user reader" not in row["Finding_Details"]
+                assert self._BR_ARN in row["Finding_Details"]
+        else:
+            assert egress[0]["Status"] == "Passed"
+            assert recording[0]["Status"] == "Passed"
+            assert "role Agent" not in egress[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "deny, boundary, holds",
+        [
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": _BR_ARN,
+                },
+                None,
+                False,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:*",
+                    "Resource": "arn:aws:bedrock-agentcore:*:aws:*",
+                },
+                None,
+                False,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": _BR_ARN,
+                    "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "false"}},
+                },
+                None,
+                True,
+            ),
+            (
+                {
+                    "Action": "bedrock-agentcore:StartBrowserSession",
+                    "Resource": "arn:aws:bedrock-agentcore:*:*:browser-custom/*",
+                },
+                None,
+                True,
+            ),
+            (
+                None,
+                {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]},
+                True,
+            ),
+            (
+                None,
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:StartBrowserSession",
+                            "Resource": "arn:aws:bedrock-agentcore:*:123456789012:browser-custom/*",
+                        }
+                    ]
+                },
+                False,
+            ),
+            (
+                None,
+                {
+                    "Statement": [
+                        {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                        {
+                            "Effect": "Deny",
+                            "Action": "bedrock-agentcore:StartBrowserSession",
+                            "Resource": "*",
+                        },
+                    ]
+                },
+                False,
+            ),
+        ],
+        ids=[
+            "deny-exact",
+            "deny-pattern",
+            "conditioned-deny",
+            "deny-custom-only",
+            "boundary-allows-all",
+            "boundary-custom-only",
+            "boundary-denies",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_or_boundary_removes_the_holder(
+        self, mock_ac, deny, boundary, holds
+    ):
+        self._wire(mock_ac)
+        statements = [self._allow(self._BR_START, "*")]
+        if deny is not None:
+            statements.append({"Effect": "Deny", **deny})
+        cache = self._cache(
+            roles={"Agent": self._principal(*statements, boundary=boundary)},
+            users={"dev": self._principal(self._allow(self._BR_START, self._BR_ARN))},
+        )
+
+        for row in (*self._egress(cache, "browser"), *self._recording(cache)):
+            assert row["Status"] == "Failed"
+            assert "user dev" in row["Finding_Details"]
+            assert ("role Agent" in row["Finding_Details"]) is holds
+
+    @pytest.mark.parametrize(
+        "network, finding, severity, text",
+        [
+            (
+                None,
+                "AgentCore Egress Unrestricted",
+                "High",
+                "reports no networkConfiguration",
+            ),
+            (
+                {"networkMode": "PUBLIC"},
+                "AgentCore Egress Unrestricted",
+                "High",
+                "runs in PUBLIC network mode",
+            ),
+            (
+                {"networkMode": "SANDBOX"},
+                "AgentCore Egress Not Customer Filtered",
+                "Medium",
+                "runs in SANDBOX network mode",
+            ),
+        ],
+        ids=["absent", "public", "sandbox"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_managed_code_interpreter_is_judged_by_its_network_mode(
+        self, mock_ac, network, finding, severity, text
+    ):
+        self._wire(
+            mock_ac,
+            interpreter={} if network is None else {"networkConfiguration": network},
+        )
+        cache = self._cache(
+            roles={
+                "Agent": self._principal(self._allow(self._CI_START, self._CI_ARN)),
+                "Browse": self._principal(self._allow(self._BR_START, self._BR_ARN)),
+            }
+        )
+
+        rows = self._egress(cache, "Code Interpreter")
+
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "Failed"
+        assert rows[0]["Finding"] == finding
+        assert rows[0]["Severity"] == severity
+        assert text in rows[0]["Finding_Details"]
+        assert "role Agent" in rows[0]["Finding_Details"]
+        assert "role Browse" not in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_managed_tool_in_another_mode_is_not_judged(self, mock_ac):
+        self._wire(
+            mock_ac, interpreter={"networkConfiguration": {"networkMode": "VPC"}}
+        )
+        cache = self._cache(
+            roles={"Agent": self._principal(self._allow(self._CI_START, "*"))}
+        )
+
+        rows = self._egress(cache, "Code Interpreter")
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "network mode 'VPC'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "cache, text",
+        [
+            (None, "the IAM permission cache was not available"),
+            (
+                {
+                    "cache_schema_version": 2,
+                    "role_permissions": {},
+                    "user_permissions": {},
+                    "principal_errors": [
+                        {
+                            "type": "role",
+                            "name": "Hidden",
+                            "stage": "policies",
+                            "error": "AccessDenied",
+                        }
+                    ],
+                },
+                "role Hidden (policies: AccessDenied)",
+            ),
+            (
+                {"role_permissions": {}, "user_permissions": {}},
+                "predates schema version 2",
+            ),
+            (
+                {
+                    "cache_schema_version": 2,
+                    "role_permissions": {
+                        "Broken": {
+                            "attached_policies": [
+                                {"name": "Bad", "document": "{not json"}
+                            ]
+                        }
+                    },
+                    "user_permissions": {},
+                },
+                "role Broken (policy Bad)",
+            ),
+        ],
+        ids=["no-cache", "principal-error", "v1-cache", "unparsable-policy"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_cache_is_na_never_passed(self, mock_ac, cache, text):
+        self._wire(mock_ac)
+
+        for row in (*self._egress(cache, "browser"), *self._recording(cache)):
+            assert row["Status"] == "N/A"
+            assert text in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_principal_beside_a_holder_still_fails_and_is_named(
+        self, mock_ac
+    ):
+        self._wire(mock_ac)
+        cache = self._cache(
+            roles={"Agent": self._principal(self._allow(self._BR_START, "*"))},
+            principal_errors=[
+                {"type": "user", "name": "ghost", "stage": "policies", "error": "x"}
+            ],
+        )
+
+        for row in (*self._egress(cache, "browser"), *self._recording(cache)):
+            assert row["Status"] == "Failed"
+            assert "role Agent" in row["Finding_Details"]
+            assert "Not read:" in row["Finding_Details"]
+            assert "user ghost (policies: x)" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ten_holders_are_named_and_the_rest_counted(self, mock_ac):
+        self._wire(mock_ac)
+        roles = {
+            f"Agent{index:02d}": self._principal(self._allow(self._BR_START, "*"))
+            for index in range(12)
+        }
+
+        for row in (*self._egress(self._cache(roles=roles), "browser"),):
+            assert "role Agent09" in row["Finding_Details"]
+            assert "role Agent10" not in row["Finding_Details"]
+            assert "and 2 more" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_managed_tool_is_na_naming_the_get_action(self, mock_ac):
+        self._wire(mock_ac)
+        mock_ac.get_browser.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        cache = self._cache(
+            roles={"Agent": self._principal(self._allow(self._BR_START, "*"))}
+        )
+
+        for row in (*self._egress(cache, "browser"), *self._recording(cache)):
+            assert row["Status"] == "N/A"
+            assert "Grant bedrock-agentcore:GetBrowser" in row["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_summary_naming_a_customer_account_is_not_a_managed_tool(self, mock_ac):
+        self._wire(mock_ac, custom_arn=True)
+        cache = self._cache(
+            roles={"Agent": self._principal(self._allow(self._BR_START, "*"))}
+        )
+
+        assert self._egress(cache, "browser") == []
+        assert self._recording(cache) == []
+        mock_ac.get_browser.assert_not_called()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_recording_leg_reads_the_recording_by_value(self, mock_ac):
+        self._wire(
+            mock_ac,
+            browser={
+                "recording": {
+                    "enabled": True,
+                    "s3Location": {"bucket": "b", "prefix": "p"},
+                }
+            },
+        )
+        cache = self._cache(
+            roles={"Agent": self._principal(self._allow(self._BR_START, "*"))}
+        )
+        rows = self._recording(cache)
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "reports session recording enabled" in rows[0]["Finding_Details"]
+
+        self._wire(mock_ac, browser={"recording": {"enabled": False}})
+        rows = self._recording(cache)
+        assert [row["Status"] for row in rows] == ["Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_managed_browser_row_survives_the_custom_inventory_returns(
+        self, mock_ac
+    ):
+        self._wire(mock_ac)
+        cache = self._cache(
+            roles={"Agent": self._principal(self._allow(self._BR_START, "*"))}
+        )
+
+        # No custom browsers: the early N/A return still carries the managed row.
+        findings = extract_csv_data(
+            agentcore_app.check_browser_tool_recording(permission_cache=cache)
+        )
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+
+        # A failed custom list returns early too.
+        def list_browsers(**kwargs):
+            if kwargs.get("type") == "CUSTOM":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {
+                "browserSummaries": [
+                    {"browserId": "aws.browser.v1", "browserArn": self._BR_ARN}
+                ]
+            }
+
+        mock_ac.list_browsers.side_effect = list_browsers
+        findings = extract_csv_data(
+            agentcore_app.check_browser_tool_recording(permission_cache=cache)
+        )
+        assert sorted(f["Status"] for f in findings) == ["Failed", "N/A"]
+        mock_ac.list_code_interpreters.assert_not_called()
+
+    def test_the_handler_passes_the_cache_to_the_egress_leg(self):
+        source = inspect.getsource(agentcore_app.lambda_handler)
+        assert (
+            "check_agentcore_vpc_configuration(\n                    browser_inventory, permission_cache\n"
+            in source
+        )
 
 
 def _raise(error):
@@ -30849,7 +31441,11 @@ class TestAC45ToolRoleInvokerBound:
             )
 
     @patch("agentcore_app.agentcore_client")
-    def test_a_conditioned_invoker_deny_is_named_and_not_subtracted(self, mock_ac):
+    def test_a_conditioned_invoker_deny_holds_the_row_at_na_naming_its_keys(
+        self, mock_ac
+    ):
+        # A conditioned Deny on a compared grant passed the row, though the
+        # invoker lacks that grant whenever the condition holds.
         conditioned = {
             "Effect": "Deny",
             "Action": "s3:GetObject",
@@ -30865,15 +31461,33 @@ class TestAC45ToolRoleInvokerBound:
         }
 
         row = self._run(mock_ac, tool, users=users)
-        assert row["Status"] == "Passed"
-        assert "A conditioned Deny is not credited" in row["Finding_Details"]
-        assert "user dev (policy Policy)" in row["Finding_Details"]
+        assert row["Status"] == "N/A"
+        assert (
+            "equal-or-fewer privileges was not established" in (row["Finding_Details"])
+        )
+        assert (
+            "user dev (policy Policy, condition keys aws:multifactorauthpresent)"
+            in row["Finding_Details"]
+        )
         assert "user ops (policy" not in row["Finding_Details"]
 
+        # The same Deny on a resource the role is not granted compares nothing.
+        users["dev"] = self._principal(
+            self._start(),
+            self._allow("s3:GetObject", "*"),
+            {**conditioned, "Resource": "arn:aws:s3:::other-bucket/*"},
+        )
+        row = self._run(mock_ac, tool, users=users)
+        assert row["Status"] == "Passed"
+        assert "condition keys" not in row["Finding_Details"]
+
+        users["dev"] = self._principal(
+            self._start(), self._allow("s3:GetObject", "*"), conditioned
+        )
         users["ops"] = self._principal(self._start())
         row = self._run(mock_ac, tool, users=users)
         assert row["Status"] == "Failed"
-        assert "user dev (policy Policy)" in row["Finding_Details"]
+        assert "user dev (policy Policy, condition keys" in row["Finding_Details"]
 
         users["ops"] = self._principal(
             self._start(),
@@ -30886,8 +31500,11 @@ class TestAC45ToolRoleInvokerBound:
             },
         )
         row = self._run(mock_ac, tool, users=users)
-        assert row["Status"] == "Passed"
-        assert "user ops (policy permissions boundary)" in row["Finding_Details"]
+        assert row["Status"] == "N/A"
+        assert (
+            "user ops (policy permissions boundary, condition keys"
+            in row["Finding_Details"]
+        )
 
     @patch("agentcore_app.agentcore_client")
     def test_a_boundary_withholding_the_start_action_does_not_make_an_invoker(
@@ -40729,7 +41346,7 @@ class TestAC02PaymentRetrievalRoleTrust:
         assert source.count("check_agentcore_payment_retrieval_role_trust") == 1
         assert source.index(
             "check_agentcore_payment_retrieval_role_trust"
-        ) < source.index("check_agentcore_vpc_configuration(browser_inventory)")
+        ) < source.index("check_agentcore_vpc_configuration(")
 
 
 class TestAC02PaymentManagerPinAndPassRoleReach:

@@ -1365,8 +1365,9 @@ def _conditioned_denies_on_grant(
     permissions: Dict[str, Any], action: str, resource: str
 ) -> List[str]:
     """Return the policy names holding a conditioned Deny that reaches a grant
-    of `action` on `resource`, which _grant_survives does not subtract. The
-    permissions boundary is named `permissions boundary`."""
+    of `action` on `resource`, which _grant_survives does not subtract, each
+    with the condition keys of those Denies. The permissions boundary is named
+    `permissions boundary`."""
     documents: List[Tuple[str, Dict[str, Any]]] = []
     for policy in _principal_policies(permissions):
         try:
@@ -1376,15 +1377,19 @@ def _conditioned_denies_on_grant(
     boundary = _principal_boundary(permissions)
     if boundary is not None:
         documents.append(("permissions boundary", boundary))
-    return [
-        name
-        for name, document in documents
-        if any(
-            _statement_condition_keys(statement)
-            and _deny_overlaps_grant(statement, action, resource)
+    named: List[str] = []
+    for name, document in documents:
+        keys = [
+            key
             for statement in _document_statements(document, effect="Deny")
-        )
-    ]
+            if _deny_overlaps_grant(statement, action, resource)
+            for key in _statement_condition_keys(statement)
+        ]
+        if keys:
+            named.append(
+                f"{name}, condition keys {', '.join(dict.fromkeys(sorted(keys)))}"
+            )
+    return named
 
 
 def _unconditioned_deny_reaches(
@@ -2154,6 +2159,322 @@ def _agentcore_tool_details(
     return details, errors
 
 
+# The AWS managed tools every account can start sessions on. Their ARNs name
+# account `aws`, the `browser` and `code-interpreter` resource types the
+# service authorization reference lists for StartBrowserSession and
+# StartCodeInterpreterSession. AWS owns their configuration, so what they
+# reach and record is decided for every principal that can start a session.
+AGENTCORE_MANAGED_TOOL_KINDS = (
+    {
+        "kind": "browser",
+        "list": "list_browsers",
+        "summaries": "browserSummaries",
+        "id": "browserId",
+        "arn": "browserArn",
+        "get": "get_browser",
+        "noun": "browser",
+        "start": "bedrock-agentcore:StartBrowserSession",
+        "read": "bedrock-agentcore:GetBrowser",
+        "list_action": "bedrock-agentcore:ListBrowsers",
+    },
+    {
+        "kind": "code_interpreter",
+        "list": "list_code_interpreters",
+        "summaries": "codeInterpreterSummaries",
+        "id": "codeInterpreterId",
+        "arn": "codeInterpreterArn",
+        "get": "get_code_interpreter",
+        "noun": "Code Interpreter",
+        "start": "bedrock-agentcore:StartCodeInterpreterSession",
+        "read": "bedrock-agentcore:GetCodeInterpreter",
+        "list_action": "bedrock-agentcore:ListCodeInterpreters",
+    },
+)
+
+
+def _agentcore_managed_tools(
+    kinds: Tuple[str, ...] = ("browser", "code_interpreter"),
+) -> Tuple[List[Dict[str, Any]], List[Tuple[str, Exception, str]]]:
+    """Return each AWS managed tool's detail, its ARN and its start action.
+
+    ListBrowsers and ListCodeInterpreters with type SYSTEM name the managed
+    tools, and only a summary whose ARN names account `aws` is kept, because
+    the start grant is matched against that ARN. Each is read with its get
+    call so the network mode and recording are judged by the value AWS
+    returns. A list or get error is returned with the action that answers it.
+    """
+    tools: List[Dict[str, Any]] = []
+    errors: List[Tuple[str, Exception, str]] = []
+    for spec in AGENTCORE_MANAGED_TOOL_KINDS:
+        if spec["kind"] not in kinds:
+            continue
+        try:
+            summaries = _agentcore_list_all(
+                spec["list"], [spec["summaries"]], type="SYSTEM"
+            )
+        except Exception as error:
+            logger.warning(f"Could not list AWS managed {spec['noun']}s: {error}")
+            errors.append(
+                (
+                    f"The list of AWS managed {spec['noun']}s",
+                    error,
+                    spec["list_action"],
+                )
+            )
+            continue
+        for summary in summaries:
+            arn = str(summary.get(spec["arn"]) or "")
+            parts = arn.split(":")
+            if len(parts) < 6 or parts[4] != "aws":
+                continue
+            tool_id = str(summary.get(spec["id"]) or parts[5].split("/")[-1])
+            label = (
+                f"AWS managed {spec['noun']} '{summary.get('name') or tool_id}' "
+                f"({tool_id})"
+            )
+            try:
+                detail = _unwrap_agentcore_detail(
+                    getattr(agentcore_client, spec["get"])(**{spec["id"]: tool_id}),
+                    "browser" if spec["kind"] == "browser" else "codeInterpreter",
+                )
+            except Exception as error:
+                logger.warning(f"Could not read {label}: {error}")
+                errors.append((label, error, spec["read"]))
+                continue
+            tools.append(
+                {
+                    "label": label,
+                    "arn": arn,
+                    "start": spec["start"],
+                    "kind": spec["kind"],
+                    "detail": detail,
+                }
+            )
+    return tools, errors
+
+
+def _managed_tool_session_holders(
+    cache: Dict[str, Any], start_action: str, tool_arn: str
+) -> Tuple[List[str], List[str]]:
+    """Return the cached roles and users that can start a session on one tool.
+
+    A principal holds the tool when one of its Allow statements, read without
+    its condition, reaches start_action on tool_arn, no unconditioned Deny in
+    its identity policies or boundary reaches it, and its permissions
+    boundary, if any, has an Allow reaching it. A pattern in any ARN segment
+    that matches the ARN reaches it. The second list names each policy that
+    could not be parsed.
+    """
+    suffix = start_action.split(":", 1)[1].lower()
+    holders: List[str] = []
+    unreadable: List[str] = []
+
+    def reaches(statement: Dict[str, Any]) -> bool:
+        return _statement_reaches_arn(statement, tool_arn) and bool(
+            _statement_reached_actions(statement, [suffix])
+        )
+
+    for kind, key in (("role", "role_permissions"), ("user", "user_permissions")):
+        for name, permissions in sorted((cache.get(key) or {}).items()):
+            if not isinstance(permissions, dict):
+                continue
+            label = f"{kind} {name}"
+            statements: List[Dict[str, Any]] = []
+            for policy in _principal_policies(permissions):
+                try:
+                    statements.extend(_allow_statements(policy))
+                except (TypeError, ValueError):
+                    unreadable.append(f"{label} (policy {policy.get('name', '')})")
+            if not any(reaches(statement) for statement in statements):
+                continue
+            if _unconditioned_deny_reaches(permissions, start_action, tool_arn):
+                continue
+            boundary = _principal_boundary(permissions)
+            if boundary is not None and not any(
+                reaches(statement)
+                for statement in _document_statements(boundary, effect="Allow")
+            ):
+                continue
+            holders.append(label)
+    return holders, unreadable
+
+
+def _managed_tool_holder_note(
+    cache: Optional[Dict[str, Any]], tool: Dict[str, Any]
+) -> Tuple[str, List[str], str]:
+    """Judge who can start sessions on one AWS managed tool.
+
+    Returns the state ("holders", "none", "unread"), the holders, and the text
+    naming what could not be read: no cache, a policy that could not be
+    parsed, or a principal the cache could not read. Ten holders are named and
+    the rest counted.
+    """
+    if not isinstance(cache, dict):
+        return "unread", [], "the IAM permission cache was not available"
+    holders, unreadable = _managed_tool_session_holders(
+        cache, tool["start"], tool["arn"]
+    )
+    read_gaps, recorded = _cache_principal_read_gaps(cache, ("role", "user"))
+    gaps = [*unreadable, *read_gaps]
+    gap_text = (
+        "the IAM permission cache could not read these principals' policies: "
+        f"{', '.join(gaps)}"
+        if gaps
+        else ""
+    )
+    if holders:
+        return "holders", holders, gap_text
+    if gaps:
+        return "unread", [], gap_text
+    if not recorded:
+        return (
+            "unread",
+            [],
+            "the IAM permission cache predates schema version 2 and did not "
+            "record which principals it could not read",
+        )
+    return "none", [], ""
+
+
+def _named_holders(holders: List[str]) -> str:
+    """Name ten holders and count the rest."""
+    return ", ".join(holders[:10]) + (
+        f" and {len(holders) - 10} more" if len(holders) > 10 else ""
+    )
+
+
+def _agentcore_managed_tool_egress_findings(
+    cache: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """AC-01 egress leg for the AWS managed browser and Code Interpreter.
+
+    The managed tools attach no customer security group, so the principals
+    that can start a session on one are the agents whose egress it carries.
+    GetBrowser and GetCodeInterpreter return no networkConfiguration for them
+    (live, account 178113193057, us-east-1, 2026-10-04), although the model
+    marks it required, and the devguide says the browser "supports the public
+    network mode", which "allows the tool to access public internet
+    resources". An absent or PUBLIC mode fails each holder, and SANDBOX fails
+    under the same rule as a custom tool. A tool nobody can start passes.
+    """
+    tools, errors = _agentcore_managed_tools()
+    findings = _agentcore_tool_read_findings(
+        "AC-01",
+        AGENTCORE_EGRESS_FINDING_NAME,
+        errors,
+        AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+    )
+    for tool in tools:
+        label = tool["label"]
+        network_mode = str(
+            (tool["detail"].get("networkConfiguration") or {}).get("networkMode") or ""
+        )
+        if network_mode not in (
+            "",
+            AGENTCORE_PUBLIC_NETWORK_MODE,
+            AGENTCORE_SANDBOX_NETWORK_MODE,
+        ):
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} reports network mode '{network_mode}', which "
+                        "this check does not judge for an AWS managed tool."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based "
+                        "on this result."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        mode_text = (
+            f"runs in {network_mode} network mode"
+            if network_mode
+            else "reports no networkConfiguration"
+        )
+        state, holders, gap_text = _managed_tool_holder_note(cache, tool)
+        not_read = f" Not read: {gap_text}." if gap_text else ""
+        if state == "holders":
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=(
+                        "AgentCore Egress Not Customer Filtered"
+                        if network_mode == AGENTCORE_SANDBOX_NETWORK_MODE
+                        else "AgentCore Egress Unrestricted"
+                    ),
+                    finding_details=(
+                        f"{label} {mode_text} and attaches no customer security "
+                        "group, so no outbound rule of this account names the "
+                        "destinations it reaches, and these principals can "
+                        f"start a session on {tool['arn']} through an Allow of "
+                        f"{tool['start']}, read without its condition, that no "
+                        "unconditioned Deny or permissions boundary of theirs "
+                        f"removes: {_named_holders(holders)}.{not_read} "
+                        f"{IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        f"Withdraw {tool['start']} on the AWS managed tool, or "
+                        "deny it, and give agents a custom tool in VPC network "
+                        "mode whose security groups name only the destinations "
+                        "they need."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=(
+                        SeverityEnum.MEDIUM
+                        if network_mode == AGENTCORE_SANDBOX_NETWORK_MODE
+                        else SeverityEnum.HIGH
+                    ),
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif state == "unread":
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} {mode_text} and attaches no customer security "
+                        "group, and whether any principal can start a session on "
+                        f"it was not judged because {gap_text}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Produce a complete IAM permission cache and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} {mode_text}, and no role or user in the IAM "
+                        f"permission cache holds an Allow of {tool['start']} "
+                        f"reaching {tool['arn']} that survives its own "
+                        "unconditioned Deny and permissions boundary, so no "
+                        "principal of this account can start a session on it. "
+                        "Session policies are not read."
+                    ),
+                    resolution="No action required",
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+    return findings
+
+
 def _agentcore_tool_read_findings(
     check_id: str,
     finding_name: str,
@@ -2653,6 +2974,7 @@ def _agentcore_egress_findings(
 
 def check_agentcore_vpc_configuration(
     browser_inventory: Dict[str, Any] = None,
+    permission_cache: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Check VPC configuration for AgentCore Runtimes, Code Interpreters, and Browser Tools.
@@ -2668,6 +2990,8 @@ def check_agentcore_vpc_configuration(
     - Every version ListAgentRuntimeVersions returns is held to the same legs
       as the latest one, since an endpoint can serve an earlier version
     - What the security groups of each VPC-mode resource permit outbound
+    - Which cached principals can start a session on the AWS managed browser
+      and Code Interpreter, whose egress no customer security group filters
 
     VPC endpoints are judged by AC-08. NAT gateways are not read: a NAT route
     gives no inbound path, and what the workload reaches through it is the
@@ -3136,6 +3460,7 @@ def check_agentcore_vpc_configuration(
                 egress_targets, browser_inventory, (tool_details, tool_errors)
             )
         )
+        findings.extend(_agentcore_managed_tool_egress_findings(permission_cache))
 
     except Exception as e:
         logger.error(f"Error in VPC configuration check: {e}")
@@ -7844,14 +8169,123 @@ def _recording_write_verdict(
     )
 
 
+def _managed_browser_recording_findings(
+    permission_cache: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """AC-06 for the AWS managed browser: name who can start an unrecorded session.
+
+    GetBrowser on aws.browser.v1 returns no recording member (live, account
+    178113193057, us-east-1, 2026-10-04) and the customer cannot set one, so a
+    session on it leaves no recording. Each cached principal that can start a
+    session on it fails, named. A browser nobody can start passes.
+    """
+    tools, errors = _agentcore_managed_tools(("browser",))
+    findings = _agentcore_tool_read_findings(
+        "AC-06",
+        AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+        errors,
+        AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+    )
+    for tool in tools:
+        label = tool["label"]
+        recording = tool["detail"].get("recording") or {}
+        if recording.get("enabled") is True:
+            findings.append(
+                create_finding(
+                    check_id="AC-06",
+                    finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                    finding_details=(
+                        f"{label} reports session recording enabled, and this "
+                        "check judges a recording destination only on custom "
+                        "browsers."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result."
+                    ),
+                    reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        state, holders, gap_text = _managed_tool_holder_note(permission_cache, tool)
+        not_read = f" Not read: {gap_text}." if gap_text else ""
+        if state == "holders":
+            findings.append(
+                create_finding(
+                    check_id="AC-06",
+                    finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                    finding_details=(
+                        f"{label} reports no session recording, and its "
+                        "configuration belongs to AWS, so a session on it leaves "
+                        "no recording. These principals can start one on "
+                        f"{tool['arn']} through an Allow of {tool['start']}, read "
+                        "without its condition, that no unconditioned Deny or "
+                        "permissions boundary of theirs removes: "
+                        f"{_named_holders(holders)}.{not_read} "
+                        f"{IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        f"Withdraw {tool['start']} on the AWS managed browser, or "
+                        "deny it, and give agents a custom browser that records "
+                        "its sessions to a protected S3 destination."
+                    ),
+                    reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif state == "unread":
+            findings.append(
+                create_finding(
+                    check_id="AC-06",
+                    finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                    finding_details=(
+                        f"{label} reports no session recording, and whether any "
+                        "principal can start a session on it was not judged "
+                        f"because {gap_text}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Produce a complete IAM permission cache and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-06",
+                    finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                    finding_details=(
+                        f"{label} reports no session recording, and no role or "
+                        "user in the IAM permission cache holds an Allow of "
+                        f"{tool['start']} reaching {tool['arn']} that survives "
+                        "its own unconditioned Deny and permissions boundary, so "
+                        "no principal of this account can start an unrecorded "
+                        "session on it. Session policies are not read."
+                    ),
+                    resolution="No action required",
+                    reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+    return findings
+
+
 def check_browser_tool_recording(
     browser_inventory: Dict[str, Any] = None,
     permission_cache: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """AC-06: Require recording on custom browsers, to a destination that keeps it.
 
-    The population is every custom browser. The AWS managed browser has no
-    recording configuration to change. A recording browser passes only when its
+    The population is every custom browser and the AWS managed browser, whose
+    rows name who can start a session on it. A recording browser passes only when its
     bucket, owned by the browser's account, encrypts with a KMS key, blocks
     public access, denies the recording prefix without TLS and expires it, lets
     no caller outside its account and organization s3:GetObject the prefix
@@ -7876,7 +8310,9 @@ def check_browser_tool_recording(
         )
         return findings
 
+    managed: List[Dict[str, Any]] = []
     try:
+        managed = _managed_browser_recording_findings(permission_cache)
         inventory = browser_inventory or get_custom_browser_inventory()
         if inventory.get("list_error"):
             error = inventory["list_error"]
@@ -7891,7 +8327,7 @@ def check_browser_tool_recording(
                     status=StatusEnum.NA,
                 )
             )
-            return findings
+            return findings + managed
 
         browsers = inventory.get("items", [])
         if not browsers and not inventory.get("errors"):
@@ -7906,7 +8342,7 @@ def check_browser_tool_recording(
                     status=StatusEnum.NA,
                 )
             )
-            return findings
+            return findings + managed
 
         organization: Dict[str, Any] = {}
 
@@ -8196,7 +8632,7 @@ def check_browser_tool_recording(
             )
         )
 
-    return findings
+    return findings + managed
 
 
 AGENTCORE_BROWSER_RECORDING_SCP_FINDING = "AgentCore Browser Recording Write SCP"
@@ -34983,7 +35419,7 @@ def _tool_role_invoker_finding(
     conditioned_note = (
         " A conditioned Deny is not credited as removing a grant, so these "
         "policies may withhold a grant the comparison counted: "
-        f"{', '.join(conditioned)}."
+        f"{'; '.join(conditioned)}."
         if conditioned
         else ""
     )
@@ -35027,6 +35463,22 @@ def _tool_role_invoker_finding(
             SeverityEnum.INFORMATIONAL,
             StatusEnum.NA,
         )
+    if conditioned:
+        # Whether the Deny applies turns on request context the cache does not
+        # hold, so the invoker may lack the grant at session time or may not.
+        return finding(
+            f"{label} uses execution role {role_name}, and principals granted "
+            f"{start_action} on it hold a conditioned Deny reaching a grant the "
+            "role holds, so whether each holds every grant of the role turns on "
+            "request context this check does not read and equal-or-fewer "
+            f"privileges was not established: {'; '.join(conditioned)}.",
+            "No action is required on the assessed workload based on this "
+            "result. Confirm the tool's execution role holds no grant these "
+            "Denies withhold from the principals that start its sessions, or "
+            "narrow the role to grants every starter holds unconditionally.",
+            SeverityEnum.INFORMATIONAL,
+            StatusEnum.NA,
+        )
     v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
     if not invokers:
         return finding(
@@ -35040,9 +35492,9 @@ def _tool_role_invoker_finding(
     return finding(
         f"{label} uses execution role {role_name}, and each principal granted "
         f"{start_action} on it ({', '.join(invokers)}) holds every action and "
-        "resource the role is granted, under the same or no condition, and no "
-        "unconditioned Deny or permissions boundary of theirs removes any part "
-        f"of it.{conditioned_note} Session policies and service control "
+        "resource the role is granted, under the same or no condition, no Deny "
+        "of theirs reaches any part of it, and their permissions boundary, if "
+        "any, allows all of it. Session policies and service control "
         f"policies are not read.{v1_note}",
         "No action required for this check.",
         SeverityEnum.MEDIUM,
@@ -43784,7 +44236,9 @@ def lambda_handler(event, context):
             (
                 ["AC-01"],
                 "VPC Configuration",
-                lambda: check_agentcore_vpc_configuration(browser_inventory),
+                lambda: check_agentcore_vpc_configuration(
+                    browser_inventory, permission_cache
+                ),
             ),
             (["AC-04"], "Observability", check_agentcore_observability),
             (["AC-05"], "Encryption", check_agentcore_encryption),
