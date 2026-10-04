@@ -199,8 +199,11 @@ AI_SUBJECT_ROWS = [
         "guardrailConfig or a capped read is N/A. It fails a guarded InvokeModel "
         "call that sends one of the groundingSource and query tags without the "
         "other, or neither while its response carries a contextual grounding "
-        "assessment; an untagged call with no such assessment is N/A, since its "
-        "guardrail is named only in request headers the log does not record. "
+        "assessment. An untagged call with no such assessment is joined by "
+        "requestId to its CloudTrail event (cloudtrail:LookupEvents), whose "
+        "requestParameters name the guardrail and version: it fails when that "
+        "version has contextual grounding filters, is excluded when it has none, "
+        "and is N/A with no matching event or a failed read. "
         "Automated Reasoning checks are reported, not judged",
         [],
         3,

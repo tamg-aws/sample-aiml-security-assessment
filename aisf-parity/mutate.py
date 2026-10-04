@@ -1849,6 +1849,38 @@ MUTATIONS = [
         "find": "            if not tags and not any(\n",
         "replace": "            if False and not any(\n",
     },
+    {
+        "name": "BR-27 InvokeModel: the CloudTrail guardrail is not read for grounding",
+        "file": BEDROCK,
+        "defect": "an untagged InvokeModel call failed through a guardrail with no grounding filter",
+        "find": '            if not grounds(joined["guardrail"], joined["version"]):\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-27 InvokeModel: an unjoined call is dropped",
+        "file": BEDROCK,
+        "defect": "an untagged InvokeModel call with no CloudTrail match let the row pass",
+        "find": "                unjudged.append(f\"{call['label']}, {joined['reason']}\")\n",
+        "replace": "                pass\n",
+    },
+    {
+        "name": "BR-27 InvokeModel: any CloudTrail event in the window is the call's",
+        "file": BEDROCK,
+        "defect": "an untagged InvokeModel call took the guardrail of another call's event",
+        "find": '                if detail.get("requestID") != call["request_id"]:\n',
+        "replace": "                if False:\n",
+    },
+    {
+        "name": "BR-27 InvokeModel: the CloudTrail join reads one page",
+        "file": BEDROCK,
+        "defect": "an untagged InvokeModel call whose event is on a later LookupEvents page went unjudged",
+        "find": "            if not isinstance(next_token, str) or not next_token:\n"
+        "                break\n"
+        '            request["NextToken"] = next_token\n',
+        "replace": "            if not isinstance(next_token, str) or not next_token:\n"
+        "                break\n"
+        "            break\n",
+    },
     # ------------------------------------------- SageMaker round-6 check logic
     # SM-39's egress legs for ECS and Lambda VPCs (AIR-SLF-RT-02) and SM-43's
     # artifact reads (AIR-SLF-CMP-08). Each was killed by hand on a byte backup
@@ -4037,6 +4069,18 @@ GROUPS: dict[str, str] = {
         "in the Bedrock invocation log guardrail evidence"
     ),
     "BR-27 InvokeModel: an untagged call with an unknown guardrail is judged": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: the CloudTrail guardrail is not read for grounding": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: an unjoined call is dropped": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: any CloudTrail event in the window is the call's": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: the CloudTrail join reads one page": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     DERIVED_PARTIAL_QUALIFIER_NAME: "in the tag column",

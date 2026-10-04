@@ -20592,6 +20592,88 @@ def _invoke_grounding_tags(body: Any) -> Optional[Set[str]]:
     }
 
 
+# An InvokeModel call names its guardrail in request headers, which the
+# invocation log omits and CloudTrail's requestParameters record, so an
+# untagged call is joined to its event by requestID within this window of its
+# log record, at most this many pages per call and this many calls per run.
+GROUNDING_JOIN_WINDOW = timedelta(minutes=5)
+
+GROUNDING_JOIN_MAX_PAGES = 5
+
+GROUNDING_JOIN_MAX_CALLS = 10
+
+
+def _invoke_call_guardrail(region: str, call: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Find the CloudTrail event whose requestID is ``call["request_id"]`` among
+    the ``call["operation"]`` events LookupEvents returns within
+    GROUNDING_JOIN_WINDOW of ``call["time"]``. Returns {"guardrail",
+    "version"} from its requestParameters, or {"reason"} when no event names
+    one.
+    """
+    try:
+        when = datetime.strptime(call["time"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (TypeError, ValueError):
+        return {"reason": "which logs no timestamp to find its CloudTrail event by"}
+    client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
+    request = {
+        "LookupAttributes": [
+            {"AttributeKey": "EventName", "AttributeValue": call["operation"]}
+        ],
+        "StartTime": when - GROUNDING_JOIN_WINDOW,
+        "EndTime": when + GROUNDING_JOIN_WINDOW,
+        "MaxResults": 50,
+    }
+    try:
+        for _ in range(GROUNDING_JOIN_MAX_PAGES):
+            response = client.lookup_events(**request)
+            if not isinstance(response, dict):
+                raise TypeError("LookupEvents returned no response object")
+            for event in response.get("Events") or []:
+                try:
+                    detail = json.loads(event.get("CloudTrailEvent") or "")
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(detail, dict):
+                    continue
+                if detail.get("requestID") != call["request_id"]:
+                    continue
+                parameters = detail.get("requestParameters") or {}
+                guardrail = parameters.get("guardrailIdentifier")
+                if not guardrail:
+                    return {
+                        "reason": "whose CloudTrail event names no guardrailIdentifier"
+                    }
+                return {
+                    "guardrail": str(guardrail),
+                    "version": str(
+                        parameters.get("guardrailVersion") or GUARDRAIL_DRAFT_VERSION
+                    ),
+                }
+            next_token = response.get("NextToken")
+            if not isinstance(next_token, str) or not next_token:
+                break
+            request["NextToken"] = next_token
+        else:
+            return {
+                "reason": "whose CloudTrail event was not found in the first "
+                f"{GROUNDING_JOIN_MAX_PAGES} LookupEvents pages of its window"
+            }
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "reason": "whose CloudTrail event was not read (cloudtrail:LookupEvents, "
+            f"{get_assessment_error_label(error)})"
+        }
+    return {
+        "reason": "which sent no grounding tag and has no CloudTrail event with its "
+        "requestID in cloudtrail:LookupEvents within "
+        f"{int(GROUNDING_JOIN_WINDOW.total_seconds() // 60)} minutes of its log "
+        "record, so which guardrail ran is not known"
+    }
+
+
 def _converse_guarded(body: Any, output: Any) -> bool:
     """Whether a logged Converse call names or reports a guardrail."""
     if isinstance(body, dict) and body.get("guardrailConfig"):
@@ -21420,6 +21502,7 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
         # grounding filter ran.
         invoke_calls = []
         invoke_unqualified = []
+        invoke_untagged = []
 
         def visit_invoke(record):
             if record.get("operation") not in INVOKE_GUARDRAIL_TAG_OPERATIONS:
@@ -21448,11 +21531,13 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
             if not tags and not any(
                 "contextualGroundingPolicy" in item for item in _nested_dicts(output)
             ):
-                unjudged.append(
-                    f"{label}, which sent no grounding tag and names its guardrail "
-                    "only in request headers the invocation log does not record, so "
-                    "whether that guardrail has contextual grounding filters is not "
-                    "known"
+                invoke_untagged.append(
+                    {
+                        "label": label,
+                        "request_id": record.get("requestId"),
+                        "operation": record.get("operation"),
+                        "time": record.get("timestamp"),
+                    }
                 )
                 return
             invoke_calls.append(label)
@@ -21477,6 +21562,31 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 f"first {invoke_scan['read']} "
                 f"({'page cap' if source['log_group'] else 'object cap'})"
             )
+        if len(invoke_untagged) > GROUNDING_JOIN_MAX_CALLS:
+            unjudged.append(
+                "{} untagged guarded InvokeModel call(s) past the first {}, which "
+                "were not joined to CloudTrail to name their guardrail".format(
+                    len(invoke_untagged) - GROUNDING_JOIN_MAX_CALLS,
+                    GROUNDING_JOIN_MAX_CALLS,
+                )
+            )
+        for call in invoke_untagged[:GROUNDING_JOIN_MAX_CALLS]:
+            joined = (
+                _invoke_call_guardrail(region, call)
+                if call["request_id"]
+                else {"reason": "which logs no request ID to join to CloudTrail"}
+            )
+            if "reason" in joined:
+                unjudged.append(f"{call['label']}, {joined['reason']}")
+                continue
+            if not grounds(joined["guardrail"], joined["version"]):
+                continue
+            invoke_calls.append(call["label"])
+            invoke_unqualified.append(
+                "{} through guardrail {} version {}".format(
+                    call["label"], joined["guardrail"], joined["version"]
+                )
+            )
         if unqualified or invoke_unqualified:
             findings["status"] = "FAIL"
             failures = []
@@ -21496,8 +21606,10 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
             if invoke_unqualified:
                 failures.append(
                     "{} of the {} guarded InvokeModel call(s) logged in {} in the "
-                    "last 24 hours that sent a grounding tag or whose response "
-                    "carries a contextual grounding assessment did not wrap both a "
+                    "last 24 hours that sent a grounding tag, whose response "
+                    "carries a contextual grounding assessment, or whose CloudTrail "
+                    "event names a guardrail version with contextual grounding "
+                    "filters did not wrap both a "
                     "{}_<tagSuffix> source and a {}_<tagSuffix> query matching the "
                     "tagSuffix in amazon-bedrock-guardrailConfig: {}.".format(
                         len(invoke_unqualified),
@@ -21541,8 +21653,10 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 "hours: {}. In the same 24 hours every one of the {} guarded "
                 "Converse call(s) through a guardrail version with contextual "
                 "grounding filters qualified a grounding_source and a query, and "
-                "every one of the {} guarded InvokeModel call(s) wrapped both a "
-                "groundingSource and a query tag.".format(
+                "every one of the {} guarded InvokeModel call(s) that sent a "
+                "grounding tag or ran through a guardrail version with contextual "
+                "grounding filters wrapped both a groundingSource and a query "
+                "tag.".format(
                     log_group,
                     len(scored),
                     "; ".join(scored[:5]),

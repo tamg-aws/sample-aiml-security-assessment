@@ -785,7 +785,7 @@ Resources:
                 - cloudtrail:GetTrailStatus # BR-06, BR-32
                 - cloudtrail:ListEventDataStores # BR-06, BR-32
                 # Former Sid CloudTrailEventHistoryRead.
-                - cloudtrail:LookupEvents # BR-04, BR-06, BR-32, BR-43, BR-56
+                - cloudtrail:LookupEvents # BR-04, BR-06, BR-27, BR-32, BR-43, BR-56
                 # Former Sid LambdaInventoryPermissions.
                 - lambda:ListFunctions # BR-02, BR-33, BR-54
                 - inspector2:BatchGetAccountStatus # BR-33
