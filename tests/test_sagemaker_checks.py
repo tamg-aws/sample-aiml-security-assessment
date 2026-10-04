@@ -24219,6 +24219,215 @@ class TestSM39WorkloadEgress:
         assert self._nfw(rows)
         assert self._sync(rows) == []
 
+    @staticmethod
+    def _ordered_dns(rules):
+        """One rule group whose rules run in list order, each over its own
+        domain list, ending in the BLOCK over "*"."""
+        firewall_rules = [
+            {
+                "Name": f"rule-{index}",
+                "Priority": 10 * (index + 1),
+                "Action": action,
+                "FirewallDomainListId": f"rslvr-fdl-{index}",
+            }
+            for index, (action, _) in enumerate(rules)
+        ]
+        return {
+            "associations": {
+                "vpc-a": [
+                    _dns_association("rslvr-frg-ordered", 100),
+                    _dns_association("rslvr-frg-block", 200),
+                ]
+            },
+            "rules": {"rslvr-frg-ordered": firewall_rules},
+            "domains": {
+                f"rslvr-fdl-{index}": list(names)
+                for index, (_, names) in enumerate(rules)
+            },
+        }
+
+    def _sync_against(self, rules, targets):
+        group = _allowlist_group()
+        group["RulesSource"]["RulesSourceList"]["Targets"] = list(targets)
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1", "subnet-a2"])],
+            firewalls={"vpc-a": {"egress-fw": "vpce-fw1"}},
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"VpcEndpointId": "vpce-fw1"}),
+                    )
+                ]
+            },
+            groups={_ALLOW_ALL: group},
+            **self._ordered_dns(rules),
+        )
+        assert [r["Status"] for r in self._dns(rows)] == ["Passed"]
+        sync = self._sync(rows)
+        assert len(sync) == 1
+        return sync[0]
+
+    def test_an_earlier_wildcard_block_withdraws_the_names_it_covers(self):
+        # "*.partner.io" matches every subdomain of partner.io and not
+        # partner.io itself, so the later ALLOW answers the apex only.
+        rules = [
+            ("BLOCK", ["*.partner.io."]),
+            ("ALLOW", ["example.com.", "partner.io.", "api.partner.io."]),
+            ("ALLOW", ["*.eu.partner.io."]),
+        ]
+        row = self._sync_against(rules, ["example.com", "partner.io"])
+        assert row["Status"] == "Passed"
+        assert "admit the same 2 DNS Firewall name(s)" in row["Finding_Details"]
+        row = self._sync_against(rules, ["example.com", "partner.io", "api.partner.io"])
+        assert row["Status"] == "Failed"
+        assert (
+            "firewall egress-fw's ALLOWLIST admits api.partner.io, which the DNS "
+            "Firewall allow-list does not" in row["Finding_Details"]
+        )
+        assert "the DNS Firewall allow-list admits" not in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("block", "targets", "text"),
+        [
+            (
+                "a.example.com.",
+                [".example.com", "a.example.com", "b.example.com"],
+                "admits .example.com, a.example.com, which the DNS Firewall",
+            ),
+            (
+                "*.x.example.com.",
+                [".example.com", "x.example.com"],
+                "admits .example.com, which the DNS Firewall",
+            ),
+        ],
+    )
+    def test_a_name_an_earlier_block_refuses_inside_an_allowed_wildcard_fails(
+        self, block, targets, text
+    ):
+        # The ALLOW over *.example.com answers every subdomain except those the
+        # earlier BLOCK refuses, so a target admitting a refused name is held
+        # by one layer only.
+        row = self._sync_against(
+            [("BLOCK", [block]), ("ALLOW", ["example.com.", "*.example.com."])],
+            targets,
+        )
+        assert row["Status"] == "Failed"
+        assert f"firewall egress-fw's ALLOWLIST {text}" in row["Finding_Details"]
+        assert "the DNS Firewall allow-list admits" not in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("rules", "targets"),
+        [
+            (
+                [("ALLOW", ["a.example.com."]), ("BLOCK", ["a.example.com."])],
+                [".example.com"],
+            ),
+            (
+                [
+                    ("ALLOW", ["*.x.example.com."]),
+                    ("BLOCK", ["*.x.example.com.", "y.x.example.com."]),
+                ],
+                [".example.com", "y.x.example.com"],
+            ),
+        ],
+    )
+    def test_a_refused_part_an_earlier_allow_answers_stays_in_sync(
+        self, rules, targets
+    ):
+        row = self._sync_against(
+            rules + [("ALLOW", ["example.com.", "*.example.com."])], targets
+        )
+        assert row["Status"] == "Passed"
+
+    def test_the_comparison_matches_first_match_evaluation(self):
+        # The oracle walks the rules in order for every name of a finite
+        # universe; the label "z" appears in no rule, so it stands for every
+        # subdomain the rules do not name, and depth 4 is one past the deepest
+        # rule.
+        import itertools
+        import random
+
+        rng = random.Random(20261004)
+        labels = ["a", "b"]
+        names = ["example.com"] + [
+            ".".join(parts) + ".example.com"
+            for depth in (1, 2)
+            for parts in itertools.product(labels, repeat=depth)
+        ]
+        universe = ["example.com"] + [
+            ".".join(parts) + ".example.com"
+            for depth in (1, 2, 3, 4)
+            for parts in itertools.product(labels + ["z"], repeat=depth)
+        ]
+
+        def matches(entry, name):
+            if entry.startswith("*."):
+                return name.endswith("." + entry[2:])
+            return name == entry
+
+        for _ in range(400):
+            rules = [
+                (
+                    rng.choice(["ALLOW", "BLOCK"]),
+                    [
+                        rng.choice(["", "*."]) + rng.choice(names)
+                        for _ in range(rng.randint(1, 3))
+                    ],
+                )
+                for _ in range(rng.randint(1, 5))
+            ]
+            dns = self._ordered_dns(
+                [(action, [d + "." for d in ds]) for action, ds in rules]
+            )
+            resolver = MagicMock()
+            resolver.get_paginator.side_effect = _pager(
+                {
+                    "list_firewall_rule_group_associations": lambda VpcId: [
+                        {"FirewallRuleGroupAssociations": dns["associations"][VpcId]}
+                    ],
+                    "list_firewall_rules": lambda FirewallRuleGroupId: [
+                        {
+                            "FirewallRules": {
+                                **dns["rules"],
+                                **_DNS_RULES,
+                            }[FirewallRuleGroupId]
+                        }
+                    ],
+                    "list_firewall_domain_lists": [
+                        {"FirewallDomainLists": [{"Id": "rslvr-fdl-star"}]}
+                    ],
+                    "list_firewall_domains": lambda FirewallDomainListId: [
+                        {
+                            "Domains": {**dns["domains"], "rslvr-fdl-star": ["*."]}[
+                                FirewallDomainListId
+                            ]
+                        }
+                    ],
+                }
+            )
+            allowed, _, _ = sagemaker_app._dns_firewall_allowed_names(
+                resolver, "vpc-a", {}
+            )
+
+            def answered(name):
+                for action, entries in rules:
+                    if any(matches(entry, name) for entry in entries):
+                        return action == "ALLOW"
+                return False
+
+            for target in names + ["." + name for name in names]:
+                pattern = sagemaker_app._domain_pattern(target, True)
+                expected = all(
+                    answered(name)
+                    for name in universe
+                    if name == pattern[0]
+                    or (pattern[2] and name.endswith("." + pattern[0]))
+                )
+                assert (
+                    sagemaker_app._dns_allow_list_covers(allowed, pattern) is expected
+                ), (rules, target)
+
     def test_an_allow_list_without_http_host_fails(self):
         rows = self._firewalled(groups={_ALLOW_ALL: _allowlist_group(("TLS_SNI",))})
         assert [r["Status"] for r in rows] == ["Failed"]
