@@ -34140,6 +34140,42 @@ class TestBR51AIUserConsoleMFA:
         )
         assert self.iam.list_instances.call_count == 2
 
+    ONE_REGION = [
+        {
+            "Regions": [
+                {"RegionName": "us-east-1", "RegionOptStatus": "ENABLED_BY_DEFAULT"}
+            ]
+        }
+    ]
+
+    @staticmethod
+    def _federated_trust(provider, action="sts:AssumeRoleWithSAML"):
+        return _policy(
+            {"Effect": "Allow", "Principal": {"Federated": provider}, "Action": action}
+        )
+
+    def _run_federated(self, roles, instances=None):
+        """``roles`` maps a role name to (provider, action, statements)."""
+        cache = _ai_user_cache()
+        for role, (_, _, statements) in roles.items():
+            cache["role_permissions"][role] = _identity(
+                attached=[_customer_policy("Write", *statements)]
+            )
+        _, rows = self._run(
+            cache,
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            regions=self.ONE_REGION,
+            instances=instances,
+            role_trust={
+                role: self._federated_trust(provider, action)
+                for role, (provider, action, _) in roles.items()
+            },
+        )
+        return rows
+
+    WRITE = {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
+
     @pytest.mark.parametrize(
         "role, provider, action",
         [
@@ -34153,50 +34189,148 @@ class TestBR51AIUserConsoleMFA:
                 "arn:aws:iam::123456789012:saml-provider/Okta",
                 ["sts:AssumeRoleWithSAML", "sts:TagSession"],
             ),
+            (
+                "GitHubAIDeploy",
+                "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com",
+                "sts:AssumeRoleWithWebIdentity",
+            ),
         ],
     )
-    def test_br51_a_federated_ai_write_role_stops_passed(self, role, provider, action):
+    def test_br51_a_federated_ai_write_role_without_a_tag_deny_fails(
+        self, role, provider, action
+    ):
         """With no instance visible, as in a member account, a federated AI
-        write role is still people signing in, and no row judges their MFA."""
-        cache = _ai_user_cache()
-        cache["role_permissions"][role] = _identity(
-            attached=[
-                _customer_policy(
-                    "Write", {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
-                )
-            ]
+        write role with no aws:PrincipalTag Deny is failed on its policies."""
+        rows = self._run_federated({role: (provider, action, [self.WRITE])})
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        details = failed[0]["Finding_Details"]
+        assert (
+            f"IAM role '{role}' is assumed through the federated identity "
+            f"provider(s) {provider} and grants AI writes (bedrock)" in details
         )
+        assert "keyed on an aws:PrincipalTag authentication tag covers bedrock," in (
+            details
+        )
+        assert failed[0]["Severity"] == "High"
+
+    def test_br51_only_the_federated_role_without_the_tag_deny_fails(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        deny = self._tag_deny()
+        rows = self._run_federated(
+            {
+                "OktaGuarded": (saml, "sts:AssumeRoleWithSAML", [self.WRITE, deny]),
+                "OktaOpen": (saml, "sts:AssumeRoleWithSAML", [self.WRITE]),
+            }
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A"]
+        (failed,) = [r for r in rows if r["Status"] == "Failed"]
+        assert "IAM role 'OktaOpen'" in failed["Finding_Details"]
+        assert "OktaGuarded" not in failed["Finding_Details"]
+        (summary,) = [r for r in rows if r["Status"] == "N/A"]
+        assert (
+            "1 in-scope IAM role(s) assumed through a federated identity provider "
+            "carry a Deny keyed on aws:PrincipalTag over every AI service they "
+            f"grant (OktaGuarded ({saml}; StringNotEquals aws:PrincipalTag/authn "
+            "mfa))" in summary["Finding_Details"]
+        )
+        assert (
+            "whether the provider sets that tag only after MFA is not read"
+            in (summary["Finding_Details"])
+        )
+
+    def test_br51_a_federated_tag_deny_covering_one_service_fails_the_other(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        rows = self._run_federated(
+            {
+                "OktaAI": (
+                    saml,
+                    "sts:AssumeRoleWithSAML",
+                    [
+                        self.WRITE,
+                        {"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"},
+                        self._tag_deny(actions=("bedrock:*",)),
+                    ],
+                )
+            }
+        )
+        (failed,) = [r for r in rows if r["Status"] == "Failed"]
+        details = failed["Finding_Details"]
+        assert "grants AI writes (bedrock, sagemaker)" in details
+        assert (
+            "covers sagemaker (the PrincipalTag Deny it has, StringNotEquals "
+            "aws:PrincipalTag/authn mfa, covers only the other services)" in details
+        )
+
+    def test_br51_a_federated_tag_deny_in_the_boundary_is_credited(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        cache = _ai_user_cache()
+        cache["role_permissions"]["OktaAI"] = {
+            **_identity(attached=[_customer_policy("Write", self.WRITE)]),
+            "permissions_boundary": {
+                "document": _policy(
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    self._tag_deny(),
+                )
+            },
+        }
         _, rows = self._run(
             cache,
             login={"alice": "yes"},
             devices={"alice": [{"SerialNumber": "s"}]},
-            regions=[
-                {
-                    "Regions": [
-                        {
-                            "RegionName": "us-east-1",
-                            "RegionOptStatus": "ENABLED_BY_DEFAULT",
-                        }
-                    ]
-                }
-            ],
-            role_trust={
-                role: _policy(
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"Federated": provider},
-                        "Action": action,
-                    }
-                )
-            },
+            regions=self.ONE_REGION,
+            role_trust={"OktaAI": self._federated_trust(saml)},
         )
         assert [r["Status"] for r in rows] == ["N/A"]
-        details = rows[0]["Finding_Details"]
-        assert f"{role} ({provider})" in details
-        assert "0 of the 1 in-scope IAM role(s)" in details
-        assert (
-            "1 in-scope IAM role(s) are assumed through a federated identity provider"
-            in details
+        assert "OktaAI (" in rows[0]["Finding_Details"]
+
+    def test_br51_an_unparsable_federated_role_policy_is_na(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        cache = _ai_user_cache()
+        cache["role_permissions"]["OktaAI"] = _identity(
+            attached=[_customer_policy("Write", self.WRITE)]
+        )
+        with patch.object(
+            bedrock_app,
+            "_federated_role_tag_deny",
+            side_effect=ValueError("bad document"),
+        ):
+            _, rows = self._run(
+                cache,
+                login={"alice": "yes"},
+                devices={"alice": [{"SerialNumber": "s"}]},
+                regions=self.ONE_REGION,
+                role_trust={"OktaAI": self._federated_trust(saml)},
+            )
+        assert "Failed" not in [r["Status"] for r in rows]
+        assert any(
+            "IAM role 'OktaAI'" in r["Finding_Details"]
+            and "could not be parsed" in r["Finding_Details"]
+            and r["Status"] == "N/A"
+            for r in rows
+        )
+
+    def test_br51_a_visible_instance_judges_its_sso_role_through_the_set(self):
+        """An AWSReservedSSO_ role is judged through its permission set when
+        the instance is visible; an Okta role beside it is still judged."""
+        sso_role = "AWSReservedSSO_AIAdmin_0123456789abcdef"
+        sso = "arn:aws:iam::123456789012:saml-provider/AWSSSO_0123_DO_NOT_DELETE"
+        okta = "arn:aws:iam::123456789012:saml-provider/Okta"
+        rows = self._run_federated(
+            {
+                sso_role: (sso, "sts:AssumeRoleWithSAML", [self.WRITE]),
+                "OktaAI": (okta, "sts:AssumeRoleWithSAML", [self.WRITE]),
+            },
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "IAM role 'OktaAI'" in failed[0]["Finding_Details"]
+        assert sso_role not in failed[0]["Finding_Details"]
+        assert any(
+            f"IAM Identity Center role(s) ({sso_role} ({sso})) are judged through "
+            "their permission sets" in r["Finding_Details"]
+            for r in rows
         )
 
     def test_br51_an_unread_region_is_not_passed(self):

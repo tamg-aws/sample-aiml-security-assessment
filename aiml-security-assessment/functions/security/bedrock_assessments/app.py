@@ -35002,6 +35002,7 @@ def _identity_center_leg(
                 "status": "Passed",
                 "severity": "High",
                 "unguarded": [],
+                "visible": False,
             }
         if not errors:
             note = (
@@ -35023,6 +35024,7 @@ def _identity_center_leg(
             "status": "N/A",
             "severity": "Informational",
             "unguarded": [],
+            "visible": False,
         }
     permission_sets = {
         "granting": [],
@@ -35097,6 +35099,7 @@ def _identity_center_leg(
         "status": "N/A",
         "severity": "Informational",
         "unguarded": permission_sets["unguarded"],
+        "visible": True,
     }
 
 
@@ -35441,6 +35444,36 @@ def _trust_federated_providers(trust_policy: Any) -> List[str]:
     return sorted(set(providers))
 
 
+def _federated_role_tag_deny(permissions: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Judge a role assumed through a federated identity provider as the role a
+    permission set is provisioned as is judged: the AI services its cached
+    policies grant writes in, and which of them a Deny keyed on one
+    aws:PrincipalTag value, in those policies or its permissions boundary,
+    covers. A policy that cannot be parsed raises ValueError or TypeError.
+    """
+    sources = [
+        (f"{source} '{policy.get('name') or 'unnamed'}'", policy.get("document"))
+        for source, policy in _cached_identity_policies(permissions)
+    ]
+    boundary = _boundary_document(permissions)
+    if boundary is not None:
+        sources.append(("permissions boundary", boundary))
+    services = _ai_write_services(permissions)
+    denies = [
+        _principal_tag_deny_statement(statement)
+        for _, document in sources
+        if document
+        for statement in _policy_statements(document)
+    ]
+    covered = {service for deny in denies for service in deny["services"]}
+    return {
+        "services": services,
+        "uncovered": [service for service in services if service not in covered],
+        "tests": [deny["test"] for deny in denies if deny["services"]],
+    }
+
+
 def check_bedrock_ai_user_console_mfa(
     permission_cache, region: str = "", identity_center_region: str = ""
 ) -> Dict[str, Any]:
@@ -35448,8 +35481,11 @@ def check_bedrock_ai_user_console_mfa(
     BR-51: Flag identities that can change Bedrock, bedrock-mantle, SageMaker AI or AgentCore
     resources without MFA: an IAM user with a console password and no MFA
     device, an IAM user with an active access key and no Deny requiring MFA,
-    and an IAM role whose trust policy lets a user or account assume it
-    without MFA. An IAM Identity Center instance visible in
+    an IAM role whose trust policy lets a user or account assume it
+    without MFA, and an IAM role assumed through a federated identity provider
+    (SAML, OIDC, or an AWSReservedSSO_ role when no Identity Center instance is
+    visible) with no aws:PrincipalTag Deny over its AI writes. An IAM Identity
+    Center instance visible in
     identity_center_region keeps the IAM-only Passed row at N/A.
     """
     logger.debug("Starting check for AI user console MFA")
@@ -35684,6 +35720,7 @@ def check_bedrock_ai_user_console_mfa(
 
         trusted = []
         federated = []
+        federated_guarded = []
         chained_trusts: Dict[str, Any] = {}
         for role_name, evidence in sorted(roles["users"].items()):
             try:
@@ -35771,32 +35808,112 @@ def check_bedrock_ai_user_console_mfa(
                 providers = _trust_federated_providers(
                     role.get("AssumeRolePolicyDocument")
                 )
-                if providers:
-                    federated.append(
-                        "{} ({})".format(role_name, ", ".join(providers[:3]))
-                    )
-                else:
+                if not providers:
                     trusted.append(role_name)
+                    continue
+                provider_text = ", ".join(providers[:3])
+                if identity_center["visible"] and role_name.startswith(
+                    "AWSReservedSSO_"
+                ):
+                    # Judged through its permission set in the Identity
+                    # Center leg.
+                    federated.append(f"{role_name} ({provider_text})")
+                    continue
+                try:
+                    tag_deny = _federated_role_tag_deny(
+                        permission_cache["role_permissions"][role_name]
+                    )
+                except (ValueError, TypeError, AttributeError) as error:
+                    findings["csv_data"].append(
+                        row(
+                            f"IAM role '{role_name}' is assumed through the "
+                            f"federated identity provider(s) {provider_text}, and "
+                            "a policy of the role could not be parsed "
+                            f"({get_assessment_error_label(error)}), so whether a "
+                            "Deny keyed on aws:PrincipalTag holds its sessions to "
+                            "MFA is not known. The role is in scope because "
+                            f"{evidence[0]}.",
+                            COULD_NOT_ASSESS_RESOLUTION,
+                            "Informational",
+                            "N/A",
+                        )
+                    )
+                    continue
+                if tag_deny["uncovered"]:
+                    findings["status"] = "WARN"
+                    findings["csv_data"].append(
+                        row(
+                            "IAM role '{}' is assumed through the federated "
+                            "identity provider(s) {} and grants AI writes ({}) in "
+                            "its policies, and no Deny in its policies or "
+                            "permissions boundary keyed on an aws:PrincipalTag "
+                            "authentication tag covers {}{}, so a federated session "
+                            "that did not complete MFA is not denied those writes. "
+                            "A Deny on aws:MultiFactorAuthPresent does not hold "
+                            "federated sessions to MFA, because the key is not "
+                            "present for them. The role is in scope because "
+                            "{}.".format(
+                                role_name,
+                                provider_text,
+                                ", ".join(tag_deny["services"]),
+                                ", ".join(tag_deny["uncovered"]),
+                                " (the PrincipalTag Deny it has, {}, covers only "
+                                "the other services)".format(
+                                    "; ".join(tag_deny["tests"])
+                                )
+                                if tag_deny["tests"]
+                                else "",
+                                evidence[0],
+                            ),
+                            "Have the identity provider pass the authentication "
+                            "method as a session tag, and add to the role a Deny "
+                            "on every Bedrock, SageMaker AI and AgentCore write it "
+                            "grants, with StringNotEquals on that aws:PrincipalTag "
+                            "key and the value the provider sends for MFA.",
+                            "High",
+                            "Failed",
+                        )
+                    )
+                    continue
+                federated_guarded.append(
+                    "{} ({}; {})".format(
+                        role_name, provider_text, "; ".join(tag_deny["tests"])
+                    )
+                )
 
-        if protected or no_console or deny_protected or trusted or federated:
+        if (
+            protected
+            or no_console
+            or deny_protected
+            or trusted
+            or federated
+            or federated_guarded
+        ):
             sso_note, status, severity = (
                 identity_center["note"],
                 identity_center["status"],
                 identity_center["severity"],
             )
-            if federated:
-                # A member account lists no Identity Center instance, yet its
-                # AWSReservedSSO_ roles are people signing in.
+            if federated_guarded:
                 sso_note = (
-                    "{} in-scope IAM role(s) are assumed through a federated "
-                    "identity provider ({}), and whether that provider required "
-                    "MFA is not read, so the people who sign in through them are "
-                    "judged by no row. {}".format(
+                    "{} in-scope IAM role(s) assumed through a federated identity "
+                    "provider carry a Deny keyed on aws:PrincipalTag over every "
+                    "AI service they grant ({}), and whether the provider sets "
+                    "that tag only after MFA is not read. {}".format(
+                        len(federated_guarded),
+                        "; ".join(federated_guarded[:10]),
+                        sso_note,
+                    )
+                )
+            if federated:
+                sso_note = (
+                    "{} in-scope IAM Identity Center role(s) ({}) are judged "
+                    "through their permission sets. {}".format(
                         len(federated), "; ".join(federated[:10]), sso_note
                     )
                 )
-                if status == "Passed":
-                    status, severity = "N/A", "Informational"
+            if (federated or federated_guarded) and status == "Passed":
+                status, severity = "N/A", "Informational"
             findings["csv_data"].append(
                 row(
                     "{} of the {} in-scope IAM user(s) have an MFA device ({}) and "
