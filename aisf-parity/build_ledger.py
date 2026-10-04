@@ -224,7 +224,16 @@ AI_SUBJECT_ROWS = [
         [],
         3,
     ),
-    ("AIR-BDR-MDL-04", COVERED, None, "bedrock_assessments", ["BR-44"], "", [], 3),
+    (
+        "AIR-BDR-MDL-04",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-44", "BR-42", "BR-43"],
+        "",
+        [],
+        3,
+    ),
     ("AIR-BDR-MDL-09", COVERED, None, "bedrock_assessments", ["BR-45"], "", [], 3),
     (
         "AIR-BDR-KB-05",

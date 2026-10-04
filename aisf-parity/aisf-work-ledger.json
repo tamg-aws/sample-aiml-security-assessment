@@ -374,10 +374,19 @@
         "bedrock_assessments"
       ],
       "incumbents": [
-        "BR-44"
+        "BR-44",
+        "BR-42",
+        "BR-43"
       ],
       "incumbent_names": [
-        "Marketplace Model Subscription Control"
+        "Marketplace Model Subscription Control",
+        "Foundation Model Invocation Allow-List",
+        "Bedrock Approved Model Control",
+        "Bedrock Region Invocation Control",
+        "Bedrock Approved Model Control",
+        "Bedrock Inference Region Evidence",
+        "AI Service Region Control",
+        "Bedrock Custom Model Cross-Account Access"
       ],
       "gap": "",
       "extra_iam": [],
