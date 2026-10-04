@@ -732,6 +732,27 @@ MUTATIONS = [
         "replace": "    missing = []\n",
     },
     {
+        "name": "BR-43 credits a Region allow-list in the management account",
+        "file": BEDROCK,
+        "defect": "BR-43 passes a Region allow-list in the management account, which no service control policy restricts",
+        "find": "        if allow_listed and not uncovered and not global_open and management:\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-42 credits a model list in the management account",
+        "file": BEDROCK,
+        "defect": "BR-42 passes an approved model list in the management account, which no service control policy restricts",
+        "find": '        if enforcing and not uncovered and inventory.get("management_account"):\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-43 credits an AI service Region deny in the management account",
+        "file": BEDROCK,
+        "defect": "BR-43 passes the AI service Region deny in the management account, which no service control policy restricts",
+        "find": '        if not uncovered and scp_inventory.get("management_account"):\n',
+        "replace": "        if False:\n",
+    },
+    {
         "name": "an unread list read lets the BR-53 sweep summary pass",
         "file": BEDROCK,
         "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
@@ -2389,6 +2410,15 @@ GROUPS: dict[str, str] = {
     ),
     "BR-46 credits a document with no metadata sidecar": (
         "in the Bedrock knowledge base classification"
+    ),
+    "BR-43 credits a Region allow-list in the management account": (
+        "in the Bedrock management-account SCP credit"
+    ),
+    "BR-42 credits a model list in the management account": (
+        "in the Bedrock management-account SCP credit"
+    ),
+    "BR-43 credits an AI service Region deny in the management account": (
+        "in the Bedrock management-account SCP credit"
     ),
     "an unread list read lets the BR-53 sweep summary pass": (
         "in the Bedrock owner tag sweep"

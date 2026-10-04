@@ -11238,6 +11238,35 @@ class TestBR43RegionInvocationControl:
         assert "UnrelatedDeny" not in findings[0]["Finding_Details"]
         assert "includes the literal 'unspecified'" in findings[0]["Finding_Details"]
 
+    # MDL-03: the allow-list that passes above is not credited in the management
+    # account, which service control policies never restrict.
+    @pytest.mark.parametrize(
+        "management, status", [(True, "Failed"), (False, "Passed")]
+    )
+    def test_br43_region_allow_list_is_not_credited_in_the_management_account(
+        self, management, status
+    ):
+        inventory = self._inventory(
+            [
+                (
+                    "ApprovedRegions",
+                    self._region_scp("StringNotEquals", ["us-east-1", "unspecified"]),
+                )
+            ]
+        )
+        inventory["management_account"] = management
+        inventory["account"] = "123456789012"
+        findings = self._run(inventory)
+
+        assert [f["Status"] for f in findings] == [status]
+        if management:
+            assert findings[0]["Severity"] == "Medium"
+            assert (
+                "this is the management account 123456789012, which service "
+                "control policies never restrict" in findings[0]["Finding_Details"]
+            )
+            assert "ApprovedRegions" in findings[0]["Finding_Details"]
+
     def test_br43_allow_list_without_the_global_literal_says_so(self):
         findings = self._run(
             self._inventory(
@@ -11327,10 +11356,18 @@ class TestBR43RegionInvocationControl:
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "222222222222" in findings[0]["Finding_Details"]
 
-    def test_br43_builds_its_own_inventory_when_not_given_one(self):
+    # MDL-03: this test used to pin Passed with the caller as the management
+    # account, which no service control policy restricts. It now pins Failed
+    # there, and a delegated administrator member account still passes.
+    @pytest.mark.parametrize(
+        "master, status",
+        [("123456789012", "Failed"), ("999999999999", "Passed")],
+        ids=["management-account", "delegated-administrator"],
+    )
+    def test_br43_builds_its_own_inventory_when_not_given_one(self, master, status):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
-            "Organization": {"MasterAccountId": "123456789012"}
+            "Organization": {"MasterAccountId": master}
         }
         org_client.list_policies.return_value = {
             "Policies": [{"Id": "p-1", "Name": "ApprovedRegions"}]
@@ -11367,10 +11404,14 @@ class TestBR43RegionInvocationControl:
                 bedrock_app.check_bedrock_region_invocation_control(region="Global")
             )
 
-        org_client.list_policies.assert_called_once_with(
-            MaxResults=20, Filter="SERVICE_CONTROL_POLICY"
+        # A delegated administrator also makes the one-item probe call.
+        assert (
+            org_client.list_policies.call_args_list.count(
+                call(MaxResults=20, Filter="SERVICE_CONTROL_POLICY")
+            )
+            == 1
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == [status]
 
     def test_br43_global_profile_passes_the_region_allow_list_when_unspecified_is_allowed(
         self,
@@ -12389,6 +12430,52 @@ class TestBR43AIServiceRegionControl:
         )
 
         assert [f["Status"] for f in findings] == ["Passed"]
+
+    # MDL-03: the Control Tower Region deny that passes above is not credited in
+    # the management account, which service control policies never restrict.
+    @pytest.mark.parametrize(
+        "management, status", [(True, "Failed"), (False, "Passed")]
+    )
+    def test_region_deny_is_not_credited_in_the_management_account(
+        self, management, status
+    ):
+        inventory = TestBR43RegionInvocationControl._inventory(
+            [
+                (
+                    "aws-guardrails-RegionDeny",
+                    {
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "NotAction": ["iam:*", "sts:*"],
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringNotEquals": {
+                                        "aws:RequestedRegion": ["us-east-1"]
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+        inventory["management_account"] = management
+        inventory["account"] = "123456789012"
+        findings = extract_csv_data(
+            bedrock_app.check_ai_service_region_control(
+                region="Global", scp_inventory=inventory
+            )
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        if management:
+            detail = findings[0]["Finding_Details"]
+            assert (
+                "this is the management account 123456789012, which service "
+                "control policies never restrict" in detail
+            )
+            assert "aws-guardrails-RegionDeny" in detail
 
     def test_bedrock_only_allow_list_leaves_sagemaker_open(self):
         findings = self._run(
@@ -28201,6 +28288,40 @@ class TestBR43ApprovedModelControl:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "through NotResource" in rows[0]["Finding_Details"]
         assert "policy 'policy-1'" in rows[0]["Finding_Details"]
+
+    # MDL-01: a service control policy never restricts the management account,
+    # so the same model list is credited in a member account and fails here.
+    @pytest.mark.parametrize(
+        "management, status", [(True, "Failed"), (False, "Passed")]
+    )
+    def test_br43_model_list_is_not_credited_in_the_management_account(
+        self, management, status
+    ):
+        inventory = self._inventory(
+            _policy(
+                {
+                    "Effect": "Deny",
+                    "Action": [
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    "NotResource": self.MODELS,
+                },
+                self.MANTLE_LIST,
+            )
+        )
+        inventory["management_account"] = management
+        inventory["account"] = "123456789012"
+        rows = self._run(inventory)
+
+        assert [r["Status"] for r in rows] == [status]
+        if management:
+            assert rows[0]["Severity"] == "Medium"
+            assert (
+                "this is the management account 123456789012, which service "
+                "control policies never restrict" in rows[0]["Finding_Details"]
+            )
+            assert "policy 'policy-0'" in rows[0]["Finding_Details"]
 
     # MDL-01: ForAnyValue: is false when the key is absent, and streaming
     # invocation sends no bedrock:ModelArn while a direct foundation-model call

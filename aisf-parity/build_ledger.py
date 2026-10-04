@@ -209,7 +209,9 @@ AI_SUBJECT_ROWS = [
         "history, without narrowing the test, since a profile not called in the "
         "window is still callable. BR-42 carries the IAM step, failing an "
         "identity policy that grants invocation on an unscoped foundation-model "
-        "or inference-profile ARN",
+        "or inference-profile ARN. In the management account, which service "
+        "control policies never restrict, a Region allow-list or model list that "
+        "would pass fails instead",
         [],
         3,
     ),

@@ -24073,6 +24073,7 @@ def check_bedrock_region_invocation_control(
         routing_errors = sorted(
             name for name, routing in routings.items() if routing["error"]
         )
+        management = bool(inventory.get("management_account"))
 
         outside_profiles = 0
         outside_regions = set()
@@ -24131,7 +24132,30 @@ def check_bedrock_region_invocation_control(
             )
         )
 
-        if allow_listed and not uncovered and not global_open and routing_errors:
+        if allow_listed and not uncovered and not global_open and management:
+            findings["status"] = "WARN"
+            findings["details"] = "SCPs do not restrict the management account"
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) condition Bedrock "
+                    "invocation on the request Region: {}, but this is the "
+                    "management account {}, which service control policies never "
+                    "restrict, so the Region control does not apply to "
+                    "invocations made here. Observed routing: {}.{}".format(
+                        len(described),
+                        "; ".join(described),
+                        inventory.get("account") or "unknown",
+                        routing_text,
+                        notes,
+                    ),
+                    "Bound Bedrock invocation in the management account with an "
+                    "IAM Deny on aws:RequestedRegion, or keep model invocation "
+                    "out of the management account.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif allow_listed and not uncovered and not global_open and routing_errors:
             findings["csv_data"].append(
                 row(
                     "{} service control policy statement(s) condition Bedrock "
@@ -24656,7 +24680,29 @@ def check_ai_service_region_control(
         described = "; ".join(summary["described"][:5])
         note = " " + _scp_scope_note(scp_inventory)
 
-        if not uncovered:
+        if not uncovered and scp_inventory.get("management_account"):
+            findings["status"] = "WARN"
+            findings["details"] = "SCPs do not restrict the management account"
+            findings["csv_data"].append(
+                row(
+                    "A credited Region allow-list in the attached service control "
+                    "policies denies {} outside the approved Regions: {}, but this "
+                    "is the management account {}, which service control policies "
+                    "never restrict, so the Region control does not apply to "
+                    "resources created here.{}".format(
+                        ", ".join(AI_SERVICE_REGION_ACTIONS),
+                        "; ".join(summary["described"]),
+                        scp_inventory.get("account") or "unknown",
+                        note,
+                    ),
+                    "Bound these actions in the management account with an IAM "
+                    "Deny on aws:RequestedRegion, or keep AI workloads out of the "
+                    "management account.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif not uncovered:
             findings["details"] = "AI services are constrained by Region"
             findings["csv_data"].append(
                 row(
@@ -25274,7 +25320,28 @@ def check_bedrock_approved_model_control(
             scope_note = (
                 "Not credited: {}. ".format("; ".join(not_credited[:5])) + scope_note
             )
-        if enforcing and not uncovered:
+        if enforcing and not uncovered and inventory.get("management_account"):
+            findings["status"] = "WARN"
+            findings["details"] = "SCPs do not restrict the management account"
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) deny model invocation "
+                    "outside a named list: {}, but this is the management account "
+                    "{}, which service control policies never restrict, so the "
+                    "list does not apply to invocations made here. {}".format(
+                        len(enforcing),
+                        "; ".join(enforcing),
+                        inventory.get("account") or "unknown",
+                        scope_note,
+                    ),
+                    "Deny model invocation outside the approved models in the "
+                    "management account's IAM policies, or keep model invocation "
+                    "out of the management account.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif enforcing and not uncovered:
             findings["details"] = "Bedrock invocation is limited to a model list"
             findings["csv_data"].append(
                 row(
