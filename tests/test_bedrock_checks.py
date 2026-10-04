@@ -35480,8 +35480,26 @@ class TestBR55EnclaveKeyBinding:
         policy_error=None,
         grants=None,
         grants_error=None,
+        events=None,
+        events_error=None,
     ):
+        """events: {key ARN: [page of LookupEvents events, ...]}."""
         kms = MagicMock()
+
+        def lookup_events(LookupAttributes, MaxResults, NextToken=None):
+            (attribute,) = LookupAttributes
+            assert attribute["AttributeKey"] == "ResourceName"
+            arn = attribute["AttributeValue"]
+            if events_error and arn in events_error:
+                raise events_error[arn]
+            pages_for_key = (events or {}).get(arn, [[]])
+            index = int(NextToken or 0)
+            response = {"Events": pages_for_key[index]}
+            if index + 1 < len(pages_for_key):
+                response["NextToken"] = str(index + 1)
+            return response
+
+        kms.lookup_events.side_effect = lookup_events
 
         def list_grants(KeyId, **kwargs):
             if grants_error and KeyId in grants_error:
@@ -35932,6 +35950,131 @@ class TestBR55EnclaveKeyBinding:
                 bedrock_app.check_kms_enclave_key_binding(region="us-east-1")
             )
         assert_could_not_assess_finding(rows[0])
+
+    @staticmethod
+    def _event(event_id, digest, name="Decrypt"):
+        """A LookupEvents event; digest None is a request with no Recipient."""
+        record = {"eventName": name, "eventID": event_id}
+        if digest is not None:
+            record["additionalEventData"] = {
+                "recipient": {
+                    "attestationDocumentModuleId": "i-0abc-enc0def",
+                    "attestationDocumentEnclaveImageDigest": digest,
+                    "attestationDocumentEnclavePCR1": digest,
+                }
+            }
+        return {
+            "EventId": event_id,
+            "EventName": name,
+            "CloudTrailEvent": json.dumps(record),
+        }
+
+    def test_br55_a_zero_digest_kms_event_fails_its_key_beside_a_clean_one(self):
+        """AIR-FND-DAT-10: a debug-mode enclave's request is detected, not assumed."""
+        _, rows, kms = self._run(
+            {
+                "a": [self._admin(), self._enclave_allow()],
+                "b": [self._admin(), self._enclave_allow()],
+            },
+            events={
+                "arn:k/a": [
+                    [
+                        self._event("ev-clean", self.DIGEST),
+                        self._event("ev-zero", self.ZERO, "GenerateDataKey"),
+                    ]
+                ],
+                "arn:k/b": [
+                    [self._event("ev-b", self.DIGEST), self._event("ev-plain", None)]
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        failed = rows[0]["Finding_Details"]
+        assert "KMS key arn:k/a" in failed
+        assert (
+            "CloudTrail event history records 1 request(s) on the key "
+            "(GenerateDataKey) whose attestation document carries an all-zero "
+            "enclave image digest, which an enclave run with --debug-mode or "
+            "--attach-console presents: ev-zero" in failed
+        )
+        assert "ev-clean" not in failed
+        passed = rows[1]["Finding_Details"]
+        assert "arn:k/a" not in passed
+        assert (
+            "CloudTrail event history (LookupEvents) holds 2 event(s) on these "
+            "keys, 1 with an attestation document, and none whose enclave image "
+            "digest is all zeros" in passed
+        )
+        kms.lookup_events.assert_any_call(
+            LookupAttributes=[
+                {"AttributeKey": "ResourceName", "AttributeValue": "arn:k/b"}
+            ],
+            MaxResults=50,
+        )
+
+    def test_br55_a_base64_zero_digest_is_zero_too(self):
+        _, rows, _ = self._run(
+            {"a": [self._admin(), self._enclave_allow()]},
+            events={"arn:k/a": [[self._event("ev-zero", "A" * 64)]]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ev-zero" in rows[0]["Finding_Details"]
+
+    def test_br55_every_page_of_event_history_is_read(self):
+        _, rows, _ = self._run(
+            {"a": [self._admin(), self._enclave_allow()]},
+            events={
+                "arn:k/a": [
+                    [self._event("ev-1", self.DIGEST)],
+                    [self._event("ev-2", self.ZERO)],
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ev-2" in rows[0]["Finding_Details"]
+
+    def test_br55_unread_event_history_withholds_the_pass(self):
+        _, rows, _ = self._run(
+            {
+                "a": [self._admin(), self._enclave_allow()],
+                "b": [self._admin(), self._enclave_allow()],
+            },
+            events_error={"arn:k/a": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "arn:k/a" not in rows[0]["Finding_Details"]
+        assert (
+            "arn:k/a: its key policy binds attestation, but its CloudTrail event "
+            "history was not read" in rows[1]["Finding_Details"]
+        )
+        assert "cloudtrail:LookupEvents" in rows[1]["Finding_Details"]
+
+    def test_br55_event_history_past_the_page_cap_withholds_the_pass(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "ENCLAVE_EVENT_MAX_PAGES", 1)
+        _, rows, _ = self._run(
+            {"a": [self._admin(), self._enclave_allow()]},
+            events={
+                "arn:k/a": [
+                    [self._event("ev-1", self.DIGEST)],
+                    [self._event("ev-2", self.ZERO)],
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "events past the first 1 page(s) were not read"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_br55_unread_event_history_is_named_beside_a_policy_gap(self):
+        _, rows, _ = self._run(
+            {"a": [self.ROOT, self._enclave_allow()]},
+            events_error={"arn:k/a": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "its CloudTrail event history was not read" in (rows[0]["Finding_Details"])
+        )
 
     def test_br55_rows_pass_the_schema(self):
         _, rows, _ = self._run(

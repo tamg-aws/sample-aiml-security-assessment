@@ -19,6 +19,8 @@ import gzip
 import random
 import re
 import json
+import base64
+import binascii
 from functools import lru_cache
 from schema import create_finding
 
@@ -36519,6 +36521,77 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
     }
 
 
+# LookupEvents pages read per attestation-bound key. At 50 events a page, a key
+# with more events in its 90-day event history is reported as not read in full.
+ENCLAVE_EVENT_MAX_PAGES = 20
+
+
+def _zero_measurement(value: Any) -> bool:
+    """True when an attestation measurement is all zeros, as hex or as base64."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if re.fullmatch(r"0+", text):
+        return True
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    return bool(decoded) and not any(decoded)
+
+
+def _enclave_attestation_events(cloudtrail_client: Any, key_arn: str) -> Dict[str, Any]:
+    """
+    Read the key's CloudTrail event history (LookupEvents by ResourceName) and
+    name each request whose additionalEventData.recipient carries an all-zero
+    attestationDocumentEnclaveImageDigest. KMS records the recipient block
+    only for a request that supplied an attestation document, and an enclave
+    run with --debug-mode or --attach-console presents every PCR as zeros.
+    """
+    read = 0
+    attested = 0
+    zero: List[str] = []
+    names: List[str] = []
+    request = {
+        "LookupAttributes": [
+            {"AttributeKey": "ResourceName", "AttributeValue": key_arn}
+        ],
+        "MaxResults": LOOKUP_EVENTS_PAGE_SIZE,
+    }
+    error = f"events past the first {ENCLAVE_EVENT_MAX_PAGES} page(s) were not read"
+    try:
+        for _ in range(ENCLAVE_EVENT_MAX_PAGES):
+            response = cloudtrail_client.lookup_events(**request)
+            for event in response.get("Events") or []:
+                read += 1
+                record = json.loads(event.get("CloudTrailEvent") or "{}")
+                recipient = (record.get("additionalEventData") or {}).get("recipient")
+                if not isinstance(recipient, dict):
+                    continue
+                attested += 1
+                if _zero_measurement(
+                    recipient.get("attestationDocumentEnclaveImageDigest")
+                ):
+                    zero.append(str(event.get("EventId") or record.get("eventID")))
+                    name = str(event.get("EventName") or record.get("eventName"))
+                    if name not in names:
+                        names.append(name)
+            token = response.get("NextToken")
+            if not token:
+                error = ""
+                break
+            request["NextToken"] = token
+    except (ClientError, BotoCoreError) as lookup_error:
+        error = f"cloudtrail:LookupEvents, {get_assessment_error_label(lookup_error)}"
+    return {
+        "read": read,
+        "attested": attested,
+        "zero": zero,
+        "names": names,
+        "error": error,
+    }
+
+
 def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
     """
     BR-55: For every KMS key whose policy declares a RecipientAttestation
@@ -36548,6 +36621,9 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
             )
 
         kms_client = boto3.client("kms", config=boto3_config, region_name=region)
+        cloudtrail_client = boto3.client(
+            "cloudtrail", config=boto3_config, region_name=region
+        )
         keys = _list_all_items(
             kms_client,
             "list_keys",
@@ -36560,6 +36636,8 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
 
         undeclared = 0
         passed = []
+        events_read = 0
+        events_attested = 0
         indeterminate = []
         for key in keys:
             key_id = key.get("KeyArn") or key.get("KeyId")
@@ -36628,6 +36706,18 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                                 ", ".join(released),
                             )
                         )
+            events = _enclave_attestation_events(cloudtrail_client, key_id)
+            if events["zero"]:
+                deficiencies.append(
+                    "CloudTrail event history records {} request(s) on the key "
+                    "({}) whose attestation document carries an all-zero enclave "
+                    "image digest, which an enclave run with --debug-mode or "
+                    "--attach-console presents: {}".format(
+                        len(events["zero"]),
+                        ", ".join(events["names"]),
+                        ", ".join(events["zero"][:5]),
+                    )
+                )
             if grants_error and not deficiencies:
                 indeterminate.append(
                     f"{key_id}: its key policy binds attestation, but its grants "
@@ -36635,13 +36725,28 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "key material with no attestation"
                 )
                 continue
+            if events["error"] and not deficiencies:
+                indeterminate.append(
+                    f"{key_id}: its key policy binds attestation, but its "
+                    f"CloudTrail event history was not read ({events['error']}), "
+                    "so a request from a debug-mode enclave was not ruled out"
+                )
+                continue
             if grants_error:
                 deficiencies.append(
                     f"its grants were not read ({grants_error}), so a grant "
                     "path was not ruled out"
                 )
+            if events["error"]:
+                deficiencies.append(
+                    f"its CloudTrail event history was not read "
+                    f"({events['error']}), so a request from a debug-mode enclave "
+                    "was not ruled out"
+                )
             if not deficiencies:
                 passed.append(f"{key_id} ({family})")
+                events_read += events["read"]
+                events_attested += events["attested"]
                 continue
             findings["status"] = "WARN"
             findings["csv_data"].append(
@@ -36674,7 +36779,14 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "(kms:ReEncryptFrom), which carries no attestation, is "
                     "allowed only by a statement that requires attestation or "
                     "is refused by a Deny, so no grant or statement releases it "
-                    "unattested: {}.".format(len(passed), ", ".join(passed[:5])),
+                    "unattested. CloudTrail event history (LookupEvents) holds {} "
+                    "event(s) on these keys, {} with an attestation document, and "
+                    "none whose enclave image digest is all zeros: {}.".format(
+                        len(passed),
+                        events_read,
+                        events_attested,
+                        ", ".join(passed[:5]),
+                    ),
                     "No action required",
                     "High",
                     "Passed",

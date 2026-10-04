@@ -2391,7 +2391,12 @@ FOUNDATION_ROWS = [
         "through a single-test Deny, because the image file is not secret, so a "
         "PCR3-only pin fails. A Deny narrowed by another condition key is not credited. Every "
         "grant is read, and a grant of the five operations fails the key unless a "
-        "Deny covers it; unread grants are N/A. Which workloads must be "
+        "Deny covers it; unread grants are N/A. Each enclave-bound key's CloudTrail "
+        "event history is read with LookupEvents by the key ARN, every page up to "
+        "20, and a request whose additionalEventData.recipient carries an all-zero "
+        "attestationDocumentEnclaveImageDigest, which a debug-mode or "
+        "--attach-console enclave presents, fails the key; an unread or capped "
+        "history is N/A. Which workloads must be "
         "enclave-bound is the customer's decision, and no API records it, so a key "
         "without the condition is never failed",
         [],
