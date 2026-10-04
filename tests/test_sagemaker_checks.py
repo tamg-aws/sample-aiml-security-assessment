@@ -12964,6 +12964,34 @@ class TestSM39StandaloneTaskAndMicrovmSegmentation:
         assert "Lambda MicroVM mvm-open" in details
         assert "default internet egress" in details
 
+    def test_a_microvm_from_an_aws_managed_image_is_read_and_judged(self):
+        # AWS-managed images carry the account segment aws (live
+        # ListManagedMicrovmImages, 2026-10-04); the account segment gates no
+        # judgment, so each MicroVM is judged on its own connector.
+        sg = TestSM39WorkloadSegmentation._sg
+        managed = "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"
+        rows = self.suite._run(
+            microvms=[
+                _microvm("mvm-aws", ["nc-open"], imageArn=managed),
+                _microvm("mvm-own", ["nc-ok"]),
+            ],
+            connectors={
+                "nc-open": {"SecurityGroupIds": ["sg-n"]},
+                "nc-ok": {"SecurityGroupIds": ["sg-m"]},
+            },
+            groups=[sg("sg-m"), sg("sg-n", egress=[self.OPEN])],
+        )
+        seg = self._seg(rows)
+        assert [r["Status"] for r in seg] == ["Failed"]
+        assert (
+            "Lambda network connector nc-open (egress of 1 MicroVM(s): mvm-aws)"
+            in seg[0]["Finding_Details"]
+        )
+        assert "nc-ok" not in seg[0]["Finding_Details"]
+        ingress = self._ingress(rows)
+        assert [r["Status"] for r in ingress] == ["Passed"]
+        assert "All 2 Lambda MicroVM(s)" in ingress[0]["Finding_Details"]
+
     def test_an_ended_microvm_is_not_judged(self):
         rows = self.suite._run(microvms=[_microvm("mvm-gone", state="TERMINATED")])
         assert [r["Status"] for r in self._seg(rows)] == ["N/A"]

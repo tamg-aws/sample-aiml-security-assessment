@@ -7,6 +7,7 @@ the reviewed action inventory for each SAM resource and verifies that both
 single- and multi-account runtime templates stay synchronized with it.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -1619,7 +1620,16 @@ _SAGEMAKER_MANAGED_GRANTS_2 = [
     (
         "Allow",
         "lambda:GetMicrovm",
-        _sagemaker_policy2_arn("lambda:*:ACCOUNT:microvm-image:*"),
+        json.dumps(
+            [
+                {
+                    "Fn::Sub": "arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:"
+                    "microvm-image:*"
+                },
+                {"Fn::Sub": "arn:${AWS::Partition}:lambda:*:aws:microvm-image:*"},
+            ],
+            sort_keys=True,
+        ),
         None,
     ),
     (
@@ -1742,6 +1752,37 @@ def test_sagemaker_managed_policy_2_is_attached_only_to_the_sagemaker_function(
     ]
     assert references == [{"Fn::Ref": "SageMakerAssessmentReadsPolicy2"}]
     assert not _references(data.get("Outputs", {}), "SageMakerAssessmentReadsPolicy2")
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+@pytest.mark.parametrize(
+    ("image_arn", "reached"),
+    [
+        # An AWS-managed image (live ListManagedMicrovmImages, 2026-10-04).
+        ("arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1", True),
+        ("arn:aws:lambda:us-east-1:123456789012:microvm-image:agent", True),
+        ("arn:aws:lambda:us-east-1:444455556666:microvm-image:agent", False),
+    ],
+)
+def test_sagemaker_get_microvm_reaches_aws_managed_images(template, image_arn, reached):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    statements = data["Resources"]["SageMakerAssessmentReadsPolicy2"]["Properties"][
+        "PolicyDocument"
+    ]["Statement"]
+    statement = next(s for s in statements if s["Sid"] == "MicrovmRead")
+    assert statement["Action"] == ["lambda:GetMicrovm"]
+    resource = statement["Resource"]
+    # A single Resource renders to one string, which must not be iterated by
+    # character: a lone "*" character would match every ARN.
+    patterns = _render_policy_intrinsics(
+        resource if isinstance(resource, list) else [resource], "aws"
+    )
+    assert all(isinstance(pattern, str) and len(pattern) > 1 for pattern in patterns)
+    assert (
+        any(fnmatch.fnmatchcase(image_arn, pattern) for pattern in patterns) is reached
+    )
 
 
 def test_sagemaker_managed_policy_2_is_identical_in_both_templates():

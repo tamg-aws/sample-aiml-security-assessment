@@ -1287,11 +1287,14 @@ Resources:
             Resource: '*'
           - Sid: MicrovmRead
             # SM-39 reads each MicroVM's network connectors. GetMicrovm has the
-            # microvmImage resource type.
+            # microvmImage resource type, and an AWS-managed image carries the
+            # account segment aws.
             Effect: Allow
             Action:
               - lambda:GetMicrovm # SM-39
-            Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
+              - !Sub 'arn:${AWS::Partition}:lambda:*:aws:microvm-image:*'
           - Sid: MicrovmNetworkConnectorRead
             # SM-39 reads the subnets and security groups of each MicroVM
             # egress connector.
