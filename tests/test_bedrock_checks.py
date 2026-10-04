@@ -21447,6 +21447,82 @@ INVOCATION_LOGGING = {
 }
 
 
+BR32_FORWARDED = [
+    {
+        "filterName": "to-siem",
+        "destinationArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/siem",
+    }
+]
+
+
+def _br32_guardrail_selector(*extra_fields, types=("AWS::Bedrock::Guardrail",)):
+    return {
+        "Name": "guardrail-calls",
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": ["Data"]},
+            {"Field": "resources.type", "Equals": list(types)},
+            *extra_fields,
+        ],
+    }
+
+
+def _br32_trail(name, selectors=None, multi=True, home="us-east-1", logging=True):
+    return {
+        "name": name,
+        "multi": multi,
+        "home": home,
+        "logging": logging,
+        "selectors": [_br32_guardrail_selector()] if selectors is None else selectors,
+    }
+
+
+def _br32_cloudtrail(trails=(), stores=(), denied=()):
+    """A CloudTrail client holding the given trails and event data stores."""
+    by_arn = {
+        f"arn:aws:cloudtrail:us-east-1:123456789012:trail/{t['name']}": t
+        for t in trails
+    }
+    client = MagicMock()
+    client.list_trails.return_value = {
+        "Trails": [{"TrailARN": arn, "Name": t["name"]} for arn, t in by_arn.items()]
+    }
+    client.get_trail.side_effect = lambda Name: {
+        "Trail": {
+            "IsMultiRegionTrail": by_arn[Name]["multi"],
+            "HomeRegion": by_arn[Name]["home"],
+        }
+    }
+    client.get_trail_status.side_effect = lambda Name: {
+        "IsLogging": by_arn[Name]["logging"]
+    }
+
+    def selectors(TrailName):
+        if by_arn[TrailName]["name"] in denied:
+            raise ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                "GetEventSelectors",
+            )
+        return {"AdvancedEventSelectors": by_arn[TrailName]["selectors"]}
+
+    client.get_event_selectors.side_effect = selectors
+    store_arns = {
+        f"arn:aws:cloudtrail:us-east-1:123456789012:eventdatastore/{store['name']}": store
+        for store in stores
+    }
+    client.list_event_data_stores.return_value = {
+        "EventDataStores": [
+            {"EventDataStoreArn": arn, "Name": store["name"]}
+            for arn, store in store_arns.items()
+        ]
+    }
+    client.get_event_data_store.side_effect = lambda EventDataStore: {
+        "Status": store_arns[EventDataStore]["status"],
+        "MultiRegionEnabled": False,
+        "AdvancedEventSelectors": store_arns[EventDataStore]["selectors"],
+    }
+    return client
+
+
 def _intervened_alarm(
     name, actions_enabled=True, actions=True, metric="InvocationsIntervened", **fields
 ):
@@ -21523,6 +21599,7 @@ class TestBR32ActingIntervention:
         logging_config=INVOCATION_LOGGING,
         subscriptions=None,
         versions=None,
+        cloudtrail=None,
     ):
         cw_client = MagicMock()
         paginator = MagicMock()
@@ -21564,10 +21641,15 @@ class TestBR32ActingIntervention:
             "subscriptionFilters": subscriptions or []
         }
 
+        self.logs_client = logs_client
+        cloudtrail_client = cloudtrail or _br32_cloudtrail()
+
         def factory(service, **kwargs):
-            return {"bedrock": bedrock_client, "logs": logs_client}.get(
-                service, cw_client
-            )
+            return {
+                "bedrock": bedrock_client,
+                "logs": logs_client,
+                "cloudtrail": cloudtrail_client,
+            }.get(service, cw_client)
 
         with patch("bedrock_app.boto3.client", side_effect=factory):
             findings = extract_csv_data(
@@ -21978,7 +22060,9 @@ class TestBR32ActingIntervention:
                     "all",
                     Dimensions=[{"Name": "Operation", "Value": "ApplyGuardrail"}],
                 )
-            ]
+            ],
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail([_br32_trail("org-trail")]),
         )
         assert signal["Status"] == "Passed"
         assert (
@@ -22042,6 +22126,8 @@ class TestBR32ActingIntervention:
                 _version_alarm("g2-v4", "gr-2", "4"),
             ],
             versions={"gr-1": ["DRAFT", "1"], "gr-2": ["DRAFT", "4"]},
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail([_br32_trail("org-trail")]),
         )
         assert signal["Status"] == "Passed"
         assert (
@@ -22388,6 +22474,257 @@ class TestBR32ActingIntervention:
             "No subscription filter forwards log group '/aws/bedrock/invocations'"
             in signal["Finding_Details"]
         )
+
+    OPERATION_ALARM = _intervened_alarm(
+        "all", Dimensions=[{"Name": "Operation", "Value": "ApplyGuardrail"}]
+    )
+
+    @pytest.mark.parametrize(
+        "forwarded, recorded, status",
+        [
+            (True, True, "Passed"),
+            (False, True, "Failed"),
+            (True, False, "Failed"),
+            (False, False, "Failed"),
+        ],
+    )
+    def test_an_acting_alarm_needs_forwarding_and_a_guardrail_trail(
+        self, forwarded, recorded, status
+    ):
+        _, signal = self._run(
+            [self.OPERATION_ALARM],
+            subscriptions=BR32_FORWARDED if forwarded else None,
+            cloudtrail=_br32_cloudtrail(
+                [
+                    _br32_trail(
+                        "org-trail",
+                        selectors=None
+                        if recorded
+                        else [
+                            _br32_guardrail_selector(types=["AWS::Bedrock::AgentAlias"])
+                        ],
+                    )
+                ]
+            ),
+        )
+        assert signal["Status"] == status
+        details = signal["Finding_Details"]
+        forwarding_gap = (
+            "no subscription filter forwards invocation log group "
+            "'/aws/bedrock/invocations' to a SIEM"
+        )
+        trail_gap = (
+            "no logging trail or enabled event data store records every "
+            "AWS::Bedrock::Guardrail data event in this Region"
+        )
+        assert (forwarding_gap in details) is not forwarded
+        assert (trail_gap in details) is not recorded
+        assert ("Add a subscription filter" in signal["Resolution"]) is not forwarded
+        assert (
+            "Record AWS::Bedrock::Guardrail data events" in signal["Resolution"]
+        ) is not recorded
+        if recorded:
+            assert (
+                "AWS::Bedrock::Guardrail data events, which record ApplyGuardrail "
+                "including the guardrail evaluations made during model invocation, "
+                "are recorded in full by trail org-trail." in details
+            )
+
+    def test_every_version_alarmed_still_needs_the_record_legs(self):
+        self.guardrails = {
+            "items": [{"summary": {"id": "gr-1", "arn": _br32_guardrail_arn("gr-1")}}],
+            "errors": [],
+            "list_error": None,
+        }
+        _, signal = self._run(
+            [_version_alarm("g1-draft", "gr-1", "DRAFT")],
+            versions={"gr-1": ["DRAFT"]},
+            cloudtrail=_br32_cloudtrail([_br32_trail("org-trail")]),
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "every one of the 1 guardrail version(s) defined or applied in this "
+            "Region" in signal["Finding_Details"]
+        )
+        assert (
+            "This is not reported as Passed, because no subscription filter "
+            "forwards invocation log group" in signal["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "trails, denied, status, text",
+        [
+            (
+                [
+                    _br32_trail(
+                        "narrow",
+                        selectors=[
+                            _br32_guardrail_selector(
+                                {"Field": "eventName", "Equals": ["ApplyGuardrail"]}
+                            )
+                        ],
+                    ),
+                    _br32_trail("stopped", logging=False),
+                    _br32_trail("elsewhere", multi=False, home="eu-west-1"),
+                ],
+                (),
+                "Failed",
+                "(trail narrow narrows it by eventName, which records a subset of "
+                "the calls)",
+            ),
+            (
+                [
+                    _br32_trail(
+                        "narrow",
+                        selectors=[
+                            _br32_guardrail_selector(
+                                {"Field": "readOnly", "Equals": ["false"]}
+                            )
+                        ],
+                    ),
+                    _br32_trail("locked"),
+                ],
+                ("locked",),
+                "N/A",
+                "whether a trail or event data store records AWS::Bedrock::Guardrail "
+                "data events was not read: trail locked (AccessDenied",
+            ),
+            (
+                [_br32_trail("locked"), _br32_trail("org-trail")],
+                ("locked",),
+                "Passed",
+                "are recorded in full by trail org-trail.",
+            ),
+            (
+                [
+                    _br32_trail(
+                        "mixed",
+                        selectors=[
+                            _br32_guardrail_selector(
+                                types=[
+                                    "AWS::Bedrock::AgentAlias",
+                                    "AWS::Bedrock::Guardrail",
+                                ]
+                            )
+                        ],
+                    )
+                ],
+                (),
+                "Passed",
+                "are recorded in full by trail mixed.",
+            ),
+        ],
+    )
+    def test_the_guardrail_trail_is_judged_by_value_across_every_trail(
+        self, trails, denied, status, text
+    ):
+        _, signal = self._run(
+            [self.OPERATION_ALARM],
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail(trails, denied=denied),
+        )
+        assert signal["Status"] == status
+        assert text in signal["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "status_value, expected",
+        [("ENABLED", "Passed"), ("STOPPED_INGESTION", "Failed")],
+    )
+    def test_an_event_data_store_can_record_guardrail_calls(
+        self, status_value, expected
+    ):
+        _, signal = self._run(
+            [self.OPERATION_ALARM],
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail(
+                stores=[
+                    {
+                        "name": "lake",
+                        "status": status_value,
+                        "selectors": [_br32_guardrail_selector()],
+                    }
+                ]
+            ),
+        )
+        assert signal["Status"] == expected
+        assert (
+            "recorded in full by event data store lake." in signal["Finding_Details"]
+        ) is (expected == "Passed")
+
+    def test_an_unread_trail_list_holds_the_pass(self):
+        cloudtrail = _br32_cloudtrail()
+        cloudtrail.list_trails.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "x"}}, "ListTrails"
+        )
+        _, signal = self._run(
+            [self.OPERATION_ALARM], subscriptions=BR32_FORWARDED, cloudtrail=cloudtrail
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            "CloudTrail trails (cloudtrail:ListTrails: AccessDenied"
+            in signal["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "logging_config, error, status, text",
+        [
+            (
+                INVOCATION_LOGGING,
+                True,
+                "N/A",
+                "because the subscription filters on log group "
+                "'/aws/bedrock/invocations' were not read",
+            ),
+            (
+                {
+                    "s3Config": {"bucketName": "invocation-logs"},
+                    "textDataDeliveryEnabled": True,
+                },
+                False,
+                "N/A",
+                "invocation logs go only to S3 bucket invocation-logs, and whether a "
+                "reader forwards them from there to a SIEM is not read",
+            ),
+            (
+                dict(INVOCATION_LOGGING, s3Config={"bucketName": "invocation-logs"}),
+                False,
+                "N/A",
+                "no subscription filter forwards invocation log group "
+                "'/aws/bedrock/invocations', and whether a reader forwards the copy "
+                "in S3 bucket invocation-logs to a SIEM is not read",
+            ),
+            (
+                {},
+                False,
+                "Failed",
+                "model invocation logging is off, so no request, response or "
+                "guardrail trace of an inference is recorded",
+            ),
+        ],
+    )
+    def test_forwarding_is_judged_on_every_logging_shape(
+        self, logging_config, error, status, text
+    ):
+        cloudtrail = _br32_cloudtrail([_br32_trail("org-trail")])
+        if error:
+            with patch.object(
+                bedrock_app,
+                "_describe_log_forwarding",
+                return_value=("unread", "The subscription filters were not read."),
+            ):
+                _, signal = self._run(
+                    [self.OPERATION_ALARM],
+                    logging_config=logging_config,
+                    cloudtrail=cloudtrail,
+                )
+        else:
+            _, signal = self._run(
+                [self.OPERATION_ALARM],
+                logging_config=logging_config,
+                cloudtrail=cloudtrail,
+            )
+        assert signal["Status"] == status
+        assert text in signal["Finding_Details"]
 
     def test_every_row_names_the_apply_guardrail_ceiling(self):
         _, signal = self._run([_intervened_alarm("paged")])

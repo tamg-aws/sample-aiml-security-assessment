@@ -320,7 +320,7 @@ Resources:
             # type and is granted on '*' in the function's inline policy.
             Effect: Allow
             Action:
-              - cloudtrail:GetEventDataStore # BR-06
+              - cloudtrail:GetEventDataStore # BR-06, BR-32
             Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
           - Sid: BedrockIngestionJobList
             # BR-46 reads when each knowledge base data source last ingested.
@@ -678,11 +678,11 @@ Resources:
                 # Former Sid ResourceTagRead.
                 - tag:GetResources # BR-53
                 # Former Sid CloudTrailPermissions.
-                - cloudtrail:ListTrails # BR-06
-                - cloudtrail:GetTrail # BR-06
-                - cloudtrail:GetEventSelectors # BR-06
-                - cloudtrail:GetTrailStatus # BR-06
-                - cloudtrail:ListEventDataStores # BR-06
+                - cloudtrail:ListTrails # BR-06, BR-32
+                - cloudtrail:GetTrail # BR-06, BR-32
+                - cloudtrail:GetEventSelectors # BR-06, BR-32
+                - cloudtrail:GetTrailStatus # BR-06, BR-32
+                - cloudtrail:ListEventDataStores # BR-06, BR-32
                 # Former Sid CloudTrailEventHistoryRead.
                 - cloudtrail:LookupEvents # BR-04, BR-06, BR-32, BR-43, BR-56
                 # Former Sid LambdaInventoryPermissions.

@@ -979,6 +979,62 @@ MUTATIONS = [
         "replace": '                    "subnets": (function.get("VpcConfig") or {}).get("SubnetIdz")\n',
     },
     {
+        "name": "BR-32 passes an acting alarm with no log forwarding",
+        "file": BEDROCK,
+        "defect": "BR-32 passes an acting intervention alarm while no subscription filter forwards the invocation log group",
+        "find": '        elif forwarding_state == "none":\n',
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "BR-32 reads a log group beside S3 as unforwarded",
+        "file": BEDROCK,
+        "defect": "BR-32 fails a log group with no subscription filter whose logs also go to S3, though forwarding from the S3 copy is not read",
+        "find": '        if forwarding_state == "none" and log_bucket:\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-32 credits a trail that records another Region",
+        "file": BEDROCK,
+        "defect": "BR-32 credits a single-Region trail homed in another Region with recording this Region's guardrail calls",
+        "find": '            records_region = trail_config.get("IsMultiRegionTrail") or (\n',
+        "replace": "            records_region = True or (\n",
+    },
+    {
+        "name": "BR-32 credits a trail that is not logging",
+        "file": BEDROCK,
+        "defect": "BR-32 credits a stopped trail with recording guardrail calls",
+        "find": '            if not client.get_trail_status(Name=trail_arn).get("IsLogging", False):\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-32 credits a narrowed guardrail selector",
+        "file": BEDROCK,
+        "defect": "BR-32 credits a trail whose AWS::Bedrock::Guardrail selector is narrowed by eventName or readOnly, which records a subset of the calls",
+        "find": "        if GUARDRAIL_DATA_EVENT_TYPE in credited:\n",
+        "replace": "        if GUARDRAIL_DATA_EVENT_TYPE in credited or GUARDRAIL_DATA_EVENT_TYPE in narrowed:\n",
+    },
+    {
+        "name": "BR-32 ignores event data stores for guardrail calls",
+        "file": BEDROCK,
+        "defect": "BR-32 fails a Region whose enabled event data store records every AWS::Bedrock::Guardrail data event",
+        "find": '    state["recorders"].extend(stores["credited"].get(GUARDRAIL_DATA_EVENT_TYPE, []))\n',
+        "replace": '    state["recorders"].extend(stores["credited"].get("AWS::Bedrock::Guardrailz", []))\n',
+    },
+    {
+        "name": "BR-32 passes beside an unread record leg",
+        "file": BEDROCK,
+        "defect": "BR-32 passes an acting alarm while the subscription filters, the trails or the event data stores were not read",
+        "find": "        if record_unread:\n            return row(\n",
+        "replace": "        if False:\n            return row(\n",
+    },
+    {
+        "name": "BR-32 drops an unread trail list",
+        "file": BEDROCK,
+        "defect": "BR-32 fails, and does not hold, a Region whose trail list could not be read",
+        "find": '        state["unread"].append(\n            f"CloudTrail trails (cloudtrail:ListTrails: "\n',
+        "replace": '        [].append(\n            f"CloudTrail trails (cloudtrail:ListTrails: "\n',
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2738,6 +2794,28 @@ GROUPS: dict[str, str] = {
     "BR-02 drops the subnets of a Lambda workload": (
         "in the Bedrock workload route tables"
     ),
+    "BR-32 passes an acting alarm with no log forwarding": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 reads a log group beside S3 as unforwarded": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 credits a trail that records another Region": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 credits a trail that is not logging": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 credits a narrowed guardrail selector": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 ignores event data stores for guardrail calls": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 passes beside an unread record leg": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 drops an unread trail list": ("in the Bedrock guardrail record legs"),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

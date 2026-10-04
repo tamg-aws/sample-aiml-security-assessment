@@ -19296,26 +19296,30 @@ def _notifying_alarm_names(
     return notifying
 
 
-def _get_invocation_log_group_name(region: str = "") -> Tuple[Optional[str], Any]:
+def _get_invocation_log_group_name(
+    region: str = "",
+) -> Tuple[Optional[str], Any, Optional[str]]:
     """
-    Return the CloudWatch log group that receives Bedrock invocation logs, and
-    textDataDeliveryEnabled as returned (None when absent).
+    Return the CloudWatch log group that receives Bedrock invocation logs,
+    textDataDeliveryEnabled as returned (None when absent), and the S3 bucket
+    that receives them.
     """
     client = boto3.client("bedrock", config=boto3_config, region_name=region)
     response = client.get_model_invocation_logging_configuration()
     if not isinstance(response, dict):
-        return None, None
+        return None, None, None
     logging_config = response.get("loggingConfig")
     if not isinstance(logging_config, dict):
-        return None, None
+        return None, None, None
     text_delivery = logging_config.get("textDataDeliveryEnabled")
+    bucket_name = _extract_s3_bucket_name(logging_config.get("s3Config"))
     cloudwatch_config = logging_config.get("cloudWatchConfig")
     if not isinstance(cloudwatch_config, dict):
-        return None, text_delivery
+        return None, text_delivery, bucket_name
     log_group_name = cloudwatch_config.get("logGroupName")
     if isinstance(log_group_name, str) and log_group_name:
-        return log_group_name, text_delivery
-    return None, text_delivery
+        return log_group_name, text_delivery, bucket_name
+    return None, text_delivery, bucket_name
 
 
 def _find_guardrail_intervention_metric_filters(
@@ -19371,8 +19375,11 @@ def _find_guardrail_intervention_metric_filters(
     return {"matched": matched, "rejected": rejected}
 
 
-def _describe_log_forwarding(log_group_name: str, region: str = "") -> str:
-    """Report the subscription filters that forward a log group, as evidence only."""
+def _describe_log_forwarding(log_group_name: str, region: str = "") -> Tuple[str, str]:
+    """
+    Read the subscription filters that forward a log group, and return the state
+    ("forwarded", "none" or "unread") with the text that reports it.
+    """
     try:
         client = boto3.client("logs", config=boto3_config, region_name=region)
         destinations = []
@@ -19393,21 +19400,98 @@ def _describe_log_forwarding(log_group_name: str, region: str = "") -> str:
                 break
             request["nextToken"] = next_token
     except (ClientError, BotoCoreError, TypeError) as error:
-        return (
+        return "unread", (
             f"The subscription filters on log group '{log_group_name}' were not read "
             f"(logs:DescribeSubscriptionFilters: {get_assessment_error_label(error)}), "
             "so forwarding to a SIEM is not reported."
         )
     if destinations:
-        return (
+        return "forwarded", (
             f"Log group '{log_group_name}' is forwarded by subscription filter(s) "
             f"{'; '.join(sorted(destinations))}. Whether the destination is a "
             "reviewed SIEM is not read."
         )
-    return (
+    return "none", (
         f"No subscription filter forwards log group '{log_group_name}'; forwarding "
         "from the S3 logging destination or by a reader of the log group is not read."
     )
+
+
+GUARDRAIL_DATA_EVENT_TYPE = "AWS::Bedrock::Guardrail"
+
+
+def _guardrail_data_event_recording(region: str) -> Dict[str, List[str]]:
+    """
+    Name the logging trails and enabled event data stores that record every
+    AWS::Bedrock::Guardrail data event in this Region, those whose selector
+    narrows the type, and what was not read.
+
+    AWS records ApplyGuardrail, including the guardrail evaluations made during
+    model invocation, only as a data event of this resource type
+    (logging-using-cloudtrail).
+    """
+    state: Dict[str, List[str]] = {"recorders": [], "narrowed": [], "unread": []}
+    client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
+    try:
+        trails = _list_all_items(
+            client,
+            "list_trails",
+            "Trails",
+            max_results_param=None,
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        state["unread"].append(
+            f"CloudTrail trails (cloudtrail:ListTrails: "
+            f"{get_assessment_error_label(error)})"
+        )
+        trails = []
+    for trail in trails:
+        trail_arn = trail.get("TrailARN") if isinstance(trail, dict) else None
+        trail_name = (trail.get("Name") if isinstance(trail, dict) else None) or (
+            trail_arn or "unnamed"
+        )
+        try:
+            if not trail_arn:
+                raise TypeError("ListTrails returned no TrailARN")
+            trail_config = client.get_trail(Name=trail_arn)["Trail"]
+            records_region = trail_config.get("IsMultiRegionTrail") or (
+                trail_config.get("HomeRegion") == region
+            )
+            if not records_region:
+                continue
+            if not client.get_trail_status(Name=trail_arn).get("IsLogging", False):
+                continue
+            selectors = client.get_event_selectors(TrailName=trail_arn)
+            if not isinstance(selectors, dict):
+                raise TypeError("GetEventSelectors returned no document")
+        except (ClientError, BotoCoreError, TypeError, KeyError) as error:
+            state["unread"].append(
+                f"trail {trail_name} ({get_assessment_error_label(error)})"
+            )
+            continue
+        credited, narrowed = _trail_data_event_coverage(
+            selectors.get("AdvancedEventSelectors", [])
+        )
+        if GUARDRAIL_DATA_EVENT_TYPE in credited:
+            state["recorders"].append(f"trail {trail_name}")
+        elif GUARDRAIL_DATA_EVENT_TYPE in narrowed:
+            state["narrowed"].append(
+                f"trail {trail_name} narrows it by "
+                f"{', '.join(sorted(set(narrowed[GUARDRAIL_DATA_EVENT_TYPE])))}"
+            )
+    stores = _assessed_event_data_store_coverage(client, region)
+    state["recorders"].extend(stores["credited"].get(GUARDRAIL_DATA_EVENT_TYPE, []))
+    if GUARDRAIL_DATA_EVENT_TYPE in stores["narrowed"]:
+        state["narrowed"].append(
+            "an event data store narrows it by "
+            f"{', '.join(sorted(set(stores['narrowed'][GUARDRAIL_DATA_EVENT_TYPE])))}"
+        )
+    store_unread = _event_data_store_unread(stores)
+    if store_unread:
+        state["unread"].append(store_unread.rstrip("."))
+    return state
 
 
 def _apply_guardrail_called(region: str = "") -> Optional[bool]:
@@ -19822,10 +19906,13 @@ def _guardrail_intervention_signal_finding(
 
     log_group_name = None
     text_delivery = None
+    log_bucket = None
     filters = {"matched": [], "rejected": []}
     signal_error = None
     try:
-        log_group_name, text_delivery = _get_invocation_log_group_name(region)
+        log_group_name, text_delivery, log_bucket = _get_invocation_log_group_name(
+            region
+        )
         if log_group_name:
             filters = _find_guardrail_intervention_metric_filters(
                 log_group_name, region
@@ -19878,9 +19965,88 @@ def _guardrail_intervention_signal_finding(
         if f["reason"]
     )
     gap_text = f" Not credited: {'; '.join(gaps)}." if gaps else ""
-    forwarding = (
-        " " + _describe_log_forwarding(log_group_name, region) if log_group_name else ""
+    # The intervention record must reach monitoring as well as an alarm: the
+    # invocation log forwarded off the log group, and ApplyGuardrail recorded
+    # by CloudTrail. An unmet leg fails an acting alarm; an unread one holds it.
+    record_failed = []
+    record_unread = []
+    forwarding = ""
+    if log_group_name:
+        forwarding_state, forwarding_text = _describe_log_forwarding(
+            log_group_name, region
+        )
+        forwarding = " " + forwarding_text
+        if forwarding_state == "none" and log_bucket:
+            record_unread.append(
+                f"no subscription filter forwards invocation log group '{log_group_name}', and whether a reader forwards the copy in S3 bucket {log_bucket} to a SIEM is not read"
+            )
+        elif forwarding_state == "none":
+            record_failed.append(
+                (
+                    f"no subscription filter forwards invocation log group '{log_group_name}' to a SIEM",
+                    f"Add a subscription filter that forwards log group '{log_group_name}' to the SIEM.",
+                )
+            )
+        elif forwarding_state == "unread":
+            record_unread.append(
+                f"the subscription filters on log group '{log_group_name}' were not read"
+            )
+    elif signal_error is not None:
+        record_unread.append(
+            "whether invocation logs are forwarded was not read, because the model invocation logging configuration was not read"
+        )
+    elif log_bucket:
+        record_unread.append(
+            f"invocation logs go only to S3 bucket {log_bucket}, and whether a reader forwards them from there to a SIEM is not read"
+        )
+    else:
+        record_failed.append(
+            (
+                "model invocation logging is off, so no request, response or guardrail trace of an inference is recorded",
+                "Turn on model invocation logging with a CloudWatch Logs destination and forward the log group to the SIEM.",
+            )
+        )
+    recording = _guardrail_data_event_recording(region)
+    narrowed_note = (
+        f" ({'; '.join(recording['narrowed'])}, which records a subset of the calls)"
+        if recording["narrowed"]
+        else ""
     )
+    if recording["recorders"]:
+        forwarding += (
+            f" {GUARDRAIL_DATA_EVENT_TYPE} data events, which record ApplyGuardrail "
+            "including the guardrail evaluations made during model invocation, are "
+            f"recorded in full by {', '.join(sorted(recording['recorders']))}."
+        )
+    elif recording["unread"]:
+        record_unread.append(
+            f"whether a trail or event data store records {GUARDRAIL_DATA_EVENT_TYPE} data events was not read: {'; '.join(recording['unread'])}{narrowed_note}"
+        )
+    else:
+        record_failed.append(
+            (
+                f"no logging trail or enabled event data store records every {GUARDRAIL_DATA_EVENT_TYPE} data event in this Region{narrowed_note}, so ApplyGuardrail calls, including the guardrail evaluations made during model invocation, are not in CloudTrail",
+                f"Record {GUARDRAIL_DATA_EVENT_TYPE} data events with an advanced event selector on a logging trail or event data store, with no field beyond eventCategory and resources.type.",
+            )
+        )
+
+    def acting_alarm_row(details: str, resolution: str) -> Dict[str, Any]:
+        """Pass an acting alarm only when the record legs are met and read."""
+        if record_failed:
+            return row(
+                f"{details} This is not reported as Passed, because {'; and '.join(gap for gap, _ in record_failed)}.{gap_text}{forwarding}",
+                " ".join(fix for _, fix in record_failed),
+                "Medium",
+                "Failed",
+            )
+        if record_unread:
+            return row(
+                f"{details} This is not reported as Passed, because {'; and '.join(record_unread)}.{gap_text}{forwarding}",
+                "Grant the named reads and retry before concluding that the guardrail intervention record reaches monitoring.",
+                "Informational",
+                "N/A",
+            )
+        return row(f"{details}{gap_text}{forwarding}", resolution, "Low", "Passed")
 
     observed = []
     if alarmed_filters:
@@ -19888,15 +20054,13 @@ def _guardrail_intervention_signal_finding(
             f"metric filter(s) on log group '{log_group_name}' selecting INTERVENED with an acting alarm: {', '.join(sorted(alarmed_filters))}"
         )
 
-    resolution = "Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace with the single dimension Operation=ApplyGuardrail, statistic Sum, threshold GreaterThanOrEqualToThreshold 1 and an enabled alarm action; it counts the interventions of direct ApplyGuardrail calls and of guardrails applied during model invocation. Forward the invocation logs to the SIEM."
+    resolution = "Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace with the single dimension Operation=ApplyGuardrail, statistic Sum, threshold GreaterThanOrEqualToThreshold 1 and an enabled alarm action; it counts the interventions of direct ApplyGuardrail calls and of guardrails applied during model invocation. Forward the invocation logs to the SIEM, and record AWS::Bedrock::Guardrail data events in CloudTrail."
     metric_resolution = "Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace with the single dimension Operation=ApplyGuardrail, or with GuardrailArn and GuardrailVersion for every guardrail version including DRAFT, each with statistic Sum, threshold GreaterThanOrEqualToThreshold 1 and an enabled alarm action."
 
     if operation_alarms:
-        return row(
-            f"{scope_text} Guardrail interventions reach an acting alarm: alarm {', '.join(operation_alarms)} evaluates {GUARDRAIL_INTERVENTION_METRIC} under Operation ApplyGuardrail alone. ApplyGuardrail is the one Operation value {GUARDRAIL_METRIC_NAMESPACE} publishes, and AWS counts the guardrail evaluations made during model invocation as ApplyGuardrail calls (logging-using-cloudtrail), so the alarm counts the interventions of every guardrail evaluated in this Region.{GUARDRAIL_METRIC_ACCOUNT_EDGE}{gap_text}{forwarding}",
+        return acting_alarm_row(
+            f"{scope_text} Guardrail interventions reach an acting alarm: alarm {', '.join(operation_alarms)} evaluates {GUARDRAIL_INTERVENTION_METRIC} under Operation ApplyGuardrail alone. ApplyGuardrail is the one Operation value {GUARDRAIL_METRIC_NAMESPACE} publishes, and AWS counts the guardrail evaluations made during model invocation as ApplyGuardrail calls (logging-using-cloudtrail), so the alarm counts the interventions of every guardrail evaluated in this Region.{GUARDRAIL_METRIC_ACCOUNT_EDGE}",
             "No action required. Confirm the alarm action reaches the security monitoring destination that is reviewed.",
-            "Low",
-            "Passed",
         )
     if version_alarms:
         population, version_errors = _guardrail_version_population(
@@ -19904,11 +20068,9 @@ def _guardrail_intervention_signal_finding(
         )
         uncovered = sorted(population - set(version_alarms))
         if population and not uncovered and not version_errors and not unjudged:
-            return row(
-                f"{scope_text} Guardrail interventions reach an acting alarm: every one of the {len(population)} guardrail version(s) defined or applied in this Region, DRAFT included, has an acting alarm on {GUARDRAIL_INTERVENTION_METRIC} with that GuardrailArn and GuardrailVersion ({', '.join(sorted(version_alarms[key] for key in population))}).{GUARDRAIL_METRIC_ACCOUNT_EDGE}{gap_text}{forwarding}",
+            return acting_alarm_row(
+                f"{scope_text} Guardrail interventions reach an acting alarm: every one of the {len(population)} guardrail version(s) defined or applied in this Region, DRAFT included, has an acting alarm on {GUARDRAIL_INTERVENTION_METRIC} with that GuardrailArn and GuardrailVersion ({', '.join(sorted(version_alarms[key] for key in population))}).{GUARDRAIL_METRIC_ACCOUNT_EDGE}",
                 "No action required. Add a per-version alarm whenever a guardrail version is created, or alarm on Operation=ApplyGuardrail instead.",
-                "Low",
-                "Passed",
             )
         version_scoped.extend(
             f"no acting alarm counts {arn} version {version}"
