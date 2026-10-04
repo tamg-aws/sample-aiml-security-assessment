@@ -44137,17 +44137,83 @@ class TestAC45WholePopulation:
             ("arn:aws:dynamodb:*:123456789012:table/orders", True),
             ("arn:aws:dynamodb:us-east-1:*:table/orders", True),
             ("arn:aws:logs:us-east-1:123456789012:log-group:/*", True),
-            ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/tool/*", False),
+            # Formerly False: a log group's name may hold "/", so /aws/tool/*
+            # reaches every group under that path.
+            ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/tool/*", True),
+            ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/app:*", False),
             ("arn:aws:bedrock:*::foundation-model/anthropic.claude-3", False),
             ("arn:aws:bedrock:us-east-1::*", True),
             ("arn:aws:sqs:us-east-1:123456789012:*", True),
             ("arn:aws:sqs:us-east-1:123456789012:jobs", False),
             ("arn:aws:iam::123456789012:role/*", True),
             ("arn:*", True),
+            # A name that may hold "/" runs to the end of the ARN, so a
+            # wildcard after its first path component still widens. Each of
+            # these was read as scoped before the sub-resource table.
+            ("arn:aws:iam::123456789012:role/service-role/*", True),
+            ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/*", True),
+            ("arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/*", True),
+            ("arn:aws:ssm:us-east-1:123456789012:parameter/app/*", True),
+            # A documented sub-resource after a fully named parent stays inside it.
+            ("arn:aws:dynamodb:us-east-1:123456789012:table/orders/index/*", False),
+            ("arn:aws:dynamodb:us-east-1:123456789012:table/ord*/index/*", True),
+            ("arn:aws:dynamodb:us-east-1:123456789012:tab*/orders", True),
+            ("arn:aws:lambda:us-east-1:123456789012:function:tool:*", False),
+            ("arn:aws:lambda:us-east-1:123456789012:function:tool-*", True),
+            ("arn:aws:bedrock:us-east-1:123456789012:agent-alias/AGENT/*", False),
+            # An unknown service or type is not credited.
+            ("arn:aws:example:us-east-1:123456789012:thing/x/*", True),
+            # An empty resource name is unbounded.
+            ("arn:aws:s3:::", True),
+            # The Secrets Manager random suffix names one secret; any other
+            # wildcard in the name widens.
+            (
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-??????",
+                False,
+            ),
+            ("arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-*", True),
+            (
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-?????",
+                True,
+            ),
+            (
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/*-??????",
+                True,
+            ),
         ],
     )
     def test_the_tool_resource_predicate(self, resource, unbounded):
         assert agentcore_app._tool_resource_is_unbounded(resource) is unbounded
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_path_wildcard_fails_beside_a_sub_resource_grant(self, mock_ac):
+        """Rule 6: secret:prod/* reaches every secret under prod/.
+
+        Before the sub-resource table both roles passed, because the first
+        component after the type was read as the whole name.
+        """
+        self._two_tools(mock_ac)
+        index = "arn:aws:dynamodb:us-east-1:123456789012:table/orders/index/*"
+        secrets = "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/*"
+        cache = _v2_cache(
+            roles={
+                "ToolRole": _principal_with([self._allow("dynamodb:Query", index)]),
+                "SecondRole": _principal_with(
+                    [self._allow("secretsmanager:GetSecretValue", secrets)]
+                ),
+            }
+        )
+
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 2
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "SecondRole" in findings[1]["Finding_Details"]
+        assert (
+            f"{agentcore_app.TOOL_ROLE_EVERY_RESOURCE_LEG} ({secrets})"
+            in (findings[1]["Finding_Details"])
+        )
 
     @pytest.mark.parametrize(
         ("statement", "leg"),

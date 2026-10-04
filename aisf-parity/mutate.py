@@ -4422,6 +4422,41 @@ MUTATIONS = [
         "find": "    elif not unmatched_vpcs:\n        gap_text = (\n",
         "replace": "    else:\n        gap_text = (\n",
     },
+    {
+        "name": "AC-45 widens a Secrets Manager random-suffix pattern",
+        "file": AGENTCORE,
+        "defect": "secret:prod/db-?????? names one secret by its six-character suffix, yet a tool role granted it failed as reaching every secret",
+        "find": '    if service == "secretsmanager" and SECRET_SUFFIX_PATTERN.fullmatch(resource_part):\n        return False\n',
+        "replace": "    if False:\n        return False\n",
+    },
+    {
+        "name": "AC-45 credits a wildcard in a resource type with no published sub-resource",
+        "file": AGENTCORE,
+        "defect": "a wildcard after the type of a service or type the sub-resource table does not list was read as scoped, so arn:...:thing/x/* passed",
+        "find": "    if prefix is None:\n        return True\n",
+        "replace": "    if prefix is None:\n        return False\n",
+    },
+    {
+        "name": "AC-45 credits a path wildcard inside a name that may hold a slash",
+        "file": AGENTCORE,
+        "defect": "log-group:/aws/lambda/* and role/service-role/* were read as one named resource, though each name runs to the end of the ARN",
+        "find": "    if end < 0:\n        return True\n    parent = rest[:end]\n",
+        "replace": "    if end < 0:\n        return False\n    parent = rest[:end]\n",
+    },
+    {
+        "name": "AC-45 credits a sub-resource under a wildcard parent",
+        "file": AGENTCORE,
+        "defect": "table/ord*/index/* was read as inside one table, though the parent matches every table it names",
+        "find": '    return not parent or "*" in parent or "?" in parent\n',
+        "replace": "    return not parent\n",
+    },
+    {
+        "name": "AC-45 reads an empty resource name as scoped",
+        "file": AGENTCORE,
+        "defect": "an ARN with no resource segment, such as arn:aws:s3:::, was read as naming one resource",
+        "find": '    if not resource_part:\n        return True\n    if "*" not in resource_part',
+        "replace": '    if not resource_part:\n        return False\n    if "*" not in resource_part',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
     {
         "name": "BR-43 credits a NotAction Deny that exempts an action of a probed service",
@@ -5740,6 +5775,11 @@ GROUPS: dict[str, str] = {
     "AC-51 reads a global web ACL in the wrong Region": "in the AgentCore verdict legs",
     "AC-51 never judges a fronting distribution's web ACL": "in the AgentCore verdict legs",
     "AC-27 adds an Unrestricted row beside a foreign SourceVpc": "in the AgentCore verdict legs",
+    "AC-45 widens a Secrets Manager random-suffix pattern": "in the AgentCore verdict legs",
+    "AC-45 credits a wildcard in a resource type with no published sub-resource": "in the AgentCore verdict legs",
+    "AC-45 credits a path wildcard inside a name that may hold a slash": "in the AgentCore verdict legs",
+    "AC-45 credits a sub-resource under a wildcard parent": "in the AgentCore verdict legs",
+    "AC-45 reads an empty resource name as scoped": "in the AgentCore verdict legs",
 }
 
 
