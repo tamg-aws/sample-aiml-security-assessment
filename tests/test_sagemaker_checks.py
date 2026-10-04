@@ -12426,13 +12426,34 @@ class TestRound9SM38MicrovmTier:
         regions=("us-east-1", "us-west-2"),
         errors=None,
         looping=(),
+        images=None,
+        versions=None,
     ):
         """looping names the Regions whose store listing repeats its NextToken.
         microvms maps an id to its egress connectors, connectors a connector
         to its subnets, subnets a subnet to its VPC, stores a Region to its
-        event data stores; errors maps a read to the exception it raises."""
+        event data stores; errors maps a read to the exception it raises.
+        images maps a MicroVM to the (image name, version) GetMicrovm reports,
+        ("img", "1") by default; versions maps an image name to its
+        ListMicrovmImageVersions items, one per page, by default each version
+        a MicroVM runs logging to /mv/<image>."""
         errors = errors or {}
         microvms = {"mv-1": ["nc-1"]} if microvms is None else microvms
+        images = (
+            {m: images.get(m, ("img", "1")) for m in microvms}
+            if images
+            else {m: ("img", "1") for m in microvms}
+        )
+        if versions is None:
+            versions = {}
+            for name, version in images.values():
+                versions.setdefault(name, []).append(
+                    {
+                        "imageVersion": version,
+                        "logging": {"cloudWatch": {"logGroup": f"/mv/{name}"}},
+                    }
+                )
+        image_arn = "arn:aws:lambda:us-east-1:111122223333:microvm-image:{}".format
         connectors = {"nc-1": ["subnet-a"]} if connectors is None else connectors
         subnets = {"subnet-a": "vpc-1"} if subnets is None else subnets
         flow_logs = (
@@ -12460,12 +12481,25 @@ class TestRound9SM38MicrovmTier:
                         for m in microvms
                     ]
 
+                def list_versions(imageIdentifier):
+                    name = imageIdentifier.rsplit(":", 1)[-1]
+                    assert imageIdentifier == image_arn(name)
+                    found = versions.get(name, [])
+                    if isinstance(found, Exception):
+                        raise found
+                    return [{"items": [item]} for item in found]
+
                 client.get_paginator.side_effect = _pager(
-                    {"list_microvms": list_microvms}
+                    {
+                        "list_microvms": list_microvms,
+                        "list_microvm_image_versions": list_versions,
+                    }
                 )
                 client.get_microvm.side_effect = lambda microvmIdentifier: {
                     "microvmId": microvmIdentifier,
                     "state": "RUNNING",
+                    "imageArn": image_arn(images[microvmIdentifier][0]),
+                    "imageVersion": images[microvmIdentifier][1],
                     "egressNetworkConnectors": microvms[microvmIdentifier],
                 }
             elif service == "lambda-core":
@@ -12627,13 +12661,110 @@ class TestRound9SM38MicrovmTier:
         )
         assert "mv-2" not in details
 
-    def test_a_microvm_without_egress_is_noted_not_failed(self):
+    def test_a_microvm_without_egress_fails_the_network_leg(self):
+        """Round 10: a MicroVM with no egress connector has no network
+        telemetry at all, so it fails and is not noted out of the Passed row."""
         rows = self._run(microvms={"mv-1": ["nc-1"], "mv-9": []})
-        assert self._statuses(rows) == ["Passed"]
+        assert self._statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
         assert (
-            "MicroVM(s) mv-9 have no egress network connector"
-            in rows[0]["Finding_Details"]
+            "MicroVM(s) mv-9 have no egress network connector, so they leave on "
+            "the default internet egress, where no VPC Flow Log records their "
+            "network calls"
+        ) in details
+        assert "mv-1" not in details
+
+    def test_a_passed_row_names_each_log_group_and_the_run_override(self):
+        rows = self._run(
+            microvms={"mv-1": ["nc-1"], "mv-2": ["nc-1"]},
+            images={"mv-1": ("a", "1"), "mv-2": ("b", "3")},
         )
+        assert self._statuses(rows) == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "Each of the 2 MicroVM(s) that have not ended has an egress" in details
+        assert "(a version 1: /mv/a; b version 3: /mv/b)" in details
+        assert (
+            "A RunMicrovm call can set its own logging for one MicroVM, which "
+            "GetMicrovm does not return, so the image version's setting is the "
+            "one read."
+        ) in details
+
+    @pytest.mark.parametrize(
+        "logging, text",
+        [
+            ({"disabled": {}}, "has logging disabled"),
+            ({}, "names no CloudWatch Logs log group"),
+            ({"cloudWatch": {}}, "names no CloudWatch Logs log group"),
+            (None, "names no CloudWatch Logs log group"),
+        ],
+    )
+    def test_an_image_version_without_a_log_group_fails_and_names_only_it(
+        self, logging, text
+    ):
+        bad = {"imageVersion": "2"}
+        if logging is not None:
+            bad["logging"] = logging
+        rows = self._run(
+            microvms={"mv-1": ["nc-1"], "mv-2": ["nc-1"], "mv-3": ["nc-1"]},
+            images={"mv-1": ("img", "1"), "mv-2": ("img", "2"), "mv-3": ("img", "2")},
+            versions={
+                "img": [
+                    {
+                        "imageVersion": "1",
+                        "logging": {"cloudWatch": {"logGroup": "/mv/img"}},
+                    },
+                    bad,
+                ]
+            },
+        )
+        assert self._statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"image img version 2, which MicroVM(s) mv-2, mv-3 run, {text}" in details
+        )
+        assert "a RunMicrovm call can set its own logging" in details
+        assert "mv-1" not in details
+
+    def test_the_version_a_microvm_runs_is_read_past_the_first_page(self):
+        rows = self._run(
+            images={"mv-1": ("img", "2")},
+            versions={
+                "img": [
+                    {"imageVersion": "1", "logging": {"disabled": {}}},
+                    {
+                        "imageVersion": "2",
+                        "logging": {"cloudWatch": {"logGroup": "/mv/two"}},
+                    },
+                ]
+            },
+        )
+        assert self._statuses(rows) == ["Passed"]
+        assert "img version 2: /mv/two" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kwargs, text",
+        [
+            (
+                {"versions": {"img": _make_client_error("AccessDeniedException")}},
+                "Lambda MicroVM image img versions (lambda:ListMicrovmImageVersions: "
+                "AccessDeniedException)",
+            ),
+            (
+                {"versions": {"img": [{"imageVersion": "9"}]}},
+                "image img version 1, which MicroVM(s) mv-1 run "
+                "(ListMicrovmImageVersions did not return the version)",
+            ),
+            (
+                {"images": {"mv-1": ("img", "")}},
+                "the image version of MicroVM mv-1 (GetMicrovm returned no "
+                "imageArn or imageVersion)",
+            ),
+        ],
+    )
+    def test_an_unread_image_version_withholds_the_pass(self, kwargs, text):
+        rows = self._run(**kwargs)
+        assert self._statuses(rows) == ["N/A"]
+        assert text in rows[0]["Finding_Details"]
 
     def test_a_subnet_describe_subnets_omits_is_unread(self):
         rows = self._run(subnets={})

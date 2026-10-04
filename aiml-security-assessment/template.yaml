@@ -1184,11 +1184,12 @@ Resources:
             Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
           - Sid: MicrovmImageVersionList
             # SM-40 reads the lifecycle hooks of each Lambda MicroVM image
-            # version. ListMicrovmImageVersions has the microvmImage resource
-            # type in the service authorization reference.
+            # version, and SM-38 the logging of the version each MicroVM runs.
+            # ListMicrovmImageVersions has the microvmImage resource type in
+            # the service authorization reference.
             Effect: Allow
             Action:
-              - lambda:ListMicrovmImageVersions # SM-40
+              - lambda:ListMicrovmImageVersions # SM-38, SM-40
             Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
           - Sid: EndpointVpcDnsAttributeRead
             # SM-18 and SM-33 read enableDnsSupport and enableDnsHostnames of
