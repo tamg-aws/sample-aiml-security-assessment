@@ -24342,6 +24342,7 @@ class TestSM39WorkloadEgress:
         tgw_routes=None,
         tgw_vpc_attachments=None,
         tgw_truncated=(),
+        sagemaker=None,
     ):
         """associations: {vpc: [associations]}; rules: {group: [rules] or pages};
         tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}};
@@ -24353,7 +24354,12 @@ class TestSM39WorkloadEgress:
         entries; tgw_routes: {route table: [routes] or pages of routes};
         tgw_vpc_attachments: {attachment id: DescribeTransitGatewayVpcAttachments
         entry}; tgw_truncated: route tables whose last page reports
-        AdditionalRoutesAvailable."""
+        AdditionalRoutesAvailable; sagemaker: {"endpoints": [{"EndpointName",
+        "config"}], "models": {name: DescribeModel}, "training" and
+        "processing": {status: [Describe*Job entries]}, "notebooks":
+        [DescribeNotebookInstance entries], "studio": [DescribeDomain
+        entries]}."""
+        sagemaker = sagemaker or {}
         tgw_attachments = tgw_attachments or []
         tgw_routes = tgw_routes or {}
         tgw_vpc_attachments = tgw_vpc_attachments or {}
@@ -24710,6 +24716,104 @@ class TestSM39WorkloadEgress:
                     return {"Configuration": {"VpcEgressConfiguration": found}}
 
                 client.get_network_connector.side_effect = get_connector
+            elif service == "sagemaker":
+                endpoints = {
+                    e["EndpointName"]: e for e in sagemaker.get("endpoints", [])
+                }
+                jobs = {
+                    kind: {
+                        j[f"{kind.title()}JobName"]: j
+                        for found in sagemaker.get(kind, {}).values()
+                        for j in found
+                    }
+                    for kind in ("training", "processing")
+                }
+
+                def job_pages(kind):
+                    # One job per page, so a first-page reader misses the rest.
+                    def pages(StatusEquals):
+                        return [
+                            {
+                                f"{kind.title()}JobSummaries": [
+                                    {
+                                        f"{kind.title()}JobName": j[
+                                            f"{kind.title()}JobName"
+                                        ]
+                                    }
+                                ]
+                            }
+                            for j in sagemaker.get(kind, {}).get(StatusEquals, [])
+                        ]
+
+                    return pages
+
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_endpoints": guarded(
+                            "sm_endpoints",
+                            [{"Endpoints": [{"EndpointName": n} for n in endpoints]}],
+                        ),
+                        "list_training_jobs": guarded(
+                            "sm_training", job_pages("training")
+                        ),
+                        "list_processing_jobs": guarded(
+                            "sm_processing", job_pages("processing")
+                        ),
+                        "list_notebook_instances": guarded(
+                            "sm_notebooks",
+                            [
+                                {
+                                    "NotebookInstances": [
+                                        {
+                                            "NotebookInstanceName": n[
+                                                "NotebookInstanceName"
+                                            ]
+                                        }
+                                    ]
+                                }
+                                for n in sagemaker.get("notebooks", [])
+                            ],
+                        ),
+                        "list_domains": guarded(
+                            "sm_domains",
+                            [
+                                {
+                                    "Domains": [
+                                        {"DomainId": d["DomainId"]}
+                                        for d in sagemaker.get("studio", [])
+                                    ]
+                                }
+                            ],
+                        ),
+                    }
+                )
+                client.describe_endpoint.side_effect = lambda EndpointName: {
+                    "EndpointName": EndpointName,
+                    "EndpointConfigName": EndpointName,
+                }
+                client.describe_endpoint_config.side_effect = (
+                    lambda EndpointConfigName: endpoints[EndpointConfigName]["config"]
+                )
+                client.describe_model.side_effect = guarded(
+                    "sm_model", lambda ModelName: sagemaker["models"][ModelName]
+                )
+                client.describe_training_job.side_effect = lambda TrainingJobName: jobs[
+                    "training"
+                ][TrainingJobName]
+                client.describe_processing_job.side_effect = guarded(
+                    "sm_processing_job",
+                    lambda ProcessingJobName: jobs["processing"][ProcessingJobName],
+                )
+                notebooks = {
+                    n["NotebookInstanceName"]: n for n in sagemaker.get("notebooks", [])
+                }
+                client.describe_notebook_instance.side_effect = (
+                    lambda NotebookInstanceName: notebooks[NotebookInstanceName]
+                )
+                studio = {d["DomainId"]: d for d in sagemaker.get("studio", [])}
+                client.describe_domain.side_effect = guarded(
+                    "sm_domain", lambda DomainId: studio[DomainId]
+                )
             else:
                 raise AssertionError(f"unexpected boto3 client: {service}")
             return client
@@ -27509,6 +27613,254 @@ class TestSM02RestApiResourcePolicy:
             rest=suite._rest(), policies={"api": text}
         )
         assert "Failed" in [r["Status"] for r in rows]
+
+
+class TestRound9SM39SageMakerWorkloads:
+    """AIR-FND-NET-03: SageMaker endpoints, running jobs, notebook instances and
+    Studio domains join SM-39's workload population, and one with an internet
+    path outside the customer VPC fails both legs."""
+
+    suite = TestSM39WorkloadEgress()
+
+    def _run(self, **sagemaker):
+        errors = sagemaker.pop("errors", None)
+        return self.suite._run(sagemaker=sagemaker, errors=errors)
+
+    def _details(self, rows):
+        return " | ".join(r["Finding_Details"] for r in rows)
+
+    @staticmethod
+    def _endpoint(name, models=(), subnets=None, isolated=False):
+        variants = [
+            {"VariantName": f"v{i}", "ModelName": m} for i, m in enumerate(models)
+        ]
+        if not models:
+            variants = [{"VariantName": "components"}]
+        config = {"ProductionVariants": variants, "EnableNetworkIsolation": isolated}
+        if subnets:
+            config["VpcConfig"] = {"Subnets": list(subnets)}
+        return {"EndpointName": name, "config": config}
+
+    @staticmethod
+    def _model(subnets=None, isolated=False):
+        model = {"EnableNetworkIsolation": isolated}
+        if subnets:
+            model["VpcConfig"] = {"Subnets": list(subnets)}
+        return model
+
+    def test_an_endpoint_model_vpc_is_judged(self):
+        rows = self._run(
+            endpoints=[self._endpoint("ep", models=["m"])],
+            models={"m": self._model(["subnet-a1"])},
+        )
+        dns = self.suite._dns(rows)
+        assert [r["Status"] for r in dns] == ["Failed"]
+        assert "SageMaker endpoint 'ep'" in dns[0]["Finding_Details"]
+        assert "outside a VPC" not in self._details(rows)
+
+    def test_an_inference_component_endpoint_is_judged_on_its_config_vpc(self):
+        rows = self._run(endpoints=[self._endpoint("ic", subnets=["subnet-b1"])])
+        dns = self.suite._dns(rows)
+        assert [r["Status"] for r in dns] == ["Failed"]
+        assert "SageMaker endpoint 'ic'" in dns[0]["Finding_Details"]
+
+    def test_every_running_job_is_read_and_a_finished_one_is_not(self):
+        rows = self._run(
+            training={
+                "InProgress": [
+                    {"TrainingJobName": "t1", "VpcConfig": {"Subnets": ["subnet-a1"]}},
+                    {"TrainingJobName": "t2", "VpcConfig": {"Subnets": ["subnet-a1"]}},
+                ],
+                "Stopping": [
+                    {"TrainingJobName": "t3", "VpcConfig": {"Subnets": ["subnet-a1"]}}
+                ],
+                "Completed": [
+                    {"TrainingJobName": "t4", "VpcConfig": {"Subnets": ["subnet-b1"]}}
+                ],
+            },
+            processing={
+                "InProgress": [
+                    {
+                        "ProcessingJobName": "p1",
+                        "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-a1"]}},
+                    }
+                ]
+            },
+        )
+        dns = self.suite._dns(rows)
+        assert [r["Status"] for r in dns] == ["Failed"]
+        details = dns[0]["Finding_Details"]
+        for label in (
+            "training job 't1'",
+            "training job 't2'",
+            "training job 't3'",
+            "processing job 'p1'",
+        ):
+            assert f"SageMaker {label}" in details
+        assert "t4" not in self._details(rows)
+
+    @pytest.mark.parametrize("access, opens", [("Disabled", False), ("Enabled", True)])
+    def test_a_notebook_subnet_is_judged_and_direct_access_fails(self, access, opens):
+        rows = self._run(
+            notebooks=[
+                {
+                    "NotebookInstanceName": "nb",
+                    "SubnetId": "subnet-a1",
+                    "DirectInternetAccess": "Disabled",
+                },
+                {
+                    "NotebookInstanceName": "nb2",
+                    "SubnetId": "subnet-b1",
+                    "DirectInternetAccess": access,
+                },
+            ]
+        )
+        dns = self.suite._dns(rows)
+        assert "SageMaker notebook instance 'nb'" in self._details(dns)
+        assert "SageMaker notebook instance 'nb2'" in self._details(dns)
+        open_rows = [
+            r
+            for r in rows
+            if "reaches the internet through SageMaker's network"
+            in r["Finding_Details"]
+        ]
+        if opens:
+            assert [(r["Finding"], r["Status"]) for r in open_rows] == [
+                ("Agent Workload DNS Egress Control", "Failed"),
+                ("Agent Workload Network Firewall Egress", "Failed"),
+            ]
+            assert open_rows[0]["Finding_Details"].startswith(
+                "SageMaker notebook instance 'nb2' has DirectInternetAccess Enabled"
+            )
+        else:
+            assert open_rows == []
+
+    @pytest.mark.parametrize(
+        "access, opens", [("VpcOnly", False), ("PublicInternetOnly", True)]
+    )
+    def test_a_studio_domain_is_judged_and_public_access_fails(self, access, opens):
+        rows = self._run(
+            studio=[
+                {
+                    "DomainId": "d-1",
+                    "DomainName": "lab",
+                    "SubnetIds": ["subnet-a1"],
+                    "AppNetworkAccessType": access,
+                }
+            ]
+        )
+        assert "SageMaker Studio domain 'lab'" in self._details(self.suite._dns(rows))
+        opened = "AppNetworkAccessType PublicInternetOnly, so its apps' traffic reaches"
+        assert (opened in self._details(rows)) is opens
+
+    @pytest.mark.parametrize(
+        "kwargs, opens",
+        [
+            (
+                {
+                    "endpoints": [_endpoint.__func__("ep", models=["m"])],
+                    "models": {"m": {"EnableNetworkIsolation": False}},
+                },
+                "SageMaker endpoint 'ep' runs outside a VPC",
+            ),
+            (
+                {
+                    "endpoints": [_endpoint.__func__("ep", models=["m"])],
+                    "models": {"m": {"EnableNetworkIsolation": True}},
+                },
+                None,
+            ),
+            (
+                {
+                    "endpoints": [_endpoint.__func__("ep", models=["m", "n"])],
+                    "models": {"m": {"EnableNetworkIsolation": True}, "n": {}},
+                },
+                "SageMaker endpoint 'ep' runs outside a VPC",
+            ),
+            (
+                {
+                    "processing": {
+                        "InProgress": [{"ProcessingJobName": "p", "NetworkConfig": {}}]
+                    }
+                },
+                "SageMaker processing job 'p' runs outside a VPC",
+            ),
+            (
+                {
+                    "processing": {
+                        "InProgress": [
+                            {
+                                "ProcessingJobName": "p",
+                                "NetworkConfig": {"EnableNetworkIsolation": True},
+                            }
+                        ]
+                    }
+                },
+                None,
+            ),
+            (
+                {"training": {"InProgress": [{"TrainingJobName": "t"}]}},
+                "SageMaker training job 't' runs outside a VPC",
+            ),
+        ],
+    )
+    def test_a_workload_outside_a_vpc_fails_unless_isolated(self, kwargs, opens):
+        rows = self._run(**kwargs)
+        if opens:
+            assert [(r["Finding"], r["Status"]) for r in rows] == [
+                ("Agent Workload DNS Egress Control", "Failed"),
+                ("Agent Workload Network Firewall Egress", "Failed"),
+            ]
+            assert rows[0]["Finding_Details"].startswith(opens)
+        else:
+            assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+            assert "SageMaker endpoint, running job" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "key, text",
+        [
+            ("sm_endpoints", "sagemaker:ListEndpoints (AccessDeniedException)"),
+            (
+                "sm_model",
+                "model 'm' of SageMaker endpoint 'ep' (AccessDeniedException)",
+            ),
+            (
+                "sm_training",
+                "InProgress SageMaker training jobs (AccessDeniedException)",
+            ),
+            (
+                "sm_processing_job",
+                "SageMaker processing job 'p' (AccessDeniedException)",
+            ),
+            ("sm_notebooks", "sagemaker:ListNotebookInstances (AccessDeniedException)"),
+            ("sm_domain", "SageMaker Studio domain d-1 (AccessDeniedException)"),
+        ],
+    )
+    def test_an_unread_sagemaker_workload_withholds_the_pass(self, key, text):
+        rows = self._run(
+            endpoints=[self._endpoint("ep", models=["m"])],
+            models={"m": self._model(["subnet-a1"])},
+            processing={
+                "InProgress": [
+                    {
+                        "ProcessingJobName": "p",
+                        "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-a1"]}},
+                    }
+                ]
+            },
+            studio=[
+                {
+                    "DomainId": "d-1",
+                    "SubnetIds": ["subnet-a1"],
+                    "AppNetworkAccessType": "VpcOnly",
+                }
+            ],
+            errors={key: _make_client_error("AccessDeniedException")},
+        )
+        incomplete = [r for r in rows if r["Finding"].endswith("Incomplete")]
+        assert len(incomplete) == 2
+        assert all(r["Status"] == "N/A" for r in incomplete)
+        assert all(text in r["Finding_Details"] for r in incomplete)
 
 
 class TestSM39EgressForEveryAgentHost:

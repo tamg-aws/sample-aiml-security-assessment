@@ -505,6 +505,14 @@ section.
   `AWS::Lambda::MicrovmImage` data events through a selector narrowed by no
   field but `eventCategory` and `resources.type`. A failed read holds the row
   at `N/A`.
+- `SM-39` judges the egress of every VPC a SageMaker endpoint, an
+  `InProgress` or `Stopping` training or processing job, a notebook instance
+  or a Studio domain runs in, beside the ECS, Lambda, EKS, EC2 and MicroVM
+  workloads it judged before. It fails, on both legs, a notebook whose
+  `DirectInternetAccess` is not `Disabled`, a domain that is not `VpcOnly`,
+  and an endpoint or running job with no VPC that is not network isolated,
+  since their internet traffic leaves through SageMaker's network. A failed
+  SageMaker read is named in the incomplete row.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule

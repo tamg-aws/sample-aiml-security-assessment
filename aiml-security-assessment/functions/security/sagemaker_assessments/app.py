@@ -20905,6 +20905,170 @@ def _egress_workload_subnets(
     return references, unread, functions
 
 
+# A training or processing job in any other status has no running instance, so
+# it has no egress to filter.
+RUNNING_JOB_STATUSES = ("InProgress", "Stopping")
+
+
+def _sagemaker_egress_workloads(
+    region: str,
+) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+    """
+    (workload label, subnet id) for each SageMaker endpoint, running training
+    and processing job, notebook instance and Studio domain in a VPC; the ones
+    with an internet path outside the customer VPC; and the unread lists.
+
+    A notebook with DirectInternetAccess other than Disabled, a domain whose
+    AppNetworkAccessType is not VpcOnly, and an endpoint or job with no VPC
+    that is not network isolated reach the internet through SageMaker's own
+    network, where neither firewall applies.
+    """
+    references: List[Tuple[str, str]] = []
+    open_paths: List[str] = []
+    unread: List[str] = []
+    outside = (
+        "reaches the internet through SageMaker's network, so no DNS Firewall "
+        "rule group or Network Firewall route applies to that egress."
+    )
+    client = boto3.client("sagemaker", config=boto3_config, region_name=region)
+    try:
+        inventory = _endpoint_hosting_inventory(client)
+    except Exception as error:
+        inventory = {"endpoints": [], "unread": []}
+        unread.append(f"sagemaker:ListEndpoints ({get_assessment_error_label(error)})")
+    unread.extend(inventory["unread"])
+    models: Dict[str, Optional[Dict[str, Any]]] = {}
+    for endpoint in inventory["endpoints"]:
+        label = f"SageMaker endpoint '{endpoint['name']}'"
+        config = endpoint["config"]
+        subnets = set((config.get("VpcConfig") or {}).get("Subnets") or [])
+        isolated = [config.get("EnableNetworkIsolation") is True] * bool(
+            endpoint["component_variants"]
+        )
+        complete = True
+        for model_name in endpoint["models"]:
+            if model_name not in models:
+                try:
+                    models[model_name] = client.describe_model(ModelName=model_name)
+                except Exception as error:
+                    models[model_name] = None
+                    unread.append(
+                        f"model '{model_name}' of {label} "
+                        f"({get_assessment_error_label(error)})"
+                    )
+            model = models[model_name]
+            if model is None:
+                complete = False
+                continue
+            subnets.update((model.get("VpcConfig") or {}).get("Subnets") or [])
+            isolated.append(model.get("EnableNetworkIsolation") is True)
+        references.extend((label, subnet) for subnet in sorted(subnets))
+        if complete and not subnets and not all(isolated):
+            open_paths.append(
+                f"{label} runs outside a VPC without network isolation and {outside}"
+            )
+    for operation, key, name_key, describe, network_of in (
+        (
+            "list_training_jobs",
+            "TrainingJobSummaries",
+            "TrainingJobName",
+            client.describe_training_job,
+            lambda detail: detail,
+        ),
+        (
+            "list_processing_jobs",
+            "ProcessingJobSummaries",
+            "ProcessingJobName",
+            client.describe_processing_job,
+            lambda detail: detail.get("NetworkConfig") or {},
+        ),
+    ):
+        kind = "training" if "Training" in key else "processing"
+        for status in RUNNING_JOB_STATUSES:
+            try:
+                names = [
+                    summary[name_key]
+                    for summary in _paged(client, operation, key, StatusEquals=status)
+                    if summary.get(name_key)
+                ]
+            except Exception as error:
+                unread.append(
+                    f"{status} SageMaker {kind} jobs "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            for job_name in names:
+                label = f"SageMaker {kind} job '{job_name}'"
+                try:
+                    network = network_of(describe(**{name_key: job_name}))
+                except Exception as error:
+                    unread.append(f"{label} ({get_assessment_error_label(error)})")
+                    continue
+                subnets = (network.get("VpcConfig") or {}).get("Subnets") or []
+                references.extend((label, subnet) for subnet in subnets)
+                if not subnets and network.get("EnableNetworkIsolation") is not True:
+                    open_paths.append(
+                        f"{label} runs outside a VPC without network isolation and {outside}"
+                    )
+    try:
+        notebooks = [
+            notebook["NotebookInstanceName"]
+            for notebook in _paged(
+                client, "list_notebook_instances", "NotebookInstances"
+            )
+            if notebook.get("NotebookInstanceName")
+        ]
+    except Exception as error:
+        notebooks = []
+        unread.append(
+            f"sagemaker:ListNotebookInstances ({get_assessment_error_label(error)})"
+        )
+    for notebook_name in notebooks:
+        label = f"SageMaker notebook instance '{notebook_name}'"
+        try:
+            detail = client.describe_notebook_instance(
+                NotebookInstanceName=notebook_name
+            )
+        except Exception as error:
+            unread.append(f"{label} ({get_assessment_error_label(error)})")
+            continue
+        if detail.get("SubnetId"):
+            references.append((label, detail["SubnetId"]))
+        if detail.get("DirectInternetAccess") != "Disabled":
+            open_paths.append(
+                f"{label} has DirectInternetAccess "
+                f"{detail.get('DirectInternetAccess') or 'not returned'}, so it "
+                + outside
+            )
+    try:
+        domains = [
+            domain["DomainId"]
+            for domain in _paged(client, "list_domains", "Domains")
+            if domain.get("DomainId")
+        ]
+    except Exception as error:
+        domains = []
+        unread.append(f"sagemaker:ListDomains ({get_assessment_error_label(error)})")
+    for domain_id in domains:
+        try:
+            detail = client.describe_domain(DomainId=domain_id)
+        except Exception as error:
+            unread.append(
+                f"SageMaker Studio domain {domain_id} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        label = f"SageMaker Studio domain '{detail.get('DomainName') or domain_id}'"
+        references.extend((label, subnet) for subnet in detail.get("SubnetIds") or [])
+        if detail.get("AppNetworkAccessType") != "VpcOnly":
+            open_paths.append(
+                f"{label} has AppNetworkAccessType "
+                f"{detail.get('AppNetworkAccessType') or 'not returned'}, so its "
+                "apps' traffic " + outside
+            )
+    return references, open_paths, unread
+
+
 def _describe_workload_subnets(
     ec2_client: Any, subnet_ids: List[str]
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -22548,7 +22712,8 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     """
     SM-39 (AIR-SLF-RT-02): judge DNS Firewall and Network Firewall egress for
     every VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS
-    cluster or an EC2 instance runs in.
+    cluster, an EC2 instance, or a SageMaker endpoint, running training or
+    processing job, notebook instance or Studio domain runs in.
 
     One DNS row and one Network Firewall row per VPC. An unread workload list
     or subnet description is reported N/A by name, never Passed. A Lambda
@@ -22576,6 +22741,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     )
     try:
         references, unread, functions = _egress_workload_subnets(region)
+        sagemaker_references, open_sagemaker, sagemaker_unread = (
+            _sagemaker_egress_workloads(region)
+        )
+        references.extend(sagemaker_references)
+        unread.extend(sagemaker_unread)
         named, named_unread = _ai_lambda_references(region)
         unread.extend(named_unread)
         # A MicroVM egresses through its VPC egress connector's subnets. AWS
@@ -22647,6 +22817,21 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 "agent Lambda functions outside a VPC",
             )
         )
+        findings["csv_data"].extend(
+            _capped_problem_rows(
+                "SM-39",
+                name,
+                open_sagemaker,
+                "Place each SageMaker endpoint, job, notebook instance and Studio "
+                "domain in private VPC subnets (VpcOnly for a domain, "
+                "DirectInternetAccess Disabled for a notebook) whose DNS Firewall "
+                "and Network Firewall filter its egress.",
+                reference,
+                "Medium",
+                region,
+                "SageMaker workloads with an internet path outside the VPC",
+            )
+        )
         if name == WORKLOAD_FIREWALL_EGRESS_FINDING:
             findings["csv_data"].extend(
                 _capped_problem_rows(
@@ -22687,7 +22872,7 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 )
             )
     if not firewall_references:
-        if not unread and not open_functions:
+        if not unread and not open_functions and not open_sagemaker:
             for name, reference in legs:
                 if open_microvms and name == WORKLOAD_FIREWALL_EGRESS_FINDING:
                     continue
@@ -22695,9 +22880,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                     _na(
                         name,
                         "No ECS awsvpc service or task, VPC-attached Lambda "
-                        "function, EKS cluster or Fargate profile, EC2 instance or "
-                        "Lambda MicroVM egress connector in this Region runs in a "
-                        "VPC, so no workload VPC's egress was judged.",
+                        "function, EKS cluster or Fargate profile, EC2 instance, "
+                        "SageMaker endpoint, running job, notebook instance or "
+                        "Studio domain, or Lambda MicroVM egress connector in this "
+                        "Region runs in a VPC, so no workload VPC's egress was "
+                        "judged.",
                         "No action required",
                         reference,
                     )
