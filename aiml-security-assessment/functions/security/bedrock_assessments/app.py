@@ -37230,6 +37230,9 @@ def _prompt_pii_entity_types(detail: Dict[str, Any]) -> List[str]:
     )
 
 
+MAX_REPORTED_UNGUARDED_REQUESTS = 10
+
+
 def check_bedrock_prompt_pii_screening(
     region: str = "",
     attachment_inventory: Optional[Dict[str, Any]] = None,
@@ -37246,7 +37249,9 @@ def check_bedrock_prompt_pii_screening(
     un-narrowed account-enforced configuration or guardrail condition pin in
     ``attachment_inventory`` applies it, or when a logged invocation joined to
     CloudTrail through ``joins`` (BR-27 and BR-34's shared state) names it. Only
-    a used version passes; an unread one is N/A.
+    a used version passes; an unread one is N/A. A logged invocation whose
+    CloudTrail event names no guardrail fails, unless an un-narrowed
+    account-enforced configuration screens it; an unjoined one is N/A.
     """
     findings = {
         "check_name": PROMPT_PII_SCREENING_FINDING,
@@ -37331,6 +37336,7 @@ def check_bedrock_prompt_pii_screening(
                 "region": entry.get("region") or region,
             }
         joins_unread = 0
+        unguarded_requests = []
         for request_id, resolved in sorted(
             ((joins or {}).get("resolved") or {}).items()
         ):
@@ -37347,7 +37353,9 @@ def check_bedrock_prompt_pii_screening(
                     },
                 )
                 entry["surfaces"].append(f"logged invocation {request_id}")
-            elif not resolved.get("unguarded"):
+            elif resolved.get("unguarded"):
+                unguarded_requests.append(request_id)
+            else:
                 joins_unread += 1
         if joins_unread:
             unread.append(
@@ -37376,20 +37384,71 @@ def check_bedrock_prompt_pii_screening(
                 entry["error"] = _guardrail_read_error(error)
 
         screening, unscreened = [], []
+        # An un-narrowed account-enforced configuration applies its guardrail
+        # to every invocation, including one whose request names none.
+        enforced = {"screening": [], "unread": []}
         for (identifier, version), entry in sorted(used.items()):
             label = "guardrail {} version {} (applied by {})".format(
                 identifier, version, ", ".join(entry["surfaces"][:5])
+            )
+            is_enforced = any(
+                surface.startswith("account-enforced configuration ")
+                for surface in entry["surfaces"]
             )
             if entry["detail"] is None:
                 unread.append(
                     f"{label} was not read with bedrock:GetGuardrail ({entry['error']})"
                 )
+                if is_enforced:
+                    enforced["unread"].append(label)
                 continue
             types = _prompt_pii_entity_types(entry["detail"])
             if types:
                 screening.append(f"{label} blocks or anonymizes {', '.join(types)}")
+                if is_enforced:
+                    enforced["screening"].append(label)
             else:
                 unscreened.append(label)
+        if unguarded_requests:
+            requests = "{}{}".format(
+                ", ".join(unguarded_requests[:MAX_REPORTED_UNGUARDED_REQUESTS]),
+                " and {} more".format(
+                    len(unguarded_requests) - MAX_REPORTED_UNGUARDED_REQUESTS
+                )
+                if len(unguarded_requests) > MAX_REPORTED_UNGUARDED_REQUESTS
+                else "",
+            )
+            if enforced["screening"]:
+                screening.append(
+                    "{} logged invocation(s) whose CloudTrail event names no "
+                    "guardrailIdentifier ({}) are screened by the account-enforced "
+                    "{}".format(
+                        len(unguarded_requests),
+                        requests,
+                        "; ".join(enforced["screening"]),
+                    )
+                )
+            elif enforced["unread"]:
+                unread.append(
+                    "{} logged invocation(s) whose CloudTrail event names no "
+                    "guardrailIdentifier ({}), screened only by an account-enforced "
+                    "configuration whose guardrail was not read".format(
+                        len(unguarded_requests), requests
+                    )
+                )
+            else:
+                findings["status"] = "WARN"
+                row(
+                    "{} logged invocation(s) in {} reached the model with no "
+                    "guardrail: the CloudTrail event of each names no "
+                    "guardrailIdentifier, and no un-narrowed account-enforced "
+                    "configuration applies a guardrail that acts on PII on the "
+                    "input, so these prompts reached the model unscreened for "
+                    "PII: {}.".format(len(unguarded_requests), region, requests),
+                    resolution,
+                    "High",
+                    "Failed",
+                )
 
         unused = sorted(
             f"'{name}' ({', '.join(types)})"

@@ -17562,6 +17562,114 @@ class TestBR46PromptPiiScreening:
         assert (arn, "4") in self.get_calls
         (passed,) = self._status(findings, "Passed")
         assert "logged invocation req-1" in passed["Finding_Details"]
+        (failed,) = self._status(findings, "Failed")
+        assert "req-2" in failed["Finding_Details"]
+        assert "req-1" not in failed["Finding_Details"]
+
+    UNGUARDED_JOINS = {
+        "resolved": {
+            "req-1": {"guardrail": "g1", "version": "1"},
+            "req-2": {"reason": "x", "unguarded": True},
+            "req-3": {"reason": "x", "unguarded": True},
+            "req-4": {"reason": "not read"},
+        }
+    }
+
+    def test_br46_prompt_unguarded_invocations_fail_by_request_id(self):
+        """Every logged call whose event names no guardrail is failed by name."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            joins=self.UNGUARDED_JOINS,
+        )
+        (failed,) = self._status(findings, "Failed")
+        assert "2 logged invocation(s) in us-east-1" in failed["Finding_Details"]
+        assert "req-2, req-3" in failed["Finding_Details"]
+        assert "req-4" not in failed["Finding_Details"]
+        assert failed["Severity"] == "High"
+        (na,) = self._status(findings, "N/A")
+        assert (
+            "1 logged invocation(s) whose CloudTrail event was"
+            in (na["Finding_Details"])
+        )
+
+    def test_br46_prompt_unguarded_invocations_screened_by_enforced_config(self):
+        """An un-narrowed account-enforced guardrail screens a call naming none."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    "account-enforced configuration c1", self.INPUT_PII
+                )
+            },
+            joins={"resolved": {"req-2": {"reason": "x", "unguarded": True}}},
+        )
+        assert not self._status(findings, "Failed")
+        (passed,) = self._status(findings, "Passed")
+        assert (
+            "1 logged invocation(s) whose CloudTrail event names no"
+            in (passed["Finding_Details"])
+        )
+        assert "req-2" in passed["Finding_Details"]
+
+    def test_br46_prompt_unguarded_invocations_fail_past_a_narrowed_config(self):
+        """A narrowed enforced configuration does not screen a call naming none."""
+        surface = "account-enforced configuration c1"
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    surface, self.INPUT_PII, narrowings={surface: ["inputTags HONOR"]}
+                )
+            },
+            joins=self.UNGUARDED_JOINS,
+        )
+        assert any(
+            "req-2, req-3" in f["Finding_Details"]
+            for f in self._status(findings, "Failed")
+        )
+
+    def test_br46_prompt_unguarded_invocations_fail_past_an_unscreening_config(
+        self,
+    ):
+        """An enforced guardrail with no input PII action leaves the calls unscreened."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.OUTPUT_ONLY_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    "account-enforced configuration c1", self.OUTPUT_ONLY_PII
+                )
+            },
+            joins={"resolved": {"req-2": {"reason": "x", "unguarded": True}}},
+        )
+        assert any(
+            "reached the model with no guardrail" in f["Finding_Details"]
+            and "req-2" in f["Finding_Details"]
+            for f in self._status(findings, "Failed")
+        )
+
+    def test_br46_prompt_unguarded_invocations_with_unread_enforced_config_are_na(
+        self,
+    ):
+        """An enforced guardrail that was not read cannot prove the calls unscreened."""
+        entry = self._entry("account-enforced configuration c1", None)
+        entry["error"] = "AccessDeniedException"
+        findings = self._run(
+            guardrails=["g1"],
+            details={
+                "g1": self.INPUT_PII,
+                ("g1", "1"): _make_client_error("AccessDeniedException"),
+            },
+            versions={("g1", "1"): entry},
+            joins={"resolved": {"req-2": {"reason": "x", "unguarded": True}}},
+        )
+        assert not self._status(findings, "Failed")
+        assert not self._status(findings, "Passed")
+        (na,) = self._status(findings, "N/A")
+        assert "guardrailIdentifier (req-2), screened only by" in na["Finding_Details"]
 
     def test_br46_prompt_denied_cross_account_guardrail_names_the_resource_policy(
         self,
