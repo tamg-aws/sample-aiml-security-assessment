@@ -13762,6 +13762,119 @@ class TestAC27GatewayPolicyConditions:
         ]
         assert [f["Status"] for f in deputy] == [status]
 
+    _INVOKER = "arn:aws:lambda:us-east-1:123456789012:function:SpecificFunction"
+
+    @pytest.mark.parametrize(
+        "operator, source_arn, status",
+        [
+            (
+                "ArnLike",
+                "arn:aws:lambda:us-east-1:123456789012:function/SpecificFunction",
+                "Passed",
+            ),
+            ("ArnEquals", _INVOKER, "Passed"),
+            ("StringLike", [_INVOKER, _INVOKER + "Two"], "Passed"),
+            ("ArnLike", "arn:aws:lambda:us-east-1:123456789012:function/*", "Failed"),
+            (
+                "ArnLike",
+                "arn:aws:lambda:us-east-1:123456789012:function:Spec?",
+                "Failed",
+            ),
+            (
+                "ArnLike",
+                "arn:aws:lambda:*:123456789012:function:SpecificFunction",
+                "Failed",
+            ),
+            (
+                "ArnLike",
+                "arn:aws:*:us-east-1:123456789012:function:SpecificFunction",
+                "Failed",
+            ),
+            (
+                "ArnLike",
+                "arn:aws:lambda:us-east-1:123456789012:function:${aws:PrincipalTag/fn}",
+                "Failed",
+            ),
+            (
+                "ArnEquals",
+                "arn:aws:lambda:us-east-1:999988887777:function:Other",
+                "Failed",
+            ),
+            (
+                "ArnEquals",
+                [_INVOKER, "arn:aws:lambda:us-east-1:999988887777:function:Other"],
+                "Failed",
+            ),
+            ("ArnLikeIfExists", _INVOKER, "Failed"),
+            ("ArnNotEquals", _INVOKER, "Failed"),
+            ("ForAllValues:ArnEquals", _INVOKER, "Failed"),
+        ],
+        ids=[
+            "aws-doc-function",
+            "invoking-function",
+            "two-functions",
+            "function-wildcard",
+            "function-question-mark",
+            "region-wildcard",
+            "service-wildcard",
+            "policy-variable",
+            "other-account",
+            "one-of-two-other-account",
+            "if-exists",
+            "negated",
+            "for-all-values",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_resource_policy_guard_credits_the_invoking_resource(
+        self, mock_ac, operator, source_arn, status
+    ):
+        # Only the gateway's own ARN was credited, so AWS's documented
+        # confused-deputy policy, which names the invoking function, failed.
+        policy = {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {"aws:SourceAccount": "123456789012"},
+                        operator: {"aws:SourceArn": source_arn},
+                    },
+                }
+            ]
+        }
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+        }
+        mock_ac.get_resource_policy.return_value = {"policy": json.dumps(policy)}
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        deputy = [
+            f
+            for f in findings
+            if f["Finding"].startswith("AgentCore Gateway Resource Policy")
+            and "Network" not in f["Finding"]
+        ]
+        assert [f["Status"] for f in deputy] == [status]
+        if status == "Failed":
+            assert deputy[0]["Finding"] == (
+                "AgentCore Gateway Resource Policy Source ARN Missing"
+            )
+            assert (
+                "1 of them carry no such aws:SourceArn"
+                in (deputy[0]["Finding_Details"])
+            )
+            assert (
+                "another resource in the account can"
+                not in (deputy[0]["Finding_Details"])
+            )
+
     @staticmethod
     def _deputy_verdicts(findings):
         return {
@@ -30343,6 +30456,243 @@ class TestAC45ToolRoleInvokerBound:
                         "Action": "s3:GetObject",
                         "NotResource": "arn:aws:s3:::secrets/*",
                     },
+                )
+            },
+        )
+
+        assert row["Status"] == status
+
+    _SECRETS = "arn:aws:s3:::secrets-bucket/*"
+
+    @pytest.mark.parametrize(
+        "deny, status, lacking",
+        [
+            ({"Action": "s3:GetObject", "Resource": _SECRETS}, "Failed", [_SECRETS]),
+            (
+                {"Action": "s3:Get*", "Resource": "arn:aws:s3:::secrets-*"},
+                "Failed",
+                [_SECRETS],
+            ),
+            (
+                {
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::secrets-bucket/keys/*",
+                },
+                "Failed",
+                [_SECRETS],
+            ),
+            (
+                {"Action": "s3:GetObject", "NotResource": "arn:aws:s3:::app-bucket/*"},
+                "Failed",
+                [_SECRETS],
+            ),
+            ({"NotAction": "s3:PutObject", "Resource": _SECRETS}, "Failed", [_SECRETS]),
+            (
+                {
+                    "Action": "s3:GetObject",
+                    "Resource": [_SECRETS, "arn:aws:s3:::app-bucket/*"],
+                },
+                "Failed",
+                [_SECRETS, "arn:aws:s3:::app-bucket/*"],
+            ),
+            (
+                {"Action": "s3:GetObject", "Resource": "arn:aws:s3:::other-bucket/*"},
+                "Passed",
+                [],
+            ),
+            ({"Action": "s3:PutObject", "Resource": _SECRETS}, "Passed", []),
+            (
+                {"Action": "s3:GetObject", "Resource": "arn:aws:s3:::Secrets-bucket/*"},
+                "Passed",
+                [],
+            ),
+            (
+                {
+                    "Action": "s3:GetObject",
+                    "NotResource": ["arn:aws:s3:::secrets-*", "arn:aws:s3:::app-*"],
+                },
+                "Passed",
+                [],
+            ),
+        ],
+        ids=[
+            "names-one-of-two",
+            "pattern-covers-one",
+            "reaches-part-of-one",
+            "not-resource-spares-the-other",
+            "not-action",
+            "names-both",
+            "names-neither",
+            "other-action",
+            "case-differs",
+            "not-resource-spares-both",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_deny_on_a_granted_resource_subtracts_that_grant(
+        self, mock_ac, deny, status, lacking
+    ):
+        # Only an unconditioned Deny on Resource "*" was subtracted, so an
+        # invoker denied the very bucket the tool role reads still passed.
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", [self._APP, self._SECRETS])),
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    self._allow("s3:GetObject", "*"),
+                    {"Effect": "Deny", **deny},
+                )
+            },
+        )
+
+        assert row["Status"] == status
+        for resource in (self._APP, self._SECRETS):
+            assert (f"s3:getobject on {resource}" in row["Finding_Details"]) is (
+                resource in lacking
+            )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_invoker_deny_is_named_and_not_subtracted(self, mock_ac):
+        conditioned = {
+            "Effect": "Deny",
+            "Action": "s3:GetObject",
+            "Resource": self._SECRETS,
+            "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "false"}},
+        }
+        tool = self._principal(self._allow("s3:GetObject", [self._APP, self._SECRETS]))
+        users = {
+            "dev": self._principal(
+                self._start(), self._allow("s3:GetObject", "*"), conditioned
+            ),
+            "ops": self._principal(self._start(), self._allow("s3:GetObject", "*")),
+        }
+
+        row = self._run(mock_ac, tool, users=users)
+        assert row["Status"] == "Passed"
+        assert "A conditioned Deny is not credited" in row["Finding_Details"]
+        assert "user dev (policy Policy)" in row["Finding_Details"]
+        assert "user ops (policy" not in row["Finding_Details"]
+
+        users["ops"] = self._principal(self._start())
+        row = self._run(mock_ac, tool, users=users)
+        assert row["Status"] == "Failed"
+        assert "user dev (policy Policy)" in row["Finding_Details"]
+
+        users["ops"] = self._principal(
+            self._start(),
+            self._allow("s3:GetObject", "*"),
+            boundary={
+                "Statement": [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    conditioned,
+                ]
+            },
+        )
+        row = self._run(mock_ac, tool, users=users)
+        assert row["Status"] == "Passed"
+        assert "user ops (policy permissions boundary)" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_boundary_withholding_the_start_action_does_not_make_an_invoker(
+        self, mock_ac
+    ):
+        lacking = self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*")
+        s3_only = {
+            "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+        }
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "bounded": self._principal(self._start(), lacking, boundary=s3_only),
+                "dev": self._principal(self._start(), lacking),
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert "user dev lacks" in row["Finding_Details"]
+        assert "user bounded" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_start_deny_on_this_tool_does_not_make_an_invoker(self, mock_ac):
+        lacking = self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*")
+        on_this = {
+            "Effect": "Deny",
+            "Action": "bedrock-agentcore:StartCodeInterpreterSession",
+            "Resource": self._CI_ARN,
+        }
+        on_other = {**on_this, "Resource": self._CI_ARN.replace("ci-1", "ci-2")}
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "denied": self._principal(self._start("*"), lacking, on_this),
+                "dev": self._principal(self._start("*"), lacking, on_other),
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert "user dev lacks" in row["Finding_Details"]
+        assert "user denied" not in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "boundary_statements, status",
+        [
+            ([{"Effect": "Allow", "Action": "*", "Resource": "*"}], "Passed"),
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:GetObject",
+                        "Resource": "arn:aws:s3:::app-bucket/*",
+                    },
+                ],
+                "Failed",
+            ),
+            (
+                [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "s3:GetObject", "Resource": _SECRETS},
+                ],
+                "Failed",
+            ),
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "*",
+                        "Resource": "*",
+                        "Condition": {"Bool": {"aws:SecureTransport": "true"}},
+                    }
+                ],
+                "Failed",
+            ),
+        ],
+        ids=[
+            "allows-all",
+            "allows-one-bucket",
+            "denies-one-bucket",
+            "conditioned-allow",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_boundary_is_read_per_granted_resource(
+        self, mock_ac, boundary_statements, status
+    ):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", [self._APP, self._SECRETS])),
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    self._allow("s3:GetObject", "*"),
+                    boundary={"Statement": boundary_statements},
                 )
             },
         )

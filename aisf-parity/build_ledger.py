@@ -749,9 +749,11 @@ AI_SUBJECT_ROWS = [
         "NotAction read as every action, a NotResource as every resource) that such a "
         "principal does not hold through a surviving Allow covering the action "
         "pattern, the resource pattern and the condition, and is Not Applicable when "
-        "no principal starts its sessions or a policy cannot be parsed. Deny "
-        "statements scoped to a resource or condition, session policies and SCPs are "
-        "not read",
+        "no principal starts its sessions or a policy cannot be parsed. A grant "
+        "survives only when no unconditioned Deny in the principal's policies or "
+        "boundary reaches any action and resource of it and a boundary, if set, has an "
+        "unconditioned Allow covering it; a conditioned Deny is not subtracted and the "
+        "row names its policy. Session policies and SCPs are not read",
         [],
         4,
     ),
@@ -818,7 +820,9 @@ AI_SUBJECT_ROWS = [
         "beside it in the same document, and fails a gateway role that trusts a second "
         "principal. A gateway resource-policy statement that names a service or "
         "wildcard principal also fails unless it carries both aws:SourceAccount naming "
-        "the account and aws:SourceArn equal to the gateway's own ARN. AC-27 also "
+        "the account and aws:SourceArn whose every value is a wildcard-free ARN in "
+        "the account, the gateway's own or the invoking resource's as in AWS's "
+        "confused-deputy example. AC-27 also "
         "reads each consent portal's executionRoleArn with GetConsentPortal and fails "
         "a trust statement with no guard naming the account, or whose aws:SourceArn "
         "does not name a consent-portal resource, because the setup guide lets the "
