@@ -314,6 +314,19 @@ section.
   - `AC-40` passed a configuration on a tool-choice alarm when ListMetrics
     listed no score for `Builtin.Harmfulness` or `Builtin.Stereotyping`. Such
     a configuration is now `N/A`, naming the unlisted score.
+  - `AC-53` passed an agent pair alarmed on its latency and errors with no
+    alarm on how often the pair calls. Each pair now also needs an anomaly
+    detection band over its `Latency` `SampleCount`, the pair's message rate,
+    and fails naming the missing band. A `SampleCount` band credits the rate
+    only, and a band on any other `Latency` stat the latency only.
+  - `AC-46` failed every Cost Anomaly Detection monitor other than an AWS
+    managed `SERVICE` monitor or a `CUSTOM` monitor naming the runtimes'
+    account, with text saying AgentCore spend is not alerted on. An AWS
+    managed `LINKED_ACCOUNT` monitor and a `CUSTOM` monitor whose `SERVICE`
+    specification names `Amazon Bedrock AgentCore` now pass. A `TAG` or
+    `COST_CATEGORY` monitor, which the API does not resolve to AgentCore
+    spend, is `N/A` naming the monitor, and the row fails only when every
+    subscribed monitor is resolved and none watches AgentCore spend.
   - `AC-34` scans every file system layer of a runtime's container image,
     every platform of an index included, for AWS access key IDs, private key
     blocks and `.env` credentials. Layers over 512 MiB compressed or
