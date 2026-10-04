@@ -1719,7 +1719,14 @@ AI_SUBJECT_ROWS = [
         "operation that returns a real-time call, and CloudTrail records the call "
         "as a management event with requestParameters.text "
         "HIDDEN_DUE_TO_SECURITY_MEASURES and responseElements null, so no read "
-        "ties a call to the prompt it screened",
+        "ties a call to the prompt it screened. The prompt level is judged through "
+        "guardrails: every guardrail in the Region is read with GetGuardrail, and "
+        "each version an agent, flow node, un-narrowed account-enforced "
+        "configuration, guardrail condition pin or logged invocation joined to "
+        "CloudTrail applies passes only when a PII entity type blocks or "
+        "anonymizes on the input with inputEnabled not false. An unread guardrail, "
+        "version or logged invocation is N/A, a used version with no such entity "
+        "fails, and a Region where nothing applies a guardrail fails",
         [],
         5,
     ),

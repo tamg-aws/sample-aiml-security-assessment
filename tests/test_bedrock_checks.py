@@ -9385,6 +9385,7 @@ class TestBedrockHandlerMultiRegion:
         "check_lambda_public_invoke_configuration": "BR-54",
         "check_kms_enclave_key_binding": "BR-55",
         "check_bedrock_llm_jacking_activity": "BR-56",
+        "check_bedrock_prompt_pii_screening": "BR-46",
         "check_agent_handoff_source_identity": "BR-57",
         "check_bedrock_agent_workload_identity": "BR-57",
         "check_bedrock_agent_role_scope": "BR-57",
@@ -9541,6 +9542,17 @@ class TestBedrockHandlerMultiRegion:
             recorded.get("check_bedrock_knowledge_base_source_classification")
             == "us-east-1"
         )
+
+    def test_br46_prompt_leg_shares_br26_attachments_and_br34_joins(self):
+        resp, _ = self._run_handler_with_check_spies(
+            _bedrock_event(region="us-east-1", region_index=0)
+        )
+        assert resp["statusCode"] == 200
+        (prompt,) = self.spy_calls["check_bedrock_prompt_pii_screening"]
+        (br26,) = self.spy_calls["check_bedrock_guardrail_pii_filters"]
+        (br34,) = self.spy_calls["check_guardrail_prompt_attack_invocation_evidence"]
+        assert prompt["attachment_inventory"] is br26["attachment_inventory"]
+        assert prompt["joins"] is br34["joins"]
 
     def test_br44_gets_both_br42_results_and_br42_org_leg_runs_once(self):
         resp, _ = self._run_handler_with_check_spies(
@@ -17287,6 +17299,188 @@ class TestBR46KnowledgeBaseSourceClassification:
         assert {f["Status"] for f in findings} == {"Failed", "Passed"}
         for finding in findings:
             assert_finding_schema(finding)
+
+
+class TestBR46PromptPiiScreening:
+    """BR-46 prompt leg: a guardrail used on invocations must act on PII on the input."""
+
+    INPUT_PII = {
+        "sensitiveInformationPolicy": {
+            "piiEntities": [
+                {"type": "EMAIL", "inputAction": "BLOCK", "inputEnabled": True}
+            ]
+        }
+    }
+    # Acts on the output only: inputEnabled false switches the input side off.
+    OUTPUT_ONLY_PII = {
+        "sensitiveInformationPolicy": {
+            "piiEntities": [
+                {
+                    "type": "EMAIL",
+                    "inputAction": "BLOCK",
+                    "inputEnabled": False,
+                    "outputAction": "ANONYMIZE",
+                }
+            ]
+        }
+    }
+
+    def _run(self, guardrails=(), details=None, versions=None, joins=None, errors=()):
+        """
+        ``guardrails`` are the ListGuardrails ids, ``details`` maps an id or an
+        (id, version) pair to a GetGuardrail answer or an exception, and
+        ``versions`` is the attachment inventory's versions map.
+        """
+        details = details or {}
+        client = MagicMock()
+        client.list_guardrails.return_value = {
+            "guardrails": [{"id": gid, "name": f"name-{gid}"} for gid in guardrails]
+        }
+        self.get_calls = []
+
+        def get_guardrail(guardrailIdentifier, guardrailVersion=None):
+            self.get_calls.append((guardrailIdentifier, guardrailVersion))
+            answer = details.get(
+                (guardrailIdentifier, guardrailVersion),
+                details.get(guardrailIdentifier),
+            )
+            if isinstance(answer, Exception):
+                raise answer
+            return {"guardrail": answer or {}}
+
+        client.get_guardrail.side_effect = get_guardrail
+        inventory = {"versions": versions or {}, "errors": list(errors)}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_prompt_pii_screening(
+                    region="us-east-1", attachment_inventory=inventory, joins=joins
+                )
+            )
+
+    @staticmethod
+    def _entry(surface, detail, narrowings=None):
+        return {
+            "surfaces": [surface],
+            "narrowings": narrowings or {},
+            "detail": detail,
+            "error": "",
+            "region": "us-east-1",
+        }
+
+    @staticmethod
+    def _status(findings, status):
+        return [f for f in findings if f["Status"] == status]
+
+    def test_br46_prompt_each_used_version_is_judged(self):
+        """Two used versions, one screening the input: one Passed, one Failed."""
+        findings = self._run(
+            guardrails=["g1", "g2"],
+            details={"g1": self.INPUT_PII, "g2": self.OUTPUT_ONLY_PII},
+            versions={
+                ("g1", "1"): self._entry("agent 'a' version 1", self.INPUT_PII),
+                ("g2", "3"): self._entry("agent 'b' version 2", self.OUTPUT_ONLY_PII),
+            },
+        )
+        (passed,) = self._status(findings, "Passed")
+        assert "guardrail g1 version 1" in passed["Finding_Details"]
+        assert "EMAIL" in passed["Finding_Details"]
+        (failed,) = self._status(findings, "Failed")
+        assert "guardrail g2 version 3" in failed["Finding_Details"]
+        assert all(f["Check_ID"] == "BR-46" for f in findings)
+
+    def test_br46_prompt_unused_guardrail_is_not_credited(self):
+        """A draft with an input PII policy that nothing applies fails the leg."""
+        findings = self._run(guardrails=["g1"], details={"g1": self.INPUT_PII})
+        assert not self._status(findings, "Passed")
+        (failed,) = self._status(findings, "Failed")
+        assert "no prompt is shown to be screened" in failed["Finding_Details"]
+        assert "'name-g1' (EMAIL)" in failed["Finding_Details"]
+
+    def test_br46_prompt_cloudtrail_joined_guardrail_is_read_at_its_version(self):
+        """A guardrail named only by a joined invocation is read at that version."""
+        arn = "arn:aws:bedrock:us-east-1:123456789012:guardrail/g9"
+        findings = self._run(
+            guardrails=["g9"],
+            details={"g9": self.OUTPUT_ONLY_PII, (arn, "4"): self.INPUT_PII},
+            joins={
+                "resolved": {
+                    "req-1": {"guardrail": arn, "version": "4"},
+                    "req-2": {"reason": "x", "unguarded": True},
+                }
+            },
+        )
+        assert (arn, "4") in self.get_calls
+        (passed,) = self._status(findings, "Passed")
+        assert "logged invocation req-1" in passed["Finding_Details"]
+
+    def test_br46_prompt_unread_guardrail_holds_passed_at_na(self):
+        """GetGuardrail failing on any listed guardrail keeps the leg off Passed."""
+        findings = self._run(
+            guardrails=["g1", "g2"],
+            details={
+                "g1": self.INPUT_PII,
+                "g2": _make_client_error("ThrottlingException"),
+            },
+            versions={("g1", "1"): self._entry("flow 'f' 1", self.INPUT_PII)},
+        )
+        assert not self._status(findings, "Passed")
+        (na,) = self._status(findings, "N/A")
+        assert "guardrail 'name-g2' (g2) was not read" in na["Finding_Details"]
+
+    def test_br46_prompt_unmatched_invocation_is_na_not_failed(self):
+        """A logged call whose guardrail is unknown cannot prove the absence."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            joins={"resolved": {"req-1": {"reason": "not read"}}},
+        )
+        assert not self._status(findings, "Failed")
+        (na,) = self._status(findings, "N/A")
+        assert "1 logged invocation(s)" in na["Finding_Details"]
+
+    def test_br46_prompt_narrowed_enforced_configuration_is_not_credited(self):
+        """An account-enforced configuration that guards part of the traffic is not use."""
+        surface = "account-enforced configuration c1"
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    surface, self.INPUT_PII, narrowings={surface: ["inputTags HONOR"]}
+                )
+            },
+        )
+        assert not self._status(findings, "Passed")
+        assert self._status(findings, "Failed")
+
+    def test_br46_prompt_guardrail_reads_stop_at_the_deadline(self, monkeypatch):
+        """Past the deadline no guardrail is read and the stop is named."""
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        findings = self._run(
+            guardrails=["g1", "g2"],
+            details={"g1": self.INPUT_PII, "g2": self.INPUT_PII},
+            joins={"resolved": {"req-1": {"guardrail": "g1", "version": "2"}}},
+        )
+        assert self.get_calls == []
+        assert not self._status(findings, "Passed")
+        (na,) = self._status(findings, "N/A")
+        assert "2 guardrail(s) from 'name-g1' on" in na["Finding_Details"]
+        assert bedrock_app.DEADLINE_STOP in na["Finding_Details"]
+
+    def test_br46_prompt_list_failure_is_na(self):
+        client_error = _make_client_error("AccessDeniedException")
+        client = MagicMock()
+        client.list_guardrails.side_effect = client_error
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_prompt_pii_screening(
+                    region="us-east-1",
+                    attachment_inventory={"versions": {}, "errors": []},
+                    joins=None,
+                )
+            )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "bedrock:ListGuardrails" in findings[0]["Finding_Details"]
 
 
 class TestBR46ClassificationJobCoverage:

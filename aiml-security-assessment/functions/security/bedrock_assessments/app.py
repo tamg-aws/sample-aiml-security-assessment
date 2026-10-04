@@ -36671,6 +36671,282 @@ def check_bedrock_knowledge_base_source_classification(
         }
 
 
+PROMPT_PII_SCREENING_FINDING = "Prompt PII Screening"
+
+PROMPT_PII_SCREENING_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html"
+
+
+def _prompt_pii_entity_types(detail: Dict[str, Any]) -> List[str]:
+    """
+    Name the PII entity types a guardrail version blocks or anonymizes on the
+    input: inputAction (or the legacy action) BLOCK or ANONYMIZE, and
+    inputEnabled not false. Regexes are not PII entity types.
+    """
+    policy = detail.get("sensitiveInformationPolicy") or {}
+    return sorted(
+        str(entity.get("type") or "unspecified")
+        for entity in policy.get("piiEntities") or []
+        if isinstance(entity, dict)
+        and _sensitive_information_action(entity, "input")
+        in SENSITIVE_INFORMATION_ACTING
+    )
+
+
+def check_bedrock_prompt_pii_screening(
+    region: str = "",
+    attachment_inventory: Optional[Dict[str, Any]] = None,
+    joins: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    BR-46 prompt leg: verify text prompts are screened for PII before the
+    model reads them.
+
+    Every guardrail in the Region is listed and read with GetGuardrail, and
+    each version a workload applies is judged by its sensitiveInformationPolicy:
+    a version screens prompts when a PII entity type blocks or anonymizes on the
+    input. A version is used on invocations when an agent, flow node,
+    un-narrowed account-enforced configuration or guardrail condition pin in
+    ``attachment_inventory`` applies it, or when a logged invocation joined to
+    CloudTrail through ``joins`` (BR-27 and BR-34's shared state) names it. Only
+    a used version passes; an unread one is N/A.
+    """
+    findings = {
+        "check_name": PROMPT_PII_SCREENING_FINDING,
+        "status": "PASS",
+        "details": "",
+        "csv_data": [],
+    }
+
+    def row(details, resolution, severity, status):
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-46",
+                finding_name=PROMPT_PII_SCREENING_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=PROMPT_PII_SCREENING_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
+
+    resolution = (
+        "Apply a guardrail to every invocation path whose sensitive-information "
+        "policy sets the PII entity types the workload handles to BLOCK or "
+        "ANONYMIZE on the input, through the agent or flow configuration, an "
+        "account-enforced guardrail configuration, or the guardrailConfig of each "
+        "InvokeModel and Converse call."
+    )
+    try:
+        if attachment_inventory is None:
+            attachment_inventory = get_guardrail_attachment_inventory(region)
+        unread = list(attachment_inventory.get("errors") or [])
+        client = boto3.client("bedrock", config=boto3_config, region_name=region)
+        drafts = {}
+        try:
+            summaries = _list_all_items(client, "list_guardrails", "guardrails")
+        except (ClientError, BotoCoreError, TypeError) as error:
+            summaries = []
+            unread.append(
+                "the guardrails in the Region were not listed with "
+                f"bedrock:ListGuardrails ({get_assessment_error_label(error)})"
+            )
+        for index, summary in enumerate(summaries):
+            guardrail_id = summary.get("id")
+            if not guardrail_id:
+                continue
+            name = summary.get("name") or guardrail_id
+            if _deadline_reached():
+                unread.append(
+                    "{} guardrail(s) from '{}' on were not read with "
+                    "bedrock:GetGuardrail, {}".format(
+                        len(summaries) - index, name, DEADLINE_STOP
+                    )
+                )
+                break
+            try:
+                response = client.get_guardrail(guardrailIdentifier=guardrail_id)
+            except (ClientError, BotoCoreError) as error:
+                unread.append(
+                    f"guardrail '{name}' ({guardrail_id}) was not read with "
+                    f"bedrock:GetGuardrail ({get_assessment_error_label(error)})"
+                )
+                continue
+            drafts[guardrail_id] = (
+                name,
+                _prompt_pii_entity_types(response.get("guardrail", response)),
+            )
+
+        used = {}
+        for (identifier, version), entry in (
+            attachment_inventory.get("versions") or {}
+        ).items():
+            narrowed = entry.get("narrowings") or {}
+            surfaces = [s for s in entry["surfaces"] if s not in narrowed]
+            if not surfaces:
+                continue
+            used[(identifier, version)] = {
+                "surfaces": surfaces,
+                "detail": entry.get("detail"),
+                "error": entry.get("error") or "no detail returned",
+                "region": entry.get("region") or region,
+            }
+        joins_unread = 0
+        for request_id, resolved in sorted(
+            ((joins or {}).get("resolved") or {}).items()
+        ):
+            if resolved.get("guardrail"):
+                reference = _parse_guardrail_reference(resolved["guardrail"], region)
+                key = (reference["identifier"], resolved["version"])
+                entry = used.setdefault(
+                    key,
+                    {
+                        "surfaces": [],
+                        "detail": None,
+                        "error": "",
+                        "region": reference["region"] or region,
+                    },
+                )
+                entry["surfaces"].append(f"logged invocation {request_id}")
+            elif not resolved.get("unguarded"):
+                joins_unread += 1
+        if joins_unread:
+            unread.append(
+                f"{joins_unread} logged invocation(s) whose CloudTrail event was "
+                "not read or not matched, so which guardrail ran is not known"
+            )
+
+        clients = {region: client}
+        for (identifier, version), entry in sorted(used.items()):
+            if entry["detail"] is not None or entry["error"]:
+                continue
+            if _deadline_reached():
+                entry["error"] = DEADLINE_STOP
+                continue
+            target = entry["region"]
+            try:
+                if target not in clients:
+                    clients[target] = boto3.client(
+                        "bedrock", config=boto3_config, region_name=target
+                    )
+                response = clients[target].get_guardrail(
+                    guardrailIdentifier=identifier, guardrailVersion=version
+                )
+                entry["detail"] = response.get("guardrail", response)
+            except (ClientError, BotoCoreError) as error:
+                entry["error"] = get_assessment_error_label(error)
+
+        screening, unscreened = [], []
+        for (identifier, version), entry in sorted(used.items()):
+            label = "guardrail {} version {} (applied by {})".format(
+                identifier, version, ", ".join(entry["surfaces"][:5])
+            )
+            if entry["detail"] is None:
+                unread.append(
+                    f"{label} was not read with bedrock:GetGuardrail ({entry['error']})"
+                )
+                continue
+            types = _prompt_pii_entity_types(entry["detail"])
+            if types:
+                screening.append(f"{label} blocks or anonymizes {', '.join(types)}")
+            else:
+                unscreened.append(label)
+
+        unused = sorted(
+            f"'{name}' ({', '.join(types)})"
+            for guardrail_id, (name, types) in drafts.items()
+            if types
+            and not any(
+                _parse_guardrail_reference(identifier, region)["id"] == guardrail_id
+                for identifier, _ in used
+            )
+        )
+        unused_note = (
+            " The working draft of {} guardrail(s) acts on PII on the input but no "
+            "version of it is evidenced on invocations, so it is not credited: "
+            "{}.".format(len(unused), "; ".join(unused[:5]))
+            if unused
+            else ""
+        )
+        unread_note = " Not read: {}.".format("; ".join(unread[:5])) if unread else ""
+        scope = (
+            f" {len(drafts)} of {len(summaries)} guardrail(s) listed in {region} "
+            "were read with GetGuardrail. A guardrail passed per request is seen "
+            "only through a logged invocation joined to its CloudTrail event."
+        )
+        for label in unscreened:
+            findings["status"] = "WARN"
+            row(
+                f"The {label} sets no PII entity type to BLOCK or ANONYMIZE on the "
+                "input, so prompts it screens reach the model with PII intact." + scope,
+                resolution,
+                "High",
+                "Failed",
+            )
+        if screening:
+            row(
+                "Prompts are screened for PII on the input by {} guardrail "
+                "version(s) used on invocations: {}. Whether those entity types "
+                "cover the PII the workload handles is not judged.{}{}{}".format(
+                    len(screening),
+                    "; ".join(screening),
+                    unread_note,
+                    unused_note,
+                    scope,
+                ),
+                COULD_NOT_ASSESS_RESOLUTION
+                if unread
+                else "No action required. Review the entity types against the "
+                "data the workload handles.",
+                "Informational" if unread else "Low",
+                "N/A" if unread else "Passed",
+            )
+        elif unread:
+            findings["status"] = "WARN"
+            row(
+                "No guardrail version read is shown to screen prompts for PII on "
+                f"the input, but the inventory is incomplete.{unread_note}"
+                f"{unused_note}{scope}",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        elif not unscreened:
+            findings["status"] = "WARN"
+            row(
+                "No agent, flow node, un-narrowed account-enforced configuration, "
+                "guardrail condition pin or logged invocation joined to CloudTrail "
+                f"in {region} applies a guardrail, so no prompt is shown to be "
+                f"screened for PII before the model reads it.{unused_note}{scope}",
+                resolution,
+                "High",
+                "Failed",
+            )
+        return findings
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_prompt_pii_screening: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": PROMPT_PII_SCREENING_FINDING,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=PROMPT_PII_SCREENING_FINDING,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=PROMPT_PII_SCREENING_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
 AI_DATA_PATH_TLS_REFERENCE = (
     "https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html"
 )
@@ -44551,6 +44827,13 @@ def lambda_handler(event, context):
         logger.info("Running knowledge base source classification check (BR-46)")
         all_findings.append(
             check_bedrock_knowledge_base_source_classification(region=region)
+        )
+        all_findings.append(
+            check_bedrock_prompt_pii_screening(
+                region=region,
+                attachment_inventory=guardrail_attachments,
+                joins=guardrail_joins,
+            )
         )
 
         logger.info("Running data path bucket TLS check (BR-47)")
