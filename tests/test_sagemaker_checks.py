@@ -3412,13 +3412,34 @@ class TestSM11AILambdaNetworkBoundary:
             return {"VpcConfig": {"SubnetIds": spec}} if spec else {}
 
         lam.get_function_configuration.side_effect = configuration
+
+        def list_functions(FunctionVersion=None):
+            # As the API does: published versions come back only under
+            # FunctionVersion ALL, which qualifies the $LATEST ARN too.
+            if FunctionVersion != "ALL":
+                return [
+                    {"Functions": [f]}
+                    for f in listed
+                    if f.get("Version", "$LATEST") == "$LATEST"
+                ]
+            return [
+                {
+                    "Functions": [
+                        f
+                        if "Version" in f
+                        else dict(
+                            f,
+                            Version="$LATEST",
+                            FunctionArn=f"{f['FunctionArn']}:$LATEST",
+                        )
+                    ]
+                }
+                for f in listed
+            ]
+
         # One function per page, so a first-page reader misses every later one.
         lam.get_paginator.side_effect = _pager(
-            {
-                "list_functions": raising(
-                    "list_functions", lambda: [{"Functions": [f]} for f in listed]
-                )
-            }
+            {"list_functions": raising("list_functions", list_functions)}
         )
         ecs = MagicMock()
         ecs.get_paginator.side_effect = _pager(
@@ -3796,6 +3817,76 @@ class TestSM11AIWorkloadsByGrant:
         assert "permission_cache=permission_cache" in call
 
 
+class TestRound9SM11PublishedVersions:
+    """AIR-FND-NET-01 round 9: a published Lambda version keeps its own Role
+    and VpcConfig, so SM-11 reads every version, not only $LATEST."""
+
+    _by_grant = TestSM11AIWorkloadsByGrant()
+
+    def _version(self, name, version, role, subnets=()):
+        function = self._by_grant._function(name, role, subnets)
+        return dict(
+            function,
+            FunctionArn=f"{function['FunctionArn']}:{version}",
+            Version=version,
+        )
+
+    def test_a_published_version_outside_a_vpc_fails_beside_a_private_latest(self):
+        rows = self._by_grant._run(
+            listed=[
+                self._by_grant._function("fn", "ai-role", ["subnet-p"]),
+                self._version("fn", "2", "ai-role"),
+            ],
+            exposure={"subnet-p": False},
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "Lambda function fn version 2 (role granted bedrock:invokeagent"
+            in failed[0]["Finding_Details"]
+        )
+        assert "runs outside a VPC" in failed[0]["Finding_Details"]
+        assert "Lambda function fn (role granted" not in failed[0]["Finding_Details"]
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "Lambda function fn (role granted" in passed[0]["Finding_Details"]
+
+    def test_a_version_is_ai_by_its_own_role_not_by_latest(self):
+        rows = self._by_grant._run(
+            listed=[
+                self._by_grant._function("fn", "plain-role"),
+                self._version("fn", "3", "ai-role", ["subnet-p"]),
+            ],
+            exposure={"subnet-p": False},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Lambda function fn version 3 (role granted" in rows[0]["Finding_Details"]
+        )
+        assert "runs outside a VPC" not in rows[0]["Finding_Details"]
+
+    def test_a_named_functions_published_version_is_still_judged_by_grant(self):
+        arn = TestSM11AILambdaNetworkBoundary.FN + "tool"
+        rows = self._by_grant._run(
+            agents={"a1": {"1": {"g1": arn}}},
+            functions={arn: ["subnet-p"]},
+            listed=[
+                self._by_grant._function("tool", "ai-role", ["subnet-p"]),
+                self._version("tool", "1", "ai-role"),
+            ],
+            exposure={"subnet-p": False},
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "Lambda function tool version 1 (role granted"
+            in failed[0]["Finding_Details"]
+        )
+        assert not any(
+            "Lambda function tool (role granted" in r["Finding_Details"] for r in rows
+        )
+
+
 class TestSM02AIApiMethodAuthorization:
     """AIR-FND-IAM-09: request-layer authorization of AI API methods."""
 
@@ -3810,6 +3901,15 @@ class TestSM02AIApiMethodAuthorization:
             "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
             f"{arn}/invocations"
         )
+
+    @staticmethod
+    def _function(arn, role, version="$LATEST"):
+        return {
+            "FunctionName": arn.rsplit(":", 1)[-1],
+            "FunctionArn": f"{arn}:{version}",
+            "Version": version,
+            "Role": f"arn:aws:iam::111122223333:role/{role}",
+        }
 
     @staticmethod
     def _method(uri, kind="COGNITO_USER_POOLS", authorizer="au1", scopes=None):
@@ -3828,10 +3928,13 @@ class TestSM02AIApiMethodAuthorization:
         errors=None,
         cache=None,
         policies=None,
+        listed=None,
     ):
         """rest: {api: {path: {verb: method}}}; http: {api: [(route key, auth
         type, scopes, uri)]}; cache is the IAM permissions cache, policies is
-        {api: resource policy text}, and errors["sts"] fails GetCallerIdentity."""
+        {api: resource policy text}, errors["sts"] fails GetCallerIdentity,
+        listed is what ListFunctions FunctionVersion ALL returns and
+        errors["lambda"] fails it."""
         rest = rest or {}
         policies = policies or {}
         http = http or {}
@@ -3907,7 +4010,27 @@ class TestSM02AIApiMethodAuthorization:
                 "Account": "111122223333",
                 "Arn": "arn:aws:sts::111122223333:assumed-role/a/s",
             }
+        lam = MagicMock()
+        lam.get_paginator.side_effect = _pager(
+            {
+                "list_functions": raising(
+                    "lambda",
+                    lambda FunctionVersion=None: [
+                        {
+                            "Functions": [
+                                f
+                                for f in listed or []
+                                if FunctionVersion == "ALL"
+                                or f.get("Version", "$LATEST") == "$LATEST"
+                            ]
+                        }
+                    ],
+                )
+            }
+        )
         clients = {"apigateway": apigateway, "apigatewayv2": v2, "sts": sts}
+        if listed is not None:
+            clients["lambda"] = lam
         with (
             patch(
                 "sagemaker_app.boto3.client", side_effect=lambda svc, **_: clients[svc]
@@ -3936,7 +4059,9 @@ class TestSM02AIApiMethodAuthorization:
                         )
                     },
                 }
-            }
+            },
+            cache=AI_GRANT_CACHE,
+            listed=[self._function(self.OTHER, "plain-role")],
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         details = rows[0]["Finding_Details"]
@@ -4018,7 +4143,9 @@ class TestSM02AIApiMethodAuthorization:
 
     def test_no_ai_methods_is_not_applicable(self):
         rows = self._run(
-            rest={"api": {"/b": {"GET": self._method(self._lambda_uri(self.OTHER))}}}
+            rest={"api": {"/b": {"GET": self._method(self._lambda_uri(self.OTHER))}}},
+            cache=AI_GRANT_CACHE,
+            listed=[self._function(self.OTHER, "plain-role")],
         )
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "None of the 1 API method(s)" in rows[0]["Finding_Details"]
@@ -4142,6 +4269,104 @@ class TestSM11ModelVpcAttachment:
         ]
         assert len(vpc_failed) == 21
         assert "25 models have no VpcConfig" in vpc_failed[-1]["Finding_Details"]
+
+
+class TestRound9SM02LambdaByGrant:
+    """AIR-FND-IAM-09 round 9: an API fronting a Lambda function no agent or
+    gateway names is AI when a version of it runs as a role granted an AI
+    invoke action, as SM-11 marks it."""
+
+    _sm02 = TestSM02AIApiMethodAuthorization()
+    AI_FN = "arn:aws:lambda:us-east-1:111122223333:function:chat"
+    PLAIN_FN = TestSM02AIApiMethodAuthorization.OTHER
+
+    def _open(self, arn):
+        return self._sm02._method(
+            self._sm02._lambda_uri(arn), kind="NONE", authorizer=None
+        )
+
+    def _listed(self):
+        return [
+            self._sm02._function(self.AI_FN, "plain-role"),
+            self._sm02._function(self.AI_FN, "ai-role", version="2"),
+            self._sm02._function(self.PLAIN_FN, "plain-role"),
+        ]
+
+    def test_an_open_method_on_a_granted_function_fails_and_a_plain_one_does_not(
+        self,
+    ):
+        rows = self._sm02._run(
+            rest={
+                "api": {
+                    "/chat": {"POST": self._open(self.AI_FN + ":live")},
+                    "/billing": {"GET": self._open(self.PLAIN_FN)},
+                }
+            },
+            cache=AI_GRANT_CACHE,
+            listed=self._listed(),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"reaches Lambda function {self.AI_FN} (version 2 role granted "
+            "bedrock:invokeagent" in details
+        )
+        assert "accepts requests with no authorization" in details
+        assert "/billing" not in details
+
+    def test_a_granted_function_with_separate_scopes_passes_and_says_why(self):
+        method = self._sm02._method
+        uri = self._sm02._lambda_uri(self.AI_FN)
+        rows = self._sm02._run(
+            rest={
+                "api": {
+                    "/chat": {
+                        "GET": method(uri, scopes=["ai/read"]),
+                        "POST": method(uri, scopes=["ai/write"]),
+                    }
+                }
+            },
+            cache=AI_GRANT_CACHE,
+            listed=self._listed(),
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 2 API method(s)" in rows[0]["Finding_Details"]
+        assert (
+            "a version of it runs as a role granted an AI invoke action"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_without_a_cache_an_unnamed_lambda_target_is_unread(self):
+        rows = self._sm02._run(
+            rest={"api": {"/b": {"GET": self._open(self.PLAIN_FN)}}},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "1 Lambda integration target(s) no agent or gateway names were not "
+            "marked AI" in rows[0]["Finding_Details"]
+        )
+
+    def test_a_target_outside_the_listing_is_unread(self):
+        rows = self._sm02._run(
+            rest={"api": {"/b": {"GET": self._open(self.PLAIN_FN)}}},
+            cache=AI_GRANT_CACHE,
+            listed=[self._sm02._function(self.AI_FN, "ai-role")],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            f"Lambda function {self.PLAIN_FN}, an API integration target, is not "
+            "listed by lambda:ListFunctions" in rows[0]["Finding_Details"]
+        )
+
+    def test_a_failed_listing_holds_the_pass(self):
+        rows = self._sm02._run(
+            rest={"api": {"/b": {"GET": self._open(self.PLAIN_FN)}}},
+            cache=AI_GRANT_CACHE,
+            listed=self._listed(),
+            errors={"lambda": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "lambda:ListFunctions (AccessDenied" in rows[0]["Finding_Details"]
 
 
 class TestSM02EndpointInvocationScoping:

@@ -6465,15 +6465,64 @@ def _method_verbs(verb: str) -> set:
     return set(READ_VERBS | WRITE_VERBS) if verb in ("ANY", "$default") else {verb}
 
 
-def _ai_integration_target(uri: Any, ai_functions: set) -> Optional[str]:
-    """What an integration URI reaches when it is an AI runtime, else None."""
+def _ai_integration_target(
+    uri: Any, ai_functions: set, granted: Optional[Dict[str, str]] = None
+) -> Optional[str]:
+    """What an integration URI reaches when it is an AI runtime, else None.
+    granted maps a Lambda function ARN to the AI grant that marks it."""
     text = str(uri or "")
     if AI_INTEGRATION_URI.search(text):
         return text.split("?", 1)[0][:160]
     match = LAMBDA_IN_URI.search(text)
     if match and match.group(1) in ai_functions:
         return f"Lambda function {match.group(1)}"
+    if match and match.group(1) in (granted or {}):
+        return f"Lambda function {match.group(1)} ({granted[match.group(1)]})"
     return None
+
+
+def _granted_lambda_targets(
+    region: str,
+    permission_cache: Dict[str, Any],
+    arns: List[str],
+    unread: List[str],
+) -> Dict[str, str]:
+    """Function ARN -> the grant that makes it AI, for each of arns that has a
+    version whose role is granted an AI invoke action, as SM-11 marks it. An
+    integration may name an alias, which is not resolved, so any version's
+    grant counts."""
+    functions, lambda_unread = _lambda_functions(region, all_versions=True)
+    unread.extend(lambda_unread)
+    if lambda_unread:
+        return {}
+    versions: Dict[str, List[Dict[str, Any]]] = {}
+    for function in functions:
+        match = LAMBDA_IN_URI.search(str(function.get("FunctionArn") or ""))
+        if match:
+            versions.setdefault(match.group(1), []).append(function)
+    granted, role_actions = {}, {}
+    for arn in arns:
+        if arn not in versions:
+            unread.append(
+                f"Lambda function {arn}, an API integration target, is not listed "
+                "by lambda:ListFunctions in this account and Region, so its role "
+                "was not read"
+            )
+            continue
+        for function in versions[arn]:
+            role = function.get("Role")
+            if role not in role_actions:
+                role_actions[role] = _ai_role_grant(
+                    permission_cache, role, f"Lambda function {arn}", unread
+                )
+            if role_actions[role]:
+                version = function.get("Version") or "$LATEST"
+                granted[arn] = (
+                    f"version {version} role granted "
+                    f"{', '.join(role_actions[role][:3])}"
+                )
+                break
+    return granted
 
 
 def _api_methods(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -6945,8 +6994,9 @@ def check_ai_api_method_authorization(
     (AIR-FND-IAM-09 request layer).
 
     A method is in the population when its integration URI names a Bedrock,
-    AgentCore or SageMaker runtime, or a Lambda function an agent action group
-    or AgentCore gateway target names. A token authorizer separates read from
+    AgentCore or SageMaker runtime, a Lambda function an agent action group
+    or AgentCore gateway target names, or a Lambda function a version of which
+    runs as a role granted an AI invoke action. A token authorizer separates read from
     write only by scopes, and an IAM authorizer by the execute-api:Invoke
     grants in the IAM permissions cache; a Lambda authorizer separates them in
     code that is not read by this check.
@@ -6961,9 +7011,28 @@ def check_ai_api_method_authorization(
     }
     methods, method_unread = _api_methods(region)
     unread.extend(method_unread)
+    # AIR-FND-IAM-09: a Lambda function no agent or gateway names still
+    # reaches a model when its role may invoke one, as SM-11 marks it.
+    unnamed = sorted(
+        {
+            match.group(1)
+            for method in methods
+            for match in [LAMBDA_IN_URI.search(str(method["uri"] or ""))]
+            if match and match.group(1) not in ai_functions
+        }
+    )
+    granted = {}
+    if unnamed and permission_cache is None:
+        unread.append(
+            f"the IAM permissions cache was not available, so {len(unnamed)} "
+            "Lambda integration target(s) no agent or gateway names were not "
+            "marked AI by their role's grants"
+        )
+    elif unnamed:
+        granted = _granted_lambda_targets(region, permission_cache, unnamed, unread)
     ai_methods = []
     for method in methods:
-        target = _ai_integration_target(method["uri"], ai_functions)
+        target = _ai_integration_target(method["uri"], ai_functions, granted)
         if target:
             ai_methods.append(dict(method, target=target))
 
@@ -7075,12 +7144,14 @@ def check_ai_api_method_authorization(
                     "Allow of the resource policy of a REST API holding an "
                     "IAM-authorized AI method. An identity's Deny narrower than "
                     "every resource is not read for its grants. A Lambda function "
-                    "no agent action group or gateway target names is not "
-                    "recognized as AI."
+                    "is AI when an agent action group or gateway target names it "
+                    "or a version of it runs as a role granted an AI invoke action."
                     if ai_methods
                     else f"None of the {len(methods)} API method(s) and route(s) in "
-                    "this region reaches a Bedrock, AgentCore or SageMaker runtime "
-                    "or a Lambda function an agent or gateway names."
+                    "this region reaches a Bedrock, AgentCore or SageMaker runtime, "
+                    "a Lambda function an agent or gateway names, or a Lambda "
+                    "function a version of which runs as a role granted an AI "
+                    "invoke action."
                 ),
                 resolution="No action required",
                 reference=AI_API_AUTHORIZATION_REFERENCE,
@@ -7127,13 +7198,21 @@ def _ai_granted_workloads(
     """Lambda functions no agent names, and ECS services and standalone tasks,
     whose role is granted an AI invoke action: (Lambda functions as listed,
     ECS workloads as {name, subnets})."""
-    functions, lambda_unread = _lambda_functions(region)
+    # AIR-FND-NET-01: a published version keeps the Role and VpcConfig it was
+    # published with, and an alias or a qualified invoke runs it, so every
+    # version is judged, not only $LATEST.
+    functions, lambda_unread = _lambda_functions(region, all_versions=True)
     unread.extend(lambda_unread)
     granted_functions = []
     for function in functions:
-        if function.get("FunctionArn") in named:
+        arn, version = function.get("FunctionArn"), function.get("Version")
+        if arn in named or (
+            version == "$LATEST" and str(arn).rsplit(":", 1)[0] in named
+        ):
             continue
-        label = f"Lambda function {function.get('FunctionName')}"
+        label = f"Lambda function {function.get('FunctionName')}" + (
+            f" version {version}" if version and version != "$LATEST" else ""
+        )
         actions = _ai_role_grant(permission_cache, function.get("Role"), label, unread)
         if actions:
             granted_functions.append(
@@ -19537,11 +19616,16 @@ def _ecs_services(region: str) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[s
     return services, unread
 
 
-def _lambda_functions(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _lambda_functions(
+    region: str, all_versions: bool = False
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Every Lambda function, or with all_versions every published version
+    and $LATEST, each carrying its own Role and VpcConfig snapshot."""
     try:
         lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
         functions = []
-        for page in lambda_client.get_paginator("list_functions").paginate():
+        paginate = lambda_client.get_paginator("list_functions").paginate
+        for page in paginate(FunctionVersion="ALL") if all_versions else paginate():
             functions.extend(page.get("Functions", []))
         return functions, []
     except Exception as error:

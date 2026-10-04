@@ -469,6 +469,14 @@ section.
   versions read before. `ListModelPackages` is called with
   `ModelPackageType` `Both`, because the API documents `UNVERSIONED` as its
   default.
+- `SM-11` lists Lambda functions with `FunctionVersion` `ALL`, so a published
+  version, which keeps the role and `VpcConfig` it was published with, is
+  judged by its own grant and subnets. It read `$LATEST` only before.
+- `SM-02` marks an API's Lambda integration target AI when a version of the
+  function runs as a role granted an AI invoke action, as `SM-11` does. Only
+  functions an agent action group or gateway target named were in scope
+  before. A target `ListFunctions` does not return, a failed listing, or a
+  missing IAM cache holds the `Passed` row.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
