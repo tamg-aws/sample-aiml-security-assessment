@@ -21,7 +21,7 @@ import re
 import json
 import base64
 import binascii
-from functools import lru_cache
+from functools import lru_cache, partial
 from schema import create_finding
 
 # Configure boto3 with retries
@@ -16484,6 +16484,107 @@ def _source_bucket_read_restrictions(document: Any, bucket: str) -> Dict[str, An
     }
 
 
+def _bucket_object_matchers(partition: str, bucket: str) -> Tuple[Any, Any]:
+    """
+    Return (covers, reaches) for the objects of one bucket, for BR-20. A
+    Resource covers every object when it ends in * and matches
+    "arn:<partition>:s3:::<bucket>/", and reaches the bucket when one of its
+    prefixes matches that string, so it can match some object of it.
+    """
+    target = f"arn:{partition}:s3:::{bucket}/"
+
+    def reaches(resource: str) -> bool:
+        # Some object matches when a prefix of the pattern matches the target
+        # whole; a literal past len(target) cannot, so the walk stops there.
+        if not re.search(r"[*?]", resource):
+            return resource.startswith(target) and len(resource) > len(target)
+        literals = 0
+        for end in range(len(resource) + 1):
+            if end and resource[end - 1] != "*":
+                literals += 1
+                if literals > len(target):
+                    return False
+            if _wildcard_matches(resource[:end], target):
+                return True
+        return False
+
+    def covers(resource: str) -> bool:
+        return resource.endswith("*") and _wildcard_matches(resource, target)
+
+    return covers, reaches
+
+
+def _source_key_state(
+    bucket: str, encryption: Any, region: str, cache: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Resolve the default encryption key of a knowledge base source bucket, for
+    BR-20: {"kind": "cmk", "arn", "policy", "grants"}, {"kind": "aws"},
+    {"kind": "none"} or {"kind": "held", "why"}. ``encryption`` is the
+    _bucket_default_encryption result, "absent" when the bucket has no
+    configuration, or None when it was not read. ``grants`` is None when
+    kms:ListGrants failed. Each key is read once a run of this check.
+    """
+    if encryption == "absent":
+        return {"kind": "none"}
+    if not isinstance(encryption, dict):
+        return {
+            "kind": "held",
+            "why": f"the default encryption of source bucket '{bucket}' was not read",
+        }
+    if encryption["algorithm"] not in KMS_SSE_ALGORITHMS:
+        return {"kind": "none"}
+    if not encryption["key"] or _is_aws_managed_kms_key(encryption["key"]):
+        return {"kind": "aws"}
+    if encryption["key"] in cache:
+        return cache[encryption["key"]]
+    key = _describe_kms_key(encryption["key"], region)
+    if key["error"] is not None:
+        state = {
+            "kind": "held",
+            "why": f"key {encryption['key']} was not read with kms:DescribeKey "
+            f"({get_assessment_error_label(key['error'])})",
+        }
+    elif key["manager"] != "CUSTOMER":
+        state = {"kind": "aws"}
+    else:
+        client = boto3.client(
+            "kms", config=boto3_config, region_name=key["arn"].split(":")[3]
+        )
+        try:
+            policy = client.get_key_policy(KeyId=key["arn"], PolicyName="default")[
+                "Policy"
+            ]
+        except (ClientError, BotoCoreError, KeyError, TypeError) as error:
+            state = {
+                "kind": "held",
+                "why": f"the policy of key {key['arn']} was not read with "
+                f"kms:GetKeyPolicy ({get_assessment_error_label(error)})",
+            }
+        else:
+            try:
+                grants = _list_all_items(
+                    client,
+                    "list_grants",
+                    "Grants",
+                    max_results_param="Limit",
+                    token_param="Marker",
+                    token_response_keys=("NextMarker",),
+                    max_results=100,
+                    KeyId=key["arn"],
+                )
+            except (ClientError, BotoCoreError, TypeError):
+                grants = None
+            state = {
+                "kind": "cmk",
+                "arn": key["arn"],
+                "policy": policy,
+                "grants": grants,
+            }
+    cache[encryption["key"]] = state
+    return state
+
+
 def _source_identity_read(
     principal: str,
     bucket: str,
@@ -16525,28 +16626,7 @@ def _source_identity_read(
         for error in permission_cache.get("principal_errors") or []
     ):
         return "held", f"the {kind} had a policy read fail in the IAM permissions cache"
-    target = f"arn:{partition}:s3:::{bucket}/"
-
-    def reaches(resource: str) -> bool:
-        literal = re.split(r"[*?]", resource, maxsplit=1)[0]
-        if literal != resource:
-            return target.startswith(literal) or literal.startswith(target)
-        return resource.startswith(target) and len(resource) > len(target)
-
-    def covers(resource: str) -> bool:
-        return resource.endswith("*") and _wildcard_matches(resource, target)
-
-    def coverage(statement: Dict[str, Any]) -> int:
-        # 2 covers every object, 1 reaches some, 0 reaches none.
-        if "NotResource" in statement:
-            excluded = [str(r) for r in _as_list(statement.get("NotResource"))]
-            if any(map(covers, excluded)):
-                return 0
-            return 1 if any(map(reaches, excluded)) else 2
-        resources = [str(r) for r in _as_list(statement.get("Resource"))]
-        if any(map(covers, resources)):
-            return 2
-        return 1 if any(map(reaches, resources)) else 0
+    covers, reaches = _bucket_object_matchers(partition, bucket)
 
     policies = list(_cached_identity_policies(permissions))
     boundary = _boundary_document(permissions)
@@ -16569,9 +16649,13 @@ def _source_identity_read(
                 continue
             if str(statement.get("Effect", "")).upper() == "ALLOW":
                 if source == "permissions boundary":
-                    bounded = max(bounded, coverage(statement))
+                    bounded = max(
+                        bounded, _statement_coverage(statement, covers, reaches)
+                    )
                 else:
-                    granted = max(granted, coverage(statement))
+                    granted = max(
+                        granted, _statement_coverage(statement, covers, reaches)
+                    )
                 continue
             if "NotResource" in statement:
                 held.append(f"{label} denies s3:GetObject with NotResource")
@@ -16612,27 +16696,321 @@ def _source_identity_read(
     return "reads", ""
 
 
+def _statement_coverage(statement: Dict[str, Any], covers: Any, reaches: Any) -> int:
+    """
+    Say how far a statement's Resource or NotResource extends over a target,
+    for BR-20: 2 covers all of it, 1 reaches part of it, 0 reaches none.
+    """
+    if "NotResource" in statement:
+        excluded = [str(r) for r in _as_list(statement.get("NotResource"))]
+        if any(map(covers, excluded)):
+            return 0
+        return 1 if any(map(reaches, excluded)) else 2
+    resources = [str(r) for r in _as_list(statement.get("Resource"))]
+    if any(map(covers, resources)):
+        return 2
+    return 1 if any(map(reaches, resources)) else 0
+
+
+def _scp_read_verdict(
+    inventory: Dict[str, Any], action: str, noun: str, covers: Any, reaches: Any
+) -> Tuple[str, str]:
+    """
+    Judge whether the service control policies attached over this account let
+    its principals perform one lowercase action on a target, for BR-20.
+    Returns ("denied", why), ("held", why) or ("reads", note).
+
+    Only policies get_service_control_policy_inventory found attached to the
+    account, an OU in its path or the root count. An unconditioned Deny
+    covering the target denies, and so does a level of that path where no
+    attached policy allows the action on the target, since every level must.
+    A conditioned, NotResource or partial Deny, an Allow on part of the target
+    only or under a Condition, or an unread inventory is held. The management account is never
+    restricted, and an account outside an organization has none.
+    """
+    list_error = str(inventory.get("list_error") or "")
+    if "AWSOrganizationsNotInUseException" in list_error:
+        return "reads", "the account is in no organization, so no SCP applies"
+    if list_error:
+        return "held", f"the service control policies were not read: {list_error}"
+    if inventory.get("management_account"):
+        return "reads", (
+            "this is the management account, which service control policies "
+            "never restrict"
+        )
+    if inventory.get("errors"):
+        return "held", "service control policies were not all read: {}".format(
+            "; ".join(inventory["errors"][:3])
+        )
+    held: List[str] = []
+    levels: Dict[str, int] = {target["Id"]: 0 for target in inventory.get("path") or []}
+    conditioned: set = set()
+    for item in inventory.get("items") or []:
+        label = f"service control policy '{item.get('name')}'"
+        try:
+            statements = _policy_statements(item.get("content"))
+        except (ValueError, TypeError) as error:
+            held.append(
+                f"{label} could not be parsed ({get_assessment_error_label(error)})"
+            )
+            continue
+        attached = [
+            target
+            for target in levels
+            if any(
+                str(where).endswith(f" {target}")
+                for where in item.get("attached_to") or []
+            )
+        ]
+        for statement in statements:
+            if not _statement_matches_action(statement, action):
+                continue
+            coverage = _statement_coverage(statement, covers, reaches)
+            if str(statement.get("Effect", "")).upper() == "ALLOW":
+                if coverage and statement.get("Condition"):
+                    coverage = 1
+                    conditioned.update(attached)
+                for target in attached:
+                    levels[target] = max(levels[target], coverage)
+                continue
+            if "NotResource" in statement:
+                held.append(f"{label} denies {noun} with NotResource")
+            elif coverage == 0:
+                continue
+            elif statement.get("Condition"):
+                held.append(f"{label} denies {noun} under a Condition")
+            elif coverage == 2:
+                return "denied", f"{label} denies {noun}"
+            else:
+                held.append(f"{label} denies {noun} on part of it")
+    for target, level in levels.items():
+        if level == 0:
+            return "denied", (
+                f"no service control policy attached to {target} allows {noun}"
+            )
+        if level == 1:
+            how = (
+                "on part of it or under a Condition"
+                if target in conditioned
+                else "on part of it"
+            )
+            held.append(
+                f"the service control policies attached to {target} allow {noun} "
+                f"{how} only"
+            )
+    if held:
+        return "held", "; ".join(held)
+    return "reads", ""
+
+
+def _kms_condition_met(statement: Dict[str, Any], account: str, region: str) -> bool:
+    """
+    Return True when every condition of a key policy statement holds for an
+    S3 read by a principal of ``account``: kms:ViaService naming S3 in the
+    key's Region, or kms:CallerAccount naming the account.
+    """
+    for operator, key, values in _condition_keys_by_operator(statement):
+        operator = re.sub(r"^for(all|any)values:", "", operator).removesuffix(
+            "ifexists"
+        )
+        via = f"s3.{region}.amazonaws.com"
+        if key == "kms:viaservice" and operator == "stringequals":
+            if via in [str(v).lower() for v in values]:
+                continue
+        if key == "kms:viaservice" and operator == "stringlike":
+            if any(_wildcard_matches(str(v).lower(), via) for v in values):
+                continue
+        if key == "kms:calleraccount" and operator == "stringequals":
+            if account in [str(v) for v in values]:
+                continue
+        return False
+    return True
+
+
+def _identity_kms_decrypt(permissions: Dict[str, Any], key_arn: str) -> Dict[str, Any]:
+    """
+    Read one principal's identity policies and boundary for kms:Decrypt on a
+    key, for BR-20: {"denied", "held", "granted", "bounded"}. ``bounded`` is
+    None with no boundary, else whether the boundary allows it on the key.
+    """
+
+    def covers(resource: str) -> bool:
+        return _wildcard_matches(resource, key_arn)
+
+    found: Dict[str, Any] = {
+        "denied": None,
+        "held": [],
+        "granted": False,
+        "bounded": None,
+    }
+    policies = list(_cached_identity_policies(permissions))
+    boundary = _boundary_document(permissions)
+    if boundary is not None:
+        policies.append(("permissions boundary", {"document": boundary}))
+        found["bounded"] = False
+    for source, policy in policies:
+        label = (
+            f"{source} '{policy.get('policy_name') or policy.get('name') or 'unnamed'}'"
+        )
+        try:
+            statements = _policy_statements(policy.get("document"))
+        except (ValueError, TypeError) as error:
+            found["held"].append(
+                f"{label} could not be parsed ({get_assessment_error_label(error)})"
+            )
+            continue
+        for statement in statements:
+            if not _statement_matches_action(statement, "kms:decrypt"):
+                continue
+            reached = _statement_coverage(statement, covers, covers) == 2
+            if str(statement.get("Effect", "")).upper() == "ALLOW":
+                if not reached:
+                    continue
+                if source == "permissions boundary":
+                    found["bounded"] = True
+                else:
+                    found["granted"] = True
+            elif "NotResource" in statement:
+                found["held"].append(f"{label} denies kms:Decrypt with NotResource")
+            elif not reached:
+                continue
+            elif statement.get("Condition"):
+                found["held"].append(f"{label} denies kms:Decrypt under a Condition")
+            elif found["denied"] is None:
+                found["denied"] = f"{label} denies kms:Decrypt on key {key_arn}"
+    return found
+
+
+def _source_key_read(
+    principal: str,
+    key_arn: str,
+    key_policy: Any,
+    grants: Optional[List[Dict[str, Any]]],
+    permissions: Dict[str, Any],
+) -> Tuple[str, str]:
+    """
+    Judge whether a principal may decrypt a source bucket's customer managed
+    key, for BR-20. Returns ("denied", why), ("held", why) or ("reads", "").
+
+    The key policy must allow kms:Decrypt to the principal or to everyone, or
+    to the root of the principal's account, which delegates to an identity
+    policy Allow on the key. A condition is met only when it is kms:ViaService
+    naming S3 in the key's Region or kms:CallerAccount naming the account. A
+    grant names the principal with the Decrypt operation. A key policy or
+    identity Deny of it, unconditioned, denies, as does a boundary that does
+    not allow it, since a key policy that names a role ARN is still limited
+    by the role's boundary. Any other condition, a NotPrincipal statement or
+    grant constraints are held. ``grants`` is None when ListGrants failed.
+    """
+    partition, account, kind = re.match(
+        r"^arn:(aws[a-z-]*):iam::(\d{12}):(role|user)/", principal
+    ).groups()
+    region = key_arn.split(":")[3]
+    root = {f"arn:{partition}:iam::{account}:root", account}
+    identity = _identity_kms_decrypt(permissions, key_arn)
+    held = list(identity["held"])
+    direct = delegated = False
+    try:
+        statements = _policy_statements(key_policy)
+    except (ValueError, TypeError) as error:
+        return "held", (
+            f"the policy of key {key_arn} could not be parsed "
+            f"({get_assessment_error_label(error)})"
+        )
+    for index, statement in enumerate(statements):
+        if not _statement_matches_action(statement, "kms:decrypt"):
+            continue
+        label = f"key policy statement {statement.get('Sid') or index + 1}"
+        effect = str(statement.get("Effect", "")).upper()
+        if "NotPrincipal" in statement:
+            held.append(f"{label} uses NotPrincipal")
+            continue
+        named = statement.get("Principal")
+        named = (
+            ["*"]
+            if named == "*"
+            else [str(p) for p in _as_list((named or {}).get("AWS"))]
+            if isinstance(named, dict)
+            else []
+        )
+        to_principal = principal in named or "*" in named
+        to_root = bool(root & set(named))
+        if not (to_principal or to_root):
+            continue
+        met = not statement.get("Condition") or _kms_condition_met(
+            statement, account, region
+        )
+        if effect == "DENY":
+            if statement.get("Condition"):
+                held.append(f"{label} denies kms:Decrypt under a Condition")
+                continue
+            return "denied", f"{label} denies kms:Decrypt on key {key_arn}"
+        if not met:
+            held.append(f"{label} allows kms:Decrypt under a Condition not computed")
+            continue
+        direct = direct or to_principal
+        delegated = delegated or to_root
+    if identity["denied"]:
+        return "denied", identity["denied"]
+    if identity["bounded"] is False and (kind == "role" or not direct):
+        return "denied", (
+            f"its permissions boundary allows kms:Decrypt on no resource matching "
+            f"key {key_arn}"
+        )
+    granted = direct or (delegated and identity["granted"])
+    if not granted:
+        if grants is None:
+            held.append(
+                f"the grants of key {key_arn} were not read with kms:ListGrants"
+            )
+        for grant in grants or []:
+            if grant.get("GranteePrincipal") != principal or "Decrypt" not in (
+                grant.get("Operations") or []
+            ):
+                continue
+            if grant.get("Constraints"):
+                held.append(
+                    f"grant {grant.get('GrantId')} allows Decrypt under constraints"
+                )
+            else:
+                granted = True
+    if held:
+        return "held", "; ".join(held)
+    if granted:
+        return "reads", ""
+    return "denied", (
+        f"the policy of key {key_arn} allows kms:Decrypt to neither it nor, "
+        "through the account root, an identity policy Allow it holds, and no grant "
+        "gives it Decrypt"
+    )
+
+
 def _knowledge_base_source_access_findings(
     buckets: Dict[str, List[str]],
     bucket_kbs: Dict[str, set],
     vector_principals: Dict[str, Dict[str, Any]],
     region: str,
     permission_cache: Optional[Dict[str, Any]] = None,
+    bucket_encryption: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Compare who a vector store admits with who the source bucket policy and
-    their own IAM policies let read the documents, for BR-20.
+    Compare who a vector store admits with who the source bucket policy, their
+    own IAM policies, the service control policies over the account and the
+    source bucket's key let read the documents, for BR-20.
 
     The admitted principals are those an OpenSearch Serverless data access
     policy names on the index, or those a restricting S3 Vectors bucket policy
     Deny exempts by aws:PrincipalArn or NotPrincipal. One that a Deny in the
     policy of a bucket the knowledge base ingests from keeps from s3:GetObject
     on every object fails, and so does one _source_identity_read finds denied
-    by its identity policies or permissions boundary. Service control policies
-    are not evaluated.
+    by its identity policies or permissions boundary, one _scp_read_verdict
+    finds denied s3:GetObject on the objects, or kms:Decrypt on a customer
+    managed default key, and one _source_key_read finds that key denies.
     """
     rows = []
     s3_client = None
+    scp_inventory: Optional[Dict[str, Any]] = None
+    key_cache: Dict[str, Any] = {}
     for bucket, labels in buckets.items():
         reaching = [
             (kb_id, vector_principals[kb_id])
@@ -16689,16 +17067,75 @@ def _knowledge_base_source_access_findings(
             )
         ]
         identity_denied, identity_held = [], []
+        scp_note, key_kind, key_arn = "", "", None
         for principal in principals:
             if principal in denied:
                 continue
-            verdict, why = _source_identity_read(
-                principal, bucket, permission_cache, restrictions["allows"]
+            verdicts = [
+                _source_identity_read(
+                    principal, bucket, permission_cache, restrictions["allows"]
+                )
+            ]
+            match = re.match(
+                r"^arn:(aws[a-z-]*):iam::\d{12}:(role|user)/(?:.*/)?([^/]+)$",
+                principal,
             )
-            if verdict == "denied":
-                identity_denied.append(f"{principal} ({why})")
-            elif verdict == "held":
-                identity_held.append(f"{principal}: {why}")
+            permissions = (
+                (permission_cache.get(f"{match.group(2)}_permissions") or {}).get(
+                    match.group(3)
+                )
+                if match and permission_cache
+                else None
+            )
+            if verdicts[0][0] != "denied" and isinstance(permissions, dict):
+                key = _source_key_state(
+                    bucket, (bucket_encryption or {}).get(bucket), region, key_cache
+                )
+                if ":role/aws-service-role/" not in principal:
+                    if scp_inventory is None:
+                        scp_inventory = get_service_control_policy_inventory()
+                    covers, reaches = _bucket_object_matchers(match.group(1), bucket)
+                    verdicts.append(
+                        _scp_read_verdict(
+                            scp_inventory,
+                            "s3:getobject",
+                            f"s3:GetObject on the objects of bucket '{bucket}'",
+                            covers,
+                            reaches,
+                        )
+                    )
+                    if key["kind"] == "cmk":
+                        verdicts.append(
+                            _scp_read_verdict(
+                                scp_inventory,
+                                "kms:decrypt",
+                                f"kms:Decrypt on key {key['arn']}",
+                                partial(_wildcard_matches, text=key["arn"]),
+                                partial(_wildcard_matches, text=key["arn"]),
+                            )
+                        )
+                if key["kind"] == "cmk":
+                    verdicts.append(
+                        _source_key_read(
+                            principal,
+                            key["arn"],
+                            key["policy"],
+                            key["grants"],
+                            permissions,
+                        )
+                    )
+                elif key["kind"] == "held":
+                    verdicts.append(("held", key["why"]))
+            if len(verdicts) > 1:
+                key_kind, key_arn = key["kind"], key.get("arn")
+                if verdicts[1][0] == "reads" and verdicts[1][1]:
+                    scp_note = verdicts[1][1]
+            denials = [why for verdict, why in verdicts if verdict == "denied"]
+            holds = [why for verdict, why in verdicts if verdict == "held"]
+            if denials:
+                identity_denied.append(f"{principal} ({denials[0]})")
+            elif holds:
+                identity_held.append(f"{principal}: {'; '.join(holds)}")
         served = "; ".join(labels)
         indexes = ", ".join(f"'{entry['name']}'" for _, entry in reaching)
         if denied or identity_denied:
@@ -16717,8 +17154,9 @@ def _knowledge_base_source_access_findings(
                     f"{len(identity_denied)} of the {len(principals)} principal(s) "
                     f"admitted to the vector index of knowledge base(s) {indexes} "
                     "cannot read the documents of source bucket "
-                    f"'{bucket}' under their own IAM policies, so they read through "
-                    "the index content their grants keep from them: "
+                    f"'{bucket}' under their IAM policies, the service control "
+                    "policies over the account or the bucket's key, so they read "
+                    "through the index content their grants keep from them: "
                     f"{'; '.join(identity_denied[:5])}."
                 )
             detail = " ".join(parts) + f" The bucket is ingested by {served}."
@@ -16748,9 +17186,24 @@ def _knowledge_base_source_access_findings(
                 + ", and each holds an identity-policy Allow of s3:GetObject whose "
                 "Resource covers every object of the bucket, within a permissions "
                 "boundary that does too if one is set, with no identity-policy or "
-                "permissions-boundary Deny of it. Conditions on those Allow "
-                "statements are not evaluated, and neither service control policies "
-                "nor the KMS key policy of the bucket's key is read."
+                "permissions-boundary Deny of it. "
+                + (
+                    f"Service control policies do not apply: {scp_note}. "
+                    if scp_note
+                    else "Each level of the organization path above the account has "
+                    "an attached service control policy allowing those reads, and "
+                    "none denies them. "
+                )
+                + {
+                    "cmk": f"The bucket's default key {key_arn} lets each of them "
+                    "use kms:Decrypt through its key policy, a grant, or the account "
+                    "root and an identity-policy Allow. ",
+                    "aws": "The bucket's default key is AWS managed, so its key "
+                    "policy is not judged. ",
+                    "none": "The bucket's default encryption uses no KMS key. ",
+                }.get(key_kind, "")
+                + "Conditions on identity-policy Allow statements are not "
+                "evaluated, and the key of each object already written is not read."
             )
         rows.append((status, detail))
     return [
@@ -16970,13 +17423,16 @@ def _knowledge_base_source_encryption_findings(
     plaintext: List[Dict[str, str]] = []
     unreadable: List[str] = []
 
+    bucket_encryption: Dict[str, Any] = {}
     for bucket, labels in buckets.items():
         served = "; ".join(labels)
         try:
             encryption = _bucket_default_encryption(bucket, region)
+            bucket_encryption[bucket] = encryption
         except ClientError as error:
             code = error.response.get("Error", {}).get("Code", "")
             if code == "ServerSideEncryptionConfigurationNotFoundError":
+                bucket_encryption[bucket] = "absent"
                 plaintext.append(
                     {
                         "bucket": bucket,
@@ -17091,7 +17547,12 @@ def _knowledge_base_source_encryption_findings(
     )
     source_findings.extend(
         _knowledge_base_source_access_findings(
-            buckets, bucket_kbs, vector_principals or {}, region, permission_cache
+            buckets,
+            bucket_kbs,
+            vector_principals or {},
+            region,
+            permission_cache,
+            bucket_encryption,
         )
     )
 

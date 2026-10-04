@@ -39115,6 +39115,45 @@ class TestBR20ValueDepth:
     INDEX = f"arn:aws:s3vectors:us-east-1:{ACCOUNT}:bucket/vec/index/kb-index"
     ROLE = f"arn:aws:iam::{ACCOUNT}:role/kb-role"
 
+    PATH = [
+        {"Id": ACCOUNT, "Type": "ACCOUNT"},
+        {"Id": "ou-ab12-cdef3456", "Type": "ORGANIZATIONAL_UNIT"},
+        {"Id": "r-ab12", "Type": "ROOT"},
+    ]
+    FULL_ACCESS_SCPS = {
+        "items": [
+            {
+                "name": "FullAWSAccess",
+                "id": "p-FullAWSAccess",
+                "content": json.dumps(
+                    {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+                ),
+                "attached_to": [
+                    f"account {ACCOUNT}",
+                    "organizational unit ou-ab12-cdef3456",
+                    "root r-ab12",
+                ],
+            }
+        ],
+        "errors": [],
+        "list_error": None,
+        "detached": [],
+        "account": ACCOUNT,
+        "path": PATH,
+        "management_account": False,
+    }
+    ROOT_KEY_POLICY = {
+        "Statement": [
+            {
+                "Sid": "Enable IAM User Permissions",
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"},
+                "Action": "kms:*",
+                "Resource": "*",
+            }
+        ]
+    }
+
     KEYS = {
         CMK: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"},
         AWS_KEY: {"KeyManager": "AWS", "KeyState": "Enabled"},
@@ -39182,8 +39221,15 @@ class TestBR20ValueDepth:
         bucket_encryption=None,
         bucket_policies=None,
         permission_cache=None,
+        scp_inventory=None,
+        key_policies=None,
+        grants=None,
     ):
         """Run BR-20 over `bodies` ({kb_id: body}) with a client per service.
+
+        `scp_inventory` defaults to FULL_ACCESS_SCPS, `key_policies` answers
+        GetKeyPolicy per key ARN (ROOT_KEY_POLICY by default, an Exception is
+        raised) and `grants` answers ListGrants per key ARN.
 
         `policies` answers GetVectorBucketPolicy per bucket ARN (an Exception is
         raised). `sources` is {kb_id: [(ds_id, bucket or None, transient key)]}.
@@ -39257,6 +39303,21 @@ class TestBR20ValueDepth:
             return {"KeyMetadata": {"Arn": KeyId, **answer}}
 
         kms.describe_key.side_effect = describe_key
+
+        def get_key_policy(KeyId, PolicyName):
+            answer = (key_policies or {}).get(KeyId, self.ROOT_KEY_POLICY)
+            if isinstance(answer, Exception):
+                raise answer
+            return {"Policy": json.dumps(answer)}
+
+        def list_grants(KeyId, **_):
+            answer = (grants or {}).get(KeyId, [])
+            if isinstance(answer, Exception):
+                raise answer
+            return {"Grants": answer}
+
+        kms.get_key_policy.side_effect = get_key_policy
+        kms.list_grants.side_effect = list_grants
         self.kms = kms
 
         s3 = MagicMock()
@@ -39287,7 +39348,14 @@ class TestBR20ValueDepth:
             self.built.append((service, kwargs.get("region_name")))
             return table[service]
 
-        with patch("bedrock_app.boto3.client", side_effect=factory):
+        with (
+            patch("bedrock_app.boto3.client", side_effect=factory),
+            patch.object(
+                bedrock_app,
+                "get_service_control_policy_inventory",
+                return_value=scp_inventory or self.FULL_ACCESS_SCPS,
+            ),
+        ):
             return extract_csv_data(
                 bedrock_app.check_bedrock_knowledge_base_kms_encryption(
                     region="us-east-1", permission_cache=permission_cache or None
@@ -39298,7 +39366,7 @@ class TestBR20ValueDepth:
     def _cache(cls, resource=None, condition=None, roles=None):
         """An IAM permissions cache where kb-role allows aoss:APIAccessAll on
         `resource` (collection c1 by default) and s3:GetObject on the objects
-        of the corpus and open source buckets."""
+        of the corpus and open source buckets, and kms:Decrypt on CMK."""
         statement = {
             "Effect": "Allow",
             "Action": "aoss:APIAccessAll",
@@ -39325,6 +39393,19 @@ class TestBR20ValueDepth:
                                     "arn:aws:s3:::corpus/*",
                                     "arn:aws:s3:::open/*",
                                 ],
+                            },
+                        ],
+                    },
+                },
+                {
+                    "policy_name": "kb-keys",
+                    "document": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "kms:Decrypt",
+                                "Resource": cls.CMK,
                             }
                         ],
                     },
@@ -40180,6 +40261,492 @@ class TestBR20ValueDepth:
             )
         )
 
+    OTHER_KEY = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/other"
+
+    def _key_run(
+        self,
+        key_statements=None,
+        kms_statements=None,
+        boundary=None,
+        scp_inventory=None,
+        key_policies=None,
+        grants=None,
+        encryption=None,
+    ):
+        """BR-20 over corpus and open, both on CMK by default. `kms_statements`
+        replaces kb-role's kms:Decrypt policy, and `key_statements` the CMK
+        key policy."""
+        cache = self._cache()
+        role = cache["role_permissions"]["kb-role"]
+        if kms_statements is not None:
+            role["attached_policies"][2]["document"]["Statement"] = kms_statements
+        if boundary is not None:
+            role["permissions_boundary"] = {"document": {"Statement": boundary}}
+        if key_statements is not None:
+            key_policies = {self.CMK: {"Statement": key_statements}}
+        return self._source_access(
+            self._run(
+                {"kb1": self._aoss_body()},
+                clients={"opensearchserverless": self._aoss(self.CMK)},
+                sources={
+                    "kb1": [("ds1", "corpus", self.CMK), ("ds2", "open", self.CMK)]
+                },
+                bucket_encryption=encryption
+                or {"corpus": self._sse(self.CMK), "open": self._sse(self.CMK)},
+                permission_cache=cache,
+                scp_inventory=scp_inventory,
+                key_policies=key_policies,
+                grants=grants,
+            )
+        )
+
+    @classmethod
+    def _scps(cls, *policies, **overrides):
+        """An inventory of FullAWSAccess plus (name, statements, targets) SCPs."""
+        inventory = json.loads(json.dumps(cls.FULL_ACCESS_SCPS))
+        for name, statements, targets in policies:
+            inventory["items"].append(
+                {
+                    "name": name,
+                    "id": f"p-{name}",
+                    "content": json.dumps({"Statement": statements}),
+                    "attached_to": targets,
+                }
+            )
+        inventory.update(overrides)
+        return inventory
+
+    @pytest.mark.parametrize(
+        "resource, statuses",
+        [
+            ("*", ["Failed", "Failed"]),
+            ("arn:aws:s3:::corpus/*", ["Failed", "Passed"]),
+            # The partition wildcard also matches the object
+            # open/:s3:::corp, so on open the Deny reaches part of the bucket.
+            ("arn:*:s3:::corp*", ["Failed", "N/A"]),
+        ],
+    )
+    def test_an_attached_scp_deny_of_the_source_fails(self, resource, statuses):
+        rows = self._key_run(
+            scp_inventory=self._scps(
+                (
+                    "DenyReads",
+                    [self._s3_statement("Deny", resource)],
+                    [f"account {self.ACCOUNT}"],
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == statuses
+        assert (
+            f"{self.ROLE} (service control policy 'DenyReads' denies s3:GetObject "
+            "on the objects of bucket 'corpus')"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "deny, expected",
+        [
+            (
+                {
+                    "Resource": "arn:aws:s3:::corpus/*",
+                    "Condition": {"StringNotEquals": {"aws:PrincipalTag/x": "y"}},
+                },
+                "service control policy 'DenyReads' denies s3:GetObject on the "
+                "objects of bucket 'corpus' under a Condition",
+            ),
+            (
+                {"Resource": "arn:aws:s3:::corpus/secret/*"},
+                "service control policy 'DenyReads' denies s3:GetObject on the "
+                "objects of bucket 'corpus' on part of it",
+            ),
+            (
+                {"NotResource": "arn:aws:s3:::open/*"},
+                "service control policy 'DenyReads' denies s3:GetObject on the "
+                "objects of bucket 'corpus' with NotResource",
+            ),
+        ],
+    )
+    def test_an_uncomputed_scp_deny_is_not_passed(self, deny, expected):
+        statement = {"Effect": "Deny", "Action": "s3:GetObject", **deny}
+        rows = self._key_run(
+            scp_inventory=self._scps(("DenyReads", [statement], ["root r-ab12"]))
+        )
+        assert rows[0]["Status"] == "N/A"
+        assert f"{self.ROLE}: {expected}" in rows[0]["Finding_Details"]
+
+    def test_an_scp_kms_deny_of_the_source_key_fails(self):
+        statement = {"Effect": "Deny", "Action": "kms:Decrypt", "Resource": "*"}
+        rows = self._key_run(
+            scp_inventory=self._scps(("NoKms", [statement], ["root r-ab12"]))
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert (
+            f"service control policy 'NoKms' denies kms:Decrypt on key {self.CMK}"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "allowed, status",
+        [
+            (["bedrock:*"], "Failed"),
+            (["s3:GetObject", "kms:Decrypt"], "Passed"),
+            (["s3:*"], "Failed"),
+        ],
+    )
+    def test_an_allow_list_scp_must_allow_the_read_at_every_level(
+        self, allowed, status
+    ):
+        inventory = self._scps(
+            (
+                "AllowList",
+                [{"Effect": "Allow", "Action": allowed, "Resource": "*"}],
+                [f"account {self.ACCOUNT}"],
+            )
+        )
+        inventory["items"][0]["attached_to"] = [
+            "organizational unit ou-ab12-cdef3456",
+            "root r-ab12",
+        ]
+        rows = self._key_run(scp_inventory=inventory)
+        assert [r["Status"] for r in rows] == [status, status]
+        if allowed == ["bedrock:*"]:
+            assert (
+                f"no service control policy attached to {self.ACCOUNT} allows "
+                "s3:GetObject on the objects of bucket 'corpus'"
+            ) in rows[0]["Finding_Details"]
+        if allowed == ["s3:*"]:
+            assert (
+                f"no service control policy attached to {self.ACCOUNT} allows "
+                f"kms:Decrypt on key {self.CMK}"
+            ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement, expected",
+        [
+            # The account level allows the objects under docs/ only: corpus is
+            # held on part of it, and open, which no Allow reaches, fails.
+            (
+                {"Resource": "arn:aws:s3:::corpus/docs/*"},
+                ("N/A", "Failed", "on part of it only"),
+            ),
+            (
+                {
+                    "Resource": "*",
+                    "Condition": {"StringEquals": {"aws:PrincipalTag/team": "ml"}},
+                },
+                ("N/A", "N/A", "on part of it or under a Condition only"),
+            ),
+        ],
+    )
+    def test_a_level_allowing_part_or_under_a_condition_is_not_passed(
+        self, statement, expected
+    ):
+        inventory = self._scps(
+            (
+                "AllowList",
+                [
+                    {"Effect": "Allow", "Action": "s3:GetObject", **statement},
+                    {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"},
+                ],
+                [f"account {self.ACCOUNT}"],
+            )
+        )
+        inventory["items"][0]["attached_to"] = [
+            "organizational unit ou-ab12-cdef3456",
+            "root r-ab12",
+        ]
+        rows = self._key_run(scp_inventory=inventory)
+        assert [r["Status"] for r in rows] == list(expected[:2])
+        assert (
+            f"the service control policies attached to {self.ACCOUNT} allow "
+            f"s3:GetObject on the objects of bucket 'corpus' {expected[2]}"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "overrides, status, expected",
+        [
+            (
+                {"list_error": "ListPolicies (AccessDeniedException)"},
+                "N/A",
+                "the service control policies were not read: ListPolicies "
+                "(AccessDeniedException)",
+            ),
+            (
+                {"errors": ["policy 'x' targets: AccessDenied"]},
+                "N/A",
+                "service control policies were not all read: policy 'x' targets: "
+                "AccessDenied",
+            ),
+            (
+                {
+                    "list_error": "the account's position in the organization could "
+                    "not be read with organizations:ListParents "
+                    "(AWSOrganizationsNotInUseException), so no service control "
+                    "policy attachment could be established"
+                },
+                "Passed",
+                "Service control policies do not apply: the account is in no "
+                "organization, so no SCP applies.",
+            ),
+            (
+                {"management_account": True, "items": []},
+                "Passed",
+                "Service control policies do not apply: this is the management "
+                "account, which service control policies never restrict.",
+            ),
+        ],
+    )
+    def test_an_scp_inventory_that_cannot_judge_is_not_passed(
+        self, overrides, status, expected
+    ):
+        rows = self._key_run(scp_inventory=self._scps(**overrides))
+        assert [r["Status"] for r in rows] == [status, status]
+        assert expected in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "key_statements, kms_statements, status, expected",
+        [
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:role/other"},
+                        "Action": "kms:*",
+                        "Resource": "*",
+                    }
+                ],
+                None,
+                "Failed",
+                "allows kms:Decrypt to neither it nor, through the account root",
+            ),
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": ROLE},
+                        "Action": "kms:Decrypt",
+                        "Resource": "*",
+                    }
+                ],
+                [],
+                "Passed",
+                None,
+            ),
+            (None, [], "Failed", "allows kms:Decrypt to neither it nor"),
+            (
+                None,
+                [{"Effect": "Allow", "Action": "kms:Decrypt", "Resource": OTHER_KEY}],
+                "Failed",
+                "allows kms:Decrypt to neither it nor",
+            ),
+            (
+                None,
+                [{"Effect": "Allow", "Action": "kms:*", "Resource": "arn:aws:kms:*"}],
+                "Passed",
+                None,
+            ),
+            (
+                None,
+                [
+                    {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "kms:Decrypt", "Resource": CMK},
+                ],
+                "Failed",
+                f"attached policy 'kb-keys' denies kms:Decrypt on key {CMK}",
+            ),
+            (
+                None,
+                [
+                    {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "kms:Decrypt",
+                        "Resource": "*",
+                        "Condition": {"Bool": {"aws:x": "1"}},
+                    },
+                ],
+                "N/A",
+                "attached policy 'kb-keys' denies kms:Decrypt under a Condition",
+            ),
+        ],
+    )
+    def test_the_source_key_must_let_the_principal_decrypt(
+        self, key_statements, kms_statements, status, expected
+    ):
+        rows = self._key_run(key_statements, kms_statements)
+        assert [r["Status"] for r in rows] == [status, status]
+        if expected:
+            assert expected in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            (
+                {"StringEquals": {"kms:ViaService": "s3.us-east-1.amazonaws.com"}},
+                "Passed",
+            ),
+            ({"StringLike": {"kms:ViaService": "s3.*.amazonaws.com"}}, "Passed"),
+            ({"StringLike": {"kms:ViaService": "s3.eu-*.amazonaws.com"}}, "N/A"),
+            # StringEquals compares literally, so a wildcard in it matches nothing.
+            ({"StringEquals": {"kms:ViaService": "s3.*.amazonaws.com"}}, "N/A"),
+            ({"StringEquals": {"kms:ViaService": "s3.eu-west-1.amazonaws.com"}}, "N/A"),
+            ({"StringEquals": {"kms:CallerAccount": ACCOUNT}}, "Passed"),
+            ({"StringEquals": {"kms:CallerAccount": "210987654321"}}, "N/A"),
+            ({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}, "N/A"),
+        ],
+    )
+    def test_a_conditioned_key_policy_grant_counts_only_for_an_s3_read(
+        self, condition, status
+    ):
+        rows = self._key_run(
+            [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                    "Condition": condition,
+                }
+            ],
+            [],
+        )
+        assert [r["Status"] for r in rows] == [status, status]
+        if status == "N/A":
+            assert (
+                "key policy statement 1 allows kms:Decrypt under a Condition not "
+                "computed"
+            ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "deny, status",
+        [
+            ({}, "Failed"),
+            ({"Condition": {"Bool": {"aws:x": "1"}}}, "N/A"),
+        ],
+    )
+    def test_a_key_policy_deny_to_everyone_is_read(self, deny, status):
+        rows = self._key_run(
+            self.ROOT_KEY_POLICY["Statement"]
+            + [
+                {
+                    "Sid": "NoDecrypt",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                    **deny,
+                }
+            ]
+        )
+        assert [r["Status"] for r in rows] == [status, status]
+        assert (
+            "key policy statement NoDecrypt denies kms:Decrypt"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "grant, status",
+        [
+            ({"GranteePrincipal": ROLE, "Operations": ["Decrypt"]}, "Passed"),
+            ({"GranteePrincipal": ROLE, "Operations": ["Encrypt"]}, "Failed"),
+            (
+                {
+                    "GranteePrincipal": f"arn:aws:iam::{ACCOUNT}:role/x",
+                    "Operations": ["Decrypt"],
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "GranteePrincipal": ROLE,
+                    "Operations": ["Decrypt"],
+                    "Constraints": {"EncryptionContextSubset": {"a": "b"}},
+                },
+                "N/A",
+            ),
+        ],
+    )
+    def test_a_grant_can_give_decrypt(self, grant, status):
+        rows = self._key_run(
+            [],
+            [],
+            grants={self.CMK: [{"GrantId": "g1", **grant}]},
+        )
+        assert [r["Status"] for r in rows] == [status, status]
+
+    def test_unread_grants_or_key_policy_are_not_judged(self):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "x"}}, "Op"
+        )
+        rows = self._key_run([], [], grants={self.CMK: denied})
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert (
+            f"the grants of key {self.CMK} were not read with kms:ListGrants"
+            in (rows[0]["Finding_Details"])
+        )
+        rows = self._key_run(key_policies={self.CMK: denied})
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert (
+            f"the policy of key {self.CMK} was not read with kms:GetKeyPolicy "
+            "(AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_role_boundary_limits_a_key_policy_grant_to_its_arn(self):
+        rows = self._key_run(
+            [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": self.ROLE},
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                }
+            ],
+            [],
+            boundary=[
+                {"Effect": "Allow", "Action": ["aoss:*", "s3:*"], "Resource": "*"}
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert (
+            f"its permissions boundary allows kms:Decrypt on no resource matching "
+            f"key {self.CMK}"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "encryption, expected",
+        [
+            (
+                {"SSEAlgorithm": "aws:kms"},
+                "The bucket's default key is AWS managed, so its key policy is not "
+                "judged.",
+            ),
+            (
+                {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "alias/aws/s3"},
+                "The bucket's default key is AWS managed, so its key policy is not "
+                "judged.",
+            ),
+            (
+                {"SSEAlgorithm": "AES256"},
+                "The bucket's default encryption uses no KMS key.",
+            ),
+        ],
+    )
+    def test_a_bucket_without_a_customer_key_skips_the_key_leg(
+        self, encryption, expected
+    ):
+        response = {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [{"ApplyServerSideEncryptionByDefault": encryption}]
+            }
+        }
+        rows = self._key_run([], [], encryption={"corpus": response, "open": response})
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+        assert expected in rows[0]["Finding_Details"]
+        assert self.kms.get_key_policy.call_count == 0
+
+    def test_each_source_key_is_read_once(self):
+        self._key_run()
+        assert self.kms.get_key_policy.call_count == 1
+        assert self.kms.list_grants.call_count == 1
+
     @staticmethod
     def _s3_statement(effect, resource, **extra):
         return {
@@ -40200,7 +40767,8 @@ class TestBR20ValueDepth:
         assert (
             "1 of the 1 principal(s) admitted to the vector index of knowledge "
             "base(s) 'KB-kb1' cannot read the documents of source bucket 'corpus' "
-            "under their own IAM policies, so they read through the index content "
+            "under their IAM policies, the service control policies over the "
+            "account or the bucket's key, so they read through the index content "
             f"their grants keep from them: {self.ROLE} (attached policy "
             "'kb-sources' denies s3:GetObject on every object)."
         ) in rows[0]["Finding_Details"]
@@ -40258,7 +40826,7 @@ class TestBR20ValueDepth:
         rows = self._identity_run(
             [self._s3_statement("Allow", "*")],
             boundary=[
-                {"Effect": "Allow", "Action": "aoss:*", "Resource": "*"},
+                {"Effect": "Allow", "Action": ["aoss:*", "kms:*"], "Resource": "*"},
                 self._s3_statement("Allow", "arn:aws:s3:::corpus/docs/*"),
                 self._s3_statement("Allow", "arn:aws:s3:::open/*"),
             ],
@@ -40292,7 +40860,7 @@ class TestBR20ValueDepth:
         rows = self._identity_run(
             [self._s3_statement("Allow", "*")],
             boundary=[
-                {"Effect": "Allow", "Action": "aoss:*", "Resource": "*"},
+                {"Effect": "Allow", "Action": ["aoss:*", "kms:*"], "Resource": "*"},
                 self._s3_statement("Allow", "arn:aws:s3:::open/*"),
             ],
         )
@@ -40395,9 +40963,14 @@ class TestBR20ValueDepth:
             "which has no Deny on those reads, and each holds an identity-policy "
             "Allow of s3:GetObject whose Resource covers every object of the "
             "bucket, within a permissions boundary that does too if one is set, "
-            "with no identity-policy or permissions-boundary Deny of it. Conditions "
-            "on those Allow statements are not evaluated, and neither service "
-            "control policies nor the KMS key policy of the bucket's key is read."
+            "with no identity-policy or permissions-boundary Deny of it. Each level "
+            "of the organization path above the account has an attached service "
+            "control policy allowing those reads, and none denies them. The "
+            f"bucket's default key {self.CMK} lets each of them use kms:Decrypt "
+            "through its key policy, a grant, or the account root and an "
+            "identity-policy Allow. Conditions on identity-policy Allow statements "
+            "are not evaluated, and the key of each object already written is not "
+            "read."
         )
 
     def _s3v_source_run(self, deny, bucket_policies):
