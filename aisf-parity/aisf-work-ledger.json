@@ -302,7 +302,7 @@
       "incumbent_names": [
         "Knowledge Base Source Data Classification"
       ],
-      "gap": "BR-46 passes a knowledge base S3 source only when a recurring, full-depth Macie job scopes in its prefix, no object's LastModified falls between the job's last run and a later ingestion, every document has a .metadata.json sidecar with non-empty metadataAttributes, read with s3:GetObject, and every source list was read. With Macie off, a source that no completed Comprehend PII detection job read fails, and a Comprehend-screened source is N/A. An object written before the last run is not ordered against each earlier ingestion, because Macie returns only lastRunTime, and which attribute names the classification is not judged",
+      "gap": "BR-46 passes a knowledge base S3 source only when a recurring, full-depth Macie job scopes in its prefix, no object's LastModified falls between the job's last run and a later ingestion, every document has a .metadata.json sidecar with non-empty metadataAttributes, read with s3:GetObject, and every source list was read. With Macie off, a source that no completed Comprehend PII detection job read fails, and a Comprehend-screened source is N/A. An object written before the last run is not ordered against each earlier ingestion, because Macie returns only lastRunTime, and which attribute names the classification is not judged. A region run reads at most 300 sidecars and 150 ListObjectsV2 pages, budgets measured against the Lambda timeout, and a source past either is N/A with a count",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",

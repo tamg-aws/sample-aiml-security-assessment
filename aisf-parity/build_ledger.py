@@ -291,7 +291,10 @@ AI_SUBJECT_ROWS = [
         "that no completed Comprehend PII detection job read fails, and a "
         "Comprehend-screened source is N/A. An object written before the last run "
         "is not ordered against each earlier ingestion, because Macie returns only "
-        "lastRunTime, and which attribute names the classification is not judged",
+        "lastRunTime, and which attribute names the classification is not judged. "
+        "A region run reads at most 300 sidecars and 150 ListObjectsV2 pages, "
+        "budgets measured against the Lambda timeout, and a source past either is "
+        "N/A with a count",
         [],
         3,
     ),

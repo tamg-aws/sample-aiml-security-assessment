@@ -732,6 +732,30 @@ MUTATIONS = [
         "replace": "    missing = []\n",
     },
     {
+        "name": "BR-46 sidecar budget resets for each source",
+        "file": BEDROCK,
+        "defect": "BR-46 gives every source the whole sidecar read budget, so "
+        "a run over many sources reads past the measured 300 GetObject calls",
+        "find": '    room = max(0, METADATA_SIDECAR_READ_CAP - budget["sidecars"])\n',
+        "replace": "    room = METADATA_SIDECAR_READ_CAP\n",
+    },
+    {
+        "name": "BR-46 listing budget is not spent",
+        "file": BEDROCK,
+        "defect": "BR-46 never counts its ListObjectsV2 pages against the region "
+        "run's budget, so many sources list past the measured 150 pages",
+        "find": '                budget["pages"] += 1\n',
+        "replace": "                pass\n",
+    },
+    {
+        "name": "BR-46 capped listing does not name where it stopped",
+        "file": BEDROCK,
+        "defect": "BR-46 reports a capped source listing without the last key "
+        "it read, so the objects past the cap are not located",
+        "find": '                    stopped = f"after key {items[-1][0]}" if items else "before any key"\n',
+        "replace": '                    stopped = "before any key"\n',
+    },
+    {
         "name": "BR-43 credits a Region allow-list in the management account",
         "file": BEDROCK,
         "defect": "BR-43 passes a Region allow-list in the management account, which no service control policy restricts",
@@ -4908,6 +4932,15 @@ GROUPS: dict[str, str] = {
         "in the Bedrock knowledge base classification"
     ),
     "BR-46 credits a document with no metadata sidecar": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-46 sidecar budget resets for each source": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-46 listing budget is not spent": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-46 capped listing does not name where it stopped": (
         "in the Bedrock knowledge base classification"
     ),
     "BR-43 credits a Region allow-list in the management account": (

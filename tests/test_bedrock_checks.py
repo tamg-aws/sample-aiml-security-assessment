@@ -17420,8 +17420,70 @@ class TestBR46ClassificationJobCoverage:
         detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
         assert "not every .metadata.json sidecar was read" in detail
         assert (
-            "past the first 1" if unread == "cap" else "(s3:GetObject, AccessDenied)"
+            "1 sidecar(s) from b.txt.metadata.json on, past the 1 this check reads "
+            "per region run"
+            if unread == "cap"
+            else "(s3:GetObject, AccessDenied)"
         ) in detail
+
+    def _two_labelled_sources(self, monkeypatch, cap, value):
+        # Both sources are fully labelled; only the run-wide budget can hold
+        # the second one back.
+        objects = {
+            bucket: {
+                key: ("2026-08-01T00:00:00Z", self._sidecar({"tier": "x"}))
+                for key in ("a.pdf", "a.pdf.metadata.json")
+            }
+            for bucket in ("support-bucket", "hr-bucket")
+        }
+        monkeypatch.setattr(bedrock_app, cap, value)
+        return self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+        )
+
+    def test_br46_the_sidecar_budget_is_spent_across_sources(self, monkeypatch):
+        findings = self._two_labelled_sources(
+            monkeypatch, "METADATA_SIDECAR_READ_CAP", 1
+        )
+        detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert (
+            "1 sidecar(s) from a.pdf.metadata.json on, past the 1 this check "
+            "reads per region run" in detail
+        )
+        assert not self._hr_rows(findings, "Passed")
+
+    def test_br46_the_listing_budget_is_spent_across_sources(self, monkeypatch):
+        findings = self._two_labelled_sources(
+            monkeypatch, "SOURCE_LISTING_BUDGET_PAGES", 1
+        )
+        detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert (
+            "the listing of s3://hr-bucket stopped before any key, at the cap of "
+            "100 ListObjectsV2 pages per source and 1 per region run" in detail
+        )
+        assert not self._hr_rows(findings, "Passed")
+
+    def test_br46_a_capped_listing_names_the_last_key_read(self, monkeypatch):
+        pages = [
+            {"Contents": [{"Key": "a.pdf", "LastModified": "2026-08-01T00:00:00Z"}]},
+            {"Contents": [{"Key": "b.pdf", "LastModified": "2026-08-01T00:00:00Z"}]},
+        ]
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.return_value = iter(pages)
+        monkeypatch.setattr(bedrock_app, "REDACTION_SOURCE_LIST_PAGE_CAP", 1)
+        budget = {"pages": 0, "sidecars": 0}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            listing = bedrock_app._source_object_listing(
+                "us-east-1", "hr-bucket", [""], budget
+            )
+        assert listing["items"] == [("a.pdf", "2026-08-01T00:00:00Z")]
+        assert listing["error"].startswith(
+            "the listing of s3://hr-bucket stopped after key a.pdf"
+        )
+        assert budget["pages"] == 1
 
     def test_br46_an_incomplete_source_list_withholds_passed(self):
         findings = self._run(

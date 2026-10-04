@@ -19693,7 +19693,10 @@ def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
 
 
 # ListObjectsV2 returns 1,000 keys a page, so a source is listed up to 100,000
-# objects; a longer listing is reported as not read, never as clean.
+# objects; a longer listing is reported as not read, never as clean. Measured
+# 2026-10-04 in account 178113193057, us-east-1: 100 full pages took mean
+# 0.215 s, p90 0.248 s, max 0.547 s, 21.5 s in all, so one capped listing
+# costs about 25 s of the 600 s Lambda timeout.
 REDACTION_SOURCE_LIST_PAGE_CAP = 100
 
 
@@ -34576,20 +34579,27 @@ def _classification_order(
     return {"status": "Passed", "detail": note}
 
 
-# A knowledge base source is read for at most this many .metadata.json
-# sidecars; the rest are reported as not read.
-METADATA_SIDECAR_READ_CAP = 50
+# BR-46 reads at most this many .metadata.json sidecars and lists at most this
+# many ListObjectsV2 pages across all its sources in one region run; a source
+# with a sidecar or an object past either budget is held N/A with a count.
+# Measured 2026-10-04 in account 178113193057, us-east-1: GetObject on 200
+# objects under 4 KB took mean 0.126 s, p90 0.169 s, max 0.296 s, so 300 reads
+# cost about 38 s (51 s at p90); 150 list pages at the measured 0.215 s mean,
+# 0.248 s p90 cost about 32 s (37 s at p90).
+METADATA_SIDECAR_READ_CAP = 300
+SOURCE_LISTING_BUDGET_PAGES = 150
 
 METADATA_SIDECAR_SUFFIX = ".metadata.json"
 
 
 def _source_object_listing(
-    region: str, bucket: str, prefixes: List[str]
+    region: str, bucket: str, prefixes: List[str], budget: Dict[str, int]
 ) -> Dict[str, Any]:
     """
     List every object under an S3 source's prefixes as (key, LastModified)
-    pairs, up to the REDACTION_SOURCE_LIST_PAGE_CAP pages, or the reason the
-    listing did not finish.
+    pairs, up to the REDACTION_SOURCE_LIST_PAGE_CAP pages and the pages left in
+    the region run's SOURCE_LISTING_BUDGET_PAGES, or the reason the listing did
+    not finish.
     """
     client = boto3.client("s3", config=boto3_config, region_name=region)
     items, pages = [], 0
@@ -34599,15 +34609,22 @@ def _source_object_listing(
                 Bucket=bucket, Prefix=prefix
             ):
                 pages += 1
-                if pages > REDACTION_SOURCE_LIST_PAGE_CAP:
+                if (
+                    pages > REDACTION_SOURCE_LIST_PAGE_CAP
+                    or budget["pages"] >= SOURCE_LISTING_BUDGET_PAGES
+                ):
+                    stopped = f"after key {items[-1][0]}" if items else "before any key"
                     return {
                         "items": items,
                         "error": (
-                            f"s3://{bucket} holds more objects than the "
-                            f"{REDACTION_SOURCE_LIST_PAGE_CAP * 1000:,} this check "
-                            "lists"
+                            f"the listing of s3://{bucket} stopped {stopped}, at "
+                            f"the cap of {REDACTION_SOURCE_LIST_PAGE_CAP} "
+                            "ListObjectsV2 pages per source and "
+                            f"{SOURCE_LISTING_BUDGET_PAGES} per region run, so the "
+                            "objects past it were not read"
                         ),
                     }
+                budget["pages"] += 1
                 for item in page.get("Contents") or []:
                     items.append((str(item.get("Key")), item.get("LastModified")))
     except (ClientError, BotoCoreError) as error:
@@ -34621,13 +34638,13 @@ def _source_object_listing(
 
 
 def _metadata_sidecar_gaps(
-    region: str, bucket: str, items: List[Tuple[str, Any]]
+    region: str, bucket: str, items: List[Tuple[str, Any]], budget: Dict[str, int]
 ) -> Dict[str, Any]:
     """
     Pair each document of a knowledge base source with the
     <document>.metadata.json sidecar the knowledge base reads its metadata from,
-    and read up to METADATA_SIDECAR_READ_CAP of them for a non-empty
-    metadataAttributes object.
+    and read as many as the region run's METADATA_SIDECAR_READ_CAP leaves for a
+    non-empty metadataAttributes object.
     """
     keys = {key for key, _ in items}
     documents = sorted(
@@ -34639,7 +34656,9 @@ def _metadata_sidecar_gaps(
     present = [key for key in documents if key + METADATA_SIDECAR_SUFFIX in keys]
     client = boto3.client("s3", config=boto3_config, region_name=region)
     empty, unread = [], []
-    for key in present[:METADATA_SIDECAR_READ_CAP]:
+    room = max(0, METADATA_SIDECAR_READ_CAP - budget["sidecars"])
+    budget["sidecars"] += min(room, len(present))
+    for key in present[:room]:
         sidecar = key + METADATA_SIDECAR_SUFFIX
         try:
             body = client.get_object(Bucket=bucket, Key=sidecar)["Body"].read()
@@ -34653,10 +34672,11 @@ def _metadata_sidecar_gaps(
             attributes = None
         if not isinstance(attributes, dict) or not attributes:
             empty.append(sidecar)
-    if len(present) > METADATA_SIDECAR_READ_CAP:
+    if len(present) > room:
         unread.append(
-            f"{len(present) - METADATA_SIDECAR_READ_CAP} sidecar(s) past the first "
-            f"{METADATA_SIDECAR_READ_CAP}"
+            f"{len(present) - room} sidecar(s) from "
+            f"{present[room]}{METADATA_SIDECAR_SUFFIX} on, past the "
+            f"{METADATA_SIDECAR_READ_CAP} this check reads per region run"
         )
     return {
         "documents": len(documents),
@@ -35111,6 +35131,7 @@ def check_bedrock_knowledge_base_source_classification(
         unmonitored = []
         indeterminate = []
         listings: Dict[Tuple[str, Tuple[str, ...]], Dict[str, Any]] = {}
+        reads = {"pages": 0, "sidecars": 0}
         for source in sources:
             bucket_name = source["bucket"]
             record = macie_buckets.get(bucket_name)
@@ -35152,7 +35173,7 @@ def check_bedrock_knowledge_base_source_classification(
             def objects(listing_key=listing_key):
                 if listing_key not in listings:
                     listings[listing_key] = _source_object_listing(
-                        region, listing_key[0], list(listing_key[1])
+                        region, listing_key[0], list(listing_key[1]), reads
                     )
                 return listings[listing_key]
 
@@ -35169,7 +35190,9 @@ def check_bedrock_knowledge_base_source_classification(
                 sidecars = (
                     None
                     if listing["error"]
-                    else _metadata_sidecar_gaps(region, bucket_name, listing["items"])
+                    else _metadata_sidecar_gaps(
+                        region, bucket_name, listing["items"], reads
+                    )
                 )
                 if sidecars is None:
                     verdict = {
