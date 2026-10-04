@@ -55,7 +55,10 @@ AI_SUBJECT_ROWS = [
         "configuration API records whether a workload screens those fields, so every "
         "row states it. The knowledge base redaction leg never passes: a "
         "transformation Lambda's logic is not read and a RetrieveAndGenerate caller "
-        "supplies its guardrail per request, so a screened knowledge base is N/A",
+        "supplies its guardrail per request, so a screened knowledge base is N/A. A guardrail another account owns, such as an "
+        "organization-enforced guardrail, is read with a cross-account "
+        "bedrock:GetGuardrail grant, and a read its owner's resource policy "
+        "denies is N/A naming that policy",
         [],
         3,
     ),
@@ -121,10 +124,20 @@ AI_SUBJECT_ROWS = [
         "(embeddingModelType, embeddingModelArn, embeddingModelConfiguration, "
         "serverSideEncryptionConfiguration and supplementalDataStorageConfiguration"
         " only), so who can read a MANAGED store is not compared with who reads its"
-        " source data. The Aurora, OpenSearch domain, Neptune Analytics, Kendra and"
-        " Redshift stores are not compared with the source bucket either, because "
-        "their readers are database users, fine-grained access control users or IAM"
-        " grants, not principals a resource policy names",
+        " source data. A Neptune Analytics graph or a Kendra index has no resource "
+        "policy, so its readers are the IAM roles and users (exact ARNs from "
+        "iam:ListRoles and iam:ListUsers) whose identity policies allow "
+        "neptune-graph:ReadDataViaQuery, or kendra:Query or kendra:Retrieve, on it "
+        "without a Condition, within any permissions boundary; they are compared "
+        "with the source bucket as above, and a conditioned grant, a principal the "
+        "cache failed to read or an unread listing is N/A. A Kendra index's source "
+        "buckets are its own S3 data sources (kendra:ListDataSources, "
+        "kendra:DescribeDataSource), a TEMPLATE connector is N/A, and an index whose"
+        " UserContextPolicy is USER_TOKEN holds its readers at N/A. Service control "
+        "policies over the store read are not evaluated. The Aurora, OpenSearch "
+        "domain and Redshift stores are not compared with the source bucket, "
+        "because their readers are database users or fine-grained access control "
+        "users, not principals a resource policy or an IAM grant names",
         [],
         3,
     ),
@@ -175,7 +188,10 @@ AI_SUBJECT_ROWS = [
         "us-east-1 on 2026-10-04 did not appear in CloudTrail LookupEvents, so it "
         "is not a management event, and the call leaves no stored configuration. "
         "Whether an application screens toolUse input and toolResult content, "
-        "which the filter never evaluates, is runtime behaviour no API reports",
+        "which the filter never evaluates, is runtime behaviour no API reports. A guardrail another account owns, such as an "
+        "organization-enforced guardrail, is read with a cross-account "
+        "bedrock:GetGuardrail grant, and a read its owner's resource policy "
+        "denies is N/A naming that policy",
         [],
         3,
     ),
@@ -229,7 +245,10 @@ AI_SUBJECT_ROWS = [
         "requestParameters name the guardrail and version: it fails when that "
         "version has contextual grounding filters, is excluded when it has none, "
         "and is N/A with no matching event or a failed read. "
-        "Automated Reasoning checks are reported, not judged",
+        "Automated Reasoning checks are reported, not judged. A guardrail another account owns, such as an "
+        "organization-enforced guardrail, is read with a cross-account "
+        "bedrock:GetGuardrail grant, and a read its owner's resource policy "
+        "denies is N/A naming that policy",
         [],
         3,
     ),
@@ -1729,7 +1748,14 @@ AI_SUBJECT_ROWS = [
         "operation that returns a real-time call, and CloudTrail records the call "
         "as a management event with requestParameters.text "
         "HIDDEN_DUE_TO_SECURITY_MEASURES and responseElements null, so no read "
-        "ties a call to the prompt it screened",
+        "ties a call to the prompt it screened. The prompt level is judged through "
+        "guardrails: every guardrail in the Region is read with GetGuardrail, and "
+        "each version an agent, flow node, un-narrowed account-enforced "
+        "configuration, guardrail condition pin or logged invocation joined to "
+        "CloudTrail applies passes only when a PII entity type blocks or "
+        "anonymizes on the input with inputEnabled not false. An unread guardrail, "
+        "version or logged invocation is N/A, a used version with no such entity "
+        "fails, and a Region where nothing applies a guardrail fails",
         [],
         5,
     ),
@@ -1987,8 +2013,10 @@ AI_SUBJECT_ROWS = [
         "or private-DNS endpoint for S3 and DynamoDB. A gateway endpoint covers a "
         "workload only when its RouteTableIds hold the route table of each of the "
         "workload's subnets (ec2:DescribeRouteTables: the subnet's association, else "
-        "the main table); unread subnets or route tables, which include every EKS pod "
-        "identity and IRSA workload, withhold Passed. BR-02 also judges the endpoint policy "
+        "the main table). An EKS pod identity or IRSA workload, whose pod subnets are "
+        "not read, is covered only when the endpoint names every route table "
+        "DescribeRouteTables returns for the cluster VPC; any other unread subnets or "
+        "route tables withhold Passed. BR-02 also judges the endpoint policy "
         "of every S3, DynamoDB and SageMaker API and runtime endpoint in a VPC that "
         "holds an AI workload or a Bedrock or AgentCore endpoint, whether or not "
         "an AgentCore endpoint is there: scoped on exact principal or network "
@@ -2777,8 +2805,12 @@ FOUNDATION_ROWS = [
         "gateways, custom browsers, custom code interpreters and workload "
         "identities, "
         "listed by their SageMaker and AgentCore list APIs and absent from the "
-        "sweep, fail as never tagged. The sweep summary passes only when every "
-        "filter and list read succeeded and no resource lacks an owner, and it names "
+        "sweep, fail as never tagged. SageMaker HyperPod clusters (ListClusters) "
+        "and AgentCore harnesses (ListHarnesses) absent from the sweep have their "
+        "tags read with sagemaker:ListTags and "
+        "bedrock-agentcore:ListTagsForResource and are judged by those tags, and "
+        "an unread tag read is N/A. The sweep summary passes only when every "
+        "filter, list and tag read succeeded and no resource lacks an owner, and it names "
         "the other types, which only the sweep reaches, as unlisted when never "
         "tagged",
         [],
@@ -2826,9 +2858,13 @@ FOUNDATION_ROWS = [
         "not a configured attribute and comes only from the identity provider's SAML "
         "assertion; whether that source reflects MFA is not judged. A permission "
         "set whose AWS managed policy is unread is N/A. Customer managed policy "
-        "references resolve in each target account, so they are named and not "
-        "read, and that permission set is not judged; the attributes for access "
-        "control that set the tag are not read",
+        "references resolve in each target account, so a permission set that has "
+        "one is judged through the AWSReservedSSO_<name>_<suffix> role it is "
+        "provisioned as in this account (its name read with "
+        "sso:DescribePermissionSet), whose cached policies carry the AI write "
+        "grant and PrincipalTag Deny tests as for any permission set; a set whose "
+        "role is absent from the IAM permissions cache or unread there is named "
+        "and not judged, and the role in each other account is not read",
         [],
         6,
     ),

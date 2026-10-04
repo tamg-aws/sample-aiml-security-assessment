@@ -1396,6 +1396,105 @@ class TestBR02WorkloadConnectivity:
         assert "Passed" not in [row["Status"] for row in rows]
         assert any(phrase in row["Finding_Details"] for row in rows)
 
+    # NET-02: an EKS workload's pod subnets are not read, so a gateway endpoint
+    # covers it only by naming every route table of the cluster VPC.
+    EVERY_ROUTE = {
+        "vpc-1": {
+            "main": "rtb-main",
+            "subnets": {"subnet-a": "rtb-a"},
+            "all": {"rtb-main", "rtb-a", "rtb-b"},
+        }
+    }
+
+    @staticmethod
+    def _pod_workload(kind, role):
+        return {"kind": kind, "name": "ml/infer", "vpc_id": "vpc-1", "role": role}
+
+    @pytest.mark.parametrize(
+        "kind", ["EKS pod identity association", "EKS IAM role for service accounts"]
+    )
+    def test_br02_an_eks_workload_is_covered_by_a_gateway_on_every_route_table(
+        self, kind
+    ):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint(
+                    "s3", "Gateway", routes=["rtb-b", "rtb-a", "rtb-main"]
+                ),
+            ],
+            [self._pod_workload(kind, "Role")],
+            route_tables=self.EVERY_ROUTE,
+        )
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert f"{kind} 'ml/infer' in vpc-1" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kind", ["EKS pod identity association", "EKS IAM role for service accounts"]
+    )
+    def test_br02_an_eks_workload_off_one_route_table_stays_unread(self, kind):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=["rtb-a", "rtb-main"]),
+            ],
+            [self._pod_workload(kind, "Role")],
+            route_tables=self.EVERY_ROUTE,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(
+            f"the subnets of {kind} 'ml/infer' in vpc-1 were not read"
+            in row["Finding_Details"]
+            for row in rows
+        )
+
+    def test_br02_a_lambda_without_subnets_is_not_credited_every_route_table(self):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint(
+                    "s3", "Gateway", routes=["rtb-b", "rtb-a", "rtb-main"]
+                ),
+            ],
+            [self._function("app", "Role")],
+            route_tables=self.EVERY_ROUTE,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(
+            "the subnets of Lambda function 'app' in vpc-1 were not read"
+            in row["Finding_Details"]
+            for row in rows
+        )
+
+    @pytest.mark.parametrize(
+        "route_tables",
+        [
+            {},
+            {"vpc-1": {"main": "rtb-main", "subnets": {}, "all": set()}},
+            {
+                "vpc-1": {
+                    "all": {"rtb-main"},
+                    "error": "the route tables of vpc-1 were not read with "
+                    "ec2:DescribeRouteTables (UnauthorizedOperation)",
+                }
+            },
+        ],
+    )
+    def test_br02_an_eks_workload_in_an_unread_vpc_stays_unread(self, route_tables):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=["rtb-main"]),
+            ],
+            [self._pod_workload("EKS pod identity association", "Role")],
+            route_tables=route_tables,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+
     def test_br02_the_collector_reads_route_tables_of_gateway_vpcs_only(self):
         ec2_client = MagicMock()
         pages = {
@@ -1461,6 +1560,7 @@ class TestBR02WorkloadConnectivity:
             "vpc-1": {
                 "main": "rtb-main",
                 "subnets": {"subnet-a": "rtb-a", "subnet-b": "rtb-a"},
+                "all": {"rtb-main", "rtb-a"},
             }
         }
         assert result["data_path_endpoints"][0]["route_tables"] == ["rtb-a"]
@@ -9150,6 +9250,15 @@ def _make_client_error(code, message="error"):
     return ClientError({"Error": {"Code": code, "Message": message}}, "operation")
 
 
+# What GetGuardrail on another account's guardrail answered on 2026-10-04, and
+# the error text each guardrail read gives it.
+CROSS_ACCOUNT_DENIAL = "The provided resource ARN is from a different account."
+CROSS_ACCOUNT_GUARDRAIL_ERROR = (
+    "AccessDeniedException: the owner's guardrail resource policy does not allow "
+    "bedrock:GetGuardrail to this account, or the guardrail does not exist there"
+)
+
+
 def _sagemaker_search(training_jobs, training_error=None, trial_components=None):
     """
     A SageMaker Search side effect. Resource TrainingJob returns each
@@ -9385,6 +9494,7 @@ class TestBedrockHandlerMultiRegion:
         "check_lambda_public_invoke_configuration": "BR-54",
         "check_kms_enclave_key_binding": "BR-55",
         "check_bedrock_llm_jacking_activity": "BR-56",
+        "check_bedrock_prompt_pii_screening": "BR-46",
         "check_agent_handoff_source_identity": "BR-57",
         "check_bedrock_agent_workload_identity": "BR-57",
         "check_bedrock_agent_role_scope": "BR-57",
@@ -9541,6 +9651,17 @@ class TestBedrockHandlerMultiRegion:
             recorded.get("check_bedrock_knowledge_base_source_classification")
             == "us-east-1"
         )
+
+    def test_br46_prompt_leg_shares_br26_attachments_and_br34_joins(self):
+        resp, _ = self._run_handler_with_check_spies(
+            _bedrock_event(region="us-east-1", region_index=0)
+        )
+        assert resp["statusCode"] == 200
+        (prompt,) = self.spy_calls["check_bedrock_prompt_pii_screening"]
+        (br26,) = self.spy_calls["check_bedrock_guardrail_pii_filters"]
+        (br34,) = self.spy_calls["check_guardrail_prompt_attack_invocation_evidence"]
+        assert prompt["attachment_inventory"] is br26["attachment_inventory"]
+        assert prompt["joins"] is br34["joins"]
 
     def test_br44_gets_both_br42_results_and_br42_org_leg_runs_once(self):
         resp, _ = self._run_handler_with_check_spies(
@@ -10784,6 +10905,47 @@ class TestBR41CentralGuardrailEnforcement:
         ]
         assert [f["Status"] for f in share] == ["Failed"]
         assert "grants no other account" in share[0]["Finding_Details"]
+
+    # GRD-10: the Automated Reasoning read of an enforced version in the
+    # administrator account is denied by that account's resource policy.
+    def test_br41_a_denied_cross_account_reasoning_read_names_the_resource_policy(
+        self,
+    ):
+        client = MagicMock()
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        with patch("bedrock_app.boto3.client", return_value=client):
+            reading = bedrock_app._enforced_guardrail_reasoning_policies(
+                self.GUARDRAIL_ARN, "3", "us-east-1", {}
+            )
+        assert reading["read"] is False
+        assert (
+            f"bedrock:GetGuardrail ({CROSS_ACCOUNT_GUARDRAIL_ERROR})"
+            in (reading["error"])
+        )
+
+    # GRD-10: a guardrail resource policy can allow only ApplyGuardrail and
+    # GetGuardrail, so the share is a ceiling outside the owner account.
+    def test_br41_a_share_outside_its_owner_account_is_a_ceiling(self):
+        client = MagicMock()
+        with patch("bedrock_app.boto3.client", return_value=client):
+            row = bedrock_app._guardrail_share_finding(
+                "arn:aws:bedrock:us-east-1:523402589643:guardrail/gr-org",
+                "178113193057",
+                "https://example.com",
+                "us-east-1",
+            )
+        client.get_resource_policy.assert_not_called()
+        assert row["Status"] == "N/A"
+        assert (
+            "can allow only bedrock:ApplyGuardrail and bedrock:GetGuardrail"
+            in row["Finding_Details"]
+            and "no policy can let account 178113193057 call "
+            "bedrock:GetResourcePolicy on it"
+            in row["Finding_Details"]
+        )
+        assert "readable only there" not in row["Finding_Details"]
 
     def test_br41_share_to_every_principal_fails(self):
         _, findings = self._run(
@@ -17289,6 +17451,209 @@ class TestBR46KnowledgeBaseSourceClassification:
             assert_finding_schema(finding)
 
 
+class TestBR46PromptPiiScreening:
+    """BR-46 prompt leg: a guardrail used on invocations must act on PII on the input."""
+
+    INPUT_PII = {
+        "sensitiveInformationPolicy": {
+            "piiEntities": [
+                {"type": "EMAIL", "inputAction": "BLOCK", "inputEnabled": True}
+            ]
+        }
+    }
+    # Acts on the output only: inputEnabled false switches the input side off.
+    OUTPUT_ONLY_PII = {
+        "sensitiveInformationPolicy": {
+            "piiEntities": [
+                {
+                    "type": "EMAIL",
+                    "inputAction": "BLOCK",
+                    "inputEnabled": False,
+                    "outputAction": "ANONYMIZE",
+                }
+            ]
+        }
+    }
+
+    def _run(self, guardrails=(), details=None, versions=None, joins=None, errors=()):
+        """
+        ``guardrails`` are the ListGuardrails ids, ``details`` maps an id or an
+        (id, version) pair to a GetGuardrail answer or an exception, and
+        ``versions`` is the attachment inventory's versions map.
+        """
+        details = details or {}
+        client = MagicMock()
+        client.list_guardrails.return_value = {
+            "guardrails": [{"id": gid, "name": f"name-{gid}"} for gid in guardrails]
+        }
+        self.get_calls = []
+
+        def get_guardrail(guardrailIdentifier, guardrailVersion=None):
+            self.get_calls.append((guardrailIdentifier, guardrailVersion))
+            answer = details.get(
+                (guardrailIdentifier, guardrailVersion),
+                details.get(guardrailIdentifier),
+            )
+            if isinstance(answer, Exception):
+                raise answer
+            return {"guardrail": answer or {}}
+
+        client.get_guardrail.side_effect = get_guardrail
+        inventory = {"versions": versions or {}, "errors": list(errors)}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_prompt_pii_screening(
+                    region="us-east-1", attachment_inventory=inventory, joins=joins
+                )
+            )
+
+    @staticmethod
+    def _entry(surface, detail, narrowings=None):
+        return {
+            "surfaces": [surface],
+            "narrowings": narrowings or {},
+            "detail": detail,
+            "error": "",
+            "region": "us-east-1",
+        }
+
+    @staticmethod
+    def _status(findings, status):
+        return [f for f in findings if f["Status"] == status]
+
+    def test_br46_prompt_each_used_version_is_judged(self):
+        """Two used versions, one screening the input: one Passed, one Failed."""
+        findings = self._run(
+            guardrails=["g1", "g2"],
+            details={"g1": self.INPUT_PII, "g2": self.OUTPUT_ONLY_PII},
+            versions={
+                ("g1", "1"): self._entry("agent 'a' version 1", self.INPUT_PII),
+                ("g2", "3"): self._entry("agent 'b' version 2", self.OUTPUT_ONLY_PII),
+            },
+        )
+        (passed,) = self._status(findings, "Passed")
+        assert "guardrail g1 version 1" in passed["Finding_Details"]
+        assert "EMAIL" in passed["Finding_Details"]
+        (failed,) = self._status(findings, "Failed")
+        assert "guardrail g2 version 3" in failed["Finding_Details"]
+        assert all(f["Check_ID"] == "BR-46" for f in findings)
+
+    def test_br46_prompt_unused_guardrail_is_not_credited(self):
+        """A draft with an input PII policy that nothing applies fails the leg."""
+        findings = self._run(guardrails=["g1"], details={"g1": self.INPUT_PII})
+        assert not self._status(findings, "Passed")
+        (failed,) = self._status(findings, "Failed")
+        assert "no prompt is shown to be screened" in failed["Finding_Details"]
+        assert "'name-g1' (EMAIL)" in failed["Finding_Details"]
+
+    def test_br46_prompt_cloudtrail_joined_guardrail_is_read_at_its_version(self):
+        """A guardrail named only by a joined invocation is read at that version."""
+        arn = "arn:aws:bedrock:us-east-1:123456789012:guardrail/g9"
+        findings = self._run(
+            guardrails=["g9"],
+            details={"g9": self.OUTPUT_ONLY_PII, (arn, "4"): self.INPUT_PII},
+            joins={
+                "resolved": {
+                    "req-1": {"guardrail": arn, "version": "4"},
+                    "req-2": {"reason": "x", "unguarded": True},
+                }
+            },
+        )
+        assert (arn, "4") in self.get_calls
+        (passed,) = self._status(findings, "Passed")
+        assert "logged invocation req-1" in passed["Finding_Details"]
+
+    def test_br46_prompt_denied_cross_account_guardrail_names_the_resource_policy(
+        self,
+    ):
+        arn = "arn:aws:bedrock:us-east-1:999988887777:guardrail/g9"
+        findings = self._run(
+            guardrails=["g1"],
+            details={
+                "g1": self.INPUT_PII,
+                (arn, "4"): _make_client_error(
+                    "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+                ),
+            },
+            joins={"resolved": {"req-1": {"guardrail": arn, "version": "4"}}},
+        )
+        assert not self._status(findings, "Passed")
+        assert any(
+            f"bedrock:GetGuardrail ({CROSS_ACCOUNT_GUARDRAIL_ERROR})"
+            in row["Finding_Details"]
+            for row in findings
+        )
+
+    def test_br46_prompt_unread_guardrail_holds_passed_at_na(self):
+        """GetGuardrail failing on any listed guardrail keeps the leg off Passed."""
+        findings = self._run(
+            guardrails=["g1", "g2"],
+            details={
+                "g1": self.INPUT_PII,
+                "g2": _make_client_error("ThrottlingException"),
+            },
+            versions={("g1", "1"): self._entry("flow 'f' 1", self.INPUT_PII)},
+        )
+        assert not self._status(findings, "Passed")
+        (na,) = self._status(findings, "N/A")
+        assert "guardrail 'name-g2' (g2) was not read" in na["Finding_Details"]
+
+    def test_br46_prompt_unmatched_invocation_is_na_not_failed(self):
+        """A logged call whose guardrail is unknown cannot prove the absence."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            joins={"resolved": {"req-1": {"reason": "not read"}}},
+        )
+        assert not self._status(findings, "Failed")
+        (na,) = self._status(findings, "N/A")
+        assert "1 logged invocation(s)" in na["Finding_Details"]
+
+    def test_br46_prompt_narrowed_enforced_configuration_is_not_credited(self):
+        """An account-enforced configuration that guards part of the traffic is not use."""
+        surface = "account-enforced configuration c1"
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    surface, self.INPUT_PII, narrowings={surface: ["inputTags HONOR"]}
+                )
+            },
+        )
+        assert not self._status(findings, "Passed")
+        assert self._status(findings, "Failed")
+
+    def test_br46_prompt_guardrail_reads_stop_at_the_deadline(self, monkeypatch):
+        """Past the deadline no guardrail is read and the stop is named."""
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        findings = self._run(
+            guardrails=["g1", "g2"],
+            details={"g1": self.INPUT_PII, "g2": self.INPUT_PII},
+            joins={"resolved": {"req-1": {"guardrail": "g1", "version": "2"}}},
+        )
+        assert self.get_calls == []
+        assert not self._status(findings, "Passed")
+        (na,) = self._status(findings, "N/A")
+        assert "2 guardrail(s) from 'name-g1' on" in na["Finding_Details"]
+        assert bedrock_app.DEADLINE_STOP in na["Finding_Details"]
+
+    def test_br46_prompt_list_failure_is_na(self):
+        client_error = _make_client_error("AccessDeniedException")
+        client = MagicMock()
+        client.list_guardrails.side_effect = client_error
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_prompt_pii_screening(
+                    region="us-east-1",
+                    attachment_inventory={"versions": {}, "errors": []},
+                    joins=None,
+                )
+            )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "bedrock:ListGuardrails" in findings[0]["Finding_Details"]
+
+
 class TestBR46ClassificationJobCoverage:
     """
     BR-46 job leg: each value on the job decides whether it classifies the
@@ -21641,6 +22006,47 @@ class TestKnowledgeBaseScreening:
             call(agentId="A1", agentVersion="3", maxResults=100),
         ]
 
+    # GRD-02: an agent's guardrail in another account that its owner does not
+    # share is named as such.
+    def test_inventory_names_a_denied_cross_account_agent_guardrail(self):
+        arn = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+        client = MagicMock()
+        client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [{"knowledgeBaseId": "KB1", "name": "one"}]
+        }
+        client.list_data_sources.return_value = {"dataSourceSummaries": []}
+        client.list_agents.return_value = {
+            "agentSummaries": [{"agentId": "A1", "agentName": "agent"}]
+        }
+        client.list_agent_aliases.return_value = {
+            "agentAliasSummaries": [{"routingConfiguration": [{"agentVersion": "3"}]}]
+        }
+        client.get_agent_version.return_value = {
+            "agentVersion": {
+                "guardrailConfiguration": {
+                    "guardrailIdentifier": arn,
+                    "guardrailVersion": "1",
+                }
+            }
+        }
+        client.list_agent_knowledge_bases.return_value = {
+            "agentKnowledgeBaseSummaries": [
+                {"knowledgeBaseId": "KB1", "knowledgeBaseState": "ENABLED"}
+            ]
+        }
+        client.list_flows.return_value = {"flowSummaries": []}
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        with patch("bedrock_app.boto3.client", return_value=client):
+            inventory = bedrock_app.get_knowledge_base_screening_inventory(
+                self.REGION, {"attachments": [], "versions": {}, "errors": []}
+            )
+        assert inventory["details"][(arn, "1")] == {
+            "detail": None,
+            "error": CROSS_ACCOUNT_GUARDRAIL_ERROR,
+        }
+
     def test_inventory_records_an_unread_agent_for_every_knowledge_base(self):
         client = MagicMock()
         client.list_knowledge_bases.return_value = {
@@ -22520,7 +22926,15 @@ class TestGuardrailConditionPins:
             "management_account": management,
         }
 
-    def _run(self, cache, scps=None, effective=None, versions=None, in_use=True):
+    def _run(
+        self,
+        cache,
+        scps=None,
+        effective=None,
+        versions=None,
+        in_use=True,
+        get_guardrail=None,
+    ):
         agent_client = MagicMock()
         agent_client.list_agents.return_value = {"agentSummaries": []}
         agent_client.list_flows.return_value = {"flowSummaries": []}
@@ -22531,9 +22945,9 @@ class TestGuardrailConditionPins:
         bedrock_client.list_guardrails.return_value = {
             "guardrails": [{"id": "gr-9", "version": v} for v in versions or []]
         }
-        bedrock_client.get_guardrail.side_effect = lambda **kwargs: {
-            "guardrail": dict(kwargs)
-        }
+        bedrock_client.get_guardrail.side_effect = get_guardrail or (
+            lambda **kwargs: {"guardrail": dict(kwargs)}
+        )
         orgs_client = MagicMock()
         if effective is None:
             orgs_client.describe_effective_policy.side_effect = ClientError(
@@ -22606,6 +23020,61 @@ class TestGuardrailConditionPins:
             (self.PINNED, "2"),
             (self.PINNED, "DRAFT"),
         ]
+
+    # GRD-01: a pin with no version lets a caller name the working draft or any
+    # of up to 20 published versions; a read cap of 20 left all 21 unread.
+    def test_an_unversioned_pin_reads_all_twenty_versions_and_the_draft(self):
+        cache = _br10_cache(
+            roles={"Pinned": _br10_identity(_br10_bound(self.PINNED))}, errors=[]
+        )
+        versions = [str(number) for number in range(1, 21)]
+        inventory = self._run(cache, versions=versions)
+        assert inventory["errors"] == []
+        assert sorted(inventory["versions"]) == sorted(
+            (self.PINNED, version) for version in versions + ["DRAFT"]
+        )
+        assert all(entry["detail"] for entry in inventory["versions"].values())
+
+    def test_guardrail_version_reads_stop_at_the_deadline(self, monkeypatch):
+        cache = _br10_cache(
+            roles={"Pinned": _br10_identity(_br10_bound(f"{self.PINNED}:3"))},
+            errors=[],
+        )
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        inventory = self._run(cache)
+        entry = inventory["versions"][(self.PINNED, "3")]
+        assert (entry["detail"], entry["error"]) == (None, bedrock_app.DEADLINE_STOP)
+
+    # GRD-01: an organization-enforced guardrail lives in another account, and
+    # its owner's resource policy decides whether this account can read it.
+    OWNED_ELSEWHERE = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+
+    def test_a_denied_cross_account_pin_names_the_owner_resource_policy(self):
+        cache = _br10_cache(
+            roles={
+                "Org": _br10_identity(_br10_bound(f"{self.OWNED_ELSEWHERE}:1")),
+                "Local": _br10_identity(_br10_bound(f"{self.PINNED}:2")),
+            },
+            errors=[],
+        )
+
+        def get_guardrail(guardrailIdentifier, guardrailVersion):
+            if guardrailIdentifier == self.OWNED_ELSEWHERE:
+                raise _make_client_error("AccessDeniedException", CROSS_ACCOUNT_DENIAL)
+            raise _make_client_error(
+                "AccessDeniedException",
+                "User: arn:aws:sts::123456789012:assumed-role/r/s is not "
+                "authorized to perform: bedrock:GetGuardrail",
+            )
+
+        inventory = self._run(cache, get_guardrail=get_guardrail)
+        assert (
+            inventory["versions"][(self.OWNED_ELSEWHERE, "1")]["error"]
+            == CROSS_ACCOUNT_GUARDRAIL_ERROR
+        )
+        assert inventory["versions"][(self.PINNED, "2")]["error"] == (
+            "AccessDeniedException"
+        )
 
     def test_a_wildcard_pin_is_reported_and_not_enumerated(self):
         cache = _br10_cache(
@@ -33286,8 +33755,11 @@ class TestBR51AIUserConsoleMFA:
         aws_policies=None,
         role_trust=None,
         abac=None,
+        set_names=None,
     ):
-        """`abac` is the DescribeInstanceAccessControlAttributeConfiguration
+        """`set_names` maps a permission set to the Name DescribePermissionSet
+        returns, or an exception it raises; by default the ARN's last segment.
+        `abac` is the DescribeInstanceAccessControlAttributeConfiguration
         response, or an exception it raises. `managed` maps a permission set to the AWS managed policy ARNs
         ListManagedPoliciesInPermissionSet returns (a dict of pages keyed by
         NextToken, or an exception), `customer` to its customer managed
@@ -33371,6 +33843,17 @@ class TestBR51AIUserConsoleMFA:
                 }
             )
         iam.get_inline_policy_for_permission_set.side_effect = get_inline_policy
+
+        def describe_permission_set(InstanceArn, PermissionSetArn):
+            outcome = (set_names or {}).get(
+                PermissionSetArn, PermissionSetArn.rsplit("/", 1)[-1]
+            )
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"PermissionSet": {"Name": outcome}}
+
+        self.described = iam.describe_permission_set
+        iam.describe_permission_set.side_effect = describe_permission_set
         if isinstance(instances, Exception):
             iam.list_instances.side_effect = instances
         else:
@@ -34086,7 +34569,9 @@ class TestBR51AIUserConsoleMFA:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert named in rows[0]["Finding_Details"]
 
-    def test_br51_customer_managed_references_are_named_not_read(self):
+    def test_br51_customer_managed_references_are_named_when_no_role_is_provisioned(
+        self,
+    ):
         _, rows = self._run_sets(
             permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
             inline={
@@ -34101,14 +34586,142 @@ class TestBR51AIUserConsoleMFA:
         assert [r["Status"] for r in rows] == ["N/A"]
         details = rows[0]["Finding_Details"]
         assert (
-            f"2 permission set(s) reference customer managed policies, which "
+            "2 permission set(s) reference customer managed policies, which "
             "resolve to a policy of that name in each account the permission set "
-            "is provisioned to and are not read, so these are not judged: "
-            f"{self.PS_WRITE} (/guard/MfaDeny); {self.PS_LATE} (/Extra)" in details
+            "is provisioned to, and no role it is provisioned as in this account "
+            f"was judged, so these are not judged: {self.PS_WRITE} (/guard/MfaDeny): "
+            "no role AWSReservedSSO_ps-write_* is in this account's IAM permissions "
+            f"cache, so the permission set is not provisioned here or its role was "
+            f"not read; {self.PS_LATE} (/Extra): no role AWSReservedSSO_ps-late_*"
+            in details
         )
         assert "0 of them carry" in details
         customer_sentence = details.split("reference customer managed")[1]
         assert "ceiling" not in customer_sentence.split(". ")[0]
+
+    ROLE_WRITE = "AWSReservedSSO_write_0123456789abcdef"
+    ROLE_LATE = "AWSReservedSSO_late_fedcba9876543210"
+    # Provisioned for a set named "write_extra": the "write" pattern must not
+    # take it, or its unguarded grant would be pinned on the wrong set.
+    ROLE_DECOY = "AWSReservedSSO_write_extra_00112233aabbccdd"
+
+    def _provisioned_cache(self, roles):
+        cache = _ai_user_cache()
+        for role, statements in roles.items():
+            cache["role_permissions"][role] = _identity(
+                attached=[_customer_policy(f"cmp-{role[-4:]}", *statements)]
+            )
+        return cache
+
+    def _federated_trusts(self, roles):
+        return {
+            role: _policy(
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Federated": "arn:aws:iam::123456789012:saml-provider/"
+                        "AWSSSO_0123_DO_NOT_DELETE"
+                    },
+                    "Action": "sts:AssumeRoleWithSAML",
+                }
+            )
+            for role in roles
+        }
+
+    def _run_provisioned(self, roles, **kwargs):
+        return self._run(
+            self._provisioned_cache(roles),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+            role_trust=self._federated_trusts(roles),
+            **kwargs,
+        )
+
+    GRANT = {"Effect": "Allow", "Action": "bedrock:CreateGuardrail", "Resource": "*"}
+
+    def test_br51_customer_managed_set_is_judged_through_its_provisioned_role(self):
+        """IAM-02: two sets referencing customer managed policies are judged by
+        their provisioned roles; only the one with no PrincipalTag Deny fails."""
+        _, rows = self._run_provisioned(
+            {
+                self.ROLE_WRITE: [self.GRANT],
+                self.ROLE_LATE: [self.GRANT, self._tag_deny()],
+                self.ROLE_DECOY: [self.GRANT],
+            },
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            set_names={self.PS_WRITE: "write", self.PS_LATE: "late"},
+            customer={
+                self.PS_WRITE: [{"Name": "cmp-cdef"}],
+                self.PS_LATE: [{"Name": "cmp-3210", "Path": "/guard/"}],
+            },
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            f"permission set {self.PS_WRITE} as provisioned in this account as "
+            f"role {self.ROLE_WRITE} grants AI writes (bedrock) in attached policy "
+            f"'cmp-cdef' of its provisioned role {self.ROLE_WRITE}" in failed[0]
+        )
+        assert "It references the customer managed policies /cmp-cdef" in failed[0]
+        assert self.ROLE_DECOY not in failed[0]
+        summary = next(r["Finding_Details"] for r in rows if r["Status"] == "N/A")
+        assert (
+            f"{self.PS_LATE} as provisioned in this account as role "
+            f"{self.ROLE_LATE} (customer managed /guard/cmp-3210) (bedrock): "
+            "StringNotEquals aws:PrincipalTag/authn mfa" in summary
+        )
+        assert "1 of them carry" in summary
+        assert "reference customer managed policies, which" not in summary
+
+    def test_br51_an_unread_provisioned_role_is_named_not_judged(self):
+        cache = self._provisioned_cache({})
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "role",
+                "name": self.ROLE_WRITE,
+                "stage": "attached_policies",
+                "error": "AccessDenied",
+            }
+        ]
+        _, rows = self._run(
+            cache,
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            set_names={self.PS_WRITE: "write"},
+            customer={self.PS_WRITE: [{"Name": "cmp"}]},
+        )
+        assert not [r for r in rows if r["Status"] in ("Failed", "Passed")]
+        assert any(
+            f"{self.PS_WRITE} (/cmp): its provisioned role {self.ROLE_WRITE} was "
+            "not read into the IAM permissions cache (AccessDenied)"
+            in r["Finding_Details"]
+            for r in rows
+        )
+
+    def test_br51_an_unread_permission_set_name_is_named_not_judged(self):
+        _, rows = self._run_provisioned(
+            {self.ROLE_WRITE: [self.GRANT]},
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            set_names={self.PS_WRITE: _make_client_error("AccessDeniedException")},
+            customer={self.PS_WRITE: [{"Name": "cmp"}]},
+        )
+        assert not [r for r in rows if r["Status"] == "Failed"]
+        (summary,) = [r["Finding_Details"] for r in rows]
+        assert (
+            f"{self.PS_WRITE} (/cmp): its name was not read with "
+            "sso:DescribePermissionSet (AccessDeniedException)" in summary
+        )
+
+    def test_br51_a_set_without_customer_managed_policies_is_not_described(self):
+        self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={self.PS_WRITE: self._grant_with()},
+        )
+        self.described.assert_not_called()
 
     def test_br51_scope_note_names_the_managed_policy_reads(self):
         assert "not granted" not in bedrock_app.AI_USER_MFA_SCOPE_NOTE
@@ -34117,8 +34730,8 @@ class TestBR51AIUserConsoleMFA:
             in bedrock_app.AI_USER_MFA_SCOPE_NOTE
         )
         assert (
-            "customer managed policy references are named and not read"
-            in bedrock_app.AI_USER_MFA_SCOPE_NOTE
+            "judged through the AWSReservedSSO_ role it is provisioned as in this "
+            "account" in bedrock_app.AI_USER_MFA_SCOPE_NOTE
         )
 
     def test_br51_denied_permission_set_list_is_named(self):
@@ -35217,9 +35830,12 @@ class TestBR53OwnerTagSweep:
         "list_processing_jobs": "ProcessingJobSummaries",
         "list_transform_jobs": "TransformJobSummaries",
         "list_workload_identities": "workloadIdentities",
+        "list_clusters": "ClusterSummaries",
+        "list_harnesses": "harnesses",
     }
 
-    def _run(self, pages, errors=None, runtimes=None, lists=None):
+    def _run(self, pages, errors=None, runtimes=None, lists=None, setup=None):
+        """``setup`` receives the shared client mock before the check runs."""
         errors = errors or {}
         tagging = MagicMock()
         if isinstance(runtimes, Exception):
@@ -35250,6 +35866,8 @@ class TestBR53OwnerTagSweep:
             return response
 
         tagging.get_resources.side_effect = get_resources
+        if setup:
+            setup(tagging)
         with patch("boto3.client", return_value=tagging):
             result = bedrock_app.check_ai_resource_owner_tag_sweep(region="us-east-1")
         rows = extract_csv_data(result)
@@ -35318,9 +35936,10 @@ class TestBR53OwnerTagSweep:
         assert (
             "SageMaker and AgentCore resource types other than endpoints, models, "
             "notebook instances, training jobs, domains, inference components, "
-            "pipelines, processing jobs, transform jobs, agent runtimes, memories, "
-            "gateways, custom browsers, custom code interpreters and workload "
-            "identities are read only through GetResources" in details
+            "pipelines, processing jobs, transform jobs, HyperPod clusters, agent "
+            "runtimes, memories, gateways, custom browsers, custom code "
+            "interpreters, workload identities and harnesses are read only "
+            "through GetResources" in details
         )
         assert "not granted" not in details
         assert "ceiling reached" not in details
@@ -35711,6 +36330,125 @@ class TestBR53OwnerTagSweep:
         assert (
             "sagemaker:ListModels (AccessDeniedException), so models never tagged "
             "are not listed" in rows[1]["Finding_Details"]
+        )
+
+    SM_CLUSTER = "arn:aws:sagemaker:us-east-1:123456789012:cluster/{}"
+    AC_HARNESS = "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/{}"
+
+    def test_clusters_and_harnesses_absent_from_get_resources_have_tags_read(self):
+        """GOV-02: a HyperPod cluster or harness GetResources misses is judged by
+        its own tag read: one owned and one not of each type."""
+        tags = {
+            self.SM_CLUSTER.format("c-owned"): [{"Key": "Owner", "Value": "ml"}],
+            self.SM_CLUSTER.format("c-bare"): [{"Key": "env", "Value": "dev"}],
+        }
+
+        def setup(tagging):
+            tagging.list_tags.side_effect = lambda **kwargs: {
+                "Tags": tags[kwargs["ResourceArn"]]
+            }
+            tagging.list_tags_for_resource.side_effect = lambda resourceArn: {
+                "tags": {"Owner": "agents"} if "h-owned" in resourceArn else {}
+            }
+
+        _, rows, tagging = self._run(
+            {
+                "sagemaker": [[self._owned(self.SM_OWNED)]],
+                "bedrock-agentcore": [[self._owned(self.AC_OWNED)]],
+            },
+            lists={
+                "list_clusters": [
+                    {"ClusterArn": self.SM_CLUSTER.format("c-owned")},
+                    {"ClusterArn": self.SM_CLUSTER.format("c-bare")},
+                ],
+                "list_harnesses": [
+                    {"arn": self.AC_HARNESS.format("h-owned")},
+                    {"arn": self.AC_HARNESS.format("h-bare")},
+                ],
+            },
+            setup=setup,
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 2
+        assert any(
+            self.SM_CLUSTER.format("c-bare") in d and "tag keys: env" in d
+            for d in failed
+        )
+        assert any(
+            self.AC_HARNESS.format("h-bare") in d and "no tags returned" in d
+            for d in failed
+        )
+        assert not any("-owned" in d for d in failed)
+        summary = rows[-1]["Finding_Details"]
+        assert (
+            "sagemaker:ListClusters listed 2 HyperPod cluster(s), and the tags of "
+            "the 2 absent from GetResources were read with sagemaker:ListTags."
+            in summary
+        )
+        assert "bedrock-agentcore:ListHarnesses listed 2 harness(s)" in summary
+        assert "2 listed resource(s) whose tags were read" in summary
+        tagging.list_clusters.assert_called_with(MaxResults=100)
+        tagging.list_harnesses.assert_called_with(maxResults=100)
+        tagging.list_tags.assert_any_call(
+            MaxResults=100, ResourceArn=self.SM_CLUSTER.format("c-bare")
+        )
+
+    def _owned_cluster_and_harness(self, harness_tags):
+        def setup(tagging):
+            tagging.list_tags.return_value = {"Tags": [{"Key": "owner", "Value": "ml"}]}
+            tagging.list_tags_for_resource.side_effect = harness_tags
+
+        return self._run(
+            {"sagemaker": [[self._owned(self.SM_OWNED)]]},
+            lists={
+                "list_clusters": [{"ClusterArn": self.SM_CLUSTER.format("c-1")}],
+                "list_harnesses": [{"arn": self.AC_HARNESS.format("h-1")}],
+            },
+            setup=setup,
+        )
+
+    def test_owned_clusters_and_harnesses_pass(self):
+        _, rows, _ = self._owned_cluster_and_harness(
+            lambda resourceArn: {"tags": {"Owner": "agents"}}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_an_unread_harness_tag_read_withholds_the_pass(self):
+        _, rows, _ = self._owned_cluster_and_harness(
+            _make_client_error("AccessDeniedException")
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "bedrock-agentcore:ListTagsForResource on "
+            + self.AC_HARNESS.format("h-1")
+            + " (AccessDeniedException)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_cluster_tag_reads_stop_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+
+        def setup(tagging):
+            tagging.list_tags.return_value = {"Tags": [{"Key": "owner", "Value": "ml"}]}
+
+        _, rows, tagging = self._run(
+            {"sagemaker": [[self._owned(self.SM_OWNED)]]},
+            lists={
+                "list_clusters": [
+                    {"ClusterArn": self.SM_CLUSTER.format("c-1")},
+                    {"ClusterArn": self.SM_CLUSTER.format("c-2")},
+                ]
+            },
+            setup=setup,
+        )
+        tagging.list_tags.assert_not_called()
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "sagemaker:ListTags for 2 HyperPod cluster(s) from "
+            + self.SM_CLUSTER.format("c-1")
+            + " on, "
+            + bedrock_app.DEADLINE_STOP
+            in rows[0]["Finding_Details"]
         )
 
     def test_an_unread_sagemaker_filter_skips_its_lists(self):
@@ -41782,6 +42520,7 @@ class TestBR20ValueDepth:
 
     def _kendra_run(self, index=None, error=None, body=None):
         kendra = MagicMock()
+        kendra.list_data_sources.return_value = {"SummaryItems": []}
         if error is not None:
             kendra.describe_index.side_effect = error
         else:
@@ -41844,6 +42583,298 @@ class TestBR20ValueDepth:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "no readable kendraIndexArn" in rows[0]["Finding_Details"]
         kendra.describe_index.assert_not_called()
+
+    # --- KB-03: Neptune Analytics and Kendra readers against the source -----
+
+    GRAPH = f"arn:aws:neptune-graph:us-east-1:{ACCOUNT}:graph/g-1"
+    # The cache keys a role by name; its ARN carries a path the bucket names.
+    READER = f"arn:aws:iam::{ACCOUNT}:role/team/reader"
+
+    @classmethod
+    def _reader_role(cls, actions, resource, condition=None, deny=None, boundary=None):
+        statements = [
+            {"Effect": "Allow", "Action": actions, "Resource": resource},
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::corpus/*",
+            },
+            {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": cls.CMK},
+        ]
+        if condition:
+            statements[0]["Condition"] = condition
+        if deny:
+            statements.append(deny)
+        role = {
+            "attached_policies": [
+                {"policy_name": "reads", "document": {"Statement": statements}}
+            ]
+        }
+        if boundary is not None:
+            role["permissions_boundary"] = {"document": {"Statement": boundary}}
+        return role
+
+    def _iam(self, roles=None, error=None):
+        iam = MagicMock()
+        listed = roles or {
+            "kb-role": self.ROLE,
+            "reader": self.READER,
+        }
+
+        def paginator(operation):
+            pager = MagicMock()
+            if error is not None and operation == "list_roles":
+                pager.paginate.side_effect = error
+            elif operation == "list_roles":
+                pager.paginate.return_value = [
+                    {"Roles": [{"RoleName": n, "Arn": a} for n, a in listed.items()]}
+                ]
+            else:
+                pager.paginate.return_value = [{"Users": []}]
+            return pager
+
+        iam.get_paginator.side_effect = paginator
+        return iam
+
+    def _graph_run(self, reader, allowed=None, iam=None, cache=None):
+        graph = MagicMock()
+        graph.get_graph.return_value = {
+            "kmsKeyIdentifier": self.CMK,
+            "publicConnectivity": False,
+        }
+        if cache is None:
+            cache = self._cache(roles={"reader": reader} if reader else None)
+        return self._source_access(
+            self._run(
+                {
+                    "kb1": self._store_body(
+                        "NEPTUNE_ANALYTICS",
+                        "neptuneAnalyticsConfiguration",
+                        {"graphArn": self.GRAPH},
+                    )
+                },
+                clients={"neptune-graph": graph, "iam": iam or self._iam()},
+                sources={"kb1": [("ds1", "corpus", self.CMK)]},
+                bucket_encryption={"corpus": self._sse(self.CMK)},
+                bucket_policies={
+                    "corpus": self._source_deny(allowed=allowed or [self.ROLE])
+                },
+                permission_cache=cache,
+            )
+        )
+
+    def test_a_neptune_graph_reader_the_source_bucket_denies_fails(self):
+        rows = self._graph_run(
+            self._reader_role("neptune-graph:ReadDataViaQuery", self.GRAPH)
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "1 of the 1 principal(s) admitted to the vector index of knowledge "
+            "base(s) 'KB-kb1' are denied s3:GetObject on the documents of source "
+            f"bucket 'corpus' by its bucket policy, so they read through the index "
+            f"content the bucket keeps from them: {self.READER}."
+        ) in details
+        assert (
+            f"The principals that read the Neptune Analytics graph '{self.GRAPH}' "
+            "behind 'KB-kb1' are the IAM roles and users whose identity policies "
+            "allow neptune-graph:ReadDataViaQuery on it without a Condition"
+        ) in details
+        assert self.ROLE not in details.split("keeps from them:")[1]
+
+    def test_a_neptune_graph_reader_the_source_bucket_admits_by_path_passes(self):
+        rows = self._graph_run(
+            self._reader_role("neptune-graph:*", "*"), allowed=[self.READER]
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "None of the 1 principal(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            # A grant on another graph, an identity Deny and a boundary without
+            # the action each leave the role unable to read this graph.
+            "other graph",
+            "denied",
+            "bounded",
+            "write only",
+        ],
+    )
+    def test_a_role_that_cannot_read_the_graph_is_not_a_reader(self, reader):
+        other = f"arn:aws:neptune-graph:us-east-1:{self.ACCOUNT}:graph/g-2"
+        role = {
+            "other graph": self._reader_role("neptune-graph:ReadDataViaQuery", other),
+            "denied": self._reader_role(
+                "*",
+                "*",
+                deny={
+                    "Effect": "Deny",
+                    "Action": "neptune-graph:ReadDataViaQuery",
+                    "Resource": "*",
+                },
+            ),
+            "bounded": self._reader_role(
+                "neptune-graph:*",
+                "*",
+                boundary=[{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+            ),
+            "write only": self._reader_role(
+                "neptune-graph:WriteDataViaQuery", self.GRAPH
+            ),
+        }[reader]
+        rows = self._graph_run(role)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert self.READER not in rows[0]["Finding_Details"]
+
+    def test_a_conditioned_graph_read_is_held_not_passed(self):
+        rows = self._graph_run(
+            self._reader_role(
+                "neptune-graph:ReadDataViaQuery",
+                self.GRAPH,
+                condition={"Bool": {"aws:SecureTransport": "true"}},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            f"for 'KB-kb1', {self.READER}: attached policy 'reads' allows the read "
+            "under a Condition"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_unread_principal_holds_the_graph_comparison(self):
+        cache = self._cache()
+        cache["principal_errors"] = [{"type": "role", "name": "ghost", "stage": "x"}]
+        rows = self._graph_run(None, cache=cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "1 IAM principal(s) had a policy read fail in the IAM permissions "
+            "cache, so whether they hold neptune-graph:ReadDataViaQuery is not "
+            "known: role ghost"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_unlisted_role_holds_the_graph_comparison(self):
+        rows = self._graph_run(
+            self._reader_role("neptune-graph:ReadDataViaQuery", self.GRAPH),
+            iam=self._iam(error=_client_error("AccessDenied", "denied", "ListRoles")),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "the IAM roles were not listed with iam:ListRoles (AccessDenied)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_the_iam_listing_stops_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        iam = self._iam()
+        with patch("bedrock_app.boto3.client", return_value=iam):
+            listing = bedrock_app._iam_principal_arns()
+        assert listing == {
+            "arns": {},
+            "error": "the IAM roles were not all listed with iam:ListRoles "
+            f"{bedrock_app.DEADLINE_STOP}",
+        }
+
+    def _kendra_reader_run(self, policy="ATTRIBUTE_FILTER", sources=None, allowed=None):
+        kendra = MagicMock()
+        kendra.describe_index.return_value = {
+            "ServerSideEncryptionConfiguration": {"KmsKeyId": self.CMK},
+            "UserContextPolicy": policy,
+        }
+        sources = sources or {"ds-1": ("S3", "corpus")}
+        kendra.list_data_sources.return_value = {
+            "SummaryItems": [{"Id": i, "Name": f"n-{i}"} for i in sources]
+        }
+
+        def describe_data_source(Id, IndexId):
+            kind, bucket = sources[Id]
+            detail = {"Type": kind}
+            if bucket:
+                detail["Configuration"] = {"S3Configuration": {"BucketName": bucket}}
+            return detail
+
+        kendra.describe_data_source.side_effect = describe_data_source
+        self.kendra = kendra
+        findings = self._run(
+            {
+                "kb1": {
+                    "knowledgeBaseConfiguration": {
+                        "type": "KENDRA",
+                        "kendraKnowledgeBaseConfiguration": {
+                            "kendraIndexArn": self.KENDRA_INDEX
+                        },
+                    }
+                }
+            },
+            clients={"kendra": kendra, "iam": self._iam()},
+            bucket_encryption={"corpus": self._sse(self.CMK)},
+            bucket_policies={
+                "corpus": self._source_deny(allowed=allowed or [self.ROLE])
+            },
+            permission_cache=self._cache(
+                roles={"reader": self._reader_role("kendra:Query", self.KENDRA_INDEX)}
+            ),
+        )
+        return findings, self._source_access(findings)
+
+    def test_a_kendra_index_reader_the_source_bucket_denies_fails(self):
+        findings, rows = self._kendra_reader_run()
+        self.kendra.list_data_sources.assert_called_once_with(
+            IndexId="idx-1", MaxResults=100
+        )
+        self.kendra.describe_data_source.assert_called_once_with(
+            Id="ds-1", IndexId="idx-1"
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert f"keeps from them: {self.READER}." in details
+        assert (
+            f"Kendra data source 'n-ds-1' of index '{self.KENDRA_INDEX}' behind "
+            "knowledge base 'KB-kb1'"
+        ) in details
+        assert "allow kendra:Query or kendra:Retrieve on it" in details
+
+    def test_a_kendra_index_reader_the_source_bucket_admits_passes(self):
+        _, rows = self._kendra_reader_run(allowed=[self.READER])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_user_token_kendra_index_holds_its_readers(self):
+        _, rows = self._kendra_reader_run(policy="USER_TOKEN")
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "the index's UserContextPolicy is USER_TOKEN, so each caller sees only "
+            "the documents its token admits, which is not read"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_template_kendra_source_is_named_not_judged(self):
+        findings, rows = self._kendra_reader_run(
+            sources={"ds-1": ("S3", "corpus"), "ds-2": ("TEMPLATE", None)}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert any(
+            f"Kendra data source 'n-ds-2' of index '{self.KENDRA_INDEX}' behind "
+            "knowledge base 'KB-kb1' is a TEMPLATE connector, whose repository is "
+            "not read, so an S3 bucket behind it is not judged"
+            in f["Finding_Details"]
+            and f["Status"] == "N/A"
+            for f in findings
+        )
+
+    def test_kendra_data_source_reads_stop_at_the_deadline(self, monkeypatch):
+        kendra = MagicMock()
+        kendra.list_data_sources.return_value = {
+            "SummaryItems": [{"Id": "ds-1"}, {"Id": "ds-2"}]
+        }
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        corpus = bedrock_app._kendra_index_s3_sources(
+            kendra, "idx-1", self.KENDRA_INDEX, "kb1", "KB-kb1"
+        )
+        kendra.describe_data_source.assert_not_called()
+        assert corpus == {
+            "sources": [],
+            "errors": [
+                f"2 data source(s) of Kendra index '{self.KENDRA_INDEX}' were not "
+                f"read with kendra:DescribeDataSource {bedrock_app.DEADLINE_STOP}"
+            ],
+        }
 
     WORKGROUP = f"arn:aws:redshift-serverless:us-west-2:{ACCOUNT}:workgroup/wg-1"
 
@@ -46705,6 +47736,30 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["N/A"]
         assert phrase in rows[0]["Finding_Details"]
 
+    # GRD-09: a grounding version in another account that its owner's resource
+    # policy does not share is named as such.
+    def test_a_denied_cross_account_grounding_version_names_the_resource_policy(
+        self,
+    ):
+        guardrails = self._grounding_guardrails()
+        guardrails[("gr-g", "1")] = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.CONVERSE: [
+                    [self._qualified("req-u", ["grounding_source", "query"])]
+                ],
+            },
+            guardrails=guardrails,
+        )
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "guardrail gr-g version 1 was not read with bedrock:GetGuardrail "
+            f"({CROSS_ACCOUNT_GUARDRAIL_ERROR})" in rows[0]["Finding_Details"]
+        )
+
     # GRD-09: an InvokeModel caller marks the grounding source and query with
     # suffixed tags in the body, which were never read.
     def _grounded_invoke(self, request_id, tags, assessed=False, suffix="xyz"):
@@ -49597,6 +50652,33 @@ class TestInvocationDeadline:
         assert reading["unread"] == (
             f"the read of its versions from 2 on stopped {bedrock_app.DEADLINE_STOP}"
         )
+
+    # GRD-01: every version a versionless value can name is read; a cap of 20
+    # held the value unread at 21 (20 published versions and the draft).
+    def test_br10_guardrail_directions_read_all_twenty_one_versions(self):
+        bedrock = MagicMock()
+        bedrock.list_guardrails.return_value = {
+            "guardrails": [{"version": str(number)} for number in range(1, 21)]
+        }
+        bedrock.get_guardrail.return_value = {}
+        reading = bedrock_app._read_guardrail_directions(
+            "gr-1", "us-east-1", {"us-east-1": bedrock}
+        )
+        assert bedrock.get_guardrail.call_count == 21
+        assert reading["unread"] == ""
+        assert len(reading["blocked"]) == 21
+
+    def test_br10_a_denied_cross_account_value_names_the_owner_resource_policy(self):
+        bedrock = MagicMock()
+        bedrock.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        reading = bedrock_app._read_guardrail_directions(
+            "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org:1",
+            "us-east-1",
+            {"us-east-1": bedrock},
+        )
+        assert reading["unread"] == CROSS_ACCOUNT_GUARDRAIL_ERROR
 
     def test_the_redaction_source_listing_stops_at_the_deadline(self):
         s3 = MagicMock()

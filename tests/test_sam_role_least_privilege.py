@@ -144,13 +144,21 @@ _EXPECTED_ACTIONS = {
     },
     "BedrockAssessmentReadsPolicy2": {
         "athena:ListDataCatalogs",
+        "bedrock-agentcore:ListHarnesses",
+        "bedrock-agentcore:ListTagsForResource",
+        "bedrock:GetGuardrail",
         "bedrock:ListCustomModelDeployments",
         "bedrock:ListPromptRouters",
         "bedrock:ListTagsForResource",
         "iam:ListRoles",
+        "iam:ListUsers",
+        "kendra:DescribeDataSource",
+        "kendra:ListDataSources",
         "lambda:GetMicrovm",
         "lambda:ListMicrovms",
         "s3:ListBucketVersions",
+        "sagemaker:ListClusters",
+        "sagemaker:ListTags",
     },
     "BedrockAssessmentReadsPolicy": {
         "account:ListRegions",
@@ -217,6 +225,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListTransformJobs",
         "sagemaker:Search",
         "sso:DescribeInstanceAccessControlAttributeConfiguration",
+        "sso:DescribePermissionSet",
         "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
         "sso:ListManagedPoliciesInPermissionSet",
     },
@@ -1174,6 +1183,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "sso:ListManagedPoliciesInPermissionSet",
                     "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
                     "sso:DescribeInstanceAccessControlAttributeConfiguration",
+                    "sso:DescribePermissionSet",
                 )
             ),
             *(
@@ -1315,6 +1325,20 @@ def test_bedrock_second_managed_policy_renders_within_its_budget(template, parti
     )
 
 
+# ListDataSources authorizes on the Kendra index, DescribeDataSource on the
+# data-source and index resource types.
+KENDRA_SOURCE_ARNS = json.dumps(
+    [
+        {"Fn::Sub": "arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*"},
+        {
+            "Fn::Sub": "arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:"
+            "index/*/data-source/*"
+        },
+    ],
+    sort_keys=True,
+)
+
+
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
 def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(template):
     with open(template, encoding="utf-8") as template_file:
@@ -1337,14 +1361,67 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
         for statement in document["Statement"]
         for action in statement["Action"]
     )
-    # ListMicrovms, ListRoles, ListCustomModelDeployments, ListPromptRouters
-    # and ListDataCatalogs have no resource type; GetMicrovm authorizes on
-    # microvmImage, in this account or the AWS-managed "aws" account;
-    # ListBucketVersions authorizes on the bucket resource type, and
-    # ListTagsForResource on each Bedrock resource type it reads.
+    # ListMicrovms, ListRoles, ListCustomModelDeployments, ListPromptRouters,
+    # ListClusters, ListHarnesses and ListDataCatalogs have no resource type;
+    # GetMicrovm authorizes on microvmImage, in this account or the AWS-managed
+    # "aws" account; ListBucketVersions authorizes on the bucket resource type,
+    # ListTagsForResource on each Bedrock resource type it reads, and the
+    # SageMaker and AgentCore tag reads on the cluster and harness types.
+    owner_tag_arns = json.dumps(
+        [
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                "${AWS::AccountId}:cluster/*"
+            },
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:harness/*"
+            },
+        ],
+        sort_keys=True,
+    )
     assert grants == sorted(
         [
             ("ManagedReadsOnWildcard2", "Allow", "athena:ListDataCatalogs", '"*"'),
+            ("ManagedReadsOnWildcard2", "Allow", "sagemaker:ListClusters", '"*"'),
+            (
+                "ManagedReadsOnWildcard2",
+                "Allow",
+                "bedrock-agentcore:ListHarnesses",
+                '"*"',
+            ),
+            ("AIOwnerTagRead", "Allow", "sagemaker:ListTags", owner_tag_arns),
+            ("ManagedReadsOnWildcard2", "Allow", "iam:ListUsers", '"*"'),
+            (
+                "KendraDataSourceRead",
+                "Allow",
+                "kendra:ListDataSources",
+                KENDRA_SOURCE_ARNS,
+            ),
+            (
+                "KendraDataSourceRead",
+                "Allow",
+                "kendra:DescribeDataSource",
+                KENDRA_SOURCE_ARNS,
+            ),
+            # A guardrail another account owns, such as an organization-enforced
+            # guardrail in the administrator account, needs the account segment
+            # open; the owner's resource policy must also allow the read.
+            (
+                "CrossAccountGuardrailRead",
+                "Allow",
+                "bedrock:GetGuardrail",
+                json.dumps(
+                    {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:*:guardrail/*"},
+                    sort_keys=True,
+                ),
+            ),
+            (
+                "AIOwnerTagRead",
+                "Allow",
+                "bedrock-agentcore:ListTagsForResource",
+                owner_tag_arns,
+            ),
             (
                 "BedrockOwnerTagRead2",
                 "Allow",

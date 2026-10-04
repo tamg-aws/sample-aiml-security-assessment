@@ -525,12 +525,16 @@ Resources:
             # DescribeInstanceAccessControlAttributeConfiguration has the
             # Instance resource type only, so the PermissionSet ARN grants it
             # nothing. It was Sid IdentityCenterAttributeRead, folded in to keep
-            # this policy under its 5,500-character budget.
+            # this policy under its 5,500-character budget. DescribePermissionSet,
+            # with the Instance and PermissionSet resource types, names the
+            # AWSReservedSSO_ role a set with a customer managed policy is
+            # provisioned as.
             Effect: Allow
             Action:
               - sso:ListManagedPoliciesInPermissionSet # BR-51
               - sso:ListCustomerManagedPolicyReferencesInPermissionSet # BR-51
               - sso:DescribeInstanceAccessControlAttributeConfiguration # BR-51
+              - sso:DescribePermissionSet # BR-51
             Resource:
               - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
               - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
@@ -663,9 +667,12 @@ Resources:
             Effect: Allow
             Action:
               - lambda:ListMicrovms # BR-57
-              - iam:ListRoles # BR-02
+              - iam:ListRoles # BR-02, BR-20
+              - iam:ListUsers # BR-20
               - bedrock:ListCustomModelDeployments # BR-53
               - bedrock:ListPromptRouters # BR-53
+              - sagemaker:ListClusters # BR-53
+              - bedrock-agentcore:ListHarnesses # BR-53
               - athena:ListDataCatalogs # BR-06
             Resource: '*'
           - Sid: BedrockOwnerTagRead2
@@ -679,6 +686,42 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:automated-reasoning-policy/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model-deployment/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:prompt-router/*'
+          - Sid: AIOwnerTagRead
+            # BR-53 reads the tags of each HyperPod cluster and AgentCore
+            # harness that tag:GetResources does not return. The service
+            # authorization reference gives sagemaker:ListTags the cluster
+            # resource type and bedrock-agentcore:ListTagsForResource the
+            # harness resource type; neither service's action authorizes on
+            # the other's ARN.
+            Effect: Allow
+            Action:
+              - sagemaker:ListTags # BR-53
+              - bedrock-agentcore:ListTagsForResource # BR-53
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:cluster/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
+          - Sid: KendraDataSourceRead
+            # BR-20 reads the S3 buckets a Kendra index behind a KENDRA
+            # knowledge base ingests from. ListDataSources authorizes on the
+            # index resource type, DescribeDataSource on the data-source and
+            # index types.
+            Effect: Allow
+            Action:
+              - kendra:ListDataSources # BR-20
+              - kendra:DescribeDataSource # BR-20
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
+              - !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*/data-source/*'
+          - Sid: CrossAccountGuardrailRead
+            # BR-10, BR-26, BR-27, BR-34, BR-41 and BR-46 read guardrails that
+            # another account owns, such as an organization-enforced guardrail
+            # in the administrator account. The read succeeds only when the
+            # owner's guardrail resource policy also allows bedrock:GetGuardrail
+            # (Amazon Bedrock User Guide, guardrails-resource-based-policies.html).
+            Effect: Allow
+            Action:
+              - bedrock:GetGuardrail # BR-10, BR-26, BR-27, BR-34, BR-41, BR-46
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:*:guardrail/*'
           - Sid: MicrovmRead
             # GetMicrovm authorizes on the microvmImage resource type. A
             # MicroVM may run an AWS-managed image, whose ARN has the account
