@@ -1710,7 +1710,11 @@ FOUNDATION_ROWS = [
         "bedrock:CreateModelCustomizationJob, bedrock-agentcore:CreateMemory, "
         "s3:CreateBucket, s3vectors:CreateVectorBucket, aoss:CreateCollection and "
         "the SageMaker endpoint, notebook, training, processing and transform "
-        "creation actions",
+        "creation actions, and every other action of sagemaker, bedrock, "
+        "bedrock-agentcore, s3, s3vectors, aoss and the knowledge base vector "
+        "stores es, rds, neptune-graph and kendra, read through a probe action "
+        "only a whole-prefix Deny covers, so a Deny that names just the listed "
+        "actions fails",
         [],
         6,
     ),
@@ -1799,8 +1803,10 @@ FOUNDATION_ROWS = [
         "bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream outside a "
         "named list of foundation-model or inference-profile ARNs, given as a "
         "NotResource or as a negated condition. Its Region leg covers agent, flow, "
-        "RetrieveAndGenerate and AgentCore runtime invocation and credits no "
-        "wildcard aws:PrincipalArn exemption. Converse and ConverseStream have "
+        "RetrieveAndGenerate and AgentCore runtime invocation, requires each of "
+        "bedrock, bedrock-agentcore and bedrock-mantle to be denied as a whole "
+        "prefix through a probe action, and credits no wildcard "
+        "aws:PrincipalArn exemption. Converse and ConverseStream have "
         "no IAM action of their own and are authorized by those two, so the leg "
         "matches only them. A Deny written with NotAction is read as covering "
         "those actions, and arn:aws:bedrock:*::foundation-model/* counts as no "
@@ -1809,8 +1815,9 @@ FOUNDATION_ROWS = [
         "Region Deny over SageMaker endpoint, notebook, training, processing, "
         "transform and synchronous and asynchronous invocation, Bedrock knowledge "
         "base and customization job creation, AgentCore memory creation, and S3 "
-        "bucket, S3 Vectors bucket and OpenSearch Serverless collection creation. "
-        "No leg reads a Deny on unapproved AI services. Organization policies are "
+        "bucket, S3 Vectors bucket and OpenSearch Serverless collection creation, "
+        "and over every other action of those services and of es, rds, "
+        "neptune-graph and kendra. No leg reads a Deny on unapproved AI services. Organization policies are "
         "readable only from the management account or a delegated administrator, "
         "so from any other member account the leg is Not Applicable",
         [],

@@ -753,6 +753,20 @@ MUTATIONS = [
         "replace": "        if False:\n",
     },
     {
+        "name": "BR-43 credits a Region deny that names only the listed invoke actions",
+        "file": BEDROCK,
+        "defect": "BR-43 drops its service probes, so a Region deny naming the nine listed actions passes while bedrock:CreateAgent runs in any Region",
+        "find": '    _region_probe("bedrock"),\n    _region_probe("bedrock-agentcore"),\n    _region_probe("bedrock-mantle"),\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-43 credits an AI service Region deny that omits the vector stores",
+        "file": BEDROCK,
+        "defect": "BR-43 drops the vector store probes, so es:CreateDomain and rds:CreateDBCluster run in any Region while the row passes",
+        "find": '    _region_probe("es"),\n    _region_probe("rds"),\n    _region_probe("neptune-graph"),\n    _region_probe("kendra"),\n',
+        "replace": "",
+    },
+    {
         "name": "an unread list read lets the BR-53 sweep summary pass",
         "file": BEDROCK,
         "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
@@ -2419,6 +2433,12 @@ GROUPS: dict[str, str] = {
     ),
     "BR-43 credits an AI service Region deny in the management account": (
         "in the Bedrock management-account SCP credit"
+    ),
+    "BR-43 credits a Region deny that names only the listed invoke actions": (
+        "in the Bedrock Region deny service prefixes"
+    ),
+    "BR-43 credits an AI service Region deny that omits the vector stores": (
+        "in the Bedrock Region deny service prefixes"
     ),
     "an unread list read lets the BR-53 sweep summary pass": (
         "in the Bedrock owner tag sweep"

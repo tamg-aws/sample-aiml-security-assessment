@@ -11066,6 +11066,11 @@ class TestBR43RegionInvocationControl:
         "bedrock:RetrieveAndGenerate",
         "bedrock-agentcore:InvokeAgentRuntime",
         "bedrock-mantle:CreateInference",
+        # ACC-02: a probe per service requires the Deny to cover each whole
+        # prefix, so the named actions alone no longer pass.
+        "bedrock:*",
+        "bedrock-agentcore:*",
+        "bedrock-mantle:*",
     ]
 
     @staticmethod
@@ -11758,7 +11763,20 @@ class TestBR43RegionInvocationControl:
             in findings[0]["Finding_Details"]
         )
 
-    def test_br43_three_policies_cover_every_invoking_action_together(self):
+    # ACC-02: this test used to pass three policies that named only the nine
+    # listed actions. Those now fail for want of each whole service prefix,
+    # and the same three policies pass once they cover the prefixes too.
+    @pytest.mark.parametrize(
+        "prefixes, status",
+        [
+            ([], "Failed"),
+            (["bedrock:*", "bedrock-agentcore:*", "bedrock-mantle:*"], "Passed"),
+        ],
+        ids=["named-actions-only", "whole-prefixes"],
+    )
+    def test_br43_three_policies_cover_every_invoking_action_together(
+        self, prefixes, status
+    ):
         findings = self._run(
             self._inventory(
                 [
@@ -11786,14 +11804,58 @@ class TestBR43RegionInvocationControl:
                             action=[
                                 "bedrock-agentcore:InvokeAgentRuntime",
                                 "bedrock-mantle:CreateInference",
-                            ],
+                            ]
+                            + prefixes,
                         ),
                     ),
                 ]
             )
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == [status]
+        if not prefixes:
+            detail = findings[0]["Finding_Details"]
+            assert (
+                "no credited allow-list covers bedrock:*, bedrock-agentcore:*, "
+                "bedrock-mantle:*, so those calls" in detail
+            )
+            assert "bedrock:invokemodel," not in detail.split("covers")[-1]
+
+    # ACC-02: a Deny on bedrock:Invoke* covers every listed bedrock action but
+    # not bedrock:CreateAgent, so it is not a whole-prefix Deny.
+    @pytest.mark.parametrize(
+        "bedrock_actions, status",
+        [
+            (["bedrock:Invoke*", "bedrock:*Job", "bedrock:Retrieve*"], "Failed"),
+            (["bedrock:*"], "Passed"),
+        ],
+        ids=["family-patterns", "whole-prefix"],
+    )
+    def test_br43_family_patterns_are_not_the_whole_bedrock_prefix(
+        self, bedrock_actions, status
+    ):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "Regions",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1", "unspecified"],
+                            action=bedrock_actions
+                            + ["bedrock-agentcore:*", "bedrock-mantle:*"],
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        if status == "Failed":
+            assert (
+                "no credited allow-list covers bedrock:*, so"
+                in findings[0]["Finding_Details"]
+            )
 
     def test_br43_allow_list_missing_agentcore_runtime_fails(self):
         findings = self._run(
@@ -12483,7 +12545,9 @@ class TestBR43AIServiceRegionControl:
                 (
                     "BedrockRegions",
                     TestBR43RegionInvocationControl._region_scp(
-                        "StringNotEquals", ["us-east-1"]
+                        "StringNotEquals",
+                        ["us-east-1"],
+                        action=TestBR43RegionInvocationControl.ALL_REGION_ACTIONS[:9],
                     ),
                 ),
                 (
@@ -12505,9 +12569,67 @@ class TestBR43AIServiceRegionControl:
             "sagemaker:invokeendpoint, sagemaker:invokeendpointasync, "
             "bedrock:createknowledgebase, bedrock:createmodelcustomizationjob, "
             "bedrock-agentcore:creatememory, s3:createbucket, "
-            "s3vectors:createvectorbucket, aoss:createcollection outside" in detail
+            "s3vectors:createvectorbucket, aoss:createcollection, sagemaker:*, "
+            "bedrock:*, bedrock-agentcore:*, s3:*, s3vectors:*, aoss:*, es:*, "
+            "rds:*, neptune-graph:*, kendra:* outside" in detail
         )
         assert "sagemaker:createtrainingjob," not in detail
+
+    # DAT-04: a Deny naming all thirteen listed actions used to pass. It now
+    # fails, because es:CreateDomain, rds:CreateDBCluster or
+    # sagemaker:CreateFeatureGroup can still create a store in any Region, and
+    # a Deny over each whole prefix passes.
+    @pytest.mark.parametrize(
+        "extra, status",
+        [
+            ([], "Failed"),
+            (
+                [
+                    "sagemaker:*",
+                    "bedrock:*",
+                    "bedrock-agentcore:*",
+                    "s3:*",
+                    "s3vectors:*",
+                    "aoss:*",
+                    "es:*",
+                    "rds:*",
+                    "neptune-graph:*",
+                    "kendra:*",
+                ],
+                "Passed",
+            ),
+        ],
+        ids=["listed-actions-only", "whole-prefixes"],
+    )
+    def test_listed_actions_alone_leave_each_service_prefix_open(self, extra, status):
+        listed = [
+            action.replace("create", "Create").replace("invoke", "Invoke")
+            for action in bedrock_app.AI_SERVICE_REGION_ACTIONS
+            if not action.endswith(bedrock_app.REGION_SERVICE_PROBE)
+        ]
+        assert len(listed) == 13
+        findings = self._run(
+            [
+                (
+                    "ListedRegions",
+                    TestBR43RegionInvocationControl._region_scp(
+                        "StringNotEquals", ["us-east-1"], action=listed + extra
+                    ),
+                )
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        detail = findings[0]["Finding_Details"]
+        if status == "Failed":
+            assert (
+                "denies sagemaker:*, bedrock:*, bedrock-agentcore:*, s3:*, "
+                "s3vectors:*, aoss:*, es:*, rds:*, neptune-graph:*, kendra:* "
+                "outside" in detail
+            )
+            assert "aoss:createcollection" not in detail.split(" outside")[0]
+        else:
+            assert "es:*, rds:*, neptune-graph:*, kendra:* outside" in detail
 
     def test_a_deny_on_the_first_four_actions_leaves_the_rest_open(self):
         """Endpoints, training, invocation and buckets are pinned, while

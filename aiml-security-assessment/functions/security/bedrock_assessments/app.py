@@ -23543,6 +23543,25 @@ REGION_CONDITION_KEY = "aws:requestedregion"
 # RetrieveAndGenerate invoke a model on the caller's behalf, an AgentCore
 # runtime is invoked through bedrock-agentcore:InvokeAgentRuntime, and the
 # bedrock-mantle endpoint sends a prompt through bedrock-mantle:CreateInference.
+# The list names the actions a finding cites; each service also gets a probe
+# action whose name is a character no action contains, so only a Deny that
+# covers the whole service prefix covers it, and a Deny naming just the listed
+# actions leaves bedrock:CreateAgent or CreateProvisionedModelThroughput open.
+REGION_SERVICE_PROBE = "\x00"
+
+
+def _region_probe(service: str) -> str:
+    """Return the probe action that only a whole-prefix Deny on a service covers."""
+    return f"{service}:{REGION_SERVICE_PROBE}"
+
+
+def _region_action_label(action: str) -> str:
+    """Name an action for finding text, writing a service probe as service:*."""
+    if action.endswith(":" + REGION_SERVICE_PROBE):
+        return action[: -len(REGION_SERVICE_PROBE)] + "*"
+    return action
+
+
 REGION_CONTROL_ACTIONS = (
     "bedrock:invokemodel",
     "bedrock:invokemodelwithresponsestream",
@@ -23553,6 +23572,9 @@ REGION_CONTROL_ACTIONS = (
     "bedrock:retrieveandgenerate",
     "bedrock-agentcore:invokeagentruntime",
     "bedrock-mantle:createinference",
+    _region_probe("bedrock"),
+    _region_probe("bedrock-agentcore"),
+    _region_probe("bedrock-mantle"),
 )
 
 GLOBAL_INFERENCE_REGION_VALUE = "unspecified"
@@ -23914,7 +23936,7 @@ def _describe_region_control(policy_name: str, control: Dict[str, Any]) -> str:
     """State one Region control statement in one report-ready clause."""
     text = "policy '{}' denies {} when {} {} {}".format(
         policy_name,
-        ", ".join(control["actions"]),
+        ", ".join(map(_region_action_label, control["actions"])),
         REGION_CONDITION_KEY,
         control["operator"],
         ", ".join(control["regions"]) or "no Region value",
@@ -24229,13 +24251,13 @@ def check_bedrock_region_invocation_control(
                     "approved Regions. Observed routing: {}.{}{}".format(
                         len(described),
                         "; ".join(described[:5]),
-                        ", ".join(uncovered),
+                        ", ".join(map(_region_action_label, uncovered)),
                         routing_text,
                         destination_text,
                         notes,
                     ),
                     "Extend the Region allow-list Deny to {}.".format(
-                        ", ".join(uncovered)
+                        ", ".join(map(_region_action_label, uncovered))
                     ),
                     "Medium",
                     "Failed",
@@ -24598,7 +24620,11 @@ AI_SERVICE_REGION_FINDING = "AI Service Region Control"
 
 # The SageMaker, Bedrock and storage actions a Region allow-list must also deny,
 # so data and compute stay in the approved Regions and not only Bedrock
-# inference. Each name is in the service authorization reference.
+# inference. Each name is in the service authorization reference. Each service
+# named, and each vector store a knowledge base can write to (OpenSearch,
+# Aurora, Neptune Analytics and Kendra), also gets a probe, so a Deny naming
+# only these actions leaves sagemaker:CreateFeatureGroup or es:CreateDomain
+# open and fails.
 AI_SERVICE_REGION_ACTIONS = (
     "sagemaker:createendpoint",
     "sagemaker:createtrainingjob",
@@ -24613,6 +24639,16 @@ AI_SERVICE_REGION_ACTIONS = (
     "s3:createbucket",
     "s3vectors:createvectorbucket",
     "aoss:createcollection",
+    _region_probe("sagemaker"),
+    _region_probe("bedrock"),
+    _region_probe("bedrock-agentcore"),
+    _region_probe("s3"),
+    _region_probe("s3vectors"),
+    _region_probe("aoss"),
+    _region_probe("es"),
+    _region_probe("rds"),
+    _region_probe("neptune-graph"),
+    _region_probe("kendra"),
 )
 
 AI_SERVICE_REGION_REFERENCE = (
@@ -24690,7 +24726,7 @@ def check_ai_service_region_control(
                     "is the management account {}, which service control policies "
                     "never restrict, so the Region control does not apply to "
                     "resources created here.{}".format(
-                        ", ".join(AI_SERVICE_REGION_ACTIONS),
+                        ", ".join(map(_region_action_label, AI_SERVICE_REGION_ACTIONS)),
                         "; ".join(summary["described"]),
                         scp_inventory.get("account") or "unknown",
                         note,
@@ -24708,7 +24744,9 @@ def check_ai_service_region_control(
                 row(
                     "A credited Region allow-list in the attached service control "
                     "policies denies {} outside the approved Regions: {}.{}".format(
-                        ", ".join(AI_SERVICE_REGION_ACTIONS), described, note
+                        ", ".join(map(_region_action_label, AI_SERVICE_REGION_ACTIONS)),
+                        described,
+                        note,
                     ),
                     "No action required. Confirm the approved Regions match the "
                     "data residency your workloads require.",
@@ -24736,7 +24774,7 @@ def check_ai_service_region_control(
                     "No credited Region allow-list in the attached service control "
                     "policies denies {} outside the approved Regions, so those calls "
                     "can create endpoints, training jobs or buckets in any Region.{}{}".format(
-                        ", ".join(uncovered),
+                        ", ".join(map(_region_action_label, uncovered)),
                         f" Statements read: {described}." if described else "",
                         note,
                     ),
