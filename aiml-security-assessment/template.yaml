@@ -348,14 +348,26 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:transform-job/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:processing-job/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:evaluation-job/*'
-          - Sid: AgentCoreBrowserRead
+          - Sid: AgentCoreResourceRead
             # BR-47 and BR-52 read the recording bucket of each custom AgentCore
-            # browser. The service authorization reference lists the
-            # browser-custom resource type for GetBrowser.
+            # browser. BR-04 reads eventExpiryDuration on each AgentCore memory.
+            # BR-57 reads the resource policy of each runtime and runtime
+            # endpoint; runtime/* also matches runtime/<id>/runtime-endpoint/<name>.
+            # The service authorization reference gives GetBrowser the
+            # browser-custom resource type, GetMemory the memory resource type,
+            # and GetResourcePolicy the gateway, runtime and runtime-endpoint
+            # resource types, so no action is granted on another's ARN. It holds
+            # the former Sids AgentCoreBrowserRead and AgentCoreMemoryRead, merged
+            # to keep this policy under its 5,500-character budget.
             Effect: Allow
             Action:
               - bedrock-agentcore:GetBrowser # BR-47, BR-52
-            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
+              - bedrock-agentcore:GetMemory # BR-04
+              - bedrock-agentcore:GetResourcePolicy # BR-57
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:memory/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
           - Sid: AccountListRegions
             # BR-51 lists the Regions enabled for this account and sweeps each
             # for an IAM Identity Center instance.
@@ -471,22 +483,30 @@ Resources:
             Action:
               - bedrock-mantle:ListProjects # BR-37
             Resource: !Sub 'arn:${AWS::Partition}:bedrock-mantle:*:${AWS::AccountId}:project/*'
-          - Sid: AuroraInstanceRead
+          - Sid: KnowledgeBaseStoreRead
             # BR-20 reads PubliclyAccessible on each instance of the Aurora
-            # cluster behind a knowledge base. The service authorization
-            # reference gives DescribeDBInstances the db resource type.
+            # cluster behind a knowledge base, the KMS key of the Kendra index
+            # behind a KENDRA knowledge base, and the key and public access of
+            # the Redshift engine behind a SQL knowledge base. The service
+            # authorization reference gives DescribeDBInstances the db resource
+            # type, DescribeIndex the index resource type, DescribeClusters the
+            # cluster resource type and GetNamespace the namespace resource
+            # type. An action matches only ARNs of its own service, so none is
+            # granted on another's ARN. It holds the former Sids
+            # AuroraInstanceRead, KendraIndexRead, RedshiftQueryEngineRead and
+            # RedshiftServerlessNamespaceRead, merged to keep this policy under
+            # its 5,500-character budget.
             Effect: Allow
             Action:
               - rds:DescribeDBInstances # BR-20
-            Resource: !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:db:*'
-          - Sid: KendraIndexRead
-            # BR-20 reads the KMS key of the Kendra index behind a KENDRA
-            # knowledge base. The service authorization reference gives
-            # DescribeIndex the index resource type.
-            Effect: Allow
-            Action:
               - kendra:DescribeIndex # BR-20
-            Resource: !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
+              - redshift:DescribeClusters # BR-20
+              - redshift-serverless:GetNamespace # BR-20
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:db:*'
+              - !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
+              - !Sub 'arn:${AWS::Partition}:redshift:*:${AWS::AccountId}:cluster:*'
+              - !Sub 'arn:${AWS::Partition}:redshift-serverless:*:${AWS::AccountId}:namespace/*'
           - Sid: InvocationLogRead
             # BR-04 reads the most recently written stream of the invocation log
             # group, with no event content. BR-27 and BR-34 read the last 24
@@ -501,28 +521,6 @@ Resources:
               - logs:DescribeLogStreams # BR-04
               - logs:FilterLogEvents # BR-27, BR-34
             Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
-          - Sid: RedshiftQueryEngineRead
-            # BR-20 reads the key and public access of the Redshift engine
-            # behind a SQL knowledge base. The service authorization reference
-            # gives DescribeClusters the cluster resource type and GetNamespace
-            # the namespace resource type.
-            Effect: Allow
-            Action:
-              - redshift:DescribeClusters # BR-20
-            Resource: !Sub 'arn:${AWS::Partition}:redshift:*:${AWS::AccountId}:cluster:*'
-          - Sid: RedshiftServerlessNamespaceRead
-            Effect: Allow
-            Action:
-              - redshift-serverless:GetNamespace # BR-20
-            Resource: !Sub 'arn:${AWS::Partition}:redshift-serverless:*:${AWS::AccountId}:namespace/*'
-          - Sid: AgentCoreMemoryRead
-            # BR-04 reads eventExpiryDuration on each AgentCore memory. The
-            # service authorization reference gives GetMemory the memory
-            # resource type.
-            Effect: Allow
-            Action:
-              - bedrock-agentcore:GetMemory # BR-04
-            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:memory/*'
           - Sid: KnowledgeBaseSourceList
             # BR-26 lists the objects an S3 knowledge base source ingests to
             # compare each LastModified with its Comprehend redaction job, and

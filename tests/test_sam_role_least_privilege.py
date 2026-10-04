@@ -147,6 +147,7 @@ _EXPECTED_ACTIONS = {
         "aoss:ListAccessPolicies",
         "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:GetMemory",
+        "bedrock-agentcore:GetResourcePolicy",
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
@@ -901,23 +902,54 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 )
                 for action in ("ecs:DescribeTasks", "ecs:DescribeContainerInstances")
             ),
-            scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
-            scoped("kendra:DescribeIndex", "kendra:*:${AWS::AccountId}:index/*"),
             scoped("logs:DescribeLogStreams", "logs:*:${AWS::AccountId}:log-group:*"),
             scoped("logs:FilterLogEvents", "logs:*:${AWS::AccountId}:log-group:*"),
-            scoped(
-                "redshift:DescribeClusters", "redshift:*:${AWS::AccountId}:cluster:*"
-            ),
-            scoped(
-                "redshift-serverless:GetNamespace",
-                "redshift-serverless:*:${AWS::AccountId}:namespace/*",
-            ),
             ("Allow", "redshift-serverless:ListWorkgroups", '"*"'),
-            scoped(
-                "bedrock-agentcore:GetMemory",
-                "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
-            ),
             scoped("s3:ListBucket", "s3:::*"),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "rds:*:${AWS::AccountId}:db:*",
+                                "kendra:*:${AWS::AccountId}:index/*",
+                                "redshift:*:${AWS::AccountId}:cluster:*",
+                                "redshift-serverless:*:${AWS::AccountId}:namespace/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "rds:DescribeDBInstances",
+                    "kendra:DescribeIndex",
+                    "redshift:DescribeClusters",
+                    "redshift-serverless:GetNamespace",
+                )
+            ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
+                                "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
+                                "bedrock-agentcore:*:${AWS::AccountId}:runtime/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "bedrock-agentcore:GetBrowser",
+                    "bedrock-agentcore:GetMemory",
+                    "bedrock-agentcore:GetResourcePolicy",
+                )
+            ),
             (
                 "Allow",
                 "bedrock:ApplyGuardrail",
@@ -933,10 +965,6 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                         },
                     ]
                 ),
-            ),
-            scoped(
-                "bedrock-agentcore:GetBrowser",
-                "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
             ),
             (
                 "Allow",

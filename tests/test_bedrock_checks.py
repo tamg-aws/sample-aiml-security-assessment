@@ -5937,6 +5937,84 @@ class TestBR07PromptProductionVersion:
         )
         assert "role 'editor'" not in rows[0]["Finding_Details"]
 
+    # MDL-08: bedrock:CreatePrompt has no resource type, so its holders were
+    # neither read nor reported.
+    def test_br07_prompt_creators_are_named_and_a_denied_one_is_not(self):
+        cache = {
+            "cache_schema_version": 2,
+            "role_permissions": {
+                "release": {
+                    "inline_policies": [self._grant("bedrock:CreatePrompt", "*")]
+                },
+                "builder": {
+                    "attached_policies": [self._grant("bedrock:CreatePromp?", "*")]
+                },
+                "blocked": {
+                    "inline_policies": [
+                        self._grant("bedrock:CreatePrompt", "*"),
+                        self._grant("bedrock:CreatePrompt", "*", effect="Deny"),
+                    ]
+                },
+            },
+        }
+        rows = self._scope_rows(cache)
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "2 role(s) or user(s) may create prompts with bedrock:CreatePrompt, "
+            "which has no resource type, so no Resource ARN bounds it: "
+            "role 'release'; role 'builder'." in details
+        )
+        assert "role 'blocked'" not in details
+        assert "None of them may also call bedrock:RenderPrompt." in details
+
+    def test_br07_no_prompt_creator_is_said_so(self):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "editor": {
+                        "inline_policies": [
+                            self._grant("bedrock:UpdatePrompt", self._PROMPT_ARN)
+                        ]
+                    }
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "No role or user may call bedrock:CreatePrompt."
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize("create", ["bedrock:CreatePrompt", "bedrock:CreatePromp?"])
+    def test_br07_a_role_that_renders_and_creates_prompts_fails(self, create):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "release": {
+                        "inline_policies": [self._grant("bedrock:CreatePrompt", "*")]
+                    },
+                    "runtime": {
+                        "inline_policies": [
+                            self._grant("bedrock:RenderPrompt", self._PROMPT_ARN),
+                            self._grant(create, "*"),
+                        ]
+                    },
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "1 role(s) or user(s) may both render prompts (bedrock:RenderPrompt) "
+            "and create them (bedrock:CreatePrompt): role 'runtime'." in details
+        )
+
 
 # ===================================================================
 # BR-08: check_bedrock_agent_roles
@@ -37580,6 +37658,174 @@ class TestBR57AgentHandoffSourceIdentity:
         assert "not evaluated per principal" in passed[0]["Finding_Details"]
         assert "ECS task roles" in passed[0]["Finding_Details"]
 
+    # AGT-05: the inbound gate of an AgentCore runtime was not read, so a
+    # runtime any JWT holder can invoke passed the handoff row.
+    RUNTIME = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
+
+    def _gate_run(self, gates=(), policies=None, gate_errors=()):
+        inventory = self._inventory({"agent-a": ["AgentCore runtime 'rt-1' version 1"]})
+        inventory["runtime_gates"] = [
+            {"label": label, "authorizer": authorizer} for label, authorizer in gates
+        ]
+        inventory["runtime_policies"] = dict(policies or {})
+        inventory["gate_errors"] = list(gate_errors)
+        _, rows, _ = self._run(self._cache({"agent-a": _identity()}), inventory, {})
+        return rows
+
+    @staticmethod
+    def _jwt(**bounds):
+        return {
+            "customJWTAuthorizer": {
+                "discoveryUrl": "https://idp.example.com/.well-known/openid-configuration",
+                **bounds,
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "bound",
+        [
+            {"allowedAudience": ["agents"]},
+            {"allowedClients": ["client-1"]},
+            {"allowedScopes": ["invoke"]},
+            {"customClaims": [{"inboundTokenClaimName": "team"}]},
+        ],
+    )
+    def test_a_runtime_any_jwt_holder_can_invoke_fails(self, bound):
+        rows = self._gate_run(
+            gates=[
+                ("AgentCore runtime 'open' version 1", self._jwt(allowedClients=[])),
+                ("AgentCore runtime 'bound' version 1", self._jwt(**bound)),
+                ("AgentCore runtime 'iam' version 1", None),
+            ]
+        )
+        assert [row["Status"] for row in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "AgentCore runtime 'open' version 1 accepts every token its JWT issuer "
+            "https://idp.example.com/.well-known/openid-configuration signs"
+        ) in details
+        assert "'bound'" not in details and "'iam'" not in details
+
+    def test_bounded_jwt_runtimes_pass_and_say_so(self):
+        rows = self._gate_run(
+            gates=[
+                ("AgentCore runtime 'a' version 1", self._jwt(allowedAudience=["x"])),
+                ("AgentCore runtime 'b' version 2", None),
+            ],
+            policies={self.RUNTIME: None},
+        )
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "2 AgentCore runtime version(s) were read, and none has a JWT "
+            "authorizer that accepts every token its issuer signs; 0 runtime and "
+            "endpoint resource polic(ies) were read"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement, status",
+        [
+            (
+                {"Principal": "*", "Action": "bedrock-agentcore:InvokeAgentRuntime"},
+                "Failed",
+            ),
+            (
+                {"Principal": {"AWS": "*"}, "Action": "bedrock-agentcore:Invoke*"},
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                    "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Condition": {
+                        "StringEquals": {"aws:PrincipalAccount": "999999999999"}
+                    },
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Condition": {
+                        "StringEqualsIfExists": {"aws:PrincipalAccount": "123456789012"}
+                    },
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": {"AWS": "arn:aws:iam::999999999999:root"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Condition": {
+                        "StringEquals": {"aws:PrincipalAccount": "123456789012"}
+                    },
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:role/caller"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                },
+                "Passed",
+            ),
+            ({"Principal": "*", "Action": "bedrock-agentcore:GetAgentCard"}, "Passed"),
+        ],
+    )
+    def test_runtime_resource_policies_are_judged_by_value(self, statement, status):
+        endpoint = f"{self.RUNTIME}/runtime-endpoint/live"
+        rows = self._gate_run(
+            gates=[("AgentCore runtime 'rt-1' version 1", None)],
+            policies={
+                self.RUNTIME: _policy(
+                    {
+                        "Sid": "own",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    }
+                ),
+                endpoint: _policy({"Sid": "probe", "Effect": "Allow", **statement}),
+            },
+        )
+        assert [row["Status"] for row in rows] == [status]
+        if status == "Failed":
+            assert (
+                f"the resource policy of {endpoint} statement 'probe' lets"
+                in rows[0]["Finding_Details"]
+            )
+        else:
+            assert (
+                "2 runtime and endpoint resource polic(ies) were read"
+                in rows[0]["Finding_Details"]
+            )
+
+    def test_an_unread_runtime_policy_withholds_the_pass(self):
+        rows = self._gate_run(
+            gates=[("AgentCore runtime 'rt-1' version 1", None)],
+            gate_errors=[
+                f"the resource policy of {self.RUNTIME} was not read with "
+                "bedrock-agentcore:GetResourcePolicy (AccessDeniedException)"
+            ],
+        )
+        assert [row["Status"] for row in rows] == ["N/A", "N/A"]
+        assert "bedrock-agentcore:GetResourcePolicy" in rows[1]["Finding_Details"]
+
     @pytest.mark.parametrize(
         "condition",
         [
@@ -37989,7 +38235,14 @@ class TestBR57AgentRoleInventory:
             f"arn:aws:bedrock:us-east-1:{cls.ACCOUNT}:agent-alias/{agent_id}/{alias_id}"
         )
 
-    def _run(self, agents, runtimes=None, runtime_error=None, collaborators=None):
+    def _run(
+        self,
+        agents,
+        runtimes=None,
+        runtime_error=None,
+        collaborators=None,
+        policies=None,
+    ):
         """agents: id -> {"name", "versions": {v: (role, collab)}, "aliases": {id: [v]}}"""
         agent = MagicMock()
         agent.list_agents.return_value = {
@@ -38060,6 +38313,7 @@ class TestBR57AgentRoleInventory:
                         "agentRuntimeId": runtime_id,
                         "agentRuntimeName": runtime_id,
                         "agentRuntimeVersion": spec["latest"],
+                        "agentRuntimeArn": spec.get("arn"),
                     }
                     for runtime_id, spec in runtimes.items()
                 ]
@@ -38069,9 +38323,24 @@ class TestBR57AgentRoleInventory:
         }
         control.get_agent_runtime.side_effect = (
             lambda agentRuntimeId, agentRuntimeVersion: {
-                "roleArn": runtimes[agentRuntimeId]["roles"][agentRuntimeVersion]
+                "roleArn": runtimes[agentRuntimeId]["roles"][agentRuntimeVersion],
+                "authorizerConfiguration": runtimes[agentRuntimeId]
+                .get("authorizers", {})
+                .get(agentRuntimeVersion),
             }
         )
+
+        def get_resource_policy(resourceArn):
+            outcome = (policies or {}).get(resourceArn)
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome is None:
+                raise _client_error(
+                    "ResourceNotFoundException", "none", "GetResourcePolicy"
+                )
+            return {"policy": json.dumps(outcome)}
+
+        control.get_resource_policy.side_effect = get_resource_policy
 
         def client(service, **kwargs):
             return {"bedrock-agent": agent, "bedrock-agentcore-control": control}[
@@ -38128,6 +38397,46 @@ class TestBR57AgentRoleInventory:
             any_order=True,
         )
         assert agent.get_agent_version.call_count == 2
+
+    def test_runtime_authorizers_and_every_resource_policy_are_read(self):
+        runtime = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt1"
+        live = f"{runtime}/runtime-endpoint/live"
+        dev = f"{runtime}/runtime-endpoint/dev"
+        jwt = {"customJWTAuthorizer": {"discoveryUrl": "https://idp/x"}}
+        inventory, _, control = self._run(
+            {},
+            runtimes={
+                "rt1": {
+                    "latest": "2",
+                    "arn": runtime,
+                    "endpoints": [
+                        {"liveVersion": "1", "agentRuntimeEndpointArn": live},
+                        {"liveVersion": "2", "agentRuntimeEndpointArn": dev},
+                    ],
+                    "roles": {"1": self._role("rt"), "2": self._role("rt")},
+                    "authorizers": {"2": jwt},
+                }
+            },
+            policies={
+                live: {"Statement": []},
+                dev: _client_error(
+                    "AccessDeniedException", "denied", "GetResourcePolicy"
+                ),
+            },
+        )
+        assert inventory["runtime_gates"] == [
+            {"label": "AgentCore runtime 'rt1' version 1", "authorizer": None},
+            {"label": "AgentCore runtime 'rt1' version 2", "authorizer": jwt},
+        ]
+        assert inventory["runtime_policies"] == {
+            runtime: None,
+            live: {"Statement": []},
+        }
+        assert inventory["gate_errors"] == [
+            f"the resource policy of {dev} was not read with "
+            "bedrock-agentcore:GetResourcePolicy (AccessDeniedException)"
+        ]
+        assert not inventory["errors"]
 
     def test_collaborators_resolve_to_alias_version_roles(self):
         inventory, agent, _ = self._run(

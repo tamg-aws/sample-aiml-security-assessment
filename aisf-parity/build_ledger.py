@@ -294,7 +294,10 @@ AI_SUBJECT_ROWS = [
         "its prompt inline, which no version pins. The flow leg runs even with no prompt "
         "in the Region. A role or user allowed bedrock:UpdatePrompt, "
         "bedrock:CreatePromptVersion or bedrock:DeletePrompt on a Resource with a wildcard "
-        "fails, and so does one that holds one of them beside bedrock:RenderPrompt. A version != DRAFT test "
+        "fails, and so does one that holds one of them beside bedrock:RenderPrompt. "
+        "bedrock:CreatePrompt has no resource type, so every holder is named in the row, "
+        "and one that also holds bedrock:RenderPrompt fails. Whether a Converse call "
+        "names a prompt ARN as its modelId is not read from CloudTrail. A version != DRAFT test "
         "on bare ListPrompts or on a GetPrompt with no promptVersion would have failed "
         "every prompt in every account, because both return the draft. Partial, ceiling "
         "reached: a prompt held in application code has no AWS record, and no AWS field "
@@ -2414,12 +2417,19 @@ FOUNDATION_ROWS = [
         "own identity policy allows sts:AssumeRole on the target, and a boundary "
         "that allows sts:AssumeRole nowhere removes it. An edge passes only on a "
         "positive string test of sts:SourceIdentity with no wildcard value, no "
-        "IfExists form and no ForAllValues: prefix. An unread agent, runtime, "
-        "collaborator alias, trust policy or cached principal reports N/A, never "
+        "IfExists form and no ForAllValues: prefix. Each runtime's inbound gate is "
+        "read: a version whose authorizerConfiguration customJWTAuthorizer names no "
+        "allowedAudience, allowedClients, allowedScopes or customClaims fails, and "
+        "GetResourcePolicy is read on the runtime and every endpoint, failing an "
+        "Allow on an invoke action to every principal with no condition naming the "
+        "runtime's account or an organization, or to another account's principals. "
+        "An unread agent, runtime, "
+        "collaborator alias, trust policy, runtime resource policy or cached "
+        "principal reports N/A, never "
         "Passed. Partial, ceiling reached: no AWS API marks which ECS task or "
-        "Lambda execution roles host an agent, GetAgentRuntime returns no field "
-        "for a runtime session's token scope, and a role in another account that "
-        "trusts an agent role is not read",
+        "Lambda execution roles host an agent, a JWT authorizer names the tokens a "
+        "runtime accepts and not which agent presented one, and a role in another "
+        "account that trusts an agent role is not read",
         [],
         6,
     ),

@@ -893,6 +893,57 @@ MUTATIONS = [
         "replace": "                    if False:\n",
     },
     {
+        "name": "BR-07 reads no CreatePrompt holder",
+        "file": BEDROCK,
+        "defect": "BR-07 never lists the holders of bedrock:CreatePrompt, which has "
+        "no resource type, so who can add prompts to the catalog goes unreported",
+        "find": "            if creates:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-07 lets a prompt creator render prompts",
+        "file": BEDROCK,
+        "defect": "BR-07 passes a runtime role that holds bedrock:RenderPrompt and "
+        "bedrock:CreatePrompt, so a runtime caller can add a prompt to the catalog",
+        "find": "                    creating_renderers.append(f\"{kind} '{name}'\")\n",
+        "replace": "                    pass\n",
+    },
+    {
+        "name": "BR-57 reads no runtime JWT authorizer",
+        "file": BEDROCK,
+        "defect": "BR-57 passes an AgentCore runtime whose JWT authorizer names no audience, client, scope or claim, so any token its issuer signs invokes it",
+        "find": "        if jwt is not None and not any(jwt.get(field) for field in RUNTIME_JWT_BOUNDS):\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-57 credits any account bound on an open runtime policy",
+        "file": BEDROCK,
+        "defect": "BR-57 passes a runtime resource policy open to every principal under a condition naming another account",
+        "find": '                    accounts is not None and accounts <= {account, "org"}\n',
+        "replace": "                    accounts is not None\n",
+    },
+    {
+        "name": "BR-57 ignores a runtime policy grant to another account",
+        "file": BEDROCK,
+        "defect": "BR-57 passes a runtime resource policy that lets another account's principals invoke it",
+        "find": '            if foreign:\n                failures.append(\n                    f"{label} lets principals of account(s)',
+        "replace": '            if False:\n                failures.append(\n                    f"{label} lets principals of account(s)',
+    },
+    {
+        "name": "BR-57 passes beside an unread runtime policy",
+        "file": BEDROCK,
+        "defect": "BR-57 reports Passed while a runtime or endpoint resource policy was not read",
+        "find": '        unread += inventory.get("gate_errors") or []\n',
+        "replace": "        pass\n",
+    },
+    {
+        "name": "BR-57 reads no runtime endpoint policy",
+        "file": BEDROCK,
+        "defect": "BR-57 reads the runtime's resource policy only, so an endpoint policy open to every principal goes unread",
+        "find": '        targets = [runtime.get("agentRuntimeArn")] + [\n',
+        "replace": '        targets = [runtime.get("agentRuntimeArn")] + 0 * [\n',
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2626,6 +2677,19 @@ GROUPS: dict[str, str] = {
     "BR-20 reads Data Catalog partitions past its page cap": (
         "in the Bedrock knowledge base stores"
     ),
+    "BR-07 reads no CreatePrompt holder": ("in the Bedrock prompt creators"),
+    "BR-07 lets a prompt creator render prompts": ("in the Bedrock prompt creators"),
+    "BR-57 reads no runtime JWT authorizer": ("in the Bedrock runtime inbound gate"),
+    "BR-57 credits any account bound on an open runtime policy": (
+        "in the Bedrock runtime inbound gate"
+    ),
+    "BR-57 ignores a runtime policy grant to another account": (
+        "in the Bedrock runtime inbound gate"
+    ),
+    "BR-57 passes beside an unread runtime policy": (
+        "in the Bedrock runtime inbound gate"
+    ),
+    "BR-57 reads no runtime endpoint policy": ("in the Bedrock runtime inbound gate"),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

@@ -7035,6 +7035,10 @@ PROMPT_WRITE_ACTIONS = (
 
 PROMPT_RENDER_ACTION = "bedrock:renderprompt"
 
+# The service authorization reference gives CreatePrompt no resource type, so
+# no Resource ARN bounds it and its holders are reported by name.
+PROMPT_CREATE_ACTION = "bedrock:createprompt"
+
 PROMPT_WRITE_SCOPE_FINDING = "Bedrock Prompt Change Permission Scope"
 
 
@@ -7070,6 +7074,8 @@ def _prompt_write_scope_findings(
     unbounded = []
     scoped = []
     renderers = []
+    creators = []
+    creating_renderers = []
     for collection, kind in (
         ("role_permissions", "role"),
         ("user_permissions", "user"),
@@ -7101,12 +7107,26 @@ def _prompt_write_scope_findings(
                     ]
                     if wide:
                         gaps.append(f"{action} on {', '.join(wide)}")
+            creates = (
+                _boundary_allowance(permissions, PROMPT_CREATE_ACTION) != "denied"
+                and not any(
+                    _merged_account_wide_deny(st, PROMPT_CREATE_ACTION)
+                    for st in statements
+                )
+                and any(
+                    str(st.get("Effect", "")).upper() == "ALLOW"
+                    and _merged_statement_matches(st, PROMPT_CREATE_ACTION)
+                    for st in statements
+                )
+            )
+            if creates:
+                creators.append(f"{kind} '{name}'")
             if gaps:
                 unbounded.append(f"{kind} '{name}' ({'; '.join(sorted(set(gaps)))})")
             elif granted:
                 scoped.append(f"{kind} '{name}'")
             if (
-                granted
+                (granted or creates)
                 and _boundary_allowance(permissions, PROMPT_RENDER_ACTION) != "denied"
                 and not any(
                     _merged_account_wide_deny(st, PROMPT_RENDER_ACTION)
@@ -7118,10 +7138,21 @@ def _prompt_write_scope_findings(
                     for st in statements
                 )
             ):
-                renderers.append(f"{kind} '{name}'")
+                if granted:
+                    renderers.append(f"{kind} '{name}'")
+                else:
+                    creating_renderers.append(f"{kind} '{name}'")
 
+    creator_note = (
+        "{} role(s) or user(s) may create prompts with bedrock:CreatePrompt, which "
+        "has no resource type, so no Resource ARN bounds it: {}.".format(
+            len(creators), "; ".join(creators)
+        )
+        if creators
+        else "No role or user may call bedrock:CreatePrompt."
+    )
     findings: Dict[str, Any] = {"status": "PASS", "csv_data": []}
-    if unbounded or renderers:
+    if unbounded or renderers or creating_renderers:
         details = []
         if unbounded:
             details.append(
@@ -7139,13 +7170,22 @@ def _prompt_write_scope_findings(
                     len(renderers), "; ".join(renderers[:MAX_REPORTED_PROMPTS])
                 )
             )
+        if creating_renderers:
+            details.append(
+                "{} role(s) or user(s) may both render prompts "
+                "(bedrock:RenderPrompt) and create them (bedrock:CreatePrompt): {}. "
+                "A runtime caller can then add a prompt to the catalog.".format(
+                    len(creating_renderers), "; ".join(creating_renderers)
+                )
+            )
+        details.append(creator_note)
         details.append(SCP_NOT_EVALUATED_NOTE)
         findings["csv_data"].append(
             create_finding(
                 check_id="BR-07",
                 finding_name=PROMPT_WRITE_SCOPE_FINDING,
                 finding_details=" ".join(details),
-                resolution="Scope bedrock:UpdatePrompt, bedrock:CreatePromptVersion and bedrock:DeletePrompt to the ARNs of the prompts each principal owns, with no wildcard in any segment, and grant them to principals that do not also hold bedrock:RenderPrompt.",
+                resolution="Scope bedrock:UpdatePrompt, bedrock:CreatePromptVersion and bedrock:DeletePrompt to the ARNs of the prompts each principal owns, with no wildcard in any segment, and grant them and bedrock:CreatePrompt only to release principals that do not also hold bedrock:RenderPrompt.",
                 reference=PROMPT_MANAGEMENT_REFERENCE,
                 severity="Medium",
                 status="Failed",
@@ -7160,10 +7200,14 @@ def _prompt_write_scope_findings(
                 finding_details=(
                     "{} role(s) or user(s) may change, version or delete prompts, "
                     "each such grant names prompt ARNs with no wildcard, and none "
-                    "of them may also call bedrock:RenderPrompt{}.".format(
+                    "of them may also call bedrock:RenderPrompt{}. {}{}".format(
                         len(scoped),
                         ": " + "; ".join(scoped[:MAX_REPORTED_PROMPTS])
                         if scoped
+                        else "",
+                        creator_note,
+                        " None of them may also call bedrock:RenderPrompt."
+                        if creators
                         else "",
                     )
                 ),
@@ -34159,9 +34203,10 @@ AGENT_HANDOFF_CEILING = (
     "Agent roles are the Bedrock agent roles (GetAgent and GetAgentVersion "
     "agentResourceRoleArn) and the AgentCore runtime roles (GetAgentRuntime "
     "roleArn) of this Region. No AWS API marks which ECS task roles, Lambda "
-    "execution roles or other roles host an agent, and GetAgentRuntime returns no "
-    "field for the scope of a runtime session's token, so neither is read; a role "
-    "in another account that trusts an agent role is not read either."
+    "execution roles or other roles host an agent, so they are not read. A "
+    "runtime's JWT authorizer names the tokens it accepts, not which agent "
+    "presented one, so a JWT caller's identity is not read; a role in another "
+    "account that trusts an agent role is not read either."
 )
 
 # Condition keys that bind the caller's source identity into an AssumeRole
@@ -34305,6 +34350,9 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
     holds one entry per collaborator of each supervisor version, with the roles
     of both sides. ``errors`` names every agent or runtime that was not read, and
     ``runtime_error`` is set when AgentCore runtimes could not be listed.
+    ``runtime_gates`` holds each runtime version's authorizerConfiguration, and
+    ``runtime_policies`` the resource policy of each runtime and endpoint ARN
+    (None when it has none), with ``gate_errors`` naming each one not read.
     """
     inventory = {
         "roles": {},
@@ -34313,6 +34361,9 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
         "runtime_error": None,
         "agent_count": 0,
         "runtime_count": 0,
+        "runtime_gates": [],
+        "runtime_policies": {},
+        "gate_errors": [],
     }
 
     def add_role(role_arn, label):
@@ -34474,13 +34525,146 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
                     detail.get("roleArn"),
                     f"AgentCore runtime '{name}' version {version}",
                 )
+                inventory["runtime_gates"].append(
+                    {
+                        "label": f"AgentCore runtime '{name}' version {version}",
+                        "authorizer": detail.get("authorizerConfiguration"),
+                    }
+                )
         except (ClientError, BotoCoreError, TypeError) as error:
             inventory["errors"].append(
                 f"AgentCore runtime '{name}' was not read with "
                 "bedrock-agentcore:ListAgentRuntimeEndpoints and "
                 f"bedrock-agentcore:GetAgentRuntime ({get_assessment_error_label(error)})"
             )
+            continue
+        targets = [runtime.get("agentRuntimeArn")] + [
+            endpoint.get("agentRuntimeEndpointArn") for endpoint in endpoints
+        ]
+        for arn in targets:
+            if not arn:
+                inventory["gate_errors"].append(
+                    f"a runtime or endpoint ARN of AgentCore runtime '{name}' was not "
+                    "returned, so its resource policy was not read"
+                )
+                continue
+            try:
+                policy = runtime_client.get_resource_policy(resourceArn=arn).get(
+                    "policy"
+                )
+                inventory["runtime_policies"][arn] = (
+                    json.loads(policy) if policy else None
+                )
+            except ClientError as error:
+                if (
+                    error.response.get("Error", {}).get("Code")
+                    == "ResourceNotFoundException"
+                ):
+                    inventory["runtime_policies"][arn] = None
+                else:
+                    inventory["gate_errors"].append(
+                        f"the resource policy of {arn} was not read with "
+                        "bedrock-agentcore:GetResourcePolicy "
+                        f"({get_assessment_error_label(error)})"
+                    )
+            except (BotoCoreError, ValueError, TypeError) as error:
+                inventory["gate_errors"].append(
+                    f"the resource policy of {arn} was not read with "
+                    "bedrock-agentcore:GetResourcePolicy "
+                    f"({get_assessment_error_label(error)})"
+                )
     return inventory
+
+
+# The actions the service authorization reference gives the runtime and
+# runtime-endpoint resource types that start a call into the agent.
+RUNTIME_INVOKE_ACTIONS = (
+    "bedrock-agentcore:invokeagentruntime",
+    "bedrock-agentcore:invokeagentruntimeforuser",
+    "bedrock-agentcore:invokeagentruntimecommand",
+    "bedrock-agentcore:invokeagentruntimecommandshell",
+    "bedrock-agentcore:invokeagentruntimewithwebsocketstream",
+    "bedrock-agentcore:invokeagentruntimewithwebsocketstreamforuser",
+)
+
+RUNTIME_JWT_BOUNDS = (
+    "allowedAudience",
+    "allowedClients",
+    "allowedScopes",
+    "customClaims",
+)
+
+
+def _runtime_inbound_gate_failures(inventory: Dict[str, Any]) -> List[str]:
+    """
+    Name each AgentCore runtime that any caller of a broad class can invoke: a
+    JWT authorizer that names no allowed audience, client, scope or custom claim
+    accepts every token its issuer signs, and a resource policy Allow on an
+    invoke action reaches every principal, unless a condition limits it to the
+    runtime's own account or organization, or another account's principals.
+    """
+    failures = []
+    for gate in inventory.get("runtime_gates") or []:
+        jwt = (gate.get("authorizer") or {}).get("customJWTAuthorizer")
+        if jwt is not None and not any(jwt.get(field) for field in RUNTIME_JWT_BOUNDS):
+            failures.append(
+                "{} accepts every token its JWT issuer {} signs, because its "
+                "authorizer names no allowed audience, client, scope or custom "
+                "claim, so any holder of such a token can invoke it".format(
+                    gate["label"], jwt.get("discoveryUrl") or "(no discovery URL)"
+                )
+            )
+    for arn, document in sorted((inventory.get("runtime_policies") or {}).items()):
+        account = (str(arn).split(":") + [""] * 5)[4]
+        for index, statement in enumerate(_policy_statements(document or {}), 1):
+            if str(statement.get("Effect", "")).upper() != "ALLOW" or not any(
+                _statement_matches_action(statement, action)
+                for action in RUNTIME_INVOKE_ACTIONS
+            ):
+                continue
+            label = "the resource policy of {} statement '{}'".format(
+                arn, statement.get("Sid") or f"statement {index}"
+            )
+            if _deny_principal_reach(statement)["all_principals"] or (
+                "NotPrincipal" in statement
+            ):
+                tests = _condition_keys_by_operator(statement)
+                if not any(
+                    accounts is not None and accounts <= {account, "org"}
+                    for operator, key, values in tests
+                    for accounts in [
+                        _bounding_condition_accounts(operator, key, values)
+                    ]
+                ):
+                    failures.append(
+                        f"{label} lets every principal invoke the runtime, with no "
+                        f"condition that limits it to account {account} or its "
+                        "organization"
+                    )
+                continue
+            principal = statement.get("Principal")
+            foreign = sorted(
+                {
+                    owner
+                    for value in _as_list(
+                        principal.get("AWS") if isinstance(principal, dict) else None
+                    )
+                    for text in [str(value)]
+                    for owner in [
+                        (text.split(":") + [""] * 5)[4]
+                        if text.startswith("arn:")
+                        else text
+                    ]
+                    if LAMBDA_ACCOUNT_ID_PATTERN.fullmatch(owner) and owner != account
+                }
+            )
+            if foreign:
+                failures.append(
+                    f"{label} lets principals of account(s) {', '.join(foreign)} "
+                    "invoke the runtime, so that account's IAM policies decide which "
+                    "of its agents hand off to it"
+                )
+    return failures
 
 
 def check_agent_handoff_source_identity(
@@ -34585,6 +34769,9 @@ def check_agent_handoff_source_identity(
                     role_arn, len(agents), ", ".join(agents)
                 )
             )
+
+        failures += _runtime_inbound_gate_failures(inventory)
+        unread += inventory.get("gate_errors") or []
 
         role_cache = (permission_cache or {}).get("role_permissions") or {}
         edges = []
@@ -34714,6 +34901,20 @@ def check_agent_handoff_source_identity(
                         1
                         for pair in inventory["collaborations"]
                         if pair["collaborator_roles"] is not None
+                    ),
+                )
+                + " {} AgentCore runtime version(s) were read, and none has a JWT "
+                "authorizer that accepts every token its issuer signs; {} "
+                "runtime and endpoint resource polic(ies) were read, and none lets "
+                "every principal, or another account's principals, invoke a "
+                "runtime.".format(
+                    len(inventory.get("runtime_gates") or []),
+                    sum(
+                        1
+                        for document in (
+                            inventory.get("runtime_policies") or {}
+                        ).values()
+                        if document is not None
                     ),
                 )
                 + " "
