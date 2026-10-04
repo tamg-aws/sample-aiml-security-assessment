@@ -9503,6 +9503,323 @@ def _invocation_log_group_encryption_rows(
     ]
 
 
+INVOCATION_LOG_ARCHIVE_FINDING = "Bedrock Invocation Log WORM Archive"
+
+INVOCATION_LOG_ARCHIVE_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/SubscriptionFilters.html"
+)
+
+INVOCATION_LOG_ARCHIVE_RESOLUTION = (
+    "Forward the invocation log group with a subscription filter that has an "
+    "empty filter pattern to a Firehose stream delivering to an S3 bucket in a "
+    "separate Log Archive account, and give every invocation log bucket Object "
+    "Lock default retention in COMPLIANCE mode."
+)
+
+
+def _invocation_log_bucket_lock(
+    s3_client, bucket: str, lock_cache: Dict[str, Tuple[str, Any]]
+) -> Tuple[str, str]:
+    """
+    Judge one bucket's Object Lock default retention: ("ok", text), ("bad",
+    text) or ("unread", text). Only COMPLIANCE mode holds against a principal
+    with s3:BypassGovernanceRetention.
+    """
+    if bucket not in lock_cache:
+        try:
+            lock_cache[bucket] = (
+                "read",
+                s3_client.get_object_lock_configuration(Bucket=bucket).get(
+                    "ObjectLockConfiguration"
+                )
+                or {},
+            )
+        except ClientError as error:
+            if (
+                error.response["Error"]["Code"]
+                == "ObjectLockConfigurationNotFoundError"
+            ):
+                lock_cache[bucket] = ("read", {})
+            else:
+                lock_cache[bucket] = ("error", get_assessment_error_label(error))
+        except BotoCoreError as error:
+            lock_cache[bucket] = ("error", get_assessment_error_label(error))
+    state, value = lock_cache[bucket]
+    if state == "error":
+        return "unread", (
+            f"s3:GetBucketObjectLockConfiguration on bucket '{bucket}' ({value})"
+        )
+    if value.get("ObjectLockEnabled") != "Enabled":
+        return "bad", f"bucket '{bucket}', which has Object Lock off"
+    retention = (value.get("Rule") or {}).get("DefaultRetention") or {}
+    mode = retention.get("Mode")
+    if not mode:
+        return "bad", (
+            f"bucket '{bucket}', which has Object Lock on and no default "
+            "retention, so the objects written to it are not locked"
+        )
+    if mode != "COMPLIANCE":
+        return "bad", (
+            f"bucket '{bucket}', whose default retention is {mode} mode, which a "
+            "principal with s3:BypassGovernanceRetention can override"
+        )
+    period = (
+        f"{retention['Days']} day(s)"
+        if retention.get("Days")
+        else f"{retention.get('Years')} year(s)"
+    )
+    return "ok", (
+        f"bucket '{bucket}', whose default retention is COMPLIANCE mode for {period}"
+    )
+
+
+def _invocation_log_subscription_archive(
+    subscription: Dict[str, Any],
+    account: str,
+    s3_client,
+    lock_cache: Dict[str, Tuple[str, Any]],
+) -> Tuple[str, str]:
+    """
+    Follow one subscription filter on the invocation log group to its archive:
+    ("ok", text), ("bad", text) or ("unread", text). A filter pattern, field
+    selection criteria or a filter on transformed logs forwards less than every
+    ingested event. Only a Firehose stream of this account is followed to its
+    S3 destination, and a Lambda record processor on it can drop or rewrite
+    records. Another destination or another account's stream is not followed.
+    """
+    label = f"subscription filter '{subscription.get('filterName') or '?'}'"
+    pattern = str(subscription.get("filterPattern") or "").strip()
+    if pattern:
+        return "bad", (
+            f"{label} forwards only the events its filter pattern '{pattern}' matches"
+        )
+    if str(subscription.get("fieldSelectionCriteria") or "").strip():
+        return "bad", (
+            f"{label} forwards only the events its field selection criteria "
+            f"'{subscription['fieldSelectionCriteria']}' select"
+        )
+    if subscription.get("applyOnTransformedLogs") is True:
+        return "bad", (
+            f"{label} applies to the transformed log events, so the archive holds "
+            "the transformer's output and not the events as ingested"
+        )
+    destination = str(subscription.get("destinationArn") or "")
+    parts = destination.split(":", 5)
+    if (
+        len(parts) != 6
+        or parts[2] != "firehose"
+        or not parts[5].startswith("deliverystream/")
+    ):
+        return "unread", (
+            f"{label} sends to {destination or 'no destination'}, which this "
+            "check does not follow to an archive bucket"
+        )
+    if parts[4] != account:
+        return "unread", (
+            f"{label} sends to Firehose stream {destination} in account "
+            f"{parts[4]}, whose destination this account cannot read"
+        )
+    stream_name = parts[5].split("/", 1)[1]
+    try:
+        stream = boto3.client(
+            "firehose", config=boto3_config, region_name=parts[3]
+        ).describe_delivery_stream(DeliveryStreamName=stream_name)[
+            "DeliveryStreamDescription"
+        ]
+    except (ClientError, BotoCoreError, KeyError) as error:
+        return "unread", (
+            f"firehose:DescribeDeliveryStream on {destination} "
+            f"({get_assessment_error_label(error)})"
+        )
+    stream_label = f"{label} to Firehose stream '{stream_name}'"
+    status = stream.get("DeliveryStreamStatus")
+    if status != "ACTIVE":
+        return "bad", f"{stream_label} is {status or 'of unknown status'}"
+    verdicts: List[Tuple[str, str]] = []
+    for target in stream.get("Destinations") or []:
+        s3_target = target.get("ExtendedS3DestinationDescription") or target.get(
+            "S3DestinationDescription"
+        )
+        if not s3_target:
+            kinds = [key for key in target if key.endswith("DestinationDescription")]
+            verdicts.append(
+                (
+                    "bad",
+                    f"{stream_label} delivers to "
+                    f"{kinds[0] if kinds else 'a destination'} and not to S3",
+                )
+            )
+            continue
+        processing = s3_target.get("ProcessingConfiguration") or {}
+        if processing.get("Enabled") is True and any(
+            processor.get("Type") == "Lambda"
+            for processor in processing.get("Processors") or []
+        ):
+            verdicts.append(
+                (
+                    "bad",
+                    f"{stream_label} runs a Lambda record processor, which can "
+                    "drop or rewrite records before the bucket holds them",
+                )
+            )
+            continue
+        bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
+        state, text = _invocation_log_bucket_lock(s3_client, bucket, lock_cache)
+        verdicts.append((state, f"{stream_label}, which delivers to {text}"))
+    if not verdicts:
+        return "bad", f"{stream_label} reports no destination"
+    for wanted in ("ok", "unread"):
+        for state, text in verdicts:
+            if state == wanted:
+                return state, text
+    return verdicts[0]
+
+
+def _invocation_log_archive_findings(
+    log_group_name: Optional[str],
+    buckets: List[str],
+    s3_client,
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    AIR-FND-DET-09 archive leg for BR-12: each invocation log destination holds
+    a WORM copy. Log events in CloudWatch Logs have no WORM storage of their
+    own, so the log group must be forwarded by a subscription filter through
+    Firehose to a bucket with Object Lock in COMPLIANCE mode; an S3 destination
+    is itself judged on its Object Lock default retention. Whether a bucket is
+    in a separate Log Archive account is not read.
+    """
+
+    def row(details: str, resolution: str, severity: str, status: str):
+        return create_finding(
+            check_id="BR-12",
+            finding_name=INVOCATION_LOG_ARCHIVE_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=INVOCATION_LOG_ARCHIVE_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    lock_cache: Dict[str, Tuple[str, Any]] = {}
+    rows = []
+    for bucket in buckets:
+        state, text = _invocation_log_bucket_lock(s3_client, bucket, lock_cache)
+        if state == "ok":
+            rows.append(
+                row(
+                    f"Invocation log {text}, so the records written to it cannot be "
+                    "deleted or overwritten until it expires. Whether the bucket "
+                    "is in a separate Log Archive account is not read.",
+                    "No action required",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        elif state == "unread":
+            rows.append(
+                row(
+                    f"Object Lock on the invocation log bucket was not read: {text}.",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        else:
+            rows.append(
+                row(
+                    f"Invocation log records are written to {text}, so they have "
+                    "no WORM copy there.",
+                    INVOCATION_LOG_ARCHIVE_RESOLUTION,
+                    "Medium",
+                    "Failed",
+                )
+            )
+    if not log_group_name:
+        return rows
+    try:
+        account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+        subscriptions = _list_all_items(
+            boto3.client("logs", config=boto3_config, region_name=region),
+            "describe_subscription_filters",
+            "subscriptionFilters",
+            max_results_param=None,
+            logGroupName=log_group_name,
+        )
+    except (ClientError, BotoCoreError, TypeError, KeyError) as error:
+        rows.append(
+            row(
+                f"The subscription filters of invocation log group "
+                f"'{log_group_name}' were not read "
+                f"({get_assessment_error_label(error)}), so whether it is forwarded "
+                "to a WORM archive is not known.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return rows
+    if not subscriptions:
+        rows.append(
+            row(
+                f"Invocation log group '{log_group_name}' has no subscription "
+                "filter, so its events are held only in a log group, with no WORM "
+                "copy.",
+                INVOCATION_LOG_ARCHIVE_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+        return rows
+    verdicts = [
+        _invocation_log_subscription_archive(
+            subscription, account, s3_client, lock_cache
+        )
+        for subscription in subscriptions
+    ]
+    passed = [text for state, text in verdicts if state == "ok"]
+    unread = [text for state, text in verdicts if state == "unread"]
+    failed = [text for state, text in verdicts if state == "bad"]
+    if passed:
+        rows.append(
+            row(
+                f"Invocation log group '{log_group_name}' forwards every event by "
+                f"{passed[0]}. Whether the bucket is in a separate Log Archive "
+                "account is not read.",
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        )
+    elif unread:
+        rows.append(
+            row(
+                f"No subscription filter of invocation log group '{log_group_name}' "
+                "was established to forward every event to an Object Lock bucket "
+                f"in COMPLIANCE mode: {'; '.join(unread + failed)}.",
+                "Confirm in the account that owns the destination that it delivers "
+                "every event to an S3 bucket with Object Lock default retention in "
+                "COMPLIANCE mode.",
+                "Informational",
+                "N/A",
+            )
+        )
+    else:
+        rows.append(
+            row(
+                f"Invocation log group '{log_group_name}' has no WORM copy: "
+                f"{'; '.join(failed)}.",
+                INVOCATION_LOG_ARCHIVE_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+    return rows
+
+
 def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
     """
     Check that every model invocation log destination is encrypted with an
@@ -9593,6 +9910,14 @@ def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
                 findings["status"] = "WARN"
 
             findings["csv_data"].extend(deletion_rows)
+            archive_rows = _invocation_log_archive_findings(
+                log_group_name, [name for name, _ in buckets], s3_client, region
+            )
+            if any(r["Status"] == "Failed" for r in archive_rows) and (
+                findings["status"] == "PASS"
+            ):
+                findings["status"] = "WARN"
+            findings["csv_data"].extend(archive_rows)
 
         except bedrock_client.exceptions.ValidationException:
             findings["csv_data"].append(

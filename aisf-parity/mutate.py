@@ -1189,6 +1189,62 @@ MUTATIONS = [
         "replace": 'next((fix for leg, fix in legs if leg["status"] == "Failed"), "")',
     },
     {
+        "name": "BR-12 credits a GOVERNANCE-mode invocation log bucket",
+        "file": BEDROCK,
+        "defect": "BR-12 accepts any Object Lock retention mode, so a GOVERNANCE bucket a privileged principal can override passes",
+        "find": '    if mode != "COMPLIANCE":\n',
+        "replace": '    if mode not in ("COMPLIANCE", "GOVERNANCE"):\n',
+    },
+    {
+        "name": "BR-12 credits a filter pattern on the invocation log group",
+        "file": BEDROCK,
+        "defect": "BR-12 ignores the subscription filter pattern, so a filter forwarding only ERROR events counts as the archive",
+        "find": '    pattern = str(subscription.get("filterPattern") or "").strip()\n',
+        "replace": '    pattern = ""\n',
+    },
+    {
+        "name": "BR-12 follows another account's Firehose stream",
+        "file": BEDROCK,
+        "defect": "BR-12 reads a Firehose stream in another account as this account's, so it judges a stream it cannot see",
+        "find": "    if parts[4] != account:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-12 credits a Firehose stream with a Lambda processor",
+        "file": BEDROCK,
+        "defect": "BR-12 ignores a Lambda record processor, which can drop or rewrite records before the bucket holds them",
+        "find": '        if processing.get("Enabled") is True and any(\n',
+        "replace": "        if False and any(\n",
+    },
+    {
+        "name": "BR-12 credits an inactive Firehose stream",
+        "file": BEDROCK,
+        "defect": "BR-12 accepts a stream that is not ACTIVE",
+        "find": '    if status != "ACTIVE":\n',
+        "replace": '    if status == "DELETING":\n',
+    },
+    {
+        "name": "BR-12 drops the invocation log archive rows",
+        "file": BEDROCK,
+        "defect": "BR-12 stops reporting the WORM archive leg",
+        "find": "            log_group_name, [name for name, _ in buckets], s3_client, region\n",
+        "replace": "            None, [], s3_client, region\n",
+    },
+    {
+        "name": "BR-12 credits a bucket with Object Lock off",
+        "file": BEDROCK,
+        "defect": "BR-12 reads the default retention without ObjectLockEnabled",
+        "find": '    if value.get("ObjectLockEnabled") != "Enabled":\n',
+        "replace": "    if not value:\n",
+    },
+    {
+        "name": "BR-12 credits a filter on transformed logs",
+        "file": BEDROCK,
+        "defect": "BR-12 credits a subscription filter applied on transformed logs as forwarding the ingested events",
+        "find": '    if subscription.get("applyOnTransformedLogs") is True:\n',
+        "replace": "    if False:\n",
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -3028,6 +3084,30 @@ GROUPS: dict[str, str] = {
         "in the Bedrock knowledge base stores"
     ),
     "BR-20 names only one Aurora fix": ("in the Bedrock knowledge base stores"),
+    "BR-12 credits a GOVERNANCE-mode invocation log bucket": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a filter pattern on the invocation log group": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 follows another account's Firehose stream": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a Firehose stream with a Lambda processor": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits an inactive Firehose stream": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 drops the invocation log archive rows": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a bucket with Object Lock off": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a filter on transformed logs": (
+        "in the Bedrock invocation log WORM archive"
+    ),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

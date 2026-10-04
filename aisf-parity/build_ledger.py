@@ -1938,7 +1938,11 @@ FOUNDATION_ROWS = [
         "a failed read is N/A naming it, so the cross-account Log Archive pattern "
         "the control prescribes reads N/A from the member account. Each trail "
         "recording the Region gets a row on its S3BucketName's Object Lock, judged "
-        "the same way, and an unread trail or bucket is N/A",
+        "the same way, and an unread trail or bucket is N/A. BR-12 applies the same "
+        "subscription-filter, Firehose and Object Lock test to the Bedrock "
+        "invocation log group, and judges each invocation log bucket on its own "
+        "Object Lock default retention; whether a bucket is in a separate Log "
+        "Archive account is not read",
         [],
         6,
     ),

@@ -7554,9 +7554,13 @@ class TestBR12InvocationLogEncryption:
             }
 
         mock_s3.get_bucket_encryption.side_effect = get_bucket_encryption
-        findings = extract_csv_data(
-            bedrock_app.check_bedrock_invocation_log_encryption(region="us-east-1")
-        )
+        findings = [
+            f
+            for f in extract_csv_data(
+                bedrock_app.check_bedrock_invocation_log_encryption(region="us-east-1")
+            )
+            if f["Finding"] != bedrock_app.INVOCATION_LOG_ARCHIVE_FINDING
+        ]
         plain = [f for f in findings if "'plain-bucket'" in f["Finding_Details"]]
         assert [f["Status"] for f in plain] == ["Failed"]
         assert (
@@ -7662,6 +7666,307 @@ class TestBedrockInferenceObserved:
         assert observed is None
 
 
+class TestBR12InvocationLogArchive:
+    """AIR-FND-DET-09: each invocation log destination holds a WORM copy."""
+
+    ACCOUNT = "123456789012"
+    STREAM = "arn:aws:firehose:us-east-1:123456789012:deliverystream/archive"
+
+    @staticmethod
+    def _lock(mode="COMPLIANCE", enabled="Enabled", days=365):
+        config = {"ObjectLockEnabled": enabled}
+        if mode:
+            config["Rule"] = {"DefaultRetention": {"Mode": mode, "Days": days}}
+        return {"ObjectLockConfiguration": config}
+
+    @staticmethod
+    def _stream(bucket="archive-bucket", status="ACTIVE", lambda_processor=False):
+        target = {"BucketARN": f"arn:aws:s3:::{bucket}"}
+        if lambda_processor:
+            target["ProcessingConfiguration"] = {
+                "Enabled": True,
+                "Processors": [{"Type": "Lambda"}],
+            }
+        return {
+            "DeliveryStreamDescription": {
+                "DeliveryStreamStatus": status,
+                "Destinations": [{"ExtendedS3DestinationDescription": target}],
+            }
+        }
+
+    def _run(
+        self, buckets=(), locks=None, log_group=None, filter_pages=None, stream=None
+    ):
+        """
+        ``locks`` maps a bucket to a GetObjectLockConfiguration response or an
+        error; ``filter_pages`` is the DescribeSubscriptionFilters pages or an
+        error.
+        """
+        locks = locks or {}
+        s3 = MagicMock()
+
+        def get_object_lock_configuration(Bucket):
+            value = locks[Bucket]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        s3.get_object_lock_configuration.side_effect = get_object_lock_configuration
+        logs = MagicMock()
+        pages = filter_pages if filter_pages is not None else [[]]
+
+        def describe_subscription_filters(logGroupName, nextToken=None):
+            if isinstance(pages, Exception):
+                raise pages
+            index = int(nextToken or 0)
+            response = {"subscriptionFilters": pages[index]}
+            if index + 1 < len(pages):
+                response["nextToken"] = str(index + 1)
+            return response
+
+        logs.describe_subscription_filters.side_effect = describe_subscription_filters
+        firehose = MagicMock()
+        if isinstance(stream, Exception):
+            firehose.describe_delivery_stream.side_effect = stream
+        else:
+            firehose.describe_delivery_stream.return_value = stream or self._stream()
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": self.ACCOUNT}
+        clients = {"logs": logs, "firehose": firehose, "sts": sts}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: clients[service],
+        ):
+            rows = bedrock_app._invocation_log_archive_findings(
+                log_group, list(buckets), s3, "us-east-1"
+            )
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-12"
+            assert row["Finding"] == "Bedrock Invocation Log WORM Archive"
+        self.firehose = firehose
+        return rows
+
+    def test_each_log_bucket_is_judged_by_its_default_retention(self):
+        rows = self._run(
+            buckets=["locked", "governance", "unlocked", "absent", "denied"],
+            locks={
+                "locked": self._lock(),
+                "governance": self._lock(mode="GOVERNANCE"),
+                "unlocked": self._lock(mode=None, enabled="Disabled"),
+                "absent": _make_client_error("ObjectLockConfigurationNotFoundError"),
+                "denied": _make_client_error("AccessDenied"),
+            },
+        )
+        assert [r["Status"] for r in rows] == [
+            "Passed",
+            "Failed",
+            "Failed",
+            "Failed",
+            "N/A",
+        ]
+        assert (
+            "bucket 'locked', whose default retention is COMPLIANCE mode for 365 day(s)"
+            in rows[0]["Finding_Details"]
+        )
+        assert "separate Log Archive account is not read" in rows[0]["Finding_Details"]
+        assert "GOVERNANCE mode" in rows[1]["Finding_Details"]
+        assert (
+            "bucket 'unlocked', which has Object Lock off" in rows[2]["Finding_Details"]
+        )
+        assert (
+            "bucket 'absent', which has Object Lock off" in rows[3]["Finding_Details"]
+        )
+        assert (
+            "s3:GetBucketObjectLockConfiguration on bucket 'denied'"
+            in rows[4]["Finding_Details"]
+        )
+
+    def test_a_locked_bucket_with_no_default_retention_fails(self):
+        rows = self._run(buckets=["b"], locks={"b": self._lock(mode=None)})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "no default retention" in rows[0]["Finding_Details"]
+
+    def test_a_full_filter_on_a_later_page_passes_beside_a_partial_one(self):
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=[
+                [
+                    {
+                        "filterName": "errors",
+                        "filterPattern": "ERROR",
+                        "destinationArn": self.STREAM,
+                    }
+                ],
+                [
+                    {
+                        "filterName": "all",
+                        "filterPattern": "",
+                        "destinationArn": self.STREAM,
+                    }
+                ],
+            ],
+            locks={"archive-bucket": self._lock()},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Invocation log group '/bedrock/invocations' forwards every event by "
+            "subscription filter 'all' to Firehose stream 'archive', which delivers "
+            "to bucket 'archive-bucket', whose default retention is COMPLIANCE mode"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "subscription, stream, locks, text",
+        [
+            (
+                {"filterPattern": "ERROR"},
+                None,
+                {"archive-bucket": None},
+                "forwards only the events its filter pattern 'ERROR' matches",
+            ),
+            (
+                {"fieldSelectionCriteria": "$.level = 'error'"},
+                None,
+                {"archive-bucket": None},
+                "field selection criteria",
+            ),
+            (
+                {"applyOnTransformedLogs": True},
+                None,
+                {"archive-bucket": None},
+                "applies to the transformed log events",
+            ),
+            (
+                {},
+                "lambda",
+                {"archive-bucket": None},
+                "runs a Lambda record processor",
+            ),
+            (
+                {},
+                "creating",
+                {"archive-bucket": None},
+                "Firehose stream 'archive' is CREATING",
+            ),
+            (
+                {},
+                None,
+                {"archive-bucket": "GOVERNANCE"},
+                "GOVERNANCE mode, which a principal with s3:BypassGovernanceRetention",
+            ),
+        ],
+        ids=[
+            "pattern",
+            "field-selection",
+            "transformed",
+            "lambda-processor",
+            "inactive-stream",
+            "governance-bucket",
+        ],
+    )
+    def test_a_partial_or_unlocked_forward_fails(
+        self, subscription, stream, locks, text
+    ):
+        stream_response = (
+            self._stream(lambda_processor=True)
+            if stream == "lambda"
+            else self._stream(status="CREATING")
+            if stream == "creating"
+            else self._stream()
+        )
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=[
+                [
+                    dict(
+                        {"filterName": "f", "destinationArn": self.STREAM},
+                        **subscription,
+                    )
+                ]
+            ],
+            stream=stream_response,
+            locks={
+                bucket: self._lock(mode=mode) if mode else self._lock()
+                for bucket, mode in locks.items()
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert text in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "destination, stream, text",
+        [
+            (
+                "arn:aws:firehose:us-east-1:999999999999:deliverystream/archive",
+                None,
+                "in account 999999999999, whose destination this account cannot read",
+            ),
+            (
+                "arn:aws:logs:us-east-1:999999999999:destination:central",
+                None,
+                "which this check does not follow to an archive bucket",
+            ),
+            (
+                "arn:aws:firehose:us-east-1:123456789012:deliverystream/archive",
+                ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                    "DescribeDeliveryStream",
+                ),
+                "firehose:DescribeDeliveryStream on",
+            ),
+        ],
+        ids=["other-account-stream", "logs-destination", "unread-stream"],
+    )
+    def test_an_unfollowed_forward_is_not_failed(self, destination, stream, text):
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=[[{"filterName": "f", "destinationArn": destination}]],
+            stream=stream,
+            locks={"archive-bucket": self._lock()},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert text in rows[0]["Finding_Details"]
+
+    def test_a_log_group_with_no_filter_fails_and_an_unread_list_is_na(self):
+        rows = self._run(log_group="/bedrock/invocations", filter_pages=[[]])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "has no subscription filter" in rows[0]["Finding_Details"]
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "were not read" in rows[0]["Finding_Details"]
+
+    def test_the_check_reports_the_archive_rows(self):
+        bedrock = MagicMock()
+        bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": {"s3Config": {"bucketName": "logs-bucket"}}
+        }
+        s3 = MagicMock()
+        s3.get_bucket_encryption.side_effect = _make_client_error("AccessDenied")
+        s3.get_object_lock_configuration.return_value = self._lock(mode="GOVERNANCE")
+        clients = {
+            "bedrock": bedrock,
+            "s3": s3,
+            "logs": MagicMock(),
+            "sts": MagicMock(),
+        }
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: clients[service],
+        ):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_invocation_log_encryption(region="us-east-1")
+            )
+        archive = [
+            r for r in rows if r["Finding"] == "Bedrock Invocation Log WORM Archive"
+        ]
+        assert [r["Status"] for r in archive] == ["Failed"]
+        assert "bucket 'logs-bucket'" in archive[0]["Finding_Details"]
+
+
 class TestBR12DestinationKeys:
     """AIR-BDR-MDL-02 / AIR-FND-DET-01: every log destination needs an enabled CMK."""
 
@@ -7728,7 +8033,11 @@ class TestBR12DestinationKeys:
         encryption = [
             r
             for r in rows
-            if r["Finding"] != "Bedrock Invocation Log Group Deletion Protection"
+            if r["Finding"]
+            not in (
+                "Bedrock Invocation Log Group Deletion Protection",
+                bedrock_app.INVOCATION_LOG_ARCHIVE_FINDING,
+            )
         ]
         return result, encryption, kms_regions
 

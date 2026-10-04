@@ -316,28 +316,32 @@ Resources:
               - redshift-serverless:ListWorkgroups # BR-20
               - glue:GetJobs # BR-26
             Resource: '*'
-          - Sid: CloudTrailEventDataStoreRead
+          - Sid: EventDataStoreAndArchiveStreamRead
             # BR-06 reads each event data store's Status and
             # AdvancedEventSelectors. ListEventDataStores has no resource
             # type and is granted on '*' in the function's inline policy.
+            # BR-12 follows a subscription filter on the invocation log group
+            # to a Firehose stream of this account and its archive bucket.
+            # The service authorization reference gives GetEventDataStore the
+            # eventdatastore resource type and DescribeDeliveryStream the
+            # deliverystream resource type, so neither is granted on the
+            # other's ARN. It holds the former Sid CloudTrailEventDataStoreRead.
             Effect: Allow
             Action:
               - cloudtrail:GetEventDataStore # BR-06, BR-32
-            Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
+              - firehose:DescribeDeliveryStream # BR-12
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
+              - !Sub 'arn:${AWS::Partition}:firehose:*:${AWS::AccountId}:deliverystream/*'
           - Sid: BedrockIngestionJobList
             # BR-46 reads when each knowledge base data source last ingested.
             Effect: Allow
             Action:
               - bedrock:ListIngestionJobs # BR-46
             Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
-          - Sid: SageMakerTrainingJobRead
+          - Sid: AIDataPathJobRead
             # BR-46, BR-47 and BR-52 resolve each training job's input
             # channels and output path to the S3 buckets it reads and writes.
-            Effect: Allow
-            Action:
-              - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
-            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
-          - Sid: AIDataPathJobRead
             # BR-47 resolves the S3 input and output of each SageMaker
             # transform and processing job and each Bedrock evaluation job.
             # BR-53 reads the owner tag of each Bedrock batch inference, model
@@ -345,14 +349,17 @@ Resources:
             # reference gives each Describe and Get action its own job resource
             # type, and ListTagsForResource all three Bedrock job resource types
             # and none of the SageMaker ones, so no action is granted on
-            # another's ARN.
+            # another's ARN. It holds the former Sid SageMakerTrainingJobRead,
+            # merged to keep this policy under its 5,500-character budget.
             Effect: Allow
             Action:
+              - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
               - sagemaker:DescribeTransformJob # BR-47
               - sagemaker:DescribeProcessingJob # BR-47
               - bedrock:GetEvaluationJob # BR-47
               - bedrock:ListTagsForResource # BR-53
             Resource:
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:transform-job/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:processing-job/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:evaluation-job/*'
@@ -420,19 +427,22 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model/*'
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:inference-component/*'
           - Sid: EKSClusterRead
-            # BR-02 reads each cluster's VPC and lists its pod identity
-            # associations.
+            # BR-02 reads each cluster's VPC, lists its pod identity
+            # associations and reads the role each association gives. The
+            # service authorization reference gives DescribeCluster and
+            # ListPodIdentityAssociations the cluster resource type and
+            # DescribePodIdentityAssociation the podidentityassociation type,
+            # so no action is granted on another's ARN. It holds the former Sid
+            # EKSPodIdentityAssociationRead, merged to keep this policy under its
+            # 5,500-character budget.
             Effect: Allow
             Action:
               - eks:DescribeCluster # BR-02
               - eks:ListPodIdentityAssociations # BR-02
-            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
-          - Sid: EKSPodIdentityAssociationRead
-            # BR-02 reads the role each pod identity association gives.
-            Effect: Allow
-            Action:
               - eks:DescribePodIdentityAssociation # BR-02
-            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:podidentityassociation/*/*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+              - !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:podidentityassociation/*/*'
           - Sid: ECSTaskRead
             # BR-02 reads the task role and subnets of each task started
             # outside a service. BR-33 resolves the EC2 instance behind a task

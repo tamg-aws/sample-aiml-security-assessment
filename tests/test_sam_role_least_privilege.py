@@ -165,6 +165,7 @@ _EXPECTED_ACTIONS = {
         "eks:ListClusters",
         "eks:ListPodIdentityAssociations",
         "events:ListTargetsByRule",
+        "firehose:DescribeDeliveryStream",
         "glue:GetJobRuns",
         "glue:GetJobs",
         "glue:GetPartitions",
@@ -891,13 +892,25 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "sagemaker:DescribeInferenceComponent",
                 )
             ),
-            scoped("eks:DescribeCluster", "eks:*:${AWS::AccountId}:cluster/*"),
-            scoped(
-                "eks:ListPodIdentityAssociations", "eks:*:${AWS::AccountId}:cluster/*"
-            ),
-            scoped(
-                "eks:DescribePodIdentityAssociation",
-                "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "eks:*:${AWS::AccountId}:cluster/*",
+                                "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "eks:DescribeCluster",
+                    "eks:ListPodIdentityAssociations",
+                    "eks:DescribePodIdentityAssociation",
+                )
             ),
             *(
                 (
@@ -985,15 +998,27 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     ]
                 ),
             ),
-            (
-                "Allow",
-                "cloudtrail:GetEventDataStore",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:cloudtrail:*:"
-                        "${AWS::AccountId}:eventdatastore/*"
-                    }
-                ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:cloudtrail:*:"
+                                "${AWS::AccountId}:eventdatastore/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:firehose:*:"
+                                "${AWS::AccountId}:deliverystream/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in (
+                    "cloudtrail:GetEventDataStore",
+                    "firehose:DescribeDeliveryStream",
+                )
             ),
             (
                 "Allow",
@@ -1005,22 +1030,16 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     }
                 ),
             ),
-            (
-                "Allow",
-                "sagemaker:DescribeTrainingJob",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
-                        "${AWS::AccountId}:training-job/*"
-                    }
-                ),
-            ),
             *(
                 (
                     "Allow",
                     action,
                     json.dumps(
                         [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                                "${AWS::AccountId}:training-job/*"
+                            },
                             {
                                 "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
                                 "${AWS::AccountId}:transform-job/*"
@@ -1045,6 +1064,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     ),
                 )
                 for action in (
+                    "sagemaker:DescribeTrainingJob",
                     "sagemaker:DescribeTransformJob",
                     "sagemaker:DescribeProcessingJob",
                     "bedrock:GetEvaluationJob",
@@ -2447,9 +2467,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "sso:ListPermissionSets",
             "sso:::instance/*",
         ),
-        ("BedrockAssessmentReadsPolicy", "CloudTrailEventDataStoreRead"): (
+        ("BedrockAssessmentReadsPolicy", "EventDataStoreAndArchiveStreamRead"): (
             "cloudtrail:GetEventDataStore",
-            "cloudtrail:*:${AWS::AccountId}:eventdatastore/*",
+            "firehose:DescribeDeliveryStream",
+            "firehose:*:${AWS::AccountId}:deliverystream/*",
         ),
         ("BedrockAssessmentReadsPolicy", "AccountListRegions"): (
             "account:ListRegions",
@@ -2469,9 +2490,6 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockAssessmentReadsPolicy", "EKSClusterRead"): (
             "eks:DescribeCluster",
             "eks:ListPodIdentityAssociations",
-            "eks:*:${AWS::AccountId}:cluster/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "EKSPodIdentityAssociationRead"): (
             "eks:DescribePodIdentityAssociation",
             "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
         ),
