@@ -301,10 +301,18 @@ Resources:
               - aoss:ListAccessPolicies # BR-20
               - aoss:GetAccessPolicy # BR-20
               - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
+              - sagemaker:ListTransformJobs # BR-47
+              - sagemaker:ListProcessingJobs # BR-47
               - sagemaker:ListInferenceComponents # BR-02
               - eks:ListClusters # BR-02
               - sagemaker:ListDomains # BR-53
               - bedrock-agentcore:ListCodeInterpreters # BR-53
+              # Former Sids BedrockMantleAccountRetentionRead, IAMAccountSummaryRead
+              # and RedshiftServerlessWorkgroupList, folded in to keep this
+              # policy under its 5,500-character budget.
+              - bedrock-mantle:GetAccountDataRetention # BR-37
+              - iam:GetAccountSummary # BR-50
+              - redshift-serverless:ListWorkgroups # BR-20
             Resource: '*'
           - Sid: CloudTrailEventDataStoreRead
             # BR-06 reads each event data store's Status and
@@ -327,6 +335,20 @@ Resources:
             Action:
               - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
             Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
+          - Sid: AIDataPathJobRead
+            # BR-47 resolves the S3 input and output of each SageMaker
+            # transform and processing job and each Bedrock evaluation job.
+            # The service authorization reference gives each action its own
+            # job resource type.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeTransformJob # BR-47
+              - sagemaker:DescribeProcessingJob # BR-47
+              - bedrock:GetEvaluationJob # BR-47
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:transform-job/*'
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:processing-job/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:evaluation-job/*'
           - Sid: AgentCoreBrowserRead
             # BR-47 and BR-52 read the recording bucket of each custom AgentCore
             # browser. The service authorization reference lists the
@@ -436,24 +458,6 @@ Resources:
             Action:
               - bedrock-mantle:ListProjects # BR-37
             Resource: !Sub 'arn:${AWS::Partition}:bedrock-mantle:*:${AWS::AccountId}:project/*'
-          - Sid: BedrockMantleAccountRetentionRead
-            # BR-37 reads the bedrock-mantle account data-retention mode that a
-            # project set to inherit takes. The service authorization reference
-            # lists no resource type for GetAccountDataRetention, so the
-            # resource must be '*'.
-            Effect: Allow
-            Action:
-              - bedrock-mantle:GetAccountDataRetention # BR-37
-            Resource: '*'
-          - Sid: IAMAccountSummaryRead
-            # BR-50 reads AccountAccessKeysPresent to learn whether the root
-            # user has an access key. The service authorization reference lists
-            # no resource type for GetAccountSummary, so the resource must be
-            # '*'.
-            Effect: Allow
-            Action:
-              - iam:GetAccountSummary # BR-50
-            Resource: '*'
           - Sid: AuroraInstanceRead
             # BR-20 reads PubliclyAccessible on each instance of the Aurora
             # cluster behind a knowledge base. The service authorization
@@ -501,13 +505,6 @@ Resources:
             Action:
               - redshift-serverless:GetNamespace # BR-20
             Resource: !Sub 'arn:${AWS::Partition}:redshift-serverless:*:${AWS::AccountId}:namespace/*'
-          - Sid: RedshiftServerlessWorkgroupList
-            # The service authorization reference lists no resource type for
-            # ListWorkgroups.
-            Effect: Allow
-            Action:
-              - redshift-serverless:ListWorkgroups # BR-20
-            Resource: '*'
           - Sid: AgentCoreMemoryRead
             # BR-04 reads eventExpiryDuration on each AgentCore memory. The
             # service authorization reference gives GetMemory the memory

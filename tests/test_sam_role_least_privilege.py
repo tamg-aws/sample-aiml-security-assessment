@@ -151,6 +151,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
         "bedrock:ApplyGuardrail",
+        "bedrock:GetEvaluationJob",
         "bedrock:ListIngestionJobs",
         "cloudtrail:GetEventDataStore",
         "ecs:DescribeTasks",
@@ -176,10 +177,14 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeInferenceComponent",
         "sagemaker:DescribeModel",
+        "sagemaker:DescribeProcessingJob",
         "sagemaker:DescribeTrainingJob",
+        "sagemaker:DescribeTransformJob",
         "sagemaker:ListDomains",
         "sagemaker:ListInferenceComponents",
+        "sagemaker:ListProcessingJobs",
         "sagemaker:ListTrainingJobs",
+        "sagemaker:ListTransformJobs",
         "sso:DescribeInstanceAccessControlAttributeConfiguration",
         "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
         "sso:ListManagedPoliciesInPermissionSet",
@@ -845,6 +850,8 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             ("Allow", "aoss:ListAccessPolicies", '"*"'),
             ("Allow", "aoss:GetAccessPolicy", '"*"'),
             ("Allow", "sagemaker:ListTrainingJobs", '"*"'),
+            ("Allow", "sagemaker:ListTransformJobs", '"*"'),
+            ("Allow", "sagemaker:ListProcessingJobs", '"*"'),
             ("Allow", "sagemaker:ListInferenceComponents", '"*"'),
             ("Allow", "eks:ListClusters", '"*"'),
             ("Allow", "sagemaker:ListDomains", '"*"'),
@@ -942,6 +949,33 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                         "${AWS::AccountId}:training-job/*"
                     }
                 ),
+            ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                                "${AWS::AccountId}:transform-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                                "${AWS::AccountId}:processing-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                                "${AWS::AccountId}:evaluation-job/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in (
+                    "sagemaker:DescribeTransformJob",
+                    "sagemaker:DescribeProcessingJob",
+                    "bedrock:GetEvaluationJob",
+                )
             ),
             (
                 "Allow",

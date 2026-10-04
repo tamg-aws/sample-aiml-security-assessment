@@ -767,6 +767,34 @@ MUTATIONS = [
         "replace": "",
     },
     {
+        "name": "BR-47 names only five enforcing buckets in its Passed text",
+        "file": BEDROCK,
+        "defect": "BR-47's Passed text lists the first five enforcing buckets, so the exempted principals of a sixth bucket go unnamed",
+        "find": '                            len(inventory["buckets"]),\n                            denied,\n                            "; ".join(enforced),\n                        )\n                    ),\n                    resolution=(\n                        "No action required.',
+        "replace": '                            len(inventory["buckets"]),\n                            denied,\n                            "; ".join(enforced[:5]),\n                        )\n                    ),\n                    resolution=(\n                        "No action required.',
+    },
+    {
+        "name": "BR-47 drops the SageMaker transform and processing job buckets",
+        "file": BEDROCK,
+        "defect": "BR-47 never reads transform or processing jobs, so their plaintext buckets are missing from the data path and the row passes",
+        "find": "        _sagemaker_batch_job_locations,\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-47 drops the SageMaker endpoint capture and async buckets",
+        "file": BEDROCK,
+        "defect": "BR-47 never reads endpoints, so a data capture or asynchronous output bucket that accepts plaintext is missing from the data path",
+        "find": "        _sagemaker_endpoint_locations,\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-47 drops the Bedrock evaluation job buckets",
+        "file": BEDROCK,
+        "defect": "BR-47 never reads evaluation jobs, so a dataset or output bucket that accepts plaintext is missing from the data path",
+        "find": "        _evaluation_job_locations,\n",
+        "replace": "",
+    },
+    {
         "name": "an unread list read lets the BR-53 sweep summary pass",
         "file": BEDROCK,
         "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
@@ -2439,6 +2467,18 @@ GROUPS: dict[str, str] = {
     ),
     "BR-43 credits an AI service Region deny that omits the vector stores": (
         "in the Bedrock Region deny service prefixes"
+    ),
+    "BR-47 names only five enforcing buckets in its Passed text": (
+        "in the Bedrock data path TLS exemptions"
+    ),
+    "BR-47 drops the SageMaker transform and processing job buckets": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 drops the SageMaker endpoint capture and async buckets": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 drops the Bedrock evaluation job buckets": (
+        "in the Bedrock data path inventory"
     ),
     "an unread list read lets the BR-53 sweep summary pass": (
         "in the Bedrock owner tag sweep"

@@ -30234,6 +30234,246 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "errors": errors}
 
 
+def _sagemaker_batch_job_locations(region: str = "") -> Dict[str, Any]:
+    """
+    Read the S3 input and output of the SageMaker transform and processing
+    jobs in ``region``, newest first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs
+    of each kind; older jobs are named in ``errors``. A transform job reads
+    TransformInput.DataSource.S3DataSource.S3Uri and writes
+    TransformOutput.S3OutputPath; a processing job reads each
+    ProcessingInputs[].S3Input.S3Uri and writes each
+    ProcessingOutputConfig.Outputs[].S3Output.S3Uri. Returns
+    {"locations": [(bucket, label)], "errors"}.
+    """
+    locations = []
+    errors = []
+    client = boto3.client("sagemaker", config=boto3_config, region_name=region)
+    for kind, list_operation, summaries_key, name_key, describe, actions in (
+        (
+            "transform",
+            "list_transform_jobs",
+            "TransformJobSummaries",
+            "TransformJobName",
+            "describe_transform_job",
+            ("ListTransformJobs", "DescribeTransformJob"),
+        ),
+        (
+            "processing",
+            "list_processing_jobs",
+            "ProcessingJobSummaries",
+            "ProcessingJobName",
+            "describe_processing_job",
+            ("ListProcessingJobs", "DescribeProcessingJob"),
+        ),
+    ):
+        try:
+            jobs = _list_all_items(
+                client,
+                list_operation,
+                summaries_key,
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                SortBy="CreationTime",
+                SortOrder="Descending",
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            errors.append(
+                f"{kind} jobs were not listed with sagemaker:{actions[0]} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
+            errors.append(
+                "{} older {} job(s) past the newest {} were not read with "
+                "sagemaker:{}".format(
+                    len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
+                    kind,
+                    MAX_SAGEMAKER_TRAINING_JOB_READS,
+                    actions[1],
+                )
+            )
+        for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
+            name = job.get(name_key) or "unnamed"
+            try:
+                detail = getattr(client, describe)(**{name_key: name})
+            except (ClientError, BotoCoreError) as error:
+                errors.append(
+                    f"{kind} job '{name}' was not read with sagemaker:{actions[1]} "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            if kind == "transform":
+                pairs = [
+                    (
+                        "input",
+                        (
+                            (
+                                (detail.get("TransformInput") or {}).get("DataSource")
+                                or {}
+                            ).get("S3DataSource")
+                            or {}
+                        ).get("S3Uri"),
+                    ),
+                    (
+                        "output",
+                        (detail.get("TransformOutput") or {}).get("S3OutputPath"),
+                    ),
+                ]
+            else:
+                pairs = [
+                    (
+                        f"input '{item.get('InputName') or 'unnamed'}'",
+                        (item.get("S3Input") or {}).get("S3Uri"),
+                    )
+                    for item in detail.get("ProcessingInputs") or []
+                ] + [
+                    (
+                        f"output '{item.get('OutputName') or 'unnamed'}'",
+                        (item.get("S3Output") or {}).get("S3Uri"),
+                    )
+                    for item in (detail.get("ProcessingOutputConfig") or {}).get(
+                        "Outputs"
+                    )
+                    or []
+                ]
+            for role, uri in pairs:
+                if _s3_uri_bucket(uri):
+                    locations.append(
+                        (
+                            _s3_uri_bucket(uri),
+                            f"the {role} of SageMaker {kind} job '{name}'",
+                        )
+                    )
+    return {"locations": locations, "errors": errors}
+
+
+def _sagemaker_endpoint_locations(region: str = "") -> Dict[str, Any]:
+    """
+    Read the S3 buckets every SageMaker endpoint in ``region`` writes to: the
+    DataCaptureConfig.DestinationS3Uri of an endpoint with capture enabled,
+    and the AsyncInferenceConfig.OutputConfig S3OutputPath and S3FailurePath
+    of its endpoint configuration. Every page is listed. Returns
+    {"locations": [(bucket, label)], "errors"}.
+    """
+    locations = []
+    errors = []
+    client = boto3.client("sagemaker", config=boto3_config, region_name=region)
+    try:
+        endpoints = _list_all_items(
+            client,
+            "list_endpoints",
+            "Endpoints",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "locations": [],
+            "errors": [
+                "endpoints were not listed with sagemaker:ListEndpoints "
+                f"({get_assessment_error_label(error)})"
+            ],
+        }
+    for endpoint in endpoints:
+        name = endpoint.get("EndpointName") or "unnamed"
+        try:
+            detail = client.describe_endpoint(EndpointName=name)
+            config = client.describe_endpoint_config(
+                EndpointConfigName=detail.get("EndpointConfigName")
+            )
+        except (ClientError, BotoCoreError) as error:
+            errors.append(
+                f"endpoint '{name}' was not read with sagemaker:DescribeEndpoint "
+                f"and sagemaker:DescribeEndpointConfig "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        capture = detail.get("DataCaptureConfig") or {}
+        output = (config.get("AsyncInferenceConfig") or {}).get("OutputConfig") or {}
+        for role, uri in (
+            (
+                "data capture destination",
+                capture.get("DestinationS3Uri")
+                if capture.get("EnableCapture")
+                else None,
+            ),
+            ("asynchronous inference output", output.get("S3OutputPath")),
+            ("asynchronous inference failure output", output.get("S3FailurePath")),
+        ):
+            if _s3_uri_bucket(uri):
+                locations.append(
+                    (
+                        _s3_uri_bucket(uri),
+                        f"the {role} of SageMaker endpoint '{name}'",
+                    )
+                )
+    return {"locations": locations, "errors": errors}
+
+
+def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
+    """
+    Read the S3 datasets and output of the Bedrock evaluation jobs in
+    ``region``, newest first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs; older
+    jobs are named in ``errors``. Each automated or human dataset's
+    datasetLocation.s3Uri is read and outputDataConfig.s3Uri is written.
+    Returns {"locations": [(bucket, label)], "errors"}.
+    """
+    locations = []
+    errors = []
+    client = boto3.client("bedrock", config=boto3_config, region_name=region)
+    try:
+        jobs = _list_all_items(
+            client,
+            "list_evaluation_jobs",
+            "jobSummaries",
+            sortBy="CreationTime",
+            sortOrder="Descending",
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "locations": [],
+            "errors": [
+                "evaluation jobs were not listed with bedrock:ListEvaluationJobs "
+                f"({get_assessment_error_label(error)})"
+            ],
+        }
+    if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
+        errors.append(
+            "{} older evaluation job(s) past the newest {} were not read with "
+            "bedrock:GetEvaluationJob".format(
+                len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
+                MAX_SAGEMAKER_TRAINING_JOB_READS,
+            )
+        )
+    for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
+        name = job.get("jobName") or job.get("jobArn") or "unnamed"
+        try:
+            detail = client.get_evaluation_job(jobIdentifier=job.get("jobArn"))
+        except (ClientError, BotoCoreError) as error:
+            errors.append(
+                f"evaluation job '{name}' was not read with bedrock:GetEvaluationJob "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        evaluation = detail.get("evaluationConfig") or {}
+        pairs = [
+            (
+                f"dataset '{(metric.get('dataset') or {}).get('name') or 'unnamed'}'",
+                ((metric.get("dataset") or {}).get("datasetLocation") or {}).get(
+                    "s3Uri"
+                ),
+            )
+            for mode in ("automated", "human")
+            for metric in (evaluation.get(mode) or {}).get("datasetMetricConfigs") or []
+        ] + [("output", (detail.get("outputDataConfig") or {}).get("s3Uri"))]
+        for role, uri in pairs:
+            if _s3_uri_bucket(uri):
+                locations.append(
+                    (_s3_uri_bucket(uri), f"the {role} of evaluation job '{name}'")
+                )
+    return {"locations": locations, "errors": errors}
+
+
 def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     """
     Resolve the S3 buckets that Bedrock reads training data from and writes
@@ -30343,10 +30583,16 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
             f"the {location['role']} of SageMaker training job '{location['job']}'"
         )
 
-    agentcore = _agentcore_s3_locations(region)
-    errors.extend(agentcore["errors"])
-    for bucket, label in agentcore["locations"]:
-        buckets.setdefault(bucket, []).append(label)
+    for reader in (
+        _sagemaker_batch_job_locations,
+        _sagemaker_endpoint_locations,
+        _evaluation_job_locations,
+        _agentcore_s3_locations,
+    ):
+        located = reader(region)
+        errors.extend(located["errors"])
+        for bucket, label in located["locations"]:
+            buckets.setdefault(bucket, []).append(label)
 
     return {"buckets": buckets, "errors": errors}
 
@@ -30473,7 +30719,13 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                         "bedrock:ListModelCustomizationJobs, "
                         "bedrock:GetModelCustomizationJob, "
                         "bedrock:ListModelInvocationJobs, sagemaker:ListTrainingJobs, "
-                        "sagemaker:DescribeTrainingJob, "
+                        "sagemaker:DescribeTrainingJob, sagemaker:ListTransformJobs, "
+                        "sagemaker:DescribeTransformJob, "
+                        "sagemaker:ListProcessingJobs, "
+                        "sagemaker:DescribeProcessingJob, sagemaker:ListEndpoints, "
+                        "sagemaker:DescribeEndpoint, "
+                        "sagemaker:DescribeEndpointConfig, "
+                        "bedrock:ListEvaluationJobs, bedrock:GetEvaluationJob, "
                         "bedrock-agentcore:ListAgentRuntimes, "
                         "bedrock-agentcore:GetAgentRuntime, "
                         "bedrock-agentcore:ListBrowsers and "
@@ -30494,8 +30746,9 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                     finding_details=(
                         "No knowledge base ingests from an S3 bucket in {}, no "
                         "model invocation log destination is configured, and no "
-                        "model customization, batch inference or SageMaker training "
-                        "job, AgentCore runtime or recording browser names a bucket, "
+                        "model customization, batch inference, evaluation, SageMaker "
+                        "training, transform or processing job, SageMaker endpoint, "
+                        "AgentCore runtime or recording browser names a bucket, "
                         "so there is no data path bucket whose transport can be "
                         "assessed.".format(region or "this region")
                     ),
@@ -30638,7 +30891,7 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                             len(enforced),
                             len(inventory["buckets"]),
                             denied,
-                            "; ".join(enforced[:5]),
+                            "; ".join(enforced),
                         )
                     ),
                     resolution=(
@@ -30661,7 +30914,7 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                             len(enforced),
                             len(inventory["buckets"]),
                             denied,
-                            "; ".join(enforced[:5]),
+                            "; ".join(enforced),
                         )
                     ),
                     resolution=(

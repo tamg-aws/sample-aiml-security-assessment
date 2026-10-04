@@ -1362,7 +1362,9 @@ AI_SUBJECT_ROWS = [
         "(knowledge base S3 sources, the invocation log S3 destination and its CloudWatch "
         "large-data bucket, the training, validation, output and distillation "
         "invocation-log source buckets of every customization job, batch inference "
-        "input and output buckets, SageMaker training job buckets, AgentCore runtime "
+        "input and output buckets, SageMaker training, transform and processing job "
+        "buckets, SageMaker endpoint data capture and asynchronous output buckets, "
+        "Bedrock evaluation job dataset and output buckets, AgentCore runtime "
         "code buckets and AgentCore browser recording buckets). It passes a "
         "bucket only when one Deny, conditioned by Bool or BoolIfExists on "
         "aws:SecureTransport false, reaches every principal, covers s3:*, and names both "
@@ -1375,10 +1377,13 @@ AI_SUBJECT_ROWS = [
         "broken ingestion is credited too: a negated aws:PrincipalArn test with no "
         "set-operator prefix whose every value is an ARN with no wildcard or policy "
         "variable, or Bool aws:ViaAWSService false. The Passed text names each exempted "
-        "ARN as keeping plaintext access, and a wildcard value, a set-operator prefix or "
-        "another narrowing key still fails. Every data source and job is read "
-        "with no cap, and a failed read withholds the Passed row, since an unread bucket "
-        "may accept plaintext",
+        "ARN on every enforcing bucket as keeping plaintext access, and a wildcard "
+        "value, a set-operator prefix or another narrowing key still fails. Every "
+        "data source, customization job, batch job and endpoint is read with no cap. "
+        "SageMaker training, transform and processing jobs and Bedrock evaluation "
+        "jobs are read to the newest 200 of each kind, and an older job withholds "
+        "the Passed row, as does a failed read, since an unread bucket may accept "
+        "plaintext",
         [],
         5,
     ),

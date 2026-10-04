@@ -24160,6 +24160,11 @@ class TestBR47DataPathBucketTLS:
         runtimes=None,
         browsers=None,
         agentcore_error=None,
+        transform_jobs=None,
+        processing_jobs=None,
+        endpoints=None,
+        evaluation_jobs=None,
+        evaluation_error=None,
     ):
         agent_client = MagicMock()
         if list_knowledge_bases_error:
@@ -24244,6 +24249,61 @@ class TestBR47DataPathBucketTLS:
             }
         sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
             training_jobs[TrainingJobName]
+        )
+        # transform_jobs and processing_jobs map a name to its Describe
+        # response; endpoints map a name to (DescribeEndpoint,
+        # DescribeEndpointConfig); evaluation_jobs map a name to its Get
+        # response. A value that is an exception is raised.
+        transform_jobs = transform_jobs or {}
+        processing_jobs = processing_jobs or {}
+        endpoints = endpoints or {}
+        evaluation_jobs = evaluation_jobs or {}
+
+        def answer(value):
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        sagemaker_client.list_transform_jobs.return_value = {
+            "TransformJobSummaries": [
+                {"TransformJobName": name} for name in transform_jobs
+            ]
+        }
+        sagemaker_client.describe_transform_job.side_effect = lambda TransformJobName: (
+            answer(transform_jobs[TransformJobName])
+        )
+        sagemaker_client.list_processing_jobs.return_value = {
+            "ProcessingJobSummaries": [
+                {"ProcessingJobName": name} for name in processing_jobs
+            ]
+        }
+        sagemaker_client.describe_processing_job.side_effect = (
+            lambda ProcessingJobName: answer(processing_jobs[ProcessingJobName])
+        )
+        sagemaker_client.list_endpoints.return_value = {
+            "Endpoints": [{"EndpointName": name} for name in endpoints]
+        }
+        sagemaker_client.describe_endpoint.side_effect = lambda EndpointName: answer(
+            {"EndpointConfigName": EndpointName, **endpoints[EndpointName][0]}
+        )
+        sagemaker_client.describe_endpoint_config.side_effect = (
+            lambda EndpointConfigName: answer(endpoints[EndpointConfigName][1])
+        )
+        self.sagemaker_client = sagemaker_client
+        if evaluation_error:
+            bedrock_client.list_evaluation_jobs.side_effect = evaluation_error
+        else:
+            bedrock_client.list_evaluation_jobs.return_value = {
+                "jobSummaries": [
+                    {
+                        "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:evaluation-job/{name}",
+                        "jobName": name,
+                    }
+                    for name in evaluation_jobs
+                ]
+            }
+        bedrock_client.get_evaluation_job.side_effect = lambda jobIdentifier: answer(
+            evaluation_jobs[jobIdentifier.rsplit("/", 1)[-1]]
         )
 
         # runtimes and browsers map an id to its Get response.
@@ -24844,6 +24904,250 @@ class TestBR47DataPathBucketTLS:
         assert [f["Status"] for f in findings] == ["Passed"]
         assert f"principal {self.INGEST_ROLE} " in findings[0]["Finding_Details"]
         assert f"principal {second} " in findings[0]["Finding_Details"]
+
+    # DAT-02: the Passed text used to name only the first five enforcing
+    # buckets, so an exemption on a sixth or later bucket went unnamed.
+    def test_br47_an_exemption_on_the_seventh_bucket_is_named(self):
+        enforced = [f"a{index}" for index in range(1, 7)]
+        findings = self._run(
+            processing_jobs={
+                "pj": {
+                    "ProcessingInputs": [
+                        {"InputName": name, "S3Input": {"S3Uri": f"s3://{name}/in/"}}
+                        for name in enforced + ["z-exempt"]
+                    ]
+                }
+            },
+            bucket_policies={
+                **self._enforced(*enforced),
+                "z-exempt": self._exempting(
+                    "z-exempt", "ArnNotEquals", "aws:PrincipalArn", self.INGEST_ROLE
+                ),
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "7 of 7 Bedrock data path bucket(s)" in details
+        assert "z-exempt (the input 'z-exempt' of SageMaker processing job" in details
+        assert f"exempts principal {self.INGEST_ROLE} " in details
+        assert all(f"{name} (" in details for name in enforced)
+
+    # DAT-02: SageMaker transform, processing and endpoint buckets and Bedrock
+    # evaluation buckets are on the data path. Each source alone names one
+    # bucket with no policy, so without its leg the estate has no bucket.
+    @pytest.mark.parametrize(
+        "source, bucket, label",
+        [
+            (
+                {
+                    "transform_jobs": {
+                        "tj": {
+                            "TransformInput": {
+                                "DataSource": {
+                                    "S3DataSource": {"S3Uri": "s3://tf-in/x/"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "tf-in",
+                "the input of SageMaker transform job 'tj'",
+            ),
+            (
+                {
+                    "transform_jobs": {
+                        "tj": {"TransformOutput": {"S3OutputPath": "s3://tf-out/"}}
+                    }
+                },
+                "tf-out",
+                "the output of SageMaker transform job 'tj'",
+            ),
+            (
+                {
+                    "processing_jobs": {
+                        "pj": {
+                            "ProcessingOutputConfig": {
+                                "Outputs": [
+                                    {
+                                        "OutputName": "report",
+                                        "S3Output": {"S3Uri": "s3://pj-out/r/"},
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+                "pj-out",
+                "the output 'report' of SageMaker processing job 'pj'",
+            ),
+            (
+                {
+                    "endpoints": {
+                        "ep": (
+                            {
+                                "DataCaptureConfig": {
+                                    "EnableCapture": True,
+                                    "DestinationS3Uri": "s3://capture/ep/",
+                                }
+                            },
+                            {},
+                        )
+                    }
+                },
+                "capture",
+                "the data capture destination of SageMaker endpoint 'ep'",
+            ),
+            (
+                {
+                    "endpoints": {
+                        "ep": (
+                            {},
+                            {
+                                "AsyncInferenceConfig": {
+                                    "OutputConfig": {"S3OutputPath": "s3://async/"}
+                                }
+                            },
+                        )
+                    }
+                },
+                "async",
+                "the asynchronous inference output of SageMaker endpoint 'ep'",
+            ),
+            (
+                {
+                    "endpoints": {
+                        "ep": (
+                            {},
+                            {
+                                "AsyncInferenceConfig": {
+                                    "OutputConfig": {"S3FailurePath": "s3://async-f/"}
+                                }
+                            },
+                        )
+                    }
+                },
+                "async-f",
+                "the asynchronous inference failure output of SageMaker endpoint 'ep'",
+            ),
+            (
+                {
+                    "evaluation_jobs": {
+                        "ev": {
+                            "evaluationConfig": {
+                                "human": {
+                                    "datasetMetricConfigs": [
+                                        {
+                                            "dataset": {
+                                                "name": "qa",
+                                                "datasetLocation": {
+                                                    "s3Uri": "s3://ev-data/qa.jsonl"
+                                                },
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                },
+                "ev-data",
+                "the dataset 'qa' of evaluation job 'ev'",
+            ),
+            (
+                {
+                    "evaluation_jobs": {
+                        "ev": {"outputDataConfig": {"s3Uri": "s3://ev-out/"}}
+                    }
+                },
+                "ev-out",
+                "the output of evaluation job 'ev'",
+            ),
+        ],
+        ids=[
+            "transform-input",
+            "transform-output",
+            "processing-output",
+            "data-capture",
+            "async-output",
+            "async-failure",
+            "evaluation-dataset",
+            "evaluation-output",
+        ],
+    )
+    def test_br47_sagemaker_and_evaluation_buckets_are_on_the_data_path(
+        self, source, bucket, label
+    ):
+        findings = self._run(
+            bucket_policies=self._enforced("kb-ok"),
+            logging_config={"loggingConfig": {"s3Config": {"bucketName": "kb-ok"}}},
+            **source,
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert (
+            f"Bucket {bucket} is on the Bedrock data path as {label} and it has no "
+            "bucket policy" in findings[0]["Finding_Details"]
+        )
+
+    def test_br47_disabled_data_capture_is_not_on_the_data_path(self):
+        findings = self._run(
+            endpoints={
+                "ep": (
+                    {
+                        "DataCaptureConfig": {
+                            "EnableCapture": False,
+                            "DestinationS3Uri": "s3://capture/ep/",
+                        }
+                    },
+                    {},
+                )
+            }
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "capture" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "unread, action",
+        [
+            ("evaluation_error", "bedrock:ListEvaluationJobs"),
+            ("transform", "sagemaker:DescribeTransformJob"),
+            ("processing", "sagemaker:DescribeProcessingJob"),
+            ("endpoint", "sagemaker:DescribeEndpointConfig"),
+            ("evaluation", "bedrock:GetEvaluationJob"),
+        ],
+    )
+    def test_br47_an_unread_new_data_path_leg_withholds_the_pass(self, unread, action):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "Read"
+        )
+        overrides = {
+            "evaluation_error": {"evaluation_error": denied},
+            "transform": {"transform_jobs": {"tj": denied}},
+            "processing": {"processing_jobs": {"pj": denied}},
+            "endpoint": {"endpoints": {"ep": ({}, denied)}},
+            "evaluation": {"evaluation_jobs": {"ev": denied}},
+        }[unread]
+        findings = self._two_bucket_estate(
+            bucket_policies=self._enforced("support-bucket", "hr-bucket"),
+            **overrides,
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert action in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "N/A"
+        )
+
+    def test_br47_transform_jobs_past_the_read_cap_withhold_the_pass(self):
+        cap = bedrock_app.MAX_SAGEMAKER_TRAINING_JOB_READS
+        jobs = {f"tj-{index:03d}": {} for index in range(cap + 1)}
+        jobs["tj-000"] = {"TransformOutput": {"S3OutputPath": "s3://tf-ok/"}}
+        findings = self._run(
+            transform_jobs=jobs, bucket_policies=self._enforced("tf-ok")
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            f"1 older transform job(s) past the newest {cap} were not read"
+            in " ".join(f["Finding_Details"] for f in findings)
+        )
+        assert self.sagemaker_client.describe_transform_job.call_count == cap
 
     @pytest.mark.parametrize("operator", ["Bool", "BoolIfExists"])
     def test_br47_a_via_aws_service_false_exemption_passes(self, operator):
@@ -30525,6 +30829,9 @@ class TestBR52DataPathObjectLock:
         sagemaker.describe_training_job.side_effect = lambda TrainingJobName: details[
             TrainingJobName
         ]
+        sagemaker.list_transform_jobs.return_value = {"TransformJobSummaries": []}
+        sagemaker.list_processing_jobs.return_value = {"ProcessingJobSummaries": []}
+        sagemaker.list_endpoints.return_value = {"Endpoints": []}
         agent = MagicMock()
         agent.list_knowledge_bases.return_value = {"knowledgeBaseSummaries": []}
         bedrock = MagicMock()
@@ -30532,6 +30839,7 @@ class TestBR52DataPathObjectLock:
         bedrock.list_model_customization_jobs.return_value = {
             "modelCustomizationJobSummaries": []
         }
+        bedrock.list_evaluation_jobs.return_value = {"jobSummaries": []}
         batch = MagicMock()
         batch.paginate.return_value = [{"invocationJobSummaries": []}]
         bedrock.get_paginator.side_effect = lambda operation: {
