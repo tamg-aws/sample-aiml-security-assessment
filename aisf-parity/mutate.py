@@ -4457,6 +4457,20 @@ MUTATIONS = [
         "find": '    if not resource_part:\n        return True\n    if "*" not in resource_part',
         "replace": '    if not resource_part:\n        return False\n    if "*" not in resource_part',
     },
+    {
+        "name": "AC-34 matches assignments in files a package RECORD lists",
+        "file": AGENTCORE,
+        "defect": "botocore's examples assigning Password and GrantToken failed every runtime whose code archive vendors its dependencies at the root",
+        "find": "                            posixpath.normpath(info.filename) in installed,\n",
+        "replace": "                            False,\n",
+    },
+    {
+        "name": "AC-34 reads a package RECORD from the archive root only",
+        "file": AGENTCORE,
+        "defect": "a RECORD under app/ was resolved against the root, so the files it lists were matched as the agent's own code",
+        "find": "        root = posixpath.dirname(posixpath.dirname(name))\n",
+        "replace": '        root = ""\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
     {
         "name": "BR-43 credits a NotAction Deny that exempts an action of a probed service",
@@ -5780,6 +5794,8 @@ GROUPS: dict[str, str] = {
     "AC-45 credits a path wildcard inside a name that may hold a slash": "in the AgentCore verdict legs",
     "AC-45 credits a sub-resource under a wildcard parent": "in the AgentCore verdict legs",
     "AC-45 reads an empty resource name as scoped": "in the AgentCore verdict legs",
+    "AC-34 matches assignments in files a package RECORD lists": "in the AgentCore verdict legs",
+    "AC-34 reads a package RECORD from the archive root only": "in the AgentCore verdict legs",
 }
 
 

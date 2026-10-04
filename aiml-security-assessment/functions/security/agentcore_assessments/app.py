@@ -12,6 +12,7 @@ import json
 from functools import lru_cache
 import logging
 import os
+import posixpath
 import re
 import tarfile
 import time
@@ -24495,8 +24496,12 @@ CREDENTIAL_PLACEHOLDER_FRAGMENTS = (
     "<",
 )
 # Installed third-party packages assign sample credentials in their own tests
-# and documentation, so assignments are not matched under these directories.
-# Access key IDs and private key blocks still are.
+# and documentation, so assignments are not matched under these directories,
+# nor in a file a package's .dist-info RECORD lists: a code archive for
+# AgentCore holds its dependencies at the archive root, beside the agent's own
+# code (an archive read in 178113193057 on 2026-10-04 held botocore, whose
+# examples assign Password and GrantToken, at its root with 98 RECORD files).
+# Access key IDs and private key blocks still are matched in both.
 CODE_DEPENDENCY_PATH_SEGMENTS = ("site-packages", "dist-packages", "node_modules")
 
 # What every passing AC-34 finding states it could not read.
@@ -24513,8 +24518,16 @@ AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
 # is scanned, whatever its size, in chunks of AC34_SCAN_CHUNK_BYTES, each
 # matched together with the last AC34_SCAN_OVERLAP_CHARS characters of the
 # chunk before, so a credential that straddles two chunks is still found and
-# memory holds one chunk. Matching ran at 28 MiB/s or more on Python 3.12
-# (assignment pattern, the slowest; 2026-10-04, 16 MiB of source and of base64).
+# memory holds one chunk. Measured live on 2026-10-04 in account 178113193057,
+# us-east-1, on two runtime code archives there (39.8 and 34.4 MiB, unpacking
+# to 92.7 and 76.6 MiB): s3:GetObject ran at 17.8 to 27.9 MiB/s, and the scan
+# at 26.5 MiB/s or more of unpacked bytes with assignment matching on every
+# file, the slowest case. The calls ran from a workstation, not from the
+# function. At the slowest rates an archive at both bounds takes 3.6 s to
+# fetch and 9.7 s to scan, 13.3 s in all, so 45 such archives fit in the
+# 600 s Lambda timeout; 15 of that account's 19 runtimes run a code archive,
+# 12 distinct ones. An archive past either bound is named in the row, which
+# is then N/A, never Passed.
 AC34_CODE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
 AC34_CODE_UNPACKED_MAX_BYTES = 256 * 1024 * 1024
 AC34_SCAN_CHUNK_BYTES = 1024 * 1024
@@ -25086,9 +25099,27 @@ def _read_s3_object_bounded(
     return data
 
 
+def _installed_package_files(archive: zipfile.ZipFile) -> Set[str]:
+    """Return the archive paths a package's .dist-info RECORD lists.
+
+    RECORD names each file pip installed for the package, relative to the
+    directory that holds the .dist-info directory.
+    """
+    installed: Set[str] = set()
+    for name in archive.namelist():
+        if not name.endswith(".dist-info/RECORD"):
+            continue
+        root = posixpath.dirname(posixpath.dirname(name))
+        text = archive.read(name).decode("utf-8", "ignore")
+        for row in csv.reader(text.splitlines()):
+            if row and row[0]:
+                installed.add(posixpath.normpath(posixpath.join(root, row[0])))
+    return installed
+
+
 def _code_archive_credentials(
     bucket: str, key: str, version_id: Optional[str]
-) -> Tuple[List[str], int, List[str]]:
+) -> Tuple[List[str], int]:
     """Scan every file of a runtime's code archive for inline credentials.
 
     Returns the findings (file names, and variable names for a .env file or
@@ -25107,6 +25138,12 @@ def _code_archive_credentials(
     scanned = 0
     unpacked = 0
     with archive:
+        try:
+            installed = _installed_package_files(archive)
+        except (RuntimeError, NotImplementedError, zipfile.BadZipFile, zlib.error):
+            raise ValueError(
+                "a package RECORD in the archive could not be read"
+            ) from None
         for info in archive.infolist():
             if info.is_dir():
                 continue
@@ -25118,7 +25155,13 @@ def _code_archive_credentials(
                 )
             try:
                 with archive.open(info) as handle:
-                    found.extend(_streamed_file_credentials(info.filename, handle))
+                    found.extend(
+                        _streamed_file_credentials(
+                            info.filename,
+                            handle,
+                            posixpath.normpath(info.filename) in installed,
+                        )
+                    )
             except (RuntimeError, NotImplementedError, zipfile.BadZipFile, zlib.error):
                 raise ValueError(
                     f"file {info.filename} in the archive could not be read"
@@ -25127,17 +25170,18 @@ def _code_archive_credentials(
     return found, scanned
 
 
-def _file_credentials(path: str, text: str) -> List[str]:
+def _file_credentials(path: str, text: str, installed: bool = False) -> List[str]:
     """Name the inline credentials one file holds, never their values.
 
     The file is named when it holds an AWS access key ID or a private key
     block, and each credential variable of a .env file is named on its own.
     In any other file, each identifier whose name names a credential (an API
     key, a client secret, a token, a password) and that is assigned a quoted
-    literal shaped like key material is named, as is a quoted Bearer token.
+    literal shaped like key material is named, as is a quoted Bearer token,
+    unless `installed` says a package installed the file.
     """
     found = [path] if _text_holds_a_credential(text) else []
-    if not path.rsplit("/", 1)[-1].endswith(".env"):
+    if not installed and not path.rsplit("/", 1)[-1].endswith(".env"):
         found.extend(
             f"{path} assignment {name}"
             for name in _code_assigned_credentials(path, text)
@@ -25154,7 +25198,9 @@ def _file_credentials(path: str, text: str) -> List[str]:
     return found
 
 
-def _streamed_file_credentials(path: str, handle: Any) -> List[str]:
+def _streamed_file_credentials(
+    path: str, handle: Any, installed: bool = False
+) -> List[str]:
     """Scan one file read from `handle` in chunks, so no file is skipped.
 
     Each chunk is matched together with the tail of the one before, from the
@@ -25168,7 +25214,7 @@ def _streamed_file_credentials(path: str, handle: Any) -> List[str]:
         if not chunk:
             break
         text = carry + chunk.decode("utf-8", "ignore")
-        found.update(dict.fromkeys(_file_credentials(path, text)))
+        found.update(dict.fromkeys(_file_credentials(path, text, installed)))
         tail = text[-AC34_SCAN_OVERLAP_CHARS:]
         carry = tail[tail.find("\n") + 1 :]
     return list(found)
@@ -25268,8 +25314,9 @@ def _agentcore_runtime_code_credential_findings(
                     "material, and no .env file holds credential material "
                     f"inline. {bounds}",
                     "No action required. Assignments are not matched under "
-                    "site-packages, dist-packages or node_modules, where installed "
-                    "packages keep sample credentials; a .env file's variables are "
+                    "site-packages, dist-packages or node_modules, or in a file a "
+                    "package's .dist-info RECORD lists, where installed packages "
+                    "keep sample credentials; a .env file's variables are "
                     "judged by name and value shape, as the environment variable "
                     "row does.",
                     SeverityEnum.HIGH,

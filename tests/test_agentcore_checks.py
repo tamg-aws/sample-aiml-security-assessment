@@ -20219,6 +20219,39 @@ class TestAC34RuntimeCode:
         assert expected in rows[0]["Finding_Details"]
         assert secret not in json.dumps(rows[0])
 
+    @pytest.mark.parametrize("root", ["", "app/"], ids=["archive-root", "subdir"])
+    def test_a_file_a_package_record_lists_is_not_matched_for_assignments(self, root):
+        """A code archive holds its dependencies at the root beside the agent.
+
+        Before this fix every assignment in a vendored package was matched,
+        so a live archive in 178113193057 failed on botocore's examples.
+        Only the file the RECORD lists is spared, and only its assignments.
+        """
+        source = 'CLIENT_SECRET = "Zx9kP2mQ7rT4vW1y"\n'
+        record = (
+            "vendored/examples.py,sha256=x,40\n"
+            "vendored/keys.py,sha256=y,40\n"
+            "vendored-1.0.dist-info/RECORD,,\n"
+        )
+        rows = self._run(
+            {"rt-a": "a.zip"},
+            {
+                "code-bucket/a.zip": self._zip(
+                    {
+                        f"{root}vendored/examples.py": source,
+                        f"{root}vendored/keys.py": f"k = '{self._ACCESS_KEY}'\n",
+                        f"{root}vendored-1.0.dist-info/RECORD": record,
+                        f"{root}agent/main.py": source,
+                    }
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert f"{root}agent/main.py assignment CLIENT_SECRET" in details
+        assert f"{root}vendored/examples.py" not in details
+        assert f"{root}vendored/keys.py in s3://" in details
+
     @pytest.mark.parametrize(
         "path, source",
         [
