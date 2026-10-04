@@ -24382,7 +24382,8 @@ class TestSM39EgressForEveryAgentHost:
 
 
 class TestSM26PromptInjectionFindings:
-    """AIR-FND-DET-04: active GuardDuty prompt-injection findings."""
+    """AIR-FND-DET-04: a GuardDuty prompt-injection finding is the example
+    flagged event; AI Protection is the detection rule."""
 
     INVENTORY = TestProposedSageMakerChecks.ENABLED_INVENTORY
 
@@ -24415,22 +24416,23 @@ class TestSM26PromptInjectionFindings:
         ]
 
     @patch("sagemaker_app.boto3.client")
-    def test_no_active_finding_passes(self, mock_client):
+    def test_no_finding_passes_and_says_no_example_exists(self, mock_client):
         rows = self._rows(mock_client)
         assert [r["Status"] for r in rows] == ["Passed"]
         assert (
-            "No active (unarchived) Impact:IAMUser/PromptInjection.Direct"
-            in (rows[0]["Finding_Details"])
-        )
+            "AI Protection is enabled on detector detector-1, the rule that raises "
+            "Impact:IAMUser/PromptInjection.Direct findings. No such finding, "
+            "archived or not, exists on the detector, so no example flagged event "
+            "exists yet."
+        ) in rows[0]["Finding_Details"]
         criterion = self.calls[0]["FindingCriteria"]["Criterion"]
-        assert criterion["type"] == {
-            "Equals": ["Impact:IAMUser/PromptInjection.Direct"]
+        assert criterion == {
+            "type": {"Equals": ["Impact:IAMUser/PromptInjection.Direct"]}
         }
-        assert criterion["service.archived"] == {"Equals": ["false"]}
         assert self.calls[0]["DetectorId"] == "detector-1"
 
     @patch("sagemaker_app.boto3.client")
-    def test_active_findings_on_every_page_fail(self, mock_client):
+    def test_findings_on_every_page_pass_as_the_flagged_event(self, mock_client):
         rows = self._rows(
             mock_client,
             pages=[["f-new"], ["f-2", "f-3"]],
@@ -24440,11 +24442,13 @@ class TestSM26PromptInjectionFindings:
                 "Resource": {"ResourceType": "AccessKey"},
             },
         )
-        assert [r["Status"] for r in rows] == ["Failed"]
+        assert [r["Status"] for r in rows] == ["Passed"]
         details = rows[0]["Finding_Details"]
         assert details.startswith(
-            "3 active (unarchived) Impact:IAMUser/PromptInjection.Direct finding(s)"
+            "AI Protection is enabled on detector detector-1 and has raised 3 "
+            "Impact:IAMUser/PromptInjection.Direct finding(s), archived included"
         )
+        assert rows[0]["Resolution"] == "No action required"
         assert (
             "The latest, f-new, was last updated 2026-10-01T11:21:39.633Z and "
             "counts 67 event(s) against a AccessKey resource."
@@ -24459,15 +24463,15 @@ class TestSM26PromptInjectionFindings:
         }
 
     @patch("sagemaker_app.boto3.client")
-    def test_an_unread_example_keeps_the_failure(self, mock_client):
+    def test_an_unread_example_still_names_the_finding_id(self, mock_client):
         rows = self._rows(
             mock_client,
             pages=[["f-1"]],
             latest=_make_client_error("AccessDeniedException"),
         )
-        assert [r["Status"] for r in rows] == ["Failed"]
+        assert [r["Status"] for r in rows] == ["Passed"]
         assert (
-            "guardduty:GetFindings failed (AccessDeniedException)"
+            "The latest is f-1; guardduty:GetFindings failed (AccessDeniedException)"
             in (rows[0]["Finding_Details"])
         )
 
@@ -24483,13 +24487,16 @@ class TestSM26PromptInjectionFindings:
         )
 
     @patch("sagemaker_app.boto3.client")
-    def test_without_ai_protection_the_findings_are_not_read(self, mock_client):
+    def test_without_ai_protection_detection_fails(self, mock_client):
         inventory = {
             "detector_id": "detector-1",
             "detail": {"Status": "ENABLED", "Features": []},
             "error": None,
         }
         rows = self._rows(mock_client, pages=[["f-1"]], inventory=inventory)
-        assert [r["Status"] for r in rows] == ["N/A"]
-        assert "AI Protection is not enabled" in rows[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "AI Protection is not enabled on this detector, so GuardDuty runs no "
+            "rule that raises an Impact:IAMUser/PromptInjection.Direct finding"
+        ) in rows[0]["Finding_Details"]
         assert self.calls == []
