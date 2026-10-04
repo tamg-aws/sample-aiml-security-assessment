@@ -338,6 +338,7 @@ _EXPECTED_ACTIONS = {
         "lambda:ListMicrovmImageVersions",
         "guardduty:ListFindings",
         "guardduty:GetFindings",
+        "ec2:DescribeVpcAttribute",
         "organizations:ListAWSServiceAccessForOrganization",
         "sagemaker:DescribeModelBiasJobDefinition",
         "sagemaker:DescribeModelExplainabilityJobDefinition",
@@ -1190,6 +1191,11 @@ _SAGEMAKER_MANAGED_GRANTS = [
                 "${AWS::AccountId}:instance-profile/*"
             }
         ),
+    ),
+    (
+        "Allow",
+        "ec2:DescribeVpcAttribute",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:vpc/*"}),
     ),
     (
         "Allow",

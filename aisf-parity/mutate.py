@@ -1015,6 +1015,56 @@ MUTATIONS = [
             '    if True:\n        return _row(\n            f"No active (unarchived)'
         ),
     },
+    {
+        "name": "SM-33 credits private DNS in a VPC with DNS off",
+        "file": SAGEMAKER,
+        "defect": "private DNS creates no record for the default hostname in a "
+        "VPC with enableDnsSupport or enableDnsHostnames false, so the job "
+        "reaches the public service while the endpoint is credited",
+        "find": "            if value is False:\n                dns_off",
+        "replace": "            if False:\n                dns_off",
+    },
+    {
+        "name": "SM-33 passes a VPC whose DNS attributes were not read",
+        "file": SAGEMAKER,
+        "defect": "a VPC whose DescribeVpcAttribute read failed is counted "
+        "complete, so a failed read yields Passed",
+        "find": (
+            "        elif vpc_id in dns_unread:\n"
+            "            unread.extend(dns_unread[vpc_id])"
+        ),
+        "replace": "        elif False:\n            unread.extend(dns_unread[vpc_id])",
+    },
+    {
+        "name": "SM-33 reads only the first VPC's DNS attributes",
+        "file": SAGEMAKER,
+        "defect": "only the first VPC holding an interface endpoint is read, so "
+        "a second VPC with DNS off passes",
+        "find": "    for vpc_id in sorted(present):\n        if not dns_served(vpc_id):",
+        "replace": (
+            "    for vpc_id in sorted(present)[:1]:\n        if not dns_served(vpc_id):"
+        ),
+    },
+    {
+        "name": "SM-18 holds a gateway-served S3 to the DNS attributes",
+        "file": SAGEMAKER,
+        "defect": "a service a gateway endpoint serves is reached by route, so "
+        "failing its interface endpoint on the VPC DNS attributes is a false "
+        "Failed",
+        "find": (
+            '            if not any(v.get("VpcEndpointType") == "Gateway" '
+            "for v in vpces)\n"
+        ),
+        "replace": "            if True\n",
+    },
+    {
+        "name": "SM-40 judges a deleted MicroVM image",
+        "file": SAGEMAKER,
+        "defect": "an image in DELETING or DELETED state is judged, so its "
+        "versions fail a workload that is being removed",
+        "find": 'if i.get("state") not in ("DELETING", "DELETED")',
+        "replace": "if True",
+    },
     # ------------------------------------------ the AgentCore verdict legs
     # Each entry reverts one round-6 verdict leg in agentcore_assessments to the
     # behaviour the regrade graded partial. The catcher is the test that pins the
@@ -2536,6 +2586,11 @@ GROUPS: dict[str, str] = {
     "SM-39 does not count an agent Lambda outside a VPC": "in the SageMaker verdict legs",
     "SM-39 drops EKS cluster subnets": "in the SageMaker verdict legs",
     "SM-26 passes active prompt-injection findings": "in the SageMaker verdict legs",
+    "SM-33 credits private DNS in a VPC with DNS off": "in the SageMaker verdict legs",
+    "SM-33 passes a VPC whose DNS attributes were not read": "in the SageMaker verdict legs",
+    "SM-33 reads only the first VPC's DNS attributes": "in the SageMaker verdict legs",
+    "SM-18 holds a gateway-served S3 to the DNS attributes": "in the SageMaker verdict legs",
+    "SM-40 judges a deleted MicroVM image": "in the SageMaker verdict legs",
     "AC-37 reads an allow-list SCP's omission as an Allow": "in the AgentCore verdict legs",
     "AC-37 passes when the organization's SCPs could not be listed": "in the AgentCore verdict legs",
     "AC-42 passes the population beside an unread configuration": "in the AgentCore verdict legs",

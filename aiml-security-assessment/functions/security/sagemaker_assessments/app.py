@@ -6768,7 +6768,7 @@ def check_ai_api_method_authorization(
     or AgentCore gateway target names. A token authorizer separates read from
     write only by scopes, and an IAM authorizer by the execute-api:Invoke
     grants in the IAM permissions cache; a Lambda authorizer separates them in
-    code no API returns.
+    code that is not read by this check.
     """
     findings = {"csv_data": []}
     named, unread = _ai_lambda_references(region)
@@ -6848,9 +6848,9 @@ def check_ai_api_method_authorization(
                 finding_details=(
                     f"{len(unjudged)} AI method(s) or grant(s) were not judged: "
                     f"{shown}. A Lambda authorizer separates read from write in "
-                    "its code, which no API returns, and an IAM authorizer in "
-                    "execute-api:Invoke grants, read only from the IAM "
-                    "permissions cache."
+                    "its code, which is not read by this check, and an IAM "
+                    "authorizer in execute-api:Invoke grants, read only from the "
+                    "IAM permissions cache."
                 ),
                 resolution=AI_API_AUTHORIZATION_RESOLUTION,
                 reference=AI_API_AUTHORIZATION_REFERENCE,
@@ -12640,7 +12640,10 @@ def _training_vpc_endpoint_findings(
     for each service in TRAINING_REQUIRED_ENDPOINT_SERVICES. An interface
     endpoint counts only with private DNS on, and not inbound-only, since the
     job resolves the service's default hostname; S3 counts as a gateway
-    endpoint or an interface endpoint under that rule.
+    endpoint or an interface endpoint under that rule. A VPC holding such an
+    interface endpoint, for a service no gateway endpoint serves, fails when
+    enableDnsSupport or enableDnsHostnames is false, and an unread attribute
+    leaves it N/A.
     AIR-SGM-EP-08 calls it for transform job models with S3 only, and with
     judge_s3_policy each S3 endpoint's policy must not grant object reads and
     writes on every bucket to any principal.
@@ -12757,6 +12760,45 @@ def _training_vpc_endpoint_findings(
             )
         ]
 
+    # Private DNS creates the default hostname's record only in a VPC with both
+    # DNS hostnames and DNS resolution enabled, so each VPC holding a credited
+    # interface endpoint has both attributes read. A service a gateway endpoint
+    # serves is reached by route, not by that record.
+    def dns_served(vpc_id: str) -> List[str]:
+        return sorted(
+            str(vpce.get("VpcEndpointId"))
+            for service in services
+            for vpces in [service_endpoints[vpc_id].get(service) or []]
+            if not any(v.get("VpcEndpointType") == "Gateway" for v in vpces)
+            for vpce in vpces
+            if vpce.get("VpcEndpointType") == "Interface"
+        )
+
+    dns_off, dns_unread = {}, {}
+    for vpc_id in sorted(present):
+        if not dns_served(vpc_id):
+            continue
+        for attribute in ("enableDnsSupport", "enableDnsHostnames"):
+            try:
+                value = (
+                    ec2_client.describe_vpc_attribute(VpcId=vpc_id, Attribute=attribute)
+                    .get(attribute[0].upper() + attribute[1:], {})
+                    .get("Value")
+                )
+            except Exception as error:
+                dns_unread.setdefault(vpc_id, []).append(
+                    f"{attribute} of {vpc_id} (ec2:DescribeVpcAttribute: "
+                    f"{get_assessment_error_label(error)})"
+                )
+                continue
+            if value is False:
+                dns_off.setdefault(vpc_id, []).append(attribute)
+            elif value is not True:
+                dns_unread.setdefault(vpc_id, []).append(
+                    f"{attribute} of {vpc_id} (not returned by "
+                    "ec2:DescribeVpcAttribute)"
+                )
+
     emitted = []
     complete = []
     unread = []
@@ -12838,7 +12880,32 @@ def _training_vpc_endpoint_findings(
                 statement = _broad_s3_endpoint_statement(policy)
                 if statement:
                     broad.append(f"{vpce.get('VpcEndpointId')} ({statement})")
-        if broad:
+        if vpc_id in dns_off:
+            interface_ids = dns_served(vpc_id)
+            emitted.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"VPC {vpc_id}, used by {subject}(s) "
+                        f"{', '.join(jobs[:5])}, has "
+                        f"{' and '.join(dns_off[vpc_id])} set to false "
+                        "(ec2:DescribeVpcAttribute), so the private DNS of "
+                        f"interface endpoint(s) {', '.join(interface_ids[:5])} "
+                        "creates no record for the service's default hostname "
+                        "and that hostname resolves to the public service."
+                    ),
+                    resolution=(
+                        "Set enableDnsSupport and enableDnsHostnames to true on "
+                        "the VPC (aws ec2 modify-vpc-attribute)."
+                    ),
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        elif broad:
             emitted.append(
                 create_finding(
                     check_id=check_id,
@@ -12889,7 +12956,7 @@ def _training_vpc_endpoint_findings(
                 )
             )
         elif policy_unread or reach_unread:
-            unread.extend(policy_unread + reach_unread)
+            unread.extend(policy_unread + reach_unread + dns_unread.get(vpc_id, []))
         elif missing:
             emitted.append(
                 create_finding(
@@ -12909,6 +12976,8 @@ def _training_vpc_endpoint_findings(
                     region=region,
                 )
             )
+        elif vpc_id in dns_unread:
+            unread.extend(dns_unread[vpc_id])
         else:
             complete.append(vpc_id)
     unresolved = [s for s in subnets if s not in subnet_vpcs]
@@ -12916,7 +12985,9 @@ def _training_vpc_endpoint_findings(
         f"{len(complete)} VPC(s) used by {subject}s have an endpoint for every "
         "required service that serves each job subnet, through its route table "
         "for a gateway endpoint or its Availability Zone for an interface "
-        f"endpoint: {', '.join(complete) or 'none'}."
+        f"endpoint: {', '.join(complete) or 'none'}. Each of them that relies on "
+        "an interface endpoint's private DNS has enableDnsSupport and "
+        "enableDnsHostnames true."
     )
     if judge_s3_policy:
         read_details += (
@@ -21070,8 +21141,9 @@ def _propagation_and_plaintext_findings(
                     "version(s) enables the /resume hook, within a "
                     "resumeTimeoutInSeconds the API holds to 1 to 60 seconds"
                     + (f": {'; '.join(resume_budgets[:10])}" if resume_budgets else "")
-                    + ". What the hook runs, and whether it re-fetches the secret, "
-                    "is not returned by any API."
+                    + ". The image's code artifact (codeArtifact.uri) is not "
+                    "read by this check, so what the hook runs, and whether it "
+                    "re-fetches the secret, is not judged."
                 ),
                 resolution="No action required",
                 reference=SECRET_PROPAGATION_REFERENCE,

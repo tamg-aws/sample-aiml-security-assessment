@@ -1041,6 +1041,14 @@ Resources:
             Action:
               - lambda:ListMicrovmImageVersions # SM-40
             Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
+          - Sid: EndpointVpcDnsAttributeRead
+            # SM-18 and SM-33 read enableDnsSupport and enableDnsHostnames of
+            # each VPC holding an interface endpoint they credit for private
+            # DNS. DescribeVpcAttribute has the vpc resource type.
+            Effect: Allow
+            Action:
+              - ec2:DescribeVpcAttribute # SM-18, SM-33
+            Resource: !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:vpc/*'
           - Sid: EKSFargateProfileList
             # SM-38 lists each EKS cluster's Fargate profiles, whose pods
             # Runtime Monitoring does not cover.

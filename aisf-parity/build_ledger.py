@@ -2320,8 +2320,8 @@ FOUNDATION_ROWS = [
         "Parameter Store, and a credential-named plaintext environment variable "
         "in an ECS container, a Lambda function, a SageMaker model container or "
         "a Lambda MicroVM image version. It fails an ACTIVE Lambda MicroVM image "
-        "version whose hooks.microvmHooks.resume is not ENABLED; what the hook "
-        "runs is not returned by any API. "
+        "version whose hooks.microvmHooks.resume is not ENABLED; the image's "
+        "code artifact is not read, so what the hook runs is not judged. "
         "A Lambda function is not graded on propagation, because no API shows "
         "whether it re-fetches a secret per invocation",
         [],

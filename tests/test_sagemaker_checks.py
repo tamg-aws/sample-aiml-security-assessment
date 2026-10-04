@@ -12631,16 +12631,19 @@ class TestSM40RotationHistoryAndPropagation:
         errors=None,
         models=None,
         microvms=None,
+        microvm_states=None,
     ):
         """services: [(cluster, name, task def arn)]; rules: [(pattern, targets)].
 
         models: {name: DescribeModel response, or an exception it raises}.
         microvms: {image name: [image versions], or an exception the version
         listing raises}; errors["microvm"] fails the image listing.
+        microvm_states: {image name: image state}, CREATED when not named.
         """
         errors = errors or {}
         models = models or {}
         microvms = microvms or {}
+        microvm_states = microvm_states or {}
         secrets = secrets if secrets is not None else [self._secret()]
         events = events or []
         services = services or []
@@ -12757,7 +12760,7 @@ class TestSM40RotationHistoryAndPropagation:
                                             "name": n,
                                             "imageArn": "arn:aws:lambda:us-east-1:"
                                             f"111122223333:microvm-image:{n}",
-                                            "state": "CREATED",
+                                            "state": microvm_states.get(n, "CREATED"),
                                         }
                                     ]
                                 }
@@ -15689,7 +15692,28 @@ def _in_vpc_job(subnet, isolated=True):
     }
 
 
-def _sm33_rows(jobs, subnets=None, vpces=None, job_pages=None):
+def _vpc_dns_attributes(dns_attributes=None, calls=None):
+    """describe_vpc_attribute over {(vpc id, attribute): bool, None or exception};
+    an attribute not named is true, and None returns no value."""
+    dns_attributes = dns_attributes or {}
+
+    def describe_vpc_attribute(VpcId, Attribute):
+        if calls is not None:
+            calls.append((VpcId, Attribute))
+        value = dns_attributes.get((VpcId, Attribute), True)
+        if isinstance(value, Exception):
+            raise value
+        response = {"VpcId": VpcId}
+        if value is not None:
+            response[Attribute[0].upper() + Attribute[1:]] = {"Value": value}
+        return response
+
+    return MagicMock(side_effect=describe_vpc_attribute)
+
+
+def _sm33_rows(
+    jobs, subnets=None, vpces=None, job_pages=None, dns_attributes=None, calls=None
+):
     """Run SM-33 over jobs {name: DescribeTrainingJob or exception}."""
     subnets = subnets or [_subnet("subnet-a", "vpc-1"), _subnet("subnet-b", "vpc-2")]
     tables = [
@@ -15722,7 +15746,8 @@ def _sm33_rows(jobs, subnets=None, vpces=None, job_pages=None):
             "describe_vpc_endpoints": vpces
             if isinstance(vpces, Exception)
             else [{"VpcEndpoints": vpces or []}],
-        }
+        },
+        describe_vpc_attribute=_vpc_dns_attributes(dns_attributes, calls),
     )
     with patch("sagemaker_app.boto3.client") as mock_client:
         mock_client.side_effect = _sm_client_factory(sagemaker=sm, ec2=ec2)
@@ -15980,6 +16005,8 @@ def _sm18_rows(
     vpces=None,
     job_pages=None,
     calls=None,
+    dns_attributes=None,
+    dns_calls=None,
 ):
     """Run SM-18 over jobs {name: DescribeTransformJob or exception}."""
     models = models if models is not None else {"m": _ISOLATED_MODEL}
@@ -16044,7 +16071,8 @@ def _sm18_rows(
                     else [_scoped_s3_gateway("vpc-1")]
                 }
             ],
-        }
+        },
+        describe_vpc_attribute=_vpc_dns_attributes(dns_attributes, dns_calls),
     )
     kms = MagicMock()
     kms.describe_key.side_effect = describe_key
@@ -22964,6 +22992,131 @@ class TestSM18S3InterfaceEndpointNeedsPrivateDns:
         assert [r["Status"] for r in row] == ["Failed"]
 
 
+class TestSM33VpcDnsAttributes:
+    """AIR-SGM-TRN-01: private DNS creates the default hostname's record only
+    in a VPC with enableDnsSupport and enableDnsHostnames both true."""
+
+    def _endpoints(self, dns_attributes=None, vpces=None, calls=None):
+        rows = _sm33_rows(
+            {"a": _in_vpc_job("subnet-a"), "b": _in_vpc_job("subnet-b")},
+            vpces=vpces
+            if vpces is not None
+            else _full_training_vpces("vpc-1") + _full_training_vpces("vpc-2"),
+            dns_attributes=dns_attributes,
+            calls=calls,
+        )
+        return _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+
+    def test_both_vpcs_with_dns_on_pass_and_each_is_read(self):
+        calls = []
+        rows = self._endpoints(calls=calls)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "relies on an interface endpoint's private DNS has enableDnsSupport "
+            "and enableDnsHostnames true" in rows[0]["Finding_Details"]
+        )
+        assert sorted(calls) == [
+            ("vpc-1", "enableDnsHostnames"),
+            ("vpc-1", "enableDnsSupport"),
+            ("vpc-2", "enableDnsHostnames"),
+            ("vpc-2", "enableDnsSupport"),
+        ]
+
+    @pytest.mark.parametrize("attribute", ["enableDnsSupport", "enableDnsHostnames"])
+    def test_only_the_vpc_with_an_attribute_off_fails(self, attribute):
+        rows = self._endpoints({("vpc-2", attribute): False})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"VPC vpc-2, used by training job(s) b, has {attribute} set to false "
+            "(ec2:DescribeVpcAttribute), so the private DNS of interface "
+            "endpoint(s) vpce-vpc-2-ecr.api"
+        ) in details
+        assert "vpc-1" not in details
+        assert "modify-vpc-attribute" in rows[0]["Resolution"]
+
+    def test_both_attributes_off_are_named(self):
+        rows = self._endpoints(
+            {
+                ("vpc-1", "enableDnsSupport"): False,
+                ("vpc-1", "enableDnsHostnames"): False,
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "has enableDnsSupport and enableDnsHostnames set to false"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "value, text",
+        [
+            (
+                _make_client_error("UnauthorizedOperation"),
+                "enableDnsHostnames of vpc-2 (ec2:DescribeVpcAttribute: "
+                "UnauthorizedOperation)",
+            ),
+            (None, "enableDnsHostnames of vpc-2 (not returned by"),
+        ],
+    )
+    def test_an_unread_attribute_is_not_passed(self, value, text):
+        rows = self._endpoints({("vpc-2", "enableDnsHostnames"): value})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Finding"].endswith(" Incomplete")
+        assert text in rows[0]["Finding_Details"]
+        assert "1 VPC(s) used by training jobs" in rows[0]["Finding_Details"]
+
+    def test_a_missing_endpoint_still_fails_when_the_attribute_is_unread(self):
+        vpces = [
+            v
+            for v in _full_training_vpces("vpc-1")
+            if "ecr.dkr" not in v["ServiceName"]
+        ] + _full_training_vpces("vpc-2")
+        rows = self._endpoints(
+            {("vpc-1", "enableDnsSupport"): _make_client_error("AccessDenied")},
+            vpces=vpces,
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed"]
+        assert "com.amazonaws.us-east-1.ecr.dkr" in rows[0]["Finding_Details"]
+
+
+class TestSM18VpcDnsAttributes:
+    """AIR-SGM-EP-08: the transform path's S3 interface endpoint needs the
+    same VPC DNS attributes; a gateway endpoint does not resolve by DNS."""
+
+    def _row(self, vpces, dns_attributes, calls=None):
+        rows = _sm18_rows(
+            {"j": _transform_job()},
+            vpces=vpces,
+            dns_attributes=dns_attributes,
+            dns_calls=calls,
+        )
+        return _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+
+    def test_an_interface_endpoint_beside_a_gateway_is_not_held_to_them(self):
+        calls = []
+        row = self._row(
+            [_s3_interface("vpc-1", dns=True), _scoped_s3_gateway("vpc-1")],
+            {("vpc-1", "enableDnsSupport"): False},
+            calls,
+        )
+        assert [r["Status"] for r in row] == ["Passed"]
+        assert calls == []
+
+    def test_an_interface_endpoint_in_a_vpc_without_dns_support_fails(self):
+        row = self._row(
+            [_s3_interface("vpc-1", dns=True)], {("vpc-1", "enableDnsSupport"): False}
+        )
+        assert [r["Status"] for r in row] == ["Failed"]
+        assert "has enableDnsSupport set to false" in row[0]["Finding_Details"]
+
+    def test_a_gateway_endpoint_is_not_held_to_the_attributes(self):
+        row = self._row(
+            [_scoped_s3_gateway("vpc-1")], {("vpc-1", "enableDnsSupport"): False}
+        )
+        assert [r["Status"] for r in row] == ["Passed"]
+
+
 # ===================================================================
 # Round 7: AIR-FND-DET-02 GuardDuty finding review in Security Hub
 # ===================================================================
@@ -23686,6 +23839,36 @@ class TestSM40MicrovmResumeHook:
         ) in rows[0]["Finding_Details"]
         assert "hunter2" not in rows[0]["Finding_Details"]
 
+    def test_the_passed_text_says_the_hook_code_is_not_read(self):
+        rows = self._propagation(microvms={"agent": [_sm40_microvm_version()]})
+        details = rows[0]["Finding_Details"]
+        assert (
+            "The image's code artifact (codeArtifact.uri) is not read by this "
+            "check, so what the hook runs, and whether it re-fetches the secret, "
+            "is not judged."
+        ) in details
+        assert "not returned by any API" not in details
+
+    @pytest.mark.parametrize("state", ["DELETING", "DELETED"])
+    def test_a_deleting_or_deleted_image_is_not_judged(self, state):
+        microvms = {
+            "gone": [_sm40_microvm_version(resume="DISABLED")],
+            "kept": [_sm40_microvm_version()],
+        }
+        rows = self._propagation(microvms=microvms, microvm_states={"gone": state})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Each of the 1 ACTIVE" in rows[0]["Finding_Details"]
+        assert "image gone" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "state", ["CREATED", "UPDATING", "UPDATED", "UPDATE_FAILED", "DELETE_FAILED"]
+    )
+    def test_an_image_in_any_other_state_is_judged(self, state):
+        microvms = {"gone": [_sm40_microvm_version(resume="DISABLED")]}
+        rows = self._propagation(microvms=microvms, microvm_states={"gone": state})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Lambda MicroVM image gone version 1 has" in rows[0]["Finding_Details"]
+
 
 def _sm02_invoke_cache(
     *statements, name="app", boundary=None, errors=None, kind="role"
@@ -23735,6 +23918,20 @@ class TestSM02IamAuthorizedMethodGrants:
         return TestSM02AIApiMethodAuthorization()._run(
             rest=rest or self._rest(), cache=cache, **kwargs
         )
+
+    def test_the_not_judged_text_says_lambda_authorizer_code_is_not_read(self):
+        suite = TestSM02AIApiMethodAuthorization
+        rows = suite()._run(
+            rest={"api": {"/x": {"POST": suite._method(suite.BEDROCK, kind="CUSTOM")}}}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "A Lambda authorizer separates read from write in its code, which is "
+            "not read by this check, and an IAM authorizer in execute-api:Invoke "
+            "grants, read only from the IAM permissions cache."
+        ) in details
+        assert "no API returns" not in details
 
     def test_per_verb_grants_pass(self):
         rows = self._run(
