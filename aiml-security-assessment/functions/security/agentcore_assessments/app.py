@@ -13,6 +13,7 @@ from functools import lru_cache
 import logging
 import os
 import re
+import tarfile
 import time
 import zipfile
 import zlib
@@ -1036,6 +1037,25 @@ NETWORK_PATH_CONDITION_KEYS = {
     "aws:vpcsourceip",
     "aws:sourceip",
 }
+
+# The keys that confine a request to a private path. An address key does not: a
+# Deny on aws:SourceIp admits every caller at a listed address, a public one over
+# the internet included, and an aws:VpcSourceIp range can repeat in another
+# account's VPC. AIR-ACR-GW-04 and AIR-ACR-RT-13 name these two, with the
+# address keys as a supplement.
+PRIVATE_NETWORK_PATH_CONDITION_KEYS = {"aws:sourcevpc", "aws:sourcevpce"}
+
+
+def _address_only_restriction_text(keys: List[str]) -> str:
+    """Name a network restriction that no Deny on a VPC key carries."""
+    if not keys:
+        return ""
+    return (
+        f" A Deny restricts it by {', '.join(keys)}, but no Deny keyed only on "
+        "aws:SourceVpc or aws:SourceVpce does, so a caller at an address the "
+        "condition admits reaches it without a private path."
+    )
+
 
 # Every action that invokes a runtime, from the bedrock-agentcore service
 # reference, where each takes the runtime and runtime-endpoint resource types. A
@@ -17445,15 +17465,17 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
 
 
 def _archive_bucket_lock(
-    bucket: str, lock_cache: Dict[str, Tuple[str, Any]]
+    bucket: str, lock_cache: Dict[str, Tuple[str, Any]], source_account: str = ""
 ) -> Tuple[str, str]:
     """Judge the Object Lock default retention of one archive bucket.
 
     Returns ("ok", text), ("bad", text) or ("unread", text). Firehose writes
     objects with no retention of their own, so only the bucket's default
     retention locks them, and only COMPLIANCE mode holds against a principal
-    with s3:BypassGovernanceRetention. ExpectedBucketOwner is not passed: the
-    archive bucket belongs to a separate Log Archive account by design.
+    with s3:BypassGovernanceRetention. With `source_account`, a locked bucket
+    is read again with ExpectedBucketOwner set to it: S3 denies that read when
+    another account owns the bucket, so a read that succeeds shows the archive
+    sits in the account whose logs it holds and not in a Log Archive account.
     """
     if bucket not in lock_cache:
         try:
@@ -17493,8 +17515,40 @@ def _archive_bucket_lock(
         if retention.get("Days")
         else f"{retention.get('Years')} year(s)"
     )
-    return "ok", (
+    locked = (
         f"bucket '{bucket}', whose default retention is COMPLIANCE mode for {period}"
+    )
+    if not source_account:
+        return "ok", locked
+    owner_key = f"{bucket} owned by {source_account}"
+    if owner_key not in lock_cache:
+        try:
+            s3_client.get_object_lock_configuration(
+                Bucket=bucket, ExpectedBucketOwner=source_account
+            )
+            lock_cache[owner_key] = ("read", True)
+        except Exception as error:
+            code = _s3_error_code(error)
+            if code == "ObjectLockConfigurationNotFoundError":
+                lock_cache[owner_key] = ("read", True)
+            elif code in ("AccessDenied", "403"):
+                lock_cache[owner_key] = ("read", False)
+            else:
+                lock_cache[owner_key] = ("error", _assessment_error_label(error))
+    owner_state, owned = lock_cache[owner_key]
+    if owner_state == "error":
+        return "unread", (
+            f"s3:GetBucketObjectLockConfiguration with ExpectedBucketOwner "
+            f"{source_account} on bucket '{bucket}' ({owned})"
+        )
+    if owned:
+        return "bad", (
+            f"bucket '{bucket}', which account {source_account} owns, so the "
+            "archive is not held in a separate Log Archive account"
+        )
+    return "ok", (
+        f"{locked}, and a read naming account {source_account} as its expected "
+        "owner is denied, so another account owns it"
     )
 
 
@@ -17504,6 +17558,7 @@ def _subscription_filter_archive(
     stream_cache: Dict[str, Any],
     lock_cache: Dict[str, Tuple[str, Any]],
     label: str = "",
+    separate_account: bool = True,
 ) -> Tuple[str, str]:
     """Follow one subscription filter to its archive and judge the copy.
 
@@ -17514,7 +17569,8 @@ def _subscription_filter_archive(
     destination; a Lambda record processor on that stream can drop or rewrite
     records before the bucket holds them. A CloudWatch Logs destination, a
     Kinesis stream, a Lambda function or another account's stream is not
-    followed.
+    followed. With `separate_account`, a bucket `account` owns fails, because
+    the archive belongs in a separate Log Archive account.
     """
     label = label or f"subscription filter '{subscription.get('filterName') or '?'}'"
     pattern = str(subscription.get("filterPattern") or "").strip()
@@ -17605,7 +17661,9 @@ def _subscription_filter_archive(
             )
             continue
         bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
-        state, text = _archive_bucket_lock(bucket, lock_cache)
+        state, text = _archive_bucket_lock(
+            bucket, lock_cache, account if separate_account else ""
+        )
         verdicts.append((state, f"{stream_label}, which delivers to {text}"))
     if not verdicts:
         return "bad", f"{stream_label} reports no destination"
@@ -17852,6 +17910,7 @@ def _log_archive_destination_findings(
             stream_cache,
             lock_cache,
             label=label,
+            separate_account=False,
         )
         if state == "ok":
             details = (
@@ -18949,7 +19008,7 @@ def _restricting_source_vpce_values(
             statement,
             "bedrock-agentcore:InvokeGateway",
             gateway_arn,
-            NETWORK_PATH_CONDITION_KEYS,
+            PRIVATE_NETWORK_PATH_CONDITION_KEYS,
             _network_values_are_bounded,
             exempt_aws_service=True,
         )
@@ -19223,10 +19282,19 @@ def _gateway_resource_policy_findings(
         _document_statements(policy),
         "bedrock-agentcore:InvokeGateway",
         str(gateway_arn),
+        PRIVATE_NETWORK_PATH_CONDITION_KEYS,
+        _network_values_are_bounded,
+        exempt_aws_service=True,
+    )
+    address_keys, address_gaps = _resource_policy_restriction(
+        _document_statements(policy),
+        "bedrock-agentcore:InvokeGateway",
+        str(gateway_arn),
         NETWORK_PATH_CONDITION_KEYS,
         _network_values_are_bounded,
         exempt_aws_service=True,
     )
+    network_gaps = list(dict.fromkeys(address_gaps + network_gaps))
     vpce_values = (
         _restricting_source_vpce_values(_document_statements(policy), str(gateway_arn))
         if "aws:sourcevpce" in network_keys
@@ -19319,9 +19387,8 @@ def _gateway_resource_policy_findings(
                     )
                 ),
                 resolution=(
-                    "No action required. Confirm the VPC, VPC endpoint or address "
-                    "range named in the condition is the approved private path for "
-                    "this workload."
+                    "No action required. Confirm the VPC or VPC endpoint named in "
+                    "the condition is the approved private path for this workload."
                 ),
                 reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                 severity=SeverityEnum.MEDIUM,
@@ -19341,10 +19408,10 @@ def _gateway_resource_policy_findings(
                 finding_details=(
                     f"{label} has no resource policy Deny that refuses "
                     "bedrock-agentcore:InvokeGateway to every principal outside a "
-                    "bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or "
-                    "aws:SourceIp value, so any caller holding a valid authorizer "
-                    "token reaches it over any network path, including the public "
-                    f"internet.{gap_text}"
+                    "bounded aws:SourceVpc or aws:SourceVpce value, so any caller "
+                    "holding a valid authorizer token reaches it over any network "
+                    "path, including the public internet."
+                    f"{_address_only_restriction_text(address_keys)}{gap_text}"
                 ),
                 resolution=(
                     "Attach a gateway resource policy that denies calls whose "
@@ -23877,9 +23944,9 @@ CREDENTIAL_TEXT_PATTERN = re.compile(
 # What every passing AC-34 finding states it could not read.
 AC34_CODE_CEILING = (
     "The agent's code that agentRuntimeArtifact names in S3 is judged in the "
-    "AgentCore Runtime Code Inline Credentials row. A container image's configuration is judged in the "
-    "AgentCore Runtime Image Inline Credentials row, and its file system layers "
-    "are not scanned."
+    "AgentCore Runtime Code Inline Credentials row. A container image's "
+    "configuration and file system layers are judged in the AgentCore Runtime "
+    "Image Inline Credentials row."
 )
 AC34_IMAGE_FINDING = "AgentCore Runtime Image Inline Credentials"
 AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
@@ -23902,6 +23969,15 @@ ECR_IMAGE_INDEX_TYPES = (
 ECR_IMAGE_MAX_PLATFORMS = 8
 ECR_IMAGE_CONFIG_MAX_BYTES = 1024 * 1024
 ECR_IMAGE_CONFIG_TIMEOUT_SECONDS = 10
+# Bounds on the image layers AC-34 reads. Each layer is streamed and unpacked
+# one file at a time, so memory holds one file of at most
+# AC34_CODE_FILE_MAX_BYTES. The totals, over every platform of one image, bound
+# the time a scan takes: the compressed one is checked against the sizes the
+# manifest declares before anything is fetched, and an image over either is
+# not read.
+AC34_IMAGE_LAYERS_MAX_BYTES = 512 * 1024 * 1024
+AC34_IMAGE_UNPACKED_MAX_BYTES = 1024 * 1024 * 1024
+ECR_IMAGE_LAYER_TIMEOUT_SECONDS = 30
 
 
 def _value_is_a_credential_literal(value: str) -> bool:
@@ -24446,18 +24522,27 @@ def _code_archive_credentials(
                     f"file {info.filename} in the archive could not be read"
                 ) from None
             scanned += 1
-            if _text_holds_a_credential(text):
-                found.append(info.filename)
-            if info.filename.rsplit("/", 1)[-1].endswith(".env"):
-                environment = {}
-                for line in text.splitlines():
-                    name, separator, value = line.strip().partition("=")
-                    if separator and name and not name.startswith("#"):
-                        name = name.removeprefix("export ").strip()
-                        environment[name] = value.strip().strip("'\"")
-                literals, _ = _credential_entries(environment)
-                found.extend(f"{info.filename} variable {name}" for name in literals)
+            found.extend(_file_credentials(info.filename, text))
     return found, scanned, oversized
+
+
+def _file_credentials(path: str, text: str) -> List[str]:
+    """Name the inline credentials one file holds, never their values.
+
+    The file is named when it holds an AWS access key ID or a private key
+    block, and each credential variable of a .env file is named on its own.
+    """
+    found = [path] if _text_holds_a_credential(text) else []
+    if path.rsplit("/", 1)[-1].endswith(".env"):
+        environment = {}
+        for line in text.splitlines():
+            name, separator, value = line.strip().partition("=")
+            if separator and name and not name.startswith("#"):
+                name = name.removeprefix("export ").strip()
+                environment[name] = value.strip().strip("'\"")
+        literals, _ = _credential_entries(environment)
+        found.extend(f"{path} variable {name}" for name in literals)
+    return found
 
 
 def _agentcore_runtime_code_credential_findings(
@@ -24590,15 +24675,59 @@ def _fetch_image_config(download_url: str) -> Dict[str, Any]:
     return document
 
 
+def _image_layer_credentials(
+    download_url: str, digest: str, unpacked: List[int]
+) -> Tuple[List[str], int, int]:
+    """Scan every file of one image layer from its pre-signed ECR layer URL.
+
+    The layer is a tar archive, gzipped or not, read as a stream. Returns the
+    credentials found (named by layer and path), the files scanned, and the
+    files over AC34_CODE_FILE_MAX_BYTES not scanned. `unpacked` carries the
+    image's running total of unpacked bytes across its layers. Raises OSError
+    or ValueError on a layer that cannot be fetched or unpacked whole.
+    """
+    if urlsplit(download_url).scheme != "https":
+        raise ValueError("the layer URL is not HTTPS")
+    found: List[str] = []
+    scanned = oversized = 0
+    try:
+        with urlopen(download_url, timeout=ECR_IMAGE_LAYER_TIMEOUT_SECONDS) as response:
+            with tarfile.open(fileobj=response, mode="r|*") as archive:
+                for member in archive:
+                    if not member.isfile():
+                        continue
+                    if member.size > AC34_CODE_FILE_MAX_BYTES:
+                        oversized += 1
+                        continue
+                    unpacked[0] += member.size
+                    if unpacked[0] > AC34_IMAGE_UNPACKED_MAX_BYTES:
+                        raise ValueError(
+                            "the image's layers unpack to more than the "
+                            f"{AC34_IMAGE_UNPACKED_MAX_BYTES} byte bound"
+                        )
+                    handle = archive.extractfile(member)
+                    text = (handle.read() if handle else b"").decode("utf-8", "ignore")
+                    scanned += 1
+                    found.extend(
+                        f"{name} in layer {digest}"
+                        for name in _file_credentials(member.name, text)
+                    )
+    except (tarfile.TarError, EOFError, zlib.error):
+        raise ValueError(f"layer {digest} could not be unpacked") from None
+    return found, scanned, oversized
+
+
 def _image_config_credentials(
     registry: str, region_name: str, repository: str, reference: str
-) -> Tuple[List[str], int, int]:
-    """Scan the configuration of every platform an ECR image reference names.
+) -> Tuple[List[str], int, int, int, int, int]:
+    """Scan the configuration and layers of every platform an ECR image names.
 
-    Returns the inline credentials found (named by variable or field, never
-    by value), the environment variables read, and the platforms read.
-    Raises ClientError, BotoCoreError, OSError or ValueError on a read that
-    fails, so the caller never reports an unread image as clean.
+    Returns the inline credentials found (named by variable, field or layer
+    file, never by value), the environment variables read, the platforms
+    read, the layers read, the layer files scanned, and the layer files over
+    the per-file bound not scanned. Raises ClientError, BotoCoreError,
+    OSError or ValueError on a read that fails, so the caller never reports
+    an unread image as clean.
     """
     client = _ecr_client_for(region_name)
     image_id = (
@@ -24644,6 +24773,26 @@ def _image_config_credentials(
     else:
         manifests = [document]
 
+    # A layer two platforms share is read once.
+    layers: Dict[str, int] = {}
+    for platform in manifests:
+        if not isinstance(platform.get("layers"), list):
+            raise ValueError("a manifest names no layers list")
+        for layer in platform["layers"]:
+            if (
+                not isinstance(layer, dict)
+                or not isinstance(layer.get("size"), int)
+                or not layer.get("digest")
+            ):
+                raise ValueError("a manifest layer names no size or digest")
+            layers[str(layer["digest"])] = layer["size"]
+    compressed = sum(layers.values())
+    if compressed > AC34_IMAGE_LAYERS_MAX_BYTES:
+        raise ValueError(
+            f"the image's layers are {compressed} bytes compressed, more than the "
+            f"{AC34_IMAGE_LAYERS_MAX_BYTES} byte bound"
+        )
+
     found: List[str] = []
     variables = 0
     for platform in manifests:
@@ -24665,22 +24814,35 @@ def _image_config_credentials(
             text = " ".join(str(part) for part in config.get(field) or [])
             if _text_holds_a_credential(text) and field not in found:
                 found.append(field)
-    return found, variables, len(manifests)
+    files = oversized = 0
+    unpacked = [0]
+    for layer_digest in layers:
+        url = client.get_download_url_for_layer(
+            registryId=registry, repositoryName=repository, layerDigest=layer_digest
+        ).get("downloadUrl")
+        layer_found, layer_files, layer_oversized = _image_layer_credentials(
+            str(url or ""), layer_digest, unpacked
+        )
+        found.extend(layer_found)
+        files += layer_files
+        oversized += layer_oversized
+    return found, variables, len(manifests), len(layers), files, oversized
 
 
 def _agentcore_runtime_image_credential_findings(
     images: Dict[str, Tuple[str, Set[str]]],
 ) -> List[Dict[str, Any]]:
-    """AC-34's image leg: scan each runtime's container image configuration.
+    """AC-34's image leg: scan each runtime's container image configuration
+    and file system layers.
 
     A container runtime names its image in
     agentRuntimeArtifact.containerConfiguration.containerUri, and the image's
     configuration carries the Env, Entrypoint and Cmd every process in the
-    microVM starts with. images holds the URIs of every version the runtime
-    leg read, keyed by runtime label; a version whose definition could not be
-    read is already reported N/A on the runtime leg's row. An image in another
-    account's registry is not read, because the role's ECR reads are scoped
-    to this account. The image's file system layers are not scanned.
+    microVM starts with, while its layers hold the agent's code. images holds
+    the URIs of every version the runtime leg read, keyed by runtime label; a
+    version whose definition could not be read is already reported N/A on the
+    runtime leg's row. An image in another account's registry is not read,
+    because the role's ECR reads are scoped to this account.
     """
 
     def finding(details, resolution, severity, status):
@@ -24694,6 +24856,13 @@ def _agentcore_runtime_image_credential_findings(
             status=status,
         )
 
+    layer_bounds = (
+        "Images whose layers total over "
+        f"{AC34_IMAGE_LAYERS_MAX_BYTES // (1024 * 1024)} MiB compressed, or unpack "
+        f"to over {AC34_IMAGE_UNPACKED_MAX_BYTES // (1024 * 1024)} MiB, are not "
+        f"read, and layer files over {AC34_CODE_FILE_MAX_BYTES // (1024 * 1024)} "
+        "MiB are not scanned."
+    )
     findings: List[Dict[str, Any]] = []
     for label, (account, uris) in images.items():
         found: List[str] = []
@@ -24712,7 +24881,14 @@ def _agentcore_runtime_image_credential_findings(
                 )
                 continue
             try:
-                credentials, variables, platforms = _image_config_credentials(
+                (
+                    credentials,
+                    variables,
+                    platforms,
+                    layers,
+                    files,
+                    oversized,
+                ) = _image_config_credentials(
                     registry, image_region, repository, uri[match.end() :]
                 )
             except (BotoCoreError, ClientError, OSError, ValueError) as error:
@@ -24724,20 +24900,27 @@ def _agentcore_runtime_image_credential_findings(
                     else _assessment_error_label(error)
                 )
                 unread.append(
-                    f"the configuration of {uri} could not be read ({reason})"
+                    f"the configuration or layers of {uri} could not be read ({reason})"
                 )
                 continue
             found.extend(f"{name} of {uri}" for name in credentials)
             scanned.append(
-                f"{uri} ({platforms} platform(s), {variables} Env variable(s))"
+                f"{uri} ({platforms} platform(s), {variables} Env variable(s), "
+                f"{layers} layer(s), {files} file(s) scanned"
+                + (
+                    f", {oversized} over the per-file bound not scanned"
+                    if oversized
+                    else ""
+                )
+                + ")"
             )
         if found:
             findings.append(
                 finding(
-                    f"{label} runs a container image whose configuration holds "
-                    f"credential material inline: {', '.join(found)}. Every "
-                    "process in the microVM starts with it. The values are "
-                    "withheld from this report."
+                    f"{label} runs a container image whose configuration or file "
+                    f"system layers hold credential material inline: "
+                    f"{', '.join(found)}. Every process in the microVM starts "
+                    "with it. The values are withheld from this report."
                     + (f" Not read: {'; '.join(unread)}." if unread else ""),
                     "Rebuild the image without the credential, pass a reference "
                     "to the AgentCore Identity token vault or AWS Secrets Manager "
@@ -24749,13 +24932,15 @@ def _agentcore_runtime_image_credential_findings(
         elif unread:
             findings.append(
                 finding(
-                    f"{label}: whether its container image configuration holds "
-                    f"an inline credential was not judged: {'; '.join(unread)}."
+                    f"{label}: whether its container image configuration or "
+                    "layers hold an inline credential was not judged: "
+                    f"{'; '.join(unread)}."
                     + (
                         f" Scanned with none found: {'; '.join(scanned)}."
                         if scanned
                         else ""
-                    ),
+                    )
+                    + f" {layer_bounds}",
                     "Grant ecr:BatchGetImage and ecr:GetDownloadUrlForLayer on "
                     "the repository, and let the function reach the ECR layer "
                     "URL over HTTPS, then retry.",
@@ -24767,13 +24952,14 @@ def _agentcore_runtime_image_credential_findings(
             findings.append(
                 finding(
                     f"{label} runs image(s) {'; '.join(scanned)}. No Env variable "
-                    "holds credential material inline, and neither Entrypoint "
-                    "nor Cmd holds an AWS access key ID or a private key block. "
-                    "The image's file system layers are not scanned.",
+                    "holds credential material inline, neither Entrypoint nor "
+                    "Cmd holds an AWS access key ID or a private key block, no "
+                    "layer file holds either, and no .env file in a layer holds "
+                    f"credential material inline. {layer_bounds}",
                     "No action required. The Env scan reads variable names and "
                     "value shapes, as the environment variable row does; "
-                    "Entrypoint and Cmd are matched only for those two "
-                    "credential forms.",
+                    "Entrypoint, Cmd and layer files are matched only for those "
+                    "two credential forms.",
                     SeverityEnum.HIGH,
                     StatusEnum.PASSED,
                 )
@@ -26104,17 +26290,34 @@ def _s3_schema_unread(label: str, error: Exception) -> str:
     return f"its {label} in S3 was not read ({reason})"
 
 
+def _mcp_tool_definitions(document: Any) -> List[Dict[str, Any]]:
+    """Return the tool definitions of an MCP server target's static tool schema.
+
+    The service asks for a schema aligned with the MCP specification, whose
+    tools/list result holds the definitions under "tools", so either that
+    object or the bare list is accepted.
+    """
+    if isinstance(document, dict) and "tools" in document:
+        document = document["tools"]
+    if not isinstance(document, list) or not all(
+        isinstance(tool, dict) for tool in document
+    ):
+        raise ValueError("it is not a JSON list of tool definitions")
+    return document
+
+
 def _gateway_tool_required_inputs(
     gateway_id: str,
 ) -> Tuple[Dict[str, Set[str]], Dict[str, str], Dict[str, Set[str]]]:
     """Map each tool of a gateway's targets to its required input paths.
 
     Returns `{target___tool: required paths}` for every tool a Lambda tool
-    schema defines, inline or in S3, nested required properties included, and
-    `{target name: reason}` for every target whose tool schemas were not read:
-    an MCP server, API Gateway or connector target, a schema not in JSON, an
-    S3 schema that could not be fetched within AC35_SCHEMA_MAX_BYTES, or a
-    target that could not be read. An OpenAPI or Smithy target's tools, inline
+    schema or an MCP server's static mcpToolSchema defines, inline or in S3,
+    nested required properties included, and `{target name: reason}` for
+    every target whose tool schemas were not read: an MCP server target with
+    no static mcpToolSchema, an API Gateway or connector target, a schema not
+    in JSON, an S3 schema that could not be fetched within
+    AC35_SCHEMA_MAX_BYTES, or a target that could not be read. An OpenAPI or Smithy target's tools, inline
     or in S3, go in the third map, the paths its schema marks required: those
     are unproven, because how the gateway exposes them in context.input is not
     documented, so only a read the schema does not mark required is judged on
@@ -26170,7 +26373,34 @@ def _gateway_tool_required_inputs(
             break
         else:
             schema = (mcp.get("lambda") or {}).get("toolSchema") or {}
-            if "inlinePayload" in schema:
+            server = mcp.get("mcpServer")
+            tool_schema = (
+                (server.get("mcpToolSchema") or {}) if isinstance(server, dict) else {}
+            )
+            if isinstance(server, dict) and "inlinePayload" in tool_schema:
+                try:
+                    definitions = _mcp_tool_definitions(
+                        json.loads(tool_schema.get("inlinePayload") or "")
+                    )
+                except (TypeError, ValueError) as error:
+                    unread[name] = f"its inline MCP tool schema was not read ({error})"
+                    continue
+            elif isinstance(server, dict) and tool_schema.get("s3"):
+                try:
+                    definitions = _mcp_tool_definitions(
+                        json.loads(_s3_schema_text(tool_schema["s3"]))
+                    )
+                except (BotoCoreError, ClientError, ValueError) as error:
+                    unread[name] = _s3_schema_unread("MCP tool schema", error)
+                    continue
+            elif isinstance(server, dict):
+                unread[name] = (
+                    "it is an MCP server target with no static mcpToolSchema, so "
+                    "its tools are discovered from the server at run time and no "
+                    "control-plane API returns them"
+                )
+                continue
+            elif "inlinePayload" in schema:
                 definitions = schema.get("inlinePayload") or []
             elif schema.get("s3"):
                 try:
@@ -26402,9 +26632,9 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                     StatusEnum.PASSED,
                     f"enforces policy engine {policy_engine_id}, and every "
                     "enforcing forbid reads a context.input path only when its "
-                    "tools' Lambda inputSchema, inline or read from S3, lists that "
-                    "path and every "
-                    "path above it as required, or after a has() test on it.",
+                    "tools' Lambda or MCP server inputSchema, inline or read from "
+                    "S3, lists that path and every path above it as required, or "
+                    "after a has() test on it.",
                     "No action required",
                 )
             )
@@ -29599,6 +29829,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
 
         tie_missing: List[str] = []
         tie_notes: List[str] = []
+        tie_unlisted: List[str] = []
         elsewhere_note = ""
         # An alarm is tied to a score only through a listed metric that names
         # an attached evaluator. Without one, an alarm on any metric in the
@@ -29671,15 +29902,24 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     if not ids:
                         continue
                     listed = sorted(set(ids) & listed_values)
-                    if not listed:
-                        tie_notes.append(
-                            f"ListMetrics lists no score of {', '.join(ids)}, so no "
-                            "alarm on it is required"
-                        )
-                        continue
                     # Each named safety evaluator scores a different failure, so
-                    # each listed safety score needs its own alarm, while either
-                    # tool-choice score answers the tool-choice leg.
+                    # each safety score needs its own alarm, while either
+                    # tool-choice score answers the tool-choice leg. A score
+                    # ListMetrics does not list has no alarm that can be shown
+                    # to read it, so it withholds the pass.
+                    unlisted = (
+                        sorted(set(ids) - listed_values)
+                        if category == "safety"
+                        else ([] if listed else ids)
+                    )
+                    if unlisted:
+                        tie_unlisted.extend(unlisted)
+                        tie_notes.append(
+                            f"ListMetrics lists no score of {', '.join(unlisted)}, "
+                            "so no alarm can be shown to read it"
+                        )
+                    if not listed:
+                        continue
                     groups = (
                         [[evaluator_id] for evaluator_id in listed]
                         if category == "safety"
@@ -29794,7 +30034,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     status=StatusEnum.NA,
                 )
             )
-        elif metric_error or untied:
+        elif metric_error or untied or tie_unlisted:
             findings.append(
                 create_finding(
                     check_id="AC-40",
@@ -29811,6 +30051,10 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                             "attached evaluator, so whether any of these alarms "
                             "reads the safety or tool-choice score, and not "
                             "another score in the namespace, is not confirmed."
+                            if untied
+                            else " Whether a falling score of "
+                            f"{', '.join(tie_unlisted)} notifies anyone is not "
+                            "confirmed."
                         )
                     ),
                     resolution=(
@@ -34234,10 +34478,18 @@ def check_agentcore_runtime_invocation_path(
         network_keys, network_gaps, network_open = _runtime_invoke_restriction(
             statements,
             str(runtime_arn or ""),
+            PRIVATE_NETWORK_PATH_CONDITION_KEYS,
+            _network_values_are_bounded,
+            exempt_aws_service=True,
+        )
+        address_keys, address_gaps, _ = _runtime_invoke_restriction(
+            statements,
+            str(runtime_arn or ""),
             NETWORK_PATH_CONDITION_KEYS,
             _network_values_are_bounded,
             exempt_aws_service=True,
         )
+        network_gaps = list(dict.fromkeys(address_gaps + network_gaps))
         if network_keys:
             exemption_text = (
                 " A Deny exempts calls an AWS service makes on the caller's "
@@ -34261,9 +34513,9 @@ def check_agentcore_runtime_invocation_path(
                         f"bounded.{exemption_text}"
                     ),
                     resolution=(
-                        "No action required. Confirm the VPC, VPC endpoint or "
-                        "address range named in the condition is the approved "
-                        "private path for this workload."
+                        "No action required. Confirm the VPC or VPC endpoint "
+                        "named in the condition is the approved private path for "
+                        "this workload."
                     ),
                     reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -34283,11 +34535,11 @@ def check_agentcore_runtime_invocation_path(
                     finding_details=(
                         f"{label} has no resource policy Deny that refuses every "
                         "runtime invoke action to every principal outside a "
-                        "bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or "
-                        "aws:SourceIp value, so a caller that satisfies its inbound "
-                        "authentication reaches it over any network path, "
-                        "including the public internet."
-                        f"{_open_actions_text(network_open)}{gap_text}"
+                        "bounded aws:SourceVpc or aws:SourceVpce value, so a caller "
+                        "that satisfies its inbound authentication reaches it over "
+                        "any network path, including the public internet."
+                        f"{_open_actions_text(network_open)}"
+                        f"{_address_only_restriction_text(address_keys)}{gap_text}"
                     ),
                     resolution=(
                         "Attach a runtime resource policy that denies "

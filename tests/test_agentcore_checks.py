@@ -21,6 +21,7 @@ import inspect
 import os
 import importlib.util
 import io
+import tarfile
 import textwrap
 import zipfile
 from contextlib import nullcontext
@@ -3721,6 +3722,31 @@ class TestAC06RecordingKeyPolicy:
 
         assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
         assert "kms:GetKeyPolicy" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_unreadable_key_policy_is_named_as_not_read(self, mock_s3, mock_kms):
+        # The write verdict also withholds on the unread key, so the status
+        # alone cannot show that the key leg recorded its failed read. The
+        # Not read clause has to name each bucket's key policy and the error.
+        findings = self._wire(
+            mock_s3,
+            mock_kms,
+            policy_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        assert (
+            "bucket 'recordings' key alias/recordings policy (kms:GetKeyPolicy "
+            "AccessDeniedException)" in findings[0]["Finding_Details"]
+        )
+        assert (
+            f"bucket 'other' key {_OPEN_RECORDING_KEY} policy (kms:GetKeyPolicy "
+            "AccessDeniedException)" in findings[1]["Finding_Details"]
+        )
+        assert "grants decrypt to no unbounded principal" not in "".join(
+            finding["Finding_Details"] for finding in findings
+        )
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.s3_client")
@@ -19205,7 +19231,9 @@ class TestAC34RuntimeInlineCredentials:
         assert "agentRuntimeArtifact" in resolution
         assert "AgentCore Runtime Code Inline Credentials row" in resolution
         assert "AgentCore Runtime Image Inline Credentials row" in resolution
-        assert "file system layers are not scanned" in resolution
+        # Stricter since round 8: the layers are scanned on the image row.
+        assert "configuration and file system layers are judged" in resolution
+        assert "not scanned" not in resolution
 
     @patch("agentcore_app.agentcore_client")
     def test_one_unreadable_runtime_does_not_hide_the_others(self, mock_ac):
@@ -20127,12 +20155,29 @@ class TestAC34RuntimeImages:
         response.__enter__.return_value = response
         return response
 
-    def _wire(self, mock_ac, mock_ecr, mock_open, runtimes, configs, index=None):
+    @staticmethod
+    def _layer(files, gzip=True):
+        """One image layer: a tar archive, gzipped by default, of {path: bytes}."""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz" if gzip else "w") as archive:
+            for path, data in files.items():
+                info = tarfile.TarInfo(path)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        return buffer.getvalue()
+
+    def _wire(
+        self, mock_ac, mock_ecr, mock_open, runtimes, configs, index=None, layers=None
+    ):
         """runtimes: {id: uri}. configs: {config digest: response}.
 
         A URI's tag (or digest) names its manifest; index maps a tag to the
-        child manifest digests of an image index.
+        child manifest digests of an image index. Since round 8 each manifest
+        names one layer, lyr-<ref>, whose bytes layers holds and which is a
+        clean file by default.
         """
+        layers = layers or {}
+        clean_layer = self._layer({"app/main.py": b"print('ok')\n"})
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [
                 {"agentRuntimeId": rid, "agentRuntimeName": rid} for rid in runtimes
@@ -20172,7 +20217,21 @@ class TestAC34RuntimeImages:
                             "application/vnd.oci.image.manifest.v1+json"
                         ),
                         "imageManifest": json.dumps(
-                            {"config": {"digest": f"cfg-{ref}"}}
+                            {
+                                "config": {"digest": f"cfg-{ref}"},
+                                "layers": [
+                                    {
+                                        "mediaType": (
+                                            "application/vnd.oci.image.layer."
+                                            "v1.tar+gzip"
+                                        ),
+                                        "digest": f"lyr-{ref}",
+                                        "size": len(
+                                            layers.get(f"lyr-{ref}", clean_layer)
+                                        ),
+                                    }
+                                ],
+                            }
                         ),
                     }
                 ]
@@ -20182,7 +20241,14 @@ class TestAC34RuntimeImages:
         mock_ecr.get_download_url_for_layer.side_effect = lambda layerDigest, **kw: {
             "downloadUrl": f"https://layer.example/{layerDigest}"
         }
-        mock_open.side_effect = lambda url, timeout: configs[url.rsplit("/", 1)[1]]
+
+        def open_url(url, timeout):
+            key = url.rsplit("/", 1)[1]
+            if key.startswith("lyr-"):
+                return io.BytesIO(layers.get(key, clean_layer))
+            return configs[key]
+
+        mock_open.side_effect = open_url
 
     @staticmethod
     def _image_rows(findings):
@@ -20212,7 +20278,9 @@ class TestAC34RuntimeImages:
         assert [r["Status"] for r in rows] == ["Passed", "Failed"]
         assert "(rt-a)" in rows[0]["Finding_Details"]
         assert "1 Env variable(s)" in rows[0]["Finding_Details"]
-        assert "file system layers are not scanned" in rows[0]["Finding_Details"]
+        # Stricter since round 8: the layers are scanned, and the row says so.
+        assert "1 layer(s), 1 file(s) scanned" in rows[0]["Finding_Details"]
+        assert "layers are not scanned" not in rows[0]["Finding_Details"]
         assert "(rt-b)" in rows[1]["Finding_Details"]
         assert f"Env API_KEY of {self._URI}:bad" in rows[1]["Finding_Details"]
         assert rows[1]["Severity"] == "High"
@@ -20498,6 +20566,189 @@ class TestAC34RuntimeImages:
         mock_boto3.client.assert_called_once()
         assert mock_boto3.client.call_args.kwargs["region_name"] == "eu-west-1"
         mock_ecr.batch_get_image.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "files, named",
+        [
+            (
+                {"app/settings.py": b"KEY = 'AKIAIOSFODNN7EXAMPLE'\n"},
+                "app/settings.py in layer lyr-bad",
+            ),
+            (
+                {"app/.env": f"API_KEY={_SECRET_VALUE}\n".encode()},
+                "app/.env variable API_KEY in layer lyr-bad",
+            ),
+            (
+                {"root/.ssh/id_rsa": b"-----BEGIN RSA PRIVATE KEY-----\nx\n"},
+                "root/.ssh/id_rsa in layer lyr-bad",
+            ),
+        ],
+        ids=["access-key", "dotenv", "private-key"],
+    )
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_credential_in_a_layer_fails_only_its_image(
+        self, mock_ac, mock_ecr, mock_open, files, named
+    ):
+        # Both configurations are clean, so only a layer scan tells them apart.
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean", "rt-b": f"{self._URI}:bad"},
+            {
+                "cfg-clean": self._config(env=["A=1"]),
+                "cfg-bad": self._config(env=["A=1"]),
+            },
+            layers={"lyr-bad": self._layer({"app/main.py": b"print('ok')\n", **files})},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        assert f"{named} of {self._URI}:bad" in rows[1]["Finding_Details"]
+        assert self._ACCESS_KEY not in json.dumps(rows)
+        assert _SECRET_VALUE not in json.dumps(rows)
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_platform_layer_is_scanned(self, mock_ac, mock_ecr, mock_open):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:multi"},
+            {
+                "cfg-sha256:amd": self._config(env=["A=1"]),
+                "cfg-sha256:arm": self._config(env=["A=1"]),
+            },
+            index={"multi": ["sha256:amd", "sha256:arm"]},
+            layers={"lyr-sha256:arm": self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"})},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "k.txt in layer lyr-sha256:arm" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_uncompressed_layer_is_scanned(self, mock_ac, mock_ecr, mock_open):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:bad"},
+            {"cfg-bad": self._config(env=["A=1"])},
+            layers={
+                "lyr-bad": self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"}, gzip=False)
+            },
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "case, phrase",
+        [
+            ("unreadable", "could not be read (OSError)"),
+            ("not-a-tar", "could not be unpacked"),
+            ("no-layers", "names no layers"),
+            ("no-size", "names no size"),
+            ("compressed-bound", "compressed, more than the 10 byte bound"),
+            ("unpacked-bound", "layers unpack to more than the 5 byte bound"),
+        ],
+    )
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_layer_not_read_whole_is_not_reported_clean(
+        self, mock_ac, mock_ecr, mock_open, case, phrase
+    ):
+        # The other image's layer holds a credential, so a bound or a read
+        # failure that skipped the layer would read as Passed on rt-a.
+        bad = self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"})
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:held"},
+            {"cfg-held": self._config(env=["A=1"])},
+            layers={"lyr-held": b"not a tar" if case == "not-a-tar" else bad},
+        )
+        if case == "unreadable":
+            original = mock_open.side_effect
+            mock_open.side_effect = lambda url, timeout: (
+                (_ for _ in ()).throw(OSError("reset"))
+                if url.endswith("lyr-held")
+                else original(url, timeout)
+            )
+        if case in ("no-layers", "no-size"):
+            original_batch = mock_ecr.batch_get_image.side_effect
+
+            def strip(**kwargs):
+                response = original_batch(**kwargs)
+                manifest = json.loads(response["images"][0]["imageManifest"])
+                if case == "no-layers":
+                    del manifest["layers"]
+                else:
+                    del manifest["layers"][0]["size"]
+                response["images"][0]["imageManifest"] = json.dumps(manifest)
+                return response
+
+            mock_ecr.batch_get_image.side_effect = strip
+        bound = {
+            "compressed-bound": ("AC34_IMAGE_LAYERS_MAX_BYTES", 10),
+            "unpacked-bound": ("AC34_IMAGE_UNPACKED_MAX_BYTES", 5),
+        }.get(case)
+        with patch.object(agentcore_app, *bound) if bound else nullcontext():
+            rows = self._image_rows(
+                agentcore_app.check_agentcore_runtime_inline_credentials()
+            )
+
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
+        assert "ecr:GetDownloadUrlForLayer" in rows[0]["Resolution"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_file_over_the_per_file_bound_is_counted(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:big"},
+            {"cfg-big": self._config(env=["A=1"])},
+            layers={
+                "lyr-big": self._layer(
+                    {"small.py": b"x = 1\n", "big.bin": b"AKIAIOSFODNN7EXAMPLE" * 4}
+                )
+            },
+        )
+
+        with patch.object(agentcore_app, "AC34_CODE_FILE_MAX_BYTES", 40):
+            rows = self._image_rows(
+                agentcore_app.check_agentcore_runtime_inline_credentials()
+            )
+
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "1 layer(s), 1 file(s) scanned, 1 over the per-file bound not scanned"
+            in rows[0]["Finding_Details"]
+        )
 
     @patch("agentcore_app.urlopen")
     @patch("agentcore_app.ecr_client")
@@ -25647,11 +25898,27 @@ def _published(*metrics):
     }
 
 
+def _companion_scores(namespace="Bedrock-AgentCore/Evaluations"):
+    """Listed and alarmed Stereotyping and tool-choice scores, as (alarms,
+    ListMetrics entries). Since round 8 a pass needs every attached safety score
+    and a tool-choice score listed and alarmed, so a test of one Harmfulness
+    alarm adds these and still fails if that one alarm is not credited."""
+    names = ("Builtin.Stereotyping", "Builtin.ToolSelectionAccuracy")
+    return (
+        [
+            _score_alarm(name=f"eval-{name}-drop", namespace=namespace, MetricName=name)
+            for name in names
+        ],
+        [(namespace, name, {}) for name in names],
+    )
+
+
 class TestAC40AlarmTiedToTheScore:
     """AC-40 ties a score alarm to the configuration and evaluators it reads."""
 
     _NS = "Bedrock-AgentCore/Evaluations"
     _HARM = "Builtin.Harmfulness"
+    _STEREO = "Builtin.Stereotyping"
     _TOOL = "Builtin.ToolSelectionAccuracy"
     _HELP = "Builtin.Helpfulness"
 
@@ -25689,11 +25956,11 @@ class TestAC40AlarmTiedToTheScore:
         metrics = [
             (self._NS, "Score", {"Config": config, "Evaluator": ev})
             for config in (own, other)
-            for ev in (self._HARM, self._TOOL)
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
         alarms = [
             self._alarm(f"second-{ev}", "Score", Config=other, Evaluator=ev)
-            for ev in (self._HARM, self._TOOL)
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
 
         findings = self._run(mock_ac, alarms, metrics, self._two_configs())
@@ -25701,8 +25968,9 @@ class TestAC40AlarmTiedToTheScore:
         assert [f["Status"] for f in findings] == ["Failed", "Passed"]
         assert "oec-1" in findings[0]["Finding_Details"]
         assert (
-            "alarm(s) second-Builtin.Harmfulness, second-Builtin.ToolSelectionAccuracy "
-            "read only another configuration's scores" in findings[0]["Finding_Details"]
+            "alarm(s) second-Builtin.Harmfulness, second-Builtin.Stereotyping, "
+            "second-Builtin.ToolSelectionAccuracy read only another "
+            "configuration's scores" in findings[0]["Finding_Details"]
         )
         assert "second-Builtin.Harmfulness" in findings[1]["Finding_Details"]
 
@@ -25751,10 +26019,12 @@ class TestAC40AlarmTiedToTheScore:
     @patch("agentcore_app.agentcore_client")
     def test_one_alarm_per_category_passes_and_names_what_it_reads(self, mock_ac):
         metrics = [
-            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+            (self._NS, "Score", {"Evaluator": ev})
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
         alarms = [
             self._alarm("harm-drop", "Score", Evaluator=self._HARM),
+            self._alarm("stereo-drop", "Score", Evaluator=self._STEREO),
             self._alarm("tool-drop", "Score", Evaluator=self._TOOL),
         ]
 
@@ -25775,10 +26045,12 @@ class TestAC40AlarmTiedToTheScore:
         self, mock_ac
     ):
         metrics = [
-            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+            (self._NS, "Score", {"Evaluator": ev})
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
         alarms = [
             self._alarm("harm-drop", "Score", Evaluator=self._HARM),
+            self._alarm("stereo-drop", "Score", Evaluator=self._STEREO),
             self._alarm("tool-drop", "Score", Evaluator=self._TOOL),
         ]
 
@@ -25787,19 +26059,49 @@ class TestAC40AlarmTiedToTheScore:
         assert [f["Status"] for f in findings] == ["Passed", "Passed"]
 
     @patch("agentcore_app.agentcore_client")
-    def test_a_category_listmetrics_does_not_list_is_not_required(self, mock_ac):
+    def test_a_category_listmetrics_does_not_list_is_not_passed(self, mock_ac):
         # No tool-choice score has recent data, so an alarm on it could not be
-        # told from one on a misspelled metric; the safety alarm alone passes.
-        metrics = [(self._NS, "Score", {"Evaluator": self._HARM})]
-        alarms = [self._alarm("harm-drop", "Score", Evaluator=self._HARM)]
+        # told from one on a misspelled metric. Stricter since round 8: the
+        # safety alarm alone no longer passes, because nothing shows a falling
+        # tool-choice score alerts anyone.
+        metrics = [
+            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._STEREO)
+        ]
+        alarms = [
+            self._alarm(f"{ev}-drop", "Score", Evaluator=ev)
+            for ev in (self._HARM, self._STEREO)
+        ]
 
         findings = self._run(mock_ac, alarms, metrics)
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
         assert (
             f"ListMetrics lists no score of {self._TOOL}"
             in findings[0]["Finding_Details"]
         )
+
+    @pytest.mark.parametrize("alarmed", [False, True], ids=["no-alarm", "alarm"])
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlisted_safety_score_withholds_the_pass(self, mock_ac, alarmed):
+        # Harmfulness and the tool-choice score are listed and alarmed, and
+        # Stereotyping, attached beside them, is not listed. Its alarm, when
+        # there is one, reads a metric ListMetrics does not list, so it is not
+        # counted either way and the configuration is not reported as alerting.
+        metrics = [
+            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+        ]
+        alarms = [
+            self._alarm(f"{ev}-drop", "Score", Evaluator=ev)
+            for ev in (self._HARM, self._TOOL) + ((self._STEREO,) if alarmed else ())
+        ]
+
+        findings = self._run(mock_ac, alarms, metrics)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        details = findings[0]["Finding_Details"]
+        assert f"ListMetrics lists no score of {self._STEREO}" in details
+        assert f"alarm(s) {self._HARM}-drop read the score of {self._HARM}" in details
+        assert "is not confirmed" in details
 
     @patch("agentcore_app.agentcore_client")
     def test_metrics_that_name_no_evaluator_keep_the_namespace_match(self, mock_ac):
@@ -25870,15 +26172,22 @@ class TestAC40PublishedScoreMetrics:
         alarm = _score_alarm(
             Dimensions=[{"Name": "EvaluatorName", "Value": "Builtin.Harmfulness"}]
         )
+        others, listed = _companion_scores()
         findings = self._run(
             mock_ac,
-            [alarm, _score_alarm(name="stale", MetricName="Harmfulnes")],
-            {self._NS: _published((self._NS, "Builtin.Harmfulness", self._DIMS))},
+            [alarm, _score_alarm(name="stale", MetricName="Harmfulnes"), *others],
+            {
+                self._NS: _published(
+                    (self._NS, "Builtin.Harmfulness", self._DIMS), *listed
+                )
+            },
         )
 
         assert findings[0]["Status"] == "Passed"
         assert (
-            "alarm(s) eval-score-drop with actions" in (findings[0]["Finding_Details"])
+            "alarm(s) eval-Builtin.Stereotyping-drop, "
+            "eval-Builtin.ToolSelectionAccuracy-drop, eval-score-drop with actions"
+            in (findings[0]["Finding_Details"])
         )
         assert "Alarm(s) stale read a metric name" in findings[0]["Finding_Details"]
 
@@ -25905,10 +26214,15 @@ class TestAC40PublishedScoreMetrics:
                 }
             ],
         )
+        others, listed = _companion_scores()
         findings = self._run(
             mock_ac,
-            [alarm],
-            {self._NS: _published((self._NS, "Builtin.Harmfulness", self._DIMS))},
+            [alarm, *others],
+            {
+                self._NS: _published(
+                    (self._NS, "Builtin.Harmfulness", self._DIMS), *listed
+                )
+            },
         )
 
         assert findings[0]["Status"] == "Passed"
@@ -25964,17 +26278,34 @@ class TestAC40PublishedScoreMetrics:
         assert findings[0]["Status"] == "Failed"
 
 
+_AC40_SCORES = (
+    "Builtin.Harmfulness",
+    "Builtin.Stereotyping",
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.ToolParameterAccuracy",
+)
+
+
 class TestAC40EvaluationSafetyCoverage:
     """AC-40: what the attached evaluators score, read from the catalogue."""
 
     @pytest.fixture(autouse=True)
     def _score_alarms(self):
         with patch("agentcore_app.cloudwatch_client") as mock_cw:
-            mock_cw.describe_alarms.return_value = {"MetricAlarms": [_score_alarm()]}
-            # Every namespace publishes the safety score the default alarm
-            # reads, so an alarm is tied to an attached evaluator's score.
+            # Since round 8 each attached safety score, and a tool-choice score,
+            # must be listed and alarmed for a pass, where the Harmfulness alarm
+            # alone passed. The first alarm keeps the default name.
+            mock_cw.describe_alarms.return_value = {
+                "MetricAlarms": [_score_alarm()]
+                + [
+                    _score_alarm(name=f"eval-{name}-drop", MetricName=name)
+                    for name in _AC40_SCORES[1:]
+                ]
+            }
+            # Every namespace publishes the scores the default alarms read, so
+            # each alarm is tied to an attached evaluator's score.
             mock_cw.list_metrics.side_effect = lambda Namespace, **_: _published(
-                (Namespace, "Builtin.Harmfulness", {})
+                *((Namespace, name, {}) for name in _AC40_SCORES)
             )
             self.mock_cw = mock_cw
             yield mock_cw
@@ -26120,6 +26451,7 @@ class TestAC40EvaluationSafetyCoverage:
         _online_evaluation_client(mock_ac)
         self.mock_cw.describe_alarms.return_value = {
             "MetricAlarms": [_score_alarm(namespace="Bedrock AgentCore/Evaluations")]
+            + _companion_scores("Bedrock AgentCore/Evaluations")[0]
         }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
@@ -26142,7 +26474,9 @@ class TestAC40EvaluationSafetyCoverage:
                 },
             },
         ]
-        self.mock_cw.describe_alarms.return_value = {"MetricAlarms": [math_alarm]}
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [math_alarm] + _companion_scores()[0]
+        }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
@@ -26173,6 +26507,7 @@ class TestAC40EvaluationSafetyCoverage:
         )
         self.mock_cw.describe_alarms.return_value = {
             "MetricAlarms": [_score_alarm(namespace=alarm_namespace)]
+            + _companion_scores(alarm_namespace)[0]
         }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
@@ -26247,7 +26582,7 @@ class TestAC40EvaluationSafetyCoverage:
                 "MetricAlarms": [_score_alarm("lambda", namespace="AWS/Lambda")],
                 "NextToken": "page-2",
             },
-            {"MetricAlarms": [_score_alarm()]},
+            {"MetricAlarms": [_score_alarm()] + _companion_scores()[0]},
         ]
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
@@ -26339,7 +26674,14 @@ class TestAC40EvaluationSafetyCoverage:
         self.mock_cw.list_metrics.side_effect = lambda Namespace, **_: _published(
             (Namespace, "Builtin.Harmfulness", {}),
             (Namespace, "Builtin.Stereotyping", {}),
+            (Namespace, "Builtin.ToolSelectionAccuracy", {}),
         )
+        tool_alarm = _score_alarm(
+            name="tool-drop", MetricName="Builtin.ToolSelectionAccuracy"
+        )
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [_score_alarm(), tool_alarm]
+        }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
@@ -26353,6 +26695,7 @@ class TestAC40EvaluationSafetyCoverage:
             "MetricAlarms": [
                 _score_alarm(),
                 _score_alarm(name="stereo-drop", MetricName="Builtin.Stereotyping"),
+                tool_alarm,
             ]
         }
 
@@ -29957,19 +30300,21 @@ class TestAC47RuntimeInvocationPath:
             assert_finding_schema(finding)
 
     # The address keys now carry an address range: "vpce-123" is not one, and a
-    # value that does not parse as a range bounds nothing.
+    # value that does not parse as a range bounds nothing. Stricter since round
+    # 8: an address key alone no longer passes, since a Deny on it admits a
+    # caller at a listed address without a private path.
     @pytest.mark.parametrize(
-        ("condition_key", "value"),
+        ("condition_key", "value", "leg"),
         [
-            ("aws:SourceVpc", "vpc-123"),
-            ("aws:SourceVpce", "vpce-123"),
-            ("aws:VpcSourceIp", "10.0.0.0/16"),
-            ("aws:SourceIp", "203.0.113.0/24"),
+            ("aws:SourceVpc", "vpc-123", "Network Path Scope"),
+            ("aws:SourceVpce", "vpce-123", "Network Path Scope"),
+            ("aws:VpcSourceIp", "10.0.0.0/16", "Network Path Unrestricted"),
+            ("aws:SourceIp", "203.0.113.0/24", "Network Path Unrestricted"),
         ],
     )
     @patch("agentcore_app.agentcore_client")
     def test_a_deny_network_condition_passes_the_network_leg(
-        self, mock_ac, condition_key, value
+        self, mock_ac, condition_key, value, leg
     ):
         # "Deny unless aws:SourceVpce is the approved endpoint" is the documented
         # form of this restriction. Reading Allow statements only would report
@@ -29993,8 +30338,10 @@ class TestAC47RuntimeInvocationPath:
 
         legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
 
-        assert legs["Network Path Scope"]["Status"] == "Passed"
-        assert condition_key.lower() in legs["Network Path Scope"]["Finding_Details"]
+        assert legs[leg]["Status"] == (
+            "Passed" if leg == "Network Path Scope" else "Failed"
+        )
+        assert condition_key.lower() in legs[leg]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_an_unrelated_condition_does_not_pass_the_network_leg(self, mock_ac):
@@ -30798,16 +31145,20 @@ class TestAC47DenyForm:
 
     @patch("agentcore_app.agentcore_client")
     def test_one_bounded_deny_passes_beside_an_open_one(self, mock_ac):
+        # Stricter since round 8: the bounded Deny keys on aws:SourceVpc, and an
+        # open aws:SourceVpce Deny beside it does not undo it. An aws:SourceIp
+        # Deny in its place no longer passes; TestR8NetworkPathNeedsAVpcKey
+        # holds that case.
         legs = self._judge(
             mock_ac,
             [
                 _deny_invoke({"StringNotLike": {"aws:SourceVpce": "*"}}),
-                _deny_invoke({"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}}),
+                _deny_invoke({"StringNotEquals": {"aws:SourceVpc": "vpc-1"}}),
             ],
         )
 
         assert legs["Network Path Scope"]["Status"] == "Passed"
-        assert "aws:sourceip" in legs["Network Path Scope"]["Finding_Details"]
+        assert "aws:sourcevpc" in legs["Network Path Scope"]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_every_runtime_is_judged_on_its_own_deny(self, mock_ac):
@@ -31015,6 +31366,127 @@ def _principal_deny(*roles):
             }
         }
     )
+
+
+_GATEWAY_ARN_R8 = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+
+
+def _deny_gateway_invoke(condition):
+    return {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "bedrock-agentcore:InvokeGateway",
+        "Resource": "*",
+        "Condition": condition,
+    }
+
+
+# A Deny keyed on an address admits every caller at a listed address, a public
+# one over the internet included, and aws:VpcSourceIp names a range another
+# account's VPC can repeat. AIR-ACR-GW-04 and AIR-ACR-RT-13 name aws:SourceVpc
+# or aws:SourceVpce as the private path, so only a Deny keyed on those passes.
+_ADDRESS_ONLY_DENIES = [
+    pytest.param(
+        [{"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}}], id="source-ip"
+    ),
+    pytest.param(
+        [{"NotIpAddress": {"aws:VpcSourceIp": "10.0.0.0/16"}}], id="vpc-source-ip"
+    ),
+    pytest.param(
+        [
+            {
+                "StringNotEquals": {"aws:SourceVpce": "vpce-1"},
+                "NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"},
+            }
+        ],
+        id="vpce-anded-with-source-ip",
+    ),
+]
+_PRIVATE_PATH_DENIES = [
+    pytest.param([{"StringNotEquals": {"aws:SourceVpce": "vpce-1"}}], id="vpce"),
+    pytest.param([{"StringNotEquals": {"aws:SourceVpc": "vpc-1"}}], id="vpc"),
+    pytest.param(
+        [
+            {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+            {"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}},
+        ],
+        id="vpce-beside-a-source-ip-deny",
+    ),
+]
+
+
+class TestR8NetworkPathNeedsAVpcKey:
+    """AC-27 and AC-47 credit a private path only from aws:SourceVpc or
+    aws:SourceVpce, never from an address key alone."""
+
+    def _gateway(self, mock_ac, conditions):
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps(
+                {"Statement": [_deny_gateway_invoke(c) for c in conditions]}
+            )
+        }
+        cache = {
+            "endpoints": {"vpce-1": "com.amazonaws.us-east-1.bedrock-agentcore.gateway"}
+        }
+        return {
+            finding["Finding"]: finding
+            for finding in agentcore_app._gateway_resource_policy_findings(
+                "Gateway 'one' (gw-1)", _GATEWAY_ARN_R8, cache
+            )
+            if "Network Path" in finding["Finding"]
+        }
+
+    def _runtime(self, mock_ac, conditions):
+        summary, runtime = _vpc_runtime()
+        _wire_runtimes(mock_ac, [(summary, runtime)])
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps({"Statement": [_deny_invoke(c) for c in conditions]})
+        }
+        return {
+            finding["Finding"]: finding
+            for finding in agentcore_app.check_agentcore_runtime_invocation_path()
+            if "Network Path" in finding["Finding"]
+        }
+
+    @pytest.mark.parametrize("conditions", _ADDRESS_ONLY_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_address_only_gateway_deny_fails(self, mock_ac, conditions):
+        legs = self._gateway(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Gateway Network Path Unrestricted"]
+        details = legs["AgentCore Gateway Network Path Unrestricted"]["Finding_Details"]
+        assert "no Deny keyed only on aws:SourceVpc or aws:SourceVpce" in details
+
+    @pytest.mark.parametrize("conditions", _PRIVATE_PATH_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vpc_keyed_gateway_deny_passes(self, mock_ac, conditions):
+        legs = self._gateway(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Gateway Network Path Scope"]
+        scope = legs["AgentCore Gateway Network Path Scope"]
+        assert scope["Status"] == "Passed"
+        assert "aws:sourceip" not in scope["Finding_Details"]
+        assert "address range" not in scope["Resolution"]
+
+    @pytest.mark.parametrize("conditions", _ADDRESS_ONLY_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_address_only_runtime_deny_fails(self, mock_ac, conditions):
+        legs = self._runtime(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Runtime Network Path Unrestricted"]
+        details = legs["AgentCore Runtime Network Path Unrestricted"]["Finding_Details"]
+        assert "no Deny keyed only on aws:SourceVpc or aws:SourceVpce" in details
+
+    @pytest.mark.parametrize("conditions", _PRIVATE_PATH_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vpc_keyed_runtime_deny_passes(self, mock_ac, conditions):
+        legs = self._runtime(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Runtime Network Path Scope"]
+        scope = legs["AgentCore Runtime Network Path Scope"]
+        assert scope["Status"] == "Passed"
+        assert "aws:sourceip" not in scope["Finding_Details"]
+        assert "address range" not in scope["Resolution"]
 
 
 class TestAC47PrincipalArnGateway:
@@ -50210,12 +50682,14 @@ class TestAgentCoreCompositeAlarmCredit:
     def test_ac40_a_score_alarm_actioned_only_by_a_composite_passes(self, mock_ac):
         _online_evaluation_client(mock_ac)
         with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            others, listed = _companion_scores()
             mock_cw.describe_alarms.return_value = {
-                "MetricAlarms": [_silent(_score_alarm())],
+                "MetricAlarms": [_silent(_score_alarm()), *others],
                 "CompositeAlarms": [_composite("rollup", 'ALARM("eval-score-drop")')],
             }
             mock_cw.list_metrics.side_effect = lambda Namespace, **_: _published(
-                (Namespace, "Builtin.Harmfulness", {})
+                (Namespace, "Builtin.Harmfulness", {}),
+                *((Namespace, name, {}) for _, name, _ in listed),
             )
             findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
@@ -51526,12 +52000,16 @@ class TestAC26LogArchiveForwarding:
         spans=False,
         invocation=None,
         destinations=None,
+        streams=None,
+        owners=None,
     ):
         """Run the archive leg over `groups`, each with its `filters` list or
         an exception, one Firehose description and a lock per bucket.
         `invocation` is the Bedrock invocation log group name, or an exception
         the logging configuration read raises; `destinations` is this
-        account's CloudWatch Logs destinations, or an exception."""
+        account's CloudWatch Logs destinations, or an exception. `streams`
+        maps a stream name to its description; `owners` maps a bucket to the
+        account that owns it, a Log Archive account by default."""
         mock_logs = MagicMock()
         listed = {"/aws/bedrock-agentcore/": [self._group(name) for name in groups]}
         if spans:
@@ -51571,12 +52049,21 @@ class TestAC26LogArchiveForwarding:
         firehose = MagicMock()
         if isinstance(stream, Exception):
             firehose.describe_delivery_stream.side_effect = stream
+        elif streams is not None:
+            firehose.describe_delivery_stream.side_effect = (
+                lambda DeliveryStreamName=None: streams[DeliveryStreamName]
+            )
         else:
             firehose.describe_delivery_stream.return_value = stream or self._stream()
         mock_s3 = MagicMock()
         locks = locks or {"archive-bucket": self._lock()}
+        owners = owners or {}
 
-        def get_object_lock_configuration(Bucket=None, **_):
+        def get_object_lock_configuration(Bucket=None, ExpectedBucketOwner=None):
+            if ExpectedBucketOwner is not None and ExpectedBucketOwner != owners.get(
+                Bucket, "999988887777"
+            ):
+                raise _make_client_error("AccessDenied", "Access Denied")
             value = locks[Bucket]
             if isinstance(value, Exception):
                 raise value
@@ -51681,6 +52168,29 @@ class TestAC26LogArchiveForwarding:
         )
         assert rows["locked"]["Status"] == "Passed"
         assert rows["locked"]["Finding"] == "AgentCore Log Archive Destination"
+
+    def test_a_destination_bucket_the_log_archive_account_owns_passes(self):
+        # The destination leg runs in the Log Archive account, which owns its
+        # own archive bucket, so the separate-account read is not made there.
+        rows = self._run(
+            [],
+            {},
+            locks={"archive-bucket": self._lock(), "other-bucket": self._lock()},
+            owners={"archive-bucket": self._ACCOUNT, "other-bucket": self._ACCOUNT},
+            streams={
+                "archive": self._stream(),
+                "other": self._stream(bucket="other-bucket", status="CREATING"),
+            },
+            destinations=[
+                self._destination("locked", self._STREAM),
+                self._destination("creating", self._STREAM.replace("archive", "other")),
+            ],
+        )
+        assert rows["locked"]["Status"] == "Passed"
+        assert rows["creating"]["Status"] == "Failed"
+        assert [
+            c.kwargs for c in self.s3.get_object_lock_configuration.call_args_list
+        ] == [{"Bucket": "archive-bucket"}]
 
     def test_an_unlisted_destination_set_is_na(self):
         findings = self._run(
@@ -51788,7 +52298,65 @@ class TestAC26LogArchiveForwarding:
         )
         assert {row["Status"] for row in rows.values()} == {"Passed"}
         assert self.firehose.describe_delivery_stream.call_count == 1
-        assert self.s3.get_object_lock_configuration.call_count == 1
+        # Round 8: the owner read is a second call, and each is made once.
+        assert [
+            c.kwargs for c in self.s3.get_object_lock_configuration.call_args_list
+        ] == [
+            {"Bucket": "archive-bucket"},
+            {"Bucket": "archive-bucket", "ExpectedBucketOwner": "123456789012"},
+        ]
+
+    def test_a_bucket_this_account_owns_fails(self):
+        # Before round 8 ExpectedBucketOwner was never passed, so a locked
+        # bucket in the assessed account passed as a Log Archive copy.
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)],
+                "/aws/bedrock-agentcore/runtimes/b": [
+                    self._filter(self._STREAM.replace("archive", "local"))
+                ],
+            },
+            streams={
+                "archive": self._stream(),
+                "local": self._stream(bucket="local-bucket"),
+            },
+            locks={"archive-bucket": self._lock(), "local-bucket": self._lock()},
+            owners={"local-bucket": self._ACCOUNT},
+        )
+        good = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert good["Status"] == "Passed"
+        assert (
+            "a read naming account 123456789012 as its expected owner is denied"
+            in good["Finding_Details"]
+        )
+        bad = rows["/aws/bedrock-agentcore/runtimes/b"]
+        assert bad["Status"] == "Failed"
+        assert (
+            "bucket 'local-bucket', which account 123456789012 owns, so the "
+            "archive is not held in a separate Log Archive account"
+            in bad["Finding_Details"]
+        )
+
+    def test_an_unread_bucket_owner_is_na(self):
+        lock = self._lock()
+
+        def owner_unread(Bucket=None, ExpectedBucketOwner=None):
+            if ExpectedBucketOwner is not None:
+                raise _make_client_error("SlowDown", "slow")
+            return lock
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object_lock_configuration.side_effect = owner_unread
+        with patch("agentcore_app.s3_client", mock_s3):
+            state, text = agentcore_app._archive_bucket_lock(
+                "archive-bucket", {}, source_account=self._ACCOUNT
+            )
+        assert state == "unread"
+        assert (
+            "s3:GetBucketObjectLockConfiguration with ExpectedBucketOwner "
+            "123456789012 on bucket 'archive-bucket'" in text
+        )
 
     def test_one_good_filter_of_two_passes(self):
         rows = self._run(
@@ -53601,6 +54169,86 @@ class TestAC35PolicyInputGuards:
         )
         assert rows["gw-a"]["Status"] == status
         assert named in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    @staticmethod
+    def _mcp_server_target(schema):
+        server = {"endpoint": "https://mcp.example.com/mcp"}
+        if schema is not None:
+            server["mcpToolSchema"] = schema
+        return {
+            "t-mcp": {
+                "name": "ledger",
+                "targetConfiguration": {"mcp": {"mcpServer": server}},
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            ('when { context.input.memo == "x" }', "Failed"),
+            ("when { context.input.amount > 500 }", "Passed"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "where, shape",
+        [("inline", "list"), ("inline", "tools"), ("s3", "list")],
+        ids=["inline-list", "inline-tools-object", "s3-list"],
+    )
+    def test_an_mcp_server_static_tool_schema_is_judged(
+        self, condition, status, where, shape
+    ):
+        # McpServerTargetConfiguration.mcpToolSchema names the server's tools
+        # inline or in S3. Before round 8 such a target read N/A as not a
+        # Lambda, OpenAPI or Smithy target.
+        body = json.dumps(
+            self._LEDGER_TOOLS if shape == "list" else {"tools": self._LEDGER_TOOLS}
+        )
+        schema = (
+            {"inlinePayload": body}
+            if where == "inline"
+            else {"s3": {"uri": "s3://schemas/mcp.json"}}
+        )
+        post = 'action == AgentCore::Action::"ledger___post"'
+        rows = self._run(
+            [
+                _input_forbid(condition, action=post),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=self._mcp_server_target(schema),
+            s3_objects={"schemas/mcp.json": body.encode()},
+        )
+        assert rows["gw-a"]["Status"] == status
+        if status == "Failed":
+            assert (
+                "context.input.memo on ledger___post" in rows["gw-a"]["Finding_Details"]
+            )
+        assert "not a Lambda, OpenAPI or Smithy" not in rows["gw-a"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "schema, reason",
+        [
+            (None, "it is an MCP server target with no static mcpToolSchema"),
+            ({"inlinePayload": "not json"}, "its inline MCP tool schema was not read"),
+            (
+                {"inlinePayload": json.dumps({"tools": "x"})},
+                "it is not a JSON list of tool definitions",
+            ),
+            ({"s3": {"uri": "s3://schemas/absent.json"}}, "(AccessDenied)"),
+        ],
+        ids=["dynamic", "not-json", "not-a-list", "s3-denied"],
+    )
+    def test_an_mcp_server_schema_not_read_is_na(self, schema, reason):
+        post = 'action == AgentCore::Action::"ledger___post"'
+        rows = self._run(
+            [
+                _input_forbid("when { context.input.amount > 500 }", action=post),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=self._mcp_server_target(schema),
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert reason in rows["gw-a"]["Finding_Details"]
         assert rows["gw-b"]["Status"] == "Passed"
 
 

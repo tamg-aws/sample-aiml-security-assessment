@@ -304,6 +304,33 @@ section.
 
 ### Fixed
 
+- AgentCore checks that passed on a partial read now fail or hold back
+  `Passed`:
+  - `AC-27` and `AC-47` credit a network-path Deny only when it is keyed on
+    `aws:SourceVpc` or `aws:SourceVpce`. A Deny keyed on `aws:SourceIp` or
+    `aws:VpcSourceIp`, alone or ANDed with a VPC key, now fails, because a
+    SourceIp list admits its public addresses from the internet and a
+    VpcSourceIp range can repeat in another VPC.
+  - `AC-40` passed a configuration on a tool-choice alarm when ListMetrics
+    listed no score for `Builtin.Harmfulness` or `Builtin.Stereotyping`. Such
+    a configuration is now `N/A`, naming the unlisted score.
+  - `AC-34` scans every file system layer of a runtime's container image,
+    every platform of an index included, for AWS access key IDs, private key
+    blocks and `.env` credentials. Layers over 512 MiB compressed or
+    unpacking past 1 GiB, or a layer that cannot be read or unpacked, make the
+    image `N/A`; files over 4 MiB are counted as not scanned.
+  - `AC-35`'s Policy Input Guard reads an MCP server target's static
+    `mcpToolSchema`, inline or in S3, and judges its tools as it judges a
+    Lambda target's. An MCP server target with no static schema stays `N/A`,
+    now naming that its tools are discovered at run time.
+  - `AC-26` fails a log group whose archive bucket the assessed account owns.
+    A second `GetObjectLockConfiguration` with `ExpectedBucketOwner` set to
+    the assessed account must be denied for the bucket to count as a
+    separate Log Archive copy. The Log Archive account's own destination leg
+    does not make this read.
+  - `AIR-ACR-RT-13` now maps `AC-01`, whose VPC Placement Guardrail judges
+    the create-time SCP Null leg the control asks for.
+
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.
 - Derive selection notices and scope descriptions from the selected assessments.
@@ -1690,6 +1717,13 @@ When upgrading from an earlier release, complete the 2.0.0 member-role and
 central infrastructure updates first. Then apply this feature's parameters
 and rerun CodeBuild to deploy the assessment/report changes. No additional
 IAM permissions are introduced by service selection.
+
+**AgentCore image layer scan.** No IAM change: `AC-34` downloads layers
+through the `ecr:GetDownloadUrlForLayer` grant the image configuration read
+already uses, and `AC-26`'s owner read reuses
+`s3:GetBucketObjectLockConfiguration`. A container runtime's image now costs
+up to 512 MiB of layer download per assessed image, inside the AgentCore
+assessment Lambda's existing 600 second timeout.
 
 **SageMaker IoT audit and monitoring execution reads.**
 `SageMakerAssessmentReadsPolicy` gains `iot:ListAuditTasks` and

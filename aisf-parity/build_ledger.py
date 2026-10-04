@@ -645,9 +645,10 @@ AI_SUBJECT_ROWS = [
         "A configuration that is not ACTIVE and ENABLED fails, because it scores nothing. "
         "The namespace is the configuration's metricsNamespace when set, read through the "
         "pinned botocore 1.43.108, and the two documented default spellings otherwise. An "
-        "alarm counts only on a metric ListMetrics lists, and when no listed metric names "
-        "an attached evaluator the configuration is N/A, because an alarm on another "
-        "score in the namespace would otherwise read as watching safety. Evaluators "
+        "alarm counts only on a metric ListMetrics lists, and when ListMetrics lists no "
+        "metric for a named safety evaluator, or for either tool-choice evaluator, the "
+        "configuration is N/A, because no alarm can be shown to read that score and an "
+        "alarm on another score would otherwise stand in for it. Evaluators "
         "written in this account are named for the owner to classify, because their "
         "descriptions are prose no check can verify",
         [],
@@ -685,13 +686,15 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-08", "AC-10", "AC-47"],
+        ["AC-01", "AC-08", "AC-10", "AC-47"],
         "AC-47 passes the network leg only on a resource policy Deny that refuses the "
-        "invoke action to every principal outside a bounded aws:SourceVpc, "
-        "aws:SourceVpce, aws:VpcSourceIp or aws:SourceIp value. An Allow condition "
-        "alone, a positive or ForAnyValue operator, a wildcard endpoint, an address "
-        "list covering every address (0.0.0.0/1 plus 128.0.0.0/1 included) and a Deny "
-        "that ANDs in another key or names specific principals fail. The caller leg "
+        "invoke action to every principal outside a bounded aws:SourceVpc or "
+        "aws:SourceVpce value. A Deny keyed on aws:SourceIp or aws:VpcSourceIp, alone "
+        "or ANDed with a VPC key, fails, because SourceIp admits a listed public "
+        "address from the internet and a VpcSourceIp range can repeat in another VPC. "
+        "An Allow condition alone, a positive or ForAnyValue operator, a wildcard "
+        "endpoint and a Deny that ANDs in another key or names specific principals "
+        "fail. The caller leg "
         "passes only on a Deny outside a bounded aws:PrincipalArn list that names the "
         "execution role GetGateway reports for a gateway whose target routes to the "
         "runtime and no other principal, because an Allow does not stop a "
@@ -712,7 +715,10 @@ AI_SUBJECT_ROWS = [
         "network conditions, because the OAuth discovery call carries no SigV4 "
         "identity, and a Deny reaching it on any non-network key blocks it. "
         "AC-10 fails an Allow that opens the runtime to any principal without binding "
-        "the caller's account or organization",
+        "the caller's account or organization. AC-01's VPC Placement Guardrail fails "
+        "unless an attached SCP denies CreateAgentRuntime, UpdateAgentRuntime, "
+        "CreateCodeInterpreter and CreateBrowser when bedrock-agentcore:subnets or bedrock-agentcore:securityGroups is Null, so a "
+        "runtime cannot be created outside the VPC",
         [],
         4,
     ),
@@ -727,8 +733,10 @@ AI_SUBJECT_ROWS = [
         "carried agentcore counted. It judges each endpoint's policy against the default "
         "allow-everything document and fails a security group set whose inbound ranges "
         "together cover 0.0.0.0/0 or ::/0. AC-27 passes the gateway network leg only on a "
-        "resource policy Deny outside a bounded aws:SourceVpc, aws:SourceVpce, "
-        "aws:VpcSourceIp or aws:SourceIp value. Which VPC a gateway's callers run in has no "
+        "resource policy Deny outside a bounded aws:SourceVpc or aws:SourceVpce value. "
+        "A Deny keyed on aws:SourceIp or aws:VpcSourceIp, alone or ANDed with a VPC "
+        "key, fails, because SourceIp admits a listed public address from the internet "
+        "and a VpcSourceIp range can repeat in another VPC. Which VPC a gateway's callers run in has no "
         "API field, so an endpoint in any VPC of the region counts",
         [],
         4,
@@ -770,8 +778,11 @@ AI_SUBJECT_ROWS = [
         "runtime version names, every platform of an image index, from this account's ECR "
         "registry: an Env variable holding a credential, or an AWS access key ID or private "
         "key block in Entrypoint or Cmd, fails, and an image in another account's registry "
-        "or one whose configuration cannot be fetched is N/A. The image's file system "
-        "layers are not scanned. AC-34 reads the code archive agentRuntimeArtifact names "
+        "or one whose configuration cannot be fetched is N/A. Every file system layer of "
+        "every platform is streamed from its ECR download URL and each file is matched "
+        "as a code archive file is; layers over 512 MiB compressed or unpacking to "
+        "over 1 GiB, or a layer that cannot be read or unpacked, make the image N/A, "
+        "and layer files over 4 MiB are counted as not scanned. AC-34 reads the code archive agentRuntimeArtifact names "
         "in S3 by its exact key and version, never listing a bucket: a file holding an "
         "AWS access key ID or a private key block, or a .env file holding a credential, "
         "fails. An archive over 64 MiB or unpacking to over 256 MiB, one that is not a "
@@ -857,9 +868,12 @@ AI_SUBJECT_ROWS = [
         "and a Smithy JSON AST target's operations, inline or in S3, are read "
         "too: a read the schema does not mark required fails, and a read of a field it "
         "marks required is N/A, because how the gateway places those inputs in "
-        "context.input is not documented. A bare action reaches every tool; an S3 "
+        "context.input is not documented. An MCP server target's static mcpToolSchema, "
+        "a JSON list of tool definitions inline or in S3, is judged as a Lambda one, "
+        "and an MCP server target with no static schema, whose tools are discovered "
+        "from the server at run time, is N/A. A bare action reaches every tool; an S3 "
         "schema that cannot be fetched or is over 2 MiB, a YAML or unparsable schema, "
-        "an MCP server, API Gateway "
+        "an API Gateway "
         "or connector target, an operation the schema does not define, an unreadable "
         "target or an action group is N/A. Permits are not judged, since an erroring "
         "permit denies. Default-deny "
@@ -2052,15 +2066,18 @@ FOUNDATION_ROWS = [
         "pattern, no field selection criteria and not applied on transformed logs "
         "sends to an ACTIVE Firehose stream of this account whose S3 destination "
         "runs no Lambda record processor and whose bucket has Object Lock default "
-        "retention in COMPLIANCE mode. No filter, a narrowed filter, a non-S3 "
-        "destination, GOVERNANCE mode or no default retention fails. A CloudWatch "
+        "retention in COMPLIANCE mode and that another account owns: a second "
+        "GetObjectLockConfiguration with ExpectedBucketOwner set to the assessed "
+        "account must be denied. No filter, a narrowed filter, a non-S3 "
+        "destination, GOVERNANCE mode, no default retention or a bucket the assessed "
+        "account owns fails, and an owner read failing any other way is N/A. A CloudWatch "
         "Logs destination, a Kinesis or Lambda target, another account's stream or "
         "a failed read is N/A naming it, and a CloudWatch Logs destination's row "
         "names the account that owns it. In that account, the Log Archive account "
         "of the cross-account pattern the control prescribes, AC-26 follows each "
         "destination listed by logs:DescribeDestinations to its Firehose stream "
-        "and bucket under the same rules, so the WORM copy is judged where it "
-        "lives; which source groups subscribe to it is read in each source "
+        "and bucket under the same rules, less the owner read, since that account "
+        "owns its own archive, so the WORM copy is judged where it lives; which source groups subscribe to it is read in each source "
         "account, and an unlisted destination set is N/A. Each trail "
         "recording the Region gets a row on its S3BucketName's Object Lock, judged "
         "the same way, and an unread trail or bucket is N/A. BR-12 applies the same "
