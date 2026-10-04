@@ -39438,16 +39438,51 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         "bedrock-agentcore:ListWorkloadIdentities",
         {"max_results": 20},
     ),
+    (
+        "sagemaker",
+        "SageMaker",
+        "HyperPod cluster",
+        "sagemaker",
+        "list_clusters",
+        "ClusterSummaries",
+        "ClusterArn",
+        "sagemaker:ListClusters",
+        {},
+    ),
+    (
+        "bedrock-agentcore",
+        "AgentCore",
+        "harness",
+        "bedrock-agentcore-control",
+        "list_harnesses",
+        "harnesses",
+        "arn",
+        "bedrock-agentcore:ListHarnesses",
+        {},
+    ),
 )
+
+# Whether tag:GetResources returns HyperPod clusters and AgentCore harnesses is
+# not documented, so a listed one it does not return has its tags read from its
+# own service before it is called never tagged: list action -> (tag action,
+# operation, ARN parameter).
+RESOURCE_OWNER_SWEEP_TAG_READS = {
+    "sagemaker:ListClusters": ("sagemaker:ListTags", "list_tags", "ResourceArn"),
+    "bedrock-agentcore:ListHarnesses": (
+        "bedrock-agentcore:ListTagsForResource",
+        "list_tags_for_resource",
+        "resourceArn",
+    ),
+}
 
 # Resource types the list reads above do not enumerate, so one never tagged is
 # still invisible to this check.
 RESOURCE_OWNER_SWEEP_GAP = (
     "SageMaker and AgentCore resource types other than endpoints, models, "
     "notebook instances, training jobs, domains, inference components, "
-    "pipelines, processing jobs, transform jobs, agent runtimes, memories, "
-    "gateways, custom browsers, custom code interpreters and workload identities "
-    "are read only through GetResources, which returns only resources that are or were "
+    "pipelines, processing jobs, transform jobs, HyperPod clusters, agent "
+    "runtimes, memories, gateways, custom browsers, custom code interpreters, "
+    "workload identities and harnesses are read only through GetResources, which returns only resources that are or were "
     "tagged, so a resource never tagged is not listed "
     "(https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/"
     "API_GetResources.html)."
@@ -39457,6 +39492,30 @@ RESOURCE_OWNER_SWEEP_GAP = (
 def _arn_resource_segment(arn: str) -> str:
     """Return the resource segment of an ARN, lower-cased for matching."""
     return str(arn).split(":", 5)[-1].lower()
+
+
+def _sweep_resource_tags(client: Any, operation: str, parameter: str, arn: str):
+    """
+    Read one resource's tags as [{"Key", "Value"}]. SageMaker ListTags pages
+    a Tags list; AgentCore ListTagsForResource returns one tags map.
+    """
+    if operation == "list_tags":
+        return _list_all_items(
+            client,
+            operation,
+            "Tags",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+            **{parameter: arn},
+        )
+    response = getattr(client, operation)(**{parameter: arn})
+    if not isinstance(response, dict):
+        raise TypeError(f"{operation} returned no response object")
+    return [
+        {"Key": key, "Value": value}
+        for key, value in (response.get("tags") or {}).items()
+    ]
 
 
 def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
@@ -39531,6 +39590,7 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
     # lower-cased.
     returned_segments = {_arn_resource_segment(arn) for arn in returned_arns}
     list_notes = []
+    direct_owned = 0
     for (
         type_filter,
         label,
@@ -39544,9 +39604,10 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
     ) in RESOURCE_OWNER_SWEEP_LISTS:
         if type_filter not in read_filters:
             continue
+        list_client = boto3.client(service, config=boto3_config, region_name=region)
         try:
             items = _list_all_items(
-                boto3.client(service, config=boto3_config, region_name=region),
+                list_client,
                 operation,
                 result_key,
                 **(
@@ -39578,6 +39639,46 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
             )
             if segment not in returned_segments:
                 untagged.add(f"gateway {value}" if field == "gatewayId" else str(value))
+        if action in RESOURCE_OWNER_SWEEP_TAG_READS:
+            tag_action, tag_operation, parameter = RESOURCE_OWNER_SWEEP_TAG_READS[
+                action
+            ]
+            pending = sorted(untagged)
+            for index, arn in enumerate(pending):
+                if _deadline_reached():
+                    unread.append(
+                        "{} for {} {}(s) from {} on, {}".format(
+                            tag_action, len(pending) - index, noun, arn, DEADLINE_STOP
+                        )
+                    )
+                    break
+                try:
+                    tags = _sweep_resource_tags(
+                        list_client, tag_operation, parameter, arn
+                    )
+                except (ClientError, BotoCoreError, TypeError) as error:
+                    unread.append(
+                        f"{tag_action} on {arn} ({get_assessment_error_label(error)})"
+                    )
+                    continue
+                rejections = []
+                credited = False
+                for tag in tags:
+                    rejection = _owner_tag_rejection(tag)
+                    if rejection == "":
+                        credited = True
+                    elif rejection:
+                        rejections.append(rejection)
+                if credited:
+                    direct_owned += 1
+                else:
+                    unowned.append((label, arn, tags, rejections))
+            list_notes.append(
+                f" {action} listed {len(items)} {noun}(s), and the tags of the "
+                f"{len(untagged)} absent from GetResources were read with "
+                f"{tag_action}."
+            )
+            continue
         for arn in sorted(untagged):
             unowned.append((label, arn, action, []))
         list_notes.append(
@@ -39630,15 +39731,19 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
         )
     unread_note = " These reads failed: {}.".format("; ".join(unread)) if unread else ""
     # Every list read and every GetResources filter was read, and nothing read
-    # lacks an owner: the fourteen listed types are judged whole, so the row passes
+    # lacks an owner: the sixteen listed types are judged whole, so the row passes
     # and names the types only GetResources reaches.
-    complete = owned > 0 and not unowned and not unread
+    complete = owned + direct_owned > 0 and not unowned and not unread
     findings["csv_data"].append(
         row(
             "{} of the {} SageMaker and AgentCore resource(s) GetResources returned "
-            "carry an owner tag with a non-placeholder value.{} {} {}{}".format(
+            "carry an owner tag with a non-placeholder value.{}{} {} {}{}".format(
                 owned,
                 returned,
+                f" {direct_owned} listed resource(s) whose tags were read from "
+                "their own service carry one as well."
+                if direct_owned
+                else "",
                 list_note,
                 RESOURCE_OWNER_SWEEP_GAP,
                 "Whether each value resolves to a person or an on-call rotation is "

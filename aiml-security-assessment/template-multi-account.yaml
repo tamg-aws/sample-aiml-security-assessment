@@ -667,6 +667,8 @@ Resources:
               - iam:ListRoles # BR-02
               - bedrock:ListCustomModelDeployments # BR-53
               - bedrock:ListPromptRouters # BR-53
+              - sagemaker:ListClusters # BR-53
+              - bedrock-agentcore:ListHarnesses # BR-53
               - athena:ListDataCatalogs # BR-06
             Resource: '*'
           - Sid: BedrockOwnerTagRead2
@@ -680,6 +682,20 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:automated-reasoning-policy/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model-deployment/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:prompt-router/*'
+          - Sid: AIOwnerTagRead
+            # BR-53 reads the tags of each HyperPod cluster and AgentCore
+            # harness that tag:GetResources does not return. The service
+            # authorization reference gives sagemaker:ListTags the cluster
+            # resource type and bedrock-agentcore:ListTagsForResource the
+            # harness resource type; neither service's action authorizes on
+            # the other's ARN.
+            Effect: Allow
+            Action:
+              - sagemaker:ListTags # BR-53
+              - bedrock-agentcore:ListTagsForResource # BR-53
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:cluster/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
           - Sid: MicrovmRead
             # GetMicrovm authorizes on the microvmImage resource type. A
             # MicroVM may run an AWS-managed image, whose ARN has the account

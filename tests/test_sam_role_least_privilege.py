@@ -144,6 +144,8 @@ _EXPECTED_ACTIONS = {
     },
     "BedrockAssessmentReadsPolicy2": {
         "athena:ListDataCatalogs",
+        "bedrock-agentcore:ListHarnesses",
+        "bedrock-agentcore:ListTagsForResource",
         "bedrock:ListCustomModelDeployments",
         "bedrock:ListPromptRouters",
         "bedrock:ListTagsForResource",
@@ -151,6 +153,8 @@ _EXPECTED_ACTIONS = {
         "lambda:GetMicrovm",
         "lambda:ListMicrovms",
         "s3:ListBucketVersions",
+        "sagemaker:ListClusters",
+        "sagemaker:ListTags",
     },
     "BedrockAssessmentReadsPolicy": {
         "account:ListRegions",
@@ -1334,14 +1338,42 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
         for statement in document["Statement"]
         for action in statement["Action"]
     )
-    # ListMicrovms, ListRoles, ListCustomModelDeployments, ListPromptRouters
-    # and ListDataCatalogs have no resource type; GetMicrovm authorizes on
-    # microvmImage, in this account or the AWS-managed "aws" account;
-    # ListBucketVersions authorizes on the bucket resource type, and
-    # ListTagsForResource on each Bedrock resource type it reads.
+    # ListMicrovms, ListRoles, ListCustomModelDeployments, ListPromptRouters,
+    # ListClusters, ListHarnesses and ListDataCatalogs have no resource type;
+    # GetMicrovm authorizes on microvmImage, in this account or the AWS-managed
+    # "aws" account; ListBucketVersions authorizes on the bucket resource type,
+    # ListTagsForResource on each Bedrock resource type it reads, and the
+    # SageMaker and AgentCore tag reads on the cluster and harness types.
+    owner_tag_arns = json.dumps(
+        [
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                "${AWS::AccountId}:cluster/*"
+            },
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:bedrock-agentcore:*:"
+                "${AWS::AccountId}:harness/*"
+            },
+        ],
+        sort_keys=True,
+    )
     assert grants == sorted(
         [
             ("ManagedReadsOnWildcard2", "Allow", "athena:ListDataCatalogs", '"*"'),
+            ("ManagedReadsOnWildcard2", "Allow", "sagemaker:ListClusters", '"*"'),
+            (
+                "ManagedReadsOnWildcard2",
+                "Allow",
+                "bedrock-agentcore:ListHarnesses",
+                '"*"',
+            ),
+            ("AIOwnerTagRead", "Allow", "sagemaker:ListTags", owner_tag_arns),
+            (
+                "AIOwnerTagRead",
+                "Allow",
+                "bedrock-agentcore:ListTagsForResource",
+                owner_tag_arns,
+            ),
             (
                 "BedrockOwnerTagRead2",
                 "Allow",

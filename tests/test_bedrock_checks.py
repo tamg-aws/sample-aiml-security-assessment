@@ -35411,9 +35411,12 @@ class TestBR53OwnerTagSweep:
         "list_processing_jobs": "ProcessingJobSummaries",
         "list_transform_jobs": "TransformJobSummaries",
         "list_workload_identities": "workloadIdentities",
+        "list_clusters": "ClusterSummaries",
+        "list_harnesses": "harnesses",
     }
 
-    def _run(self, pages, errors=None, runtimes=None, lists=None):
+    def _run(self, pages, errors=None, runtimes=None, lists=None, setup=None):
+        """``setup`` receives the shared client mock before the check runs."""
         errors = errors or {}
         tagging = MagicMock()
         if isinstance(runtimes, Exception):
@@ -35444,6 +35447,8 @@ class TestBR53OwnerTagSweep:
             return response
 
         tagging.get_resources.side_effect = get_resources
+        if setup:
+            setup(tagging)
         with patch("boto3.client", return_value=tagging):
             result = bedrock_app.check_ai_resource_owner_tag_sweep(region="us-east-1")
         rows = extract_csv_data(result)
@@ -35512,9 +35517,10 @@ class TestBR53OwnerTagSweep:
         assert (
             "SageMaker and AgentCore resource types other than endpoints, models, "
             "notebook instances, training jobs, domains, inference components, "
-            "pipelines, processing jobs, transform jobs, agent runtimes, memories, "
-            "gateways, custom browsers, custom code interpreters and workload "
-            "identities are read only through GetResources" in details
+            "pipelines, processing jobs, transform jobs, HyperPod clusters, agent "
+            "runtimes, memories, gateways, custom browsers, custom code "
+            "interpreters, workload identities and harnesses are read only "
+            "through GetResources" in details
         )
         assert "not granted" not in details
         assert "ceiling reached" not in details
@@ -35905,6 +35911,125 @@ class TestBR53OwnerTagSweep:
         assert (
             "sagemaker:ListModels (AccessDeniedException), so models never tagged "
             "are not listed" in rows[1]["Finding_Details"]
+        )
+
+    SM_CLUSTER = "arn:aws:sagemaker:us-east-1:123456789012:cluster/{}"
+    AC_HARNESS = "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/{}"
+
+    def test_clusters_and_harnesses_absent_from_get_resources_have_tags_read(self):
+        """GOV-02: a HyperPod cluster or harness GetResources misses is judged by
+        its own tag read: one owned and one not of each type."""
+        tags = {
+            self.SM_CLUSTER.format("c-owned"): [{"Key": "Owner", "Value": "ml"}],
+            self.SM_CLUSTER.format("c-bare"): [{"Key": "env", "Value": "dev"}],
+        }
+
+        def setup(tagging):
+            tagging.list_tags.side_effect = lambda **kwargs: {
+                "Tags": tags[kwargs["ResourceArn"]]
+            }
+            tagging.list_tags_for_resource.side_effect = lambda resourceArn: {
+                "tags": {"Owner": "agents"} if "h-owned" in resourceArn else {}
+            }
+
+        _, rows, tagging = self._run(
+            {
+                "sagemaker": [[self._owned(self.SM_OWNED)]],
+                "bedrock-agentcore": [[self._owned(self.AC_OWNED)]],
+            },
+            lists={
+                "list_clusters": [
+                    {"ClusterArn": self.SM_CLUSTER.format("c-owned")},
+                    {"ClusterArn": self.SM_CLUSTER.format("c-bare")},
+                ],
+                "list_harnesses": [
+                    {"arn": self.AC_HARNESS.format("h-owned")},
+                    {"arn": self.AC_HARNESS.format("h-bare")},
+                ],
+            },
+            setup=setup,
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 2
+        assert any(
+            self.SM_CLUSTER.format("c-bare") in d and "tag keys: env" in d
+            for d in failed
+        )
+        assert any(
+            self.AC_HARNESS.format("h-bare") in d and "no tags returned" in d
+            for d in failed
+        )
+        assert not any("-owned" in d for d in failed)
+        summary = rows[-1]["Finding_Details"]
+        assert (
+            "sagemaker:ListClusters listed 2 HyperPod cluster(s), and the tags of "
+            "the 2 absent from GetResources were read with sagemaker:ListTags."
+            in summary
+        )
+        assert "bedrock-agentcore:ListHarnesses listed 2 harness(s)" in summary
+        assert "2 listed resource(s) whose tags were read" in summary
+        tagging.list_clusters.assert_called_with(MaxResults=100)
+        tagging.list_harnesses.assert_called_with(maxResults=100)
+        tagging.list_tags.assert_any_call(
+            MaxResults=100, ResourceArn=self.SM_CLUSTER.format("c-bare")
+        )
+
+    def _owned_cluster_and_harness(self, harness_tags):
+        def setup(tagging):
+            tagging.list_tags.return_value = {"Tags": [{"Key": "owner", "Value": "ml"}]}
+            tagging.list_tags_for_resource.side_effect = harness_tags
+
+        return self._run(
+            {"sagemaker": [[self._owned(self.SM_OWNED)]]},
+            lists={
+                "list_clusters": [{"ClusterArn": self.SM_CLUSTER.format("c-1")}],
+                "list_harnesses": [{"arn": self.AC_HARNESS.format("h-1")}],
+            },
+            setup=setup,
+        )
+
+    def test_owned_clusters_and_harnesses_pass(self):
+        _, rows, _ = self._owned_cluster_and_harness(
+            lambda resourceArn: {"tags": {"Owner": "agents"}}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_an_unread_harness_tag_read_withholds_the_pass(self):
+        _, rows, _ = self._owned_cluster_and_harness(
+            _make_client_error("AccessDeniedException")
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "bedrock-agentcore:ListTagsForResource on "
+            + self.AC_HARNESS.format("h-1")
+            + " (AccessDeniedException)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_cluster_tag_reads_stop_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+
+        def setup(tagging):
+            tagging.list_tags.return_value = {"Tags": [{"Key": "owner", "Value": "ml"}]}
+
+        _, rows, tagging = self._run(
+            {"sagemaker": [[self._owned(self.SM_OWNED)]]},
+            lists={
+                "list_clusters": [
+                    {"ClusterArn": self.SM_CLUSTER.format("c-1")},
+                    {"ClusterArn": self.SM_CLUSTER.format("c-2")},
+                ]
+            },
+            setup=setup,
+        )
+        tagging.list_tags.assert_not_called()
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "sagemaker:ListTags for 2 HyperPod cluster(s) from "
+            + self.SM_CLUSTER.format("c-1")
+            + " on, "
+            + bedrock_app.DEADLINE_STOP
+            in rows[0]["Finding_Details"]
         )
 
     def test_an_unread_sagemaker_filter_skips_its_lists(self):

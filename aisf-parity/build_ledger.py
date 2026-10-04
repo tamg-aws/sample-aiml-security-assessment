@@ -2763,8 +2763,12 @@ FOUNDATION_ROWS = [
         "gateways, custom browsers, custom code interpreters and workload "
         "identities, "
         "listed by their SageMaker and AgentCore list APIs and absent from the "
-        "sweep, fail as never tagged. The sweep summary passes only when every "
-        "filter and list read succeeded and no resource lacks an owner, and it names "
+        "sweep, fail as never tagged. SageMaker HyperPod clusters (ListClusters) "
+        "and AgentCore harnesses (ListHarnesses) absent from the sweep have their "
+        "tags read with sagemaker:ListTags and "
+        "bedrock-agentcore:ListTagsForResource and are judged by those tags, and "
+        "an unread tag read is N/A. The sweep summary passes only when every "
+        "filter, list and tag read succeeded and no resource lacks an owner, and it names "
         "the other types, which only the sweep reaches, as unlisted when never "
         "tagged",
         [],
