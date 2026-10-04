@@ -11572,13 +11572,57 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
                     )
                 )
 
-        # A data-path endpoint is judged only in a VPC that also holds an
-        # AgentCore endpoint. An S3 or DynamoDB endpoint in an unrelated VPC
-        # carries no agent traffic, and reporting its policy under AC-08 would
-        # name an endpoint this workload never calls.
+        # A data-path endpoint is judged in a VPC that holds an AgentCore
+        # endpoint or hosts a VPC-mode AgentCore resource, which reaches S3,
+        # DynamoDB and SageMaker through the endpoints of the VPC it runs in. An
+        # S3 or DynamoDB endpoint in an unrelated VPC carries no agent traffic,
+        # and reporting its policy under AC-08 would name an endpoint this
+        # workload never calls.
         agentcore_vpc_ids = {
             entry["vpc_id"] for entry in found_agentcore_endpoints if entry["vpc_id"]
         }
+        hosting_references, hosting_errors = _agentcore_hosting_subnets()
+        hosting_subnet_ids = sorted({subnet for _, subnet in hosting_references})
+        if hosting_subnet_ids:
+            try:
+                described, _ = _describe_subnets_reporting_missing(hosting_subnet_ids)
+                agentcore_vpc_ids.update(
+                    subnet["VpcId"] for subnet in described if subnet.get("VpcId")
+                )
+            except (BotoCoreError, ClientError) as error:
+                hosting_errors.append(
+                    (
+                        f"The {len(hosting_subnet_ids)} subnet(s) that host "
+                        "AgentCore resources",
+                        error,
+                        "ec2:DescribeSubnets",
+                    )
+                )
+        if hosting_errors:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Policy",
+                    finding_details=(
+                        "The data-path endpoints in the VPCs these resources run "
+                        "in were not judged, because their VPCs could not be "
+                        "resolved: "
+                        + "; ".join(
+                            f"{label} ({_assessment_error_label(error)} on {action})"
+                            for label, error, action in hosting_errors
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "Grant "
+                        + ", ".join(sorted({action for _, _, action in hosting_errors}))
+                        + " and retry."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
         data_path_endpoints = [
             entry
             for entry in data_path_candidates
@@ -32643,6 +32687,164 @@ def _tool_execution_role_problems(
     return sorted(set(problems)), unreadable
 
 
+# The action that starts a session on each custom tool kind, keyed by the ARN
+# field its Get call returns. Neither tool kind accepts a resource policy (the
+# service authorization reference gives GetResourcePolicy only the gateway,
+# runtime and runtime-endpoint types), so the principals that start its
+# sessions are the identity-policy holders of this account.
+AGENTCORE_TOOL_SESSION_ACTIONS = {
+    "codeInterpreterArn": "bedrock-agentcore:StartCodeInterpreterSession",
+    "browserArn": "bedrock-agentcore:StartBrowserSession",
+}
+
+
+def _resource_pattern_covers(outer: str, inner: str) -> bool:
+    """Return whether every ARN `inner` matches is also matched by `outer`.
+
+    The rule is _action_pattern_covers's, compared case-sensitively as IAM
+    compares ARNs.
+    """
+    if "?" in outer and any(wildcard in inner for wildcard in ("*", "?")):
+        return False
+    return fnmatchcase(inner, outer.replace("[", "[[]"))
+
+
+def _statement_reaches_arn(statement: Dict[str, Any], arn: str) -> bool:
+    """Return whether one Allow's Resource or NotResource reaches one ARN."""
+    if "Resource" in statement:
+        patterns = _statement_resources(statement)
+        return any(fnmatchcase(arn, p.replace("[", "[[]")) for p in patterns)
+    excluded = statement.get("NotResource")
+    if excluded is None:
+        return False
+    excluded = excluded if isinstance(excluded, list) else [excluded]
+    return not any(fnmatchcase(arn, str(p).replace("[", "[[]")) for p in excluded)
+
+
+def _statement_covers_grant(
+    statement: Dict[str, Any], action: str, resource: str, condition: Any
+) -> bool:
+    """Return whether one Allow grants `action` on `resource` under `condition`.
+
+    `action` and `resource` may be patterns, and are covered only when every
+    action and ARN they match is. A NotAction covers an action pattern none of
+    its exclusions overlap, and a NotResource covers a literal ARN none of its
+    exclusions match. A conditioned statement covers only a grant
+    under the same condition.
+    """
+    own = statement.get("Condition") or {}
+    if own and own != condition:
+        return False
+    if "Action" in statement:
+        if not any(
+            _action_pattern_covers(pattern, action)
+            for pattern in _statement_actions(statement)
+        ):
+            return False
+    elif "NotAction" not in statement or any(
+        _action_patterns_overlap(excluded, action)
+        for excluded in _statement_not_actions(statement)
+    ):
+        return False
+    if "Resource" in statement:
+        return any(
+            _resource_pattern_covers(pattern, resource)
+            for pattern in _statement_resources(statement)
+        )
+    excluded = statement.get("NotResource")
+    if excluded is None:
+        return False
+    excluded = excluded if isinstance(excluded, list) else [excluded]
+    return not any(wildcard in resource for wildcard in ("*", "?")) and not any(
+        fnmatchcase(resource, str(p).replace("[", "[[]")) for p in excluded
+    )
+
+
+def _tool_role_invoker_gaps(
+    tool_arn: str,
+    start_action: str,
+    role_name: str,
+    role_permissions: Dict[str, Any],
+    cache: Dict[str, Any],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Compare a tool role's grants with each principal that starts its sessions.
+
+    Returns (invokers, gaps, unreadable): every cached role and user other than
+    the tool role whose Allow reaches start_action on tool_arn and survives its
+    own Deny and boundary, one line per invoker naming the tool role grants it
+    lacks, and each principal with a policy that could not be parsed. A grant
+    is compared as action, resource and condition: a NotAction tool grant is
+    read as every action and a NotResource one as every resource. A tool role
+    grant its own Deny or boundary removes is not compared, and an invoker's
+    grant counts only when it survives the invoker's own Deny and boundary.
+    """
+    unreadable: List[str] = []
+    grants: List[Tuple[str, str, Any]] = []
+    for policy in _principal_policies(role_permissions):
+        try:
+            statements = list(_allow_statements(policy))
+        except (TypeError, ValueError):
+            unreadable.append(f"role {role_name} (policy {policy.get('name', '')})")
+            continue
+        for statement in statements:
+            condition = statement.get("Condition") or {}
+            actions = _statement_actions(statement) if "Action" in statement else ["*"]
+            resources = (
+                _statement_resources(statement) if "Resource" in statement else ["*"]
+            )
+            for action in actions:
+                if _grant_survives(role_permissions, action):
+                    grants.extend(
+                        (action, resource, condition) for resource in resources
+                    )
+
+    start_suffix = start_action.split(":", 1)[1].lower()
+    invokers: List[str] = []
+    gaps: List[str] = []
+    for kind, key in (("role", "role_permissions"), ("user", "user_permissions")):
+        for name, permissions in sorted((cache.get(key) or {}).items()):
+            if not isinstance(permissions, dict) or (
+                kind == "role" and name == role_name
+            ):
+                continue
+            label = f"{kind} {name}"
+            statements = []
+            readable = True
+            for policy in _principal_policies(permissions):
+                try:
+                    statements.extend(_allow_statements(policy))
+                except (TypeError, ValueError):
+                    unreadable.append(f"{label} (policy {policy.get('name', '')})")
+                    readable = False
+            if not readable or not _grant_survives(permissions, start_action):
+                continue
+            if not any(
+                _statement_reaches_arn(statement, tool_arn)
+                and _statement_reached_actions(statement, [start_suffix])
+                for statement in statements
+            ):
+                continue
+            invokers.append(label)
+            lacking = [
+                f"{action} on {resource}"
+                + (" under its condition" if condition else "")
+                for action, resource, condition in grants
+                if not (
+                    _grant_survives(permissions, action)
+                    and any(
+                        _statement_covers_grant(statement, action, resource, condition)
+                        for statement in statements
+                    )
+                )
+            ]
+            if lacking:
+                gaps.append(
+                    f"{label} lacks {', '.join(lacking[:5])}"
+                    + (f" and {len(lacking) - 5} more" if len(lacking) > 5 else "")
+                )
+    return invokers, gaps, unreadable
+
+
 # The two ways to run a command inside a live runtime session. The shell opens
 # a terminal whose commands reach the container filesystem and every credential
 # in it, and the service does not log what is typed, so the grant is read on
@@ -33396,8 +33598,99 @@ def check_agentcore_tool_execution_role_scope(
                     status=StatusEnum.PASSED,
                 )
             )
+        if kind == "tool":
+            findings.append(
+                _tool_role_invoker_finding(label, detail, role_name, permissions, cache)
+            )
 
     return findings
+
+
+def _tool_role_invoker_finding(
+    label: str,
+    detail: Dict[str, Any],
+    role_name: str,
+    permissions: Dict[str, Any],
+    cache: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the AC-45 row holding a tool role to its session starters' grants.
+
+    AIR-ACR-RT-03 keeps a tool's execution role at equal-or-fewer privileges
+    than the invoking user, because whoever starts a session runs code with the
+    role: a role holding a grant its invoker lacks hands that grant to the
+    invoker.
+    """
+    finding_name = "AgentCore Tool Execution Role Invoker Bound"
+    arn_key = next(
+        (key for key in AGENTCORE_TOOL_SESSION_ACTIONS if detail.get(key)), None
+    )
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-45",
+            finding_name=finding_name,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    if arn_key is None:
+        return finding(
+            f"{label} reports no ARN, so the principals that start its sessions "
+            "were not found.",
+            "No action is required on the assessed workload based on this "
+            "result. Rerun the assessment.",
+            SeverityEnum.INFORMATIONAL,
+            StatusEnum.NA,
+        )
+    start_action = AGENTCORE_TOOL_SESSION_ACTIONS[arn_key]
+    invokers, gaps, unreadable = _tool_role_invoker_gaps(
+        str(detail[arn_key]), start_action, role_name, permissions, cache
+    )
+    if gaps:
+        return finding(
+            f"{label} uses execution role {role_name}, and principals granted "
+            f"{start_action} on it, who run code with that role, hold fewer "
+            f"grants than it: {'; '.join(gaps)}. {IAM_CACHE_SCP_NOTE}",
+            "Narrow the tool's execution role to grants each principal that "
+            "starts its sessions already holds, or withdraw "
+            f"{start_action} from the principals that should not reach the "
+            "role's grants.",
+            SeverityEnum.MEDIUM,
+            StatusEnum.FAILED,
+        )
+    if unreadable:
+        return finding(
+            f"These cached policy documents could not be parsed, so whether a "
+            f"principal starting a session on {label} holds fewer grants than "
+            f"execution role {role_name} was not judged: {', '.join(unreadable)}.",
+            "No action is required on the assessed workload based on this "
+            "result. Repair the unreadable policy documents in the IAM "
+            "permission cache and rerun the assessment.",
+            SeverityEnum.INFORMATIONAL,
+            StatusEnum.NA,
+        )
+    if not invokers:
+        return finding(
+            f"{label} uses execution role {role_name}, and no principal in the "
+            f"IAM permission cache other than that role is granted {start_action} "
+            "on it, so there is no invoker to hold the role to.",
+            "No action required for this check.",
+            SeverityEnum.INFORMATIONAL,
+            StatusEnum.NA,
+        )
+    return finding(
+        f"{label} uses execution role {role_name}, and each principal granted "
+        f"{start_action} on it ({', '.join(invokers)}) holds every action and "
+        "resource the role is granted, under the same or no condition. A Deny "
+        "scoped to a resource or condition, session policies and service "
+        "control policies are not read.",
+        "No action required for this check.",
+        SeverityEnum.MEDIUM,
+        StatusEnum.PASSED,
+    )
 
 
 # Both lifecycle fields accept 60 to 1209600 seconds. A value at the ceiling is

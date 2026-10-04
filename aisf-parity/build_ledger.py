@@ -601,8 +601,18 @@ AI_SUBJECT_ROWS = [
         "ORGANIZATION_UNUSED_ACCESS analyzer excludes neither the account nor a "
         "resource tag. An account outside any organization with none fails; in an "
         "organization, whose analyzer the member account cannot list, it is N/A, as "
-        "is a tag exclusion or an unlisted Region. Whether each role holds equal or "
-        "fewer privileges than the principals that invoke it is not judged",
+        "is a tag exclusion or an unlisted Region. AC-45's Invoker Bound row holds "
+        "each code interpreter and browser role to the principals that can start its "
+        "sessions: every cached role and user other than the tool role whose Allow "
+        "reaches StartCodeInterpreterSession or StartBrowserSession on the tool's ARN "
+        "and survives its own Deny and boundary, since neither tool type accepts a "
+        "resource policy. It fails a tool role grant (action, resource, condition; a "
+        "NotAction read as every action, a NotResource as every resource) that such a "
+        "principal does not hold through a surviving Allow covering the action "
+        "pattern, the resource pattern and the condition, and is Not Applicable when "
+        "no principal starts its sessions or a policy cannot be parsed. Deny "
+        "statements scoped to a resource or condition, session policies and SCPs are "
+        "not read",
         [],
         4,
     ),
@@ -1733,8 +1743,10 @@ AI_SUBJECT_ROWS = [
         "AC-08 judges private DNS on interface endpoints, the endpoint policy, and whether "
         "the endpoint's security groups admit inbound traffic from 0.0.0.0/0 or ::/0, on "
         "the AgentCore interface endpoints and on the S3, DynamoDB and SageMaker endpoints "
-        "in the same VPCs, so an endpoint left on the default full-access policy is "
-        "reported. BR-02 reads "
+        "in every VPC that holds an AgentCore endpoint or hosts a VPC-mode runtime "
+        "version, Code Interpreter or Browser, so an endpoint left on the default "
+        "full-access policy is reported; a hosting VPC that cannot be resolved is Not "
+        "Applicable naming the action. BR-02 reads "
         "private DNS and the endpoint policy on the Bedrock endpoints, where it used to "
         "report only that an endpoint existed. An endpoint policy counts as scoped only "
         "on exact principal or network values: a Deny needs one negated condition and "

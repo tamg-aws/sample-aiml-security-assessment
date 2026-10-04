@@ -29132,6 +29132,26 @@ class TestAC08EndpointPrivateDns:
         assert self._run(mock_ac, mock_ec2, endpoint) == []
 
 
+def _without_invoker_rows(findings, expected, reason="reports no ARN"):
+    """Split off AC-45's invoker rows, asserting `expected` of them.
+
+    Each tool with a readable role gets one, and each is N/A naming `reason`:
+    a fixture that reports no tool ARN, or one whose cache holds no principal
+    starting a session. The scope-leg assertions that follow keep their exact
+    counts.
+    """
+    rows = [
+        finding
+        for finding in findings
+        if finding["Finding"] == "AgentCore Tool Execution Role Invoker Bound"
+    ]
+    assert len(rows) == expected
+    for row in rows:
+        assert row["Status"] == "N/A"
+        assert reason in row["Finding_Details"]
+    return [finding for finding in findings if finding not in rows]
+
+
 def _tool_policy(name, document):
     return {"name": name, "document": document}
 
@@ -29248,7 +29268,9 @@ class TestAC45ToolExecutionRoleScope:
         )
         cache = _tool_cache("ToolRole", [_tool_policy("ToolPolicy", document)])
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Failed"
@@ -29271,7 +29293,9 @@ class TestAC45ToolExecutionRoleScope:
             inline=[_tool_policy("ToolInline", self._statement("s3:GetObject", "*"))],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Failed"
@@ -29293,7 +29317,9 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Passed"
@@ -29366,7 +29392,9 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 2
         assert findings[0]["Status"] == "N/A"
@@ -29386,7 +29414,9 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Failed"
@@ -29405,7 +29435,9 @@ class TestAC45ToolExecutionRoleScope:
             "ToolRole", [_tool_policy("ToolPolicy", self._statement("s3:*", "*"))]
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert sorted(finding["Status"] for finding in findings) == [
             "Failed",
@@ -29434,7 +29466,9 @@ class TestAC45ToolExecutionRoleScope:
             "ToolRole", [_tool_policy("ToolPolicy", self._statement("s3:*", "*"))]
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
         assert "ListCodeInterpreters" in findings[0]["Resolution"]
@@ -29481,7 +29515,11 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache),
+            1,
+            reason="no principal in the IAM permission cache",
+        )
 
         statuses = {
             tool: [f["Status"] for f in findings if tool in f["Finding_Details"]]
@@ -29496,6 +29534,340 @@ class TestAC45ToolExecutionRoleScope:
             if finding["Status"] == "N/A":
                 assert "from account 444455556666" in finding["Finding_Details"]
                 assert_finding_schema(finding)
+
+
+class TestAC45ToolRoleInvokerBound:
+    """AC-45: a tool role holds no grant a principal starting its sessions lacks.
+
+    AIR-ACR-RT-03 keeps the tool role at equal-or-fewer privileges than the
+    invoking user, because whoever starts a session runs code with the role.
+    """
+
+    _FINDING = "AgentCore Tool Execution Role Invoker Bound"
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/ToolRole"
+    _CI_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:code-interpreter-custom/ci-1"
+    )
+    _BR_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:browser-custom/br-1"
+    _APP = "arn:aws:s3:::app-bucket/*"
+
+    def _allow(self, action, resource, **extra):
+        return {"Effect": "Allow", "Action": action, "Resource": resource, **extra}
+
+    def _principal(self, *statements, boundary=None):
+        permissions = {
+            "attached_policies": [
+                _tool_policy("Policy", {"Statement": list(statements)})
+            ],
+            "inline_policies": [],
+        }
+        if boundary is not None:
+            permissions["permissions_boundary"] = boundary
+        return permissions
+
+    def _start(
+        self, resource=None, action="bedrock-agentcore:StartCodeInterpreterSession"
+    ):
+        return self._allow(action, resource or self._CI_ARN)
+
+    def _run(self, mock_ac, tool_role, roles=None, users=None, browser=False):
+        if browser:
+            _wire_tools(
+                mock_ac,
+                browsers=[
+                    _browser(browserArn=self._BR_ARN, executionRoleArn=self._ROLE_ARN)
+                ],
+            )
+        else:
+            _wire_tools(
+                mock_ac,
+                interpreters=[
+                    _code_interpreter(
+                        codeInterpreterArn=self._CI_ARN,
+                        executionRoleArn=self._ROLE_ARN,
+                    )
+                ],
+            )
+        cache = {
+            "role_permissions": {"ToolRole": tool_role, **(roles or {})},
+            "user_permissions": users or {},
+        }
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        rows = [f for f in findings if f["Finding"] == self._FINDING]
+        assert len(rows) == 1, [f["Finding"] for f in findings]
+        assert rows[0]["Check_ID"] == "AC-45"
+        assert_finding_schema(rows[0])
+        return rows[0]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_lacking_a_tool_role_grant_fails(self, mock_ac):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            roles={
+                "Ops": self._principal(
+                    self._start("*"),
+                    self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*"),
+                )
+            },
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                )
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert row["Severity"] == "Medium"
+        assert f"role Ops lacks s3:getobject on {self._APP}" in row["Finding_Details"]
+        assert "user dev" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_invokers_holding_every_tool_role_grant_pass(self, mock_ac):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            roles={"Admin": self._principal(self._allow("*", "*"))},
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    self._allow(["s3:Get*", "s3:PutObject"], "arn:aws:s3:::app-*"),
+                )
+            },
+        )
+
+        assert row["Status"] == "Passed"
+        assert "role Admin, user dev" in row["Finding_Details"]
+        assert "StartCodeInterpreterSession" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tool_statement, invoker_statement",
+        [
+            (
+                ("s3:Get*", "arn:aws:s3:::app-bucket/*"),
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+            ),
+            (
+                ("s3:GetObject", "arn:aws:s3:::app-*"),
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+            ),
+            (
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/?"),
+            ),
+        ],
+        ids=["action-pattern", "resource-pattern", "question-mark"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_narrower_pattern_does_not_cover_a_wider_one(
+        self, mock_ac, tool_statement, invoker_statement
+    ):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow(*tool_statement)),
+            users={
+                "dev": self._principal(self._start(), self._allow(*invoker_statement))
+            },
+        )
+
+        assert row["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_invoker_grant_does_not_cover_an_unconditioned_one(
+        self, mock_ac
+    ):
+        condition = {"StringEquals": {"aws:SourceVpc": "vpc-1"}}
+        tool = self._principal(self._allow("s3:GetObject", self._APP))
+        users = {
+            "dev": self._principal(
+                self._start(),
+                self._allow("s3:GetObject", self._APP, Condition=condition),
+            )
+        }
+
+        assert self._run(mock_ac, tool, users=users)["Status"] == "Failed"
+        same = self._principal(
+            self._allow("s3:GetObject", self._APP, Condition=condition)
+        )
+        assert self._run(mock_ac, same, users=users)["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_whose_boundary_removes_the_action_fails(self, mock_ac):
+        boundary = {
+            "Statement": [
+                {"Effect": "Allow", "Action": "bedrock-agentcore:*", "Resource": "*"}
+            ]
+        }
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    self._allow("s3:GetObject", self._APP),
+                    boundary=boundary,
+                )
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert "user dev lacks s3:getobject" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_tool_role_grant_its_own_deny_removes_is_not_compared(self, mock_ac):
+        tool = self._principal(
+            self._allow(["s3:GetObject", "s3:DeleteObject"], self._APP),
+            {"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"},
+        )
+        row = self._run(
+            mock_ac,
+            tool,
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                )
+            },
+        )
+
+        assert row["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "users",
+        [
+            {},
+            {"other": {"attached_policies": [], "inline_policies": []}},
+            {
+                "elsewhere": None,
+            },
+        ],
+        ids=["no-users", "no-start-grant", "not-a-dict"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_no_principal_starting_a_session_is_na(self, mock_ac, users):
+        row = self._run(
+            mock_ac,
+            self._principal(self._start(), self._allow("s3:GetObject", self._APP)),
+            users=users,
+        )
+
+        assert row["Status"] == "N/A"
+        assert "no principal in the IAM permission cache" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_start_grant_its_own_deny_removes_does_not_make_an_invoker(self, mock_ac):
+        lacking = self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*")
+        denied = {
+            "Effect": "Deny",
+            "Action": "bedrock-agentcore:StartCodeInterpreterSession",
+            "Resource": "*",
+        }
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "denied": self._principal(self._start(), lacking, denied),
+                "dev": self._principal(self._start(), lacking),
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert "user dev lacks" in row["Finding_Details"]
+        assert "user denied" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_start_grant_on_another_tool_or_kind_does_not_make_an_invoker(
+        self, mock_ac
+    ):
+        lacking = self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*")
+        users = {
+            "other-tool": self._principal(
+                self._start(self._CI_ARN.replace("ci-1", "ci-2")), lacking
+            ),
+            "interpreter-only": self._principal(self._start("*"), lacking),
+            "other-browser": self._principal(
+                self._start(
+                    self._BR_ARN.replace("br-1", "br-2"),
+                    "bedrock-agentcore:StartBrowserSession",
+                ),
+                lacking,
+            ),
+        }
+        tool = self._principal(self._allow("s3:GetObject", self._APP))
+
+        assert self._run(mock_ac, tool, users=users, browser=True)["Status"] == "N/A"
+        users["browser-user"] = self._principal(
+            self._start(self._BR_ARN, "bedrock-agentcore:StartBrowserSession"), lacking
+        )
+        row = self._run(mock_ac, tool, users=users, browser=True)
+        assert row["Status"] == "Failed"
+        assert "user browser-user lacks" in row["Finding_Details"]
+        assert "other-tool" not in row["Finding_Details"]
+        assert "interpreter-only" not in row["Finding_Details"]
+        assert "other-browser" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_invoker_policy_is_na(self, mock_ac):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                ),
+                "broken": {
+                    "attached_policies": [_tool_policy("Bad", "not json")],
+                    "inline_policies": [],
+                },
+            },
+        )
+
+        assert row["Status"] == "N/A"
+        assert "user broken (policy Bad)" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tool_resource, status",
+        [
+            ("arn:aws:s3:::app-bucket/report.json", "Passed"),
+            ("arn:aws:s3:::secrets/key.pem", "Failed"),
+            ("arn:aws:s3:::app-bucket/*", "Failed"),
+        ],
+        ids=["literal-outside", "literal-excluded", "pattern"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_not_resource_covers_only_a_literal_arn_it_spares(
+        self, mock_ac, tool_resource, status
+    ):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", tool_resource)),
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:GetObject",
+                        "NotResource": "arn:aws:s3:::secrets/*",
+                    },
+                )
+            },
+        )
+
+        assert row["Status"] == status
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_not_action_tool_grant_needs_an_every_action_invoker(self, mock_ac):
+        tool = self._principal(
+            {"Effect": "Allow", "NotAction": "iam:*", "Resource": self._APP}
+        )
+        users = {
+            "dev": self._principal(
+                self._start(), self._allow(["s3:*", "dynamodb:*"], "*")
+            )
+        }
+
+        assert self._run(mock_ac, tool, users=users)["Status"] == "Failed"
+        users["dev"] = self._principal(self._start(), self._allow("*", "*"))
+        assert self._run(mock_ac, tool, users=users)["Status"] == "Passed"
 
 
 class TestAC46RuntimeSessionLimits:
@@ -35469,6 +35841,76 @@ class TestAC08DataPathEndpointScope:
 
         assert not self._naming(findings, "vpce-s3-other")
         assert not self._naming(findings, "vpc-2")
+
+    def _wire_hosted(self, mock_ac, mock_ec2):
+        """Runtime rt-1 runs in subnet-b of vpc-2, which holds an S3 endpoint
+        and no AgentCore endpoint; vpc-3 hosts nothing and holds another."""
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                self._agentcore_endpoint(),
+                self._gateway_endpoint(endpoint_id="vpce-s3-hosted", vpc_id="vpc-2"),
+                self._gateway_endpoint(endpoint_id="vpce-s3-other", vpc_id="vpc-3"),
+            ],
+        )
+        mock_ac.get_agent_runtime.return_value = {
+            "agentRuntimeId": "rt-1",
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {"subnets": ["subnet-b"]},
+            },
+        }
+        mock_ac.list_agent_runtime_versions.return_value = {"agentRuntimes": []}
+        mock_ac.list_code_interpreters.return_value = {"codeInterpreterSummaries": []}
+        mock_ac.list_browsers.return_value = {"browserSummaries": []}
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [{"SubnetId": "subnet-b", "VpcId": "vpc-2"}]
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_data_path_endpoint_in_a_hosting_vpc_is_judged(self, mock_ac, mock_ec2):
+        # A VPC-mode runtime reads its data through the S3 endpoint of the VPC
+        # it runs in, whether or not that VPC also holds an AgentCore endpoint.
+        self._wire_hosted(mock_ac, mock_ec2)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        hosted = self._naming(findings, "vpce-s3-hosted")
+
+        assert [finding["Finding"] for finding in hosted] == [
+            "AgentCore VPC Endpoint Policy Unrestricted"
+        ]
+        assert hosted[0]["Status"] == "Failed"
+        assert not self._naming(findings, "vpce-s3-other")
+
+    @pytest.mark.parametrize(
+        "denied, action",
+        [
+            ("get_agent_runtime", "bedrock-agentcore:GetAgentRuntime"),
+            ("describe_subnets", "ec2:DescribeSubnets"),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_hosting_vpc_is_na(self, mock_ac, mock_ec2, denied, action):
+        self._wire_hosted(mock_ac, mock_ec2)
+        client = mock_ec2 if denied == "describe_subnets" else mock_ac
+        getattr(client, denied).side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        unread = [
+            finding
+            for finding in findings
+            if "data-path endpoints" in finding["Finding_Details"]
+        ]
+
+        assert [finding["Status"] for finding in unread] == ["N/A"]
+        assert unread[0]["Finding"] == "AgentCore VPC Endpoint Policy"
+        assert unread[0]["Resolution"] == f"Grant {action} and retry."
+        assert not self._naming(findings, "vpce-s3-hosted")
 
     @pytest.mark.parametrize(
         "service", ["dynamodb", "sagemaker.api", "sagemaker.runtime"]
@@ -43138,7 +43580,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 2
+        )
 
         assert [f["Status"] for f in findings] == ["Passed", "Failed"]
         assert "ToolRole" in findings[0]["Finding_Details"]
@@ -43162,7 +43606,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Passed"]
 
@@ -43187,7 +43633,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Failed"]
 
@@ -43210,7 +43658,9 @@ class TestAC45WholePopulation:
             roles={"ToolRole": _principal_with([self._allow("s3:*", "*")], boundary)}
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == [status]
 
@@ -43234,7 +43684,9 @@ class TestAC45WholePopulation:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["N/A", "Passed"]
         assert findings[0]["Finding"].endswith("Incomplete")
@@ -43258,7 +43710,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["N/A"]
 
@@ -43273,7 +43727,9 @@ class TestAC45WholePopulation:
         ]
         cache = _v2_cache(roles={"ToolRole": permissions})
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Failed"]
 
@@ -43288,7 +43744,9 @@ class TestAC45WholePopulation:
         }
         cache = _v2_cache(roles=roles) if v2 else {"role_permissions": roles}
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Passed"]
         assert (agentcore_app.IAM_CACHE_V1_NOTE in findings[0]["Finding_Details"]) is (
@@ -43635,7 +44093,9 @@ class TestAC45RuntimeExecutionRole:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Finding"] for f in findings] == [
             "AgentCore Tool Execution Role Scope",
@@ -43757,7 +44217,9 @@ class TestAC45RuntimeExecutionRole:
             {"ToolRole": [self._allow("ecr:GetAuthorizationToken", "*")]}
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Failed"]
 

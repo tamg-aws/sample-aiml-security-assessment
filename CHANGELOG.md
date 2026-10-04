@@ -345,6 +345,18 @@ section.
     and is `N/A` when either list cannot be read or is absent.
   - `AIR-ACR-NET-03` now maps `SM-39`, whose egress legs judge the ECS,
     Lambda, EKS and EC2 VPCs the control names.
+  - `AC-08` judges the S3, DynamoDB and SageMaker endpoint policies in every
+    VPC that hosts a VPC-mode runtime version, Code Interpreter or Browser, as
+    well as in VPCs that hold an AgentCore endpoint. Before, a runtime whose
+    VPC held only an S3 gateway endpoint left that endpoint's policy unjudged.
+    A hosting resource or subnet whose VPC cannot be read is `N/A` naming the
+    action.
+  - `AC-45` adds an `AgentCore Tool Execution Role Invoker Bound` row per
+    custom Code Interpreter and Browser. It fails when a principal that can
+    start the tool's sessions (`StartCodeInterpreterSession` or
+    `StartBrowserSession` on the tool's ARN) lacks one of the tool role's
+    grants, because that principal runs code with the role. No IAM change:
+    the row reads the IAM permission cache.
 
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.
