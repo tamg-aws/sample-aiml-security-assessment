@@ -2386,10 +2386,15 @@ AGENTCORE_ENDPOINT_SURFACES = (
 WORKLOAD_ENDPOINT_SURFACES = BEDROCK_ENDPOINT_SURFACES + AGENTCORE_ENDPOINT_SURFACES
 
 # The data paths a Bedrock or AgentCore workload also reaches. Each is required
-# only of a workload already granted a Bedrock or AgentCore surface. S3 and
-# DynamoDB are covered by a gateway endpoint or a private-DNS interface endpoint.
+# only of a workload already granted a Bedrock, AgentCore or SageMaker runtime
+# surface. S3 and DynamoDB are covered by a private-DNS interface endpoint, or
+# by a gateway endpoint that names the route table of each workload subnet.
 DATA_PATH_ENDPOINT_SURFACES = ("sagemaker.api", "sagemaker.runtime", "s3", "dynamodb")
 GATEWAY_ENDPOINT_SURFACES = ("s3", "dynamodb")
+
+# Model invocation through SageMaker is an AI surface of its own, so a role
+# granted it is a workload in scope even with no Bedrock or AgentCore grant.
+AI_WORKLOAD_SURFACES = WORKLOAD_ENDPOINT_SURFACES + ("sagemaker.runtime",)
 
 # The S3 object and listing actions a workload uses to move data. S3 IAM action
 # names do not follow its operation names, so they are listed here.
@@ -2459,8 +2464,41 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
                     "private_dns": endpoint.get("PrivateDnsEnabled"),
                     "policy": endpoint.get("PolicyDocument"),
                     "type": endpoint.get("VpcEndpointType"),
+                    "route_tables": endpoint.get("RouteTableIds") or [],
                 }
             )
+
+    # A gateway endpoint carries only the traffic of the subnets whose route
+    # table it names, so each VPC holding one has its route tables read.
+    route_tables: Dict[str, Dict[str, Any]] = {}
+    for vpc_id in sorted(
+        {
+            endpoint["vpc_id"]
+            for endpoint in found_data_path
+            if endpoint.get("type") == "Gateway"
+        }
+    ):
+        tables: Dict[str, Any] = {"main": None, "subnets": {}}
+        try:
+            for page in ec2_client.get_paginator("describe_route_tables").paginate(
+                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+            ):
+                for table in page.get("RouteTables", []):
+                    for association in table.get("Associations") or []:
+                        if association.get("Main"):
+                            tables["main"] = table.get("RouteTableId")
+                        elif association.get("SubnetId"):
+                            tables["subnets"][association["SubnetId"]] = table.get(
+                                "RouteTableId"
+                            )
+        except (ClientError, BotoCoreError) as error:
+            tables = {
+                "error": "the route tables of {} were not read with "
+                "ec2:DescribeRouteTables ({})".format(
+                    vpc_id, get_assessment_error_label(error)
+                )
+            }
+        route_tables[vpc_id] = tables
 
     return {
         "has_endpoints": len(found_endpoints) > 0,
@@ -2470,6 +2508,7 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
         "agentcore_endpoints": found_agentcore,
         # SageMaker, S3 and DynamoDB endpoints feed only the workload leg.
         "data_path_endpoints": found_data_path,
+        "route_tables": route_tables,
         "all_vpcs": vpc_ids,
     }
 
@@ -2692,7 +2731,15 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
         role = str(task_role or "").rsplit("/", 1)[-1] or None
         for vpc_id in sorted({vpc for vpc in vpcs.values() if vpc}):
             inventory["workloads"].append(
-                {"kind": kind, "name": name, "vpc_id": vpc_id, "role": role}
+                {
+                    "kind": kind,
+                    "name": name,
+                    "vpc_id": vpc_id,
+                    "role": role,
+                    "subnets": sorted(
+                        subnet for subnet, vpc in vpcs.items() if vpc == vpc_id
+                    ),
+                }
             )
         if not any(vpcs.values()):
             inventory["errors"].append(
@@ -2858,6 +2905,7 @@ def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
                 "name": name,
                 "vpc_id": vpc_id,
                 "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                "subnets": [subnet] if subnet else None,
             }
         )
 
@@ -2918,6 +2966,11 @@ def _sagemaker_endpoint_workloads(region: str, inventory: Dict[str, Any]) -> Non
                 "name": name,
                 "vpc_id": vpc_id,
                 "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                "subnets": sorted(
+                    subnet for subnet, vpc in vpcs.items() if vpc == vpc_id
+                )
+                if subnets
+                else None,
             }
         )
 
@@ -3182,6 +3235,9 @@ def _agentcore_runtime_workloads(region: str, inventory: Dict[str, Any]) -> None
                         "name": f"{name} version {version}",
                         "vpc_id": vpc_id,
                         "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                        "subnets": sorted(
+                            subnet for subnet, vpc in vpcs.items() if vpc == vpc_id
+                        ),
                     }
                 )
 
@@ -3210,6 +3266,8 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
                     "name": function.get("FunctionName") or "unnamed",
                     "vpc_id": (function.get("VpcConfig") or {}).get("VpcId") or None,
                     "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                    "subnets": (function.get("VpcConfig") or {}).get("SubnetIds")
+                    or None,
                 }
             )
     except Exception as error:
@@ -3269,6 +3327,7 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
                 "name": name,
                 "vpc_id": instance.get("VpcId") or None,
                 "role": role,
+                "subnets": [instance["SubnetId"]] if instance.get("SubnetId") else None,
             }
         )
     return inventory
@@ -3279,35 +3338,71 @@ def _workload_connectivity_findings(
     found_endpoints: List[Dict[str, Any]],
     workload_inventory: Dict[str, Any],
     region: str,
+    route_tables: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Judge, per workload, whether each Bedrock surface its role is granted has an
     interface endpoint with private DNS in the workload's own VPC.
 
-    A workload granted a Bedrock or AgentCore surface must also have an endpoint
-    for each SageMaker, S3 and DynamoDB surface its role is granted. For S3 and
-    DynamoDB a gateway endpoint counts. An interface endpoint without private
-    DNS does not count, because an unmodified SDK client still resolves the
-    public hostname. A workload outside any VPC cannot use an endpoint at all.
+    A workload granted a Bedrock, AgentCore or SageMaker runtime surface must
+    also have an endpoint for each SageMaker, S3 and DynamoDB surface its role
+    is granted. For S3 and DynamoDB a gateway endpoint counts when it names the
+    route table of every subnet the workload runs in: the subnet's explicit
+    association, else the VPC's main table. An interface endpoint without
+    private DNS does not count, because an unmodified SDK client still resolves
+    the public hostname. A workload outside any VPC cannot use an endpoint at all.
     """
     rows = []
     covered_by_vpc: Dict[str, set] = {}
     no_dns_by_vpc: Dict[str, set] = {}
+    # (vpc, surface) -> the route tables a gateway endpoint for it names
+    gateway_routes: Dict[Tuple[str, str], set] = {}
     prefix = f"com.amazonaws.{region}."
     for endpoint in found_endpoints:
         surface = str(endpoint.get("service", ""))
         if not surface.startswith(prefix):
             continue
         surface = surface[len(prefix) :]
-        gateway = (
-            surface in GATEWAY_ENDPOINT_SURFACES and endpoint.get("type") == "Gateway"
-        )
+        if surface in GATEWAY_ENDPOINT_SURFACES and endpoint.get("type") == "Gateway":
+            gateway_routes.setdefault((endpoint.get("vpc_id"), surface), set()).update(
+                endpoint.get("route_tables") or []
+            )
+            continue
         target = (
-            covered_by_vpc
-            if gateway or endpoint.get("private_dns") is True
-            else no_dns_by_vpc
+            covered_by_vpc if endpoint.get("private_dns") is True else no_dns_by_vpc
         )
         target.setdefault(endpoint.get("vpc_id"), set()).add(surface)
+
+    def gateway_gap(workload, vpc_id, surface):
+        """Return (gap, unread) for a surface only a gateway endpoint may carry."""
+        subnets = workload.get("subnets")
+        if not subnets:
+            return None, (
+                f"the subnets of {workload['kind']} '{workload['name']}' in "
+                f"{vpc_id} were not read, so its route tables were not compared "
+                f"with the {surface} gateway endpoint's"
+            )
+        tables = (route_tables or {}).get(vpc_id)
+        if tables is None or "error" in tables:
+            return None, (tables or {}).get("error") or (
+                f"the route tables of {vpc_id} were not read"
+            )
+        off = []
+        for subnet in sorted(subnets):
+            table = tables["subnets"].get(subnet) or tables["main"]
+            if not table:
+                return None, (
+                    f"subnet {subnet} in {vpc_id} has no route table association "
+                    "and the VPC reports no main route table"
+                )
+            if table not in gateway_routes[(vpc_id, surface)]:
+                off.append(f"{subnet} ({table})")
+        if off:
+            return (
+                f"{surface}: the gateway endpoint names no route table of subnet(s) "
+                f"{', '.join(off)}"
+            ), None
+        return None, None
 
     roles = permission_cache.get("role_permissions") or {}
     gaps = []
@@ -3324,9 +3419,7 @@ def _workload_connectivity_findings(
             )
             continue
         try:
-            surfaces = _granted_bedrock_surfaces(
-                roles[role], WORKLOAD_ENDPOINT_SURFACES
-            )
+            surfaces = _granted_bedrock_surfaces(roles[role], AI_WORKLOAD_SURFACES)
         except (ValueError, TypeError, AttributeError):
             unread.append(
                 f"{label} runs as role '{role}', whose policies could not be parsed"
@@ -3353,14 +3446,21 @@ def _workload_connectivity_findings(
             )
             continue
         missing = sorted(surfaces - covered_by_vpc.get(vpc_id, set()))
+        routed = []
+        held = []
+        for surface in [item for item in missing if (vpc_id, item) in gateway_routes]:
+            gap, not_read = gateway_gap(workload, vpc_id, surface)
+            if not_read:
+                held.append(not_read)
+            elif gap:
+                routed.append(gap)
+            missing.remove(surface)
+        parts = []
         if missing:
             no_dns = sorted(set(missing) & no_dns_by_vpc.get(vpc_id, set()))
-            gaps.append(
-                "{} in {} (role '{}') is granted {} with no private-DNS endpoint "
-                "(and, for S3 and DynamoDB, no gateway endpoint) in that VPC{}".format(
-                    label,
-                    vpc_id,
-                    role,
+            parts.append(
+                "is granted {} with no private-DNS endpoint (and, for S3 and "
+                "DynamoDB, no gateway endpoint) in that VPC{}".format(
                     ", ".join(missing),
                     (
                         "; the endpoint for {} has private DNS off".format(
@@ -3371,6 +3471,22 @@ def _workload_connectivity_findings(
                     ),
                 )
             )
+        if routed:
+            parts.append(
+                "reaches {} through a gateway endpoint its subnets do not route "
+                "to: {}".format(
+                    ", ".join(sorted(gap.split(":", 1)[0] for gap in routed)),
+                    "; ".join(routed),
+                )
+            )
+        if parts:
+            gaps.append(
+                "{} in {} (role '{}') {}".format(
+                    label, vpc_id, role, ", and ".join(parts)
+                )
+            )
+        elif held:
+            unread.extend(held)
         else:
             covered.append(
                 "{} in {} ({})".format(label, vpc_id, ", ".join(sorted(surfaces)))
@@ -3378,11 +3494,12 @@ def _workload_connectivity_findings(
 
     scope = (
         "Surfaces are taken from the grants of each workload's role, including a "
-        "permissions boundary that removes an action. SageMaker, S3 and "
-        "DynamoDB surfaces are required only of a workload granted a Bedrock or "
-        "AgentCore surface. A gateway endpoint is credited for its whole VPC, "
-        "because the route tables of each workload's subnets are not compared "
-        "with the endpoint's route tables. Only endpoints in the available "
+        "permissions boundary that removes an action. SageMaker API, S3 and "
+        "DynamoDB surfaces are required only of a workload granted a Bedrock, "
+        "AgentCore or SageMaker runtime surface. A gateway endpoint covers a "
+        "workload only when it names the route table of each of the workload's "
+        "subnets, the subnet's own association or else the VPC's main table. "
+        "Only endpoints in the available "
         f"state are counted. {SCP_NOT_EVALUATED_NOTE} {WORKLOAD_CONNECTIVITY_CEILING}"
     )
     if gaps:
@@ -4060,6 +4177,7 @@ def check_bedrock_access_and_vpc_endpoints(
                     + vpc_endpoint_check.get("data_path_endpoints", []),
                     workload_inventory,
                     region,
+                    vpc_endpoint_check.get("route_tables"),
                 )
             },
             permission_cache,

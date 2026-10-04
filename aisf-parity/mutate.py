@@ -944,6 +944,41 @@ MUTATIONS = [
         "replace": '        targets = [runtime.get("agentRuntimeArn")] + 0 * [\n',
     },
     {
+        "name": "BR-02 credits a gateway endpoint for its whole VPC",
+        "file": BEDROCK,
+        "defect": "BR-02 credits an S3 or DynamoDB gateway endpoint to every workload in its VPC, so a subnet whose route table it does not name passes",
+        "find": "            if table not in gateway_routes[(vpc_id, surface)]:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-02 credits a gateway endpoint to a workload with unread subnets",
+        "file": BEDROCK,
+        "defect": "BR-02 passes a gateway-only workload whose subnets were not read, though its route tables were never compared",
+        "find": "        if not subnets:\n            return None, (\n",
+        "replace": "        if not subnets:\n            return None, None and (\n",
+    },
+    {
+        "name": "BR-02 leaves a SageMaker runtime workload out",
+        "file": BEDROCK,
+        "defect": "BR-02 judges only workloads granted a Bedrock or AgentCore surface, so a workload that invokes SageMaker endpoints is never judged",
+        "find": "            surfaces = _granted_bedrock_surfaces(roles[role], AI_WORKLOAD_SURFACES)\n",
+        "replace": "            surfaces = _granted_bedrock_surfaces(roles[role], WORKLOAD_ENDPOINT_SURFACES)\n",
+    },
+    {
+        "name": "BR-02 passes beside unread route tables",
+        "file": BEDROCK,
+        "defect": "BR-02 reports a gateway-only workload Passed while the route tables of its VPC were not read",
+        "find": "        elif held:\n            unread.extend(held)\n",
+        "replace": "        elif False:\n            unread.extend(held)\n",
+    },
+    {
+        "name": "BR-02 drops the subnets of a Lambda workload",
+        "file": BEDROCK,
+        "defect": "BR-02 never records a Lambda function's subnets, so its gateway endpoint coverage can never be compared",
+        "find": '                    "subnets": (function.get("VpcConfig") or {}).get("SubnetIds")\n',
+        "replace": '                    "subnets": (function.get("VpcConfig") or {}).get("SubnetIdz")\n',
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2690,6 +2725,19 @@ GROUPS: dict[str, str] = {
         "in the Bedrock runtime inbound gate"
     ),
     "BR-57 reads no runtime endpoint policy": ("in the Bedrock runtime inbound gate"),
+    "BR-02 credits a gateway endpoint for its whole VPC": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-02 credits a gateway endpoint to a workload with unread subnets": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-02 leaves a SageMaker runtime workload out": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-02 passes beside unread route tables": ("in the Bedrock workload route tables"),
+    "BR-02 drops the subnets of a Lambda workload": (
+        "in the Bedrock workload route tables"
+    ),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

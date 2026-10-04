@@ -1005,10 +1005,20 @@ class TestBR02WorkloadConnectivity:
         }
 
     @staticmethod
-    def _function(name, role, vpc_id="vpc-1"):
-        return {"kind": "Lambda function", "name": name, "vpc_id": vpc_id, "role": role}
+    def _function(name, role, vpc_id="vpc-1", subnets=None):
+        workload = {
+            "kind": "Lambda function",
+            "name": name,
+            "vpc_id": vpc_id,
+            "role": role,
+        }
+        if subnets is not None:
+            workload["subnets"] = subnets
+        return workload
 
-    def _run(self, cache, endpoints, workloads, errors=None, agentcore=()):
+    def _run(
+        self, cache, endpoints, workloads, errors=None, agentcore=(), route_tables=None
+    ):
         with (
             patch(
                 "bedrock_app.check_bedrock_vpc_endpoints",
@@ -1017,6 +1027,7 @@ class TestBR02WorkloadConnectivity:
                     "found_endpoints": list(endpoints),
                     "agentcore_endpoints": list(agentcore),
                     "all_vpcs": ["vpc-1", "vpc-2"],
+                    "route_tables": route_tables or {},
                 },
             ),
             patch(
@@ -1216,9 +1227,10 @@ class TestBR02WorkloadConnectivity:
             assert surface in detail
 
     @classmethod
-    def _data_endpoint(cls, surface, endpoint_type, private_dns=False):
+    def _data_endpoint(cls, surface, endpoint_type, private_dns=False, routes=()):
         endpoint = cls._endpoint(surface, private_dns=private_dns)
         endpoint["type"] = endpoint_type
+        endpoint["route_tables"] = list(routes)
         return endpoint
 
     @pytest.mark.parametrize(
@@ -1255,6 +1267,10 @@ class TestBR02WorkloadConnectivity:
         )
         assert [row["Status"] for row in covered] == ["Passed"]
 
+    # The gateway endpoint now covers a workload only through the route table
+    # of each of its subnets, so this fixture names them.
+    ROUTES = {"vpc-1": {"main": "rtb-main", "subnets": {"subnet-a": "rtb-a"}}}
+
     @pytest.mark.parametrize("surface", ["s3", "dynamodb"])
     def test_br02_a_gateway_endpoint_covers_s3_and_dynamodb(self, surface):
         action = "s3:GetObject" if surface == "s3" else "dynamodb:GetItem"
@@ -1262,11 +1278,188 @@ class TestBR02WorkloadConnectivity:
             self._cache({"Role": self._role(["bedrock:InvokeModel", action])}),
             [
                 self._endpoint("bedrock-runtime"),
-                self._data_endpoint(surface, "Gateway"),
+                self._data_endpoint(surface, "Gateway", routes=["rtb-a", "rtb-main"]),
             ],
-            [self._function("app", "Role")],
+            [self._function("app", "Role", subnets=["subnet-a", "subnet-b"])],
+            route_tables=self.ROUTES,
         )
         assert [row["Status"] for row in rows] == ["Passed"]
+
+    # NET-02: a gateway endpoint was credited for its whole VPC, though only
+    # the subnets whose route table it names reach it.
+    @pytest.mark.parametrize(
+        "routes, subnet",
+        [(["rtb-a"], "subnet-b (rtb-main)"), (["rtb-main"], "subnet-a (rtb-a)")],
+    )
+    def test_br02_a_gateway_endpoint_off_a_subnet_route_table_fails(
+        self, routes, subnet
+    ):
+        cache = self._cache(
+            {
+                "Role": self._role(["bedrock:InvokeModel", "s3:GetObject"]),
+                "Other": self._role(["bedrock:InvokeModel", "s3:GetObject"]),
+            }
+        )
+        rows = self._run(
+            cache,
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=routes),
+            ],
+            [
+                self._function("app", "Role", subnets=["subnet-a", "subnet-b"]),
+                self._function(
+                    "inside",
+                    "Other",
+                    subnets=["subnet-a" if routes == ["rtb-a"] else "subnet-b"],
+                ),
+            ],
+            route_tables=self.ROUTES,
+        )
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "1 workload(s) can call" in details
+            and "Lambda function 'app' in vpc-1 (role 'Role') reaches s3 through a "
+            "gateway endpoint its subnets do not route to: s3: the gateway "
+            f"endpoint names no route table of subnet(s) {subnet}"
+            in details
+        )
+        assert "'inside'" not in details
+        assert "Lambda function 'inside' in vpc-1" in rows[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "subnets, route_tables, phrase",
+        [
+            (None, {"vpc-1": {"main": "rtb-main", "subnets": {}}}, "were not read"),
+            (["subnet-a"], {}, "the route tables of vpc-1 were not read"),
+            (
+                ["subnet-a"],
+                {
+                    "vpc-1": {
+                        "error": "the route tables of vpc-1 were not read with "
+                        "ec2:DescribeRouteTables (UnauthorizedOperation)"
+                    }
+                },
+                "ec2:DescribeRouteTables (UnauthorizedOperation)",
+            ),
+            (
+                ["subnet-z"],
+                {"vpc-1": {"main": None, "subnets": {}}},
+                "reports no main route table",
+            ),
+        ],
+    )
+    def test_br02_unread_routes_withhold_the_gateway_pass(
+        self, subnets, route_tables, phrase
+    ):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=["rtb-main"]),
+            ],
+            [self._function("app", "Role", subnets=subnets)],
+            route_tables=route_tables,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(phrase in row["Finding_Details"] for row in rows)
+
+    def test_br02_the_collector_reads_route_tables_of_gateway_vpcs_only(self):
+        ec2_client = MagicMock()
+        pages = {
+            "describe_vpcs": [{"Vpcs": [{"VpcId": "vpc-1"}, {"VpcId": "vpc-2"}]}],
+            "describe_vpc_endpoints": [
+                {
+                    "VpcEndpoints": [
+                        {
+                            "VpcEndpointId": "vpce-s3",
+                            "VpcId": "vpc-1",
+                            "ServiceName": "com.amazonaws.us-east-1.s3",
+                            "VpcEndpointType": "Gateway",
+                            "State": "available",
+                            "RouteTableIds": ["rtb-a"],
+                        },
+                        {
+                            "VpcEndpointId": "vpce-ddb",
+                            "VpcId": "vpc-2",
+                            "ServiceName": "com.amazonaws.us-east-1.dynamodb",
+                            "VpcEndpointType": "Interface",
+                            "State": "available",
+                        },
+                    ]
+                }
+            ],
+            "describe_route_tables": [
+                {
+                    "RouteTables": [
+                        {
+                            "RouteTableId": "rtb-main",
+                            "Associations": [{"Main": True}],
+                        },
+                        {
+                            "RouteTableId": "rtb-a",
+                            "Associations": [
+                                {"Main": False, "SubnetId": "subnet-a"},
+                                {"Main": False, "SubnetId": "subnet-b"},
+                            ],
+                        },
+                    ]
+                }
+            ],
+        }
+        filters = []
+
+        def paginator(name):
+            pager = MagicMock()
+
+            def paginate(**kwargs):
+                if name == "describe_route_tables":
+                    filters.append(kwargs["Filters"])
+                return pages[name]
+
+            pager.paginate.side_effect = paginate
+            return pager
+
+        ec2_client.get_paginator.side_effect = paginator
+        with patch("bedrock_app.boto3.client", return_value=ec2_client):
+            result = bedrock_app.check_bedrock_vpc_endpoints(region=self.REGION)
+
+        assert filters == [[{"Name": "vpc-id", "Values": ["vpc-1"]}]]
+        assert result["route_tables"] == {
+            "vpc-1": {
+                "main": "rtb-main",
+                "subnets": {"subnet-a": "rtb-a", "subnet-b": "rtb-a"},
+            }
+        }
+        assert result["data_path_endpoints"][0]["route_tables"] == ["rtb-a"]
+
+    # NET-02: an AI workload that calls only SageMaker runtime was never judged.
+    def test_br02_a_sagemaker_runtime_only_workload_is_in_scope(self):
+        cache = self._cache(
+            {
+                "Invoker": self._role(["sagemaker:InvokeEndpoint"]),
+                "Trainer": self._role(["sagemaker:CreateTrainingJob"]),
+            }
+        )
+        workloads = [
+            self._function("invoker", "Invoker"),
+            self._function("trainer", "Trainer"),
+        ]
+        rows = self._run(cache, [], workloads)
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "Lambda function 'invoker' in vpc-1 (role 'Invoker') is granted "
+            "sagemaker.runtime with no private-DNS endpoint"
+        ) in rows[0]["Finding_Details"]
+        assert "'trainer'" not in rows[0]["Finding_Details"]
+
+        covered = self._run(
+            cache,
+            [self._data_endpoint("sagemaker.runtime", "Interface", private_dns=True)],
+            workloads,
+        )
+        assert [row["Status"] for row in covered] == ["Passed"]
 
     def test_br02_a_no_dns_sagemaker_interface_endpoint_is_not_coverage(self):
         rows = self._run(
@@ -1392,7 +1585,7 @@ class TestBR02WorkloadConnectivity:
                     {
                         "FunctionName": "one",
                         "Role": "arn:aws:iam::123456789012:role/service-role/RoleOne",
-                        "VpcConfig": {"VpcId": "vpc-1"},
+                        "VpcConfig": {"VpcId": "vpc-1", "SubnetIds": ["subnet-a"]},
                     }
                 ]
             },
@@ -1427,12 +1620,14 @@ class TestBR02WorkloadConnectivity:
                 "name": "one",
                 "vpc_id": "vpc-1",
                 "role": "RoleOne",
+                "subnets": ["subnet-a"],
             },
             {
                 "kind": "Lambda function",
                 "name": "two",
                 "vpc_id": None,
                 "role": "RoleTwo",
+                "subnets": None,
             },
         ]
         assert len(inventory["errors"]) == 1

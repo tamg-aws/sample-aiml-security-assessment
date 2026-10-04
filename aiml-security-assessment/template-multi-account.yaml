@@ -693,7 +693,7 @@ Resources:
                 # Former Sid EC2Permissions.
                 - ec2:DescribeVpcEndpoints # BR-02
                 - ec2:DescribeSubnets # BR-02, BR-39
-                - ec2:DescribeRouteTables # BR-39
+                - ec2:DescribeRouteTables # BR-02, BR-39
                 - ec2:DescribeVpcs # BR-02
                 - ec2:DescribeInstances # BR-02, BR-33
                 - ecs:ListClusters # BR-02
