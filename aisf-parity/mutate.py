@@ -1035,6 +1035,20 @@ MUTATIONS = [
         "replace": '        [].append(\n            f"CloudTrail trails (cloudtrail:ListTrails: "\n',
     },
     {
+        "name": "BR-46 clears a source by a job alone",
+        "file": BEDROCK,
+        "defect": "BR-46 passes a source a qualifying Macie job covers while automated sensitive data discovery is off or does not monitor its bucket",
+        "find": '                if precondition["ready"] and automated == "MONITORED":\n',
+        "replace": "                if True:\n",
+    },
+    {
+        "name": "BR-46 fails an unread discovery state",
+        "file": BEDROCK,
+        "defect": "BR-46 fails a source whose automated discovery configuration or bucket monitoring status was not read, though neither was established",
+        "find": '                elif precondition["permissions"] or (\n',
+        "replace": "                elif False and (\n",
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2816,6 +2830,12 @@ GROUPS: dict[str, str] = {
         "in the Bedrock guardrail record legs"
     ),
     "BR-32 drops an unread trail list": ("in the Bedrock guardrail record legs"),
+    "BR-46 clears a source by a job alone": (
+        "in the Bedrock Macie discovery requirement"
+    ),
+    "BR-46 fails an unread discovery state": (
+        "in the Bedrock Macie discovery requirement"
+    ),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

@@ -15241,7 +15241,7 @@ class TestBR46KnowledgeBaseSourceClassification:
         return [f for f in findings if f["Status"] == status]
 
     def test_br46_monitored_and_unmonitored_buckets_discriminate(self):
-        """MONITORED without a job fails; a job over a NOT_MONITORED bucket passes."""
+        """MONITORED without a job fails; a job over a NOT_MONITORED bucket fails too."""
         findings = self._two_bucket_estate(
             macie_buckets=[
                 self._bucket("support-bucket", sensitivityScore=42),
@@ -15251,18 +15251,86 @@ class TestBR46KnowledgeBaseSourceClassification:
         )
 
         failed = self._status(findings, "Failed")
-        passed = self._status(findings, "Passed")
-        assert len(failed) == 1
+        assert len(failed) == 2
         assert failed[0]["Check_ID"] == "BR-46"
         assert "(bucket support-bucket)" in failed[0]["Finding_Details"]
         assert "reports MONITORED" in failed[0]["Finding_Details"]
         assert "samples objects" in failed[0]["Finding_Details"]
+        assert (
+            "data source 'hr-docs' in knowledge base 'hr-kb' (bucket hr-bucket) is "
+            "classified by scheduled Macie job 'nightly-hr'"
+        ) in failed[1]["Finding_Details"]
+        assert (
+            "but automated sensitive data discovery does not monitor the bucket: its "
+            "automatedDiscoveryMonitoringStatus is NOT_MONITORED"
+            in failed[1]["Finding_Details"]
+        )
+        assert "Enable automated sensitive data discovery" in failed[1]["Resolution"]
+        assert not self._status(findings, "Passed")
+
+    def test_br46_a_job_over_a_monitored_bucket_passes(self):
+        findings = self._two_bucket_estate(
+            macie_buckets=[
+                self._bucket("support-bucket", sensitivityScore=42),
+                self._bucket("hr-bucket"),
+            ],
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
+        )
+
+        passed = self._status(findings, "Passed")
         assert len(passed) == 1
         assert (
             "data source 'hr-docs' in knowledge base 'hr-kb' (bucket hr-bucket) is "
             "classified by scheduled Macie job 'nightly-hr'"
         ) in passed[0]["Finding_Details"]
         assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert (
+            "Automated sensitive data discovery is ENABLED and reports each of these "
+            "buckets MONITORED" in passed[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "overrides, text",
+        [
+            (
+                {
+                    "discovery_error": ClientError(
+                        {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                        "GetAutomatedDiscoveryConfiguration",
+                    )
+                },
+                "whether automated sensitive data discovery monitors the bucket was "
+                "not read: the automated sensitive data discovery configuration "
+                "could not be read",
+            ),
+            (
+                {"hr_status": None},
+                "whether automated sensitive data discovery monitors the bucket was "
+                "not read: DescribeBuckets returned no "
+                "automatedDiscoveryMonitoringStatus",
+            ),
+        ],
+    )
+    def test_br46_an_unread_discovery_state_withholds_the_pass(self, overrides, text):
+        hr_status = overrides.pop("hr_status", "MONITORED")
+        hr_bucket = (
+            self._bucket("hr-bucket", hr_status)
+            if hr_status
+            else {"bucketName": "hr-bucket"}
+        )
+        findings = self._two_bucket_estate(
+            macie_buckets=[self._bucket("support-bucket"), hr_bucket],
+            classification_jobs=[self._job("nightly", ["support-bucket", "hr-bucket"])],
+            **overrides,
+        )
+
+        assert not self._status(findings, "Failed")
+        assert not [
+            f
+            for f in self._status(findings, "Passed")
+            if "(bucket hr-bucket)" in f["Finding_Details"]
+        ]
+        assert any(text in f["Finding_Details"] for f in self._status(findings, "N/A"))
 
     def test_br46_monitored_account_bucket_no_knowledge_base_uses_is_not_counted(self):
         """The Macie inventory is wider than the source set on any real account."""
@@ -15403,13 +15471,18 @@ class TestBR46KnowledgeBaseSourceClassification:
         )
 
         failed = self._status(findings, "Failed")
-        assert len(failed) == 1
+        assert len(failed) == 2
         assert "(bucket support-bucket)" in failed[0]["Finding_Details"]
         assert (
             "not in effect: automated sensitive data discovery is DISABLED"
             in failed[0]["Finding_Details"]
         )
-        assert len(self._status(findings, "Passed")) == 1
+        assert "(bucket hr-bucket)" in failed[1]["Finding_Details"]
+        assert (
+            "does not monitor the bucket: automated sensitive data discovery is "
+            "DISABLED" in failed[1]["Finding_Details"]
+        )
+        assert not self._status(findings, "Passed")
 
     def test_br46_bucket_error_code_is_indeterminate_not_failed(self):
         findings = self._two_bucket_estate(
@@ -15560,7 +15633,7 @@ class TestBR46KnowledgeBaseSourceClassification:
         findings = self._two_bucket_estate(
             macie_buckets=[
                 self._bucket("support-bucket"),
-                self._bucket("hr-bucket", "NOT_MONITORED"),
+                self._bucket("hr-bucket"),
             ],
             classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
         )
@@ -15582,7 +15655,7 @@ class TestBR46ClassificationJobCoverage:
         },
         {
             "bucketName": "hr-bucket",
-            "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+            "automatedDiscoveryMonitoringStatus": "MONITORED",
         },
     ]
 
@@ -15630,7 +15703,26 @@ class TestBR46ClassificationJobCoverage:
         assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
         assert "(bucket hr-bucket)" not in passed[0]["Finding_Details"]
 
-    def test_br46_scheduled_job_clears_an_unmonitored_bucket(self):
+    def test_br46_scheduled_job_alone_does_not_clear_an_unmonitored_bucket(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            macie_buckets=[
+                self._BUCKETS[0],
+                dict(
+                    self._BUCKETS[1], automatedDiscoveryMonitoringStatus="NOT_MONITORED"
+                ),
+            ],
+        )
+        self._hr_fails_because(
+            findings,
+            "is classified by scheduled Macie job 'nightly-hr' (IDLE",
+        )
+        assert (
+            "automatedDiscoveryMonitoringStatus is NOT_MONITORED"
+            in self._hr_rows(findings, "Failed")[0]["Finding_Details"]
+        )
+
+    def test_br46_scheduled_job_clears_a_monitored_bucket(self):
         findings = self._run([self._job("nightly-hr")])
 
         assert not [f for f in findings if f["Status"] == "Failed"]
@@ -16149,7 +16241,13 @@ class TestBR46ClassificationJobCoverage:
                 "job-nightly-hr": self._detail(createdAt=self.CREATED),
                 "job-train-a": self._detail(createdAt=self.CREATED),
             },
-            macie_buckets=self._BUCKETS + [{"bucketName": "train-a"}],
+            macie_buckets=self._BUCKETS
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                }
+            ],
             ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
             training_jobs={"tj-a": self._training_job("s3://train-a/data/")},
         )
@@ -16189,7 +16287,16 @@ class TestBR46ClassificationJobCoverage:
             [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
             {"job-train-a": self._detail(createdAt=self.CREATED)},
             macie_buckets=self._BUCKETS
-            + [{"bucketName": "train-a"}, {"bucketName": "train-b"}],
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "train-b",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+            ],
             training_jobs={"tj-a": job},
         )
         failed = [f for f in findings if f["Status"] == "Failed"]
@@ -16207,7 +16314,13 @@ class TestBR46ClassificationJobCoverage:
         findings = self._run(
             [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
             {"job-train-a": self._detail(createdAt=self.CREATED)},
-            macie_buckets=self._BUCKETS + [{"bucketName": "train-a"}],
+            macie_buckets=self._BUCKETS
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                }
+            ],
             training_jobs={
                 "tj-new": self._training_job(
                     "s3://train-a/data/", created="2026-08-20T00:00:00Z"
@@ -16271,7 +16384,16 @@ class TestBR46ClassificationJobCoverage:
             [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
             {"job-train-a": self._detail(createdAt=self.CREATED)},
             macie_buckets=self._BUCKETS
-            + [{"bucketName": "train-a"}, {"bucketName": "train-b"}],
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "train-b",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+            ],
             training_jobs={
                 "tj-a": self._training_job("s3://train-a/data/"),
                 "tj-b": self._training_job("s3://train-b/data/"),

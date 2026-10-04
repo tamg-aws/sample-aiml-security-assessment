@@ -30498,6 +30498,7 @@ def check_bedrock_knowledge_base_source_classification(
         passed = []
         failed = []
         unlabelled = []
+        unmonitored = []
         indeterminate = []
         listings: Dict[Tuple[str, Tuple[str, ...]], Dict[str, Any]] = {}
         for source in sources:
@@ -30605,7 +30606,33 @@ def check_bedrock_knowledge_base_source_classification(
             else:
                 sampled = f" Automated sensitive data discovery is not in effect: {precondition['detail']}."
             if verdict["status"] == "Passed":
-                passed.append(verdict["detail"])
+                # The control asks for both Macie mechanisms: a job alone, with
+                # automated discovery off or not monitoring the bucket, fails.
+                if precondition["ready"] and automated == "MONITORED":
+                    passed.append(verdict["detail"])
+                elif precondition["permissions"] or (
+                    precondition["ready"] and not automated
+                ):
+                    indeterminate.append(
+                        "{}, but whether automated sensitive data discovery "
+                        "monitors the bucket was not read: {}".format(
+                            verdict["detail"],
+                            "DescribeBuckets returned no "
+                            "automatedDiscoveryMonitoringStatus"
+                            if precondition["ready"]
+                            else precondition["detail"],
+                        )
+                    )
+                else:
+                    unmonitored.append(
+                        "{}, but automated sensitive data discovery does not "
+                        "monitor the bucket: {}".format(
+                            verdict["detail"],
+                            f"its automatedDiscoveryMonitoringStatus is {automated}"
+                            if precondition["ready"]
+                            else precondition["detail"],
+                        )
+                    )
             elif verdict["status"] == "Failed":
                 failed.append(verdict["detail"] + "." + sampled)
             else:
@@ -30630,6 +30657,30 @@ def check_bedrock_knowledge_base_source_classification(
                     ),
                     reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
                     severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        for detail in unmonitored:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=(
+                        f"{detail}. A scheduled job classifies the objects present "
+                        "at each run; automated discovery is the second Macie "
+                        "mechanism the control asks for, and samples the bucket "
+                        "continuously between runs."
+                    ),
+                    resolution=(
+                        "Enable automated sensitive data discovery in Amazon Macie "
+                        "and keep the bucket in its classification scope, beside "
+                        "the scheduled classification job."
+                    ),
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Medium",
                     status="Failed",
                     region=region,
                 )
@@ -30671,7 +30722,10 @@ def check_bedrock_knowledge_base_source_classification(
                         "its .metadata.json sidecar and the sidecar's "
                         "metadataAttributes is read; which attribute names the "
                         "classification in per-document metadata is not "
-                        "judged.{}".format(
+                        "judged. Automated sensitive data discovery is ENABLED and "
+                        "reports each of these buckets MONITORED "
+                        "(automatedDiscoveryMonitoringStatus); it samples objects "
+                        "and does not classify each one.{}".format(
                             len(passed),
                             len(sources),
                             "; ".join(passed),
