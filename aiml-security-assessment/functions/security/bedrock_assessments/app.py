@@ -4633,7 +4633,8 @@ def _bucket_expiration_rules(
     current object leaves a noncurrent version behind, so a rule that expires
     noncurrent versions is required as well. Returns ``expirations`` (the rules
     that count), ``schedules`` (each counted rule's Days or Date),
-    ``deficiency`` (why the bucket keeps logs forever) and ``undetermined``
+    ``noncurrent_schedules`` (each counted NoncurrentDays, on a bucket that is
+    or was versioned), ``deficiency`` (why the bucket keeps logs forever) and ``undetermined``
     (why that could not be read). ``root`` replaces the
     AWSLogs/ root for data another service writes under its own prefix, and
     ``records`` and ``objects`` name that data in the text.
@@ -4654,6 +4655,7 @@ def _bucket_expiration_rules(
     expirations = []
     schedules: List[Any] = []
     noncurrent_expirations = []
+    noncurrent_days: List[int] = []
     uncovering = []
     for rule in response.get("Rules", []):
         if rule.get("Status") != "Enabled":
@@ -4693,12 +4695,14 @@ def _bucket_expiration_rules(
                 f"{rule_id} expires noncurrent versions after "
                 f"{noncurrent['NoncurrentDays']} day(s)"
             )
+            noncurrent_days.append(noncurrent["NoncurrentDays"])
 
     uncovered_note = f" ({'; '.join(uncovering)})" if uncovering else ""
     if not expirations:
         return {
             "expirations": [],
             "schedules": [],
+            "noncurrent_schedules": [],
             "deficiency": (
                 "has no enabled lifecycle rule that expires objects under "
                 f"'{log_root}', so {records} are kept indefinitely{uncovered_note}"
@@ -4714,6 +4718,7 @@ def _bucket_expiration_rules(
         return {
             "expirations": expirations,
             "schedules": schedules,
+            "noncurrent_schedules": [],
             "deficiency": None,
             "undetermined": describe_api_error(error, "s3:GetBucketVersioning", region),
         }
@@ -4723,6 +4728,7 @@ def _bucket_expiration_rules(
         return {
             "expirations": expirations,
             "schedules": schedules,
+            "noncurrent_schedules": [],
             "deficiency": (
                 f"has versioning {versioning_status} and no enabled lifecycle rule "
                 f"that expires noncurrent versions under '{log_root}', so "
@@ -4734,6 +4740,9 @@ def _bucket_expiration_rules(
     return {
         "expirations": expirations + noncurrent_expirations,
         "schedules": schedules,
+        "noncurrent_schedules": (
+            noncurrent_days if versioning_status in ("Enabled", "Suspended") else []
+        ),
         "deficiency": None,
         "undetermined": None,
     }
@@ -4902,6 +4911,118 @@ def _oldest_object_under(s3_client: Any, bucket_name: str, root: str) -> Dict[st
     return {"oldest": oldest, "error": ""}
 
 
+def _oldest_noncurrent_version_under(
+    s3_client: Any, bucket_name: str, root: str
+) -> Dict[str, Any]:
+    """
+    Find the version under ``root`` that became noncurrent longest ago, with
+    ListObjectVersions. A version becomes noncurrent when the next newer
+    version or delete marker of its key is written, and NoncurrentDays counts
+    from then. Each level is listed with Delimiter '/'. At a level whose every
+    folder is a date component the folders are entered in key order until one
+    holds a noncurrent version, because a folder whose versions have expired
+    can still hold delete markers. Returns ``oldest`` ({Key, VersionId,
+    since}, or None) and ``error``.
+    """
+    calls = 0
+    capped = (
+        f"the version listing under s3://{bucket_name}/{root} stopped after "
+        f"{OLDEST_OBJECT_LIST_CAP} ListObjectVersions calls"
+    )
+
+    def walk(prefix: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        nonlocal calls
+        entries: List[Tuple[Dict[str, Any], bool]] = []
+        folders: List[str] = []
+        request = {"Bucket": bucket_name, "Prefix": prefix, "Delimiter": "/"}
+        while True:
+            if calls >= OLDEST_OBJECT_LIST_CAP:
+                return None, capped
+            page = s3_client.list_object_versions(**request)
+            calls += 1
+            entries.extend((item, True) for item in page.get("Versions") or [])
+            entries.extend((item, False) for item in page.get("DeleteMarkers") or [])
+            folders.extend(
+                common["Prefix"] for common in page.get("CommonPrefixes") or []
+            )
+            if not page.get("IsTruncated"):
+                break
+            key_marker = page.get("NextKeyMarker")
+            request["KeyMarker"] = key_marker
+            if page.get("NextVersionIdMarker"):
+                request["VersionIdMarker"] = page["NextVersionIdMarker"]
+            else:
+                request.pop("VersionIdMarker", None)
+        oldest = None
+        by_key: Dict[str, List[Tuple[Dict[str, Any], bool]]] = {}
+        for item, is_version in entries:
+            by_key.setdefault(item["Key"], []).append((item, is_version))
+        for items in by_key.values():
+            items.sort(key=lambda pair: pair[0]["LastModified"], reverse=True)
+            for (newer, _), (item, is_version) in zip(items, items[1:]):
+                if is_version and (
+                    oldest is None or newer["LastModified"] < oldest["since"]
+                ):
+                    oldest = {
+                        "Key": item["Key"],
+                        "VersionId": item.get("VersionId"),
+                        "since": newer["LastModified"],
+                    }
+        dated = bool(folders) and all(
+            DATE_FOLDER_PATTERN.fullmatch(folder[len(prefix) :].rstrip("/"))
+            for folder in folders
+        )
+        for folder in sorted(folders):
+            found, error = walk(folder)
+            if error:
+                return None, error
+            if found and (oldest is None or found["since"] < oldest["since"]):
+                oldest = found
+            if dated and found:
+                break
+        return oldest, ""
+
+    oldest, error = walk(root)
+    return {"oldest": oldest, "error": error}
+
+
+def _noncurrent_deletion_evidence(
+    found: Dict[str, Any], root: str, noncurrent_schedules: List[int]
+) -> Dict[str, Any]:
+    """Judge the version that became noncurrent longest ago against NoncurrentDays."""
+    oldest = found["oldest"]
+    if oldest is None:
+        return {
+            "overdue": None,
+            "evidence": (
+                f"ListObjectVersions returns no noncurrent version under '{root}'"
+            ),
+        }
+    days = min(noncurrent_schedules)
+    now = datetime.now(timezone.utc)
+    age = int((now - oldest["since"]).total_seconds() // 86400)
+    stated = (
+        f"the noncurrent version under '{root}' that became noncurrent longest "
+        f"ago, '{oldest['Key']}' version {oldest['VersionId']}, did so {age} "
+        "day(s) ago"
+    )
+    allowance = (
+        f"plus {LIFECYCLE_DELETION_GRACE_DAYS} day(s) for the daily lifecycle run"
+    )
+    if now > oldest["since"] + timedelta(days=days + LIFECYCLE_DELETION_GRACE_DAYS):
+        return {
+            "overdue": (
+                f"{stated}, past its {days}-day noncurrent rule {allowance}, so "
+                "lifecycle deletion has not removed it on schedule"
+            ),
+            "evidence": "",
+        }
+    return {
+        "overdue": None,
+        "evidence": f"{stated} and is not past its {days}-day noncurrent rule {allowance}",
+    }
+
+
 def _lifecycle_deletion_evidence(
     s3_client: Any,
     bucket_name: str,
@@ -4909,16 +5030,56 @@ def _lifecycle_deletion_evidence(
     root: Optional[str],
     schedules: List[Any],
     region: str,
+    noncurrent_schedules: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Judge whether lifecycle deletion has run from the age of the oldest object
     under the bucket's record root (AIR-FND-DAT-08). Every counted rule covers
     the whole root, so an object kept past the earliest of their expiries,
-    plus the daily run, was not deleted on schedule. Without ``root`` the root
-    is <keyPrefix>/AWSLogs/<account>/BedrockModelInvocationLogs/. Returns
-    ``overdue`` (the Failed text), ``evidence`` (the text a retained line
-    carries) and ``error``.
+    plus the daily run, was not deleted on schedule. With
+    ``noncurrent_schedules`` the version that became noncurrent longest ago is
+    judged the same way against the shortest NoncurrentDays. Without ``root``
+    the root is <keyPrefix>/AWSLogs/<account>/BedrockModelInvocationLogs/.
+    Returns ``overdue`` (the Failed text), ``evidence`` (the text a retained
+    line carries) and ``error``.
     """
+    current = _current_deletion_evidence(
+        s3_client, bucket_name, key_prefix, root, schedules, region
+    )
+    if not noncurrent_schedules or current["error"]:
+        return current
+    action = "s3:ListBucketVersions"
+    try:
+        found = _oldest_noncurrent_version_under(
+            s3_client, bucket_name, current["root"]
+        )
+    except (ClientError, BotoCoreError) as error:
+        return dict(current, error=describe_api_error(error, action, region))
+    if found["error"]:
+        return dict(current, error=found["error"])
+    noncurrent = _noncurrent_deletion_evidence(
+        found, current["root"], noncurrent_schedules
+    )
+    overdue = [text for text in (current["overdue"], noncurrent["overdue"]) if text]
+    return {
+        "overdue": "; ".join(overdue) or None,
+        "evidence": ""
+        if overdue
+        else f"{current['evidence']}; {noncurrent['evidence']}",
+        "error": "",
+        "root": current["root"],
+    }
+
+
+def _current_deletion_evidence(
+    s3_client: Any,
+    bucket_name: str,
+    key_prefix: Optional[str],
+    root: Optional[str],
+    schedules: List[Any],
+    region: str,
+) -> Dict[str, Any]:
+    """The current-object half of _lifecycle_deletion_evidence."""
     action = "s3:ListBucket"
     try:
         if root is None:
@@ -4938,9 +5099,10 @@ def _lifecycle_deletion_evidence(
             "overdue": None,
             "evidence": "",
             "error": describe_api_error(error, action, region),
+            "root": root,
         }
     if found["error"]:
-        return {"overdue": None, "evidence": "", "error": found["error"]}
+        return {"overdue": None, "evidence": "", "error": found["error"], "root": root}
     oldest = found["oldest"]
     if oldest is None:
         return {
@@ -4950,6 +5112,7 @@ def _lifecycle_deletion_evidence(
                 "is yet due"
             ),
             "error": "",
+            "root": root,
         }
     written = oldest["LastModified"]
     dues = []
@@ -4979,6 +5142,7 @@ def _lifecycle_deletion_evidence(
             ),
             "evidence": "",
             "error": "",
+            "root": root,
         }
     return {
         "overdue": None,
@@ -4987,6 +5151,7 @@ def _lifecycle_deletion_evidence(
             "held past it"
         ),
         "error": "",
+        "root": root,
     }
 
 
@@ -5063,7 +5228,13 @@ def _judge_log_bucket_retention(
         )
         return
     deletion = _lifecycle_deletion_evidence(
-        s3_client, bucket_name, key_prefix, root, lifecycle["schedules"], region
+        s3_client,
+        bucket_name,
+        key_prefix,
+        root,
+        lifecycle["schedules"],
+        region,
+        lifecycle["noncurrent_schedules"],
     )
     if deletion["overdue"]:
         unretained.append(f"{label} '{bucket_name}': {deletion['overdue']}")
@@ -5147,6 +5318,7 @@ def _judge_log_bucket_retention(
                 root,
                 replica_lifecycle["schedules"],
                 region,
+                replica_lifecycle["noncurrent_schedules"],
             )
             if replica_deletion["overdue"]:
                 unretained.append(
@@ -5249,9 +5421,10 @@ def _invocation_log_retention_findings(
                     f"{len(retained)} destination(s): {'; '.join(retained)}. "
                     "Confirm the stated period meets your own record-retention "
                     "policy. On an S3 destination, lifecycle deletion is judged "
-                    "from the age of the oldest current object; noncurrent "
-                    "versions are not listed, and any legal hold on an individual "
-                    "object version is not read by this check."
+                    "from the age of the oldest current object, and on a "
+                    "versioned bucket the oldest noncurrent version is read the "
+                    "same way; any legal hold on an individual object version is "
+                    "not read by this check."
                 ),
                 resolution="No action required",
                 reference=INVOCATION_LOG_RETENTION_REFERENCE,
@@ -5742,8 +5915,9 @@ def _sagemaker_inference_retention_findings(region: str) -> List[Dict[str, Any]]
             row(
                 f"SageMaker inference data retention is stated on {len(retained)} "
                 f"destination(s): {'; '.join(retained)}. Lifecycle deletion is "
-                "judged from the age of the oldest current object; noncurrent "
-                "versions are not listed by this check."
+                "judged from the age of the oldest current object, and on a "
+                "versioned bucket the oldest noncurrent version is read the same "
+                "way."
                 + (
                     " This is not reported as Passed, because not every "
                     "destination was read."

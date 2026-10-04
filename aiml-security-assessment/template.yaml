@@ -668,6 +668,13 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
               - !Sub 'arn:${AWS::Partition}:lambda:*:aws:microvm-image:*'
+          - Sid: LogBucketVersionsRead
+            # ListObjectVersions authorizes on the bucket resource type. A log,
+            # replica or SageMaker inference bucket can be any bucket.
+            Effect: Allow
+            Action:
+              - s3:ListBucketVersions # BR-04
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

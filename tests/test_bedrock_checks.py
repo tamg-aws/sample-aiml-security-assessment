@@ -3130,6 +3130,7 @@ class TestBR04LoggingConfiguration:
         # A bucket that was never versioned returns no Status key.
         mock_s3.get_bucket_versioning.return_value = versioning or {}
         mock_s3.list_objects_v2.return_value = {"Contents": [], "IsTruncated": False}
+        mock_s3.list_object_versions.return_value = {"IsTruncated": False}
         mock_sts = MagicMock()
         mock_sts.get_caller_identity.return_value = {"Account": "111122223333"}
 
@@ -37453,12 +37454,16 @@ class TestBR04RetentionDepth:
         written=None,
         list_error=None,
         page_size=None,
+        versions=None,
+        versions_error=None,
     ):
         """
         lifecycles, locks, replication: {bucket: response or exception}.
         objects: {bucket: {key: ReplicationStatus or None}}.
         written: {bucket: {key: LastModified}}; an object not named was
         written now.
+        versions: {bucket: [(key, version id, days since written, is a delete
+        marker)]}; a bucket named here has versioning Enabled.
         """
 
         def per_bucket(table, missing_code, operation):
@@ -37478,7 +37483,9 @@ class TestBR04RetentionDepth:
             "NoSuchLifecycleConfiguration",
             "GetBucketLifecycleConfiguration",
         )
-        s3.get_bucket_versioning.return_value = {}
+        s3.get_bucket_versioning.side_effect = lambda Bucket: (
+            {"Status": "Enabled"} if Bucket in (versions or {}) else {}
+        )
         s3.get_object_lock_configuration.side_effect = per_bucket(
             locks,
             "ObjectLockConfigurationNotFoundError",
@@ -37549,9 +37556,47 @@ class TestBR04RetentionDepth:
                 page["NextContinuationToken"] = str(end)
             return page
 
+        def list_object_versions(
+            Bucket, Prefix, Delimiter, KeyMarker=None, VersionIdMarker=None
+        ):
+            if versions_error is not None:
+                raise versions_error
+            entries = []
+            for key, version_id, age, marker in sorted((versions or {})[Bucket]):
+                if not key.startswith(Prefix):
+                    continue
+                rest = key[len(Prefix) :]
+                if Delimiter in rest:
+                    folder = Prefix + rest.split(Delimiter)[0] + Delimiter
+                    if ("folder", folder) not in entries:
+                        entries.append(("folder", folder))
+                else:
+                    item = {
+                        "Key": key,
+                        "VersionId": version_id,
+                        "LastModified": now - _td(days=age),
+                    }
+                    entries.append(("marker" if marker else "version", item))
+            start = int(KeyMarker or 0)
+            end = len(entries) if page_size is None else start + page_size
+            chunk = entries[start:end]
+            page = {
+                "Versions": [item for kind, item in chunk if kind == "version"],
+                "DeleteMarkers": [item for kind, item in chunk if kind == "marker"],
+                "CommonPrefixes": [
+                    {"Prefix": folder} for kind, folder in chunk if kind == "folder"
+                ],
+                "IsTruncated": end < len(entries),
+            }
+            if end < len(entries):
+                page["NextKeyMarker"] = str(end)
+                page["NextVersionIdMarker"] = "v"
+            return page
+
         s3.get_paginator.return_value.paginate.side_effect = paginate
         s3.head_object.side_effect = head_object
         s3.list_objects_v2.side_effect = list_objects_v2
+        s3.list_object_versions.side_effect = list_object_versions
         bedrock = MagicMock()
         bedrock.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": logging_config
@@ -37603,7 +37648,8 @@ class TestBR04RetentionDepth:
         assert "Large-data S3 bucket 'large' lifecycle" in rows[0]["Finding_Details"]
         assert (
             "lifecycle deletion is judged from the age of the oldest current "
-            "object; noncurrent versions are not listed"
+            "object, and on a versioned bucket the oldest noncurrent version is "
+            "read the same way"
         ) in rows[0]["Finding_Details"]
 
     def test_large_data_bucket_equal_to_the_log_bucket_is_read_once(self):
@@ -37942,6 +37988,115 @@ class TestBR04RetentionDepth:
             "past its expiry date 2026-01-01 plus 2 day(s)"
             in (rows[0]["Finding_Details"])
         )
+
+    VERSIONED = {
+        "Rules": [
+            {
+                "ID": "expire",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "Expiration": {"Days": 30},
+                "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+            }
+        ]
+    }
+
+    def test_an_overdue_noncurrent_version_fails_beside_an_on_schedule_bucket(self):
+        old = self.LOG_KEY + "08/01/00/a.json.gz"
+        new = "big/" + self.LOG_KEY + "09/20/00/b.json.gz"
+        rows, _ = self._rows(
+            self.LARGE,
+            {"logs": self.VERSIONED, "large": self.VERSIONED},
+            versions={
+                # Expired 20 days ago: the delete marker made v1 noncurrent.
+                "logs": [(old, "v1", 40, False), (old, "m1", 20, True)],
+                "large": [(new, "v1", 10, False), (new, "v2", 5, False)],
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]["Finding_Details"]
+        passed = [r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"]
+        assert (
+            "S3 bucket 'logs': the noncurrent version under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/' that became "
+            f"noncurrent longest ago, '{old}' version v1, did so 20 day(s) ago, "
+            "past its 7-day noncurrent rule plus 2 day(s) for the daily lifecycle "
+            "run, so lifecycle deletion has not removed it on schedule" in failed
+        )
+        assert "'large'" not in failed
+        assert "S3 bucket 'logs' lifecycle" not in passed
+        assert (
+            f"'{new}' version v1, did so 5 day(s) ago and is not past its 7-day "
+            "noncurrent rule plus 2 day(s)" in passed
+        )
+        assert "the oldest noncurrent version is read the same way" in passed
+
+    def test_noncurrent_age_counts_from_the_successor_write(self):
+        key = self.LOG_KEY + "01/01/00/a.json.gz"
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            objects={"logs": {key: None}},
+            versions={"logs": [(key, "v1", 100, False), (key, "v2", 3, False)]},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "version v1, did so 3 day(s) ago" in rows[0]["Finding_Details"]
+
+    def test_a_date_folder_of_delete_markers_is_passed_over(self):
+        gone = self.LOG_KEY + "01/01/00/a.json.gz"
+        kept = self.LOG_KEY + "02/01/00/b.json.gz"
+        later = self.LOG_KEY + "03/01/00/c.json.gz"
+        rows, s3 = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            versions={
+                "logs": [
+                    (gone, "m0", 60, True),
+                    (kept, "v1", 50, False),
+                    (kept, "m1", 30, True),
+                    (later, "v1", 40, False),
+                    (later, "m1", 4, True),
+                ]
+            },
+            page_size=1,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"'{kept}' version v1, did so 30 day(s) ago" in (rows[0]["Finding_Details"])
+        )
+        listed = [c.kwargs["Prefix"] for c in s3.list_object_versions.call_args_list]
+        assert not any(p.endswith("/2026/03/") for p in listed)
+
+    def test_an_unread_version_listing_withholds_the_pass(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            versions={"logs": []},
+            versions_error=_make_client_error("AccessDenied"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "s3:ListBucketVersions" in rows[0]["Finding_Details"]
+        assert (
+            "whether lifecycle deletion has run was not read"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_no_noncurrent_version_is_stated(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            versions={"logs": []},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "ListObjectVersions returns no noncurrent version under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/'"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_never_versioned_bucket_lists_no_versions(self):
+        rows, s3 = self._rows({"s3Config": {"bucketName": "logs"}}, {"logs": EXPIRING})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        s3.list_object_versions.assert_not_called()
 
     def test_an_overdue_object_in_a_replica_fails_the_replica(self):
         key = self.LOG_KEY + "01/01/00/a.json.gz"
@@ -43645,6 +43800,22 @@ class TestBR04SageMakerInferenceRetention:
             }
 
         client.list_objects_v2.side_effect = list_objects_v2
+
+        def list_object_versions(Bucket, Prefix, Delimiter):
+            # versions: [(key, version id, days since written)], flat keys only.
+            listed = [
+                {
+                    "Key": key,
+                    "VersionId": version_id,
+                    "LastModified": _dt.now(_tz.utc) - _td(days=age),
+                }
+                for key, version_id, age in buckets.get(Bucket, {}).get("versions")
+                or []
+                if key.startswith(Prefix) and Delimiter not in key[len(Prefix) :]
+            ]
+            return {"Versions": listed, "IsTruncated": False}
+
+        client.list_object_versions.side_effect = list_object_versions
         return client
 
     def _rows(self, uris, buckets, errors=()):
@@ -43778,6 +43949,27 @@ class TestBR04SageMakerInferenceRetention:
             "day(s) ago and is not past its 30-day rule"
         ) in rows[1]["Finding_Details"]
         assert "capture-a" not in rows[1]["Finding_Details"]
+
+    def test_an_overdue_noncurrent_async_output_version_fails(self):
+        rows = self._rows(
+            [self.ASYNC],
+            {
+                "async-b": {
+                    "rules": [self._rule("out/", noncurrent=True)],
+                    "versioning": "Enabled",
+                    "versions": [
+                        ("out/0f1e.out", "v1", 40),
+                        ("out/0f1e.out", "v2", 12),
+                    ],
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "the noncurrent version under 'out/' that became noncurrent longest "
+            "ago, 'out/0f1e.out' version v1, did so 12 day(s) ago, past its 7-day "
+            "noncurrent rule" in rows[0]["Finding_Details"]
+        )
 
     def test_the_oldest_capture_object_is_found_under_every_variant(self):
         rows = self._rows(

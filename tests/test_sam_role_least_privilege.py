@@ -144,6 +144,7 @@ _EXPECTED_ACTIONS = {
     "BedrockAssessmentReadsPolicy2": {
         "lambda:GetMicrovm",
         "lambda:ListMicrovms",
+        "s3:ListBucketVersions",
         "sagemaker:Search",
     },
     "BedrockAssessmentReadsPolicy": {
@@ -1294,9 +1295,16 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
         for action in statement["Action"]
     )
     # ListMicrovms and Search have no resource type; GetMicrovm authorizes on
-    # microvmImage, in this account or the AWS-managed "aws" account.
+    # microvmImage, in this account or the AWS-managed "aws" account;
+    # ListBucketVersions authorizes on the bucket resource type.
     assert grants == sorted(
         [
+            (
+                "LogBucketVersionsRead",
+                "Allow",
+                "s3:ListBucketVersions",
+                json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*"}),
+            ),
             ("ManagedReadsOnWildcard2", "Allow", "lambda:ListMicrovms", '"*"'),
             ("ManagedReadsOnWildcard2", "Allow", "sagemaker:Search", '"*"'),
             (
