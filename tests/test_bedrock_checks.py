@@ -48,6 +48,18 @@ sys.modules["bedrock_app"] = bedrock_app
 _spec.loader.exec_module(bedrock_app)
 
 
+@pytest.fixture(autouse=True)
+def _no_other_enabled_regions():
+    """Most tests mock one Region's clients, so the enabled-Region sweep for
+    event data stores reads no other Region unless a test patches it again."""
+    with patch.object(
+        bedrock_app,
+        "_event_data_store_home_regions",
+        return_value={"regions": [], "error": None},
+    ):
+        yield
+
+
 @pytest.mark.parametrize(
     ("caller_identity", "expected_partition"),
     [
@@ -4355,16 +4367,57 @@ class TestBR06SelectorValues:
         assert "eu-west-1" in row["Finding_Details"]
         assert "cloudtrail:ListEventDataStores" in row["Finding_Details"]
 
-    def test_an_unassessed_home_region_is_named_in_the_gap(self):
+    def test_the_gap_says_every_enabled_region_is_read(self):
         rows = self._run({"a": {"advanced": [_management()]}})
         details = rows["Bedrock Knowledge Base Retrieval Data Event Logging"][
             "Finding_Details"
         ]
         assert (
-            "Stores homed in the other assessed Regions are read too; a "
-            "multi-Region event data store homed in a Region this assessment "
-            "does not scan is not read." in details
+            "Multi-Region stores homed in every other Region enabled for the "
+            "account (account:ListRegions) and every other assessed Region are "
+            "read too." in details
         )
+
+    def test_a_multi_region_store_homed_in_an_unassessed_enabled_region_is_coverage(
+        self,
+    ):
+        """MDL-07: TARGET_REGIONS names only this Region, yet a multi-Region store
+        homed in an enabled Region records this Region's calls."""
+        remote = self._remote(
+            detail={
+                "Status": "ENABLED",
+                "MultiRegionEnabled": True,
+                "AdvancedEventSelectors": self.STORE_SELECTORS,
+            }
+        )
+        idle = self._remote(pages=({"EventDataStores": []},))
+        with patch.object(
+            bedrock_app,
+            "_event_data_store_home_regions",
+            return_value={
+                "regions": ["ap-south-1", "eu-west-1", "us-east-1"],
+                "error": None,
+            },
+        ):
+            rows = self._run(
+                {}, remote_clients={"eu-west-1": remote, "ap-south-1": idle}
+            )
+        assert remote.list_event_data_stores.call_count == 1
+        assert idle.list_event_data_stores.call_count == 1
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Passed"
+        assert "org-lake (multi-Region, homed in eu-west-1)" in row["Finding_Details"]
+
+    def test_unlisted_enabled_regions_withhold_failed(self):
+        with patch.object(
+            bedrock_app,
+            "_event_data_store_home_regions",
+            return_value={"regions": [], "error": "account:ListRegions (AccessDenied)"},
+        ):
+            rows = self._run({})
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "N/A"
+        assert "account:ListRegions (AccessDenied)" in row["Finding_Details"]
 
     def test_no_event_data_store_keeps_the_trail_gap_failed(self):
         rows = self._run({"a": {"advanced": [_management()]}})
@@ -8520,6 +8573,7 @@ class TestBedrockHandlerMultiRegion:
     # invoke once per scanned region, passing region=region.
     NEW_REGIONAL_CHECKS = {
         "check_bedrock_guardrail_pii_filters": "BR-26",
+        "check_bedrock_inference_trace": "BR-06",
         "check_bedrock_guardrail_contextual_grounding": "BR-27",
         "check_guardrail_grounding_score_evidence": "BR-27",
         "check_guardrail_prompt_attack_invocation_evidence": "BR-34",
@@ -42690,3 +42744,304 @@ class TestBR57AgentRoleScope:
         )
         assert [r["Status"] for r in rows] == ["Passed"]
         assert bedrock_app.IAM_CACHE_V1_NOTE in rows[0]["Finding_Details"]
+
+
+class TestBR06InferenceTrace:
+    """AIR-BDR-MDL-07: one invocation traced from CloudTrail to its invocation
+    log record, and the CloudTrail events queryable centrally."""
+
+    GROUP = "/aws/bedrock/model-invocation-logs"
+    TRACE = "Bedrock Inference End-to-End Trace"
+    CENTRAL = "Bedrock Inference Trace Centralization"
+
+    @staticmethod
+    def _event(request_id, time, error=None, operation="InvokeModel"):
+        detail = {
+            "eventTime": time,
+            "requestID": request_id,
+            "userIdentity": {"arn": f"arn:aws:sts::1:assumed-role/app/{request_id}"},
+            "sourceIPAddress": "10.0.0.1",
+            "requestParameters": {"modelId": "anthropic.claude"},
+            "additionalEventData": {"inferenceRegion": "us-east-2"},
+        }
+        if error:
+            detail["errorCode"] = error
+        return {"CloudTrailEvent": json.dumps(detail)}
+
+    @staticmethod
+    def _record(request_id, body=True):
+        return {
+            "requestId": request_id,
+            "timestamp": "2026-10-03T10:00:00Z",
+            "modelId": "arn:aws:bedrock:us-east-1:1:inference-profile/x",
+            "identity": {"arn": f"arn:aws:sts::1:assumed-role/app/{request_id}"},
+            "input": {"inputBodyJson": {}} if body else {"inputTokenCount": 1},
+            "output": {"outputBodyJson": {}} if body else {},
+        }
+
+    def _run(
+        self,
+        events=None,
+        records=(),
+        source=None,
+        lookup_error=None,
+        logs_error=None,
+        stores=None,
+        glue=None,
+        glue_error=None,
+        home=None,
+    ):
+        events = events or {}
+        cloudtrail = MagicMock()
+
+        def lookup_events(LookupAttributes, **kwargs):
+            if lookup_error:
+                raise lookup_error
+            self.lookups.append(
+                {**kwargs, "name": LookupAttributes[0]["AttributeValue"]}
+            )
+            return {"Events": events.get(LookupAttributes[0]["AttributeValue"], [])}
+
+        self.lookups = []
+        cloudtrail.lookup_events.side_effect = lookup_events
+        logs = MagicMock()
+        self.patterns = []
+
+        def filter_log_events(**request):
+            self.patterns.append(request["filterPattern"])
+            if logs_error:
+                raise logs_error
+            return {"events": [{"message": json.dumps(r)} for r in records]}
+
+        logs.filter_log_events.side_effect = filter_log_events
+        glue_clients = {}
+
+        def glue_client(region):
+            client = MagicMock()
+            tables = (glue or {}).get(region, {})
+
+            def paginator(name):
+                pages = MagicMock()
+                if name == "get_databases":
+                    if glue_error:
+                        pages.paginate.side_effect = glue_error
+                    else:
+                        pages.paginate.return_value = [
+                            {"DatabaseList": [{"Name": db} for db in tables]}
+                        ]
+                else:
+                    pages.paginate.side_effect = lambda DatabaseName: [
+                        {
+                            "TableList": [
+                                {"Name": name, "StorageDescriptor": {"Location": loc}}
+                                for name, loc in tables[DatabaseName].items()
+                            ]
+                        }
+                    ]
+                return pages
+
+            client.get_paginator.side_effect = paginator
+            glue_clients[region] = client
+            return client
+
+        def client(service, region_name=None, **_):
+            if service == "glue":
+                return glue_client(region_name)
+            return {"cloudtrail": cloudtrail, "logs": logs}[service]
+
+        coverage = {
+            "names": [],
+            "error": None,
+            "management": [],
+            "credited": {},
+            "narrowed": {},
+            "inactive": [],
+            "unread": [],
+            **(stores or {}),
+        }
+        with (
+            patch("bedrock_app.boto3.client", side_effect=client),
+            patch.object(
+                bedrock_app,
+                "_invocation_log_source",
+                return_value=source
+                or {
+                    "log_group": self.GROUP,
+                    "s3": None,
+                    "where": self.GROUP,
+                    "logging": True,
+                    "reason": None,
+                },
+            ),
+            patch.object(
+                bedrock_app,
+                "_assessed_event_data_store_coverage",
+                return_value=coverage,
+            ),
+            patch.object(
+                bedrock_app,
+                "_event_data_store_home_regions",
+                return_value=home or {"regions": ["eu-west-1"], "error": None},
+            ),
+        ):
+            result = bedrock_app.check_bedrock_inference_trace(region="us-east-1")
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-06"
+        return {row["Finding"]: row for row in rows}, result
+
+    def test_a_joined_call_is_the_trace_example_and_an_unjoined_one_is_named(self):
+        rows, _ = self._run(
+            events={
+                "InvokeModel": [
+                    self._event("req-old", "2026-10-03T08:00:00Z"),
+                    self._event("req-denied", "2026-10-03T11:00:00Z", "AccessDenied"),
+                ],
+                "Converse": [self._event("req-new", "2026-10-03T10:00:00Z")],
+            },
+            records=[self._record("req-old"), self._record("req-other")],
+        )
+        row = rows[self.TRACE]
+        assert row["Status"] == "Passed"
+        detail = row["Finding_Details"]
+        assert "1 of the 2 newest" in detail
+        assert "event req-old at 2026-10-03T08:00:00Z" in detail
+        assert "assumed-role/app/req-old" in detail and "us-east-2" in detail
+        assert "an input body and an output body" in detail
+        assert "Unjoined: req-new." in detail
+        assert "req-denied" not in detail
+        assert "req-other" not in detail
+        assert self.patterns == [
+            '{ ($.requestId = "req-new") || ($.requestId = "req-old") }'
+        ]
+        assert sorted(call["name"] for call in self.lookups) == sorted(
+            bedrock_app.INFERENCE_TRACE_OPERATIONS
+        )
+        assert all(
+            call["EndTime"] - call["StartTime"]
+            == bedrock_app.INVOCATION_LOG_SCAN_LOOKBACK
+            - bedrock_app.INFERENCE_TRACE_SETTLE
+            for call in self.lookups
+        )
+
+    def test_only_the_newest_calls_are_joined(self):
+        calls = [
+            self._event(f"req-{index:02d}", f"2026-10-03T{index:02d}:00:00Z")
+            for index in range(12)
+        ]
+        rows, _ = self._run(
+            events={"InvokeModel": calls}, records=[self._record("req-11")]
+        )
+        assert "req-00" not in self.patterns[0] and "req-01" not in self.patterns[0]
+        assert "req-02" in self.patterns[0] and "req-11" in self.patterns[0]
+        assert "1 of the 10 newest" in rows[self.TRACE]["Finding_Details"]
+
+    def test_no_joined_call_fails(self):
+        rows, result = self._run(
+            events={"InvokeModel": [self._event("req-1", "2026-10-03T08:00:00Z")]},
+            records=[self._record("req-2")],
+        )
+        assert rows[self.TRACE]["Status"] == "Failed"
+        assert "req-1" in rows[self.TRACE]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_a_record_without_bodies_says_so(self):
+        rows, _ = self._run(
+            events={"InvokeModel": [self._event("req-1", "2026-10-03T08:00:00Z")]},
+            records=[self._record("req-1", body=False)],
+        )
+        assert "no request or response body" in rows[self.TRACE]["Finding_Details"]
+
+    def test_text_delivery_off_fails_and_an_unread_config_is_na(self):
+        rows, _ = self._run(
+            source={
+                "log_group": None,
+                "s3": None,
+                "where": None,
+                "logging": False,
+                "reason": "invocation logging does not deliver text",
+            }
+        )
+        assert rows[self.TRACE]["Status"] == "Failed"
+        rows, _ = self._run(
+            source={
+                "log_group": None,
+                "s3": None,
+                "where": None,
+                "logging": None,
+                "reason": "the invocation logging configuration was not read",
+            }
+        )
+        assert rows[self.TRACE]["Status"] == "N/A"
+
+    @pytest.mark.parametrize("failed", ["lookup", "logs"])
+    def test_a_failed_read_is_never_passed_or_failed(self, failed):
+        error = ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "Op")
+        rows, _ = self._run(
+            events={"InvokeModel": [self._event("req-1", "2026-10-03T08:00:00Z")]},
+            lookup_error=error if failed == "lookup" else None,
+            logs_error=error if failed == "logs" else None,
+        )
+        assert rows[self.TRACE]["Status"] == "N/A"
+        assert "AccessDenied" in rows[self.TRACE]["Finding_Details"]
+
+    def test_no_call_is_na(self):
+        rows, _ = self._run(
+            events={"InvokeModel": [self._event("bad id!", "2026-10-03T08:00:00Z")]}
+        )
+        assert rows[self.TRACE]["Status"] == "N/A"
+        assert self.patterns == []
+
+    def test_a_lake_store_recording_bedrock_is_central(self):
+        rows, _ = self._run(stores={"management": ["event data store lake"]})
+        assert rows[self.CENTRAL]["Status"] == "Passed"
+        assert "event data store lake" in rows[self.CENTRAL]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "s3://trail-bucket/AWSLogs/123456789012/CloudTrail/",
+            "s3://lake-bucket/aws/CLOUD_TRAIL_MGMT/1.0/",
+        ],
+    )
+    def test_a_glue_table_in_another_region_is_central(self, location):
+        rows, _ = self._run(
+            glue={
+                "us-east-1": {
+                    "logs": {"elb": "s3://b/AWSLogs/1/elasticloadbalancing/"}
+                },
+                "eu-west-1": {"audit": {"trail": location}},
+            }
+        )
+        row = rows[self.CENTRAL]
+        assert row["Status"] == "Passed"
+        assert "audit.trail in eu-west-1" in row["Finding_Details"]
+        assert "logs.elb" not in row["Finding_Details"]
+
+    def test_no_store_and_no_trail_table_fails(self):
+        rows, _ = self._run(
+            glue={
+                "us-east-1": {"logs": {"elb": "s3://b/AWSLogs/1/elasticloadbalancing/"}}
+            }
+        )
+        assert rows[self.CENTRAL]["Status"] == "Failed"
+        assert "eu-west-1, us-east-1" in rows[self.CENTRAL]["Finding_Details"]
+
+    @pytest.mark.parametrize("unread", ["glue", "stores", "regions"])
+    def test_an_unread_part_withholds_the_centralization_verdict(self, unread):
+        rows, _ = self._run(
+            glue_error=ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetDatabases"
+            )
+            if unread == "glue"
+            else None,
+            stores={"error": "stores were not listed (AccessDenied)"}
+            if unread == "stores"
+            else None,
+            home={"regions": [], "error": "account:ListRegions (AccessDenied)"}
+            if unread == "regions"
+            else None,
+        )
+        assert rows[self.CENTRAL]["Status"] == "N/A"
+        assert "AccessDenied" in rows[self.CENTRAL]["Finding_Details"]

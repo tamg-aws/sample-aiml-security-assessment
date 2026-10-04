@@ -166,6 +166,7 @@ _EXPECTED_ACTIONS = {
         "eks:ListPodIdentityAssociations",
         "events:ListTargetsByRule",
         "firehose:DescribeDeliveryStream",
+        "glue:GetDatabases",
         "glue:GetJobRuns",
         "glue:GetJobs",
         "glue:GetPartitions",
@@ -1139,6 +1140,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "glue:GetTables",
                     "glue:GetPartitions",
                     "glue:GetJobRuns",
+                    "glue:GetDatabases",
                 )
             ),
             ("Allow", "glue:GetJobs", '"*"'),

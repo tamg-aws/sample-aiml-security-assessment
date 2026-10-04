@@ -5862,8 +5862,8 @@ EVENT_DATA_STORE_REFERENCE = (
 # in, and a multi-Region store records every Region's events, so the other
 # assessed Regions are listed as well.
 EVENT_DATA_STORE_OTHER_REGIONS_NOTE = (
-    "Stores homed in the other assessed Regions are read too; a multi-Region "
-    "event data store homed in a Region this assessment does not scan is not read."
+    "Multi-Region stores homed in every other Region enabled for the account "
+    "(account:ListRegions) and every other assessed Region are read too."
 )
 
 EVENT_DATA_STORE_ELSEWHERE_NOTE = (
@@ -5955,13 +5955,27 @@ def _event_data_store_coverage(
     return coverage
 
 
+def _event_data_store_home_regions() -> Dict[str, Any]:
+    """List the Regions enabled for this account, where a store may be homed."""
+    return _identity_center_regions()
+
+
 def _assessed_event_data_store_coverage(
     cloudtrail_client, region: str
 ) -> Dict[str, Any]:
     """Read this Region's event data stores and the multi-Region stores homed in
-    every other assessed Region."""
+    every other Region enabled for the account or assessed."""
     coverage = _event_data_store_coverage(cloudtrail_client)
-    for other in _assessed_regions(region) if region else []:
+    others = set(_assessed_regions(region)) if region else set()
+    if region:
+        enabled = _event_data_store_home_regions()
+        if enabled["error"]:
+            coverage["unread"].append(
+                "the Regions enabled for the account, where a multi-Region store "
+                f"may be homed, were not listed with {enabled['error']}"
+            )
+        others.update(enabled["regions"])
+    for other in sorted(others):
         if other == region:
             continue
         remote = _event_data_store_coverage(
@@ -6576,6 +6590,395 @@ def _bedrock_data_event_findings(
         )
 
     return data_event_findings
+
+
+INFERENCE_TRACE_FINDING = "Bedrock Inference End-to-End Trace"
+
+INFERENCE_TRACE_CENTRAL_FINDING = "Bedrock Inference Trace Centralization"
+
+INFERENCE_TRACE_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html\n"
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html"
+)
+
+# The runtime operations CloudTrail records as management events, which
+# LookupEvents returns, and whose requestID the invocation log record repeats.
+INFERENCE_TRACE_OPERATIONS = (
+    "InvokeModel",
+    "InvokeModelWithResponseStream",
+    "Converse",
+    "ConverseStream",
+)
+
+# The newest successful calls joined per run. Each request ID adds about 50
+# characters to a CloudWatch Logs filter pattern, which is limited to 1,024.
+INFERENCE_TRACE_SAMPLE = 10
+
+# Event history and the invocation log both lag the call, so a call newer
+# than this is not expected to have its record yet.
+INFERENCE_TRACE_SETTLE = timedelta(minutes=15)
+
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def _inference_trace_events(region: str) -> Dict[str, Any]:
+    """
+    Read the last 24 hours of event history for the runtime invoke operations
+    and return the newest successful calls that carry a requestID, or the
+    reason they were not read.
+    """
+    client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
+    now = datetime.now(timezone.utc)
+    calls = []
+    for operation in INFERENCE_TRACE_OPERATIONS:
+        try:
+            response = client.lookup_events(
+                LookupAttributes=[
+                    {"AttributeKey": "EventName", "AttributeValue": operation}
+                ],
+                StartTime=now - INVOCATION_LOG_SCAN_LOOKBACK,
+                EndTime=now - INFERENCE_TRACE_SETTLE,
+                MaxResults=50,
+            )
+            if not isinstance(response, dict):
+                raise TypeError("LookupEvents returned no response object")
+        except (ClientError, BotoCoreError, TypeError) as error:
+            return {
+                "calls": [],
+                "error": f"cloudtrail:LookupEvents for {operation} "
+                f"({get_assessment_error_label(error)})",
+            }
+        for event in response.get("Events") or []:
+            try:
+                detail = json.loads(event.get("CloudTrailEvent") or "")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(detail, dict) or detail.get("errorCode"):
+                continue
+            request_id = detail.get("requestID")
+            if not isinstance(request_id, str) or not REQUEST_ID_PATTERN.match(
+                request_id
+            ):
+                continue
+            calls.append(
+                {
+                    "request_id": request_id,
+                    "operation": operation,
+                    "time": str(detail.get("eventTime") or ""),
+                    "caller": (detail.get("userIdentity") or {}).get("arn")
+                    or "an unnamed caller",
+                    "source_ip": detail.get("sourceIPAddress") or "no source IP",
+                    "model": (detail.get("requestParameters") or {}).get("modelId")
+                    or "no model ID",
+                    "inference_region": (detail.get("additionalEventData") or {}).get(
+                        "inferenceRegion"
+                    )
+                    or region,
+                }
+            )
+    calls.sort(key=lambda call: call["time"], reverse=True)
+    return {"calls": calls[:INFERENCE_TRACE_SAMPLE], "error": None}
+
+
+def _glue_cloudtrail_tables(regions: List[str]) -> Dict[str, Any]:
+    """
+    Name every AWS Glue Data Catalog table, in each listed Region, whose
+    location is a CloudTrail log path (.../AWSLogs/.../CloudTrail...) or the
+    Amazon Security Lake CloudTrail management event source
+    (.../aws/CLOUD_TRAIL_MGMT/...), which Athena can query.
+    """
+    found = {"tables": [], "errors": []}
+    for region in regions:
+        client = boto3.client("glue", config=boto3_config, region_name=region)
+        try:
+            databases = [
+                database.get("Name")
+                for page in client.get_paginator("get_databases").paginate()
+                for database in page.get("DatabaseList") or []
+                if database.get("Name")
+            ]
+        except (ClientError, BotoCoreError, TypeError) as error:
+            found["errors"].append(
+                f"Glue databases in {region} were not listed with glue:GetDatabases "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for database in databases:
+            try:
+                for page in client.get_paginator("get_tables").paginate(
+                    DatabaseName=database
+                ):
+                    for table in page.get("TableList") or []:
+                        location = str(
+                            (table.get("StorageDescriptor") or {}).get("Location") or ""
+                        )
+                        logs = location.find("/AWSLogs/")
+                        if (
+                            logs >= 0 and "/CloudTrail" in location[logs:]
+                        ) or "/aws/CLOUD_TRAIL_MGMT/" in location:
+                            found["tables"].append(
+                                f"{database}.{table.get('Name')} in {region} "
+                                f"({location})"
+                            )
+            except (ClientError, BotoCoreError, TypeError) as error:
+                found["errors"].append(
+                    f"tables of Glue database {database} in {region} were not read "
+                    f"with glue:GetTables ({get_assessment_error_label(error)})"
+                )
+    return found
+
+
+def check_bedrock_inference_trace(region: str = "") -> Dict[str, Any]:
+    """BR-06 MDL-07 legs; see _inference_trace_findings."""
+    try:
+        return _inference_trace_findings(region)
+    except Exception as e:
+        logger.error(f"Error in check_bedrock_inference_trace: {str(e)}", exc_info=True)
+        return {
+            "check_name": INFERENCE_TRACE_FINDING,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-06",
+                    finding_name=INFERENCE_TRACE_FINDING,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=INFERENCE_TRACE_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+def _inference_trace_findings(region: str) -> Dict[str, Any]:
+    """
+    BR-06 MDL-07 legs. Join the newest successful runtime invoke calls in
+    CloudTrail event history to their model invocation log records by request
+    ID, as one end-to-end trace example, and require the CloudTrail events to
+    be queryable centrally: a CloudTrail Lake event data store recording
+    Bedrock management events, or a Glue table over a CloudTrail log path.
+    """
+    findings = {"check_name": INFERENCE_TRACE_FINDING, "status": "PASS", "csv_data": []}
+
+    def row(name, details, resolution, severity, status):
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-06",
+                finding_name=name,
+                finding_details=details,
+                resolution=resolution,
+                reference=INFERENCE_TRACE_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
+        if status == "Failed":
+            findings["status"] = "WARN"
+        elif status == "N/A" and findings["status"] == "PASS":
+            findings["status"] = "N/A"
+
+    operations = ", ".join(INFERENCE_TRACE_OPERATIONS)
+    source = _invocation_log_source(region)
+    events = _inference_trace_events(region) if not source["reason"] else None
+    if source["reason"]:
+        row(
+            INFERENCE_TRACE_FINDING,
+            f"No end-to-end trace can be built: {source['reason']}.",
+            "Turn on model invocation logging with text delivery, so each call's "
+            "request ID joins its CloudTrail event to its prompt and response."
+            if source["logging"] is False
+            else COULD_NOT_ASSESS_RESOLUTION,
+            "Medium" if source["logging"] is False else "Informational",
+            "Failed" if source["logging"] is False else "N/A",
+        )
+    elif events["error"]:
+        row(
+            INFERENCE_TRACE_FINDING,
+            f"No end-to-end trace was built: event history was not read with "
+            f"{events['error']}.",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    elif not events["calls"]:
+        row(
+            INFERENCE_TRACE_FINDING,
+            f"Event history holds no successful {operations} call with a request "
+            "ID between 24 hours and 15 minutes ago, so no trace example was built.",
+            "No action required",
+            "Informational",
+            "N/A",
+        )
+    else:
+        wanted = {call["request_id"] for call in events["calls"]}
+        records: Dict[str, Dict[str, Any]] = {}
+
+        def visit(record):
+            if record.get("requestId") in wanted:
+                records.setdefault(record["requestId"], record)
+
+        scan = _scan_invocation_records(
+            region,
+            source,
+            "{ "
+            + " || ".join(f'($.requestId = "{rid}")' for rid in sorted(wanted))
+            + " }",
+            lambda line, record: record.get("requestId") in wanted,
+            visit,
+        )
+        joined = [call for call in events["calls"] if call["request_id"] in records]
+        if joined:
+            call = joined[0]
+            record = records[call["request_id"]]
+            bodies = [
+                part
+                for part, key in (("input", "inputBody"), ("output", "outputBody"))
+                if any(str(name).startswith(key) for name in (record.get(part) or {}))
+            ]
+            row(
+                INFERENCE_TRACE_FINDING,
+                "{} of the {} newest successful {} call(s) join their invocation "
+                "log record in {} by request ID. Trace example: CloudTrail {} event "
+                "{} at {} by {} from {} on model {} (inference Region {}) matches "
+                "the record whose identity is {}, model {} and timestamp {}, "
+                "carrying {}.{}".format(
+                    len(joined),
+                    len(events["calls"]),
+                    operations,
+                    source["where"],
+                    call["operation"],
+                    call["request_id"],
+                    call["time"],
+                    call["caller"],
+                    call["source_ip"],
+                    call["model"],
+                    call["inference_region"],
+                    (record.get("identity") or {}).get("arn") or "unrecorded",
+                    record.get("modelId") or "unrecorded",
+                    record.get("timestamp") or "unrecorded",
+                    " and ".join(f"an {part} body" for part in bodies)
+                    or "no request or response body",
+                    " Unjoined: {}.".format(
+                        ", ".join(
+                            c["request_id"]
+                            for c in events["calls"]
+                            if c["request_id"] not in records
+                        )
+                    )
+                    if len(joined) < len(events["calls"])
+                    else "",
+                ),
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        elif scan["error"] or scan["capped"]:
+            row(
+                INFERENCE_TRACE_FINDING,
+                "None of the {} newest successful {} call(s) was found in the "
+                "invocation log in {}, but the read {}, so the join is not "
+                "judged.".format(
+                    len(events["calls"]),
+                    operations,
+                    source["where"],
+                    f"failed ({scan.get('action')}: {scan['error']})"
+                    if scan["error"]
+                    else "reached its cap",
+                ),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        else:
+            row(
+                INFERENCE_TRACE_FINDING,
+                "None of the {} newest successful {} call(s) in event history has "
+                "a record in the invocation log in {} with its request ID ({}), so "
+                "no call can be traced from its caller to its prompt and "
+                "response.".format(
+                    len(events["calls"]),
+                    operations,
+                    source["where"],
+                    ", ".join(call["request_id"] for call in events["calls"]),
+                ),
+                "Check that model invocation logging in this Region delivers every "
+                "call, and that the destination keeps 24 hours of records.",
+                "Medium",
+                "Failed",
+            )
+
+    stores = _assessed_event_data_store_coverage(
+        boto3.client("cloudtrail", config=boto3_config, region_name=region), region
+    )
+    if stores["management"]:
+        row(
+            INFERENCE_TRACE_CENTRAL_FINDING,
+            "CloudTrail Lake event data store(s) {} record Bedrock management "
+            "events, so {} calls can be queried centrally. Whether the invocation "
+            "log records are centralized too is not judged.".format(
+                ", ".join(stores["management"]), operations
+            ),
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+        return findings
+    home = _event_data_store_home_regions()
+    regions = sorted(set(home["regions"]) | ({region} if region else set()))
+    tables = _glue_cloudtrail_tables(regions)
+    unread = (
+        [_event_data_store_unread(stores).rstrip(".")]
+        if _event_data_store_unread(stores)
+        else []
+    )
+    unread += [f"Regions not listed with {home['error']}"] if home["error"] else []
+    unread += tables["errors"]
+    if tables["tables"]:
+        row(
+            INFERENCE_TRACE_CENTRAL_FINDING,
+            "No CloudTrail Lake event data store records Bedrock management events, "
+            "but AWS Glue table(s) {} sit over a CloudTrail log path or a Security "
+            "Lake CloudTrail management source, so Athena can "
+            "query the {} events. Whether the trail writing there records Bedrock "
+            "calls, and whether the invocation log records are centralized too, are "
+            "not judged.".format("; ".join(tables["tables"][:5]), operations),
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    elif unread:
+        row(
+            INFERENCE_TRACE_CENTRAL_FINDING,
+            "No CloudTrail Lake event data store recording Bedrock management "
+            "events and no Glue table over a CloudTrail log path was found, but "
+            "{} part(s) were not read: {}.".format(len(unread), "; ".join(unread[:10])),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    else:
+        row(
+            INFERENCE_TRACE_CENTRAL_FINDING,
+            "No CloudTrail Lake event data store records Bedrock management events "
+            "(stores homed here and multi-Region stores homed in {} were read), and "
+            "no AWS Glue Data Catalog table in {} sits over a CloudTrail log path "
+            "(.../AWSLogs/.../CloudTrail...) or a Security Lake CLOUD_TRAIL_MGMT "
+            "source, so the {} events cannot be queried "
+            "centrally for forensic reconstruction.".format(
+                ", ".join(r for r in regions if r != region) or "no other Region",
+                ", ".join(regions),
+                operations,
+            ),
+            "Create a CloudTrail Lake event data store that records Bedrock "
+            "management events, or an Athena table over the trail's S3 log path.",
+            "Medium",
+            "Failed",
+        )
+    return findings
 
 
 def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
@@ -38738,6 +39141,7 @@ def lambda_handler(event, context):
         logger.info("Running Bedrock CloudTrail logging check")
         bedrock_cloudtrail_findings = check_bedrock_cloudtrail_logging(region=region)
         all_findings.append(bedrock_cloudtrail_findings)
+        all_findings.append(check_bedrock_inference_trace(region=region))
 
         logger.info("Running Bedrock Prompt Management check")
         bedrock_prompt_management_findings = check_bedrock_prompt_management(

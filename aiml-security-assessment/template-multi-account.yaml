@@ -571,14 +571,17 @@ Resources:
           - Sid: GlueTableLocationRead
             # BR-20 resolves the S3 location of each AWS Glue Data Catalog table,
             # and of each partition, a SQL knowledge base reads; BR-26 resolves
-            # the table a Glue job writes and reads that job's runs. The service
-            # authorization reference gives GetTable, GetTables and
-            # GetPartitions the catalog, database and table resource types, and
-            # GetJobRuns the job resource type.
+            # the table a Glue job writes and reads that job's runs. BR-06 lists
+            # every database and table to find one over a CloudTrail log path.
+            # The service authorization reference gives GetTable, GetTables and
+            # GetPartitions the catalog, database and table resource types,
+            # GetDatabases the catalog and database types, and GetJobRuns the
+            # job resource type.
             Effect: Allow
             Action:
               - glue:GetTable # BR-20, BR-26
-              - glue:GetTables # BR-20
+              - glue:GetTables # BR-06, BR-20
+              - glue:GetDatabases # BR-06
               - glue:GetPartitions # BR-20
               - glue:GetJobRuns # BR-26
             Resource:
