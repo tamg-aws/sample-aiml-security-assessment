@@ -22,7 +22,7 @@ import json
 import base64
 import binascii
 import copy
-from functools import lru_cache
+from functools import lru_cache, partial
 from schema import create_finding
 
 # Configure boto3 with retries
@@ -7687,6 +7687,183 @@ def _invocation_log_s3_root(region: str) -> Dict[str, Any]:
     }
 
 
+def _invocation_log_group_central_paths(
+    log_group: Optional[str],
+    tables: Dict[str, Any],
+    regions: List[str],
+    region: str,
+) -> Dict[str, List[str]]:
+    """
+    For BR-06, follow invocation logs delivered only to CloudWatch Logs to a
+    store Athena can query, and return {"met", "gaps", "held"}.
+
+    A subscription filter on the log group is followed when it forwards every
+    event as logged (no filter pattern, field selection or transformed logs)
+    to an ACTIVE Firehose stream of this account whose S3 destination runs no
+    Lambda record processor. The destination's prefix, up to its first !{...}
+    expression, is met when a Glue table's location is at or above it. With
+    nothing met, an Athena data catalog of type LAMBDA, or FEDERATED with no
+    ConnectionType, could be a CloudWatch Logs connector over the group, so it
+    holds the verdict, as does any read that fails.
+    """
+    found: Dict[str, List[str]] = {"met": [], "gaps": [], "held": []}
+    where = f"CloudWatch Logs group {log_group or 'unnamed'}"
+    if not log_group:
+        found["held"].append(
+            "the invocation logs go only to CloudWatch Logs, and the log group "
+            "name was not read"
+        )
+        return found
+    try:
+        account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+        subscriptions = _list_all_items(
+            boto3.client("logs", config=boto3_config, region_name=region),
+            "describe_subscription_filters",
+            "subscriptionFilters",
+            max_results_param=None,
+            logGroupName=log_group,
+        )
+    except (ClientError, BotoCoreError, TypeError, KeyError) as error:
+        found["held"].append(
+            f"the invocation logs go only to {where}, whose subscription filters "
+            "were not read with logs:DescribeSubscriptionFilters "
+            f"({get_assessment_error_label(error)})"
+        )
+        return found
+    missed: List[str] = []
+    for subscription in subscriptions:
+        label = f"subscription filter '{subscription.get('filterName') or '?'}'"
+        pattern = str(subscription.get("filterPattern") or "").strip()
+        criteria = str(subscription.get("fieldSelectionCriteria") or "").strip()
+        if pattern:
+            missed.append(f"{label} forwards only the events matching '{pattern}'")
+            continue
+        if criteria:
+            missed.append(f"{label} forwards only the events '{criteria}' selects")
+            continue
+        if subscription.get("applyOnTransformedLogs") is True:
+            missed.append(f"{label} forwards the transformed events, not the records")
+            continue
+        destination = str(subscription.get("destinationArn") or "")
+        parts = destination.split(":", 5)
+        if (
+            len(parts) != 6
+            or parts[2] != "firehose"
+            or not parts[5].startswith("deliverystream/")
+        ):
+            found["held"].append(
+                f"{label} sends to {destination or 'no destination'}, which this "
+                "check does not follow to a queryable store"
+            )
+            continue
+        if parts[4] != account:
+            found["held"].append(
+                f"{label} sends to Firehose stream {destination} in account "
+                f"{parts[4]}, whose destination is not read"
+            )
+            continue
+        stream_name = parts[5].split("/", 1)[1]
+        try:
+            stream = boto3.client(
+                "firehose", config=boto3_config, region_name=parts[3]
+            ).describe_delivery_stream(DeliveryStreamName=stream_name)[
+                "DeliveryStreamDescription"
+            ]
+        except (ClientError, BotoCoreError, KeyError, TypeError) as error:
+            found["held"].append(
+                f"{label} sends to {destination}, which was not read with "
+                f"firehose:DescribeDeliveryStream ({get_assessment_error_label(error)})"
+            )
+            continue
+        stream_label = f"{label} through Firehose stream '{stream_name}'"
+        status = stream.get("DeliveryStreamStatus")
+        if status != "ACTIVE":
+            missed.append(f"{stream_label} is {status or 'of unknown status'}")
+            continue
+        for target in stream.get("Destinations") or []:
+            s3_target = target.get("ExtendedS3DestinationDescription") or target.get(
+                "S3DestinationDescription"
+            )
+            if not s3_target:
+                missed.append(f"{stream_label} delivers to a destination other than S3")
+                continue
+            processing = s3_target.get("ProcessingConfiguration") or {}
+            if processing.get("Enabled") is True and any(
+                processor.get("Type") == "Lambda"
+                for processor in processing.get("Processors") or []
+            ):
+                found["held"].append(
+                    f"{stream_label} runs a Lambda record processor, whose output "
+                    "is not read"
+                )
+                continue
+            bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
+            prefix = str(s3_target.get("Prefix") or "").split("!{", 1)[0]
+            root = f"s3://{bucket}/{prefix}"
+            covering = [
+                table["label"]
+                for table in tables["tables"]
+                if root.startswith(table["location"].rstrip("/") + "/")
+            ]
+            if covering:
+                found["met"].append(
+                    "Glue table(s) {} sit over {}, where {} delivers every event "
+                    "of {}".format("; ".join(covering[:5]), root, stream_label, where)
+                )
+            else:
+                missed.append(
+                    f"{stream_label} delivers to {root}, which no Glue table in "
+                    f"{', '.join(regions)} sits over"
+                )
+    if found["met"]:
+        return {"met": found["met"], "gaps": [], "held": []}
+    if not subscriptions:
+        missed.append(f"{where} has no subscription filter")
+    found["held"].extend(tables["errors"][:5])
+    for catalog_region in regions:
+        try:
+            catalogs = _list_all_items(
+                boto3.client("athena", config=boto3_config, region_name=catalog_region),
+                "list_data_catalogs",
+                "DataCatalogsSummary",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                max_results=50,
+            )
+        except (ClientError, BotoCoreError, TypeError, KeyError) as error:
+            found["held"].append(
+                f"Athena data catalogs in {catalog_region} were not listed with "
+                f"athena:ListDataCatalogs ({get_assessment_error_label(error)})"
+            )
+            continue
+        for catalog in catalogs:
+            kind = str(catalog.get("Type") or "")
+            if kind == "LAMBDA" or (
+                kind == "FEDERATED" and not catalog.get("ConnectionType")
+            ):
+                found["held"].append(
+                    f"Athena data catalog '{catalog.get('CatalogName')}' in "
+                    f"{catalog_region} is a {kind} connector whose source is not "
+                    f"read, so it may query {where}"
+                )
+    if found["held"]:
+        found["held"] = [
+            f"the invocation logs go only to {where}, and no path to a queryable "
+            "store was established: {}".format("; ".join(missed + found["held"]))
+        ]
+        return found
+    found["gaps"].append(
+        "the invocation logs go only to {}, and none of its events reach a Glue "
+        "table: {}; no Athena data catalog in {} is a LAMBDA or FEDERATED "
+        "connector that could query the group".format(
+            where, "; ".join(missed), ", ".join(regions)
+        )
+    )
+    return found
+
+
 def check_bedrock_inference_trace(region: str = "") -> Dict[str, Any]:
     """BR-06 MDL-07 legs; see _inference_trace_findings."""
     try:
@@ -7720,7 +7897,9 @@ def _inference_trace_findings(region: str) -> Dict[str, Any]:
     centrally: the CloudTrail events in a CloudTrail Lake event data store
     recording Bedrock management events, or in a Glue table under the S3 log
     root of a logging trail that records them in this Region, and the
-    invocation log records in a Glue table over their S3 path.
+    invocation log records in a Glue table over their S3 path, or over the S3
+    path a CloudWatch Logs subscription delivers them to
+    (_invocation_log_group_central_paths).
     """
     findings = {"check_name": INFERENCE_TRACE_FINDING, "status": "PASS", "csv_data": []}
 
@@ -7970,16 +8149,18 @@ def _inference_trace_findings(region: str) -> Dict[str, Any]:
                     else "",
                 )
             )
+    chain_met: List[str] = []
     if invocation["error"]:
         held.append(invocation["error"])
     elif source["logging"] is False and not invocation["root"]:
         gaps.append(f"no invocation log record can be centralized: {source['reason']}")
     elif not invocation["root"]:
-        held.append(
-            "the invocation logs go only to CloudWatch Logs group {}, and whether a "
-            "subscription carries them to a central Athena or CloudTrail Lake store "
-            "is not read".format(invocation["log_group"] or "unnamed")
+        chain = _invocation_log_group_central_paths(
+            invocation["log_group"], tables, regions, region
         )
+        chain_met = chain["met"]
+        gaps += chain["gaps"]
+        held += chain["held"]
     elif not invocation_tables and tables["errors"]:
         held.append(
             "no Glue table over the invocation log path {} was found, but {}".format(
@@ -7995,6 +8176,7 @@ def _inference_trace_findings(region: str) -> Dict[str, Any]:
     met = []
     if trail_text:
         met.append(trail_text)
+    met += chain_met
     if invocation_tables:
         met.append(
             "Glue table(s) {} sit over the invocation log path {}, so Athena can "
@@ -8763,7 +8945,14 @@ PROMPT_ARN_MODEL_ID = re.compile(
     r"prompt/[0-9a-zA-Z]{10}(?::([0-9]{1,5}))?$"
 )
 
-# Event history pages read per operation, at 50 events a page.
+# Event history pages read per operation, at 50 events a page. Measured with
+# this function's adaptive retry config over the last 24 hours of the four
+# operations (account 178113193057, us-east-1, 2026-10-04): 13 pages took 0.44 s
+# on average and 1.05 s at most, and 57 back-to-back pages 1.6 s at most, so 40
+# pages cost at most about 64 s of the 600 s timeout. That account logged 8,454
+# InvokeModelWithResponseStream calls in those 24 hours, more than the 500 read.
+# LookupEvents returns the newest events first, so a capped operation names the
+# time before which its calls were not read, and the row is held at N/A.
 RUNTIME_PROMPT_LOOKUP_PAGES = 10
 
 
@@ -8778,6 +8967,7 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     found = {"versioned": [], "draft": [], "read": 0, "capped": [], "error": None}
     for operation in INFERENCE_TRACE_OPERATIONS:
+        oldest = None
         request = {
             "LookupAttributes": [
                 {"AttributeKey": "EventName", "AttributeValue": operation}
@@ -8805,6 +8995,8 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
                     continue
                 if not isinstance(detail, dict):
                     continue
+                if isinstance(detail.get("eventTime"), str):
+                    oldest = min(oldest or detail["eventTime"], detail["eventTime"])
                 model_id = str(
                     (detail.get("requestParameters") or {}).get("modelId") or ""
                 )
@@ -8823,7 +9015,11 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
                 break
             request["NextToken"] = response["NextToken"]
         else:
-            found["capped"].append(operation)
+            found["capped"].append(
+                f"{operation} calls before {oldest}"
+                if oldest
+                else f"{operation} calls, none of which was read"
+            )
     return found
 
 
@@ -8880,13 +9076,14 @@ def _runtime_prompt_version_findings(
         return [
             row(
                 "{} of the {} event(s) read passed a prompt ARN, each with a "
-                "numbered version, but event history for {} holds more than the "
-                "{} event(s) read per operation, so a later call that runs a "
-                "prompt DRAFT may be unread.".format(
+                "numbered version, but event history holds more than the {} "
+                "event(s) read per operation, newest first, so these were not "
+                "read, and one that runs a prompt DRAFT may be among them: "
+                "{}.".format(
                     total,
                     references["read"],
-                    ", ".join(references["capped"]),
                     RUNTIME_PROMPT_LOOKUP_PAGES * 50,
+                    "; ".join(references["capped"]),
                 ),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
@@ -16518,8 +16715,10 @@ def _source_bucket_read_restrictions(document: Any, bucket: str) -> Dict[str, An
     allow_only: List[List[str]] = []
     excluded: List[str] = []
     held: List[str] = []
+    allows = False
     for index, statement in enumerate(_policy_statements(document)):
         if str(statement.get("Effect", "")).upper() != "DENY":
+            allows = allows or _statement_matches_action(statement, "s3:getobject")
             continue
         if not _statement_matches_action(statement, "s3:getobject"):
             continue
@@ -16573,7 +16772,513 @@ def _source_bucket_read_restrictions(document: Any, bucket: str) -> Dict[str, An
             allow_only.append([str(v) for v in _as_list(keys[0][2])])
             continue
         held.append(f"{label} carries a Condition whose effect is not computed")
-    return {"allow_only": allow_only, "excluded": excluded, "held": held}
+    return {
+        "allow_only": allow_only,
+        "excluded": excluded,
+        "held": held,
+        "allows": allows,
+    }
+
+
+def _bucket_object_matchers(partition: str, bucket: str) -> Tuple[Any, Any]:
+    """
+    Return (covers, reaches) for the objects of one bucket, for BR-20. A
+    Resource covers every object when it ends in * and matches
+    "arn:<partition>:s3:::<bucket>/", and reaches the bucket when one of its
+    prefixes matches that string, so it can match some object of it.
+    """
+    target = f"arn:{partition}:s3:::{bucket}/"
+
+    def reaches(resource: str) -> bool:
+        # Some object matches when a prefix of the pattern matches the target
+        # whole; a literal past len(target) cannot, so the walk stops there.
+        if not re.search(r"[*?]", resource):
+            return resource.startswith(target) and len(resource) > len(target)
+        literals = 0
+        for end in range(len(resource) + 1):
+            if end and resource[end - 1] != "*":
+                literals += 1
+                if literals > len(target):
+                    return False
+            if _wildcard_matches(resource[:end], target):
+                return True
+        return False
+
+    def covers(resource: str) -> bool:
+        return resource.endswith("*") and _wildcard_matches(resource, target)
+
+    return covers, reaches
+
+
+def _source_key_state(
+    bucket: str, encryption: Any, region: str, cache: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Resolve the default encryption key of a knowledge base source bucket, for
+    BR-20: {"kind": "cmk", "arn", "policy", "grants"}, {"kind": "aws"},
+    {"kind": "none"} or {"kind": "held", "why"}. ``encryption`` is the
+    _bucket_default_encryption result, "absent" when the bucket has no
+    configuration, or None when it was not read. ``grants`` is None when
+    kms:ListGrants failed. Each key is read once a run of this check.
+    """
+    if encryption == "absent":
+        return {"kind": "none"}
+    if not isinstance(encryption, dict):
+        return {
+            "kind": "held",
+            "why": f"the default encryption of source bucket '{bucket}' was not read",
+        }
+    if encryption["algorithm"] not in KMS_SSE_ALGORITHMS:
+        return {"kind": "none"}
+    if not encryption["key"] or _is_aws_managed_kms_key(encryption["key"]):
+        return {"kind": "aws"}
+    if encryption["key"] in cache:
+        return cache[encryption["key"]]
+    key = _describe_kms_key(encryption["key"], region)
+    if key["error"] is not None:
+        state = {
+            "kind": "held",
+            "why": f"key {encryption['key']} was not read with kms:DescribeKey "
+            f"({get_assessment_error_label(key['error'])})",
+        }
+    elif key["manager"] != "CUSTOMER":
+        state = {"kind": "aws"}
+    else:
+        client = boto3.client(
+            "kms", config=boto3_config, region_name=key["arn"].split(":")[3]
+        )
+        try:
+            policy = client.get_key_policy(KeyId=key["arn"], PolicyName="default")[
+                "Policy"
+            ]
+        except (ClientError, BotoCoreError, KeyError, TypeError) as error:
+            state = {
+                "kind": "held",
+                "why": f"the policy of key {key['arn']} was not read with "
+                f"kms:GetKeyPolicy ({get_assessment_error_label(error)})",
+            }
+        else:
+            try:
+                grants = _list_all_items(
+                    client,
+                    "list_grants",
+                    "Grants",
+                    max_results_param="Limit",
+                    token_param="Marker",
+                    token_response_keys=("NextMarker",),
+                    max_results=100,
+                    KeyId=key["arn"],
+                )
+            except (ClientError, BotoCoreError, TypeError):
+                grants = None
+            state = {
+                "kind": "cmk",
+                "arn": key["arn"],
+                "policy": policy,
+                "grants": grants,
+            }
+    cache[encryption["key"]] = state
+    return state
+
+
+def _source_identity_read(
+    principal: str,
+    bucket: str,
+    permission_cache: Optional[Dict[str, Any]],
+    bucket_allows: bool,
+) -> Tuple[str, str]:
+    """
+    Judge whether a principal's own IAM policies let it read the objects of a
+    knowledge base source bucket, for BR-20. Returns ("denied", why), ("held",
+    why) or ("reads", "").
+
+    A Resource covers every object of the bucket when it ends in * and matches
+    "arn:<partition>:s3:::<bucket>/", and reaches the bucket when it can match
+    some object of it. An unconditioned Deny of s3:GetObject that covers every
+    object, in an identity policy or the permissions boundary, denies. So does
+    a boundary that allows s3:GetObject on no resource reaching the bucket, and
+    identity policies that allow it nowhere there while the bucket policy has
+    no Allow of s3:GetObject either, since the read then has no grant. A
+    principal reads only when an identity Allow covers every object and so
+    does the boundary, if one is set. A Deny with a Condition, with NotResource
+    or on part of the bucket, an Allow on part of the bucket only, or no
+    identity Allow beside a bucket policy Allow, is held, as is a principal the
+    cache does not hold. An Allow is credited without judging its Condition.
+    """
+    match = re.match(
+        r"^arn:(aws[a-z-]*):iam::\d{12}:(role|user)/(?:.*/)?([^/]+)$", principal
+    )
+    if not match:
+        return "held", "it is not an IAM role or user ARN"
+    partition, kind, name = match.groups()
+    if permission_cache is None:
+        return "held", "the IAM permissions cache was not available"
+    permissions = (permission_cache.get(f"{kind}_permissions") or {}).get(name)
+    if not isinstance(permissions, dict):
+        return "held", f"the {kind} is not in the IAM permissions cache"
+    if any(
+        isinstance(error, dict)
+        and (str(error.get("type")), str(error.get("name"))) == (kind, name)
+        for error in permission_cache.get("principal_errors") or []
+    ):
+        return "held", f"the {kind} had a policy read fail in the IAM permissions cache"
+    covers, reaches = _bucket_object_matchers(partition, bucket)
+
+    policies = list(_cached_identity_policies(permissions))
+    boundary = _boundary_document(permissions)
+    if boundary is not None:
+        policies.append(("permissions boundary", {"document": boundary}))
+    granted, bounded, held = 0, 0, []
+    for source, policy in policies:
+        label = (
+            f"{source} '{policy.get('policy_name') or policy.get('name') or 'unnamed'}'"
+        )
+        try:
+            statements = _policy_statements(policy.get("document"))
+        except (ValueError, TypeError) as error:
+            held.append(
+                f"{label} could not be parsed ({get_assessment_error_label(error)})"
+            )
+            continue
+        for statement in statements:
+            if not _statement_matches_action(statement, "s3:getobject"):
+                continue
+            if str(statement.get("Effect", "")).upper() == "ALLOW":
+                if source == "permissions boundary":
+                    bounded = max(
+                        bounded, _statement_coverage(statement, covers, reaches)
+                    )
+                else:
+                    granted = max(
+                        granted, _statement_coverage(statement, covers, reaches)
+                    )
+                continue
+            if "NotResource" in statement:
+                held.append(f"{label} denies s3:GetObject with NotResource")
+                continue
+            resources = [str(r) for r in _as_list(statement.get("Resource"))]
+            if not any(map(reaches, resources)):
+                continue
+            if statement.get("Condition"):
+                held.append(f"{label} denies s3:GetObject under a Condition")
+            elif any(map(covers, resources)):
+                return "denied", f"{label} denies s3:GetObject on every object"
+            else:
+                held.append(f"{label} denies s3:GetObject on part of the bucket")
+    if boundary is not None and bounded == 0:
+        return "denied", (
+            "its permissions boundary allows s3:GetObject on no object of the bucket"
+        )
+    if boundary is not None and bounded == 1:
+        held.append(
+            "its permissions boundary allows s3:GetObject on part of the bucket only"
+        )
+    if granted == 1:
+        held.append(
+            "its identity policies allow s3:GetObject on part of the bucket only"
+        )
+    if held:
+        return "held", "; ".join(held)
+    if granted == 0:
+        if bucket_allows:
+            return "held", (
+                "no identity policy allows s3:GetObject on the bucket, and the "
+                "bucket policy's Allow statements are not compared per principal"
+            )
+        return "denied", (
+            "no identity policy allows s3:GetObject on the bucket and the bucket "
+            "policy allows it to no one"
+        )
+    return "reads", ""
+
+
+def _statement_coverage(statement: Dict[str, Any], covers: Any, reaches: Any) -> int:
+    """
+    Say how far a statement's Resource or NotResource extends over a target,
+    for BR-20: 2 covers all of it, 1 reaches part of it, 0 reaches none.
+    """
+    if "NotResource" in statement:
+        excluded = [str(r) for r in _as_list(statement.get("NotResource"))]
+        if any(map(covers, excluded)):
+            return 0
+        return 1 if any(map(reaches, excluded)) else 2
+    resources = [str(r) for r in _as_list(statement.get("Resource"))]
+    if any(map(covers, resources)):
+        return 2
+    return 1 if any(map(reaches, resources)) else 0
+
+
+def _scp_read_verdict(
+    inventory: Dict[str, Any], action: str, noun: str, covers: Any, reaches: Any
+) -> Tuple[str, str]:
+    """
+    Judge whether the service control policies attached over this account let
+    its principals perform one lowercase action on a target, for BR-20.
+    Returns ("denied", why), ("held", why) or ("reads", note).
+
+    Only policies get_service_control_policy_inventory found attached to the
+    account, an OU in its path or the root count. An unconditioned Deny
+    covering the target denies, and so does a level of that path where no
+    attached policy allows the action on the target, since every level must.
+    A conditioned, NotResource or partial Deny, an Allow on part of the target
+    only or under a Condition, or an unread inventory is held. The management account is never
+    restricted, and an account outside an organization has none.
+    """
+    list_error = str(inventory.get("list_error") or "")
+    if "AWSOrganizationsNotInUseException" in list_error:
+        return "reads", "the account is in no organization, so no SCP applies"
+    if list_error:
+        return "held", f"the service control policies were not read: {list_error}"
+    if inventory.get("management_account"):
+        return "reads", (
+            "this is the management account, which service control policies "
+            "never restrict"
+        )
+    if inventory.get("errors"):
+        return "held", "service control policies were not all read: {}".format(
+            "; ".join(inventory["errors"][:3])
+        )
+    held: List[str] = []
+    levels: Dict[str, int] = {target["Id"]: 0 for target in inventory.get("path") or []}
+    conditioned: set = set()
+    for item in inventory.get("items") or []:
+        label = f"service control policy '{item.get('name')}'"
+        try:
+            statements = _policy_statements(item.get("content"))
+        except (ValueError, TypeError) as error:
+            held.append(
+                f"{label} could not be parsed ({get_assessment_error_label(error)})"
+            )
+            continue
+        attached = [
+            target
+            for target in levels
+            if any(
+                str(where).endswith(f" {target}")
+                for where in item.get("attached_to") or []
+            )
+        ]
+        for statement in statements:
+            if not _statement_matches_action(statement, action):
+                continue
+            coverage = _statement_coverage(statement, covers, reaches)
+            if str(statement.get("Effect", "")).upper() == "ALLOW":
+                if coverage and statement.get("Condition"):
+                    coverage = 1
+                    conditioned.update(attached)
+                for target in attached:
+                    levels[target] = max(levels[target], coverage)
+                continue
+            if "NotResource" in statement:
+                held.append(f"{label} denies {noun} with NotResource")
+            elif coverage == 0:
+                continue
+            elif statement.get("Condition"):
+                held.append(f"{label} denies {noun} under a Condition")
+            elif coverage == 2:
+                return "denied", f"{label} denies {noun}"
+            else:
+                held.append(f"{label} denies {noun} on part of it")
+    for target, level in levels.items():
+        if level == 0:
+            return "denied", (
+                f"no service control policy attached to {target} allows {noun}"
+            )
+        if level == 1:
+            how = (
+                "on part of it or under a Condition"
+                if target in conditioned
+                else "on part of it"
+            )
+            held.append(
+                f"the service control policies attached to {target} allow {noun} "
+                f"{how} only"
+            )
+    if held:
+        return "held", "; ".join(held)
+    return "reads", ""
+
+
+def _kms_condition_met(statement: Dict[str, Any], account: str, region: str) -> bool:
+    """
+    Return True when every condition of a key policy statement holds for an
+    S3 read by a principal of ``account``: kms:ViaService naming S3 in the
+    key's Region, or kms:CallerAccount naming the account.
+    """
+    for operator, key, values in _condition_keys_by_operator(statement):
+        operator = re.sub(r"^for(all|any)values:", "", operator).removesuffix(
+            "ifexists"
+        )
+        via = f"s3.{region}.amazonaws.com"
+        if key == "kms:viaservice" and operator == "stringequals":
+            if via in [str(v).lower() for v in values]:
+                continue
+        if key == "kms:viaservice" and operator == "stringlike":
+            if any(_wildcard_matches(str(v).lower(), via) for v in values):
+                continue
+        if key == "kms:calleraccount" and operator == "stringequals":
+            if account in [str(v) for v in values]:
+                continue
+        return False
+    return True
+
+
+def _identity_kms_decrypt(permissions: Dict[str, Any], key_arn: str) -> Dict[str, Any]:
+    """
+    Read one principal's identity policies and boundary for kms:Decrypt on a
+    key, for BR-20: {"denied", "held", "granted", "bounded"}. ``bounded`` is
+    None with no boundary, else whether the boundary allows it on the key.
+    """
+
+    def covers(resource: str) -> bool:
+        return _wildcard_matches(resource, key_arn)
+
+    found: Dict[str, Any] = {
+        "denied": None,
+        "held": [],
+        "granted": False,
+        "bounded": None,
+    }
+    policies = list(_cached_identity_policies(permissions))
+    boundary = _boundary_document(permissions)
+    if boundary is not None:
+        policies.append(("permissions boundary", {"document": boundary}))
+        found["bounded"] = False
+    for source, policy in policies:
+        label = (
+            f"{source} '{policy.get('policy_name') or policy.get('name') or 'unnamed'}'"
+        )
+        try:
+            statements = _policy_statements(policy.get("document"))
+        except (ValueError, TypeError) as error:
+            found["held"].append(
+                f"{label} could not be parsed ({get_assessment_error_label(error)})"
+            )
+            continue
+        for statement in statements:
+            if not _statement_matches_action(statement, "kms:decrypt"):
+                continue
+            reached = _statement_coverage(statement, covers, covers) == 2
+            if str(statement.get("Effect", "")).upper() == "ALLOW":
+                if not reached:
+                    continue
+                if source == "permissions boundary":
+                    found["bounded"] = True
+                else:
+                    found["granted"] = True
+            elif "NotResource" in statement:
+                found["held"].append(f"{label} denies kms:Decrypt with NotResource")
+            elif not reached:
+                continue
+            elif statement.get("Condition"):
+                found["held"].append(f"{label} denies kms:Decrypt under a Condition")
+            elif found["denied"] is None:
+                found["denied"] = f"{label} denies kms:Decrypt on key {key_arn}"
+    return found
+
+
+def _source_key_read(
+    principal: str,
+    key_arn: str,
+    key_policy: Any,
+    grants: Optional[List[Dict[str, Any]]],
+    permissions: Dict[str, Any],
+) -> Tuple[str, str]:
+    """
+    Judge whether a principal may decrypt a source bucket's customer managed
+    key, for BR-20. Returns ("denied", why), ("held", why) or ("reads", "").
+
+    The key policy must allow kms:Decrypt to the principal or to everyone, or
+    to the root of the principal's account, which delegates to an identity
+    policy Allow on the key. A condition is met only when it is kms:ViaService
+    naming S3 in the key's Region or kms:CallerAccount naming the account. A
+    grant names the principal with the Decrypt operation. A key policy or
+    identity Deny of it, unconditioned, denies, as does a boundary that does
+    not allow it, since a key policy that names a role ARN is still limited
+    by the role's boundary. Any other condition, a NotPrincipal statement or
+    grant constraints are held. ``grants`` is None when ListGrants failed.
+    """
+    partition, account, kind = re.match(
+        r"^arn:(aws[a-z-]*):iam::(\d{12}):(role|user)/", principal
+    ).groups()
+    region = key_arn.split(":")[3]
+    root = {f"arn:{partition}:iam::{account}:root", account}
+    identity = _identity_kms_decrypt(permissions, key_arn)
+    held = list(identity["held"])
+    direct = delegated = False
+    try:
+        statements = _policy_statements(key_policy)
+    except (ValueError, TypeError) as error:
+        return "held", (
+            f"the policy of key {key_arn} could not be parsed "
+            f"({get_assessment_error_label(error)})"
+        )
+    for index, statement in enumerate(statements):
+        if not _statement_matches_action(statement, "kms:decrypt"):
+            continue
+        label = f"key policy statement {statement.get('Sid') or index + 1}"
+        effect = str(statement.get("Effect", "")).upper()
+        if "NotPrincipal" in statement:
+            held.append(f"{label} uses NotPrincipal")
+            continue
+        named = statement.get("Principal")
+        named = (
+            ["*"]
+            if named == "*"
+            else [str(p) for p in _as_list((named or {}).get("AWS"))]
+            if isinstance(named, dict)
+            else []
+        )
+        to_principal = principal in named or "*" in named
+        to_root = bool(root & set(named))
+        if not (to_principal or to_root):
+            continue
+        met = not statement.get("Condition") or _kms_condition_met(
+            statement, account, region
+        )
+        if effect == "DENY":
+            if statement.get("Condition"):
+                held.append(f"{label} denies kms:Decrypt under a Condition")
+                continue
+            return "denied", f"{label} denies kms:Decrypt on key {key_arn}"
+        if not met:
+            held.append(f"{label} allows kms:Decrypt under a Condition not computed")
+            continue
+        direct = direct or to_principal
+        delegated = delegated or to_root
+    if identity["denied"]:
+        return "denied", identity["denied"]
+    if identity["bounded"] is False and (kind == "role" or not direct):
+        return "denied", (
+            f"its permissions boundary allows kms:Decrypt on no resource matching "
+            f"key {key_arn}"
+        )
+    granted = direct or (delegated and identity["granted"])
+    if not granted:
+        if grants is None:
+            held.append(
+                f"the grants of key {key_arn} were not read with kms:ListGrants"
+            )
+        for grant in grants or []:
+            if grant.get("GranteePrincipal") != principal or "Decrypt" not in (
+                grant.get("Operations") or []
+            ):
+                continue
+            if grant.get("Constraints"):
+                held.append(
+                    f"grant {grant.get('GrantId')} allows Decrypt under constraints"
+                )
+            else:
+                granted = True
+    if held:
+        return "held", "; ".join(held)
+    if granted:
+        return "reads", ""
+    return "denied", (
+        f"the policy of key {key_arn} allows kms:Decrypt to neither it nor, "
+        "through the account root, an identity policy Allow it holds, and no grant "
+        "gives it Decrypt"
+    )
 
 
 def _knowledge_base_source_access_findings(
@@ -16581,21 +17286,27 @@ def _knowledge_base_source_access_findings(
     bucket_kbs: Dict[str, set],
     vector_principals: Dict[str, Dict[str, Any]],
     region: str,
+    permission_cache: Optional[Dict[str, Any]] = None,
+    bucket_encryption: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Compare who a vector store admits with who the source bucket policy lets
-    read the documents, for BR-20.
+    Compare who a vector store admits with who the source bucket policy, their
+    own IAM policies, the service control policies over the account and the
+    source bucket's key let read the documents, for BR-20.
 
     The admitted principals are those an OpenSearch Serverless data access
     policy names on the index, or those a restricting S3 Vectors bucket policy
     Deny exempts by aws:PrincipalArn or NotPrincipal. One that a Deny in the
     policy of a bucket the knowledge base ingests from keeps from s3:GetObject
-    on every object fails. IAM grants on the source
-    objects are not compared, because the bucket policy is the only resource
-    side read here.
+    on every object fails, and so does one _source_identity_read finds denied
+    by its identity policies or permissions boundary, one _scp_read_verdict
+    finds denied s3:GetObject on the objects, or kms:Decrypt on a customer
+    managed default key, and one _source_key_read finds that key denies.
     """
     rows = []
     s3_client = None
+    scp_inventory: Optional[Dict[str, Any]] = None
+    key_cache: Dict[str, Any] = {}
     for bucket, labels in buckets.items():
         reaching = [
             (kb_id, vector_principals[kb_id])
@@ -16626,7 +17337,12 @@ def _knowledge_base_source_access_findings(
                     )
                 )
                 continue
-            restrictions = {"allow_only": [], "excluded": [], "held": []}
+            restrictions = {
+                "allow_only": [],
+                "excluded": [],
+                "held": [],
+                "allows": False,
+            }
         except (ValueError, TypeError) as error:
             rows.append(
                 (
@@ -16646,24 +17362,111 @@ def _knowledge_base_source_access_findings(
                 for patterns in restrictions["allow_only"]
             )
         ]
+        identity_denied, identity_held = [], []
+        scp_note, key_kind, key_arn = "", "", None
+        for principal in principals:
+            if principal in denied:
+                continue
+            verdicts = [
+                _source_identity_read(
+                    principal, bucket, permission_cache, restrictions["allows"]
+                )
+            ]
+            match = re.match(
+                r"^arn:(aws[a-z-]*):iam::\d{12}:(role|user)/(?:.*/)?([^/]+)$",
+                principal,
+            )
+            permissions = (
+                (permission_cache.get(f"{match.group(2)}_permissions") or {}).get(
+                    match.group(3)
+                )
+                if match and permission_cache
+                else None
+            )
+            if verdicts[0][0] != "denied" and isinstance(permissions, dict):
+                key = _source_key_state(
+                    bucket, (bucket_encryption or {}).get(bucket), region, key_cache
+                )
+                if ":role/aws-service-role/" not in principal:
+                    if scp_inventory is None:
+                        scp_inventory = get_service_control_policy_inventory()
+                    covers, reaches = _bucket_object_matchers(match.group(1), bucket)
+                    verdicts.append(
+                        _scp_read_verdict(
+                            scp_inventory,
+                            "s3:getobject",
+                            f"s3:GetObject on the objects of bucket '{bucket}'",
+                            covers,
+                            reaches,
+                        )
+                    )
+                    if key["kind"] == "cmk":
+                        verdicts.append(
+                            _scp_read_verdict(
+                                scp_inventory,
+                                "kms:decrypt",
+                                f"kms:Decrypt on key {key['arn']}",
+                                partial(_wildcard_matches, text=key["arn"]),
+                                partial(_wildcard_matches, text=key["arn"]),
+                            )
+                        )
+                if key["kind"] == "cmk":
+                    verdicts.append(
+                        _source_key_read(
+                            principal,
+                            key["arn"],
+                            key["policy"],
+                            key["grants"],
+                            permissions,
+                        )
+                    )
+                elif key["kind"] == "held":
+                    verdicts.append(("held", key["why"]))
+            if len(verdicts) > 1:
+                key_kind, key_arn = key["kind"], key.get("arn")
+                if verdicts[1][0] == "reads" and verdicts[1][1]:
+                    scp_note = verdicts[1][1]
+            denials = [why for verdict, why in verdicts if verdict == "denied"]
+            holds = [why for verdict, why in verdicts if verdict == "held"]
+            if denials:
+                identity_denied.append(f"{principal} ({denials[0]})")
+            elif holds:
+                identity_held.append(f"{principal}: {'; '.join(holds)}")
         served = "; ".join(labels)
         indexes = ", ".join(f"'{entry['name']}'" for _, entry in reaching)
-        if denied:
+        if denied or identity_denied:
             status = "Failed"
-            detail = (
-                f"{len(denied)} of the {len(principals)} principal(s) admitted to "
-                f"the vector index of knowledge base(s) {indexes} are denied "
-                f"s3:GetObject on the documents of source bucket '{bucket}' by its "
-                f"bucket policy, so they read through the index content the bucket "
-                f"keeps from them: {', '.join(denied[:5])}. The bucket is ingested "
-                f"by {served}."
-            )
-        elif restrictions["held"] or unread:
+            parts = []
+            if denied:
+                parts.append(
+                    f"{len(denied)} of the {len(principals)} principal(s) admitted "
+                    f"to the vector index of knowledge base(s) {indexes} are denied "
+                    f"s3:GetObject on the documents of source bucket '{bucket}' by "
+                    "its bucket policy, so they read through the index content the "
+                    f"bucket keeps from them: {', '.join(denied[:5])}."
+                )
+            if identity_denied:
+                parts.append(
+                    f"{len(identity_denied)} of the {len(principals)} principal(s) "
+                    f"admitted to the vector index of knowledge base(s) {indexes} "
+                    "cannot read the documents of source bucket "
+                    f"'{bucket}' under their IAM policies, the service control "
+                    "policies over the account or the bucket's key, so they read "
+                    "through the index content their grants keep from them: "
+                    f"{'; '.join(identity_denied[:5])}."
+                )
+            detail = " ".join(parts) + f" The bucket is ingested by {served}."
+        elif restrictions["held"] or unread or identity_held:
             status = "N/A"
-            reasons = list(restrictions["held"]) + [
-                f"the principals admitted to the index of '{name}' were not all read"
-                for name in unread
-            ]
+            reasons = (
+                list(restrictions["held"])
+                + [
+                    f"the principals admitted to the index of '{name}' were not "
+                    "all read"
+                    for name in unread
+                ]
+                + identity_held
+            )
             detail = (
                 f"Who reads the documents of source bucket '{bucket}' was not fully "
                 f"compared with who reads the vector index of {indexes}: "
@@ -16676,7 +17479,27 @@ def _knowledge_base_source_access_findings(
                 f"index of {indexes} is denied s3:GetObject by the policy of "
                 f"source bucket '{bucket}'"
                 + ("" if restricted else ", which has no Deny on those reads")
-                + ". IAM grants on the source objects are not compared."
+                + ", and each holds an identity-policy Allow of s3:GetObject whose "
+                "Resource covers every object of the bucket, within a permissions "
+                "boundary that does too if one is set, with no identity-policy or "
+                "permissions-boundary Deny of it. "
+                + (
+                    f"Service control policies do not apply: {scp_note}. "
+                    if scp_note
+                    else "Each level of the organization path above the account has "
+                    "an attached service control policy allowing those reads, and "
+                    "none denies them. "
+                )
+                + {
+                    "cmk": f"The bucket's default key {key_arn} lets each of them "
+                    "use kms:Decrypt through its key policy, a grant, or the account "
+                    "root and an identity-policy Allow. ",
+                    "aws": "The bucket's default key is AWS managed, so its key "
+                    "policy is not judged. ",
+                    "none": "The bucket's default encryption uses no KMS key. ",
+                }.get(key_kind, "")
+                + "Conditions on identity-policy Allow statements are not "
+                "evaluated, and the key of each object already written is not read."
             )
         rows.append((status, detail))
     return [
@@ -16836,7 +17659,9 @@ def _knowledge_base_transient_key_findings(
 
 
 def _knowledge_base_source_encryption_findings(
-    region: str, vector_principals: Optional[Dict[str, Dict[str, Any]]] = None
+    region: str,
+    vector_principals: Optional[Dict[str, Dict[str, Any]]] = None,
+    permission_cache: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Assess encryption at rest on every S3 bucket a knowledge base ingests from.
 
@@ -16894,13 +17719,16 @@ def _knowledge_base_source_encryption_findings(
     plaintext: List[Dict[str, str]] = []
     unreadable: List[str] = []
 
+    bucket_encryption: Dict[str, Any] = {}
     for bucket, labels in buckets.items():
         served = "; ".join(labels)
         try:
             encryption = _bucket_default_encryption(bucket, region)
+            bucket_encryption[bucket] = encryption
         except ClientError as error:
             code = error.response.get("Error", {}).get("Code", "")
             if code == "ServerSideEncryptionConfigurationNotFoundError":
+                bucket_encryption[bucket] = "absent"
                 plaintext.append(
                     {
                         "bucket": bucket,
@@ -17015,7 +17843,12 @@ def _knowledge_base_source_encryption_findings(
     )
     source_findings.extend(
         _knowledge_base_source_access_findings(
-            buckets, bucket_kbs, vector_principals or {}, region
+            buckets,
+            bucket_kbs,
+            vector_principals or {},
+            region,
+            permission_cache,
+            bucket_encryption,
         )
     )
 
@@ -17385,6 +18218,7 @@ def check_bedrock_knowledge_base_kms_encryption(
                     for kb in kbs_store_assessments
                     if "principals" in kb
                 },
+                permission_cache,
             )
             if any(row["Status"] == "Failed" for row in source_encryption):
                 findings["status"] = "WARN"
@@ -19974,7 +20808,10 @@ def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
 
 
 # ListObjectsV2 returns 1,000 keys a page, so a source is listed up to 100,000
-# objects; a longer listing is reported as not read, never as clean.
+# objects; a longer listing is reported as not read, never as clean. Measured
+# 2026-10-04 in account 178113193057, us-east-1: 100 full pages took mean
+# 0.215 s, p90 0.248 s, max 0.547 s, 21.5 s in all, so one capped listing
+# costs about 25 s of the 600 s Lambda timeout.
 REDACTION_SOURCE_LIST_PAGE_CAP = 100
 
 
@@ -20648,6 +21485,14 @@ CONTEXTUAL_GROUNDING_CEILING = (
 # to 100 KB each, so the page size bounds the memory one page takes.
 INVOCATION_LOG_SCAN_PAGE_SIZE = 25
 
+# Measured on /aws/bedrock/model-invocation-logs (account 178113193057,
+# us-east-1, 2026-10-04): 72 filtered pages over the last 24 hours took 0.55 s
+# on average, 0.96 s at the 90th percentile and 1.69 s at most, and the first
+# call of a cold client 3.24 s. That group logged 8,454 records in those 24
+# hours, and each pattern read all of them in 8 pages, mostly empty. Ten pages
+# cost at most about 17 s per pattern; BR-34 and BR-27 read six patterns, about
+# 101 s of the function's 600 s timeout. A capped read names the time from
+# which matching records were not read, and holds the row at N/A.
 INVOCATION_LOG_SCAN_MAX_PAGES = 10
 
 INVOCATION_LOG_SCAN_LOOKBACK = timedelta(hours=24)
@@ -20686,8 +21531,10 @@ def _scan_invocation_log(
     """
     Pass each invocation log record of the last 24 hours that matches
     ``pattern`` to ``visit``, one page at a time, so no page is kept. Returns
-    the count read, whether the page cap stopped the read, and the error label
-    of a failed read.
+    the count read, whether the page cap stopped the read, the error label of a
+    failed read, and, for a capped read, ``unread_from``: the time of the last
+    record read, or the start of the window, from which on matching records
+    were not all read. FilterLogEvents returns events in timestamp order.
     """
     client = boto3.client("logs", config=boto3_config, region_name=region)
     start = int(
@@ -20700,10 +21547,13 @@ def _scan_invocation_log(
         "limit": INVOCATION_LOG_SCAN_PAGE_SIZE,
     }
     read = 0
+    last = start
     try:
         for _ in range(INVOCATION_LOG_SCAN_MAX_PAGES):
             response = client.filter_log_events(**request)
             for event in response.get("events") or []:
+                if isinstance(event.get("timestamp"), int):
+                    last = max(last, event["timestamp"])
                 try:
                     record = json.loads(event.get("message") or "")
                 except ValueError:
@@ -20721,36 +21571,60 @@ def _scan_invocation_log(
             "capped": False,
             "error": get_assessment_error_label(error),
         }
-    return {"read": read, "capped": True, "error": None}
+    return {
+        "read": read,
+        "capped": True,
+        "error": None,
+        "unread_from": datetime.fromtimestamp(last / 1000, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    }
 
 
 # An S3-only invocation log destination is read through at most this many
 # record objects, each a gzip file of JSON lines under the hour folder of
 # AWSLogs/<account>/BedrockModelInvocationLogs/<region>/YYYY/MM/DD/HH/.
+# Measured on the large-data objects under that layout in
+# soc-cloudtrail-logs-178113193057-useast1 (account 178113193057, us-east-1,
+# 2026-10-04; the account delivers no record objects to S3): ListObjectsV2 of
+# an hour folder took 0.12 s on average and 0.97 s at most (30 calls), and
+# GetObject plus gunzip of a 100 KB object 0.15 s on average and 0.61 s at most
+# (30 calls), 0.29 s to 0.40 s for a 1.9 MB one (10 calls). The 25 hour folders
+# and 40 objects cost at most about 49 s per check, because each object is read
+# once for every leg of the check, so BR-34 and BR-27 take about 97 s of the
+# function's 600 s timeout. A capped read names the hour from which records
+# were not all read, and holds the row at N/A.
 INVOCATION_LOG_S3_MAX_OBJECTS = 40
 
 
 def _scan_invocation_log_s3(
     region: str,
     target: Dict[str, str],
-    match: Callable[[str, Dict[str, Any]], bool],
-    visit: Callable[[Dict[str, Any]], None],
-) -> Dict[str, Any]:
+    legs: List[tuple],
+) -> List[Dict[str, Any]]:
     """
     Pass each record of the last 24 hours in the S3 invocation log destination
-    that ``match`` accepts to ``visit``. The hour folders are UTC. Large-data
-    bodies under data/ are not records and are skipped. Returns the same
-    summary as _scan_invocation_log, with the action a failed read needed.
+    to the visit of every (match, visit) leg whose match accepts it, so each
+    object is read once for all legs. The hour folders are UTC. Large-data
+    bodies under data/ are not records and are skipped. Returns one summary
+    per leg, as _scan_invocation_log does, with the action a failed read
+    needed; ``unread_from`` of a capped read is the start of the hour folder
+    the cap stopped in.
     """
     client = boto3.client("s3", config=boto3_config, region_name=region)
     now = datetime.now(timezone.utc)
     start = now - INVOCATION_LOG_SCAN_LOOKBACK
     hour = start.replace(minute=0, second=0, microsecond=0)
-    read = 0
+    reads = [0] * len(legs)
     objects = 0
     action = "s3:ListBucket"
+
+    def summaries(**state):
+        return [{"read": read, "action": action, **state} for read in reads]
+
     try:
         while hour <= now:
+            folder = hour
             request = {
                 "Bucket": target["bucket"],
                 "Prefix": target["root"] + hour.strftime("%Y/%m/%d/%H/"),
@@ -20764,12 +21638,11 @@ def _scan_invocation_log_s3(
                     if "/data/" in key[len(request["Prefix"]) - 1 :]:
                         continue
                     if objects >= INVOCATION_LOG_S3_MAX_OBJECTS:
-                        return {
-                            "read": read,
-                            "capped": True,
-                            "error": None,
-                            "action": action,
-                        }
+                        return summaries(
+                            capped=True,
+                            error=None,
+                            unread_from=folder.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        )
                     objects += 1
                     action = "s3:GetObject"
                     raw = client.get_object(Bucket=target["bucket"], Key=key)[
@@ -20782,7 +21655,7 @@ def _scan_invocation_log_s3(
                             record = json.loads(line)
                         except ValueError:
                             continue
-                        if not isinstance(record, dict) or not match(line, record):
+                        if not isinstance(record, dict):
                             continue
                         stamp = record.get("timestamp")
                         try:
@@ -20791,8 +21664,10 @@ def _scan_invocation_log_s3(
                             when = None
                         if when and when.replace(tzinfo=timezone.utc) < start:
                             continue
-                        read += 1
-                        visit(record)
+                        for index, (match, visit) in enumerate(legs):
+                            if match(line, record):
+                                reads[index] += 1
+                                visit(record)
                 token = response.get("NextContinuationToken")
                 if response.get("IsTruncated") is not True or not isinstance(
                     token, str
@@ -20800,13 +21675,30 @@ def _scan_invocation_log_s3(
                     break
                 request["ContinuationToken"] = token
     except (ClientError, BotoCoreError, OSError, EOFError) as error:
-        return {
-            "read": read,
-            "capped": False,
-            "error": get_assessment_error_label(error),
-            "action": action,
-        }
-    return {"read": read, "capped": False, "error": None, "action": action}
+        return summaries(capped=False, error=get_assessment_error_label(error))
+    return summaries(capped=False, error=None)
+
+
+def _scan_invocation_legs(
+    region: str, source: Dict[str, Any], legs: List[tuple]
+) -> List[Dict[str, Any]]:
+    """
+    Read the invocation log records of the last 24 hours for each
+    (pattern, match, visit) leg, from the CloudWatch Logs group when one is
+    configured, one filtered read per pattern, or else from the S3
+    destination, one read of each object for every leg's match. Returns one
+    summary per leg.
+    """
+    if source["log_group"]:
+        scans = []
+        for pattern, _, visit in legs:
+            scan = _scan_invocation_log(region, source["log_group"], pattern, visit)
+            scan["action"] = "logs:FilterLogEvents"
+            scans.append(scan)
+        return scans
+    return _scan_invocation_log_s3(
+        region, source["s3"], [(match, visit) for _, match, visit in legs]
+    )
 
 
 def _scan_invocation_records(
@@ -20821,11 +21713,7 @@ def _scan_invocation_records(
     Logs group when one is configured, or else from the S3 destination.
     ``pattern`` filters the log group and ``match`` filters S3 records.
     """
-    if source["log_group"]:
-        scan = _scan_invocation_log(region, source["log_group"], pattern, visit)
-        scan["action"] = "logs:FilterLogEvents"
-        return scan
-    return _scan_invocation_log_s3(region, source["s3"], match, visit)
+    return _scan_invocation_legs(region, source, [(pattern, match, visit)])[0]
 
 
 def _nested_dicts(value: Any):
@@ -20891,7 +21779,11 @@ def _invoke_grounding_tags(body: Any) -> Optional[Set[str]]:
 # An InvokeModel call names its guardrail in request headers, which the
 # invocation log omits and CloudTrail's requestParameters record, so untagged
 # calls are joined to their events by requestID: one LookupEvents stream per
-# operation name, over the span of the calls widened by this window.
+# operation name, over the span of the calls widened by this window. A Converse
+# call's guardrailConfig is absent from its logged request body too, and its
+# event carries it as requestParameters.guardrailConfig (record and event
+# f5561a4b, account 178113193057, us-east-1, read 2026-10-04), so Converse and
+# ConverseStream calls are joined the same way.
 GROUNDING_JOIN_WINDOW = timedelta(minutes=5)
 
 # A live LookupEvents page of 50 events took 0.30 s to 0.60 s warm and 1.06 s
@@ -20901,21 +21793,46 @@ GROUNDING_JOIN_WINDOW = timedelta(minutes=5)
 # per operation.
 GROUNDING_JOIN_MAX_PAGES = 50
 
+# Every join of one region's run, BR-27's and BR-34's, draws on this many
+# pages, so joining Converse calls keeps the run at the 100 pages BR-27 alone
+# could read before. Measured again with this function's adaptive retry config
+# (account 178113193057, us-east-1, 2026-10-04): 57 back-to-back pages over the
+# four runtime operations took 0.41 s on average and 1.6 s at most, so 100
+# pages cost about 41 s and at most about 160 s of the 600 s timeout. One page
+# of 13 in an earlier run with the default retry config took 17.7 s.
+GROUNDING_JOIN_BUDGET_PAGES = 100
 
-def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+
+def _invoke_call_guardrails(
+    region: str,
+    calls: List[Dict[str, Any]],
+    joins: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Join each call {"label", "request_id", "operation", "time"} to the
     CloudTrail event with its requestID. Each operation is one LookupEvents
     stream by EventName, from GROUNDING_JOIN_WINDOW before its earliest call to
     GROUNDING_JOIN_WINDOW after its latest, paged until every call is matched,
-    the stream ends or GROUNDING_JOIN_MAX_PAGES pages are read. Returns
-    {"resolved": {request_id: {"guardrail", "version"} or {"reason"}},
-    "capped": [labels unmatched when the page cap stopped the stream]}.
+    the stream ends, GROUNDING_JOIN_MAX_PAGES pages are read or the run's
+    GROUNDING_JOIN_BUDGET_PAGES are spent. ``joins`` ({"resolved", "pages"})
+    is shared by every join of one region's run, so a call joined before is not
+    looked up again. Returns {"resolved": {request_id: {"guardrail",
+    "version"} or {"reason"}}, "capped": [labels unmatched when a page cap
+    stopped the stream]}. A reason carries "unguarded" when the event names no
+    guardrail, and "missing" when the stream holds no event for the call.
     """
-    resolved: Dict[str, Dict[str, str]] = {}
+    joins = joins if joins is not None else {"resolved": {}, "pages": 0}
+    resolved: Dict[str, Dict[str, Any]] = {}
     capped = []
     by_operation: Dict[str, List[tuple]] = {}
     for call in calls:
+        known = joins["resolved"].get(call["request_id"])
+        if known is not None:
+            if known.get("capped"):
+                capped.append(call["label"])
+            else:
+                resolved[call["request_id"]] = known
+            continue
         try:
             when = datetime.strptime(call["time"], "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc
@@ -20937,14 +21854,24 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
             "EndTime": max(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,
             "MaxResults": 50,
         }
-        unmatched = (
-            "which sent no grounding tag and has no CloudTrail event with its "
-            "requestID in cloudtrail:LookupEvents within "
+        unmatched = {
+            "reason": "which has no CloudTrail event with its requestID in "
+            "cloudtrail:LookupEvents within "
             f"{int(GROUNDING_JOIN_WINDOW.total_seconds() // 60)} minutes of the "
-            "logged calls, so which guardrail ran is not known"
-        )
+            "logged calls, so which guardrail ran is not known",
+            "missing": True,
+        }
         try:
-            for _ in range(GROUNDING_JOIN_MAX_PAGES):
+            for _ in range(
+                max(
+                    0,
+                    min(
+                        GROUNDING_JOIN_MAX_PAGES,
+                        GROUNDING_JOIN_BUDGET_PAGES - joins["pages"],
+                    ),
+                )
+            ):
+                joins["pages"] += 1
                 response = client.lookup_events(**request)
                 if not isinstance(response, dict):
                     raise TypeError("LookupEvents returned no response object")
@@ -20960,6 +21887,9 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
                         continue
                     pending.discard(request_id)
                     parameters = detail.get("requestParameters") or {}
+                    config = parameters.get("guardrailConfig")
+                    if isinstance(config, dict):
+                        parameters = config
                     guardrail = parameters.get("guardrailIdentifier")
                     resolved[request_id] = (
                         {
@@ -20972,7 +21902,8 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
                         if guardrail
                         else {
                             "reason": "whose CloudTrail event names no "
-                            "guardrailIdentifier"
+                            "guardrailIdentifier",
+                            "unguarded": True,
                         }
                     )
                 next_token = response.get("NextToken")
@@ -20980,24 +21911,28 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
                     break
                 request["NextToken"] = next_token
             else:
-                capped.extend(
-                    call["label"] for _, call in timed if call["request_id"] in pending
-                )
+                for _, call in timed:
+                    if call["request_id"] in pending:
+                        capped.append(call["label"])
+                        joins["resolved"][call["request_id"]] = {"capped": True}
                 pending = set()
         except (ClientError, BotoCoreError, TypeError) as error:
-            unmatched = (
-                "whose CloudTrail event was not read (cloudtrail:LookupEvents, "
+            unmatched = {
+                "reason": "whose CloudTrail event was not read "
+                "(cloudtrail:LookupEvents, "
                 f"{get_assessment_error_label(error)})"
-            )
+            }
         for request_id in pending:
-            resolved[request_id] = {"reason": unmatched}
+            resolved[request_id] = dict(unmatched)
+    joins["resolved"].update(resolved)
     return {"resolved": resolved, "capped": capped}
 
 
-def _converse_guarded(body: Any, output: Any) -> bool:
-    """Whether a logged Converse call names or reports a guardrail."""
-    if isinstance(body, dict) and body.get("guardrailConfig"):
-        return True
+def _converse_guarded(output: Any) -> bool:
+    """
+    Whether a logged Converse response reports a guardrail: a guardrail trace
+    or an intervention. The logged request never names its guardrailConfig.
+    """
     for item in _nested_dicts(output):
         trace = item.get("trace")
         if item.get("stopReason") == "guardrail_intervened" or (
@@ -21005,6 +21940,96 @@ def _converse_guarded(body: Any, output: Any) -> bool:
         ):
             return True
     return False
+
+
+def _converse_call_guardrails(
+    region: str, calls: List[Dict[str, Any]], joins: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Join logged Converse calls {"label", "request_id", "operation", "time"} to
+    their CloudTrail events and sort them: "guarded" maps a request ID to its
+    {"guardrail", "version"}, "unguarded" holds the request IDs whose event
+    names no guardrailConfig, "recent" the labels of calls logged within
+    INFERENCE_TRACE_SETTLE whose event is not in event history yet, "unread"
+    the label and reason of every other call whose guardrail is not known, and
+    "capped" the labels a LookupEvents page cap left unmatched.
+    """
+    settled = datetime.now(timezone.utc) - INFERENCE_TRACE_SETTLE
+    sorted_calls = {
+        "guarded": {},
+        "unguarded": set(),
+        "recent": [],
+        "unread": [],
+        "capped": [],
+    }
+    joinable = []
+    for call in calls:
+        if call["request_id"]:
+            joinable.append(call)
+        else:
+            sorted_calls["unread"].append(
+                f"{call['label']}, which logs no request ID to join to CloudTrail"
+            )
+    if not joinable:
+        return sorted_calls
+    joined = _invoke_call_guardrails(region, joinable, joins)
+    sorted_calls["capped"] = joined["capped"]
+    for call in joinable:
+        entry = joined["resolved"].get(call["request_id"])
+        if entry is None:
+            continue
+        if "guardrail" in entry:
+            sorted_calls["guarded"][call["request_id"]] = entry
+        elif entry.get("unguarded"):
+            sorted_calls["unguarded"].add(call["request_id"])
+        elif (
+            entry.get("missing")
+            and datetime.strptime(call["time"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            >= settled
+        ):
+            sorted_calls["recent"].append(call["label"])
+        else:
+            sorted_calls["unread"].append(f"{call['label']}, {entry['reason']}")
+    return sorted_calls
+
+
+def _converse_join_notes(
+    sorted_calls: Dict[str, Any], what: str
+) -> Tuple[List[str], str]:
+    """
+    Return the not-read entries for Converse calls whose guardrail the join did
+    not establish, and the sentence counting the calls too recent to judge.
+    ``what`` names what an unmatched call leaves unknown.
+    """
+    unread = list(sorted_calls["unread"])
+    if sorted_calls["capped"]:
+        unread.insert(
+            0,
+            "{} Converse call(s) not matched to CloudTrail within the LookupEvents "
+            "page cap ({} pages per operation, {} per region run), so {} is not "
+            "known: {}".format(
+                len(sorted_calls["capped"]),
+                GROUNDING_JOIN_MAX_PAGES,
+                GROUNDING_JOIN_BUDGET_PAGES,
+                what,
+                ", ".join(sorted_calls["capped"][:5]),
+            ),
+        )
+    recent = sorted_calls["recent"]
+    note = (
+        " {} Converse call(s) logged within the last {} minutes have no CloudTrail "
+        "event in event history yet, which lags the call, and were not judged: "
+        "{}.".format(
+            len(recent),
+            int(INFERENCE_TRACE_SETTLE.total_seconds() // 60),
+            ", ".join(recent[:5]),
+        )
+        if recent
+        else ""
+    )
+    return unread, note
 
 
 def _tool_result_only(content: Any) -> bool:
@@ -21346,12 +22371,16 @@ def check_guardduty_prompt_injection_detection(region: str = "") -> Dict[str, An
 
 def check_guardrail_prompt_attack_invocation_evidence(
     region: str = "",
+    joins: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-34: Read the last 24 hours of invocation log records for a prompt attack
     the guardrail blocked, and for guarded InvokeModel calls whose input carries
     no guardrail input tag, which the prompt attack filter does not evaluate.
-    Only request IDs, operations and model IDs are reported, never a body.
+    A Converse call is guarded when its CloudTrail event names a guardrailConfig
+    or its response reports a guardrail. ``joins`` is the region run's shared
+    CloudTrail join state. Only request IDs, operations and model IDs are
+    reported, never a body.
     """
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html"
     findings = {
@@ -21391,6 +22420,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
         catches = []
         guarded = []
         untagged = []
+        converse_calls = []
         converse_guarded = []
         converse_untagged = []
         converse_partial = []
@@ -21435,54 +22465,79 @@ def check_guardrail_prompt_attack_invocation_evidence(
                     "amazon-bedrock-guardrailConfig to match its input tag against"
                 )
 
+        # The logged request never names its guardrailConfig, so each call's
+        # turn verdict is kept and its guardrail is read from CloudTrail below.
         def visit_converse(record):
             if record.get("operation") not in CONVERSE_OPERATIONS:
                 return
             body = (record.get("input") or {}).get("inputBodyJson")
             output = (record.get("output") or {}).get("outputBodyJson")
-            if not _converse_guarded(body, output):
-                return
-            label = label_of(record)
-            converse_guarded.append(label)
-            tool_result_turns[0] += _tool_result_only_turns(body)
             turn = _latest_user_turn(body)
-            if turn is None:
+            converse_calls.append(
+                {
+                    "label": label_of(record),
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                    "log_guarded": _converse_guarded(output),
+                    "tool_turns": _tool_result_only_turns(body),
+                    "turn": None
+                    if turn is None
+                    else any(
+                        isinstance(block, dict) and "guardContent" in block
+                        for block in turn
+                    ),
+                    "earlier": _untagged_user_turns(body),
+                }
+            )
+
+        catch_scan, tag_scan, converse_scan = _scan_invocation_legs(
+            region,
+            source,
+            [
+                (
+                    '"PROMPT_ATTACK"',
+                    lambda line, record: "PROMPT_ATTACK" in line,
+                    visit_catch,
+                ),
+                (
+                    f'"{GUARDRAIL_ACTION_FIELD}"',
+                    lambda line, record: GUARDRAIL_ACTION_FIELD in line,
+                    visit_guarded,
+                ),
+                (
+                    CONVERSE_LOG_PATTERN,
+                    lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
+                    visit_converse,
+                ),
+            ],
+        )
+        joined = _converse_call_guardrails(
+            region, [call for call in converse_calls if not call["log_guarded"]], joins
+        )
+        for call in converse_calls:
+            if not call["log_guarded"] and call["request_id"] not in joined["guarded"]:
+                continue
+            label = call["label"]
+            converse_guarded.append(label)
+            tool_result_turns[0] += call["tool_turns"]
+            if call["turn"] is None:
                 unread.append(
                     f"{label}, whose logged request holds no user turn other than "
                     "tool results"
                 )
-            elif not any(
-                isinstance(block, dict) and "guardContent" in block for block in turn
-            ):
+            elif not call["turn"]:
                 converse_untagged.append(label)
-            elif _untagged_user_turns(body):
+            elif call["earlier"]:
                 converse_partial.append(
                     "{}, message(s) {}".format(
-                        label, ", ".join(str(n) for n in _untagged_user_turns(body))
+                        label, ", ".join(str(n) for n in call["earlier"])
                     )
                 )
-
-        catch_scan = _scan_invocation_records(
-            region,
-            source,
-            '"PROMPT_ATTACK"',
-            lambda line, record: "PROMPT_ATTACK" in line,
-            visit_catch,
+        join_unread, recent_note = _converse_join_notes(
+            joined, "whether a guardrail ran"
         )
-        tag_scan = _scan_invocation_records(
-            region,
-            source,
-            f'"{GUARDRAIL_ACTION_FIELD}"',
-            lambda line, record: GUARDRAIL_ACTION_FIELD in line,
-            visit_guarded,
-        )
-        converse_scan = _scan_invocation_records(
-            region,
-            source,
-            CONVERSE_LOG_PATTERN,
-            lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
-            visit_converse,
-        )
+        unread.extend(join_unread)
         where = source["where"]
         cap = "page cap" if source["log_group"] else "object cap"
         for scan, what in (
@@ -21498,7 +22553,8 @@ def check_guardrail_prompt_attack_invocation_evidence(
             elif scan["capped"]:
                 unread.append(
                     f"records matching {what} in {where} past the first "
-                    f"{scan['read']} ({cap})"
+                    f"{scan['read']} ({cap}; those logged from "
+                    f"{scan['unread_from']} on were not all read)"
                 )
         unread_note = " Not read: {}.".format("; ".join(unread[:5])) if unread else ""
         catch_note = (
@@ -21509,16 +22565,16 @@ def check_guardrail_prompt_attack_invocation_evidence(
             else "No PROMPT_ATTACK block was logged in the last 24 hours."
         )
         guarded_scope = (
-            "A Converse call counts as guarded only when its logged request "
-            "names guardrailConfig or its response carries a guardrail trace or "
-            "intervention."
+            "A Converse call counts as guarded when its CloudTrail event, joined "
+            "by requestID, names a guardrailConfig, or its logged response "
+            "carries a guardrail trace or intervention."
         )
         tool_result_note = (
             " {} user turn(s) of the guarded Converse calls held only toolResult "
             "blocks and were not judged, because a guardContent block cannot wrap "
             "a tool result. Per-turn InvokeGuardrailChecks calls are not judged, "
-            "because CloudTrail does not record them as management events.".format(
-                tool_result_turns[0]
+            "because CloudTrail does not record them as management events.{}".format(
+                tool_result_turns[0], recent_note
             )
         )
         if untagged or converse_untagged or converse_partial:
@@ -21641,11 +22697,14 @@ def check_guardrail_prompt_attack_invocation_evidence(
         return findings
 
 
-def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]:
+def check_guardrail_grounding_score_evidence(
+    region: str = "", joins: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     BR-27: Confirm invocation logging captures response bodies, where a traced
     guardrail response carries its contextual grounding scores, and read the
     last 24 hours of records for a scored GROUNDING or RELEVANCE assessment.
+    ``joins`` is the region run's shared CloudTrail join state.
     """
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-contextual-grounding-check.html"
     findings = {
@@ -21711,13 +22770,6 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     )
 
         log_group = source["where"]
-        scan = _scan_invocation_records(
-            region,
-            source,
-            '"contextualGroundingPolicy"',
-            lambda line, record: "contextualGroundingPolicy" in line,
-            visit,
-        )
 
         # The grounding filter scores a Converse call only when the caller
         # qualifies a grounding_source and a query, so each guarded call through
@@ -21756,38 +22808,16 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     )
             return grounding_versions[key]
 
+        # The logged request never names its guardrailConfig, so a call whose
+        # response shows no grounding assessment is joined to its CloudTrail
+        # event for the guardrail version that ran.
+        converse_calls = []
+
         def visit_converse(record):
             if record.get("operation") not in CONVERSE_OPERATIONS:
                 return
             body = (record.get("input") or {}).get("inputBodyJson")
             output = (record.get("output") or {}).get("outputBodyJson")
-            if not _converse_guarded(body, output):
-                return
-            label = "{} ({} {})".format(
-                record.get("requestId") or "no request ID",
-                record.get("operation"),
-                record.get("modelId") or "no model ID",
-            )
-            config = body.get("guardrailConfig") if isinstance(body, dict) else None
-            identifier = (
-                config.get("guardrailIdentifier") if isinstance(config, dict) else None
-            )
-            if not identifier:
-                if not any(
-                    "contextualGroundingPolicy" in item
-                    for item in _nested_dicts(output)
-                ):
-                    unjudged.append(
-                        f"{label}, which names no guardrailConfig, so which "
-                        "guardrail version ran is not logged"
-                    )
-                return
-            if not grounds(
-                str(identifier),
-                str(config.get("guardrailVersion") or GUARDRAIL_DRAFT_VERSION),
-            ):
-                return
-            grounded_calls.append(label)
             qualifiers = {
                 qualifier
                 for item in _nested_dicts(body)
@@ -21795,27 +22825,24 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 and isinstance(item["guardContent"].get("text"), dict)
                 for qualifier in item["guardContent"]["text"].get("qualifiers") or []
             }
-            if not {"grounding_source", "query"} <= qualifiers:
-                unqualified.append(label)
+            converse_calls.append(
+                {
+                    "label": "{} ({} {})".format(
+                        record.get("requestId") or "no request ID",
+                        record.get("operation"),
+                        record.get("modelId") or "no model ID",
+                    ),
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                    "assessed": any(
+                        "contextualGroundingPolicy" in item
+                        for item in _nested_dicts(output)
+                    ),
+                    "qualified": {"grounding_source", "query"} <= qualifiers,
+                }
+            )
 
-        converse_scan = _scan_invocation_records(
-            region,
-            source,
-            CONVERSE_LOG_PATTERN,
-            lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
-            visit_converse,
-        )
-        if converse_scan["error"]:
-            unjudged.append(
-                f"records matching a Converse operation in {log_group} "
-                f"({converse_scan['action']}, {converse_scan['error']})"
-            )
-        elif converse_scan["capped"]:
-            unjudged.append(
-                f"records matching a Converse operation in {log_group} past the "
-                f"first {converse_scan['read']} "
-                f"({'page cap' if source['log_group'] else 'object cap'})"
-            )
         # A guarded InvokeModel call names its guardrail only in request
         # headers, which the log does not record, so it is judged when it sends
         # one grounding tag without the other, or when its response shows the
@@ -21864,27 +22891,68 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
             if len(tags) < 2:
                 invoke_unqualified.append(label)
 
-        invoke_scan = _scan_invocation_records(
+        scan, converse_scan, invoke_scan = _scan_invocation_legs(
             region,
             source,
-            f'"{GUARDRAIL_ACTION_FIELD}"',
-            lambda line, record: GUARDRAIL_ACTION_FIELD in line,
-            visit_invoke,
+            [
+                (
+                    '"contextualGroundingPolicy"',
+                    lambda line, record: "contextualGroundingPolicy" in line,
+                    visit,
+                ),
+                (
+                    CONVERSE_LOG_PATTERN,
+                    lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
+                    visit_converse,
+                ),
+                (
+                    f'"{GUARDRAIL_ACTION_FIELD}"',
+                    lambda line, record: GUARDRAIL_ACTION_FIELD in line,
+                    visit_invoke,
+                ),
+            ],
         )
-        if invoke_scan["error"]:
-            unjudged.append(
-                f"records carrying {GUARDRAIL_ACTION_FIELD} in {log_group} "
-                f"({invoke_scan['action']}, {invoke_scan['error']})"
-            )
-        elif invoke_scan["capped"]:
-            unjudged.append(
-                f"records carrying {GUARDRAIL_ACTION_FIELD} in {log_group} past the "
-                f"first {invoke_scan['read']} "
-                f"({'page cap' if source['log_group'] else 'object cap'})"
-            )
-        joins = (
+        cap = "page cap" if source["log_group"] else "object cap"
+        for leg_scan, what in (
+            (converse_scan, "matching a Converse operation"),
+            (invoke_scan, f"carrying {GUARDRAIL_ACTION_FIELD}"),
+        ):
+            if leg_scan["error"]:
+                unjudged.append(
+                    f"records {what} in {log_group} "
+                    f"({leg_scan['action']}, {leg_scan['error']})"
+                )
+            elif leg_scan["capped"]:
+                unjudged.append(
+                    f"records {what} in {log_group} past the first "
+                    f"{leg_scan['read']} ({cap}; those logged from "
+                    f"{leg_scan['unread_from']} on were not all read)"
+                )
+        joined = _converse_call_guardrails(
+            region, [call for call in converse_calls if not call["assessed"]], joins
+        )
+        # A call whose response carries a grounding assessment was scored, so
+        # only the others are judged for their qualifiers.
+        for call in converse_calls:
+            version = joined["guarded"].get(call["request_id"])
+            if (
+                call["assessed"]
+                or version is None
+                or not grounds(version["guardrail"], version["version"])
+            ):
+                continue
+            grounded_calls.append(call["label"])
+            if not call["qualified"]:
+                unqualified.append(call["label"])
+        join_unread, recent_note = _converse_join_notes(
+            joined, "which guardrail version ran"
+        )
+        unjudged.extend(join_unread)
+        invoke_joins = (
             _invoke_call_guardrails(
-                region, [call for call in invoke_untagged if call["request_id"]]
+                region,
+                [call for call in invoke_untagged if call["request_id"]],
+                joins,
             )
             if invoke_untagged
             else {"resolved": {}, "capped": []}
@@ -21895,7 +22963,7 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     f"{call['label']}, which logs no request ID to join to CloudTrail"
                 )
                 continue
-            joined = joins["resolved"].get(call["request_id"])
+            joined = invoke_joins["resolved"].get(call["request_id"])
             if joined is None:
                 continue
             if "reason" in joined:
@@ -21909,15 +22977,17 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     call["label"], joined["guardrail"], joined["version"]
                 )
             )
-        if joins["capped"]:
+        if invoke_joins["capped"]:
             unjudged.insert(
                 0,
                 "{} untagged guarded InvokeModel call(s) were not matched to "
-                "CloudTrail within the first {} LookupEvents pages of their "
-                "window, so their guardrail is not known: {}".format(
-                    len(joins["capped"]),
+                "CloudTrail within the LookupEvents page cap ({} pages per "
+                "operation, {} per region run), so their guardrail is not "
+                "known: {}".format(
+                    len(invoke_joins["capped"]),
                     GROUNDING_JOIN_MAX_PAGES,
-                    ", ".join(joins["capped"][:5]),
+                    GROUNDING_JOIN_BUDGET_PAGES,
+                    ", ".join(invoke_joins["capped"][:5]),
                 ),
             )
         if unqualified or invoke_unqualified:
@@ -21954,8 +23024,9 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     )
                 )
             row(
-                "{}{}".format(
+                "{}{}{}".format(
                     " ".join(failures),
+                    recent_note,
                     " Not read: {}.".format("; ".join(unjudged[:5]))
                     if unjudged
                     else "",
@@ -21973,7 +23044,7 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
             row(
                 "No guarded Converse or InvokeModel call read in {} omitted a "
                 "grounding source or query, but not every guarded call was judged: "
-                "{}.".format(log_group, "; ".join(unjudged[:5])),
+                "{}.{}".format(log_group, "; ".join(unjudged[:5]), recent_note),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
                 "N/A",
@@ -21989,12 +23060,14 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 "every one of the {} guarded InvokeModel call(s) that sent a "
                 "grounding tag or ran through a guardrail version with contextual "
                 "grounding filters wrapped both a groundingSource and a query "
-                "tag.".format(
+                "tag. A Converse call's guardrail version is read from its "
+                "CloudTrail event, joined by requestID.{}".format(
                     log_group,
                     len(scored),
                     "; ".join(scored[:5]),
                     len(grounded_calls),
                     len(invoke_calls),
+                    recent_note,
                 ),
                 "No action required.",
                 "Medium",
@@ -23213,6 +24286,100 @@ def _spike_alarm_bound(alarm: Dict[str, Any]) -> str:
 
 COMPOSITE_ALARM_REFERENCE = re.compile(r'(NOT\s+)?ALARM\(\s*"?([^")]+?)"?\s*\)')
 
+# One token of a composite alarm rule: a state function and the alarm it names,
+# a keyword, or a parenthesis. Anything else, such as AT_LEAST, is not read.
+COMPOSITE_RULE_TOKEN = re.compile(
+    r'\s*(?:(ALARM|OK|INSUFFICIENT_DATA)\(\s*(?:"([^"]*)"|([^")]+?))\s*\)'
+    r"|(AND|OR|NOT|TRUE|FALSE)\b|([()]))"
+)
+
+
+def _composite_rule_forced(rule: str, reference: str) -> Optional[bool]:
+    """
+    Whether a composite alarm rule is TRUE whenever the alarm ``reference``
+    names is in ALARM, whatever state every other alarm it names is in, so that
+    alarm alone raises the composite. Each node is read as whether it can be
+    true and whether it can be false with every other reference free, which can
+    miss a rule true only through a repeated reference but never credits one
+    that is not. Returns None for syntax this does not read (AT_LEAST, or AND
+    and OR mixed at one level without parentheses).
+    """
+    tokens = []
+    position = 0
+    text = rule.strip()
+    while position < len(text):
+        match = COMPOSITE_RULE_TOKEN.match(text, position)
+        if not match or match.end() == position:
+            return None
+        state, quoted, bare, keyword, paren = match.groups()
+        if state:
+            tokens.append(
+                ("state", state, (quoted if quoted is not None else bare).strip())
+            )
+        else:
+            tokens.append(("word", keyword or paren, None))
+        position = match.end()
+        while position < len(text) and text[position].isspace():
+            position += 1
+    index = [0]
+
+    def peek():
+        return tokens[index[0]] if index[0] < len(tokens) else None
+
+    def term():
+        token = peek()
+        if token is None:
+            raise ValueError("rule ends early")
+        index[0] += 1
+        kind, word, name = token
+        if kind == "state":
+            if name != reference:
+                return (True, True)
+            return (True, False) if word == "ALARM" else (False, True)
+        if word == "NOT":
+            can_true, can_false = term()
+            return (can_false, can_true)
+        if word == "TRUE":
+            return (True, False)
+        if word == "FALSE":
+            return (False, True)
+        if word == "(":
+            value = expression()
+            if peek() != ("word", ")", None):
+                raise ValueError("unclosed parenthesis")
+            index[0] += 1
+            return value
+        raise ValueError(f"unexpected {word}")
+
+    def expression():
+        can_true, can_false = term()
+        operator = None
+        while peek() is not None and peek()[1] in ("AND", "OR"):
+            if operator and peek()[1] != operator:
+                raise ValueError("AND and OR mixed without parentheses")
+            operator = peek()[1]
+            index[0] += 1
+            right_true, right_false = term()
+            if operator == "AND":
+                can_true, can_false = (
+                    can_true and right_true,
+                    can_false or right_false,
+                )
+            else:
+                can_true, can_false = (
+                    can_true or right_true,
+                    can_false and right_false,
+                )
+        return can_true, can_false
+
+    try:
+        can_true, can_false = expression()
+    except ValueError:
+        return None
+    if peek() is not None:
+        return None
+    return can_true and not can_false
+
 
 def _alarm_metrics(alarm: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Name each (namespace, metric name) an alarm evaluates, metric math included."""
@@ -23230,13 +24397,20 @@ def _notifying_alarm_names(
 ) -> set:
     """
     Name the alarms whose state change reaches an action: an alarm with
-    ActionsEnabled true and an AlarmActions target, or an alarm an acting
-    composite alarm's rule reads as ALARM(...).
+    ActionsEnabled true and an AlarmActions target, or an alarm whose ALARM
+    state alone makes an acting composite alarm's rule true
+    (_composite_rule_forced), so an alarm under an AND with another is not
+    credited. Each alarm is named by its name and its ARN.
     """
 
     def acts(alarm: Dict[str, Any]) -> bool:
         return alarm.get("ActionsEnabled") is True and bool(alarm.get("AlarmActions"))
 
+    aliases: Dict[str, set] = {}
+    for alarm in metric_alarms + composite_alarms:
+        keys = {key for key in (alarm.get("AlarmName"), alarm.get("AlarmArn")) if key}
+        for key in keys:
+            aliases[key] = keys
     notifying = set()
     for alarm in metric_alarms + composite_alarms:
         if acts(alarm):
@@ -23252,12 +24426,14 @@ def _notifying_alarm_names(
                 or composite.get("AlarmArn") in notifying
             ):
                 continue
-            for negated, reference in COMPOSITE_ALARM_REFERENCE.findall(
-                composite.get("AlarmRule") or ""
-            ):
-                if negated or reference in notifying:
+            rule = composite.get("AlarmRule") or ""
+            for _, reference in COMPOSITE_ALARM_REFERENCE.findall(rule):
+                reference = reference.strip()
+                if reference in notifying or not _composite_rule_forced(
+                    rule, reference
+                ):
                     continue
-                notifying.add(reference)
+                notifying.update(aliases.get(reference, {reference}))
                 changed = True
     return notifying
 
@@ -23706,7 +24882,7 @@ def check_bedrock_cloudwatch_alarms(
                 lambda ns, _name: ns == "AWS/Bedrock"
             )
             silent_note = (
-                f" Alarm(s) {', '.join(silent_bedrock_alarms)} evaluate AWS/Bedrock metrics but reach no action: ActionsEnabled is false or AlarmActions is empty, and no acting composite alarm reads them."
+                f" Alarm(s) {', '.join(silent_bedrock_alarms)} evaluate AWS/Bedrock metrics but reach no action: ActionsEnabled is false or AlarmActions is empty, and no acting composite alarm's rule is true whenever they alone are in ALARM."
                 if silent_bedrock_alarms
                 else ""
             )
@@ -34524,20 +35700,27 @@ def _classification_order(
     return {"status": "Passed", "detail": note}
 
 
-# A knowledge base source is read for at most this many .metadata.json
-# sidecars; the rest are reported as not read.
-METADATA_SIDECAR_READ_CAP = 50
+# BR-46 reads at most this many .metadata.json sidecars and lists at most this
+# many ListObjectsV2 pages across all its sources in one region run; a source
+# with a sidecar or an object past either budget is held N/A with a count.
+# Measured 2026-10-04 in account 178113193057, us-east-1: GetObject on 200
+# objects under 4 KB took mean 0.126 s, p90 0.169 s, max 0.296 s, so 300 reads
+# cost about 38 s (51 s at p90); 150 list pages at the measured 0.215 s mean,
+# 0.248 s p90 cost about 32 s (37 s at p90).
+METADATA_SIDECAR_READ_CAP = 300
+SOURCE_LISTING_BUDGET_PAGES = 150
 
 METADATA_SIDECAR_SUFFIX = ".metadata.json"
 
 
 def _source_object_listing(
-    region: str, bucket: str, prefixes: List[str]
+    region: str, bucket: str, prefixes: List[str], budget: Dict[str, int]
 ) -> Dict[str, Any]:
     """
     List every object under an S3 source's prefixes as (key, LastModified)
-    pairs, up to the REDACTION_SOURCE_LIST_PAGE_CAP pages, or the reason the
-    listing did not finish.
+    pairs, up to the REDACTION_SOURCE_LIST_PAGE_CAP pages and the pages left in
+    the region run's SOURCE_LISTING_BUDGET_PAGES, or the reason the listing did
+    not finish.
     """
     client = boto3.client("s3", config=boto3_config, region_name=region)
     items, pages = [], 0
@@ -34547,15 +35730,22 @@ def _source_object_listing(
                 Bucket=bucket, Prefix=prefix
             ):
                 pages += 1
-                if pages > REDACTION_SOURCE_LIST_PAGE_CAP:
+                if (
+                    pages > REDACTION_SOURCE_LIST_PAGE_CAP
+                    or budget["pages"] >= SOURCE_LISTING_BUDGET_PAGES
+                ):
+                    stopped = f"after key {items[-1][0]}" if items else "before any key"
                     return {
                         "items": items,
                         "error": (
-                            f"s3://{bucket} holds more objects than the "
-                            f"{REDACTION_SOURCE_LIST_PAGE_CAP * 1000:,} this check "
-                            "lists"
+                            f"the listing of s3://{bucket} stopped {stopped}, at "
+                            f"the cap of {REDACTION_SOURCE_LIST_PAGE_CAP} "
+                            "ListObjectsV2 pages per source and "
+                            f"{SOURCE_LISTING_BUDGET_PAGES} per region run, so the "
+                            "objects past it were not read"
                         ),
                     }
+                budget["pages"] += 1
                 for item in page.get("Contents") or []:
                     items.append((str(item.get("Key")), item.get("LastModified")))
     except (ClientError, BotoCoreError) as error:
@@ -34569,13 +35759,13 @@ def _source_object_listing(
 
 
 def _metadata_sidecar_gaps(
-    region: str, bucket: str, items: List[Tuple[str, Any]]
+    region: str, bucket: str, items: List[Tuple[str, Any]], budget: Dict[str, int]
 ) -> Dict[str, Any]:
     """
     Pair each document of a knowledge base source with the
     <document>.metadata.json sidecar the knowledge base reads its metadata from,
-    and read up to METADATA_SIDECAR_READ_CAP of them for a non-empty
-    metadataAttributes object.
+    and read as many as the region run's METADATA_SIDECAR_READ_CAP leaves for a
+    non-empty metadataAttributes object.
     """
     keys = {key for key, _ in items}
     documents = sorted(
@@ -34587,7 +35777,9 @@ def _metadata_sidecar_gaps(
     present = [key for key in documents if key + METADATA_SIDECAR_SUFFIX in keys]
     client = boto3.client("s3", config=boto3_config, region_name=region)
     empty, unread = [], []
-    for key in present[:METADATA_SIDECAR_READ_CAP]:
+    room = max(0, METADATA_SIDECAR_READ_CAP - budget["sidecars"])
+    budget["sidecars"] += min(room, len(present))
+    for key in present[:room]:
         sidecar = key + METADATA_SIDECAR_SUFFIX
         try:
             body = client.get_object(Bucket=bucket, Key=sidecar)["Body"].read()
@@ -34601,10 +35793,11 @@ def _metadata_sidecar_gaps(
             attributes = None
         if not isinstance(attributes, dict) or not attributes:
             empty.append(sidecar)
-    if len(present) > METADATA_SIDECAR_READ_CAP:
+    if len(present) > room:
         unread.append(
-            f"{len(present) - METADATA_SIDECAR_READ_CAP} sidecar(s) past the first "
-            f"{METADATA_SIDECAR_READ_CAP}"
+            f"{len(present) - room} sidecar(s) from "
+            f"{present[room]}{METADATA_SIDECAR_SUFFIX} on, past the "
+            f"{METADATA_SIDECAR_READ_CAP} this check reads per region run"
         )
     return {
         "documents": len(documents),
@@ -35059,6 +36252,7 @@ def check_bedrock_knowledge_base_source_classification(
         unmonitored = []
         indeterminate = []
         listings: Dict[Tuple[str, Tuple[str, ...]], Dict[str, Any]] = {}
+        reads = {"pages": 0, "sidecars": 0}
         for source in sources:
             bucket_name = source["bucket"]
             record = macie_buckets.get(bucket_name)
@@ -35100,7 +36294,7 @@ def check_bedrock_knowledge_base_source_classification(
             def objects(listing_key=listing_key):
                 if listing_key not in listings:
                     listings[listing_key] = _source_object_listing(
-                        region, listing_key[0], list(listing_key[1])
+                        region, listing_key[0], list(listing_key[1]), reads
                     )
                 return listings[listing_key]
 
@@ -35117,7 +36311,9 @@ def check_bedrock_knowledge_base_source_classification(
                 sidecars = (
                     None
                     if listing["error"]
-                    else _metadata_sidecar_gaps(region, bucket_name, listing["items"])
+                    else _metadata_sidecar_gaps(
+                        region, bucket_name, listing["items"], reads
+                    )
                 )
                 if sidecars is None:
                     verdict = {
@@ -43054,7 +44250,14 @@ def lambda_handler(event, context):
             region=region, attachment_inventory=guardrail_attachments
         )
         all_findings.append(guardrail_grounding_findings)
-        all_findings.append(check_guardrail_grounding_score_evidence(region=region))
+        # BR-27 and BR-34 join invocation log records to CloudTrail through one
+        # shared cache and LookupEvents page budget.
+        guardrail_joins = {"resolved": {}, "pages": 0}
+        all_findings.append(
+            check_guardrail_grounding_score_evidence(
+                region=region, joins=guardrail_joins
+            )
+        )
 
         logger.info("Running agent guardrail association check (BR-28)")
         agent_guardrail_findings = check_bedrock_agent_guardrail_association(
@@ -43108,7 +44311,9 @@ def lambda_handler(event, context):
         )
         all_findings.append(check_guardrail_intervention_logging(region=region))
         all_findings.append(
-            check_guardrail_prompt_attack_invocation_evidence(region=region)
+            check_guardrail_prompt_attack_invocation_evidence(
+                region=region, joins=guardrail_joins
+            )
         )
         all_findings.append(check_guardduty_prompt_injection_detection(region=region))
 

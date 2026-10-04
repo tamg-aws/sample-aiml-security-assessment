@@ -732,6 +732,289 @@ MUTATIONS = [
         "replace": "    missing = []\n",
     },
     {
+        "name": "BR-20 source: an identity Deny is ignored",
+        "file": BEDROCK,
+        "defect": "BR-20 skips an unconditioned identity-policy Deny of s3:GetObject on the source bucket, so a principal its own policy keeps from the documents passes",
+        "find": '                return "denied", f"{label} denies s3:GetObject on every object"\n',
+        "replace": "                pass\n",
+    },
+    {
+        "name": "BR-20 source: a missing identity grant reads as a read",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a principal no identity policy lets read the source bucket, beside a bucket policy that allows no one",
+        "find": "    if granted == 0:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: a boundary Allow counts as a grant",
+        "file": BEDROCK,
+        "defect": "BR-20 reads a permissions boundary Allow as a grant, though a boundary only limits one",
+        "find": '                if source == "permissions boundary":\n                    bounded = max(\n',
+        "replace": "                if False:\n                    bounded = max(\n",
+    },
+    {
+        "name": "BR-20 source: a boundary scoped elsewhere is not read",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a principal whose permissions boundary allows s3:GetObject only on other buckets",
+        "find": "    if boundary is not None and bounded == 0:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: a boundary on part of the bucket is credited",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a principal whose permissions boundary allows s3:GetObject on one prefix of the source bucket only",
+        "find": "    if boundary is not None and bounded == 1:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: any wildcard grant reaches the bucket",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a wildcard s3:GetObject Allow on another bucket as a grant on the source",
+        "find": "            if _wildcard_matches(resource[:end], target):\n",
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "BR-20 source: a pattern ending past the bucket covers it",
+        "file": BEDROCK,
+        "defect": "BR-20 reads a Resource that matches the bucket prefix but does not end in a wildcard as covering every object",
+        "find": '        return resource.endswith("*") and _wildcard_matches(resource, target)\n',
+        "replace": "        return _wildcard_matches(resource, target)\n",
+    },
+    {
+        "name": "BR-20 source: a grant on part of the bucket is credited",
+        "file": BEDROCK,
+        "defect": "BR-20 credits an identity Allow of s3:GetObject on one prefix of the source bucket as a read of every document",
+        "find": "    if granted == 1:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: a NotResource Allow excluding a prefix covers the bucket",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a NotResource Allow that excludes a prefix of the source bucket as a read of every document",
+        "find": "        return 1 if any(map(reaches, excluded)) else 2\n",
+        "replace": "        return 2\n",
+    },
+    {
+        "name": "BR-20 source: the identity verdict is not read",
+        "file": BEDROCK,
+        "defect": "BR-20 computes the identity-policy verdict and never fails on it",
+        "find": "            if denials:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-20 source: an unjudged identity reads as passed",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal whose identity policies were not read or not computed",
+        "find": "            elif holds:\n",
+        "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-20 SCP: an attached Deny of the source is ignored",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal an attached SCP Deny keeps from every source object",
+        "find": '                return "denied", f"{label} denies {noun}"\n',
+        "replace": "                pass\n",
+    },
+    {
+        "name": "BR-20 SCP: a level with no Allow is not read",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal although a level of the organization path allows no source read",
+        "find": '        if level == 0:\n            return "denied", (',
+        "replace": '        if False:\n            return "denied", (',
+    },
+    {
+        "name": "BR-20 SCP: a conditioned level Allow is credited",
+        "file": BEDROCK,
+        "defect": "BR-20 credits an SCP Allow of s3:GetObject that applies under a Condition only",
+        "find": '                if coverage and statement.get("Condition"):\n',
+        "replace": "                if False:\n",
+    },
+    {
+        "name": "BR-20 SCP: a partial level Allow is credited",
+        "file": BEDROCK,
+        "defect": "BR-20 credits an SCP level that allows s3:GetObject on part of the source only",
+        "find": "        if level == 1:\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-20 SCP: an unread inventory reads as applied",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal when the SCP inventory could not be read",
+        "find": '    if list_error:\n        return "held"',
+        "replace": '    if False:\n        return "held"',
+    },
+    {
+        "name": "BR-20 SCP: unread policy targets are ignored",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal when some SCP targets could not be read",
+        "find": '    if inventory.get("errors"):\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 SCP: a conditioned Deny is read as total",
+        "file": BEDROCK,
+        "defect": "BR-20 fails a principal on an SCP Deny whose Condition it does not compute",
+        "find": '            elif statement.get("Condition"):\n                held.append(f"{label} denies {noun} under a Condition")',
+        "replace": '            elif False:\n                held.append(f"{label} denies {noun} under a Condition")',
+    },
+    {
+        "name": "BR-20 SCP: the management account is restricted",
+        "file": BEDROCK,
+        "defect": "BR-20 applies SCPs to the management account, which they never restrict",
+        "find": '    if inventory.get("management_account"):\n        return "reads", (',
+        "replace": '    if False:\n        return "reads", (',
+    },
+    {
+        "name": "BR-20 SCP: no organization reads as unread",
+        "file": BEDROCK,
+        "defect": "BR-20 holds an account outside any organization at N/A, though no SCP can apply",
+        "find": '    if "AWSOrganizationsNotInUseException" in list_error:\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 SCP: kms:Decrypt is not judged",
+        "file": BEDROCK,
+        "defect": "BR-20 skips an SCP Deny of kms:Decrypt on the source key",
+        "find": '                    if key["kind"] == "cmk":\n                        verdicts.append(\n                            _scp_read_verdict(',
+        "replace": "                    if False:\n                        verdicts.append(\n                            _scp_read_verdict(",
+    },
+    {
+        "name": "BR-20 SCP: the leg never runs",
+        "file": BEDROCK,
+        "defect": "BR-20 never reads SCPs for a vector principal",
+        "find": '                if ":role/aws-service-role/" not in principal:\n',
+        "replace": "                if False:\n",
+    },
+    {
+        "name": "BR-20 key: a key policy Deny is ignored",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal a key policy Deny keeps from kms:Decrypt",
+        "find": '            return "denied", f"{label} denies kms:Decrypt on key {key_arn}"\n',
+        "replace": "            continue\n",
+    },
+    {
+        "name": "BR-20 key: a conditioned grant is credited",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a key policy grant under a Condition it does not compute",
+        "find": "        if not met:\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-20 key: kms:ViaService names any Region",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a kms:ViaService condition naming S3 in another Region",
+        "find": "            if any(_wildcard_matches(str(v).lower(), via) for v in values):\n",
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "BR-20 key: StringEquals on kms:ViaService takes a wildcard",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a StringEquals kms:ViaService wildcard that never matches a request",
+        "find": "            if via in [str(v).lower() for v in values]:\n",
+        "replace": "            if any(_wildcard_matches(str(v).lower(), via) for v in values):\n",
+    },
+    {
+        "name": "BR-20 key: kms:CallerAccount names any account",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a kms:CallerAccount condition naming another account",
+        "find": "            if account in [str(v) for v in values]:\n",
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "BR-20 key: root delegation needs no identity grant",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a key policy that delegates to the account root without an identity Allow",
+        "find": '    granted = direct or (delegated and identity["granted"])\n',
+        "replace": "    granted = direct or delegated\n",
+    },
+    {
+        "name": "BR-20 key: an identity Allow on another key counts",
+        "file": BEDROCK,
+        "defect": "BR-20 credits an identity kms:Decrypt Allow on a different key",
+        "find": "            reached = _statement_coverage(statement, covers, covers) == 2\n",
+        "replace": "            reached = True\n",
+    },
+    {
+        "name": "BR-20 key: an identity Deny of decrypt is ignored",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal whose own policy denies kms:Decrypt on the key",
+        "find": '    if identity["denied"]:\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 key: a role boundary does not limit a direct grant",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a key policy naming a role whose boundary allows no kms:Decrypt",
+        "find": '    if identity["bounded"] is False and (kind == "role" or not direct):\n',
+        "replace": '    if identity["bounded"] is False and not direct:\n',
+    },
+    {
+        "name": "BR-20 key: a grant to another principal counts",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a KMS grant whose grantee is another principal",
+        "find": '            if grant.get("GranteePrincipal") != principal or "Decrypt" not in (\n',
+        "replace": '            if "Decrypt" not in (\n',
+    },
+    {
+        "name": "BR-20 key: grant constraints are ignored",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a KMS grant whose constraints it does not compute",
+        "find": '            if grant.get("Constraints"):\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-20 key: unread grants read as none",
+        "file": BEDROCK,
+        "defect": "BR-20 fails a principal when the key's grants were not read",
+        "find": "        if grants is None:\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-20 key: the key leg never runs",
+        "file": BEDROCK,
+        "defect": "BR-20 never compares a vector principal with the source bucket's key",
+        "find": '                if key["kind"] == "cmk":\n                    verdicts.append(\n                        _source_key_read(',
+        "replace": "                if False:\n                    verdicts.append(\n                        _source_key_read(",
+    },
+    {
+        "name": "BR-20 key: an unread key reads as passed",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal when the source key or its policy was not read",
+        "find": '                elif key["kind"] == "held":\n',
+        "replace": "                elif False:\n",
+    },
+    {
+        "name": "BR-20 key: each key is read for every bucket",
+        "file": BEDROCK,
+        "defect": "BR-20 reads a source key's policy and grants again for every bucket on it",
+        "find": '    if encryption["key"] in cache:\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-46 sidecar budget resets for each source",
+        "file": BEDROCK,
+        "defect": "BR-46 gives every source the whole sidecar read budget, so "
+        "a run over many sources reads past the measured 300 GetObject calls",
+        "find": '    room = max(0, METADATA_SIDECAR_READ_CAP - budget["sidecars"])\n',
+        "replace": "    room = METADATA_SIDECAR_READ_CAP\n",
+    },
+    {
+        "name": "BR-46 listing budget is not spent",
+        "file": BEDROCK,
+        "defect": "BR-46 never counts its ListObjectsV2 pages against the region "
+        "run's budget, so many sources list past the measured 150 pages",
+        "find": '                budget["pages"] += 1\n',
+        "replace": "                pass\n",
+    },
+    {
+        "name": "BR-46 capped listing does not name where it stopped",
+        "file": BEDROCK,
+        "defect": "BR-46 reports a capped source listing without the last key "
+        "it read, so the objects past the cap are not located",
+        "find": '                    stopped = f"after key {items[-1][0]}" if items else "before any key"\n',
+        "replace": '                    stopped = "before any key"\n',
+    },
+    {
         "name": "BR-43 credits a Region allow-list in the management account",
         "file": BEDROCK,
         "defect": "BR-43 passes a Region allow-list in the management account, which no service control policy restricts",
@@ -1657,16 +1940,25 @@ MUTATIONS = [
         "file": BEDROCK,
         "defect": "BR-34 accepts any content block as a mark, so a guarded Converse "
         "call that sent plain text passes",
-        "find": '                isinstance(block, dict) and "guardContent" in block for block in turn\n',
-        "replace": "                isinstance(block, dict) for block in turn\n",
+        "find": '                        isinstance(block, dict) and "guardContent" in block\n'
+        "                        for block in turn\n",
+        "replace": "                        isinstance(block, dict)\n"
+        "                        for block in turn\n",
     },
     {
         "name": "BR-27 and BR-34 read nothing from an S3-only log destination",
         "file": BEDROCK,
         "defect": "the S3 reader returns an empty read, so an untagged call or a "
         "grounding score in an S3-only invocation log is never seen",
-        "find": '    return _scan_invocation_log_s3(region, source["s3"], match, visit)\n',
-        "replace": '    return {"read": 0, "capped": False, "error": None, "action": "s3:GetObject"}\n',
+        "find": (
+            "    return _scan_invocation_log_s3(\n"
+            '        region, source["s3"], [(match, visit) for _, match, visit in legs]\n'
+            "    )\n"
+        ),
+        "replace": (
+            '    return [{"read": 0, "capped": False, "error": None, '
+            '"action": "s3:GetObject"} for _ in legs]\n'
+        ),
     },
     {
         "name": "BR-34 reads a large-data body as an invocation log record",
@@ -1715,6 +2007,31 @@ MUTATIONS = [
         "defect": "a notification filtered to a prefix under the log root was credited for every object",
         "find": '            elif not root.startswith(rules.get("prefix", "")):\n',
         "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-32 composite: an AND rule credits each alarm it names",
+        "file": BEDROCK,
+        "defect": "an intervention alarm ANDed with another raises the composite "
+        "only with it, so crediting it passes an alarm that never notifies alone",
+        "find": "                    can_false or right_false,\n",
+        "replace": "                    can_false and right_false,\n",
+    },
+    {
+        "name": "BR-32 composite: an ARN reference is not mapped to its name",
+        "file": BEDROCK,
+        "defect": "a composite rule may name an alarm by ARN, so crediting only "
+        "the ARN leaves the alarm, judged by name, reading as silent",
+        "find": "                notifying.update(aliases.get(reference, {reference}))\n",
+        "replace": "                notifying.add(reference)\n",
+    },
+    {
+        "name": "BR-32 composite: an unread rule credits its alarms",
+        "file": BEDROCK,
+        "defect": "a rule this parser does not read, such as AT_LEAST, may need "
+        "several alarms, so crediting its alarms passes one that never notifies "
+        "alone",
+        "find": "        if not match or match.end() == position:\n            return None\n",
+        "replace": "        if not match or match.end() == position:\n            return True\n",
     },
     {
         "name": "BR-20 network: a public rule is not judged",
@@ -1773,6 +2090,14 @@ MUTATIONS = [
         "replace": '                found["versioned"].append(label)\n',
     },
     {
+        "name": "BR-07 runtime: a capped lookup names its newest event",
+        "file": BEDROCK,
+        "defect": "event history is read newest first, so naming the newest time "
+        "read as the cap claims every older call of the window was read",
+        "find": '                    oldest = min(oldest or detail["eventTime"], detail["eventTime"])\n',
+        "replace": '                    oldest = max(oldest or detail["eventTime"], detail["eventTime"])\n',
+    },
+    {
         "name": "BR-06 centralization: any CloudTrail table credited",
         "file": BEDROCK,
         "defect": "a Glue table under no recording trail's log root was credited as central",
@@ -1787,10 +2112,101 @@ MUTATIONS = [
         "replace": "            if True:\n",
     },
     {
+        "name": "BR-06 log group: a filter pattern forwards every event",
+        "file": BEDROCK,
+        "defect": "a subscription filter with a filter pattern was credited as forwarding every invocation log event",
+        "find": "            missed.append(f\"{label} forwards only the events matching '{pattern}'\")\n            continue\n",
+        "replace": "            pass\n",
+    },
+    {
+        "name": "BR-06 log group: field selection forwards every event",
+        "file": BEDROCK,
+        "defect": "a subscription filter with field selection criteria was credited as forwarding every event",
+        "find": "            missed.append(f\"{label} forwards only the events '{criteria}' selects\")\n            continue\n",
+        "replace": "            pass\n",
+    },
+    {
+        "name": "BR-06 log group: transformed events credited",
+        "file": BEDROCK,
+        "defect": "a subscription filter on transformed logs was credited as forwarding the records",
+        "find": '            missed.append(f"{label} forwards the transformed events, not the records")\n            continue\n',
+        "replace": "            pass\n",
+    },
+    {
+        "name": "BR-06 log group: an inactive stream credited",
+        "file": BEDROCK,
+        "defect": "a Firehose stream that is not ACTIVE was credited as delivering the log group",
+        "find": '        if status != "ACTIVE":\n            missed.append(',
+        "replace": "        if False:\n            missed.append(",
+    },
+    {
+        "name": "BR-06 log group: a Lambda processor not held",
+        "file": BEDROCK,
+        "defect": "a Firehose stream whose Lambda record processor can rewrite the records was credited",
+        "find": '            if processing.get("Enabled") is True and any(\n                processor.get("Type") == "Lambda"\n                for processor in processing.get("Processors") or []\n            ):\n                found["held"].append(',
+        "replace": '            if False:\n                found["held"].append(',
+    },
+    {
+        "name": "BR-06 log group: another account's stream followed",
+        "file": BEDROCK,
+        "defect": "a subscription to another account's Firehose stream was followed as if this account could read it",
+        "find": '        if parts[4] != account:\n            found["held"].append(',
+        "replace": '        if False:\n            found["held"].append(',
+    },
+    {
+        "name": "BR-06 log group: a string-prefix table credited",
+        "file": BEDROCK,
+        "defect": "a Glue table whose location is a string prefix but not a folder of the Firehose path was credited",
+        "find": '                if root.startswith(table["location"].rstrip("/") + "/")\n',
+        "replace": '                if root.startswith(table["location"])\n',
+    },
+    {
+        "name": "BR-06 log group: one dropped subscription blocks a full one",
+        "file": BEDROCK,
+        "defect": "a full subscription was not credited beside a filtered one, so any filtered subscription failed the leg",
+        "find": '    if found["met"]:\n        return {"met": found["met"], "gaps": [], "held": []}\n',
+        "replace": '    if found["met"] and not missed:\n        return {"met": found["met"], "gaps": [], "held": []}\n',
+    },
+    {
+        "name": "BR-06 log group: Athena connectors not read",
+        "file": BEDROCK,
+        "defect": "a LAMBDA Athena connector that may query the log group did not hold a missing subscription",
+        "find": '            if kind == "LAMBDA" or (\n',
+        "replace": "            if False and (\n",
+    },
+    {
+        "name": "BR-06 log group: any FEDERATED catalog held",
+        "file": BEDROCK,
+        "defect": "a FEDERATED Athena catalog over another source, such as DynamoDB, held the verdict",
+        "find": '                kind == "FEDERATED" and not catalog.get("ConnectionType")\n',
+        "replace": '                kind == "FEDERATED"\n',
+    },
+    {
+        "name": "BR-06 log group: catalogs read in one Region",
+        "file": BEDROCK,
+        "defect": "Athena data catalogs were listed only in the scanned Region, though a connector elsewhere can query the group",
+        "find": "    for catalog_region in regions:\n",
+        "replace": "    for catalog_region in [region]:\n",
+    },
+    {
+        "name": "BR-06 log group: an unfollowed chain fails",
+        "file": BEDROCK,
+        "defect": "a chain that was not followed in full was reported as a gap and Failed",
+        "find": '    if found["held"]:\n        found["held"] = [\n',
+        "replace": '    if False:\n        found["held"] = [\n',
+    },
+    {
+        "name": "BR-06 log group: the chain is not consulted",
+        "file": BEDROCK,
+        "defect": "a CloudWatch Logs-only invocation log group with no queryable path passed",
+        "find": '        gaps += chain["gaps"]\n',
+        "replace": "        gaps += []\n",
+    },
+    {
         "name": "BR-34 Converse: an earlier untagged turn not judged",
         "file": BEDROCK,
         "defect": "a Converse call tagging only its latest user turn passed",
-        "find": "            elif _untagged_user_turns(body):\n",
+        "find": '            elif call["earlier"]:\n',
         "replace": "            elif False:\n",
     },
     {
@@ -1804,7 +2220,7 @@ MUTATIONS = [
         "name": "BR-27 grounding: Converse qualifiers not read",
         "file": BEDROCK,
         "defect": "a guarded Converse call with no grounding_source qualifier passed",
-        "find": '            if not {"grounding_source", "query"} <= qualifiers:\n',
+        "find": '            if not call["qualified"]:\n',
         "replace": "            if False:\n",
     },
     {
@@ -1890,6 +2306,88 @@ MUTATIONS = [
         "defect": "the LookupEvents window missed the events of every call after the first",
         "find": '            "EndTime": max(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,\n',
         "replace": '            "EndTime": min(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,\n',
+    },
+    # ------------------------------------------- Bedrock round-9 Converse join
+    # GRD-02, GRD-09 and DET-04: a Converse call's guardrail is read from its
+    # CloudTrail event, and the scans and joins of one region run share reads.
+    {
+        "name": "Converse join: the event's guardrailConfig is ignored",
+        "file": BEDROCK,
+        "defect": "a Converse event carries its guardrail under "
+        "requestParameters.guardrailConfig, so reading only the top level calls "
+        "every guarded Converse call unguarded and an untagged one passes",
+        "find": "                    if isinstance(config, dict):\n"
+        "                        parameters = config\n",
+        "replace": "                    if False:\n"
+        "                        parameters = config\n",
+    },
+    {
+        "name": "BR-34 Converse: a CloudTrail-guarded call is not judged",
+        "file": BEDROCK,
+        "defect": "the logged request never names its guardrail, so a guarded, "
+        "untraced Converse call that sent untagged input passes",
+        "find": '            if not call["log_guarded"] and call["request_id"] not in joined["guarded"]:\n',
+        "replace": '            if not call["log_guarded"]:\n',
+    },
+    {
+        "name": "BR-27 Converse: the joined guardrail version is ignored",
+        "file": BEDROCK,
+        "defect": "a call through a version without grounding filters is judged "
+        "as if it ran through another, so an unqualified call is missed or "
+        "a call outside the population fails",
+        "find": '                or not grounds(version["guardrail"], version["version"])\n',
+        "replace": '                or not grounds(version["guardrail"], "1")\n',
+    },
+    {
+        "name": "Converse join: an old call with no event reads as recent",
+        "file": BEDROCK,
+        "defect": "a Converse call older than the event-history lag with no "
+        "CloudTrail event is counted as too recent, so its unknown guardrail no "
+        "longer holds the row at N/A",
+        "find": "            >= settled\n",
+        "replace": "            >= settled - timedelta(days=1)\n",
+    },
+    {
+        "name": "Converse join: an unguarded event reads as unread",
+        "file": BEDROCK,
+        "defect": "a Converse event that names no guardrail is reported as not "
+        "read, so every unguarded call in the account holds the row at N/A",
+        "find": '        elif entry.get("unguarded"):\n',
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "Join: the region run's page budget is not shared",
+        "file": BEDROCK,
+        "defect": "each join reads its own 50 pages per operation, so BR-27 and "
+        "BR-34 together read past the 100 pages the timeout was measured for",
+        "find": '                        GROUNDING_JOIN_BUDGET_PAGES - joins["pages"],\n',
+        "replace": "                        GROUNDING_JOIN_BUDGET_PAGES,\n",
+    },
+    {
+        "name": "Join: a call BR-27 joined is looked up again",
+        "file": BEDROCK,
+        "defect": "BR-34 rereads every Converse event BR-27 already joined, "
+        "doubling the LookupEvents pages of a region run",
+        "find": '        known = joins["resolved"].get(call["request_id"])\n',
+        "replace": "        known = None\n",
+    },
+    {
+        "name": "S3 scan: only the first leg sees each record",
+        "file": BEDROCK,
+        "defect": "one read of each S3 object serves every leg, so passing a "
+        "record to the first leg alone drops the untagged calls and Converse "
+        "calls of an S3-only destination",
+        "find": "                            if match(line, record):\n",
+        "replace": "                            if index == 0 and match(line, record):\n",
+    },
+    {
+        "name": "Capped log scan names the start of the window",
+        "file": BEDROCK,
+        "defect": "a capped scan must name the time from which matching records "
+        "were not read; without the last record's time it names the window "
+        "start and overstates what was not read",
+        "find": '                    last = max(last, event["timestamp"])\n',
+        "replace": "                    pass\n",
     },
     # ------------------------------------------- SageMaker round-6 check logic
     # SM-39's egress legs for ECS and Lambda VPCs (AIR-SLF-RT-02) and SM-43's
@@ -4761,6 +5259,15 @@ GROUPS: dict[str, str] = {
     "BR-32 spike: a lower-band alarm credited": "in the Bedrock guardrail spike alarms",
     "BR-32 S3 forward: any notification event credited": "in the Bedrock guardrail spike alarms",
     "BR-32 S3 forward: a narrower prefix rule credited": "in the Bedrock guardrail spike alarms",
+    "BR-32 composite: an AND rule credits each alarm it names": (
+        "in the Bedrock guardrail spike alarms"
+    ),
+    "BR-32 composite: an ARN reference is not mapped to its name": (
+        "in the Bedrock guardrail spike alarms"
+    ),
+    "BR-32 composite: an unread rule credits its alarms": (
+        "in the Bedrock guardrail spike alarms"
+    ),
     "BR-20 network: a public rule is not judged": "in the Bedrock knowledge base stores",
     "BR-20 APIAccessAll: only a bare * is wide": "in the Bedrock knowledge base stores",
     "BR-20 source: a PrincipalArn allow-list is not compared": "in the Bedrock knowledge base stores",
@@ -4769,8 +5276,24 @@ GROUPS: dict[str, str] = {
     "BR-57 scope: only the probe actions are judged": "in the Bedrock agent role scope",
     "BR-57 scope: an unbounded NotAction read on the probe set": "in the Bedrock agent role scope",
     "BR-07 runtime: a draft prompt call counted as versioned": "in the Bedrock runtime prompt references",
+    "BR-07 runtime: a capped lookup names its newest event": (
+        "in the Bedrock runtime prompt references"
+    ),
     "BR-06 centralization: any CloudTrail table credited": "in the Bedrock inference trace",
     "BR-06 centralization: invocation logs not required": "in the Bedrock inference trace",
+    "BR-06 log group: a filter pattern forwards every event": "in the Bedrock inference trace",
+    "BR-06 log group: field selection forwards every event": "in the Bedrock inference trace",
+    "BR-06 log group: transformed events credited": "in the Bedrock inference trace",
+    "BR-06 log group: an inactive stream credited": "in the Bedrock inference trace",
+    "BR-06 log group: a Lambda processor not held": "in the Bedrock inference trace",
+    "BR-06 log group: another account's stream followed": "in the Bedrock inference trace",
+    "BR-06 log group: a string-prefix table credited": "in the Bedrock inference trace",
+    "BR-06 log group: one dropped subscription blocks a full one": "in the Bedrock inference trace",
+    "BR-06 log group: Athena connectors not read": "in the Bedrock inference trace",
+    "BR-06 log group: any FEDERATED catalog held": "in the Bedrock inference trace",
+    "BR-06 log group: catalogs read in one Region": "in the Bedrock inference trace",
+    "BR-06 log group: an unfollowed chain fails": "in the Bedrock inference trace",
+    "BR-06 log group: the chain is not consulted": "in the Bedrock inference trace",
     "BR-34 Converse: an earlier untagged turn not judged": "in the Bedrock invocation log guardrail evidence",
     "BR-34 strength: only HIGH blocks a prompt attack": "in the Bedrock invocation log guardrail evidence",
     "BR-27 grounding: Converse qualifiers not read": "in the Bedrock invocation log guardrail evidence",
@@ -4802,6 +5325,33 @@ GROUPS: dict[str, str] = {
         "in the Bedrock invocation log guardrail evidence"
     ),
     "BR-27 InvokeModel: the window ends at the earliest call": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Converse join: the event's guardrailConfig is ignored": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 Converse: a CloudTrail-guarded call is not judged": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 Converse: the joined guardrail version is ignored": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Converse join: an old call with no event reads as recent": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Converse join: an unguarded event reads as unread": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Join: the region run's page budget is not shared": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Join: a call BR-27 joined is looked up again": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "S3 scan: only the first leg sees each record": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Capped log scan names the start of the window": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     DERIVED_PARTIAL_QUALIFIER_NAME: "in the tag column",
@@ -4899,6 +5449,74 @@ GROUPS: dict[str, str] = {
         "in the Bedrock knowledge base classification"
     ),
     "BR-46 credits a document with no metadata sidecar": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-20 source: an identity Deny is ignored": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a missing identity grant reads as a read": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a boundary Allow counts as a grant": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a boundary scoped elsewhere is not read": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a boundary on part of the bucket is credited": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: any wildcard grant reaches the bucket": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a pattern ending past the bucket covers it": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a grant on part of the bucket is credited": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a NotResource Allow excluding a prefix covers the bucket": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: the identity verdict is not read": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: an unjudged identity reads as passed": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 SCP: an attached Deny of the source is ignored": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: a level with no Allow is not read": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: a conditioned level Allow is credited": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: a partial level Allow is credited": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: an unread inventory reads as applied": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: unread policy targets are ignored": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: a conditioned Deny is read as total": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: the management account is restricted": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: no organization reads as unread": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: kms:Decrypt is not judged": "in the Bedrock knowledge base stores",
+    "BR-20 SCP: the leg never runs": "in the Bedrock knowledge base stores",
+    "BR-20 key: a key policy Deny is ignored": "in the Bedrock knowledge base stores",
+    "BR-20 key: a conditioned grant is credited": "in the Bedrock knowledge base stores",
+    "BR-20 key: kms:ViaService names any Region": "in the Bedrock knowledge base stores",
+    "BR-20 key: StringEquals on kms:ViaService takes a wildcard": "in the Bedrock knowledge base stores",
+    "BR-20 key: kms:CallerAccount names any account": "in the Bedrock knowledge base stores",
+    "BR-20 key: root delegation needs no identity grant": "in the Bedrock knowledge base stores",
+    "BR-20 key: an identity Allow on another key counts": "in the Bedrock knowledge base stores",
+    "BR-20 key: an identity Deny of decrypt is ignored": "in the Bedrock knowledge base stores",
+    "BR-20 key: a role boundary does not limit a direct grant": "in the Bedrock knowledge base stores",
+    "BR-20 key: a grant to another principal counts": "in the Bedrock knowledge base stores",
+    "BR-20 key: grant constraints are ignored": "in the Bedrock knowledge base stores",
+    "BR-20 key: unread grants read as none": "in the Bedrock knowledge base stores",
+    "BR-20 key: the key leg never runs": "in the Bedrock knowledge base stores",
+    "BR-20 key: an unread key reads as passed": "in the Bedrock knowledge base stores",
+    "BR-20 key: each key is read for every bucket": "in the Bedrock knowledge base stores",
+    "BR-46 sidecar budget resets for each source": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-46 listing budget is not spent": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-46 capped listing does not name where it stopped": (
         "in the Bedrock knowledge base classification"
     ),
     "BR-43 credits a Region allow-list in the management account": (

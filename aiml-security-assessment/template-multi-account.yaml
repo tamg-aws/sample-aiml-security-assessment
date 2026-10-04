@@ -658,13 +658,16 @@ Resources:
         Statement:
           - Sid: ManagedReadsOnWildcard2
             # These actions have no resource type in the service authorization
-            # reference.
+            # reference. BR-06 lists Athena data catalogs to find a LAMBDA or
+            # FEDERATED connector that could query a CloudWatch Logs-only
+            # invocation log group.
             Effect: Allow
             Action:
               - lambda:ListMicrovms # BR-57
               - iam:ListRoles # BR-02
               - bedrock:ListCustomModelDeployments # BR-53
               - bedrock:ListPromptRouters # BR-53
+              - athena:ListDataCatalogs # BR-06
             Resource: '*'
           - Sid: BedrockOwnerTagRead2
             # BR-53 reads the tags of these resource types from

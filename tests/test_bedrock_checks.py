@@ -6385,11 +6385,15 @@ class TestBR07PromptProductionVersion:
         ]
 
     @staticmethod
-    def _call(model_id, caller="arn:aws:sts::123456789012:assumed-role/app/s"):
+    def _call(
+        model_id,
+        caller="arn:aws:sts::123456789012:assumed-role/app/s",
+        when="2026-10-04T10:00:00Z",
+    ):
         return {
             "CloudTrailEvent": json.dumps(
                 {
-                    "eventTime": "2026-10-04T10:00:00Z",
+                    "eventTime": when,
                     "userIdentity": {"arn": caller},
                     "requestParameters": {"modelId": model_id},
                 }
@@ -6447,6 +6451,30 @@ class TestBR07PromptProductionVersion:
         )
         assert ("Converse", "1") in calls
 
+    def test_br07_a_capped_lookup_names_the_time_it_stopped_at(self):
+        client = self._flow_client([], {})
+        newer = self._call(f"{self._PROMPT_ARN}:2", when="2026-10-04T11:00:00Z")
+        older = self._call("anthropic.model", when="2026-10-04T09:30:00Z")
+        with patch.object(bedrock_app, "RUNTIME_PROMPT_LOOKUP_PAGES", 2):
+            self._lookup(
+                client,
+                {
+                    "InvokeModel": [[newer], [older], [newer]],
+                    "Converse": [[], [], []],
+                    "ConverseStream": [[self._call(f"{self._PROMPT_ARN}:3")]],
+                },
+            )
+            rows = self._runtime_rows(self._run(client))
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "event history holds more than the 100 event(s) read per operation, "
+            "newest first, so these were not read, and one that runs a prompt "
+            "DRAFT may be among them: InvokeModel calls before "
+            "2026-10-04T09:30:00Z; Converse calls, none of which was read."
+        ) in detail
+        assert "ConverseStream before" not in detail
+
     def test_br07_runtime_calls_naming_versions_pass(self):
         client = self._flow_client([], {})
         self._lookup(
@@ -6472,8 +6500,10 @@ class TestBR07PromptProductionVersion:
             (
                 {"Converse": [[]] * 11},
                 None,
-                "event history for Converse holds more than the 500 event(s) read "
-                "per operation",
+                "event history holds more than the 500 event(s) read per "
+                "operation, newest first, so these were not read, and one that "
+                "runs a prompt DRAFT may be among them: Converse calls, none of "
+                "which was read.",
             ),
             (
                 {},
@@ -17740,8 +17770,70 @@ class TestBR46ClassificationJobCoverage:
         detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
         assert "not every .metadata.json sidecar was read" in detail
         assert (
-            "past the first 1" if unread == "cap" else "(s3:GetObject, AccessDenied)"
+            "1 sidecar(s) from b.txt.metadata.json on, past the 1 this check reads "
+            "per region run"
+            if unread == "cap"
+            else "(s3:GetObject, AccessDenied)"
         ) in detail
+
+    def _two_labelled_sources(self, monkeypatch, cap, value):
+        # Both sources are fully labelled; only the run-wide budget can hold
+        # the second one back.
+        objects = {
+            bucket: {
+                key: ("2026-08-01T00:00:00Z", self._sidecar({"tier": "x"}))
+                for key in ("a.pdf", "a.pdf.metadata.json")
+            }
+            for bucket in ("support-bucket", "hr-bucket")
+        }
+        monkeypatch.setattr(bedrock_app, cap, value)
+        return self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+        )
+
+    def test_br46_the_sidecar_budget_is_spent_across_sources(self, monkeypatch):
+        findings = self._two_labelled_sources(
+            monkeypatch, "METADATA_SIDECAR_READ_CAP", 1
+        )
+        detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert (
+            "1 sidecar(s) from a.pdf.metadata.json on, past the 1 this check "
+            "reads per region run" in detail
+        )
+        assert not self._hr_rows(findings, "Passed")
+
+    def test_br46_the_listing_budget_is_spent_across_sources(self, monkeypatch):
+        findings = self._two_labelled_sources(
+            monkeypatch, "SOURCE_LISTING_BUDGET_PAGES", 1
+        )
+        detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert (
+            "the listing of s3://hr-bucket stopped before any key, at the cap of "
+            "100 ListObjectsV2 pages per source and 1 per region run" in detail
+        )
+        assert not self._hr_rows(findings, "Passed")
+
+    def test_br46_a_capped_listing_names_the_last_key_read(self, monkeypatch):
+        pages = [
+            {"Contents": [{"Key": "a.pdf", "LastModified": "2026-08-01T00:00:00Z"}]},
+            {"Contents": [{"Key": "b.pdf", "LastModified": "2026-08-01T00:00:00Z"}]},
+        ]
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.return_value = iter(pages)
+        monkeypatch.setattr(bedrock_app, "REDACTION_SOURCE_LIST_PAGE_CAP", 1)
+        budget = {"pages": 0, "sidecars": 0}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            listing = bedrock_app._source_object_listing(
+                "us-east-1", "hr-bucket", [""], budget
+            )
+        assert listing["items"] == [("a.pdf", "2026-08-01T00:00:00Z")]
+        assert listing["error"].startswith(
+            "the listing of s3://hr-bucket stopped after key a.pdf"
+        )
+        assert budget["pages"] == 1
 
     def test_br46_an_incomplete_source_list_withholds_passed(self):
         findings = self._run(
@@ -23847,6 +23939,95 @@ class TestBR32ActingIntervention:
             in signal["Finding_Details"]
         )
 
+    def test_an_and_composite_does_not_carry_the_alarm_beside_an_or_one(self):
+        """Under AND the intervention alarm raises the composite only with the
+        other alarm, so it never notifies on its own; under OR it does. The
+        slice dimensions make the credited alarm name itself."""
+        sliced = [
+            {"Name": "GuardrailArn", "Value": "arn:g"},
+            {"Name": "GuardrailVersion", "Value": "1"},
+        ]
+        _, signal = self._run(
+            [
+                _intervened_alarm("anded", actions=False, Dimensions=sliced),
+                _intervened_alarm("ored", actions=False, Dimensions=sliced),
+            ],
+            composites=[
+                {
+                    "AlarmName": "both",
+                    "AlarmRule": 'ALARM("anded") AND ALARM("other")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+                {
+                    "AlarmName": "either",
+                    "AlarmRule": '(ALARM("x") AND ALARM("y")) OR ALARM("ored")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+            ],
+        )
+        detail = signal["Finding_Details"]
+        assert signal["Status"] == "N/A"
+        assert "alarm ored counts only GuardrailArn arn:g, GuardrailVersion 1" in detail
+        assert "alarm anded counts only" not in detail
+        assert "anded on InvocationsIntervened reach no action" in detail
+
+    def test_an_and_composite_alone_leaves_the_alarm_silent(self):
+        _, signal = self._run(
+            [_intervened_alarm("anded", actions=False)],
+            composites=[
+                {
+                    "AlarmName": "both",
+                    "AlarmRule": 'ALARM("anded") AND ALARM("other")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+                {
+                    "AlarmName": "counted",
+                    # AT_LEAST is not read, so the alarm beside it is not
+                    # credited; here it would need a second alarm anyway.
+                    "AlarmRule": ('ALARM("anded") AND AT_LEAST(1, ALARM, ("x", "y"))'),
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "anded on InvocationsIntervened reach no action"
+            in signal["Finding_Details"]
+        )
+
+    def test_a_composite_naming_the_alarm_by_arn_carries_it(self):
+        arn = "arn:aws:cloudwatch:us-east-1:123456789012:alarm:by-arn"
+        _, signal = self._run(
+            [
+                _intervened_alarm(
+                    "by-arn",
+                    actions=False,
+                    AlarmArn=arn,
+                    Dimensions=[
+                        {"Name": "GuardrailArn", "Value": "arn:g"},
+                        {"Name": "GuardrailVersion", "Value": "1"},
+                    ],
+                )
+            ],
+            composites=[
+                {
+                    "AlarmName": "parent",
+                    "AlarmRule": f'ALARM("{arn}") OR ALARM("other")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                }
+            ],
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            "alarm by-arn counts only GuardrailArn arn:g, GuardrailVersion 1"
+            in signal["Finding_Details"]
+        )
+
     def test_metric_filter_without_an_alarm_is_not_a_signal(self):
         _, signal = self._run(
             [ACTING_RUNTIME_ALARM],
@@ -24638,7 +24819,8 @@ class TestBR32ActingIntervention:
         assert (
             "Alarm(s) orphan-throttle evaluate AWS/Bedrock metrics but reach no "
             "action: ActionsEnabled is false or AlarmActions is empty, and no "
-            "acting composite alarm reads them." in runtime[0]["Finding_Details"]
+            "acting composite alarm's rule is true whenever they alone are in ALARM."
+            in runtime[0]["Finding_Details"]
         )
 
     def test_runtime_alarm_under_a_silent_or_negated_composite_fails(self):
@@ -24668,7 +24850,8 @@ class TestBR32ActingIntervention:
         assert (
             "Alarm(s) child-throttle, sibling-throttle evaluate AWS/Bedrock metrics "
             "but reach no action: ActionsEnabled is false or AlarmActions is empty, "
-            "and no acting composite alarm reads them." in runtime[0]["Finding_Details"]
+            "and no acting composite alarm's rule is true whenever they alone are in ALARM."
+            in runtime[0]["Finding_Details"]
         )
 
     def test_log_forwarding_is_reported(self):
@@ -39434,6 +39617,45 @@ class TestBR20ValueDepth:
     INDEX = f"arn:aws:s3vectors:us-east-1:{ACCOUNT}:bucket/vec/index/kb-index"
     ROLE = f"arn:aws:iam::{ACCOUNT}:role/kb-role"
 
+    PATH = [
+        {"Id": ACCOUNT, "Type": "ACCOUNT"},
+        {"Id": "ou-ab12-cdef3456", "Type": "ORGANIZATIONAL_UNIT"},
+        {"Id": "r-ab12", "Type": "ROOT"},
+    ]
+    FULL_ACCESS_SCPS = {
+        "items": [
+            {
+                "name": "FullAWSAccess",
+                "id": "p-FullAWSAccess",
+                "content": json.dumps(
+                    {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+                ),
+                "attached_to": [
+                    f"account {ACCOUNT}",
+                    "organizational unit ou-ab12-cdef3456",
+                    "root r-ab12",
+                ],
+            }
+        ],
+        "errors": [],
+        "list_error": None,
+        "detached": [],
+        "account": ACCOUNT,
+        "path": PATH,
+        "management_account": False,
+    }
+    ROOT_KEY_POLICY = {
+        "Statement": [
+            {
+                "Sid": "Enable IAM User Permissions",
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"},
+                "Action": "kms:*",
+                "Resource": "*",
+            }
+        ]
+    }
+
     KEYS = {
         CMK: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"},
         AWS_KEY: {"KeyManager": "AWS", "KeyState": "Enabled"},
@@ -39501,8 +39723,15 @@ class TestBR20ValueDepth:
         bucket_encryption=None,
         bucket_policies=None,
         permission_cache=None,
+        scp_inventory=None,
+        key_policies=None,
+        grants=None,
     ):
         """Run BR-20 over `bodies` ({kb_id: body}) with a client per service.
+
+        `scp_inventory` defaults to FULL_ACCESS_SCPS, `key_policies` answers
+        GetKeyPolicy per key ARN (ROOT_KEY_POLICY by default, an Exception is
+        raised) and `grants` answers ListGrants per key ARN.
 
         `policies` answers GetVectorBucketPolicy per bucket ARN (an Exception is
         raised). `sources` is {kb_id: [(ds_id, bucket or None, transient key)]}.
@@ -39576,6 +39805,21 @@ class TestBR20ValueDepth:
             return {"KeyMetadata": {"Arn": KeyId, **answer}}
 
         kms.describe_key.side_effect = describe_key
+
+        def get_key_policy(KeyId, PolicyName):
+            answer = (key_policies or {}).get(KeyId, self.ROOT_KEY_POLICY)
+            if isinstance(answer, Exception):
+                raise answer
+            return {"Policy": json.dumps(answer)}
+
+        def list_grants(KeyId, **_):
+            answer = (grants or {}).get(KeyId, [])
+            if isinstance(answer, Exception):
+                raise answer
+            return {"Grants": answer}
+
+        kms.get_key_policy.side_effect = get_key_policy
+        kms.list_grants.side_effect = list_grants
         self.kms = kms
 
         s3 = MagicMock()
@@ -39606,7 +39850,14 @@ class TestBR20ValueDepth:
             self.built.append((service, kwargs.get("region_name")))
             return table[service]
 
-        with patch("bedrock_app.boto3.client", side_effect=factory):
+        with (
+            patch("bedrock_app.boto3.client", side_effect=factory),
+            patch.object(
+                bedrock_app,
+                "get_service_control_policy_inventory",
+                return_value=scp_inventory or self.FULL_ACCESS_SCPS,
+            ),
+        ):
             return extract_csv_data(
                 bedrock_app.check_bedrock_knowledge_base_kms_encryption(
                     region="us-east-1", permission_cache=permission_cache or None
@@ -39616,7 +39867,8 @@ class TestBR20ValueDepth:
     @classmethod
     def _cache(cls, resource=None, condition=None, roles=None):
         """An IAM permissions cache where kb-role allows aoss:APIAccessAll on
-        `resource` (collection c1 by default)."""
+        `resource` (collection c1 by default) and s3:GetObject on the objects
+        of the corpus and open source buckets, and kms:Decrypt on CMK."""
         statement = {
             "Effect": "Allow",
             "Action": "aoss:APIAccessAll",
@@ -39630,7 +39882,36 @@ class TestBR20ValueDepth:
                 {
                     "policy_name": "kb-aoss",
                     "document": {"Version": "2012-10-17", "Statement": [statement]},
-                }
+                },
+                {
+                    "policy_name": "kb-sources",
+                    "document": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "s3:GetObject",
+                                "Resource": [
+                                    "arn:aws:s3:::corpus/*",
+                                    "arn:aws:s3:::open/*",
+                                ],
+                            },
+                        ],
+                    },
+                },
+                {
+                    "policy_name": "kb-keys",
+                    "document": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "kms:Decrypt",
+                                "Resource": cls.CMK,
+                            }
+                        ],
+                    },
+                },
             ]
         }
         return {
@@ -40456,6 +40737,743 @@ class TestBR20ValueDepth:
         rows = self._source_access(self._source_run({"corpus": policy}))
         assert [r["Status"] for r in rows] == ["N/A", "Passed"]
         assert expected in rows[0]["Finding_Details"]
+
+    def _identity_run(self, statements, boundary=None, bucket_policies=None):
+        # kb-role keeps its aoss grant; only its s3 statements vary.
+        cache = self._cache()
+        policies = cache["role_permissions"]["kb-role"]["attached_policies"]
+        policies[1]["document"]["Statement"] = statements
+        if boundary is not None:
+            cache["role_permissions"]["kb-role"]["permissions_boundary"] = {
+                "document": {"Statement": boundary}
+            }
+        return self._source_access(
+            self._run(
+                {"kb1": self._aoss_body()},
+                clients={"opensearchserverless": self._aoss(self.CMK)},
+                sources={
+                    "kb1": [("ds1", "corpus", self.CMK), ("ds2", "open", self.CMK)]
+                },
+                bucket_encryption={
+                    "corpus": self._sse(self.CMK),
+                    "open": self._sse(self.CMK),
+                },
+                bucket_policies=bucket_policies,
+                permission_cache=cache,
+            )
+        )
+
+    OTHER_KEY = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/other"
+
+    def _key_run(
+        self,
+        key_statements=None,
+        kms_statements=None,
+        boundary=None,
+        scp_inventory=None,
+        key_policies=None,
+        grants=None,
+        encryption=None,
+    ):
+        """BR-20 over corpus and open, both on CMK by default. `kms_statements`
+        replaces kb-role's kms:Decrypt policy, and `key_statements` the CMK
+        key policy."""
+        cache = self._cache()
+        role = cache["role_permissions"]["kb-role"]
+        if kms_statements is not None:
+            role["attached_policies"][2]["document"]["Statement"] = kms_statements
+        if boundary is not None:
+            role["permissions_boundary"] = {"document": {"Statement": boundary}}
+        if key_statements is not None:
+            key_policies = {self.CMK: {"Statement": key_statements}}
+        return self._source_access(
+            self._run(
+                {"kb1": self._aoss_body()},
+                clients={"opensearchserverless": self._aoss(self.CMK)},
+                sources={
+                    "kb1": [("ds1", "corpus", self.CMK), ("ds2", "open", self.CMK)]
+                },
+                bucket_encryption=encryption
+                or {"corpus": self._sse(self.CMK), "open": self._sse(self.CMK)},
+                permission_cache=cache,
+                scp_inventory=scp_inventory,
+                key_policies=key_policies,
+                grants=grants,
+            )
+        )
+
+    @classmethod
+    def _scps(cls, *policies, **overrides):
+        """An inventory of FullAWSAccess plus (name, statements, targets) SCPs."""
+        inventory = json.loads(json.dumps(cls.FULL_ACCESS_SCPS))
+        for name, statements, targets in policies:
+            inventory["items"].append(
+                {
+                    "name": name,
+                    "id": f"p-{name}",
+                    "content": json.dumps({"Statement": statements}),
+                    "attached_to": targets,
+                }
+            )
+        inventory.update(overrides)
+        return inventory
+
+    @pytest.mark.parametrize(
+        "resource, statuses",
+        [
+            ("*", ["Failed", "Failed"]),
+            ("arn:aws:s3:::corpus/*", ["Failed", "Passed"]),
+            # The partition wildcard also matches the object
+            # open/:s3:::corp, so on open the Deny reaches part of the bucket.
+            ("arn:*:s3:::corp*", ["Failed", "N/A"]),
+        ],
+    )
+    def test_an_attached_scp_deny_of_the_source_fails(self, resource, statuses):
+        rows = self._key_run(
+            scp_inventory=self._scps(
+                (
+                    "DenyReads",
+                    [self._s3_statement("Deny", resource)],
+                    [f"account {self.ACCOUNT}"],
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == statuses
+        assert (
+            f"{self.ROLE} (service control policy 'DenyReads' denies s3:GetObject "
+            "on the objects of bucket 'corpus')"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "deny, expected",
+        [
+            (
+                {
+                    "Resource": "arn:aws:s3:::corpus/*",
+                    "Condition": {"StringNotEquals": {"aws:PrincipalTag/x": "y"}},
+                },
+                "service control policy 'DenyReads' denies s3:GetObject on the "
+                "objects of bucket 'corpus' under a Condition",
+            ),
+            (
+                {"Resource": "arn:aws:s3:::corpus/secret/*"},
+                "service control policy 'DenyReads' denies s3:GetObject on the "
+                "objects of bucket 'corpus' on part of it",
+            ),
+            (
+                {"NotResource": "arn:aws:s3:::open/*"},
+                "service control policy 'DenyReads' denies s3:GetObject on the "
+                "objects of bucket 'corpus' with NotResource",
+            ),
+        ],
+    )
+    def test_an_uncomputed_scp_deny_is_not_passed(self, deny, expected):
+        statement = {"Effect": "Deny", "Action": "s3:GetObject", **deny}
+        rows = self._key_run(
+            scp_inventory=self._scps(("DenyReads", [statement], ["root r-ab12"]))
+        )
+        assert rows[0]["Status"] == "N/A"
+        assert f"{self.ROLE}: {expected}" in rows[0]["Finding_Details"]
+
+    def test_an_scp_kms_deny_of_the_source_key_fails(self):
+        statement = {"Effect": "Deny", "Action": "kms:Decrypt", "Resource": "*"}
+        rows = self._key_run(
+            scp_inventory=self._scps(("NoKms", [statement], ["root r-ab12"]))
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert (
+            f"service control policy 'NoKms' denies kms:Decrypt on key {self.CMK}"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "allowed, status",
+        [
+            (["bedrock:*"], "Failed"),
+            (["s3:GetObject", "kms:Decrypt"], "Passed"),
+            (["s3:*"], "Failed"),
+        ],
+    )
+    def test_an_allow_list_scp_must_allow_the_read_at_every_level(
+        self, allowed, status
+    ):
+        inventory = self._scps(
+            (
+                "AllowList",
+                [{"Effect": "Allow", "Action": allowed, "Resource": "*"}],
+                [f"account {self.ACCOUNT}"],
+            )
+        )
+        inventory["items"][0]["attached_to"] = [
+            "organizational unit ou-ab12-cdef3456",
+            "root r-ab12",
+        ]
+        rows = self._key_run(scp_inventory=inventory)
+        assert [r["Status"] for r in rows] == [status, status]
+        if allowed == ["bedrock:*"]:
+            assert (
+                f"no service control policy attached to {self.ACCOUNT} allows "
+                "s3:GetObject on the objects of bucket 'corpus'"
+            ) in rows[0]["Finding_Details"]
+        if allowed == ["s3:*"]:
+            assert (
+                f"no service control policy attached to {self.ACCOUNT} allows "
+                f"kms:Decrypt on key {self.CMK}"
+            ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement, expected",
+        [
+            # The account level allows the objects under docs/ only: corpus is
+            # held on part of it, and open, which no Allow reaches, fails.
+            (
+                {"Resource": "arn:aws:s3:::corpus/docs/*"},
+                ("N/A", "Failed", "on part of it only"),
+            ),
+            (
+                {
+                    "Resource": "*",
+                    "Condition": {"StringEquals": {"aws:PrincipalTag/team": "ml"}},
+                },
+                ("N/A", "N/A", "on part of it or under a Condition only"),
+            ),
+        ],
+    )
+    def test_a_level_allowing_part_or_under_a_condition_is_not_passed(
+        self, statement, expected
+    ):
+        inventory = self._scps(
+            (
+                "AllowList",
+                [
+                    {"Effect": "Allow", "Action": "s3:GetObject", **statement},
+                    {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"},
+                ],
+                [f"account {self.ACCOUNT}"],
+            )
+        )
+        inventory["items"][0]["attached_to"] = [
+            "organizational unit ou-ab12-cdef3456",
+            "root r-ab12",
+        ]
+        rows = self._key_run(scp_inventory=inventory)
+        assert [r["Status"] for r in rows] == list(expected[:2])
+        assert (
+            f"the service control policies attached to {self.ACCOUNT} allow "
+            f"s3:GetObject on the objects of bucket 'corpus' {expected[2]}"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "overrides, status, expected",
+        [
+            (
+                {"list_error": "ListPolicies (AccessDeniedException)"},
+                "N/A",
+                "the service control policies were not read: ListPolicies "
+                "(AccessDeniedException)",
+            ),
+            (
+                {"errors": ["policy 'x' targets: AccessDenied"]},
+                "N/A",
+                "service control policies were not all read: policy 'x' targets: "
+                "AccessDenied",
+            ),
+            (
+                {
+                    "list_error": "the account's position in the organization could "
+                    "not be read with organizations:ListParents "
+                    "(AWSOrganizationsNotInUseException), so no service control "
+                    "policy attachment could be established"
+                },
+                "Passed",
+                "Service control policies do not apply: the account is in no "
+                "organization, so no SCP applies.",
+            ),
+            (
+                {"management_account": True, "items": []},
+                "Passed",
+                "Service control policies do not apply: this is the management "
+                "account, which service control policies never restrict.",
+            ),
+        ],
+    )
+    def test_an_scp_inventory_that_cannot_judge_is_not_passed(
+        self, overrides, status, expected
+    ):
+        rows = self._key_run(scp_inventory=self._scps(**overrides))
+        assert [r["Status"] for r in rows] == [status, status]
+        assert expected in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "key_statements, kms_statements, status, expected",
+        [
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:role/other"},
+                        "Action": "kms:*",
+                        "Resource": "*",
+                    }
+                ],
+                None,
+                "Failed",
+                "allows kms:Decrypt to neither it nor, through the account root",
+            ),
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": ROLE},
+                        "Action": "kms:Decrypt",
+                        "Resource": "*",
+                    }
+                ],
+                [],
+                "Passed",
+                None,
+            ),
+            (None, [], "Failed", "allows kms:Decrypt to neither it nor"),
+            (
+                None,
+                [{"Effect": "Allow", "Action": "kms:Decrypt", "Resource": OTHER_KEY}],
+                "Failed",
+                "allows kms:Decrypt to neither it nor",
+            ),
+            (
+                None,
+                [{"Effect": "Allow", "Action": "kms:*", "Resource": "arn:aws:kms:*"}],
+                "Passed",
+                None,
+            ),
+            (
+                None,
+                [
+                    {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "kms:Decrypt", "Resource": CMK},
+                ],
+                "Failed",
+                f"attached policy 'kb-keys' denies kms:Decrypt on key {CMK}",
+            ),
+            (
+                None,
+                [
+                    {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "kms:Decrypt",
+                        "Resource": "*",
+                        "Condition": {"Bool": {"aws:x": "1"}},
+                    },
+                ],
+                "N/A",
+                "attached policy 'kb-keys' denies kms:Decrypt under a Condition",
+            ),
+        ],
+    )
+    def test_the_source_key_must_let_the_principal_decrypt(
+        self, key_statements, kms_statements, status, expected
+    ):
+        rows = self._key_run(key_statements, kms_statements)
+        assert [r["Status"] for r in rows] == [status, status]
+        if expected:
+            assert expected in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            (
+                {"StringEquals": {"kms:ViaService": "s3.us-east-1.amazonaws.com"}},
+                "Passed",
+            ),
+            ({"StringLike": {"kms:ViaService": "s3.*.amazonaws.com"}}, "Passed"),
+            ({"StringLike": {"kms:ViaService": "s3.eu-*.amazonaws.com"}}, "N/A"),
+            # StringEquals compares literally, so a wildcard in it matches nothing.
+            ({"StringEquals": {"kms:ViaService": "s3.*.amazonaws.com"}}, "N/A"),
+            ({"StringEquals": {"kms:ViaService": "s3.eu-west-1.amazonaws.com"}}, "N/A"),
+            ({"StringEquals": {"kms:CallerAccount": ACCOUNT}}, "Passed"),
+            ({"StringEquals": {"kms:CallerAccount": "210987654321"}}, "N/A"),
+            ({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}, "N/A"),
+        ],
+    )
+    def test_a_conditioned_key_policy_grant_counts_only_for_an_s3_read(
+        self, condition, status
+    ):
+        rows = self._key_run(
+            [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                    "Condition": condition,
+                }
+            ],
+            [],
+        )
+        assert [r["Status"] for r in rows] == [status, status]
+        if status == "N/A":
+            assert (
+                "key policy statement 1 allows kms:Decrypt under a Condition not "
+                "computed"
+            ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "deny, status",
+        [
+            ({}, "Failed"),
+            ({"Condition": {"Bool": {"aws:x": "1"}}}, "N/A"),
+        ],
+    )
+    def test_a_key_policy_deny_to_everyone_is_read(self, deny, status):
+        rows = self._key_run(
+            self.ROOT_KEY_POLICY["Statement"]
+            + [
+                {
+                    "Sid": "NoDecrypt",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                    **deny,
+                }
+            ]
+        )
+        assert [r["Status"] for r in rows] == [status, status]
+        assert (
+            "key policy statement NoDecrypt denies kms:Decrypt"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "grant, status",
+        [
+            ({"GranteePrincipal": ROLE, "Operations": ["Decrypt"]}, "Passed"),
+            ({"GranteePrincipal": ROLE, "Operations": ["Encrypt"]}, "Failed"),
+            (
+                {
+                    "GranteePrincipal": f"arn:aws:iam::{ACCOUNT}:role/x",
+                    "Operations": ["Decrypt"],
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "GranteePrincipal": ROLE,
+                    "Operations": ["Decrypt"],
+                    "Constraints": {"EncryptionContextSubset": {"a": "b"}},
+                },
+                "N/A",
+            ),
+        ],
+    )
+    def test_a_grant_can_give_decrypt(self, grant, status):
+        rows = self._key_run(
+            [],
+            [],
+            grants={self.CMK: [{"GrantId": "g1", **grant}]},
+        )
+        assert [r["Status"] for r in rows] == [status, status]
+
+    def test_unread_grants_or_key_policy_are_not_judged(self):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "x"}}, "Op"
+        )
+        rows = self._key_run([], [], grants={self.CMK: denied})
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert (
+            f"the grants of key {self.CMK} were not read with kms:ListGrants"
+            in (rows[0]["Finding_Details"])
+        )
+        rows = self._key_run(key_policies={self.CMK: denied})
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert (
+            f"the policy of key {self.CMK} was not read with kms:GetKeyPolicy "
+            "(AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_role_boundary_limits_a_key_policy_grant_to_its_arn(self):
+        rows = self._key_run(
+            [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": self.ROLE},
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                }
+            ],
+            [],
+            boundary=[
+                {"Effect": "Allow", "Action": ["aoss:*", "s3:*"], "Resource": "*"}
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert (
+            f"its permissions boundary allows kms:Decrypt on no resource matching "
+            f"key {self.CMK}"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "encryption, expected",
+        [
+            (
+                {"SSEAlgorithm": "aws:kms"},
+                "The bucket's default key is AWS managed, so its key policy is not "
+                "judged.",
+            ),
+            (
+                {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "alias/aws/s3"},
+                "The bucket's default key is AWS managed, so its key policy is not "
+                "judged.",
+            ),
+            (
+                {"SSEAlgorithm": "AES256"},
+                "The bucket's default encryption uses no KMS key.",
+            ),
+        ],
+    )
+    def test_a_bucket_without_a_customer_key_skips_the_key_leg(
+        self, encryption, expected
+    ):
+        response = {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [{"ApplyServerSideEncryptionByDefault": encryption}]
+            }
+        }
+        rows = self._key_run([], [], encryption={"corpus": response, "open": response})
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+        assert expected in rows[0]["Finding_Details"]
+        assert self.kms.get_key_policy.call_count == 0
+
+    def test_each_source_key_is_read_once(self):
+        self._key_run()
+        assert self.kms.get_key_policy.call_count == 1
+        assert self.kms.list_grants.call_count == 1
+
+    @staticmethod
+    def _s3_statement(effect, resource, **extra):
+        return {
+            "Effect": effect,
+            "Action": "s3:GetObject",
+            "Resource": resource,
+            **extra,
+        }
+
+    def test_a_vector_principal_its_own_policy_denies_fails(self):
+        rows = self._identity_run(
+            [
+                self._s3_statement("Allow", "*"),
+                self._s3_statement("Deny", "arn:aws:s3:::corpus/*"),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "1 of the 1 principal(s) admitted to the vector index of knowledge "
+            "base(s) 'KB-kb1' cannot read the documents of source bucket 'corpus' "
+            "under their IAM policies, the service control policies over the "
+            "account or the bucket's key, so they read through the index content "
+            f"their grants keep from them: {self.ROLE} (attached policy "
+            "'kb-sources' denies s3:GetObject on every object)."
+        ) in rows[0]["Finding_Details"]
+        assert "by its bucket policy" not in rows[0]["Finding_Details"]
+        assert rows[0]["Resolution"] == bedrock_app.KB_SOURCE_ACCESS_RESOLUTION
+
+    @pytest.mark.parametrize(
+        "resource, status",
+        [
+            ("arn:aws:s3:::open/*", "Failed"),
+            ("arn:aws:s3:::corpus", "Failed"),
+            ("arn:aws:s3:::corp*", "Passed"),
+            ("arn:*:s3:::corpus/*", "Passed"),
+            ("arn:aws:s3:::corpus/docs/a.pdf", "N/A"),
+            ("arn:aws:s3:::corpus/docs/*", "N/A"),
+            ("arn:aws:s3:::corpus*/", "N/A"),
+        ],
+    )
+    def test_a_vector_principal_with_no_source_grant_fails(self, resource, status):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", [resource, "arn:aws:s3:::open/*"])]
+        )
+        assert [r["Status"] for r in rows] == [status, "Passed"]
+        if status == "Failed":
+            assert (
+                f"{self.ROLE} (no identity policy allows s3:GetObject on the bucket "
+                "and the bucket policy allows it to no one)"
+            ) in rows[0]["Finding_Details"]
+        if status == "N/A":
+            assert (
+                f"{self.ROLE}: its identity policies allow s3:GetObject on part of "
+                "the bucket only"
+            ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "excluded, status",
+        [
+            ("arn:aws:s3:::other/*", "Passed"),
+            ("arn:aws:s3:::corpus/secret/*", "N/A"),
+            ("arn:aws:s3:::corpus/*", "Failed"),
+        ],
+    )
+    def test_a_not_resource_allow_grants_what_it_does_not_exclude(
+        self, excluded, status
+    ):
+        rows = self._identity_run(
+            [
+                self._s3_statement("Allow", "arn:aws:s3:::open/*"),
+                {"Effect": "Allow", "Action": "s3:GetObject", "NotResource": excluded},
+            ]
+        )
+        assert [r["Status"] for r in rows] == [status, "Passed"]
+
+    def test_a_boundary_on_part_of_the_source_is_not_passed(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "*")],
+            boundary=[
+                {"Effect": "Allow", "Action": ["aoss:*", "kms:*"], "Resource": "*"},
+                self._s3_statement("Allow", "arn:aws:s3:::corpus/docs/*"),
+                self._s3_statement("Allow", "arn:aws:s3:::open/*"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert (
+            f"{self.ROLE}: its permissions boundary allows s3:GetObject on part of "
+            "the bucket only"
+        ) in rows[0]["Finding_Details"]
+
+    def test_no_identity_grant_beside_a_bucket_allow_is_not_compared(self):
+        allow = self._policy(
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{self.ACCOUNT}:root"},
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::corpus/*",
+            }
+        )
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "arn:aws:s3:::open/*")],
+            bucket_policies={"corpus": allow},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert (
+            f"{self.ROLE}: no identity policy allows s3:GetObject on the bucket, "
+            "and the bucket policy's Allow statements are not compared per principal"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_boundary_without_the_source_fails(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "*")],
+            boundary=[
+                {"Effect": "Allow", "Action": ["aoss:*", "kms:*"], "Resource": "*"},
+                self._s3_statement("Allow", "arn:aws:s3:::open/*"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "its permissions boundary allows s3:GetObject on no object of the bucket"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_a_boundary_allow_is_not_a_grant(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "arn:aws:s3:::open/*")],
+            boundary=[{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "no identity policy allows s3:GetObject on the bucket and the bucket "
+            "policy allows it to no one" in rows[0]["Finding_Details"]
+        )
+
+    def test_a_boundary_deny_on_the_source_fails(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "*")],
+            boundary=[
+                {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                self._s3_statement("Deny", "arn:aws:s3:::corpus/*"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "permissions boundary 'unnamed' denies s3:GetObject on every object"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "deny, expected",
+        [
+            (
+                {
+                    "Resource": "arn:aws:s3:::corpus/*",
+                    "Condition": {"Bool": {"aws:x": "1"}},
+                },
+                "attached policy 'kb-sources' denies s3:GetObject under a Condition",
+            ),
+            (
+                {"Resource": "arn:aws:s3:::corpus/secret/*"},
+                "attached policy 'kb-sources' denies s3:GetObject on part of the bucket",
+            ),
+            (
+                {"Resource": "arn:aws:s3:::corpus*/"},
+                "attached policy 'kb-sources' denies s3:GetObject on part of the bucket",
+            ),
+            (
+                {"NotResource": "arn:aws:s3:::open/*"},
+                "attached policy 'kb-sources' denies s3:GetObject with NotResource",
+            ),
+        ],
+    )
+    def test_an_uncomputed_identity_deny_is_not_passed(self, deny, expected):
+        statement = {"Effect": "Deny", "Action": "s3:GetObject", **deny}
+        rows = self._identity_run([self._s3_statement("Allow", "*"), statement])
+        assert rows[0]["Status"] == "N/A"
+        assert f"{self.ROLE}: {expected}" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "cache, expected",
+        [
+            ("missing", "the role is not in the IAM permissions cache"),
+            ("errored", "the role had a policy read fail in the IAM permissions cache"),
+            (False, "the IAM permissions cache was not available"),
+        ],
+    )
+    def test_an_unread_identity_is_not_passed(self, cache, expected):
+        if cache == "missing":
+            cache = self._cache()
+            cache["role_permissions"] = {}
+        elif cache == "errored":
+            cache = self._cache()
+            cache["principal_errors"] = [{"type": "role", "name": "kb-role"}]
+        rows = self._source_access(self._source_run_with_cache(cache))
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert f"{self.ROLE}: {expected}" in rows[0]["Finding_Details"]
+
+    def _source_run_with_cache(self, cache):
+        return self._run(
+            {"kb1": self._aoss_body()},
+            clients={"opensearchserverless": self._aoss(self.CMK)},
+            sources={"kb1": [("ds1", "corpus", self.CMK), ("ds2", "open", self.CMK)]},
+            bucket_encryption={
+                "corpus": self._sse(self.CMK),
+                "open": self._sse(self.CMK),
+            },
+            permission_cache=cache,
+        )
+
+    def test_a_passed_source_comparison_names_the_identity_leg(self):
+        rows = self._identity_run([self._s3_statement("Allow", "*")])
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+        assert rows[0]["Finding_Details"].endswith(
+            "which has no Deny on those reads, and each holds an identity-policy "
+            "Allow of s3:GetObject whose Resource covers every object of the "
+            "bucket, within a permissions boundary that does too if one is set, "
+            "with no identity-policy or permissions-boundary Deny of it. Each level "
+            "of the organization path above the account has an attached service "
+            "control policy allowing those reads, and none denies them. The "
+            f"bucket's default key {self.CMK} lets each of them use kms:Decrypt "
+            "through its key policy, a grant, or the account root and an "
+            "identity-policy Allow. Conditions on identity-policy Allow statements "
+            "are not evaluated, and the key of each object already written is not "
+            "read."
+        )
 
     def _s3v_source_run(self, deny, bucket_policies):
         return self._run(
@@ -44740,15 +45758,42 @@ class TestInvocationLogGuardrailEvidence:
         }
     }
 
+    # An hour old: inside the 24-hour scan and past the 15 minutes event
+    # history may lag the call.
+    RECORD_TIME = (_dt.now(_tz.utc) - _td(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _converse_event(self, request_id, guardrail=None, version="1"):
+        """
+        Record the CloudTrail event of a Converse call as event history holds
+        it: the guardrail sits under requestParameters.guardrailConfig (live
+        event f5561a4b, account 178113193057, us-east-1), never in the logged
+        request body.
+        """
+        parameters = {"modelId": "anthropic.test", "inferenceConfig": {}}
+        if guardrail:
+            parameters["guardrailConfig"] = {
+                "guardrailIdentifier": guardrail,
+                "guardrailVersion": version,
+                "trace": "enabled",
+            }
+        self.__dict__.setdefault("converse_events", {})[request_id] = {
+            "eventName": "Converse",
+            "requestID": request_id,
+            "requestParameters": parameters,
+        }
+
     def _record(self, request_id, operation="InvokeModel", inp=None, out=None):
         record = {
             "schemaType": "ModelInvocationLog",
             "requestId": request_id,
             "operation": operation,
             "modelId": "anthropic.test",
+            "timestamp": self.RECORD_TIME,
             "input": {},
             "output": {"outputBodyJson": out if out is not None else {}},
         }
+        if operation == "Converse":
+            self._converse_event(request_id)
         if inp is not ...:
             record["input"]["inputBodyJson"] = (
                 inp if inp is not None else {"prompt": self.BODY_TEXT}
@@ -44828,6 +45873,7 @@ class TestInvocationLogGuardrailEvidence:
         s3_error=None,
         guardrails=None,
         trail=None,
+        joins=None,
     ):
         """
         ``pages`` maps a filter pattern to a list of pages of records.
@@ -44835,7 +45881,13 @@ class TestInvocationLogGuardrailEvidence:
         ``guardrails`` maps (identifier, version) to a GetGuardrail detail or an
         exception. ``trail`` maps an event name to the pages LookupEvents
         returns for it, each one event or a list of events, or to an exception.
+        Unless ``trail`` names Converse, its one page holds the event of every
+        Converse record the test built.
         """
+        trail = dict(trail or {})
+        trail.setdefault(
+            "Converse", [list(self.__dict__.get("converse_events", {}).values())]
+        )
         bedrock = MagicMock()
         self.guardrail_reads = []
 
@@ -44875,7 +45927,16 @@ class TestInvocationLogGuardrailEvidence:
             index = int(nextToken or 0)
             response = {
                 "events": [
-                    {"message": json.dumps(record), "logStreamName": "s"}
+                    {
+                        "message": json.dumps(record),
+                        "logStreamName": "s",
+                        "timestamp": int(
+                            _dt.strptime(record["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+                            .replace(tzinfo=_tz.utc)
+                            .timestamp()
+                            * 1000
+                        ),
+                    }
                     for record in listed[index]
                 ]
             }
@@ -44946,7 +46007,11 @@ class TestInvocationLogGuardrailEvidence:
             "bedrock_app.boto3.client",
             side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
         ):
-            rows = extract_csv_data(check(region="us-east-1"))
+            rows = extract_csv_data(
+                check(region="us-east-1", joins=joins)
+                if joins is not None
+                else check(region="us-east-1")
+            )
         for row in rows:
             assert self.BODY_TEXT not in row["Finding_Details"]
         return rows
@@ -45053,7 +46118,10 @@ class TestInvocationLogGuardrailEvidence:
                 {"logs_error": _make_client_error("AccessDeniedException")},
                 "(logs:FilterLogEvents, AccessDeniedException)",
             ),
-            ({"endless": True}, "(page cap)"),
+            (
+                {"endless": True},
+                "past the first 0 (page cap; those logged from ",
+            ),
             (
                 {
                     "config": {
@@ -45189,10 +46257,11 @@ class TestInvocationLogGuardrailEvidence:
         body = {
             "messages": [{"role": role, "content": content} for role, content in turns]
         }
-        if guarded:
-            body["guardrailConfig"] = {"guardrailIdentifier": "g1"}
         out = {"stopReason": "guardrail_intervened" if intervened else "end_turn"}
-        return self._record(request_id, "Converse", inp=body, out=out)
+        record = self._record(request_id, "Converse", inp=body, out=out)
+        if guarded:
+            self._converse_event(request_id, "g1")
+        return record
 
     CONVERSE = '{ ($.operation = "Converse") || ($.operation = "ConverseStream") }'
     TEXT_BLOCK = {"text": "SECRET-PROMPT-TEXT"}
@@ -45278,7 +46347,12 @@ class TestInvocationLogGuardrailEvidence:
 
         assert [row["Status"] for row in rows] == ["Failed"]
         detail = rows[0]["Finding_Details"]
-        assert "2 of the 3 guarded Converse call(s)" in detail
+        assert (
+            "2 of the 3 guarded Converse call(s) logged in "
+            "/aws/bedrock/model-invocation-logs in the last 24 hours sent their "
+            "latest user turn with no guardContent block"
+        ) in detail
+        assert "but sent an earlier user turn with text" not in detail
         assert "req-c-late (Converse anthropic.test)" in detail
         assert "req-c-blocked (Converse anthropic.test)" in detail
         for other in ("req-c-ok", "req-c-unguarded", "InvokeModel call(s)"):
@@ -45349,7 +46423,11 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["Passed"]
         detail = rows[0]["Finding_Details"]
         assert "every one of the 1 guarded Converse call(s)" in detail
-        assert "counts as guarded only when" in detail
+        assert (
+            "A Converse call counts as guarded when its CloudTrail event, joined by "
+            "requestID, names a guardrailConfig, or its logged response carries a "
+            "guardrail trace or intervention."
+        ) in detail
         assert "0 user turn(s) of the guarded Converse calls held only toolResult" in (
             detail
         )
@@ -45468,7 +46546,11 @@ class TestInvocationLogGuardrailEvidence:
         )
 
         assert [row["Status"] for row in rows] == ["N/A"]
-        assert "(object cap)" in rows[0]["Finding_Details"]
+        assert (
+            "past the first 1 (object cap; those logged from "
+            + _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:00:00Z")
+            + " on were not all read)"
+        ) in rows[0]["Finding_Details"]
 
     def test_s3_only_grounding_scores_are_read(self):
         rows = self._grounding(
@@ -45508,14 +46590,11 @@ class TestInvocationLogGuardrailEvidence:
             for qualifier in qualifiers
         ]
         body = {"messages": [{"role": "user", "content": blocks or [self.TEXT_BLOCK]}]}
-        if guardrail:
-            body["guardrailConfig"] = {
-                "guardrailIdentifier": guardrail,
-                "guardrailVersion": version,
-            }
-        return self._record(
+        record = self._record(
             request_id, "Converse", inp=body, out={"stopReason": "end_turn"}
         )
+        self._converse_event(request_id, guardrail, version)
+        return record
 
     def _grounding_guardrails(self, **overrides):
         return {
@@ -45581,9 +46660,10 @@ class TestInvocationLogGuardrailEvidence:
                 "(AccessDeniedException)",
             ),
             (
-                "no-config",
-                "names no guardrailConfig, so which guardrail version ran is not "
-                "logged",
+                "no-event",
+                "req-u (Converse anthropic.test), which has no CloudTrail event with "
+                "its requestID in cloudtrail:LookupEvents within 5 minutes of the "
+                "logged calls, so which guardrail ran is not known",
             ),
         ],
     )
@@ -45593,8 +46673,11 @@ class TestInvocationLogGuardrailEvidence:
             guardrails[("gr-g", "1")] = _make_client_error("AccessDeniedException")
             call = self._qualified("req-u", ["grounding_source", "query"])
         else:
+            # An intervened call with no event in event history: which
+            # guardrail version ran is not known.
             call = self._converse("req-u", [("user", [self.TEXT_BLOCK])], guarded=False)
             call["output"]["outputBodyJson"]["stopReason"] = "guardrail_intervened"
+            del self.converse_events["req-u"]
         rows = self._grounding(
             {
                 self.GROUNDING: [[self._scored("req-s", 0.4)]],
@@ -45695,9 +46778,9 @@ class TestInvocationLogGuardrailEvidence:
         [
             (
                 "bare",
-                "which sent no grounding tag and has no CloudTrail event with its "
-                "requestID in cloudtrail:LookupEvents within 5 minutes of the "
-                "logged calls, so which guardrail ran is not known",
+                "which has no CloudTrail event with its requestID in "
+                "cloudtrail:LookupEvents within 5 minutes of the logged calls, so "
+                "which guardrail ran is not known",
             ),
             (
                 "no-suffix",
@@ -45846,8 +46929,9 @@ class TestInvocationLogGuardrailEvidence:
         assert "20 of the 20 guarded InvokeModel call(s)" in detail
         assert (
             "10 untagged guarded InvokeModel call(s) were not matched to CloudTrail "
-            "within the first 2 LookupEvents pages of their window, so their "
-            "guardrail is not known: req-20 (InvokeModel anthropic.test)"
+            "within the LookupEvents page cap (2 pages per operation, 100 per "
+            "region run), so their guardrail is not known: req-20 (InvokeModel "
+            "anthropic.test)"
         ) in detail
         assert len(self.trail_requests) == 2
 
@@ -45909,6 +46993,255 @@ class TestInvocationLogGuardrailEvidence:
         )
 
         assert [row["Status"] for row in rows] == ["N/A"]
+
+    # GRD-02, GRD-09, DET-04: Bedrock logs no guardrailConfig in a Converse
+    # request body; the call's CloudTrail event carries it, joined by requestID.
+    def test_a_converse_call_guarded_only_in_cloudtrail_is_judged(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse("req-c-g", [("user", [self.TEXT_BLOCK])]),
+                        self._converse(
+                            "req-c-u", [("user", [self.TEXT_BLOCK])], guarded=False
+                        ),
+                    ]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 1 guarded Converse call(s)" in detail
+        assert "req-c-g (Converse anthropic.test)" in detail
+        assert "req-c-u" not in detail
+        assert {request["name"] for request in self.trail_requests} == {"Converse"}
+
+    def test_a_converse_stream_call_is_joined_on_its_own_event_name(self):
+        record = self._converse("req-s-g", [("user", [self.TEXT_BLOCK])])
+        record["operation"] = "ConverseStream"
+        event = self.converse_events.pop("req-s-g")
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [[record]],
+            },
+            trail={"Converse": [], "ConverseStream": [[event]]},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "req-s-g (ConverseStream anthropic.test)" in rows[0]["Finding_Details"]
+        assert [request["name"] for request in self.trail_requests] == [
+            "ConverseStream"
+        ]
+
+    def test_a_logged_intervention_needs_no_join(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse(
+                            "req-c-i",
+                            [("user", [self.GUARD_BLOCK])],
+                            guarded=False,
+                            intervened=True,
+                        )
+                    ]
+                ],
+            },
+            trail={"Converse": _make_client_error("AccessDeniedException")},
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "every one of the 1 guarded Converse call(s)"
+            in (rows[0]["Finding_Details"])
+        )
+        assert self.trail_requests == []
+
+    def test_a_converse_call_without_an_event_withholds_the_pass(self):
+        old = self._converse("req-c-old", [("user", [self.GUARD_BLOCK])])
+        recent = self._converse("req-c-new", [("user", [self.TEXT_BLOCK])])
+        recent["timestamp"] = (_dt.now(_tz.utc) - _td(minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        del self.converse_events["req-c-old"], self.converse_events["req-c-new"]
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [[old, recent]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "req-c-old (Converse anthropic.test), which has no CloudTrail event "
+            "with its requestID in cloudtrail:LookupEvents within 5 minutes"
+        ) in detail
+        assert (
+            "1 Converse call(s) logged within the last 15 minutes have no "
+            "CloudTrail event in event history yet, which lags the call, and were "
+            "not judged: req-c-new (Converse anthropic.test)."
+        ) in detail
+
+    def test_a_recent_unjoined_converse_call_is_counted_not_withheld(self):
+        recent = self._converse("req-c-new", [("user", [self.TEXT_BLOCK])])
+        recent["timestamp"] = (_dt.now(_tz.utc) - _td(minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        del self.converse_events["req-c-new"]
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])]), recent]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "every one of the 1 guarded Converse call(s)" in detail
+        assert "1 Converse call(s) logged within the last 15 minutes" in detail
+
+    def test_a_converse_call_past_the_join_budget_is_na_with_a_count(self):
+        joins = {"resolved": {}, "pages": bedrock_app.GROUNDING_JOIN_BUDGET_PAGES}
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse("req-c-a", [("user", [self.GUARD_BLOCK])]),
+                        self._converse("req-c-b", [("user", [self.GUARD_BLOCK])]),
+                    ]
+                ],
+            },
+            joins=joins,
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "2 Converse call(s) not matched to CloudTrail within the LookupEvents "
+            "page cap (50 pages per operation, 100 per region run), so whether a "
+            "guardrail ran is not known: req-c-a (Converse anthropic.test), "
+            "req-c-b (Converse anthropic.test)"
+        ) in rows[0]["Finding_Details"]
+        assert self.trail_requests == []
+
+    def test_br34_reuses_the_events_br27_joined(self):
+        joins = {"resolved": {}, "pages": 0}
+        pages = {
+            self.GROUNDING: [[self._scored("req-s", 0.4)]],
+            self.CONVERSE: [
+                [
+                    self._converse("req-c-g", [("user", [self.TEXT_BLOCK])]),
+                    self._converse(
+                        "req-c-u", [("user", [self.TEXT_BLOCK])], guarded=False
+                    ),
+                ]
+            ],
+        }
+        self._grounding(pages, guardrails={("g1", "1"): {"guardrail": {}}}, joins=joins)
+        first = len(self.trail_requests)
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                **pages,
+            },
+            joins=joins,
+        )
+
+        assert first == 1
+        assert self.trail_requests == []
+        assert joins["pages"] == 1
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "req-c-g (Converse anthropic.test)" in detail
+        assert "req-c-u" not in detail
+
+    def test_the_converse_guardrail_version_comes_from_the_event(self):
+        guardrails = self._grounding_guardrails()
+        guardrails[("gr-g", "3")] = {"guardrail": {"contentPolicy": {"filters": []}}}
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.CONVERSE: [
+                    [
+                        self._qualified("req-v3", [], version="3"),
+                        self._qualified("req-v1", [], version="1"),
+                    ]
+                ],
+            },
+            guardrails=guardrails,
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 1 guarded Converse call(s)" in detail
+        assert "req-v1 (Converse anthropic.test)" in detail
+        assert "req-v3" not in detail
+        assert sorted(set(self.guardrail_reads)) == [("gr-g", "1"), ("gr-g", "3")]
+
+    def test_an_s3_object_is_read_once_for_every_leg(self):
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [
+                        self._catch("req-catch"),
+                        self._guarded("req-ok", True),
+                        self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])]),
+                    ]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz": self._s3_body(
+                    [self._guarded("req-untagged", False)]
+                ),
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 2 guarded InvokeModel call(s)" in detail
+        assert "req-untagged" in detail
+        assert "1 prompt attack block(s)" in detail
+        assert sorted(self.s3_gets) == sorted(
+            [
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz",
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz",
+            ]
+        )
+
+    def test_a_capped_log_scan_names_the_time_it_stopped_at(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "INVOCATION_LOG_SCAN_MAX_PAGES", 1)
+        early = self._guarded("req-a", True)
+        early["timestamp"] = "2026-10-04T13:40:00Z"
+        late = self._guarded("req-b", True)
+        late["timestamp"] = "2026-10-04T13:45:07Z"
+        unread = self._guarded("req-c", False)
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[early, late], [unread]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "records matching amazon-bedrock-guardrailAction in "
+            "/aws/bedrock/model-invocation-logs past the first 2 (page cap; those logged from 2026-10-04T13:45:07Z on "
+            "were not all read)"
+        ) in rows[0]["Finding_Details"]
 
 
 class TestBR04AgentMemoryRetention:
@@ -47198,6 +48531,11 @@ class TestBR06InferenceTrace:
         home=None,
         trails=(),
         invocation=None,
+        subscriptions=(),
+        subscription_error=None,
+        streams=None,
+        catalogs=None,
+        catalog_error=None,
     ):
         events = events or {}
         cloudtrail = MagicMock()
@@ -47248,6 +48586,37 @@ class TestBR06InferenceTrace:
             return {"events": [{"message": json.dumps(r)} for r in records]}
 
         logs.filter_log_events.side_effect = filter_log_events
+        if subscription_error:
+            logs.describe_subscription_filters.side_effect = subscription_error
+        else:
+            logs.describe_subscription_filters.return_value = {
+                "subscriptionFilters": list(subscriptions)
+            }
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        def firehose_client(region):
+            client = MagicMock()
+
+            def describe(DeliveryStreamName):
+                stream = (streams or {})[DeliveryStreamName]
+                if isinstance(stream, Exception):
+                    raise stream
+                return {"DeliveryStreamDescription": stream}
+
+            client.describe_delivery_stream.side_effect = describe
+            return client
+
+        def athena_client(region):
+            client = MagicMock()
+            if catalog_error:
+                client.list_data_catalogs.side_effect = catalog_error
+            else:
+                client.list_data_catalogs.return_value = {
+                    "DataCatalogsSummary": (catalogs or {}).get(region, [])
+                }
+            return client
+
         glue_clients = {}
 
         def glue_client(region):
@@ -47281,7 +48650,11 @@ class TestBR06InferenceTrace:
         def client(service, region_name=None, **_):
             if service == "glue":
                 return glue_client(region_name)
-            return {"cloudtrail": cloudtrail, "logs": logs}[service]
+            if service == "firehose":
+                return firehose_client(region_name)
+            if service == "athena":
+                return athena_client(region_name)
+            return {"cloudtrail": cloudtrail, "logs": logs, "sts": sts}[service]
 
         coverage = {
             "names": [],
@@ -47449,7 +48822,9 @@ class TestBR06InferenceTrace:
         """
         Round 8 (MDL-07): this test passed on the Lake store alone. The
         invocation log records must be centralized too, so it gives them a
-        Glue table, and the CloudWatch-only shape is held.
+        Glue table. Round 9: the CloudWatch-only shape, held at N/A before, is
+        now followed, and a log group with no subscription and no Athena
+        connector fails.
         """
         rows, _ = self._run(
             stores={"management": ["event data store lake"]},
@@ -47462,11 +48837,14 @@ class TestBR06InferenceTrace:
             "bedrock.invocations in us-east-1" in rows[self.CENTRAL]["Finding_Details"]
         )
         rows, _ = self._run(stores={"management": ["event data store lake"]})
-        assert rows[self.CENTRAL]["Status"] == "N/A"
+        assert rows[self.CENTRAL]["Status"] == "Failed"
         assert (
-            f"the invocation logs go only to CloudWatch Logs group {self.GROUP}"
-            in rows[self.CENTRAL]["Finding_Details"]
-        )
+            f"the invocation logs go only to CloudWatch Logs group {self.GROUP}, "
+            "and none of its events reach a Glue table: CloudWatch Logs group "
+            f"{self.GROUP} has no subscription filter; no Athena data catalog in "
+            "eu-west-1, us-east-1 is a LAMBDA or FEDERATED connector that could "
+            "query the group"
+        ) in rows[self.CENTRAL]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "location, trail, status, text",
@@ -47580,6 +48958,8 @@ class TestBR06InferenceTrace:
     @pytest.mark.parametrize("unread", ["glue", "stores", "regions"])
     def test_an_unread_part_withholds_the_centralization_verdict(self, unread):
         rows, _ = self._run(
+            invocation=self.S3_INVOCATION,
+            glue={"us-east-1": self.INVOCATION_TABLE},
             glue_error=ClientError(
                 {"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetDatabases"
             )
@@ -47594,6 +48974,248 @@ class TestBR06InferenceTrace:
         )
         assert rows[self.CENTRAL]["Status"] == "N/A"
         assert "AccessDenied" in rows[self.CENTRAL]["Finding_Details"]
+
+    ARCHIVE_STREAM = "arn:aws:firehose:us-east-1:123456789012:deliverystream/inv"
+    ARCHIVE_ROOT = "s3://cw-archive/bedrock/"
+
+    @staticmethod
+    def _subscription(name="all", destination=None, **extra):
+        return {
+            "filterName": name,
+            "filterPattern": "",
+            "destinationArn": destination or TestBR06InferenceTrace.ARCHIVE_STREAM,
+            **extra,
+        }
+
+    @staticmethod
+    def _stream(status="ACTIVE", prefix="bedrock/!{timestamp:yyyy}/", **s3):
+        return {
+            "DeliveryStreamStatus": status,
+            "Destinations": [
+                {
+                    "ExtendedS3DestinationDescription": {
+                        "BucketARN": "arn:aws:s3:::cw-archive",
+                        "Prefix": prefix,
+                        **s3,
+                    }
+                }
+            ],
+        }
+
+    def _chain(self, location="s3://cw-archive/bedrock/", **kwargs):
+        kwargs.setdefault("subscriptions", [self._subscription()])
+        kwargs.setdefault("streams", {"inv": self._stream()})
+        rows, _ = self._run(
+            stores={"management": ["event data store lake"]},
+            glue={"us-east-1": {"arch": {"inv": location}}},
+            **kwargs,
+        )
+        return rows[self.CENTRAL]
+
+    @pytest.mark.parametrize(
+        "location",
+        ["s3://cw-archive/bedrock/", "s3://cw-archive/bedrock", "s3://cw-archive/"],
+    )
+    def test_a_subscription_to_a_glue_covered_firehose_path_is_central(self, location):
+        row = self._chain(location)
+        assert row["Status"] == "Passed"
+        assert (
+            f"Glue table(s) arch.inv in us-east-1 ({location}) sit over "
+            f"{self.ARCHIVE_ROOT}, where subscription filter 'all' through Firehose "
+            "stream 'inv' delivers every event of CloudWatch Logs group "
+            f"{self.GROUP}"
+        ) in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "location",
+        ["s3://cw-archive/bedrock/2026/", "s3://cw-archive/bed", "s3://other/"],
+    )
+    def test_a_glue_table_not_over_the_firehose_prefix_fails(self, location):
+        row = self._chain(location)
+        assert row["Status"] == "Failed"
+        assert (
+            "subscription filter 'all' through Firehose stream 'inv' delivers to "
+            f"{self.ARCHIVE_ROOT}, which no Glue table in eu-west-1, us-east-1 sits "
+            "over"
+        ) in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "subscription, stream, text",
+        [
+            (
+                {"filterPattern": "ERROR"},
+                None,
+                "subscription filter 'all' forwards only the events matching 'ERROR'",
+            ),
+            (
+                {"fieldSelectionCriteria": "$.modelId"},
+                None,
+                "subscription filter 'all' forwards only the events '$.modelId' "
+                "selects",
+            ),
+            (
+                {"applyOnTransformedLogs": True},
+                None,
+                "subscription filter 'all' forwards the transformed events",
+            ),
+            (
+                {},
+                {"status": "CREATING"},
+                "Firehose stream 'inv' is CREATING",
+            ),
+        ],
+    )
+    def test_a_chain_that_drops_or_rewrites_events_fails(
+        self, subscription, stream, text
+    ):
+        row = self._chain(
+            subscriptions=[self._subscription(**subscription)],
+            streams={"inv": self._stream(**(stream or {}))},
+        )
+        assert row["Status"] == "Failed"
+        assert text in row["Finding_Details"]
+
+    def test_one_full_subscription_beside_a_filtered_one_is_central(self):
+        row = self._chain(
+            subscriptions=[
+                self._subscription("errors", filterPattern="ERROR"),
+                self._subscription("all"),
+            ]
+        )
+        assert row["Status"] == "Passed"
+        assert "subscription filter 'all'" in row["Finding_Details"]
+
+    def test_a_non_s3_firehose_destination_fails(self):
+        row = self._chain(
+            streams={
+                "inv": {
+                    "DeliveryStreamStatus": "ACTIVE",
+                    "Destinations": [{"SplunkDestinationDescription": {}}],
+                }
+            }
+        )
+        assert row["Status"] == "Failed"
+        assert "delivers to a destination other than S3" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kwargs, text",
+        [
+            (
+                {
+                    "subscriptions": [
+                        {
+                            "filterName": "fn",
+                            "destinationArn": "arn:aws:lambda:us-east-1:"
+                            "123456789012:function:ship",
+                        }
+                    ]
+                },
+                "subscription filter 'fn' sends to arn:aws:lambda:us-east-1:"
+                "123456789012:function:ship, which this check does not follow",
+            ),
+            (
+                {
+                    "subscriptions": [
+                        {
+                            "filterName": "x",
+                            "destinationArn": "arn:aws:firehose:us-east-1:"
+                            "210987654321:deliverystream/inv",
+                        }
+                    ]
+                },
+                "in account 210987654321, whose destination is not read",
+            ),
+            (
+                {
+                    "streams": {
+                        "inv": ClientError(
+                            {"Error": {"Code": "AccessDenied", "Message": "x"}},
+                            "DescribeDeliveryStream",
+                        )
+                    }
+                },
+                "was not read with firehose:DescribeDeliveryStream",
+            ),
+            (
+                {
+                    "streams": {
+                        "inv": {
+                            "DeliveryStreamStatus": "ACTIVE",
+                            "Destinations": [
+                                {
+                                    "ExtendedS3DestinationDescription": {
+                                        "BucketARN": "arn:aws:s3:::cw-archive",
+                                        "Prefix": "bedrock/",
+                                        "ProcessingConfiguration": {
+                                            "Enabled": True,
+                                            "Processors": [{"Type": "Lambda"}],
+                                        },
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                },
+                "runs a Lambda record processor, whose output is not read",
+            ),
+            (
+                {
+                    "subscription_error": ClientError(
+                        {"Error": {"Code": "AccessDenied", "Message": "x"}},
+                        "DescribeSubscriptionFilters",
+                    )
+                },
+                "whose subscription filters were not read with "
+                "logs:DescribeSubscriptionFilters",
+            ),
+            (
+                {
+                    "subscriptions": [],
+                    "catalog_error": ClientError(
+                        {"Error": {"Code": "AccessDenied", "Message": "x"}},
+                        "ListDataCatalogs",
+                    ),
+                },
+                "Athena data catalogs in eu-west-1 were not listed with "
+                "athena:ListDataCatalogs",
+            ),
+        ],
+    )
+    def test_an_unfollowed_chain_is_not_judged(self, kwargs, text):
+        row = self._chain(**kwargs)
+        assert row["Status"] == "N/A"
+        assert (
+            f"the invocation logs go only to CloudWatch Logs group {self.GROUP}, "
+        ) in row["Finding_Details"]
+        assert text in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "catalog, status",
+        [
+            ({"CatalogName": "cw", "Type": "LAMBDA"}, "N/A"),
+            ({"CatalogName": "fed", "Type": "FEDERATED"}, "N/A"),
+            (
+                {
+                    "CatalogName": "ddb",
+                    "Type": "FEDERATED",
+                    "ConnectionType": "DYNAMODB",
+                },
+                "Failed",
+            ),
+            ({"CatalogName": "AwsDataCatalog", "Type": "GLUE"}, "Failed"),
+        ],
+    )
+    def test_an_athena_connector_in_any_region_holds_a_missing_subscription(
+        self, catalog, status
+    ):
+        row = self._chain(subscriptions=[], catalogs={"eu-west-1": [catalog]})
+        assert row["Status"] == status
+        if status == "N/A":
+            assert (
+                f"Athena data catalog '{catalog['CatalogName']}' in eu-west-1 is a "
+                f"{catalog['Type']} connector whose source is not read, so it may "
+                f"query CloudWatch Logs group {self.GROUP}"
+            ) in row["Finding_Details"]
 
 
 def test_data_path_buckets_are_read_once_a_region_and_handed_out_as_copies():

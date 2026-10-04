@@ -143,6 +143,7 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockAssessmentReadsPolicy2": {
+        "athena:ListDataCatalogs",
         "bedrock:ListCustomModelDeployments",
         "bedrock:ListPromptRouters",
         "bedrock:ListTagsForResource",
@@ -1319,13 +1320,14 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
         for statement in document["Statement"]
         for action in statement["Action"]
     )
-    # ListMicrovms, ListRoles, ListCustomModelDeployments and
-    # ListPromptRouters have no resource type; GetMicrovm authorizes on
+    # ListMicrovms, ListRoles, ListCustomModelDeployments, ListPromptRouters
+    # and ListDataCatalogs have no resource type; GetMicrovm authorizes on
     # microvmImage, in this account or the AWS-managed "aws" account;
     # ListBucketVersions authorizes on the bucket resource type, and
     # ListTagsForResource on each Bedrock resource type it reads.
     assert grants == sorted(
         [
+            ("ManagedReadsOnWildcard2", "Allow", "athena:ListDataCatalogs", '"*"'),
             (
                 "BedrockOwnerTagRead2",
                 "Allow",
