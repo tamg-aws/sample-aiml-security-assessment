@@ -143,6 +143,10 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockAssessmentReadsPolicy2": {
+        "bedrock:ListCustomModelDeployments",
+        "bedrock:ListPromptRouters",
+        "bedrock:ListTagsForResource",
+        "iam:ListRoles",
         "lambda:GetMicrovm",
         "lambda:ListMicrovms",
         "s3:ListBucketVersions",
@@ -1315,11 +1319,40 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
         for statement in document["Statement"]
         for action in statement["Action"]
     )
-    # ListMicrovms has no resource type; GetMicrovm authorizes on
+    # ListMicrovms, ListRoles, ListCustomModelDeployments and
+    # ListPromptRouters have no resource type; GetMicrovm authorizes on
     # microvmImage, in this account or the AWS-managed "aws" account;
-    # ListBucketVersions authorizes on the bucket resource type.
+    # ListBucketVersions authorizes on the bucket resource type, and
+    # ListTagsForResource on each Bedrock resource type it reads.
     assert grants == sorted(
         [
+            (
+                "BedrockOwnerTagRead2",
+                "Allow",
+                "bedrock:ListTagsForResource",
+                json.dumps(
+                    [
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                            f"${{AWS::AccountId}}:{resource_type}/*"
+                        }
+                        for resource_type in (
+                            "automated-reasoning-policy",
+                            "custom-model-deployment",
+                            "prompt-router",
+                        )
+                    ],
+                    sort_keys=True,
+                ),
+            ),
+            (
+                "ManagedReadsOnWildcard2",
+                "Allow",
+                "bedrock:ListCustomModelDeployments",
+                '"*"',
+            ),
+            ("ManagedReadsOnWildcard2", "Allow", "bedrock:ListPromptRouters", '"*"'),
+            ("ManagedReadsOnWildcard2", "Allow", "iam:ListRoles", '"*"'),
             (
                 "LogBucketVersionsRead",
                 "Allow",

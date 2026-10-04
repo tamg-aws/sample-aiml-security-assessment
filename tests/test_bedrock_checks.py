@@ -49,6 +49,14 @@ _spec.loader.exec_module(bedrock_app)
 
 
 @pytest.fixture(autouse=True)
+def _fresh_data_path_buckets():
+    """Each test mocks its own clients, so no data path read carries over."""
+    bedrock_app._AI_DATA_PATH_BUCKETS_BY_REGION.clear()
+    yield
+    bedrock_app._AI_DATA_PATH_BUCKETS_BY_REGION.clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_other_enabled_regions():
     """Most tests mock one Region's clients, so the enabled-Region sweep for
     event data stores reads no other Region unless a test patches it again."""
@@ -1190,10 +1198,11 @@ class TestBR02WorkloadConnectivity:
             "associations and VPC-mode AgentCore runtime versions are read." in detail
         )
         assert (
-            "An EKS pod that takes a role through IAM roles for service accounts "
-            "is not read, because that binding is a service account annotation "
-            "held by the Kubernetes API, which this assessment does not call." in detail
+            "A role an EKS pod takes through IAM roles for service accounts is read "
+            "as every role whose trust policy allows sts:AssumeRoleWithWebIdentity "
+            "to the cluster's OIDC provider, in the cluster's VPC." in detail
         )
+        assert "Kubernetes API" not in detail
         assert "not granted" not in detail
         assert "ceiling" not in detail.lower()
         for action in (
@@ -1733,8 +1742,15 @@ class TestBR02WorkloadConnectivity:
         inference_components=None,
         models=None,
         eks_clusters=None,
+        container_instances=None,
+        iam_roles=None,
+        lambda_pages=None,
     ):
         """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired.
+
+        `container_instances` maps a container instance ARN to (EC2 instance id,
+        subnet), `iam_roles` is what iam:ListRoles returns (or an error), and
+        `lambda_pages` the ListFunctions pages.
 
         `describe_failures` names services DescribeServices returns as failures.
         `tasks` maps a cluster to the tasks ListTasks returns, `endpoint_configs`
@@ -1743,12 +1759,13 @@ class TestBR02WorkloadConnectivity:
         `eks_clusters` a cluster name to its vpcId and pod identity associations.
         """
         lambda_client = MagicMock()
-        lambda_client.get_paginator.return_value.paginate.return_value = [
-            {"Functions": []}
-        ]
+        lambda_client.get_paginator.return_value.paginate.return_value = (
+            lambda_pages or [{"Functions": []}]
+        )
         subnets = subnets if subnets is not None else {"subnet-1": "vpc-1"}
         ec2_client = MagicMock()
         subnet_calls = []
+        container_instances = container_instances or {}
 
         def paginator(name):
             pager = MagicMock()
@@ -1768,7 +1785,16 @@ class TestBR02WorkloadConnectivity:
 
                 pager.paginate.side_effect = paginate
             else:
-                pager.paginate.return_value = [{"Reservations": []}]
+
+                def describe_instances(InstanceIds=()):
+                    found = [
+                        {"InstanceId": instance, "SubnetId": subnet}
+                        for instance, subnet in container_instances.values()
+                        if instance in InstanceIds and subnet
+                    ]
+                    return [{"Reservations": [{"Instances": found}]}]
+
+                pager.paginate.side_effect = describe_instances
             return pager
 
         ec2_client.get_paginator.side_effect = paginator
@@ -1835,6 +1861,16 @@ class TestBR02WorkloadConnectivity:
 
         ecs.list_tasks.side_effect = list_tasks
         ecs.describe_tasks.side_effect = describe_tasks
+        ecs.describe_container_instances.side_effect = lambda **kwargs: {
+            "containerInstances": [
+                {
+                    "containerInstanceArn": arn,
+                    "ec2InstanceId": container_instances[arn][0],
+                }
+                for arn in kwargs["containerInstances"]
+                if arn in container_instances and container_instances[arn][0]
+            ]
+        }
         sagemaker = MagicMock()
         if isinstance(notebooks, Exception):
             sagemaker.list_notebook_instances.side_effect = notebooks
@@ -1913,6 +1949,11 @@ class TestBR02WorkloadConnectivity:
                 "cluster": {
                     "name": name,
                     "resourcesVpcConfig": {"vpcId": outcome["vpc"]},
+                    **(
+                        {"identity": {"oidc": {"issuer": outcome["issuer"]}}}
+                        if outcome.get("issuer")
+                        else {}
+                    ),
                 }
             }
 
@@ -1950,10 +1991,17 @@ class TestBR02WorkloadConnectivity:
         agentcore.get_agent_runtime.side_effect = lambda **kwargs: runtime_details[
             (kwargs["agentRuntimeId"], kwargs["agentRuntimeVersion"])
         ]
+        iam = MagicMock()
+        if isinstance(iam_roles, Exception):
+            iam.get_paginator.return_value.paginate.side_effect = iam_roles
+        else:
+            iam.get_paginator.return_value.paginate.return_value = [
+                {"Roles": list(iam_roles or [])}
+            ]
         clients = {
             "lambda": lambda_client,
             "ec2": ec2_client,
-            "iam": MagicMock(),
+            "iam": iam,
             "ecs": ecs,
             "sagemaker": sagemaker,
             "eks": eks,
@@ -1965,7 +2013,7 @@ class TestBR02WorkloadConnectivity:
         ):
             inventory = bedrock_app.get_bedrock_vpc_workload_inventory(self.REGION)
         self.ecs, self.sagemaker, self.subnet_calls = ecs, sagemaker, subnet_calls
-        self.eks = eks
+        self.eks, self.iam, self.lambda_client = eks, iam, lambda_client
         return inventory
 
     @staticmethod
@@ -2105,8 +2153,8 @@ class TestBR02WorkloadConnectivity:
             ("ECS task", "a/t2", "vpc-1", "Override"),
         ]
         assert inventory["errors"] == [
-            "ECS task 'a/t3' uses no awsvpc subnets, so the VPC of the container "
-            "instance it runs on was not read"
+            "ECS task 'a/t3' uses no awsvpc subnets and names no container "
+            "instance, so the VPC of the container instance it runs on was not read"
         ]
         assert [c.kwargs for c in self.ecs.list_tasks.call_args_list] == [
             {"cluster": self.CLUSTER_A, "maxResults": 100},
@@ -2474,9 +2522,180 @@ class TestBR02WorkloadConnectivity:
         )
         assert self._names(inventory) == [("ECS service", "api", "vpc-1", "ApiTask")]
         assert inventory["errors"] == [
-            "ECS service 'bridge' uses no awsvpc subnets, so the VPC of the "
-            "container instances its tasks run on was not read"
+            "ECS service 'bridge' uses no awsvpc subnets and names no container "
+            "instance, so the VPC of the container instances its tasks run on was "
+            "not read"
         ]
+
+    # Round 9 (NET-01, NET-02): a service or task that does not use awsvpc
+    # networking read only N/A, although ecs:DescribeContainerInstances names
+    # the EC2 instance whose network it runs in.
+    def test_br02_a_bridge_service_and_task_run_in_their_instance_vpc(self):
+        ci = "arn:aws:ecs:us-east-1:123456789012:container-instance/a/{}"
+        bridge_task = self._task("b1", "service:bridge", subnet=None)
+        bridge_task["containerInstanceArn"] = ci.format("ci-1")
+        host_task = self._task("t4", "family:batch", subnet=None)
+        host_task["containerInstanceArn"] = ci.format("ci-2")
+        external_task = self._task("t5", "family:batch", subnet=None)
+        external_task["containerInstanceArn"] = ci.format("ci-ext")
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A],
+            services={
+                self.CLUSTER_A: [
+                    self._service("bridge", "td-api:1", subnets=None),
+                    self._service("idle", "td-api:1", subnets=None),
+                ]
+            },
+            tasks={self.CLUSTER_A: [bridge_task, host_task, external_task]},
+            task_roles={
+                "td-api:1": "arn:aws:iam::123456789012:role/ApiTask",
+                "td-batch:1": "arn:aws:iam::123456789012:role/BatchTask",
+            },
+            container_instances={
+                ci.format("ci-1"): ("i-1", "subnet-2"),
+                ci.format("ci-2"): ("i-2", "subnet-1"),
+                ci.format("ci-ext"): (None, None),
+            },
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+        )
+
+        assert self._names(inventory) == [
+            ("ECS service", "bridge", "vpc-2", "ApiTask"),
+            ("ECS task", "a/t4", "vpc-1", "BatchTask"),
+        ]
+        assert inventory["errors"] == [
+            "ECS service 'idle' uses no awsvpc subnets and names no container "
+            "instance, so the VPC of the container instances its tasks run on was "
+            "not read",
+            "ECS task 'a/t5' uses no awsvpc subnets, and the VPC of the container "
+            "instance it runs on was not read: container instance "
+            f"{ci.format('ci-ext')} returned no EC2 instance from "
+            "ecs:DescribeContainerInstances",
+        ]
+        assert {
+            arn
+            for call in self.ecs.describe_container_instances.call_args_list
+            for arn in call.kwargs["containerInstances"]
+        } == {ci.format("ci-1"), ci.format("ci-2"), ci.format("ci-ext")}
+        assert all(
+            call.kwargs["cluster"] == self.CLUSTER_A
+            for call in self.ecs.describe_container_instances.call_args_list
+        )
+
+    # Round 9 (NET-01, NET-02): ListFunctions ran without FunctionVersion ALL,
+    # so a published version an alias routes to, with its own VpcConfig and
+    # role, was never read.
+    def test_br02_every_published_lambda_version_is_a_workload(self):
+        def function(version, vpc, role):
+            return {
+                "FunctionName": "fn",
+                "Version": version,
+                "Role": f"arn:aws:iam::123456789012:role/{role}",
+                "VpcConfig": {"VpcId": vpc, "SubnetIds": [f"subnet-{vpc}"]}
+                if vpc
+                else {},
+            }
+
+        inventory = self._inventory(
+            lambda_pages=[
+                {"Functions": [function("$LATEST", "vpc-1", "NewRole")]},
+                {"Functions": [function("3", None, "OldRole")]},
+            ]
+        )
+
+        assert [
+            (w["name"], w["vpc_id"], w["role"])
+            for w in inventory["workloads"]
+            if w["kind"] == "Lambda function"
+        ] == [("fn", "vpc-1", "NewRole"), ("fn:3", None, "OldRole")]
+        self.lambda_client.get_paginator.assert_any_call("list_functions")
+        self.lambda_client.get_paginator.return_value.paginate.assert_any_call(
+            FunctionVersion="ALL"
+        )
+
+    # Round 9 (NET-02): a role an EKS pod takes through IAM roles for service
+    # accounts was named a ceiling, but its trust policy names the cluster's
+    # OIDC provider, whose issuer eks:DescribeCluster returns with the VPC.
+    def test_br02_irsa_roles_run_in_their_cluster_vpc(self):
+        from urllib.parse import quote
+
+        def trust(issuer_id, action="sts:AssumeRoleWithWebIdentity"):
+            return {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Federated": "arn:aws:iam::123456789012:oidc-provider/"
+                            f"oidc.eks.us-east-1.amazonaws.com/id/{issuer_id}"
+                        },
+                        "Action": action,
+                    }
+                ],
+            }
+
+        issuer = "https://oidc.eks.us-east-1.amazonaws.com/id/{}"
+        inventory = self._inventory(
+            eks_clusters={
+                "prod": {
+                    "vpc": "vpc-1",
+                    "associations": [],
+                    "issuer": issuer.format("A"),
+                },
+                "dev": {
+                    "vpc": "vpc-2",
+                    "associations": [],
+                    "issuer": issuer.format("B"),
+                },
+                "old": {"vpc": "vpc-3", "associations": []},
+            },
+            iam_roles=[
+                {
+                    "RoleName": "ProdPods",
+                    "AssumeRolePolicyDocument": quote(json.dumps(trust("A"))),
+                },
+                {"RoleName": "OtherPods", "AssumeRolePolicyDocument": trust("Z")},
+                {
+                    "RoleName": "NotWebIdentity",
+                    "AssumeRolePolicyDocument": trust("A", "sts:AssumeRole"),
+                },
+                {"RoleName": "DevPods", "AssumeRolePolicyDocument": trust("B")},
+            ],
+        )
+
+        assert inventory["errors"] == []
+        assert self._names(inventory) == [
+            ("EKS IAM role for service accounts", "prod ProdPods", "vpc-1", "ProdPods"),
+            ("EKS IAM role for service accounts", "dev DevPods", "vpc-2", "DevPods"),
+        ]
+        self.iam.get_paginator.assert_called_once_with("list_roles")
+
+    def test_br02_unread_irsa_roles_are_named(self):
+        inventory = self._inventory(
+            eks_clusters={
+                "prod": {
+                    "vpc": "vpc-1",
+                    "associations": [],
+                    "issuer": "https://oidc.eks.us-east-1.amazonaws.com/id/A",
+                },
+                "old": {"vpc": "vpc-3", "associations": []},
+            },
+            iam_roles=_make_client_error("AccessDenied"),
+        )
+
+        assert self._names(inventory) == []
+        assert inventory["errors"] == [
+            "the IAM roles that EKS cluster(s) prod give pods through IAM roles for "
+            "service accounts were not read with iam:ListRoles (AccessDenied)"
+        ]
+
+    def test_br02_no_oidc_issuer_reads_no_roles(self):
+        inventory = self._inventory(
+            eks_clusters={"old": {"vpc": "vpc-3", "associations": []}}
+        )
+
+        assert inventory["errors"] == []
+        self.iam.get_paginator.assert_not_called()
 
     def test_br02_notebooks_on_every_page_carry_their_vpc_and_role(self):
         inventory = self._inventory(
@@ -3113,6 +3332,8 @@ class TestBR04LoggingConfiguration:
             return pages[index] if index < len(pages) else {"logGroups": []}
 
         mock_logs.describe_log_groups.side_effect = describe_log_groups
+        # No event older than the retention period: deletion has run.
+        mock_logs.filter_log_events.return_value = {"events": []}
 
         mock_s3 = MagicMock()
         if lifecycle is None:
@@ -3428,6 +3649,97 @@ class TestBR04LoggingConfiguration:
         )
         assert [f["Status"] for f in retention] == ["Passed"]
         assert "expires events after 30 day(s)" in retention[0]["Finding_Details"]
+
+    def _thirty_day_group_retention(self, mock_client, filter_log_events):
+        factory, clients = self._retention_clients(
+            {
+                "s3Config": {},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+            },
+            log_group_pages=[
+                {
+                    "logGroups": [
+                        {
+                            "logGroupName": "/aws/bedrock/invocations",
+                            "retentionInDays": 30,
+                        }
+                    ]
+                }
+            ],
+        )
+        if isinstance(filter_log_events, Exception):
+            clients["logs"].filter_log_events.side_effect = filter_log_events
+        elif isinstance(filter_log_events, list):
+            clients["logs"].filter_log_events.side_effect = filter_log_events
+        else:
+            clients["logs"].filter_log_events.return_value = filter_log_events
+        mock_client.side_effect = factory
+        return clients, self._retention_findings(
+            extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        )
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_a_log_group_holding_an_expired_event_fails(
+        self, mock_footprint, mock_client
+    ):
+        # retentionInDays 30, but an event from 40 days ago is still returned.
+        written = _dt.now(_tz.utc) - _td(days=40)
+        clients, retention = self._thirty_day_group_retention(
+            mock_client,
+            {"events": [{"timestamp": int(written.timestamp() * 1000)}]},
+        )
+
+        request = clients["logs"].filter_log_events.call_args.kwargs
+        assert request["startTime"] == 0
+        assert request["limit"] == 1
+        assert "filterPattern" not in request
+        cutoff = _dt.now(_tz.utc) - _td(days=30, hours=72)
+        assert abs(request["endTime"] - cutoff.timestamp() * 1000) < 60_000
+        assert [f["Status"] for f in retention] == ["Failed"]
+        details = retention[0]["Finding_Details"]
+        assert f"returns an event from {written.date().isoformat()}" in details
+        assert "past its 30-day retentionInDays plus 72 hours" in details
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_a_log_group_with_no_expired_event_passes_on_that_evidence(
+        self, mock_footprint, mock_client
+    ):
+        # The first page holds nothing but a token; the second ends the search.
+        _, retention = self._thirty_day_group_retention(
+            mock_client, [{"events": [], "nextToken": "t"}, {"events": []}]
+        )
+
+        assert [f["Status"] for f in retention] == ["Passed"]
+        assert (
+            "returns no event older than its 30-day retentionInDays plus 72 hours"
+            in retention[0]["Finding_Details"]
+        )
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_an_unread_or_unfinished_deletion_search_is_not_a_pass(
+        self, mock_footprint, mock_client
+    ):
+        _, denied = self._thirty_day_group_retention(
+            mock_client,
+            ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+                "FilterLogEvents",
+            ),
+        )
+        assert [f["Status"] for f in denied] == ["N/A"]
+        assert "whether deletion has run was not read" in denied[0]["Finding_Details"]
+
+        _, unfinished = self._thirty_day_group_retention(
+            mock_client, {"events": [], "nextToken": "more"}
+        )
+        assert [f["Status"] for f in unfinished] == ["N/A"]
+        assert (
+            f"after {bedrock_app.LOG_DELETION_MAX_PAGES} pages"
+            in unfinished[0]["Finding_Details"]
+        )
 
     @patch("boto3.client")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
@@ -33956,6 +34268,84 @@ class TestBR51AIUserConsoleMFA:
             "HopRole"
         ) == 1
 
+    # IAM-02: a ForAllValues:Bool aws:MultiFactorAuthPresent true condition
+    # was credited as requiring MFA, but it is true when the key is absent, so
+    # a user calling with long-term keys assumed the role. ForAnyValue: is false
+    # on an absent key and stays credited, on a direct trust and on a chain hop.
+    def test_br51_for_all_values_mfa_trust_is_not_credited(self):
+        cache = {"role_permissions": {}, "user_permissions": {}}
+        write = [
+            _customer_policy(
+                "Write", {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
+            )
+        ]
+        names = (
+            "AllRole",
+            "AnyRole",
+            "AllChainRole",
+            "AnyChainRole",
+            "AllHopChainRole",
+            "AnyHopChainRole",
+        )
+        for name in names:
+            cache["role_permissions"][name] = _identity(attached=write)
+        all_mfa = {"ForAllValues:Bool": {"aws:MultiFactorAuthPresent": "true"}}
+        any_mfa = {"ForAnyValue:Bool": {"aws:MultiFactorAuthPresent": "true"}}
+
+        def trust(principal, condition=None):
+            statement = {
+                "Sid": "Trust",
+                "Effect": "Allow",
+                "Principal": {"AWS": principal},
+                "Action": "sts:AssumeRole",
+            }
+            if condition:
+                statement["Condition"] = condition
+            return _policy(statement)
+
+        account = "arn:aws:iam::123456789012"
+        trusts = {
+            "AllRole": trust(f"{account}:user/dev", all_mfa),
+            "AnyRole": trust(f"{account}:user/dev", any_mfa),
+            "AllChainRole": trust(f"{account}:role/OpenHop", all_mfa),
+            "AnyChainRole": trust(f"{account}:role/OpenHop", any_mfa),
+            "AllHopChainRole": trust(f"{account}:role/AllHop"),
+            "AnyHopChainRole": trust(f"{account}:role/AnyHop"),
+            "OpenHop": trust(f"{account}:user/dev"),
+            "AnyHop": trust(f"{account}:user/dev", any_mfa),
+            "AllHop": trust(f"{account}:user/dev", all_mfa),
+        }
+        iam = MagicMock()
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "Arn": f"{account}:role/{RoleName}",
+                "AssumeRolePolicyDocument": trusts[RoleName],
+            }
+        }
+        iam.list_instances.return_value = {"Instances": []}
+        with patch("boto3.client", return_value=iam):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+            )
+
+        failed = {
+            r["Finding_Details"].split("'")[1]: r["Finding_Details"]
+            for r in rows
+            if r["Status"] == "Failed"
+        }
+        assert sorted(failed) == ["AllChainRole", "AllHopChainRole", "AllRole"]
+        assert (
+            "trusts arn:aws:iam::123456789012:user/dev with no Bool "
+            "aws:MultiFactorAuthPresent true condition"
+        ) in failed["AllRole"]
+        assert "trusts role 'OpenHop'" in failed["AllChainRole"]
+        assert (
+            "trusts role 'AllHop', whose statement 'Trust'" in failed["AllHopChainRole"]
+        )
+        summary = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert "3 of the 6 in-scope IAM role(s)" in summary[0]["Finding_Details"]
+        assert "AnyChainRole, AnyHopChainRole, AnyRole" in summary[0]["Finding_Details"]
+
     def test_br51_unread_principal_stops_a_passed_row(self):
         cache = _ai_user_cache()
         cache["cache_schema_version"] = 2
@@ -35145,6 +35535,9 @@ class TestBR53ResourceOwnerTag:
             "list_model_customization_jobs": "modelCustomizationJobSummaries",
             "list_evaluation_jobs": "jobSummaries",
             "list_marketplace_model_endpoints": "marketplaceModelEndpoints",
+            "list_automated_reasoning_policies": "automatedReasoningPolicySummaries",
+            "list_custom_model_deployments": "modelDeploymentSummaries",
+            "list_prompt_routers": "promptRouterSummaries",
         }
         for operation, key in result_keys.items():
             client = (
@@ -35328,6 +35721,76 @@ class TestBR53ResourceOwnerTag:
         tagging.get_resources.assert_called_once_with(
             ResourceARNList=[self.GUARDRAIL_OWNED]
         )
+
+    # Round 9 (GOV-02): automated reasoning policies, custom model deployments
+    # and custom prompt routers were never listed, so a never-tagged one went
+    # unseen while the Bedrock row passed. Their tags are read from
+    # bedrock:ListTagsForResource, and an AWS default prompt router is not
+    # listed.
+    def test_br53_reasoning_policies_deployments_and_routers_are_judged(self):
+        policy = self.JOB.format("automated-reasoning-policy", "p-owned")
+        deployment = self.JOB.format("custom-model-deployment", "d-bare")
+        router = self.JOB.format("prompt-router", "r-owned")
+        result, rows, tagging = self._run(
+            {
+                "list_guardrails": [{"arn": self.GUARDRAIL_OWNED}],
+                "list_automated_reasoning_policies": [{"policyArn": policy}],
+                "list_custom_model_deployments": [
+                    {"customModelDeploymentArn": deployment}
+                ],
+                "list_prompt_routers": [{"promptRouterArn": router}],
+            },
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                }
+            ],
+            job_tags={
+                policy: [{"key": "owner", "value": "risk-team"}],
+                deployment: [],
+                router: [{"key": "Owner", "value": "routing-team"}],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            f"Bedrock custom model deployment {deployment} has no owner tag"
+            in rows[0]["Finding_Details"]
+        )
+        assert "3 of the 4 Bedrock resource(s)" in rows[1]["Finding_Details"]
+        tagging.get_resources.assert_called_once_with(
+            ResourceARNList=[self.GUARDRAIL_OWNED]
+        )
+        assert {
+            call.kwargs["resourceARN"]
+            for call in self.bedrock.list_tags_for_resource.call_args_list
+        } == {policy, deployment, router}
+        self.bedrock.list_prompt_routers.assert_called_once_with(
+            maxResults=100, type="custom"
+        )
+
+    def test_br53_an_unread_router_list_downgrades_the_pass(self):
+        _, rows, _ = self._run(
+            {"list_guardrails": [{"arn": self.GUARDRAIL_OWNED}]},
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                }
+            ],
+            list_errors={
+                "list_prompt_routers": _make_client_error("AccessDeniedException"),
+                "list_automated_reasoning_policies": _make_client_error(
+                    "AccessDeniedException"
+                ),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert (
+            "automated reasoning policies: AccessDeniedException"
+            in (rows[0]["Finding_Details"])
+        )
+        assert "prompt routers: AccessDeniedException" in rows[0]["Finding_Details"]
 
     def test_br53_an_unread_job_list_downgrades_the_pass(self):
         _, rows, _ = self._run(
@@ -38345,6 +38808,7 @@ class TestBR04RetentionDepth:
         logs.describe_log_groups.return_value = {
             "logGroups": [{"logGroupName": "/bedrock/logs", "retentionInDays": 30}]
         }
+        logs.filter_log_events.return_value = {"events": []}
         sts = MagicMock()
         sts.get_caller_identity.return_value = {"Account": "111122223333"}
 
@@ -45701,23 +46165,59 @@ class TestBR04SageMakerInferenceRetention:
         )
         assert [r["Status"] for r in rows] == ["Passed"]
 
-    def test_a_replicated_destination_is_held_and_its_replica_judged(self):
+    def test_a_replicated_destination_is_credited_and_its_replica_judged(self):
+        # ReplicationStatus is not readable without s3:GetObject, but an object
+        # held back from expiry would be older than the rule, and none is.
         rows = self._rows(
             [self.CAPTURE],
             {
-                "capture-a": {"rules": [self._rule("")], "replicas": ["copy-c"]},
+                "capture-a": {
+                    "rules": [self._rule("")],
+                    "replicas": ["copy-c"],
+                    "objects": {"capture/ep1/AllTraffic/2026/09/01/00/a.jsonl": 5},
+                },
                 "copy-c": {"rules": None},
             },
         )
-        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
         assert (
             "Replica S3 bucket (copied from 'capture-a') 'copy-c'"
             in rows[0]["Finding_Details"]
         )
+        details = rows[1]["Finding_Details"]
         assert (
-            "the ReplicationStatus of the objects under 'capture/ep1/' was not read"
-            in rows[1]["Finding_Details"]
+            "The ReplicationStatus of the objects under 'capture/ep1/' was not "
+            "read, because s3:GetObject is granted only on invocation log "
+            "records, but" in details
         )
+        assert "copies it to 'copy-c'" in details
+
+    def test_a_replicated_destination_holding_an_overdue_object_is_not_credited(
+        self,
+    ):
+        # The invocation log ReplicationStatus probe needs s3:GetObject, which
+        # is not granted on captured objects, so it never runs on them.
+        with patch.object(
+            bedrock_app,
+            "_replication_held_log_objects",
+            wraps=bedrock_app._replication_held_log_objects,
+        ) as probe:
+            rows = self._rows(
+                [self.CAPTURE],
+                {
+                    "capture-a": {
+                        "rules": [self._rule("")],
+                        "replicas": ["copy-c"],
+                        "objects": {"capture/ep1/AllTraffic/2026/08/01/00/a.jsonl": 45},
+                    },
+                    "copy-c": {"rules": [self._rule("")]},
+                },
+            )
+        probe.assert_not_called()
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "'capture-a'" in rows[0]["Finding_Details"]
+        assert "copies it to" not in rows[1]["Finding_Details"]
+        assert "'copy-c' lifecycle" in rows[1]["Finding_Details"]
 
     def test_an_overdue_capture_object_fails_beside_an_on_schedule_one(self):
         rows = self._rows(
@@ -46161,14 +46661,22 @@ class TestBR57AgentRoleScope:
         "action, resource",
         [
             ("s3:GetObject", "arn:aws:s3:::kb-docs/*"),
-            ("s3:GetObject", "arn:aws:s3:::kb-*/*"),
-            ("dynamodb:GetItem", "arn:aws:dynamodb:*:123456789012:table/orders"),
-            ("lambda:InvokeFunction", "arn:aws:lambda:*:*:function:tool-*"),
+            (
+                "dynamodb:GetItem",
+                "arn:aws:dynamodb:us-east-1:123456789012:table/orders",
+            ),
+            (
+                "lambda:InvokeFunction",
+                "arn:aws:lambda:us-east-1:123456789012:function:tool-a:*",
+            ),
             (
                 "execute-api:Invoke",
                 "arn:aws:execute-api:us-east-1:123456789012:abc123/*",
             ),
-            ("bedrock:InvokeModel", "arn:aws:bedrock:*::foundation-model/anthropic.*"),
+            (
+                "bedrock:InvokeModel",
+                "arn:aws:bedrock:*::foundation-model/anthropic.claude-v2",
+            ),
             ("ec2:DescribeInstances", "*"),
             (["xray:PutTraceSegments", "sts:GetCallerIdentity"], "*"),
         ],
@@ -46202,6 +46710,88 @@ class TestBR57AgentRoleScope:
             "bedrock:listagents" in rows[0]["Finding_Details"]
         )
         assert "Actions outside this set" not in rows[0]["Finding_Details"]
+
+    # Round 9 (IAM-05): a partial name wildcard and a wildcard in the
+    # partition, service, account, Region or resource type were credited as
+    # scoped, although each reaches every resource the pattern matches. Each
+    # case moves one segment off the scoped ARN the passing test keeps.
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:*:dynamodb:us-east-1:123456789012:table/orders",
+            "arn:aws:dynamo*:us-east-1:123456789012:table/orders",
+            "arn:aws:dynamodb:*:123456789012:table/orders",
+            "arn:aws:dynamodb:us-east-1:*:table/orders",
+            "arn:aws:dynamodb:us-east-1:123456789012:tab*/orders",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/ord*",
+            "arn:aws:s3:::kb-*/*",
+            "arn:aws:lambda:us-east-1:123456789012:function:tool-*",
+            "arn:aws:bedrock:*::foundation-model/anthropic.*",
+        ],
+    )
+    def test_a_wildcard_in_any_arn_segment_fails(self, resource):
+        def role(statement):
+            return _identity(inline=[{"name": "p", "document": _policy(statement)}])
+
+        _, rows = self._run(
+            {
+                "wide": role(self._allow("dynamodb:GetItem", resource, sid="Wide")),
+                "tight": role(
+                    self._allow(
+                        "dynamodb:GetItem",
+                        "arn:aws:dynamodb:us-east-1:123456789012:table/orders",
+                    )
+                ),
+            },
+            {
+                "wide": ["Bedrock agent 'w' version 1"],
+                "tight": ["Bedrock agent 't' version 1"],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert self._role("wide") in detail and resource in detail
+        assert self._role("tight") not in detail
+
+    # Round 9 (IAM-05): the scope population kept only labels starting
+    # "Bedrock agent ", so a Lambda MicroVM agent role was never judged and a
+    # MicroVM listing error never held the Passed row.
+    def test_a_lambda_microvm_agent_role_is_judged(self):
+        def role(statement):
+            return _identity(inline=[{"name": "p", "document": _policy(statement)}])
+
+        microvm = "Lambda MicroVM image arn:img version 1 (MicroVM mv-1)"
+        _, rows = self._run(
+            {
+                "vm-wide": role(self._allow("s3:GetObject", "*", sid="AnyObject")),
+                "agent-tight": role(
+                    self._allow("s3:GetObject", "arn:aws:s3:::kb-docs/*")
+                ),
+            },
+            {
+                "vm-wide": [microvm],
+                "agent-tight": ["Bedrock agent 't' version 1"],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert self._role("vm-wide") in rows[0]["Finding_Details"]
+        assert microvm in rows[0]["Finding_Details"]
+        assert "Lambda MicroVM" in rows[0]["Finding_Details"].split(" role ")[0]
+
+        _, rows = self._run(
+            {
+                "agent-tight": role(
+                    self._allow("s3:GetObject", "arn:aws:s3:::kb-docs/*")
+                )
+            },
+            {"agent-tight": ["Bedrock agent 't' version 1"]},
+            errors=[
+                "Lambda MicroVMs were not listed with lambda:ListMicrovms "
+                "(AccessDenied)"
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "lambda:ListMicrovms" in rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "action, resource",
@@ -46866,3 +47456,49 @@ class TestBR06InferenceTrace:
         )
         assert rows[self.CENTRAL]["Status"] == "N/A"
         assert "AccessDenied" in rows[self.CENTRAL]["Finding_Details"]
+
+
+def test_data_path_buckets_are_read_once_a_region_and_handed_out_as_copies():
+    reads = []
+
+    def read(region=""):
+        reads.append(region)
+        return {"buckets": {"b": {"sources": [region]}}, "errors": []}
+
+    with patch.object(bedrock_app, "_read_ai_data_path_buckets", side_effect=read):
+        first = bedrock_app._ai_data_path_buckets("us-east-1")
+        first["buckets"]["b"]["sources"].append("changed by a caller")
+        first["errors"].append("changed by a caller")
+        second = bedrock_app._ai_data_path_buckets("us-east-1")
+        other = bedrock_app._ai_data_path_buckets("eu-west-1")
+
+    assert reads == ["us-east-1", "eu-west-1"]
+    assert second == {"buckets": {"b": {"sources": ["us-east-1"]}}, "errors": []}
+    assert other["buckets"]["b"]["sources"] == ["eu-west-1"]
+
+
+def test_handler_does_not_reuse_a_previous_invocations_data_path():
+    bedrock_app._AI_DATA_PATH_BUCKETS_BY_REGION["us-east-1"] = {
+        "buckets": {"stale": {}},
+        "errors": [],
+    }
+    test_client = MagicMock()
+    test_client.get_model_invocation_logging_configuration.side_effect = (
+        _make_client_error("AccessDeniedException")
+    )
+    with (
+        patch.object(bedrock_app.boto3, "client", return_value=test_client),
+        patch.object(bedrock_app, "get_permissions_cache", return_value=None),
+        patch.object(bedrock_app, "generate_csv_report", return_value="csv"),
+        patch.object(bedrock_app, "write_to_s3", return_value="s3://b/r.csv"),
+        patch.object(
+            bedrock_app,
+            "_read_ai_data_path_buckets",
+            return_value={"buckets": {"fresh": {}}, "errors": []},
+        ),
+    ):
+        bedrock_app.lambda_handler(
+            _bedrock_event(region="us-east-1", region_index=0), None
+        )
+    held = bedrock_app._AI_DATA_PATH_BUCKETS_BY_REGION
+    assert all("stale" not in entry["buckets"] for entry in held.values())

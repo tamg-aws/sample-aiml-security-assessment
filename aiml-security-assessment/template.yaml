@@ -490,14 +490,16 @@ Resources:
           - Sid: ECSTaskRead
             # BR-02 reads the task role and subnets of each task started
             # outside a service. BR-33 resolves the EC2 instance behind a task
-            # that has no task role, to judge it by that instance's role. The
+            # that has no task role, to judge it by that instance's role, and
+            # BR-02 resolves the same instance to place a task or service
+            # without awsvpc in its VPC. The
             # service authorization reference gives DescribeTasks the task
             # resource type and DescribeContainerInstances the
             # container-instance resource type.
             Effect: Allow
             Action:
               - ecs:DescribeTasks # BR-02
-              - ecs:DescribeContainerInstances # BR-33
+              - ecs:DescribeContainerInstances # BR-02, BR-33
             Resource:
               - !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/*'
               - !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:container-instance/*'
@@ -567,7 +569,9 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:redshift-serverless:*:${AWS::AccountId}:namespace/*'
           - Sid: InvocationLogRead
             # BR-04 reads the most recently written stream of the invocation log
-            # group, with no event content. BR-27 and BR-34 read the last 24
+            # group, with no event content, and asks FilterLogEvents for one
+            # event older than the group's retention, reading only its
+            # timestamp. BR-27 and BR-34 read the last 24
             # hours of invocation log records that match a guardrail field, and
             # report request IDs and scores, never a body. The service
             # authorization reference gives DescribeLogStreams and
@@ -577,7 +581,7 @@ Resources:
             Effect: Allow
             Action:
               - logs:DescribeLogStreams # BR-04
-              - logs:FilterLogEvents # BR-27, BR-34
+              - logs:FilterLogEvents # BR-04, BR-27, BR-34
             Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
           - Sid: KnowledgeBaseSourceList
             # BR-26 lists the objects an S3 knowledge base source ingests to
@@ -652,12 +656,26 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Sid: ManagedReadsOnWildcard2
-            # The action has no resource type in the service authorization
+            # These actions have no resource type in the service authorization
             # reference.
             Effect: Allow
             Action:
               - lambda:ListMicrovms # BR-57
+              - iam:ListRoles # BR-02
+              - bedrock:ListCustomModelDeployments # BR-53
+              - bedrock:ListPromptRouters # BR-53
             Resource: '*'
+          - Sid: BedrockOwnerTagRead2
+            # BR-53 reads the tags of these resource types from
+            # ListTagsForResource, because whether tag:GetResources returns
+            # them is not documented.
+            Effect: Allow
+            Action:
+              - bedrock:ListTagsForResource # BR-53
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:automated-reasoning-policy/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model-deployment/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:prompt-router/*'
           - Sid: MicrovmRead
             # GetMicrovm authorizes on the microvmImage resource type. A
             # MicroVM may run an AWS-managed image, whose ARN has the account

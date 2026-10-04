@@ -21,6 +21,7 @@ import re
 import json
 import base64
 import binascii
+import copy
 from functools import lru_cache
 from schema import create_finding
 
@@ -2649,10 +2650,10 @@ WORKLOAD_CONNECTIVITY_CEILING = (
     "Lambda functions, EC2 instances, ECS services and standalone tasks, "
     "SageMaker notebook instances and endpoints, EKS pod identity associations "
     "and VPC-mode AgentCore runtime versions are read. A PUBLIC-mode AgentCore "
-    "runtime is judged by AC-01. An EKS pod that takes a role through IAM roles "
-    "for service accounts is not read, because that binding is a service "
-    "account annotation held by the Kubernetes API, which this assessment does "
-    "not call. Endpoints reached from another VPC through a shared private "
+    "runtime is judged by AC-01. A role an EKS pod takes through IAM roles for "
+    "service accounts is read as every role whose trust policy allows "
+    "sts:AssumeRoleWithWebIdentity to the cluster's OIDC provider, in the "
+    "cluster's VPC. Endpoints reached from another VPC through a shared private "
     "hosted zone are not read."
 )
 
@@ -2692,8 +2693,81 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
         clusters = [None]
     subnet_cache: Dict[str, Optional[str]] = {}
     task_roles: Dict[str, Any] = {}
+    instance_subnets: Dict[str, Any] = {}
 
-    def record(kind, name, task_definition, override_role, subnets, runs_on):
+    def container_instance_subnets(cluster, container_instances):
+        """
+        Return the subnets of the EC2 instances behind container instances,
+        for a task that does not use awsvpc networking and so runs in the
+        network of its instance, or a string naming what was not read.
+        """
+        wanted = sorted(set(container_instances) - set(instance_subnets))
+        try:
+            for start in range(0, len(wanted), 100):
+                described = ecs_client.describe_container_instances(
+                    cluster=cluster, containerInstances=wanted[start : start + 100]
+                )
+                for found in described.get("containerInstances") or []:
+                    instance_subnets[found.get("containerInstanceArn")] = found.get(
+                        "ec2InstanceId"
+                    )
+            instance_ids = sorted(
+                {
+                    instance_subnets[arn]
+                    for arn in wanted
+                    if isinstance(instance_subnets.get(arn), str)
+                    and instance_subnets[arn].startswith("i-")
+                }
+            )
+            by_instance = {}
+            if instance_ids:
+                for page in ec2_client.get_paginator("describe_instances").paginate(
+                    InstanceIds=instance_ids
+                ):
+                    for reservation in page.get("Reservations") or []:
+                        for instance in reservation.get("Instances") or []:
+                            by_instance[instance.get("InstanceId")] = instance.get(
+                                "SubnetId"
+                            )
+            for arn in wanted:
+                instance_id = instance_subnets.get(arn)
+                if by_instance.get(instance_id):
+                    instance_subnets[arn] = by_instance[instance_id]
+                elif not instance_id:
+                    instance_subnets[arn] = (
+                        f"container instance {arn} returned no EC2 instance "
+                        "from ecs:DescribeContainerInstances"
+                    )
+                else:
+                    instance_subnets[arn] = (
+                        f"EC2 instance {instance_id} behind container instance "
+                        f"{arn} returned no subnet from ec2:DescribeInstances"
+                    )
+        except (ClientError, BotoCoreError) as error:
+            return (
+                "container instance(s) {} were not read with "
+                "ecs:DescribeContainerInstances and ec2:DescribeInstances "
+                "({})".format(", ".join(wanted), get_assessment_error_label(error))
+            )
+        unread = [
+            instance_subnets[arn]
+            for arn in container_instances
+            if not str(instance_subnets[arn]).startswith("subnet-")
+        ]
+        if unread:
+            return "; ".join(unread)
+        return sorted({instance_subnets[arn] for arn in container_instances})
+
+    def record(
+        kind,
+        name,
+        task_definition,
+        override_role,
+        subnets,
+        runs_on,
+        cluster=None,
+        container_instances=(),
+    ):
         label = f"{kind} '{name}'"
         if override_role:
             task_role = override_role
@@ -2720,10 +2794,18 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                     )
                 )
                 return
+        if not subnets and cluster and container_instances:
+            subnets = container_instance_subnets(cluster, container_instances)
+            if isinstance(subnets, str):
+                inventory["errors"].append(
+                    f"{label} uses no awsvpc subnets, and the VPC of the "
+                    f"{runs_on} was not read: {subnets}"
+                )
+                return
         if not subnets:
             inventory["errors"].append(
-                f"{label} uses no awsvpc subnets, so the VPC of the "
-                f"{runs_on} was not read"
+                f"{label} uses no awsvpc subnets and names no container "
+                f"instance, so the VPC of the {runs_on} was not read"
             )
             return
         try:
@@ -2755,6 +2837,7 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
     for cluster in clusters:
         cluster_kwargs = {"cluster": cluster} if cluster else {}
         cluster_label = cluster or "the default cluster"
+        cluster_services = []
         try:
             service_arns = _list_all_items(
                 ecs_client, "list_services", "serviceArns", **cluster_kwargs
@@ -2788,33 +2871,22 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                         failure.get("reason") or "no reason returned",
                     )
                 )
-            for service in services:
-                record(
-                    "ECS service",
-                    service.get("serviceName") or service.get("serviceArn"),
-                    service.get("taskDefinition"),
-                    None,
-                    (
-                        (service.get("networkConfiguration") or {}).get(
-                            "awsvpcConfiguration"
-                        )
-                        or {}
-                    ).get("subnets")
-                    or [],
-                    "container instances its tasks run on",
+            cluster_services.extend(services)
+        # A service whose tasks do not use awsvpc networking runs in the
+        # network of the container instances its running tasks are placed on.
+        service_instances: Dict[str, List[str]] = {}
+        standalone_tasks = []
+        task_arns = []
+        if cluster:
+            try:
+                task_arns = _list_all_items(
+                    ecs_client, "list_tasks", "taskArns", cluster=cluster
                 )
-        if not cluster:
-            continue
-        try:
-            task_arns = _list_all_items(
-                ecs_client, "list_tasks", "taskArns", cluster=cluster
-            )
-        except (ClientError, BotoCoreError, TypeError) as error:
-            inventory["errors"].append(
-                f"ECS tasks in {cluster_label} were not listed with "
-                f"ecs:ListTasks ({get_assessment_error_label(error)})"
-            )
-            continue
+            except (ClientError, BotoCoreError, TypeError) as error:
+                inventory["errors"].append(
+                    f"ECS tasks in {cluster_label} were not listed with "
+                    f"ecs:ListTasks ({get_assessment_error_label(error)})"
+                )
         for start in range(0, len(task_arns), 100):
             batch = task_arns[start : start + 100]
             try:
@@ -2833,22 +2905,51 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                     )
                 )
             for task in described.get("tasks", []):
-                if str(task.get("group") or "").startswith("service:"):
+                group = str(task.get("group") or "")
+                if group.startswith("service:"):
+                    if task.get("containerInstanceArn"):
+                        service_instances.setdefault(group[8:], []).append(
+                            task["containerInstanceArn"]
+                        )
                     continue
-                record(
-                    "ECS task",
-                    str(task.get("taskArn") or "unnamed").split(":task/", 1)[-1],
-                    task.get("taskDefinitionArn"),
-                    (task.get("overrides") or {}).get("taskRoleArn"),
-                    [
-                        detail.get("value")
-                        for attachment in task.get("attachments") or []
-                        if attachment.get("type") == "ElasticNetworkInterface"
-                        for detail in attachment.get("details") or []
-                        if detail.get("name") == "subnetId" and detail.get("value")
-                    ],
-                    "container instance it runs on",
-                )
+                standalone_tasks.append(task)
+        for service in cluster_services:
+            service_name = service.get("serviceName") or service.get("serviceArn")
+            record(
+                "ECS service",
+                service_name,
+                service.get("taskDefinition"),
+                None,
+                (
+                    (service.get("networkConfiguration") or {}).get(
+                        "awsvpcConfiguration"
+                    )
+                    or {}
+                ).get("subnets")
+                or [],
+                "container instances its tasks run on",
+                cluster,
+                service_instances.get(service_name, []),
+            )
+        for task in standalone_tasks:
+            record(
+                "ECS task",
+                str(task.get("taskArn") or "unnamed").split(":task/", 1)[-1],
+                task.get("taskDefinitionArn"),
+                (task.get("overrides") or {}).get("taskRoleArn"),
+                [
+                    detail.get("value")
+                    for attachment in task.get("attachments") or []
+                    if attachment.get("type") == "ElasticNetworkInterface"
+                    for detail in attachment.get("details") or []
+                    if detail.get("name") == "subnetId" and detail.get("value")
+                ],
+                "container instance it runs on",
+                cluster,
+                [task["containerInstanceArn"]]
+                if task.get("containerInstanceArn")
+                else [],
+            )
 
 
 def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
@@ -3060,10 +3161,81 @@ def _sagemaker_endpoint_workloads(region: str, inventory: Dict[str, Any]) -> Non
             )
 
 
+def _eks_irsa_workloads(oidc_clusters: List[tuple], inventory: Dict[str, Any]) -> None:
+    """
+    Add each IAM role an EKS cluster can give its pods through IAM roles for
+    service accounts, with that cluster's VPC, to ``inventory``. Such a role's
+    trust policy allows sts:AssumeRoleWithWebIdentity to the cluster's OIDC
+    provider, whose ARN ends in the issuer eks:DescribeCluster returns.
+    ``oidc_clusters`` holds (cluster, label, VPC id, issuer URL).
+    """
+    if not oidc_clusters:
+        return
+    iam_client = boto3.client("iam", config=boto3_config)
+    try:
+        roles = []
+        for page in iam_client.get_paginator("list_roles").paginate():
+            roles.extend(page.get("Roles", []))
+    except (ClientError, BotoCoreError) as error:
+        inventory["errors"].append(
+            "the IAM roles that EKS cluster(s) {} give pods through IAM roles for "
+            "service accounts were not read with iam:ListRoles ({})".format(
+                ", ".join(cluster for cluster, *_ in oidc_clusters),
+                get_assessment_error_label(error),
+            )
+        )
+        return
+    trusts = []
+    for role in roles:
+        try:
+            trusts.append((role, _trust_policy_document(role)))
+        except (ValueError, TypeError) as error:
+            inventory["errors"].append(
+                "the trust policy of role '{}' returned by iam:ListRoles was not "
+                "parsed ({})".format(
+                    role.get("RoleName") or "unnamed", get_assessment_error_label(error)
+                )
+            )
+    for cluster, label, vpc_id, issuer in oidc_clusters:
+        provider = ":oidc-provider/" + str(issuer).split("://", 1)[-1].rstrip("/")
+        for role, document in trusts:
+            trusted = any(
+                str(statement.get("Effect", "")).upper() == "ALLOW"
+                and _statement_matches_action(
+                    statement, "sts:assumerolewithwebidentity"
+                )
+                and any(
+                    str(value).endswith(provider)
+                    for value in _as_list(
+                        (statement.get("Principal") or {}).get("Federated")
+                        if isinstance(statement.get("Principal"), dict)
+                        else None
+                    )
+                )
+                for statement in _policy_statements(document or {})
+            )
+            if not trusted:
+                continue
+            if not vpc_id:
+                inventory["errors"].append(
+                    f"{label} returned no vpcId from eks:DescribeCluster"
+                )
+                break
+            inventory["workloads"].append(
+                {
+                    "kind": "EKS IAM role for service accounts",
+                    "name": "{} {}".format(cluster, role.get("RoleName") or "unnamed"),
+                    "vpc_id": vpc_id,
+                    "role": role.get("RoleName") or None,
+                }
+            )
+
+
 def _eks_pod_identity_workloads(region: str, inventory: Dict[str, Any]) -> None:
     """
-    Add every EKS pod identity association, with its cluster's VPC and the
-    role its pods receive, to ``inventory``.
+    Add every EKS pod identity association, and every role a cluster gives
+    its pods through IAM roles for service accounts, with its cluster's VPC
+    and the role its pods receive, to ``inventory``.
     """
     eks_client = boto3.client("eks", config=boto3_config, region_name=region)
     try:
@@ -3074,21 +3246,21 @@ def _eks_pod_identity_workloads(region: str, inventory: Dict[str, Any]) -> None:
             f"({get_assessment_error_label(error)})"
         )
         return
+    oidc_clusters = []
     for cluster in clusters:
         label = f"EKS cluster '{cluster}'"
         try:
-            vpc_id = (
-                (eks_client.describe_cluster(name=cluster).get("cluster") or {}).get(
-                    "resourcesVpcConfig"
-                )
-                or {}
-            ).get("vpcId")
+            described = eks_client.describe_cluster(name=cluster).get("cluster") or {}
         except (ClientError, BotoCoreError) as error:
             inventory["errors"].append(
                 f"{label} was not read with eks:DescribeCluster "
                 f"({get_assessment_error_label(error)})"
             )
             continue
+        vpc_id = (described.get("resourcesVpcConfig") or {}).get("vpcId")
+        issuer = ((described.get("identity") or {}).get("oidc") or {}).get("issuer")
+        if issuer:
+            oidc_clusters.append((cluster, label, vpc_id, issuer))
         try:
             associations = _list_all_items(
                 eks_client,
@@ -3145,6 +3317,7 @@ def _eks_pod_identity_workloads(region: str, inventory: Dict[str, Any]) -> None:
                     "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
                 }
             )
+    _eks_irsa_workloads(oidc_clusters, inventory)
 
 
 def _agentcore_runtime_workloads(region: str, inventory: Dict[str, Any]) -> None:
@@ -3262,14 +3435,20 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     try:
         lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
         functions = []
-        for page in lambda_client.get_paginator("list_functions").paginate():
+        # A published version keeps the VpcConfig and role it was published
+        # with, and an alias can route to it, so every version is a workload.
+        for page in lambda_client.get_paginator("list_functions").paginate(
+            FunctionVersion="ALL"
+        ):
             functions.extend(page.get("Functions", []))
         for function in functions:
             role_arn = str(function.get("Role") or "")
+            name = function.get("FunctionName") or "unnamed"
+            version = str(function.get("Version") or "$LATEST")
             inventory["workloads"].append(
                 {
                     "kind": "Lambda function",
-                    "name": function.get("FunctionName") or "unnamed",
+                    "name": name if version == "$LATEST" else f"{name}:{version}",
                     "vpc_id": (function.get("VpcConfig") or {}).get("VpcId") or None,
                     "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
                     "subnets": (function.get("VpcConfig") or {}).get("SubnetIds")
@@ -4597,6 +4776,87 @@ def _log_group_retention_days(log_group_name: str, region: str) -> Dict[str, Any
     return {"found": True, "retention_days": group.get("retentionInDays")}
 
 
+# CloudWatch Logs "typically takes up to 72 hours" after an event reaches its
+# retention setting to delete it (PutRetentionPolicy API reference).
+LOG_EVENT_DELETION_GRACE = timedelta(hours=72)
+
+# FilterLogEvents pages one search for an expired event may read. With no
+# filter pattern and limit 1 the first page holding an event returns it, and a
+# group with nothing before the cutoff returns no nextToken: the cutoff query
+# took 195 ms on the Bedrock invocation log group and 55 ms on an 82 GB group in
+# account 178113193057, us-east-1, on 2026-10-04. A scan that matches nothing
+# paged at 5,195 ms at the slowest on that 82 GB group, so 5 pages take at most
+# 26 s. The deployed function's slowest of 25 runs in the 30 days to 2026-10-04
+# took 420 s of its 600 s timeout. A search that reaches the cap is reported
+# N/A, never Passed.
+LOG_DELETION_MAX_PAGES = 5
+
+
+def _log_group_deletion_evidence(
+    log_group_name: str, retention_days: int, region: str
+) -> Dict[str, Any]:
+    """
+    Judge whether CloudWatch Logs has deleted a group's expired events
+    (AIR-FND-DAT-08): FilterLogEvents with no filter pattern and limit 1 over
+    everything older than retentionInDays plus 72 hours. Only the event's
+    timestamp is read, never its message. Returns ``overdue`` (the Failed
+    text), ``evidence`` and ``error``.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=retention_days) - LOG_EVENT_DELETION_GRACE
+    request = {
+        "logGroupName": log_group_name,
+        "startTime": 0,
+        "endTime": int(cutoff.timestamp() * 1000),
+        "limit": 1,
+    }
+    allowance = f"its {retention_days}-day retentionInDays plus 72 hours"
+    try:
+        logs_client = boto3.client("logs", config=boto3_config, region_name=region)
+        for _ in range(LOG_DELETION_MAX_PAGES):
+            response = logs_client.filter_log_events(**request)
+            events = response.get("events") or []
+            if events:
+                written = datetime.fromtimestamp(
+                    int(events[0]["timestamp"]) / 1000, tz=timezone.utc
+                )
+                return {
+                    "overdue": (
+                        "FilterLogEvents returns an event from "
+                        f"{written.date().isoformat()}, "
+                        f"{int((now - written).total_seconds() // 86400)} day(s) "
+                        f"ago, past {allowance} for deletion, so expired events "
+                        "are not deleted on schedule"
+                    ),
+                    "evidence": "",
+                    "error": "",
+                }
+            token = response.get("nextToken")
+            if not token:
+                return {
+                    "overdue": None,
+                    "evidence": (
+                        f"FilterLogEvents returns no event older than {allowance}"
+                    ),
+                    "error": "",
+                }
+            request["nextToken"] = token
+    except (ClientError, BotoCoreError, KeyError, TypeError, ValueError) as error:
+        return {
+            "overdue": None,
+            "evidence": "",
+            "error": describe_api_error(error, "logs:FilterLogEvents", region),
+        }
+    return {
+        "overdue": None,
+        "evidence": "",
+        "error": (
+            f"FilterLogEvents had not finished searching for an event older than "
+            f"{allowance} after {LOG_DELETION_MAX_PAGES} pages"
+        ),
+    }
+
+
 def _lifecycle_rule_prefix(rule: Dict[str, Any]) -> Optional[str]:
     """Return the key prefix a lifecycle rule applies to.
 
@@ -4796,7 +5056,13 @@ def _replica_buckets(s3_client: Any, bucket_name: str) -> List[str]:
 
 
 # HeadObject is read for at most this many invocation log objects in one
-# bucket; the rest are reported as not read.
+# bucket; the rest are reported as not read. HeadObject took 57 ms at the
+# median and 110 ms at the slowest of 20 calls on invocation log objects in
+# account 178113193057, us-east-1, on 2026-10-04, so 500 calls take 29 s at the
+# median. The deployed function's slowest of 25 runs in the 30 days to
+# 2026-10-04 took 420 s of its 600 s timeout. The verdict does not rest on the
+# objects past the cap: an object a FAILED status holds back past its rule is
+# older than the rule, so the oldest-object read fails it.
 REPLICATION_STATUS_HEAD_CAP = 500
 
 
@@ -4855,7 +5121,14 @@ def _replication_held_log_objects(
 # once a day, so an object is overdue only this many days past its rule.
 LIFECYCLE_DELETION_GRACE_DAYS = 2
 
-# ListObjectsV2 calls one search for a bucket's oldest object may make.
+# ListObjectsV2 or ListObjectVersions calls one search for a bucket's oldest
+# object or noncurrent version may make. With Delimiter '/', ListObjectsV2 took
+# 60 ms at the median and 74 ms at the slowest of ten calls, and
+# ListObjectVersions 58 ms and 65 ms, in account 178113193057, us-east-1, on
+# 2026-10-04, so 200 calls take 15 s at the slowest. The deployed function's
+# slowest of 25 runs in the 30 days to 2026-10-04 took 420 s of its 600 s
+# timeout. A search that reaches the cap names the root it did not finish, and
+# that destination is reported N/A, never Passed.
 OLDEST_OBJECT_LIST_CAP = 200
 
 DATE_FOLDER_PATTERN = re.compile(r"\d{4}|\d{2}")
@@ -5172,7 +5445,8 @@ def _judge_log_bucket_retention(
     A replica is a second copy of every prompt and response, so a source rule
     that expires objects deletes nothing at the destination. With ``root``, the
     bucket holds SageMaker inference data under that prefix, whose objects
-    s3:GetObject is not granted on, so their ReplicationStatus is not read.
+    s3:GetObject is not granted on, so their ReplicationStatus is not read and
+    the oldest object under the prefix is the evidence.
     """
     wording = (
         {}
@@ -5249,15 +5523,18 @@ def _judge_log_bucket_retention(
             f"{label} '{bucket_name}' lifecycle: "
             f"{'; '.join(lifecycle['expirations'])}; {deletion['evidence']}"
         )
-    if replicas and root is not None:
-        undetermined.append(
+    if replicas and root is not None and not lock and on_schedule:
+        # An object a PENDING or FAILED status holds back past the rule would
+        # be older than the rule, and the oldest object is not.
+        retained.append(
             f"{label} '{bucket_name}': an enabled replication rule copies it to "
-            f"{', '.join(repr(r) for r in replicas)}, S3 Lifecycle takes no action "
-            "on an object whose replication status is PENDING or FAILED, and the "
-            f"ReplicationStatus of the objects under '{root}' was not read, "
-            "because s3:GetObject is granted only on invocation log records"
+            f"{', '.join(repr(r) for r in replicas)}, and S3 Lifecycle takes no "
+            "action on an object whose replication status is PENDING or FAILED. "
+            f"The ReplicationStatus of the objects under '{root}' was not read, "
+            "because s3:GetObject is granted only on invocation log records, but "
+            f"{deletion['evidence']}"
         )
-    elif replicas:
+    elif replicas and root is None:
         held = _replication_held_log_objects(s3_client, bucket_name, key_prefix)
         copies = (
             f"{label} '{bucket_name}': an enabled replication rule copies it to "
@@ -5365,10 +5642,23 @@ def _invocation_log_retention_findings(
                     "DescribeLogGroups for this account"
                 )
             elif retention["retention_days"]:
-                retained.append(
-                    f"CloudWatch Logs group '{log_group_name}' expires events after "
-                    f"{retention['retention_days']} day(s)"
+                deletion = _log_group_deletion_evidence(
+                    log_group_name, retention["retention_days"], region
                 )
+                group = f"CloudWatch Logs group '{log_group_name}'"
+                if deletion["overdue"]:
+                    unretained.append(f"{group}: {deletion['overdue']}")
+                elif deletion["error"]:
+                    undetermined.append(
+                        f"{group} expires events after "
+                        f"{retention['retention_days']} day(s), but whether "
+                        f"deletion has run was not read ({deletion['error']})"
+                    )
+                else:
+                    retained.append(
+                        f"{group} expires events after "
+                        f"{retention['retention_days']} day(s); {deletion['evidence']}"
+                    )
             else:
                 unretained.append(
                     f"CloudWatch Logs group '{log_group_name}' has no retentionInDays, "
@@ -5420,7 +5710,10 @@ def _invocation_log_retention_findings(
                     "Invocation log retention is stated on "
                     f"{len(retained)} destination(s): {'; '.join(retained)}. "
                     "Confirm the stated period meets your own record-retention "
-                    "policy. On an S3 destination, lifecycle deletion is judged "
+                    "policy. On a CloudWatch Logs destination, deletion is "
+                    "judged from whether FilterLogEvents returns any event older "
+                    "than retentionInDays plus 72 hours. "
+                    "On an S3 destination, lifecycle deletion is judged "
                     "from the age of the oldest current object, and on a "
                     "versioned bucket the oldest noncurrent version is read the "
                     "same way; any legal hold on an individual object version is "
@@ -33076,6 +33369,25 @@ def _mfa_deny_source(permissions: Dict[str, Any], console: bool = True) -> str:
     return ", ".join(names) if covered >= needed else ""
 
 
+def _statement_requires_mfa(statement: Dict[str, Any]) -> bool:
+    """
+    Return True when a statement carries a Bool aws:MultiFactorAuthPresent
+    true condition that is false when the key is absent.
+
+    A ForAllValues: Bool test is true on an absent key, as for a user calling
+    with long-term access keys, so it requires nothing. ForAnyValue: is false on
+    an absent key and is credited.
+    """
+    return any(
+        not operator.startswith("forallvalues:")
+        and _strip_condition_set_operator(operator) == "bool"
+        and key == MFA_PRESENT_CONDITION_KEY
+        and values
+        and all(str(value).strip().lower() == "true" for value in values)
+        for operator, key, values in _condition_keys_by_operator(statement)
+    )
+
+
 def _trust_statements_without_mfa(trust_policy: Any) -> List[str]:
     """
     Describe each Allow in a role trust policy that lets an IAM user, or any
@@ -33109,14 +33421,7 @@ def _trust_statements_without_mfa(trust_policy: Any) -> List[str]:
         ]
         if not human:
             continue
-        requires_mfa = any(
-            _strip_condition_set_operator(operator) == "bool"
-            and key == MFA_PRESENT_CONDITION_KEY
-            and values
-            and all(str(value).strip().lower() == "true" for value in values)
-            for operator, key, values in _condition_keys_by_operator(statement)
-        )
-        if not requires_mfa:
+        if not _statement_requires_mfa(statement):
             open_statements.append(
                 "statement '{}' trusts {} with no Bool aws:MultiFactorAuthPresent "
                 "true condition".format(
@@ -33140,13 +33445,7 @@ def _trust_role_principals_without_mfa(trust_policy: Any) -> List[tuple]:
         actions = [str(action).lower() for action in _as_list(statement.get("Action"))]
         if not any(_wildcard_matches(action, "sts:assumerole") for action in actions):
             continue
-        if any(
-            _strip_condition_set_operator(operator) == "bool"
-            and key == MFA_PRESENT_CONDITION_KEY
-            and values
-            and all(str(value).strip().lower() == "true" for value in values)
-            for operator, key, values in _condition_keys_by_operator(statement)
-        ):
+        if _statement_requires_mfa(statement):
             continue
         principal = statement.get("Principal")
         for value in _as_list(
@@ -35426,8 +35725,17 @@ def _customization_job_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "errors": errors}
 
 
-# Describe and Get calls are one per job, so the most recent jobs a bulk read
-# does not return are read and the rest are named as unread.
+# Describe calls are one per job, so the most recent jobs a bulk read does not
+# return are described, newest first, and the rest are counted as unread, which
+# holds every check reading them at N/A. Measured in account 178113193057,
+# us-east-1, on 2026-10-04 over ten calls each: DescribeTrainingJob 122 ms at
+# the median and 459 ms at the slowest, DescribeTransformJob 88 ms and 172 ms,
+# and DescribeProcessingJob, on a missing job name because the account holds no
+# processing job, 429 ms and 1,584 ms. 200 calls of each kind take 128 s at
+# those medians. _ai_data_path_buckets reads them once a Region per invocation,
+# and BR-46 reads the training jobs once more, 24 s. The deployed function's
+# slowest of 25 runs in the 30 days to 2026-10-04 took 420 s of its 600 s
+# timeout, in an account where no job reached this fallback.
 MAX_SAGEMAKER_TRAINING_JOB_READS = 200
 
 
@@ -35853,7 +36161,22 @@ def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "errors": errors}
 
 
+# The _read_ai_data_path_buckets result for each Region, kept for one handler
+# invocation. BR-42, BR-47 and BR-52 read the same
+# population, and its SageMaker and evaluation job reads are the slowest in the
+# function, so they run once a Region. lambda_handler clears it, because a warm
+# container keeps module state between invocations.
+_AI_DATA_PATH_BUCKETS_BY_REGION: Dict[str, Dict[str, Any]] = {}
+
+
 def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
+    """Return a copy of _read_ai_data_path_buckets(region), read once a Region."""
+    if region not in _AI_DATA_PATH_BUCKETS_BY_REGION:
+        _AI_DATA_PATH_BUCKETS_BY_REGION[region] = _read_ai_data_path_buckets(region)
+    return copy.deepcopy(_AI_DATA_PATH_BUCKETS_BY_REGION[region])
+
+
+def _read_ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     """
     Resolve the S3 buckets that Bedrock reads training data from and writes
     inference records to.
@@ -36885,6 +37208,14 @@ BEDROCK_JOB_LABELS = (
     "evaluation job",
 )
 
+# The inventory labels whose tags come from bedrock:ListTagsForResource and
+# not from tag:GetResources.
+BEDROCK_LIST_TAGS_LABELS = BEDROCK_JOB_LABELS + (
+    "automated reasoning policy",
+    "custom model deployment",
+    "prompt router",
+)
+
 MAX_REPORTED_UNOWNED_RESOURCES = 25
 
 
@@ -36917,7 +37248,8 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
     List the ARN of every Bedrock agent, knowledge base, flow, prompt,
     guardrail, custom and imported model, provisioned throughput, application
     inference profile, batch inference, model customization and evaluation
-    job, and Marketplace model endpoint in the Region.
+    job, Marketplace model endpoint, automated reasoning policy, custom model
+    deployment and custom prompt router in the Region.
 
     The population comes from the Bedrock list APIs, never from a tag query,
     because a tag query cannot return a resource that was never tagged.
@@ -37009,22 +37341,45 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
             "endpointArn",
             None,
         ),
+        (
+            "automated reasoning policy",
+            bedrock_client,
+            "list_automated_reasoning_policies",
+            "automatedReasoningPolicySummaries",
+            "policyArn",
+            None,
+        ),
+        (
+            "custom model deployment",
+            bedrock_client,
+            "list_custom_model_deployments",
+            "modelDeploymentSummaries",
+            "customModelDeploymentArn",
+            None,
+        ),
+        (
+            "prompt router",
+            bedrock_client,
+            "list_prompt_routers",
+            "promptRouterSummaries",
+            "promptRouterArn",
+            None,
+        ),
     )
     resource_types = {"agent": "agent", "knowledge base": "knowledge-base"}
+    # An AWS default prompt router belongs to no one in the account.
+    list_filters = {
+        "list_inference_profiles": {"typeEquals": "APPLICATION"},
+        "list_prompt_routers": {"type": "custom"},
+    }
     for label, client, operation, result_key, arn_field, id_field in legs:
         try:
             items = _list_all_items(
-                client,
-                operation,
-                result_key,
-                **(
-                    {"typeEquals": "APPLICATION"}
-                    if operation == "list_inference_profiles"
-                    else {}
-                ),
+                client, operation, result_key, **list_filters.get(operation, {})
             )
         except Exception as error:
-            errors.append(f"{label}s: {get_assessment_error_label(error)}")
+            plural = label[:-1] + "ies" if label.endswith("y") else label + "s"
+            errors.append(f"{plural}: {get_assessment_error_label(error)}")
             continue
         for item in items:
             if arn_field:
@@ -37045,8 +37400,9 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
     """
     BR-53: Verify every Bedrock agent, knowledge base, flow, prompt, guardrail,
     custom and imported model, provisioned throughput, application inference
-    profile, batch inference, customization and evaluation job, and Marketplace
-    model endpoint carries an owner tag whose value names someone.
+    profile, batch inference, customization and evaluation job, Marketplace
+    model endpoint, automated reasoning policy, custom model deployment and
+    custom prompt router carries an owner tag whose value names someone.
     """
     logger.debug("Starting check for Bedrock resource owner tags")
     check_name = RESOURCE_OWNER_FINDING
@@ -37090,8 +37446,9 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
                     "No Bedrock agent, knowledge base, flow, prompt, guardrail, custom "
                     "or imported model, provisioned throughput, application "
                     "inference profile, batch inference, model customization or "
-                    "evaluation job, or Marketplace model endpoint was listed in "
-                    "{}.".format(region or "this region"),
+                    "evaluation job, Marketplace model endpoint, automated "
+                    "reasoning policy, custom model deployment or custom prompt "
+                    "router was listed in {}.".format(region or "this region"),
                     "No action required",
                     "Informational",
                     "N/A",
@@ -37105,10 +37462,13 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
         arns = sorted(inventory["arns"])
         tags_by_arn: Dict[str, List[Dict[str, Any]]] = {}
         unread = []
-        # Whether GetResources returns Bedrock jobs is not documented, so a job's
-        # tags are read from bedrock:ListTagsForResource, which names all three
-        # job resource types.
-        job_arns = [arn for arn in arns if inventory["arns"][arn] in BEDROCK_JOB_LABELS]
+        # Whether GetResources returns Bedrock jobs, automated reasoning
+        # policies, custom model deployments and prompt routers is not
+        # documented, so their tags are read from bedrock:ListTagsForResource,
+        # which names each of those resource types.
+        job_arns = [
+            arn for arn in arns if inventory["arns"][arn] in BEDROCK_LIST_TAGS_LABELS
+        ]
         if job_arns:
             bedrock_client = boto3.client(
                 "bedrock", config=boto3_config, region_name=region
@@ -38538,8 +38898,14 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
     }
 
 
-# LookupEvents pages read per attestation-bound key. At 50 events a page, a key
-# with more events in its 90-day event history is reported as not read in full.
+# LookupEvents pages read per attestation-bound key, 50 events a page. Paging
+# LookupEvents by ResourceName for five KMS keys in account 178113193057,
+# us-east-1, on 2026-10-04 took 159 ms a page at the median and 528 ms at the
+# slowest, and sustained paging under the two-calls-a-second throttle took
+# 591 ms a page, so 20 pages take about 12 s a key. The deployed function's
+# slowest of 25 runs in the 30 days to 2026-10-04 took 420 s of its 600 s
+# timeout. A key with more events in its 90-day event history is named as not
+# read in full and is never credited as bound.
 ENCLAVE_EVENT_MAX_PAGES = 20
 
 
@@ -38896,10 +39262,20 @@ LLM_JACKING_THRESHOLD = 0.4
 
 LLM_JACKING_LOOKBACK = timedelta(minutes=1440)
 
-# LookupEvents returns at most 50 events per call and is throttled near two
-# calls per second per Region, so the page cap bounds the check at 14 x 5 calls.
+# LookupEvents returns at most 50 events per call.
 LOOKUP_EVENTS_PAGE_SIZE = 50
 
+# LookupEvents is throttled near two calls per second per account and Region.
+# Paging 20 calls by EventName over 24 hours in account 178113193057,
+# us-east-1, on 2026-10-04 took 386 ms a page in wall time for AssumeRole and
+# 416 ms for Decrypt, and an EventSource lookup took 591 ms a page with its
+# slowest page at 3,821 ms under throttling. At 591 ms a page BR-56's 14 event
+# names take 41 s at 5 pages each, and BR-43's inferenceRegion leg takes 3 s an
+# event name. The deployed function's slowest of 25 runs in the 30 days to
+# 2026-10-04 took 420 s of its 600 s timeout. An event name with more than 5
+# pages is named as not read in full. BR-43 then holds its Region at N/A, and
+# BR-56 passes only if crediting every identity with that event name still
+# leaves each at or below its threshold.
 LLM_JACKING_MAX_PAGES_PER_ACTION = 5
 
 # Event history holds management events only. Bedrock logs InvokeModel,
@@ -40459,10 +40835,15 @@ ARN_WITHOUT_TYPE_PREFIX_SERVICES = frozenset({"s3", "execute-api"})
 
 def _arn_covers_every_resource(resource: Any) -> bool:
     """
-    Return True when a Resource entry names no particular resource of its type:
-    "*", an ARN whose resource name starts with a wildcard (such as
-    arn:aws:s3:::*, table/*, function:* or secret:*), a pattern covering every
-    foundation model or inference profile, or a short ARN ending in a wildcard.
+    Return True when a Resource entry reaches more than the resources it names:
+    "*", a pattern covering every foundation model or inference profile, a
+    wildcard in the partition, service, account or Region (except on Bedrock,
+    where a model or inference profile id names the same model in every Region),
+    a wildcard in the resource type, or a whole or partial wildcard in the
+    resource name (such as arn:aws:s3:::*, table/*, function:tool-* or
+    anthropic.*). A wildcard after the name, such as arn:aws:s3:::kb-docs/*,
+    stays inside one named resource. S3 and API Gateway carry the name first,
+    with no type; a short ARN with any wildcard is unbounded.
     """
     if not isinstance(resource, str):
         return False
@@ -40471,17 +40852,26 @@ def _arn_covers_every_resource(resource: Any) -> bool:
         return True
     parts = resource.split(":", 5)
     if len(parts) < 6:
-        return resource.endswith("*")
-    name = parts[5]
-    if not name or name[0] in "*?":
+        return "*" in resource or "?" in resource
+    _, partition, service, arn_region, account, resource_part = parts
+    service = service.lower()
+    segments = [partition, service, account]
+    if service != "bedrock":
+        segments.append(arn_region)
+    if any(wildcard in segment for segment in segments for wildcard in "*?"):
         return True
-    if parts[2] in ARN_WITHOUT_TYPE_PREFIX_SERVICES:
-        return False
-    cut = min(
-        (index for index in (name.find("/"), name.find(":")) if index >= 0),
-        default=-1,
+    components = re.split(r"[/:]", resource_part)
+    name_index = (
+        0 if service in ARN_WITHOUT_TYPE_PREFIX_SERVICES or len(components) == 1 else 1
     )
-    return cut >= 0 and name[cut + 1 : cut + 2] in ("*", "?", "")
+    if any(
+        wildcard in component
+        for component in components[:name_index]
+        for wildcard in "*?"
+    ):
+        return True
+    name = next((component for component in components[name_index:] if component), "")
+    return not name or "*" in name or "?" in name
 
 
 def check_bedrock_agent_role_scope(
@@ -40535,14 +40925,16 @@ def check_bedrock_agent_role_scope(
         population: Dict[str, List[str]] = {}
         for role_arn, labels in inventory["roles"].items():
             for label in labels:
-                if label.startswith("Bedrock agent "):
+                if label.startswith(("Bedrock agent ", "Lambda MicroVM ")):
                     population.setdefault(role_arn, []).append(label)
         for role_arn, arns in functions["roles"].items():
             population.setdefault(role_arn, []).extend(
                 f"action group function {arn}" for arn in arns
             )
         unread = [
-            error for error in inventory["errors"] if error.startswith("Bedrock")
+            error
+            for error in inventory["errors"]
+            if error.startswith(("Bedrock", "Lambda MicroVM"))
         ] + list(functions["errors"])
         errored = {
             str(error.get("name"))
@@ -40657,7 +41049,7 @@ def check_bedrock_agent_role_scope(
 
         for gap in failed[:MAX_REPORTED_UNOWNED_RESOURCES]:
             row(
-                f"Bedrock agent or action group {gap}, so the role reaches every "
+                f"Bedrock agent, Lambda MicroVM or action group {gap}, so the role reaches every "
                 "resource of that type, not only the models, data and APIs its "
                 "agent needs. Deny statements and service control policies are not "
                 "subtracted, so this may overstate the effective grant.",
@@ -40669,7 +41061,8 @@ def check_bedrock_agent_role_scope(
             )
         if len(failed) > MAX_REPORTED_UNOWNED_RESOURCES:
             row(
-                "{} further Bedrock agent or action group role(s) allow an action "
+                "{} further Bedrock agent, Lambda MicroVM or action group role(s) "
+                "allow an action "
                 "on every resource of its type.".format(
                     len(failed) - MAX_REPORTED_UNOWNED_RESOURCES
                 ),
@@ -40679,7 +41072,8 @@ def check_bedrock_agent_role_scope(
             )
         if conditioned:
             row(
-                "{} Bedrock agent or action group role(s) allow an action on every "
+                "{} Bedrock agent, Lambda MicroVM or action group role(s) allow an "
+                "action on every "
                 "resource of its type only under a Condition, which is not judged, "
                 "or under a permissions boundary whose overlap with the action "
                 "pattern is not computed: {}.".format(
@@ -40700,7 +41094,8 @@ def check_bedrock_agent_role_scope(
             )
         if not population and not unread:
             row(
-                "No Bedrock agent or action group function role exists in "
+                "No Bedrock agent, Lambda MicroVM or action group function role "
+                "exists in "
                 f"{region or 'this Region'}.",
                 "No action required",
                 "Informational",
@@ -40713,7 +41108,8 @@ def check_bedrock_agent_role_scope(
                 else ""
             )
             row(
-                "None of the {} Bedrock agent and action group role(s) allows any "
+                "None of the {} Bedrock agent, Lambda MicroVM and action group "
+                "role(s) allows any "
                 "action on every resource of its type in its attached or inline "
                 "policies, after its permissions boundary: {}. These actions have "
                 "no resource type and are not judged: {}.{}".format(
@@ -42169,6 +42565,7 @@ def lambda_handler(event, context):
     """
     logger.info("Starting Bedrock security assessment")
     all_findings = []
+    _AI_DATA_PATH_BUCKETS_BY_REGION.clear()
 
     try:
         # Extract target region from Step Functions Map state
