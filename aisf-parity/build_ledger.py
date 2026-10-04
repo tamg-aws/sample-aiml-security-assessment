@@ -575,9 +575,13 @@ AI_SUBJECT_ROWS = [
         ["AC-17", "AC-40"],
         "AC-40 classifies the evaluators each configuration attaches against the account's own "
         "catalogue, which marks a service-authored evaluator's category in its description, and "
-        "fails a configuration that attaches no safety evaluator, attaches neither "
+        "fails a configuration that does not attach both Builtin.Harmfulness and "
+        "Builtin.Stereotyping, since another safety evaluator does not score the same "
+        "harm, attaches neither "
         "Builtin.ToolSelectionAccuracy nor Builtin.ToolParameterAccuracy, or has no CloudWatch "
-        "alarm with actions on a metric in the namespace its scores are published to. "
+        "alarm with actions on a metric in the namespace its scores are published to, "
+        "with each named safety evaluator needing its own alarmed metric. A catalogue "
+        "that no longer marks both named evaluators as safety metrics is N/A. "
         "A configuration that is not ACTIVE and ENABLED fails, because it scores nothing. "
         "The namespace is the configuration's metricsNamespace when set, read through the "
         "pinned botocore 1.43.108, and the two documented default spellings otherwise. An "
@@ -608,7 +612,10 @@ AI_SUBJECT_ROWS = [
         "reads each consent portal's executionRoleArn with GetConsentPortal and fails "
         "a trust statement with no guard naming the account, or whose aws:SourceArn "
         "does not name a consent-portal resource, because the setup guide lets the "
-        "role be created without its Condition. IfExists, "
+        "role be created without its Condition. On a CUSTOM_JWT gateway, whose caller "
+        "has no IAM identity to name, a Principal '*' statement passes when an Allow "
+        "condition or a restricting Deny bounds the caller to aws:SourceVpc or "
+        "aws:SourceVpce with an equals operator and no wildcard value. IfExists, "
         "ForAllValues and wildcard values do not count",
         [],
         4,
@@ -639,6 +646,11 @@ AI_SUBJECT_ROWS = [
         "naming the Region. AC-08 requires an available bedrock-agentcore endpoint "
         "when runtimes exist, fails an interface endpoint with private DNS off, and "
         "fails a security group set whose inbound ranges together cover the internet. "
+        "When a runtime authenticates with CUSTOM_JWT, AC-08 also fails an available "
+        "bedrock-agentcore interface endpoint whose policy does not allow "
+        "GetRuntimeProtectedResourceMetadata to Principal '*' on that runtime with only "
+        "network conditions, because the OAuth discovery call carries no SigV4 "
+        "identity, and a Deny reaching it on any non-network key blocks it. "
         "AC-10 fails an Allow that opens the runtime to any principal without binding "
         "the caller's account or organization",
         [],
@@ -737,10 +749,10 @@ AI_SUBJECT_ROWS = [
         "as customer managed and Enabled, AC-36 asserts the key policy names who may "
         "decrypt with it and who may disable it or schedule it for deletion, scopes "
         "CreateGrant, Decrypt and GenerateDataKey by ViaService, grant constraint and "
-        "source context as the policy encryption guide shows, with Decrypt and "
-        "GenerateDataKey needing both aws:SourceAccount and aws:SourceArn naming the "
-        "account (DescribeKey is scoped by ViaService alone, as the guide's complete "
-        "policy shows), and that the key carries the engine's management and "
+        "source context as the policy encryption guide shows, with Decrypt, "
+        "GenerateDataKey and DescribeKey each needing both aws:SourceAccount and "
+        "aws:SourceArn naming the account, and the encryption context held to Decrypt "
+        "and GenerateDataKey alone, and that the key carries the engine's management and "
         "evaluation grants; the key cannot be added to or changed on an existing "
         "engine, so the key policy is the whole guard. AC-36 reads an EventBridge rule "
         "or a metric-filter alarm on DisableKey and ScheduleKeyDeletion, crediting a "
@@ -1049,7 +1061,11 @@ AI_SUBJECT_ROWS = [
         "user. The same statement must also deny a type the key does not list, "
         "because AWS publishes no list of the values it takes: StringNotEquals "
         "CUSTOM_JWT passes, and a StringEquals deny-list of AWS_IAM fails as "
-        "Deny-List. IfExists operators read as their plain form. The policy counts only "
+        "Deny-List. The authorizer configuration is optional on both writes in the "
+        "pinned botocore, so the Deny must also fire when the key is absent: a "
+        "ForAnyValue allow-list or a Null test set to false fails as Absent Key, and a "
+        "Null true test or an IfExists or ForAllValues operator passes that leg. IfExists "
+        "operators otherwise read as their plain form. The policy counts only "
         "when it is attached to the assessed account, to an organizational unit above "
         "it or to the root, read with organizations:ListParents and "
         "organizations:ListTargetsForPolicy: a guard attached elsewhere fails as "
@@ -1641,7 +1657,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-01", "AC-15", "AC-49"],
+        ["AC-01", "AC-15", "AC-49", "AG-25", "AC-35"],
         "AC-01 fails a runtime or built-in tool whose security groups together allow "
         "egress to 0.0.0.0/0 or ::/0, unioning the ranges so 0.0.0.0/1 plus "
         "128.0.0.0/1 fails, fails a rule naming a public range of /16 (IPv6 /48) or "
@@ -1668,7 +1684,14 @@ AI_SUBJECT_ROWS = [
         "the value named. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
         "does not substitute for this: the devguide lists those keys while the "
         "machine-readable IAM reference lists none for CreateGatewayTarget or "
-        "UpdateGatewayTarget, so such a Deny can fail open",
+        "UpdateGatewayTarget, so such a Deny can fail open. The tool-level allow-list "
+        "is judged at the gateway: AG-25 asserts each gateway's policy engine is "
+        "attached in ENFORCE mode with status and enforcementMode ACTIVE, and fails a "
+        "permit over every action with no condition as Allows All; AC-35 fails an "
+        "enforcing permit that leaves the action position unconstrained, a bare "
+        "principal no condition reads, and a resource named by type alone or not at "
+        "all, so a gateway passes only when its enforcing permits name the tools, "
+        "callers and gateway they authorize",
         [],
         5,
     ),

@@ -12196,6 +12196,176 @@ class TestAC08RuntimeVpcEndpoint:
         assert "UnauthorizedOperation on ec2:DescribeSubnets" in details
 
 
+class TestAC08OAuthDiscoveryEndpointPolicy:
+    """AC-08: with an OAuth runtime in the Region, every runtime data-plane
+    endpoint must let an unsigned caller read the protected-resource metadata."""
+
+    _JWT = {"customJWTAuthorizer": {"discoveryUrl": "https://idp/.well-known"}}
+    _OPEN_DISCOVERY = {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "bedrock-agentcore:GetRuntimeProtectedResourceMetadata",
+        "Resource": "*",
+    }
+    _APP = {
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+        "Action": "bedrock-agentcore:*",
+        "Resource": "*",
+    }
+
+    def _wire(self, mock_ac, mock_ec2, authorizers, policies):
+        """Runtimes keyed by id with their authorizerConfiguration, and one
+        bedrock-agentcore endpoint per entry in `policies`."""
+        TestAC08RuntimeVpcEndpoint()._wire(
+            mock_ac,
+            mock_ec2,
+            {runtime_id: {"networkMode": "PUBLIC"} for runtime_id in authorizers},
+            [("vpc-1", "available")] * len(policies),
+        )
+
+        def get_agent_runtime(agentRuntimeId):
+            detail = {
+                "agentRuntimeId": agentRuntimeId,
+                "agentRuntimeArn": (
+                    "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/"
+                    f"{agentRuntimeId}"
+                ),
+                "networkConfiguration": {"networkMode": "PUBLIC"},
+            }
+            if authorizers[agentRuntimeId]:
+                detail["authorizerConfiguration"] = authorizers[agentRuntimeId]
+            return detail
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+        endpoints = mock_ec2.describe_vpc_endpoints.return_value["VpcEndpoints"]
+        for endpoint, statements in zip(endpoints, policies):
+            endpoint["PolicyDocument"] = json.dumps({"Statement": statements})
+
+    @staticmethod
+    def _leg(findings):
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore VPC Endpoint OAuth Discovery")
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_endpoint_is_judged_for_oauth_discovery(
+        self, mock_ac, mock_ec2
+    ):
+        # vpce-0 admits discovery; vpce-1 keeps the app-only policy, so OAuth
+        # discovery through it returns HTTP 403. Before round 7 neither was read.
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {"rt-jwt": self._JWT, "rt-iam": None},
+            [[self._APP, self._OPEN_DISCOVERY], [self._APP]],
+        )
+
+        leg = self._leg(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert [f["Status"] for f in leg] == ["Passed", "Failed"]
+        assert "vpce-0" in leg[0]["Finding_Details"]
+        assert "vpce-1" in leg[1]["Finding_Details"]
+        assert "rt-jwt" in leg[1]["Finding_Details"]
+        assert "rt-iam" not in leg[1]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_oauth_runtime_raises_no_discovery_row(self, mock_ac, mock_ec2):
+        self._wire(mock_ac, mock_ec2, {"rt-iam": None}, [[self._APP]])
+
+        assert self._leg(agentcore_app.check_agentcore_vpc_endpoints()) == []
+
+    @pytest.mark.parametrize(
+        ("statements", "status"),
+        [
+            pytest.param(
+                [
+                    {
+                        **_OPEN_DISCOVERY,
+                        "Condition": {
+                            "StringEquals": {"aws:PrincipalOrgID": "o-example"}
+                        },
+                    }
+                ],
+                "Failed",
+                id="identity-conditioned-allow",
+            ),
+            pytest.param(
+                [
+                    _OPEN_DISCOVERY,
+                    {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringNotEquals": {"aws:PrincipalOrgID": "o-example"}
+                        },
+                    },
+                ],
+                "Failed",
+                id="org-deny-blocks-unsigned",
+            ),
+            pytest.param(
+                [
+                    _OPEN_DISCOVERY,
+                    {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                        "Condition": {"StringNotEquals": {"aws:SourceVpc": "vpc-1"}},
+                    },
+                ],
+                "Passed",
+                id="network-deny-allowed",
+            ),
+            pytest.param(
+                [
+                    {
+                        **_OPEN_DISCOVERY,
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                    }
+                ],
+                "Failed",
+                id="named-principal",
+            ),
+            pytest.param(
+                [
+                    {
+                        **_OPEN_DISCOVERY,
+                        "Resource": (
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                            "runtime/rt-other"
+                        ),
+                    }
+                ],
+                "Failed",
+                id="other-runtime-arn",
+            ),
+            pytest.param(
+                [{**_OPEN_DISCOVERY, "Action": "bedrock-agentcore:Get*"}],
+                "Passed",
+                id="wildcard-action",
+            ),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_discovery_statement_is_judged_by_value(
+        self, mock_ac, mock_ec2, statements, status
+    ):
+        self._wire(mock_ac, mock_ec2, {"rt-jwt": self._JWT}, [statements])
+
+        leg = self._leg(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert [f["Status"] for f in leg] == [status]
+
+
 class TestAC08EndpointScope:
     """AC-08 now judges each AgentCore endpoint's policy and inbound scope."""
 
@@ -13495,6 +13665,156 @@ class TestAC27GatewayPolicyConditions:
         ]
         assert [f["Status"] for f in deputy] == [status]
 
+    @staticmethod
+    def _deputy_verdicts(findings):
+        return {
+            gateway: [
+                f["Status"]
+                for f in findings
+                if f["Finding"].startswith("AgentCore Gateway Resource Policy")
+                and "Network" not in f["Finding"]
+                and f"({gateway})" in f["Finding_Details"]
+            ]
+            for gateway in ("gw-1", "gw-2")
+        }
+
+    @pytest.mark.parametrize(
+        ("condition", "authorizer", "status"),
+        [
+            pytest.param(
+                {"StringEquals": {"aws:SourceVpce": "vpce-0abc"}},
+                "CUSTOM_JWT",
+                "Passed",
+                id="jwt-vpce",
+            ),
+            pytest.param(
+                {"StringEquals": {"aws:SourceVpc": ["vpc-1", "vpc-2"]}},
+                "CUSTOM_JWT",
+                "Passed",
+                id="jwt-vpc-list",
+            ),
+            pytest.param(
+                {"StringLike": {"aws:SourceVpce": "vpce-*"}},
+                "CUSTOM_JWT",
+                "Failed",
+                id="jwt-wildcard-vpce",
+            ),
+            pytest.param(
+                {"StringEqualsIfExists": {"aws:SourceVpce": "vpce-0abc"}},
+                "CUSTOM_JWT",
+                "Failed",
+                id="jwt-if-exists",
+            ),
+            pytest.param(
+                {"StringNotEquals": {"aws:SourceVpce": "vpce-0abc"}},
+                "CUSTOM_JWT",
+                "Failed",
+                id="jwt-negated-allow",
+            ),
+            pytest.param(
+                {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}},
+                "CUSTOM_JWT",
+                "Failed",
+                id="jwt-source-ip",
+            ),
+            pytest.param(
+                {"StringEquals": {"aws:SourceVpce": "vpce-0abc"}},
+                "AWS_IAM",
+                "Failed",
+                id="iam-vpce",
+            ),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_jwt_gateway_wildcard_bounded_to_a_private_path_is_not_a_deputy(
+        self, mock_ac, condition, authorizer, status
+    ):
+        # The control's OAuth pattern is Principal '*' bounded by a network
+        # condition. Before round 7 every such statement failed. gw-2 keeps an
+        # unbounded '*' statement on a JWT gateway beside it and always fails.
+        def policy_for(statement_condition):
+            statement = {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "bedrock-agentcore:InvokeGateway",
+                "Resource": "*",
+            }
+            if statement_condition:
+                statement["Condition"] = statement_condition
+            return json.dumps({"Statement": [statement]})
+
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-1", "name": "One"},
+                {"gatewayId": "gw-2", "name": "Two"},
+            ]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayArn": (
+                "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/"
+                f"{gatewayIdentifier}"
+            ),
+            "authorizerType": authorizer
+            if gatewayIdentifier == "gw-1"
+            else "CUSTOM_JWT",
+        }
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": policy_for(condition if resourceArn.endswith("gw-1") else None)
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        verdicts = self._deputy_verdicts(findings)
+        assert verdicts["gw-1"] == [status]
+        assert verdicts["gw-2"] == ["Failed"]
+        if status == "Passed":
+            passed = next(
+                f
+                for f in findings
+                if f["Status"] == "Passed"
+                and "(gw-1)" in f["Finding_Details"]
+                and "Network" not in f["Finding"]
+            )
+            assert "CUSTOM_JWT gateway" in passed["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_jwt_gateway_wildcard_bounded_by_a_restricting_deny_passes(self, mock_ac):
+        policy = {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                    "Condition": {"StringNotEquals": {"aws:SourceVpc": "vpc-1"}},
+                },
+            ]
+        }
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1",
+            "authorizerType": "CUSTOM_JWT",
+        }
+        mock_ac.get_resource_policy.return_value = {"policy": json.dumps(policy)}
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        assert self._deputy_verdicts(findings)["gw-1"] == ["Passed"]
+        passed = [
+            f
+            for f in findings
+            if f["Status"] == "Passed" and "restricting Deny" in f["Finding_Details"]
+        ]
+        assert passed
+
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
@@ -14602,6 +14922,164 @@ class TestAC29RuntimeAuthorizerSCP:
         assert findings[0]["Finding"].endswith("Deny-List")
         assert "DenySigV4Runtime" in findings[0]["Finding_Details"]
         assert "attached here was not read" in findings[0]["Finding_Details"]
+
+    @staticmethod
+    def _deny(condition, actions=None):
+        return {
+            "Effect": "Deny",
+            "Action": actions or _RUNTIME_WRITE,
+            "Resource": "*",
+            "Condition": condition,
+        }
+
+    def test_the_authorizer_configuration_is_optional_on_runtime_writes(self):
+        # This is why the runtime leg judges a request that carries no
+        # authorizer type: botocore marks authorizerConfiguration optional.
+        import botocore.session
+
+        model = botocore.session.get_session().get_service_model(
+            "bedrock-agentcore-control"
+        )
+        for operation in ("CreateAgentRuntime", "UpdateAgentRuntime"):
+            shape = model.operation_model(operation).input_shape
+            assert "authorizerConfiguration" in shape.members
+            assert "authorizerConfiguration" not in shape.required_members
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_for_any_value_allow_list_misses_an_absent_authorizer(self, mock_orgs):
+        # ForAnyValue: evaluates false on an absent key, so a SigV4 write with no
+        # authorizerConfiguration is not denied. Before round 7 this passed.
+        self._wire(
+            mock_orgs,
+            {
+                "AnyValueJwt": [
+                    self._deny(
+                        {"ForAnyValue:StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}}
+                    )
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Absent Key")
+        assert "AnyValueJwt" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("documents", "status"),
+        [
+            pytest.param(
+                {
+                    "AnyValueJwtWithNull": [
+                        {
+                            "Effect": "Deny",
+                            "Action": _RUNTIME_WRITE,
+                            "Resource": "*",
+                            "Condition": {
+                                "ForAnyValue:StringNotEquals": {
+                                    _RUNTIME_KEY: "CUSTOM_JWT"
+                                }
+                            },
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Action": _RUNTIME_WRITE,
+                            "Resource": "*",
+                            "Condition": {"Null": {_RUNTIME_KEY: "true"}},
+                        },
+                    ]
+                },
+                "Passed",
+                id="for-any-value-plus-null",
+            ),
+            pytest.param(
+                {
+                    "IfExistsJwt": [
+                        {
+                            "Effect": "Deny",
+                            "Action": _RUNTIME_WRITE,
+                            "Resource": "*",
+                            "Condition": {
+                                "StringNotEqualsIfExists": {_RUNTIME_KEY: "CUSTOM_JWT"}
+                            },
+                        }
+                    ]
+                },
+                "Passed",
+                id="if-exists",
+            ),
+            pytest.param(
+                {
+                    "NullFalseIsNotAbsent": [
+                        {
+                            "Effect": "Deny",
+                            "Action": _RUNTIME_WRITE,
+                            "Resource": "*",
+                            "Condition": {
+                                "ForAnyValue:StringNotEquals": {
+                                    _RUNTIME_KEY: "CUSTOM_JWT"
+                                }
+                            },
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Action": _RUNTIME_WRITE,
+                            "Resource": "*",
+                            "Condition": {"Null": {_RUNTIME_KEY: "false"}},
+                        },
+                    ]
+                },
+                "Failed",
+                id="null-false",
+            ),
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_an_absent_authorizer_is_denied_by_value(
+        self, mock_orgs, documents, status
+    ):
+        self._wire(mock_orgs, documents)
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == [status]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_null_guard_on_create_alone_leaves_update_open(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "NullOnCreateOnly": [
+                    self._deny(
+                        {"ForAnyValue:StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}}
+                    ),
+                    self._deny(
+                        {"Null": {_RUNTIME_KEY: "true"}},
+                        actions=["bedrock-agentcore:CreateAgentRuntime"],
+                    ),
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Partial")
+        assert "but not on UpdateAgentRuntime" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_null_test_alone_is_ineffective(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {"NullOnly": [self._deny({"Null": {_RUNTIME_KEY: "true"}})]},
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Ineffective")
+        assert "not one that carries AWS_IAM" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.organizations_client")
     def test_an_allow_list_passes_beside_a_deny_list(self, mock_orgs):
@@ -20085,6 +20563,22 @@ def _engine_service_use(
             "Resource": "*",
             "Condition": use_condition,
         },
+        {
+            # The validation statement carries both source keys too, and no
+            # encryption context, which DescribeKey does not send.
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "kms:DescribeKey",
+            "Resource": "*",
+            "Condition": {
+                operator: {
+                    key: value
+                    for key, value in entries.items()
+                    if key != _ENGINE_CONTEXT_KEY
+                }
+                for operator, entries in use_condition.items()
+            },
+        },
     ]
 
 
@@ -20951,7 +21445,7 @@ class TestAC36PolicyEngineServiceScope:
             "bedrock-agentcore.us-east-1.amazonaws.com and kms:GrantConstraintType "
             "EncryptionContextSubset"
         ) in details
-        assert "kms:Decrypt, kms:GenerateDataKey only with" in details
+        assert "kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey only with" in details
 
     @pytest.mark.parametrize(
         "variant",
@@ -21030,12 +21524,12 @@ class TestAC36PolicyEngineServiceScope:
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
     def test_a_create_grant_without_a_constraint_type_fails(self, mock_ac, mock_kms):
-        grant_statement, use_statement = _engine_service_use()
+        grant_statement, use_statement, describe_statement = _engine_service_use()
         del grant_statement["Condition"]["StringEquals"]["kms:GrantConstraintType"]
         self._setup(
             mock_ac,
             mock_kms,
-            [self._ADMIN, grant_statement, use_statement],
+            [self._ADMIN, grant_statement, use_statement, describe_statement],
             _engine_grants("pe-1"),
         )
 
@@ -21698,7 +22192,7 @@ class TestAC36KeyLossAlarmAndServiceBounds:
     def test_a_service_statement_not_bound_to_the_engine_fails(
         self, mock_ac, mock_kms, context
     ):
-        grant_statement, use_statement = _engine_service_use()
+        grant_statement, use_statement, describe_statement = _engine_service_use()
         for statement in (grant_statement, use_statement):
             # The context key alone changes; the use statement keeps its
             # aws:SourceArn.
@@ -21706,7 +22200,14 @@ class TestAC36KeyLossAlarmAndServiceBounds:
             if context is not None:
                 statement["Condition"]["StringLike"][_ENGINE_CONTEXT_KEY] = context
         findings = self._run(
-            mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
+            mock_ac,
+            mock_kms,
+            statements=[
+                self._ADMIN,
+                grant_statement,
+                use_statement,
+                describe_statement,
+            ],
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
@@ -21723,14 +22224,21 @@ class TestAC36KeyLossAlarmAndServiceBounds:
     def test_an_if_exists_context_on_decrypt_alone_is_named_alone(
         self, mock_ac, mock_kms
     ):
-        grant_statement, use_statement = _engine_service_use()
+        grant_statement, use_statement, describe_statement = _engine_service_use()
         use_statement["Condition"]["StringLikeIfExists"] = {
             _ENGINE_CONTEXT_KEY: use_statement["Condition"]["StringLike"].pop(
                 _ENGINE_CONTEXT_KEY
             )
         }
         findings = self._run(
-            mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
+            mock_ac,
+            mock_kms,
+            statements=[
+                self._ADMIN,
+                grant_statement,
+                use_statement,
+                describe_statement,
+            ],
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
@@ -21769,10 +22277,17 @@ class TestAC36KeyLossAlarmAndServiceBounds:
     def test_a_service_statement_granting_more_actions_fails(
         self, mock_ac, mock_kms, actions, named
     ):
-        grant_statement, use_statement = _engine_service_use()
+        grant_statement, use_statement, describe_statement = _engine_service_use()
         use_statement["Action"] = actions
         findings = self._run(
-            mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
+            mock_ac,
+            mock_kms,
+            statements=[
+                self._ADMIN,
+                grant_statement,
+                use_statement,
+                describe_statement,
+            ],
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
@@ -21784,13 +22299,19 @@ class TestAC36KeyLossAlarmAndServiceBounds:
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
     def test_a_not_action_service_statement_fails(self, mock_ac, mock_kms):
-        grant_statement, use_statement = _engine_service_use()
+        grant_statement, use_statement, describe_statement = _engine_service_use()
         extra = {**use_statement, "NotAction": ["kms:ScheduleKeyDeletion"]}
         del extra["Action"]
         findings = self._run(
             mock_ac,
             mock_kms,
-            statements=[self._ADMIN, grant_statement, use_statement, extra],
+            statements=[
+                self._ADMIN,
+                grant_statement,
+                use_statement,
+                describe_statement,
+                extra,
+            ],
         )
 
         assert [f["Status"] for f in findings] == ["Failed"]
@@ -21822,15 +22343,65 @@ class TestAC36KeyLossAlarmAndServiceBounds:
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "no action beyond kms:CreateGrant" in findings[0]["Finding_Details"]
 
+    @pytest.mark.parametrize("drop", ["aws:SourceAccount", "aws:SourceArn", "both"])
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_describe_key_statement_needs_both_source_keys(
+        self, mock_ac, mock_kms, drop
+    ):
+        # Two engines: pe-1 keeps the guide's validation statement, pe-2's
+        # DescribeKey statement drops a source key. Only pe-2 fails, and only on
+        # DescribeKey. Before round 7 DescribeKey was never held to the keys.
+        grant_statement, use_statement, describe_statement = _engine_service_use()
+        for operator in list(describe_statement["Condition"]):
+            for key in ("aws:SourceAccount", "aws:SourceArn"):
+                if drop in (key, "both"):
+                    describe_statement["Condition"][operator].pop(key, None)
+        policies = {
+            "pe-1": [self._ADMIN, *_engine_service_use()],
+            "pe-2": [self._ADMIN, grant_statement, use_statement, describe_statement],
+        }
+        findings = self._run(
+            mock_ac, mock_kms, engines=("pe-1", "pe-2"), policies=policies
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        details = findings[1]["Finding_Details"]
+        assert "has no statement allowing kms:DescribeKey only with" in details
+        assert "kms:Decrypt" not in details.split("only with")[0]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_describe_key_is_not_held_to_the_encryption_context(
+        self, mock_ac, mock_kms
+    ):
+        # DescribeKey sends no encryption context, so a validation statement
+        # without one still passes, while Decrypt without one fails.
+        grant_statement, use_statement, describe_statement = _engine_service_use()
+        assert _ENGINE_CONTEXT_KEY not in str(describe_statement["Condition"])
+
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            statements=[
+                self._ADMIN,
+                grant_statement,
+                use_statement,
+                describe_statement,
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
     def test_one_engine_key_without_the_context_fails_alone(self, mock_ac, mock_kms):
-        grant_statement, use_statement = _engine_service_use()
+        grant_statement, use_statement, describe_statement = _engine_service_use()
         for statement in (grant_statement, use_statement):
             del statement["Condition"]["StringLike"]
         policies = {
             "pe-1": [self._ADMIN, *_engine_service_use()],
-            "pe-2": [self._ADMIN, grant_statement, use_statement],
+            "pe-2": [self._ADMIN, grant_statement, use_statement, describe_statement],
             "pe-3": [self._ADMIN, *_engine_service_use()],
         }
         findings = self._run(
@@ -23361,6 +23932,7 @@ def _online_evaluation_detail(**overrides):
         },
         "evaluators": [
             {"evaluatorId": "Builtin.Harmfulness"},
+            {"evaluatorId": "Builtin.Stereotyping"},
             {"evaluatorId": "Builtin.ToolSelectionAccuracy"},
         ],
         "outputConfig": {
@@ -23380,6 +23952,12 @@ def _evaluator_catalogue():
             "evaluatorType": "Builtin",
             "level": "TRACE",
             "description": "Safety Metric. Evaluates whether the response contains harmful content",
+        },
+        {
+            "evaluatorId": "Builtin.Stereotyping",
+            "evaluatorType": "Builtin",
+            "level": "TRACE",
+            "description": "Safety Metric. Detects content that makes generalizations about individuals or groups",
         },
         {
             "evaluatorId": "Builtin.ToolSelectionAccuracy",
@@ -24164,7 +24742,7 @@ class TestAC39OnlineEvaluationOperation:
         assert findings[0]["Severity"] == "Medium"
         assert "samples 100.0 percent" in findings[0]["Finding_Details"]
         assert "1 log group(s) and 1 service(s)" in findings[0]["Finding_Details"]
-        assert "2 evaluator(s)" in findings[0]["Finding_Details"]
+        assert "3 evaluator(s)" in findings[0]["Finding_Details"]
         assert_finding_schema(findings[0])
 
     @pytest.mark.parametrize(
@@ -24836,6 +25414,7 @@ class TestAC40EvaluationSafetyCoverage:
                 _online_evaluation_detail(
                     evaluators=[
                         {"evaluatorId": "Builtin.Harmfulness"},
+                        {"evaluatorId": "Builtin.Stereotyping"},
                         {"evaluatorId": "Builtin.ToolParameterAccuracy"},
                     ]
                 )
@@ -25080,6 +25659,94 @@ class TestAC40EvaluationSafetyCoverage:
         assert_finding_schema(findings[0])
 
     @patch("agentcore_app.agentcore_client")
+    def test_each_named_safety_evaluator_is_required(self, mock_ac):
+        # Three configurations: one attaches both named safety evaluators, each
+        # of the others attaches one. Only the first passes, and each failure
+        # names the evaluator it lacks and not the one it attaches.
+        tool = {"evaluatorId": "Builtin.ToolSelectionAccuracy"}
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="harm-only",
+                    evaluators=[{"evaluatorId": "Builtin.Harmfulness"}, tool],
+                ),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-3",
+                    onlineEvaluationConfigName="stereo-only",
+                    evaluators=[{"evaluatorId": "Builtin.Stereotyping"}, tool],
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        by_config = {
+            config: finding
+            for finding in findings
+            for config in ("(oec-1)", "(oec-2)", "(oec-3)")
+            if config in finding["Finding_Details"]
+        }
+        assert by_config["(oec-1)"]["Status"] == "Passed"
+        harm_only = by_config["(oec-2)"]["Finding_Details"]
+        stereo_only = by_config["(oec-3)"]["Finding_Details"]
+        assert by_config["(oec-2)"]["Status"] == "Failed"
+        assert by_config["(oec-3)"]["Status"] == "Failed"
+        assert "does not attach Builtin.Stereotyping, so" in harm_only
+        assert "does not attach Builtin.Harmfulness, so" in stereo_only
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_catalogue_without_a_named_safety_evaluator_is_not_judged(self, mock_ac):
+        # Stereotyping is listed but no longer marked as a safety metric, so the
+        # catalogue cannot confirm what the named evaluator scores.
+        catalogue = [
+            dict(entry, description="Quality Metric. Renamed")
+            if entry["evaluatorId"] == "Builtin.Stereotyping"
+            else entry
+            for entry in _evaluator_catalogue()
+        ]
+        _online_evaluation_client(mock_ac, catalogue=catalogue)
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert (
+            "1 of Builtin.Harmfulness, Builtin.Stereotyping"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_listed_safety_score_needs_its_own_alarm(self, mock_ac):
+        # Both safety scores are published and the only alarm reads Harmfulness,
+        # so a falling Stereotyping score notifies nobody.
+        _online_evaluation_client(mock_ac)
+        self.mock_cw.list_metrics.side_effect = lambda Namespace, **_: _published(
+            (Namespace, "Builtin.Harmfulness", {}),
+            (Namespace, "Builtin.Stereotyping", {}),
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "no CloudWatch alarm with actions on the score of Builtin.Stereotyping"
+            in findings[0]["Finding_Details"]
+        )
+
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [
+                _score_alarm(),
+                _score_alarm(name="stereo-drop", MetricName="Builtin.Stereotyping"),
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
     def test_quality_evaluators_alone_fail_on_both_legs(self, mock_ac):
         _online_evaluation_client(
             mock_ac,
@@ -25095,7 +25762,10 @@ class TestAC40EvaluationSafetyCoverage:
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Severity"] == "Medium"
         assert findings[0]["Finding"].endswith("Incomplete")
-        assert "safety metric" in findings[0]["Finding_Details"]
+        assert (
+            "does not attach Builtin.Harmfulness or Builtin.Stereotyping"
+            in findings[0]["Finding_Details"]
+        )
         assert "TOOL_CALL level" in findings[0]["Finding_Details"]
         assert agentcore_app.EVALUATION_SCORE_ALARM_NOTE in findings[0]["Resolution"]
 
@@ -25126,6 +25796,7 @@ class TestAC40EvaluationSafetyCoverage:
                 _online_evaluation_detail(
                     evaluators=[
                         {"evaluatorId": "Builtin.Harmfulness"},
+                        {"evaluatorId": "Builtin.Stereotyping"},
                         {"evaluatorId": "Builtin.ToolSelectionAccuracy"},
                         {"evaluatorId": "custom_tool_fidelity-abc"},
                     ]
@@ -25158,26 +25829,25 @@ class TestAC40EvaluationSafetyCoverage:
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
         assert findings[0]["Status"] == "Failed"
-        assert "safety metric" in findings[0]["Finding_Details"]
+        assert (
+            "does not attach Builtin.Harmfulness or Builtin.Stereotyping"
+            in findings[0]["Finding_Details"]
+        )
         assert "TOOL_CALL level" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
-    def test_a_third_party_evaluator_is_service_authored(self, mock_ac):
-        # The catalogue's third-party entries carry the same service-written
-        # descriptions as the built-in ones, so a workload scoring safety with a
-        # third-party judge is covered.
-        catalogue = [
+    def test_a_third_party_safety_evaluator_does_not_stand_in_for_a_named_one(
+        self, mock_ac
+    ):
+        # The catalogue marks ThirdParty.DeepEval.Toxicity as a safety metric, but
+        # the control names Harmfulness and Stereotyping, and Toxicity scores
+        # neither. Before round 7 any marked evaluator passed this leg.
+        catalogue = _evaluator_catalogue() + [
             {
                 "evaluatorId": "ThirdParty.DeepEval.Toxicity",
                 "evaluatorType": "ThirdParty",
                 "level": "TRACE",
                 "description": "Safety Metric. Evaluates toxic content",
-            },
-            {
-                "evaluatorId": "Builtin.ToolSelectionAccuracy",
-                "evaluatorType": "Builtin",
-                "level": "TOOL_CALL",
-                "description": "Component Level Metric.",
             },
         ]
         _online_evaluation_client(
@@ -25201,8 +25871,11 @@ class TestAC40EvaluationSafetyCoverage:
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
-        assert findings[0]["Status"] == "Passed"
-        assert "ThirdParty.DeepEval.Toxicity" in findings[0]["Finding_Details"]
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "does not attach Builtin.Harmfulness or Builtin.Stereotyping"
+            in findings[0]["Finding_Details"]
+        )
         assert "workload owner's to state" not in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
@@ -25213,6 +25886,12 @@ class TestAC40EvaluationSafetyCoverage:
                 "evaluatorType": "Builtin",
                 "level": "TRACE",
                 "description": "SAFETY METRIC. Harmful content",
+            },
+            {
+                "evaluatorId": "Builtin.Stereotyping",
+                "evaluatorType": "Builtin",
+                "level": "TRACE",
+                "description": "safety metric. Stereotyping",
             },
             {
                 "evaluatorId": "Builtin.ToolSelectionAccuracy",

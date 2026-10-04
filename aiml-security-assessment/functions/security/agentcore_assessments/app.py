@@ -10764,9 +10764,176 @@ def _agentcore_endpoint_scope_findings(
     return findings
 
 
+# vpc-interface-endpoints.html: for an OAuth runtime the endpoint policy "must
+# also allow GetRuntimeProtectedResourceMetadata (Principal '*') or OAuth
+# discovery returns HTTP 403". The discovery call carries no AWS signature, so
+# only a statement for every principal reaches it. The action is named in the
+# developer guide; the IAM service reference and botocore list no such action.
+RUNTIME_OAUTH_METADATA_ACTION = "bedrock-agentcore:GetRuntimeProtectedResourceMetadata"
+
+
+def _endpoint_policy_admits_oauth_discovery(
+    policy_document: Any, runtime_arns: List[str]
+) -> Tuple[bool, str]:
+    """Return whether an endpoint policy lets an unsigned caller reach the OAuth
+    metadata of every runtime named, and why not.
+
+    An Allow counts when it names every principal, reaches the action and the
+    runtime ARN, and carries no condition other than a network-path key, since
+    an unsigned request has no principal for an identity condition to test. A
+    Deny reaching the action blocks it unless every one of its condition keys is
+    a network-path key: aws:PrincipalOrgID StringNotEquals, the usual endpoint
+    guard, matches the absent value and denies the discovery call.
+    """
+    statements = _document_statements(policy_document)
+    action = RUNTIME_OAUTH_METADATA_ACTION.lower()
+
+    def reaches(statement: Dict[str, Any], arn: str) -> bool:
+        if "NotResource" in statement:
+            return False
+        resources = statement.get("Resource")
+        return any(
+            fnmatchcase(arn, str(pattern))
+            for pattern in (resources if isinstance(resources, list) else [resources])
+            if pattern
+        )
+
+    def network_only(statement: Dict[str, Any]) -> bool:
+        return all(
+            key in NETWORK_PATH_CONDITION_KEYS
+            for key in _statement_condition_keys(statement)
+        )
+
+    for statement in statements:
+        if statement.get("Effect") != "Deny" or not _statement_matches_action(
+            statement, action
+        ):
+            continue
+        if any(reaches(statement, arn) for arn in runtime_arns) and not (
+            statement.get("Condition") and network_only(statement)
+        ):
+            keys = sorted(_statement_condition_keys(statement))
+            return False, (
+                "a Deny reaches it"
+                + (
+                    f" under {', '.join(keys)}, which an unsigned request fails"
+                    if keys
+                    else ""
+                )
+            )
+    unreached = [
+        arn
+        for arn in runtime_arns
+        if not any(
+            statement.get("Effect") == "Allow"
+            and "NotPrincipal" not in statement
+            and "*" in _statement_principals(statement)
+            and _statement_matches_action(statement, action)
+            and reaches(statement, arn)
+            and network_only(statement)
+            for statement in statements
+        )
+    ]
+    if unreached:
+        return False, (
+            "no Allow for Principal '*' with no identity condition reaches it on "
+            + ", ".join(unreached)
+        )
+    return True, ""
+
+
+def _agentcore_oauth_metadata_endpoint_findings(
+    oauth_runtimes: List[Tuple[str, str]],
+    agentcore_endpoints: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Require each runtime data-plane endpoint to admit OAuth discovery.
+
+    With a CUSTOM_JWT runtime in the Region, an OAuth client resolves the
+    runtime's protected-resource metadata through the bedrock-agentcore
+    interface endpoint of its VPC, so every available one is judged.
+    """
+    if not oauth_runtimes:
+        return []
+    endpoints = [
+        entry
+        for entry in agentcore_endpoints
+        if entry["state"] == "available"
+        and str(entry["service"]).lower().endswith(".bedrock-agentcore")
+        and entry["endpoint"].get("VpcEndpointType", "Interface") == "Interface"
+    ]
+    runtime_label = "; ".join(label for label, _ in oauth_runtimes)
+    runtime_arns = [arn for _, arn in oauth_runtimes]
+    findings: List[Dict[str, Any]] = []
+    for entry in endpoints:
+        endpoint_id = entry["endpoint"].get("VpcEndpointId", "unknown")
+        label = f"{entry['vpc_id'] or 'unknown VPC'} endpoint {endpoint_id}"
+        document = entry["endpoint"].get("PolicyDocument")
+        if not document:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint OAuth Discovery",
+                    finding_details=(
+                        f"AgentCore VPC {label} returned no policy document, so "
+                        f"whether OAuth runtime(s) {runtime_label} can be "
+                        "discovered through it could not be assessed."
+                    ),
+                    resolution="Grant ec2:DescribeVpcEndpoints and retry.",
+                    reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        admitted, reason = _endpoint_policy_admits_oauth_discovery(
+            document, runtime_arns
+        )
+        if admitted:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint OAuth Discovery",
+                    finding_details=(
+                        f"AgentCore VPC {label} allows "
+                        f"{RUNTIME_OAUTH_METADATA_ACTION} to Principal '*' with no "
+                        "identity condition, and no Deny an unsigned request "
+                        f"fails reaches it, for OAuth runtime(s) {runtime_label}."
+                    ),
+                    resolution="No action required.",
+                    reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint OAuth Discovery Blocked",
+                    finding_details=(
+                        f"AgentCore VPC {label} does not let an unsigned caller "
+                        f"reach {RUNTIME_OAUTH_METADATA_ACTION}: {reason}. OAuth "
+                        f"runtime(s) {runtime_label} answer discovery through it "
+                        "with HTTP 403."
+                    ),
+                    resolution=(
+                        "Add an endpoint policy statement allowing "
+                        f"{RUNTIME_OAUTH_METADATA_ACTION} to Principal '*' on the "
+                        "OAuth runtimes, and exempt it from any Deny keyed on the "
+                        "caller's identity."
+                    ),
+                    reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+    return findings
+
+
 def _agentcore_runtime_vpc_endpoint_findings(
     runtimes: List[Dict[str, Any]],
     agentcore_endpoints: List[Dict[str, Any]],
+    oauth_runtimes: Optional[List[Tuple[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """Require an available bedrock-agentcore endpoint in each runtime's own VPC.
 
@@ -10799,6 +10966,17 @@ def _agentcore_runtime_vpc_endpoint_findings(
                 "bedrock-agentcore:GetAgentRuntime"
             )
             continue
+        if oauth_runtimes is not None and (
+            (detail.get("authorizerConfiguration") or {}).get("customJWTAuthorizer")
+        ):
+            oauth_runtimes.append(
+                (
+                    label,
+                    str(
+                        detail.get("agentRuntimeArn") or runtime.get("agentRuntimeArn")
+                    ),
+                )
+            )
         network = detail.get("networkConfiguration") or {}
         if network.get("networkMode") != "VPC":
             continue
@@ -10919,6 +11097,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
     - Each endpoint's security group admits a narrower source than the internet
     - The S3, DynamoDB and SageMaker endpoints in the same VPCs are judged on the
       same two legs, because they carry the workload's data and its model calls
+    - With an OAuth runtime in the Region, each bedrock-agentcore endpoint policy
+      lets an unsigned caller reach GetRuntimeProtectedResourceMetadata
 
     Returns:
         List of findings
@@ -11145,9 +11325,15 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             if entry["vpc_id"] in agentcore_vpc_ids
         ]
 
+        oauth_runtimes: List[Tuple[str, str]] = []
         findings.extend(
             _agentcore_runtime_vpc_endpoint_findings(
-                runtimes, found_agentcore_endpoints
+                runtimes, found_agentcore_endpoints, oauth_runtimes
+            )
+        )
+        findings.extend(
+            _agentcore_oauth_metadata_endpoint_findings(
+                oauth_runtimes, found_agentcore_endpoints
             )
         )
         findings.extend(
@@ -17900,7 +18086,10 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
         ]
         findings.extend(
             _gateway_resource_policy_findings(
-                label, detail.get("gatewayArn"), endpoint_cache
+                label,
+                detail.get("gatewayArn"),
+                endpoint_cache,
+                authorizer_type=detail.get("authorizerType"),
             )
         )
         findings.extend(
@@ -18132,8 +18321,42 @@ def _restricting_source_vpce_values(
     return sorted(values)
 
 
+GATEWAY_PRIVATE_PATH_CONDITION_KEYS = ("aws:sourcevpc", "aws:sourcevpce")
+
+
+def _statement_private_path_bound(statement: Dict[str, Any]) -> List[str]:
+    """Return the aws:SourceVpc or aws:SourceVpce keys an Allow pins by value.
+
+    An entry counts when an equals-family operator lists only values with no
+    wildcard, and the operator is not met by a request that omits the key. One
+    such entry bounds the statement, because condition entries are ANDed.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return []
+    bound: Set[str] = set()
+    for operator, entries in condition.items():
+        if not isinstance(entries, dict) or _operator_admits_an_absent_key(operator):
+            continue
+        if _normalized_condition_operator(operator) not in CONDITION_EQUALS_OPERATORS:
+            continue
+        for entry_key, raw in entries.items():
+            key = str(entry_key).strip().lower()
+            if key not in GATEWAY_PRIVATE_PATH_CONDITION_KEYS:
+                continue
+            values = [str(value).strip() for value in _condition_values(raw)]
+            if values and all(
+                value and "*" not in value and "?" not in value for value in values
+            ):
+                bound.add(key)
+    return sorted(bound)
+
+
 def _gateway_resource_policy_findings(
-    label: str, gateway_arn: Any, endpoint_cache: Optional[Dict[str, Any]] = None
+    label: str,
+    gateway_arn: Any,
+    endpoint_cache: Optional[Dict[str, Any]] = None,
+    authorizer_type: Any = None,
 ) -> List[Dict[str, Any]]:
     """Judge one gateway resource policy's confused-deputy and network conditions.
 
@@ -18141,6 +18364,12 @@ def _gateway_resource_policy_findings(
     VPC endpoints, read once into `endpoint_cache`: an id that is not an
     AgentCore gateway endpoint here is either another account's endpoint, whose
     VPC then reaches the gateway, or a path that carries no gateway call.
+
+    On a CUSTOM_JWT gateway the caller's identity is in the token, not in IAM,
+    so the resource policy has to allow Principal '*'. Such a statement is not
+    a confused-deputy exposure when it is bounded to a private path: the Allow
+    pins aws:SourceVpc or aws:SourceVpce to values with no wildcard, or a
+    restricting Deny in the same policy does.
     """
     if not gateway_arn:
         return [
@@ -18215,10 +18444,33 @@ def _gateway_resource_policy_findings(
         )
     else:
         account_id = _arn_account(gateway_arn)
+        jwt_bounded: List[Tuple[Dict[str, Any], List[str]]] = []
+        if str(authorizer_type or "") == "CUSTOM_JWT":
+            deny_keys, _ = _resource_policy_restriction(
+                _document_statements(policy),
+                "bedrock-agentcore:InvokeGateway",
+                str(gateway_arn),
+                set(GATEWAY_PRIVATE_PATH_CONDITION_KEYS),
+                _network_values_are_bounded,
+                exempt_aws_service=True,
+            )
+            for statement in statements:
+                principals = _statement_principals(statement)
+                if "*" not in principals or any(
+                    principal.endswith(".amazonaws.com") for principal in principals
+                ):
+                    continue
+                keys = _statement_private_path_bound(statement) or [
+                    f"{key} (restricting Deny)" for key in deny_keys
+                ]
+                if keys:
+                    jwt_bounded.append((statement, keys))
+        bounded_statements = [statement for statement, _ in jwt_bounded]
         exposed = [
             statement
             for statement in statements
-            if _statement_is_confused_deputy_exposed(statement, account_id)
+            if statement not in bounded_statements
+            and _statement_is_confused_deputy_exposed(statement, account_id)
         ]
         # The control asks for both keys: SourceAccount alone admits any
         # resource in the account, and SourceArn must name this gateway.
@@ -18226,6 +18478,7 @@ def _gateway_resource_policy_findings(
             statement
             for statement in statements
             if statement not in exposed
+            and statement not in bounded_statements
             and any(
                 principal == "*" or principal.endswith(".amazonaws.com")
                 for principal in _statement_principals(statement)
@@ -18299,7 +18552,20 @@ def _gateway_resource_policy_findings(
                         "in its resource policy with an aws:SourceAccount "
                         f"condition naming account {account_id} and an "
                         f"aws:SourceArn condition naming {gateway_arn}, or names "
-                        "no service or wildcard principal."
+                        "no service or wildcard principal"
+                        + (
+                            f", or, for {len(jwt_bounded)} statement(s) allowing "
+                            "Principal '*' on this CUSTOM_JWT gateway, bounds the "
+                            "caller to a private path by "
+                            + "; ".join(
+                                sorted({", ".join(keys) for _, keys in jwt_bounded})
+                            )
+                            + " with no wildcard value, since a JWT caller has "
+                            "no IAM identity to name"
+                            if jwt_bounded
+                            else ""
+                        )
+                        + "."
                     ),
                     resolution=(
                         "No action required. Confirm the aws:SourceArn pattern "
@@ -18802,13 +19068,18 @@ def _condition_string_matches(
 
 
 def _statement_condition_denies_value(
-    statement: Dict[str, Any], key: str, value: str
+    statement: Dict[str, Any], key: str, value: Optional[str]
 ) -> bool:
     """Return whether a Deny statement's condition fires for one key value.
 
     Every condition entry is ANDed, so each must be `key` and each must fire for
     `value`: a second key (an aws:PrincipalArn exemption, a tag test) lets a
     request that fails it through, and the Deny is not credited.
+
+    A `value` of None is a request that carries no value for the key. Then a
+    Null test of true fires, an IfExists operator and a ForAllValues: operator
+    evaluate true, a ForAnyValue: operator evaluates false, and a plain negated
+    operator matches the absent value while a plain positive one does not.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict) or not condition:
@@ -18819,17 +19090,36 @@ def _statement_condition_denies_value(
         if not isinstance(entries, dict) or not entries:
             return False
         name = str(operator).strip().lower()
+        set_prefix = ""
         for prefix in SCP_SET_OPERATOR_PREFIXES:
             if name.startswith(prefix):
+                set_prefix = prefix
                 name = name[len(prefix) :]
                 break
-        # The authorizer type is always present on the write, so an IfExists
-        # operator reads the same as its plain form.
-        if name.endswith("ifexists"):
+        # With a value present, an IfExists operator reads the same as its
+        # plain form.
+        if_exists = name.endswith("ifexists")
+        if if_exists:
             name = name[: -len("ifexists")]
         for entry_key, raw in entries.items():
             if str(entry_key).strip().lower() != key:
                 return False
+            if value is None:
+                if name == "null":
+                    absent_fires = any(
+                        str(entry).strip().lower() == "true"
+                        for entry in _condition_values(raw)
+                    )
+                elif set_prefix == "foranyvalue:":
+                    absent_fires = False
+                elif set_prefix == "forallvalues:" or if_exists:
+                    absent_fires = True
+                else:
+                    absent_fires = name in SCP_DENY_VALUE_EXCLUDES_OPERATORS
+                if not absent_fires:
+                    return False
+                fires = True
+                continue
             matched = any(
                 _condition_string_matches(
                     entry,
@@ -18889,6 +19179,7 @@ def _scp_authorizer_deny_coverage(
     value: str,
     resource_type: str,
     also_denies: Tuple[str, ...] = (),
+    absent_denied: bool = False,
 ) -> Tuple[Set[str], bool]:
     """Return which of `actions` one SCP denies for `key` = `value`, and whether
     the policy conditions on the key at all.
@@ -18896,23 +19187,30 @@ def _scp_authorizer_deny_coverage(
     The second value separates a policy that never mentions the authorizer type
     from one that mentions it in a shape that cannot deny the value, because the
     two need different remediation. A statement counts only when it also denies
-    every value in `also_denies`.
+    every value in `also_denies`. With `absent_denied`, an action counts only
+    when a statement in the same policy also denies a request that carries no
+    value for the key, such as a Null test of true.
     """
     covered: Set[str] = set()
+    absent_covered: Set[str] = set()
     names_key = False
     for statement in _document_statements(document, effect="Deny"):
         if key in _statement_condition_keys(statement):
             names_key = True
-        if not all(
+        if not _scp_deny_reaches_every_resource(statement, resource_type):
+            continue
+        matched = {
+            action for action in actions if _statement_matches_action(statement, action)
+        }
+        if absent_denied and _statement_condition_denies_value(statement, key, None):
+            absent_covered |= matched
+        if all(
             _statement_condition_denies_value(statement, key, denied)
             for denied in (value, *also_denies)
         ):
-            continue
-        if not _scp_deny_reaches_every_resource(statement, resource_type):
-            continue
-        for action in actions:
-            if _statement_matches_action(statement, action):
-                covered.add(action)
+            covered |= matched
+    if absent_denied:
+        covered &= absent_covered
     return covered, names_key
 
 
@@ -19691,6 +19989,7 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
     inverted_coverage: Dict[str, Tuple[str, Set[str]]] = {}
     attempting_policies: List[str] = []
     deny_list_policies: List[str] = []
+    absent_gap_policies: List[str] = []
     read_errors: List[Tuple[str, Exception]] = []
 
     for policy in policies:
@@ -19702,7 +20001,19 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
             continue
 
         content = (detail.get("Policy") or {}).get("Content", "")
+        # authorizerConfiguration is optional on CreateAgentRuntime and
+        # UpdateAgentRuntime, so a SigV4 write can carry no authorizer type at
+        # all, and the Deny has to fire on that request too.
         covered, names_key = _scp_authorizer_deny_coverage(
+            content,
+            RUNTIME_WRITE_ACTIONS,
+            RUNTIME_AUTHORIZER_CONDITION_KEY,
+            RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE,
+            "runtime",
+            also_denies=(RUNTIME_AUTHORIZER_UNLISTED_VALUE,),
+            absent_denied=True,
+        )
+        present_only, _ = _scp_authorizer_deny_coverage(
             content,
             RUNTIME_WRITE_ACTIONS,
             RUNTIME_AUTHORIZER_CONDITION_KEY,
@@ -19726,6 +20037,8 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
         )
         if covered:
             coverage[policy["Id"]] = (policy_name, covered)
+        elif present_only:
+            absent_gap_policies.append(policy_name)
         elif listed_only:
             deny_list_policies.append(policy_name)
         elif inverted:
@@ -19794,8 +20107,9 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
                 finding_name="AgentCore Runtime Authorizer Guardrail",
                 finding_details=(
                     "CreateAgentRuntime and UpdateAgentRuntime are both denied "
-                    "when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM or "
-                    "a value the statement does not list, by service control "
+                    "when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, is "
+                    "a value the statement does not list, or is absent from the "
+                    "request, by service control "
                     f"policy: {guarding_label}, so a new runtime "
                     "has to carry a JWT authorizer that validates the end user's "
                     f"token. {attached_label}, which binds this account."
@@ -19886,6 +20200,36 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
         )
         return findings
 
+    if absent_gap_policies:
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail Absent Key",
+                finding_details=(
+                    "Runtime writes are denied when "
+                    "bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM or a "
+                    "value the statement does not list, but not when the request "
+                    "carries no authorizer type, by service control policy: "
+                    f"{', '.join(sorted(absent_gap_policies))}. "
+                    "authorizerConfiguration is optional on CreateAgentRuntime "
+                    "and UpdateAgentRuntime, and a ForAnyValue: or positive "
+                    "operator evaluates false on an absent key, so a SigV4 write "
+                    "that omits it is not shown to be denied. Whether the policy "
+                    "is attached here was not read."
+                ),
+                resolution=(
+                    "Deny CreateAgentRuntime and UpdateAgentRuntime with a plain "
+                    "StringNotEquals bedrock-agentcore:RuntimeAuthorizerType "
+                    "CUSTOM_JWT, which matches an absent value, or add a Deny "
+                    "with a Null test of true on the key."
+                ),
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
     if deny_list_policies:
         findings.append(
             create_finding(
@@ -19922,9 +20266,9 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
                     "bedrock-agentcore:RuntimeAuthorizerType is conditioned on in "
                     "a shape that denies neither AWS_IAM nor CUSTOM_JWT, by "
                     "service control policy: "
-                    f"{', '.join(sorted(attempting_policies))}. A Null test is one "
-                    "such shape: the authorizer type is a required member of the "
-                    "create request, so it is never absent."
+                    f"{', '.join(sorted(attempting_policies))}. A Null test alone "
+                    "is one such shape: it denies a write that carries no "
+                    "authorizer type, and not one that carries AWS_IAM."
                 ),
                 resolution=(
                     "Deny CreateAgentRuntime and UpdateAgentRuntime with "
@@ -24328,7 +24672,16 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
 # context key: a management grant that generates data keys and an evaluation
 # grant that re-encrypts.
 POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY = "aws:bedrock-agentcore-policy:policy-engine-arn"
-POLICY_ENGINE_SOURCE_GUARDED_ACTIONS = ("kms:Decrypt", "kms:GenerateDataKey")
+# The guide asks for both source keys on "the KMS operations and validation
+# statements", and the validation call is kms:DescribeKey. DescribeKey carries
+# no encryption context, so it is held to the source keys and not to the
+# engine's encryption context.
+POLICY_ENGINE_SOURCE_GUARDED_ACTIONS = (
+    "kms:Decrypt",
+    "kms:GenerateDataKey",
+    "kms:DescribeKey",
+)
+POLICY_ENGINE_CONTEXT_BOUND_ACTIONS = ("kms:Decrypt", "kms:GenerateDataKey")
 POLICY_ENGINE_MANAGEMENT_GRANT_OPERATION = "GenerateDataKey"
 POLICY_ENGINE_EVALUATION_GRANT_OPERATIONS = ("ReEncryptFrom", "ReEncryptTo")
 # The four actions the guide says the service needs on the key.
@@ -24724,8 +25077,8 @@ def _policy_engine_key_policy_gaps(
     outside AgentCore or for an unconstrained grant, so their IfExists forms
     scope nothing and are not read as scoping. aws:SourceAccount and
     aws:SourceArn are available on the grant-based calls and not on
-    kms:CreateGrant, so the source guard is read on kms:Decrypt and
-    kms:GenerateDataKey only. kms:CreateGrant, kms:Decrypt and
+    kms:CreateGrant, so the source guard is read on kms:Decrypt,
+    kms:GenerateDataKey and kms:DescribeKey only. kms:CreateGrant, kms:Decrypt and
     kms:GenerateDataKey must also carry the engine's encryption context, and a
     statement scoped to AgentCore must grant only the four actions the service
     needs. A statement granting the same actions with no condition, such as the
@@ -24783,7 +25136,13 @@ def _policy_engine_key_policy_gaps(
         )
     unbound = [
         action
-        for action, found in (("kms:CreateGrant", constrained_grants), *guarded.items())
+        for action, found in (
+            ("kms:CreateGrant", constrained_grants),
+            *(
+                (action, guarded[action])
+                for action in POLICY_ENGINE_CONTEXT_BOUND_ACTIONS
+            ),
+        )
         if found
         and not any(_binds_policy_engine_context(item, engine_arn) for item in found)
     ]
@@ -25637,10 +25996,11 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                         "kms:ViaService for "
                         "bedrock-agentcore.<region>.amazonaws.com and "
                         "kms:GrantConstraintType EncryptionContextSubset, and "
-                        "kms:Decrypt and kms:GenerateDataKey with aws:SourceAccount "
-                        "or aws:SourceArn, each with the "
+                        "kms:Decrypt, kms:GenerateDataKey and kms:DescribeKey with "
+                        "both aws:SourceAccount and aws:SourceArn, kms:Decrypt and "
+                        "kms:GenerateDataKey each with the "
                         "kms:EncryptionContext:aws:bedrock-agentcore-policy:"
-                        "policy-engine-arn condition and no action beyond "
+                        "policy-engine-arn condition, and no action beyond "
                         "kms:CreateGrant, kms:Decrypt, kms:GenerateDataKey and "
                         "kms:DescribeKey, as the key policy in the policy "
                         "encryption guide shows. Alarm on the key's DisableKey and "
@@ -25687,9 +26047,11 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                         "condition binds the caller's account, organization, "
                         "principal ARN or source. It allows kms:CreateGrant through "
                         "AgentCore in this region only for grants constrained by "
-                        "encryption context, and kms:Decrypt and "
-                        "kms:GenerateDataKey through AgentCore only from this "
-                        "account, each bound to policy engines by the "
+                        "encryption context, kms:Decrypt, kms:GenerateDataKey and "
+                        "kms:DescribeKey through AgentCore only with an "
+                        "aws:SourceAccount and an aws:SourceArn naming this "
+                        "account, kms:Decrypt and kms:GenerateDataKey each bound "
+                        "to policy engines by the "
                         f"{POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY} encryption "
                         "context, and grants through AgentCore no action beyond "
                         f"{', '.join(POLICY_ENGINE_SERVICE_ACTIONS)}. The key "
@@ -27339,6 +27701,14 @@ def check_agentcore_online_evaluation_operation() -> List[Dict[str, Any]]:
 # only, because a customer-authored description is prose this check cannot verify.
 EVALUATOR_SAFETY_DESCRIPTION_MARKER = "safety metric"
 SERVICE_AUTHORED_EVALUATOR_TYPES = ("Builtin", "ThirdParty")
+# The control names two built-in safety evaluators, harmful content and
+# stereotyping, and each scores a different failure, so a configuration has to
+# attach both. Another evaluator the catalogue marks as a safety metric, such as
+# ThirdParty.DeepEval.Toxicity, does not stand in for either one.
+EVALUATOR_REQUIRED_SAFETY_IDS = (
+    "Builtin.Harmfulness",
+    "Builtin.Stereotyping",
+)
 # EvaluatorSummary.level: an evaluator at TOOL_CALL level scores one tool call.
 # The level alone does not name tool choice, because the skill evaluators
 # (Builtin.SkillSelectionAccuracy, Builtin.SkillInstructionFollowing) score at
@@ -27515,12 +27885,15 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
             continue
         service_authored_ids.add(evaluator_id)
         description = str(evaluator.get("description") or "").lower()
-        if EVALUATOR_SAFETY_DESCRIPTION_MARKER in description:
+        if (
+            evaluator_id in EVALUATOR_REQUIRED_SAFETY_IDS
+            and EVALUATOR_SAFETY_DESCRIPTION_MARKER in description
+        ):
             safety_ids.add(evaluator_id)
         if evaluator_id in EVALUATOR_TOOL_CHOICE_IDS:
             tool_call_ids.add(evaluator_id)
 
-    if not safety_ids or not tool_call_ids:
+    if safety_ids != set(EVALUATOR_REQUIRED_SAFETY_IDS) or not tool_call_ids:
         # Neither category can be read out of this catalogue, so judging the
         # configurations against it would fail every one of them for a fact about
         # the catalogue. The drift is reported instead of charged to the workload.
@@ -27530,12 +27903,14 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                 finding_name="AgentCore Evaluation Safety Coverage",
                 finding_details=(
                     f"The catalogue returned {len(catalogue)} evaluator(s), of which "
-                    f"{len(safety_ids)} carry '"
+                    f"{len(safety_ids)} of "
+                    f"{', '.join(EVALUATOR_REQUIRED_SAFETY_IDS)} carry '"
                     f"{EVALUATOR_SAFETY_DESCRIPTION_MARKER}' in a service-authored "
                     f"description and {len(tool_call_ids)} are among "
-                    f"{', '.join(EVALUATOR_TOOL_CHOICE_IDS)}. With one of those two "
-                    "categories empty the catalogue cannot say which attached "
-                    "evaluator scores safety, so no configuration is judged here."
+                    f"{', '.join(EVALUATOR_TOOL_CHOICE_IDS)}. With a required "
+                    "safety evaluator or the tool-choice category missing, the "
+                    "catalogue cannot say which attached evaluator scores safety, "
+                    "so no configuration is judged here."
                 ),
                 resolution=(
                     "No action is required on the assessed workload based on this "
@@ -27735,23 +28110,32 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                             "alarm on it is required"
                         )
                         continue
-                    readers = sorted(
-                        alarm_labels[str(alarm.get("AlarmName"))]
-                        for alarm in watching_alarms
-                        if alarm_values[str(alarm.get("AlarmName"))] & set(listed)
+                    # Each named safety evaluator scores a different failure, so
+                    # each listed safety score needs its own alarm, while either
+                    # tool-choice score answers the tool-choice leg.
+                    groups = (
+                        [[evaluator_id] for evaluator_id in listed]
+                        if category == "safety"
+                        else [listed]
                     )
-                    if readers:
-                        tie_notes.append(
-                            f"alarm(s) {', '.join(readers)} read the score of "
-                            f"{', '.join(listed)}"
+                    for group in groups:
+                        readers = sorted(
+                            alarm_labels[str(alarm.get("AlarmName"))]
+                            for alarm in watching_alarms
+                            if alarm_values[str(alarm.get("AlarmName"))] & set(group)
                         )
-                    else:
-                        tie_missing.append(
-                            "has no CloudWatch alarm with actions on the score of "
-                            f"{', '.join(listed)}, which ListMetrics lists in "
-                            f"{namespace_text}, so a falling {category} score "
-                            "notifies nobody"
-                        )
+                        if readers:
+                            tie_notes.append(
+                                f"alarm(s) {', '.join(readers)} read the score of "
+                                f"{', '.join(group)}"
+                            )
+                        else:
+                            tie_missing.append(
+                                "has no CloudWatch alarm with actions on the score "
+                                f"of {', '.join(group)}, which ListMetrics lists in "
+                                f"{namespace_text}, so a falling {category} score "
+                                "notifies nobody"
+                            )
         tie_note = f" Of those, {'; '.join(tie_notes)}." if tie_notes else ""
         watching = sorted(
             alarm_labels[str(alarm.get("AlarmName"))] for alarm in watching_alarms
@@ -27769,10 +28153,16 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         not_running = _online_evaluation_problems(detail)
         if not_running:
             missing.append("scores no traffic, because it " + "; ".join(not_running))
-        if not safety_attached:
+        safety_missing = [
+            evaluator_id
+            for evaluator_id in EVALUATOR_REQUIRED_SAFETY_IDS
+            if evaluator_id not in safety_attached
+        ]
+        if safety_missing:
             missing.append(
-                "attaches no evaluator the catalogue marks as a safety metric, so "
-                "harmful, biased or personal-data-bearing output goes unscored"
+                f"does not attach {' or '.join(safety_missing)}, so harmful or "
+                "stereotyping output goes unscored (another safety evaluator "
+                "does not stand in for a named one)"
             )
         if not tool_call_attached:
             missing.append(

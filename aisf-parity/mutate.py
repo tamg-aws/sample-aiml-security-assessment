@@ -901,8 +901,8 @@ MUTATIONS = [
         "name": "AC-29 credits a runtime deny-list of AWS_IAM",
         "file": AGENTCORE,
         "defect": "AWS publishes no list of the values RuntimeAuthorizerType takes, so a Deny that fires on AWS_IAM but not on an unlisted value is not shown to deny a SigV4 write, and dropping the probe passes it",
-        "find": "            also_denies=(RUNTIME_AUTHORIZER_UNLISTED_VALUE,),\n",
-        "replace": "",
+        "find": "            also_denies=(RUNTIME_AUTHORIZER_UNLISTED_VALUE,),\n            absent_denied=True,\n",
+        "replace": "            absent_denied=True,\n",
     },
     {
         "name": "AC-07 passes a memory beside a strategy with no namespace",
@@ -2073,6 +2073,41 @@ MUTATIONS = [
         "find": '            if code == "ACTIVE":\n',
         "replace": '            if code in ("ACTIVE", "INACTIVE"):\n',
     },
+    {
+        "name": "AC-40 safety: one named evaluator stands in for both",
+        "file": AGENTCORE,
+        "defect": "a configuration attaching Harmfulness without Stereotyping passed",
+        "find": "        if safety_missing:\n",
+        "replace": "        if len(safety_missing) == len(EVALUATOR_REQUIRED_SAFETY_IDS):\n",
+    },
+    {
+        "name": "AC-29 authorizer: an absent authorizer type is not judged",
+        "file": AGENTCORE,
+        "defect": "a guardrail that never fires on an absent authorizer type passed",
+        "find": "            also_denies=(RUNTIME_AUTHORIZER_UNLISTED_VALUE,),\n            absent_denied=True,\n        )\n",
+        "replace": "            also_denies=(RUNTIME_AUTHORIZER_UNLISTED_VALUE,),\n        )\n",
+    },
+    {
+        "name": "AC-36 engine key: DescribeKey is not source-guarded",
+        "file": AGENTCORE,
+        "defect": "a key policy granting kms:DescribeKey without a source guard passed",
+        "find": '    "kms:GenerateDataKey",\n    "kms:DescribeKey",\n)\nPOLICY_ENGINE_CONTEXT_BOUND_ACTIONS',
+        "replace": '    "kms:GenerateDataKey",\n)\nPOLICY_ENGINE_CONTEXT_BOUND_ACTIONS',
+    },
+    {
+        "name": "AC-27 deputy: a private path excuses any gateway",
+        "file": AGENTCORE,
+        "defect": "an AWS_IAM gateway allowing Principal '*' bounded by aws:SourceVpce passed",
+        "find": '        if str(authorizer_type or "") == "CUSTOM_JWT":\n',
+        "replace": "        if True:\n",
+    },
+    {
+        "name": "AC-08 OAuth discovery: a named principal admits the discovery call",
+        "file": AGENTCORE,
+        "defect": "an endpoint policy allowing only a named principal passed OAuth discovery",
+        "find": '            and "NotPrincipal" not in statement\n            and "*" in _statement_principals(statement)\n            and _statement_matches_action(statement, action)\n',
+        "replace": '            and "NotPrincipal" not in statement\n            and _statement_matches_action(statement, action)\n',
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -2525,6 +2560,11 @@ GROUPS: dict[str, str] = {
     "AC-50 image: an untagged URI resolved without latest": "in the AgentCore verdict legs",
     "AC-50 image: any scanned image credits the runtime": "in the AgentCore verdict legs",
     "AC-50 image: a lapsed image scan passes": "in the AgentCore verdict legs",
+    "AC-40 safety: one named evaluator stands in for both": "in the AgentCore verdict legs",
+    "AC-29 authorizer: an absent authorizer type is not judged": "in the AgentCore verdict legs",
+    "AC-36 engine key: DescribeKey is not source-guarded": "in the AgentCore verdict legs",
+    "AC-27 deputy: a private path excuses any gateway": "in the AgentCore verdict legs",
+    "AC-08 OAuth discovery: a named principal admits the discovery call": "in the AgentCore verdict legs",
 }
 
 
