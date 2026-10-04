@@ -405,8 +405,13 @@ def _subnet_exposure_findings(
 
 def iter_model_packages(sagemaker_client, group_name: str) -> Iterator[Dict[str, Any]]:
     """Yield every model package in a SageMaker model package group."""
+    # ListModelPackages documents UNVERSIONED as its default ModelPackageType,
+    # and a group holds only versioned packages, so the type is named rather
+    # than left to that default.
     paginator = sagemaker_client.get_paginator("list_model_packages")
-    for page in paginator.paginate(ModelPackageGroupName=group_name):
+    for page in paginator.paginate(
+        ModelPackageGroupName=group_name, ModelPackageType="Both"
+    ):
         yield from page.get("ModelPackageSummaryList", [])
 
 
@@ -6136,12 +6141,22 @@ def _runtime_private_path_findings(
 
 INVOKE_SOURCE_NETWORK_FINDING = "SageMaker Endpoint Invocation Source Network"
 INVOKE_SOURCE_NETWORK_KEYS = ("aws:sourcevpce", "aws:sourcevpc")
+# AIR-SGM-EP-01: the account root user is bound by no identity policy, so only
+# an attached SCP Deny on these actions, as SM-34 reads one, holds it to the
+# private path.
+INVOKE_SOURCE_SCP_ACTIONS = (
+    "sagemaker:InvokeEndpoint",
+    "sagemaker:InvokeEndpointAsync",
+    "sagemaker:InvokeEndpointWithResponseStream",
+)
+INVOKE_SOURCE_SCP_UNDETERMINED = ("unread", "documents-unread", "attachment-unread")
 INVOKE_SOURCE_NETWORK_RESOLUTION = (
     "Condition each sagemaker:InvokeEndpoint Allow on aws:SourceVpce (the "
     "sagemaker.runtime interface endpoint IDs) or aws:SourceVpc with "
     "StringEquals, or add an identity Deny on sagemaker:InvokeEndpoint for "
     "every endpoint with StringNotEquals on aws:SourceVpce, so a call from "
-    "outside the private path is refused."
+    "outside the private path is refused. Only the same Deny in a service "
+    "control policy attached above this account binds the account root user."
 )
 
 
@@ -6199,16 +6214,43 @@ def _deny_pins_invoke_source(statement: Dict[str, Any]) -> bool:
 
 
 def _invoke_source_network_findings(
-    permission_cache: Optional[Dict[str, Any]], inventory: Dict[str, Any], region: str
+    permission_cache: Optional[Dict[str, Any]],
+    inventory: Dict[str, Any],
+    region: str,
+    scp: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     AIR-SGM-EP-01: an interface endpoint gives callers a private path but does
     not stop a caller elsewhere from using the public runtime endpoint. Only an
     IAM condition on aws:SourceVpce or aws:SourceVpc does, so each principal
-    that can invoke an endpoint must be held to one.
+    that can invoke an endpoint must be held to one. The account root user is
+    bound by no identity policy, so an attached SCP Deny on every invoke action
+    passes on its own, and without one the root user fails the leg.
     """
     if not inventory["endpoints"]:
         return []
+    if scp is None:
+        try:
+            scp = _creation_scp_state(None)
+        except Exception as error:
+            scp = {
+                "state": "unread",
+                "detail": (
+                    "service control policies were not read "
+                    f"({get_assessment_error_label(error)})"
+                ),
+            }
+    scp_legs = {
+        action: _creation_scp_leg(scp, action, INVOKE_SOURCE_NETWORK_KEYS)
+        for action in INVOKE_SOURCE_SCP_ACTIONS
+    }
+    scp_open = {
+        action: leg for action, leg in scp_legs.items() if leg["state"] != "enforced"
+    }
+    scp_text = "; ".join(
+        f"{action.split(':', 1)[1]}: {_creation_scp_reason(leg, scp)}"
+        for action, leg in scp_open.items()
+    )
 
     def _row(details, resolution, severity, status, name=None):
         return create_finding(
@@ -6222,12 +6264,32 @@ def _invoke_source_network_findings(
             region=region,
         )
 
+    if not scp_open:
+        policies = sorted(
+            {name for leg in scp_legs.values() for name in leg["policies"]}
+        )
+        return [
+            _row(
+                "Service control policy "
+                f"{', '.join(repr(n) for n in policies[:3])}, attached above "
+                f"account {scp.get('account') or 'unknown'}, denies "
+                f"{', '.join(INVOKE_SOURCE_SCP_ACTIONS)} on every endpoint unless "
+                "the call arrives through a named VPC endpoint or VPC "
+                "(aws:SourceVpce or aws:SourceVpc), which binds every principal "
+                "in the account, the root user included.",
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        ]
+
     if permission_cache is None:
         return [
             _row(
                 "The IAM permissions cache was not available, so whether "
                 "sagemaker:InvokeEndpoint grants are held to aws:SourceVpce or "
-                "aws:SourceVpc was not read.",
+                "aws:SourceVpc was not read, and no attached service control "
+                f"policy holds every invoke action to it ({scp_text}).",
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
                 "N/A",
@@ -6293,7 +6355,8 @@ def _invoke_source_network_findings(
                 f"{len(open_principals)} principal(s) can call "
                 "sagemaker:InvokeEndpoint from any network: no Allow condition "
                 "on aws:SourceVpce or aws:SourceVpc and no identity Deny holds the "
-                f"call to a VPC endpoint or VPC: {shown}. {SCP_NOT_EVALUATED_NOTE}",
+                f"call to a VPC endpoint or VPC: {shown}. No attached service "
+                f"control policy holds every invoke action to it ({scp_text}).",
                 INVOKE_SOURCE_NETWORK_RESOLUTION,
                 "Medium",
                 "Failed",
@@ -6315,11 +6378,30 @@ def _invoke_source_network_findings(
                 region,
             )
         )
-    elif not open_principals and pinned:
-        details = read_details
+    elif not open_principals and any(
+        leg["state"] in INVOKE_SOURCE_SCP_UNDETERMINED for leg in scp_open.values()
+    ):
+        rows.append(
+            _row(
+                f"{read_details} The account root user is bound by no identity "
+                "policy, and whether an attached service control policy holds it "
+                f"to the private path was not established: {scp_text}.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+                name=f"{INVOKE_SOURCE_NETWORK_FINDING} Incomplete",
+            )
+        )
+    elif not open_principals:
+        details = (
+            f"{read_details} The account root user is bound by no identity "
+            "policy, and no attached service control policy holds every invoke "
+            f"action to a VPC endpoint or VPC ({scp_text}), so the root user can "
+            "call the public runtime endpoint from any network."
+        )
         if _principal_read_errors(permission_cache) is None:
             details += " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE
-        rows.append(_row(details, "No action required", "Medium", "Passed"))
+        rows.append(_row(details, INVOKE_SOURCE_NETWORK_RESOLUTION, "Medium", "Failed"))
     return rows
 
 
@@ -6460,15 +6542,64 @@ def _method_verbs(verb: str) -> set:
     return set(READ_VERBS | WRITE_VERBS) if verb in ("ANY", "$default") else {verb}
 
 
-def _ai_integration_target(uri: Any, ai_functions: set) -> Optional[str]:
-    """What an integration URI reaches when it is an AI runtime, else None."""
+def _ai_integration_target(
+    uri: Any, ai_functions: set, granted: Optional[Dict[str, str]] = None
+) -> Optional[str]:
+    """What an integration URI reaches when it is an AI runtime, else None.
+    granted maps a Lambda function ARN to the AI grant that marks it."""
     text = str(uri or "")
     if AI_INTEGRATION_URI.search(text):
         return text.split("?", 1)[0][:160]
     match = LAMBDA_IN_URI.search(text)
     if match and match.group(1) in ai_functions:
         return f"Lambda function {match.group(1)}"
+    if match and match.group(1) in (granted or {}):
+        return f"Lambda function {match.group(1)} ({granted[match.group(1)]})"
     return None
+
+
+def _granted_lambda_targets(
+    region: str,
+    permission_cache: Dict[str, Any],
+    arns: List[str],
+    unread: List[str],
+) -> Dict[str, str]:
+    """Function ARN -> the grant that makes it AI, for each of arns that has a
+    version whose role is granted an AI invoke action, as SM-11 marks it. An
+    integration may name an alias, which is not resolved, so any version's
+    grant counts."""
+    functions, lambda_unread = _lambda_functions(region, all_versions=True)
+    unread.extend(lambda_unread)
+    if lambda_unread:
+        return {}
+    versions: Dict[str, List[Dict[str, Any]]] = {}
+    for function in functions:
+        match = LAMBDA_IN_URI.search(str(function.get("FunctionArn") or ""))
+        if match:
+            versions.setdefault(match.group(1), []).append(function)
+    granted, role_actions = {}, {}
+    for arn in arns:
+        if arn not in versions:
+            unread.append(
+                f"Lambda function {arn}, an API integration target, is not listed "
+                "by lambda:ListFunctions in this account and Region, so its role "
+                "was not read"
+            )
+            continue
+        for function in versions[arn]:
+            role = function.get("Role")
+            if role not in role_actions:
+                role_actions[role] = _ai_role_grant(
+                    permission_cache, role, f"Lambda function {arn}", unread
+                )
+            if role_actions[role]:
+                version = function.get("Version") or "$LATEST"
+                granted[arn] = (
+                    f"version {version} role granted "
+                    f"{', '.join(role_actions[role][:3])}"
+                )
+                break
+    return granted
 
 
 def _api_methods(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -6940,8 +7071,9 @@ def check_ai_api_method_authorization(
     (AIR-FND-IAM-09 request layer).
 
     A method is in the population when its integration URI names a Bedrock,
-    AgentCore or SageMaker runtime, or a Lambda function an agent action group
-    or AgentCore gateway target names. A token authorizer separates read from
+    AgentCore or SageMaker runtime, a Lambda function an agent action group
+    or AgentCore gateway target names, or a Lambda function a version of which
+    runs as a role granted an AI invoke action. A token authorizer separates read from
     write only by scopes, and an IAM authorizer by the execute-api:Invoke
     grants in the IAM permissions cache; a Lambda authorizer separates them in
     code that is not read by this check.
@@ -6956,9 +7088,28 @@ def check_ai_api_method_authorization(
     }
     methods, method_unread = _api_methods(region)
     unread.extend(method_unread)
+    # AIR-FND-IAM-09: a Lambda function no agent or gateway names still
+    # reaches a model when its role may invoke one, as SM-11 marks it.
+    unnamed = sorted(
+        {
+            match.group(1)
+            for method in methods
+            for match in [LAMBDA_IN_URI.search(str(method["uri"] or ""))]
+            if match and match.group(1) not in ai_functions
+        }
+    )
+    granted = {}
+    if unnamed and permission_cache is None:
+        unread.append(
+            f"the IAM permissions cache was not available, so {len(unnamed)} "
+            "Lambda integration target(s) no agent or gateway names were not "
+            "marked AI by their role's grants"
+        )
+    elif unnamed:
+        granted = _granted_lambda_targets(region, permission_cache, unnamed, unread)
     ai_methods = []
     for method in methods:
-        target = _ai_integration_target(method["uri"], ai_functions)
+        target = _ai_integration_target(method["uri"], ai_functions, granted)
         if target:
             ai_methods.append(dict(method, target=target))
 
@@ -7070,12 +7221,14 @@ def check_ai_api_method_authorization(
                     "Allow of the resource policy of a REST API holding an "
                     "IAM-authorized AI method. An identity's Deny narrower than "
                     "every resource is not read for its grants. A Lambda function "
-                    "no agent action group or gateway target names is not "
-                    "recognized as AI."
+                    "is AI when an agent action group or gateway target names it "
+                    "or a version of it runs as a role granted an AI invoke action."
                     if ai_methods
                     else f"None of the {len(methods)} API method(s) and route(s) in "
-                    "this region reaches a Bedrock, AgentCore or SageMaker runtime "
-                    "or a Lambda function an agent or gateway names."
+                    "this region reaches a Bedrock, AgentCore or SageMaker runtime, "
+                    "a Lambda function an agent or gateway names, or a Lambda "
+                    "function a version of which runs as a role granted an AI "
+                    "invoke action."
                 ),
                 resolution="No action required",
                 reference=AI_API_AUTHORIZATION_REFERENCE,
@@ -7122,13 +7275,21 @@ def _ai_granted_workloads(
     """Lambda functions no agent names, and ECS services and standalone tasks,
     whose role is granted an AI invoke action: (Lambda functions as listed,
     ECS workloads as {name, subnets})."""
-    functions, lambda_unread = _lambda_functions(region)
+    # AIR-FND-NET-01: a published version keeps the Role and VpcConfig it was
+    # published with, and an alias or a qualified invoke runs it, so every
+    # version is judged, not only $LATEST.
+    functions, lambda_unread = _lambda_functions(region, all_versions=True)
     unread.extend(lambda_unread)
     granted_functions = []
     for function in functions:
-        if function.get("FunctionArn") in named:
+        arn, version = function.get("FunctionArn"), function.get("Version")
+        if arn in named or (
+            version == "$LATEST" and str(arn).rsplit(":", 1)[0] in named
+        ):
             continue
-        label = f"Lambda function {function.get('FunctionName')}"
+        label = f"Lambda function {function.get('FunctionName')}" + (
+            f" version {version}" if version and version != "$LATEST" else ""
+        )
         actions = _ai_role_grant(permission_cache, function.get("Role"), label, unread)
         if actions:
             granted_functions.append(
@@ -9280,6 +9441,7 @@ def _approval_attribution_findings(
     approvals_without_approver: List[Dict[str, Any]],
     versions_examined: int,
     region: str,
+    versions_unread: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Report the approver-metadata leg of AIR-SGM-GOV-01.
@@ -9339,12 +9501,16 @@ def _approval_attribution_findings(
                 finding_details=(
                     f"{len(approvals_with_approver)} of {versions_examined} "
                     "approved model package versions examined record an approver "
-                    f"identity: {described}."
+                    f"identity: {described}." + _versions_unread_clause(versions_unread)
                 ),
-                resolution="No action required.",
+                resolution=(
+                    "No action required."
+                    if not versions_unread
+                    else COULD_NOT_ASSESS_RESOLUTION
+                ),
                 reference=APPROVER_ATTRIBUTION_REFERENCE,
-                severity="Medium",
-                status="Passed",
+                severity="Medium" if not versions_unread else "Informational",
+                status="Passed" if not versions_unread else "N/A",
                 region=region,
             )
         )
@@ -9352,8 +9518,17 @@ def _approval_attribution_findings(
     return emitted
 
 
+def _versions_unread_clause(versions_unread: int) -> str:
+    if not versions_unread:
+        return ""
+    return (
+        f" {versions_unread} model package read(s) failed, so the versions they "
+        "cover were not examined and this is not established for them."
+    )
+
+
 def _lifecycle_finding(
-    unstaged: List[str], examined: int, region: str
+    unstaged: List[str], examined: int, region: str, versions_unread: int = 0
 ) -> Dict[str, Any]:
     """Report whether each approved version carries a ModelLifeCycle stage."""
     if unstaged:
@@ -9380,13 +9555,16 @@ def _lifecycle_finding(
         check_id="SM-22",
         finding_name=MODEL_LIFECYCLE_FINDING,
         finding_details=(
-            f"All {examined} approved model package versions carry a ModelLifeCycle "
-            "Stage and StageStatus."
+            f"All {examined} approved model package versions examined carry a "
+            "ModelLifeCycle Stage and StageStatus."
+            + _versions_unread_clause(versions_unread)
         ),
-        resolution="No action required",
+        resolution=(
+            "No action required" if not versions_unread else COULD_NOT_ASSESS_RESOLUTION
+        ),
         reference=MODEL_LIFECYCLE_REFERENCE,
-        severity="Low",
-        status="Passed",
+        severity="Low" if not versions_unread else "Informational",
+        status="Passed" if not versions_unread else "N/A",
         region=region,
     )
 
@@ -9469,16 +9647,25 @@ def _endpoint_variant_models(
                 config_name = sagemaker_client.describe_endpoint(
                     EndpointName=endpoint
                 ).get("EndpointConfigName")
-                variants = sagemaker_client.describe_endpoint_config(
+                config = sagemaker_client.describe_endpoint_config(
                     EndpointConfigName=config_name
-                ).get("ProductionVariants", [])
+                )
             except Exception as error:
                 unread.append(
                     f"endpoint {endpoint} ({get_assessment_error_label(error)})"
                 )
                 continue
-            for variant in variants:
-                label = f"{endpoint}/{variant.get('VariantName')}"
+            # A shadow variant serves a copy of live traffic, so its model is
+            # deployed as much as a production variant's.
+            variants = [
+                (variant, "") for variant in config.get("ProductionVariants") or []
+            ]
+            variants += [
+                (variant, " (shadow)")
+                for variant in config.get("ShadowProductionVariants") or []
+            ]
+            for variant, role in variants:
+                label = f"{endpoint}/{variant.get('VariantName')}{role}"
                 if variant.get("ModelName"):
                     models.setdefault(variant["ModelName"], []).append(label)
                     continue
@@ -9924,12 +10111,16 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                 approvals_without_approver,
                 approval_versions_examined,
                 region,
+                versions_unread=len(unread),
             )
         )
         if approval_versions_examined:
             findings["csv_data"].append(
                 _lifecycle_finding(
-                    unstaged_versions, approval_versions_examined, region
+                    unstaged_versions,
+                    approval_versions_examined,
+                    region,
+                    versions_unread=len(unread),
                 )
             )
         findings["csv_data"].extend(
@@ -11949,7 +12140,10 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
     DescribeEndpoint reports the live capture state (EnableCapture plus
     CaptureStatus, which is Started or Stopped), so an endpoint whose
     configuration enables capture but whose capture has stopped is reported as a
-    failure and not as compliant.
+    failure and not as compliant. DescribeEndpoint does not return what is
+    captured, so the endpoint config's DataCaptureConfig.CaptureOptions is read:
+    the control asks for requests and responses, so the modes must cover Input
+    and Output.
     """
     logger.debug("Starting check for SageMaker endpoint data capture")
     findings = {"csv_data": []}
@@ -11988,7 +12182,53 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                     capture_config = {}
                 enabled = capture_config.get("EnableCapture") is True
                 capture_status = capture_config.get("CaptureStatus")
+                modes = set()
                 if enabled and capture_status == "Started":
+                    config_name = detail.get("EndpointConfigName") or ""
+                    try:
+                        config = sagemaker_client.describe_endpoint_config(
+                            EndpointConfigName=config_name
+                        )
+                    except Exception as error:
+                        describe_errors.append(
+                            {
+                                "name": endpoint_name,
+                                "label": (
+                                    "sagemaker:DescribeEndpointConfig on "
+                                    f"'{config_name}' "
+                                    f"({get_assessment_error_label(error)}), so "
+                                    "which records it captures was not read"
+                                ),
+                            }
+                        )
+                        continue
+                    modes = {
+                        option.get("CaptureMode")
+                        for option in (
+                            (config.get("DataCaptureConfig") or {}).get(
+                                "CaptureOptions"
+                            )
+                            or []
+                        )
+                        if isinstance(option, dict)
+                    }
+                if (
+                    enabled
+                    and capture_status == "Started"
+                    and not ("InputAndOutput" in modes or {"Input", "Output"} <= modes)
+                ):
+                    not_capturing.append(
+                        {
+                            "name": endpoint_name,
+                            "reason": (
+                                "CaptureStatus is Started, but the endpoint config's "
+                                "DataCaptureConfig.CaptureOptions capture "
+                                f"{', '.join(sorted(m for m in modes if m)) or 'no mode'}, "
+                                "so requests and responses are not both recorded"
+                            ),
+                        }
+                    )
+                elif enabled and capture_status == "Started":
                     capturing.append(
                         {
                             "name": endpoint_name,
@@ -12085,7 +12325,9 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                     finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
                     finding_details=(
                         f"{len(capturing)} of {endpoints_seen} endpoint(s) report "
-                        f"CaptureStatus Started: {described}. Whether the captured "
+                        "CaptureStatus Started and capture both requests and "
+                        "responses (endpoint config CaptureOptions): "
+                        f"{described}. Whether the captured "
                         "records are reviewed, and at what sampling percentage, is "
                         "not readable from the endpoint."
                     ),
@@ -12112,7 +12354,10 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                         f"Endpoint '{entry['name']}' could not be assessed for data "
                         f"capture. Assessment error: {entry['label']}."
                     ),
-                    resolution="Grant sagemaker:DescribeEndpoint and retry.",
+                    resolution=(
+                        "Grant sagemaker:DescribeEndpoint and "
+                        "sagemaker:DescribeEndpointConfig and retry."
+                    ),
                     reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
                     severity="Informational",
                     status="N/A",
@@ -13769,65 +14014,206 @@ CREATION_GUARDRAIL_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/security_iam_service-with-iam.html"
 )
 
-# The creation actions this control names, with the resource type each creates.
-# A batch transform job takes its network posture from its model, so
-# CreateModel carries the network keys and CreateTransformJob the KMS keys.
-SAGEMAKER_GUARDED_CREATE_ACTIONS = (
-    ("sagemaker:CreateTrainingJob", "training-job"),
-    ("sagemaker:CreateEndpointConfig", "endpoint-config"),
-    ("sagemaker:CreateNotebookInstance", "notebook-instance"),
-    ("sagemaker:CreateModel", "model"),
-    ("sagemaker:CreateTransformJob", "transform-job"),
+# AIR-SGM-TRN-01, TRN-02, TRN-05 and TRN-08: every sagemaker create or update
+# action whose ActionConditionKeys hold one of the guardrail keys below, with the
+# resource type the action is named after and the guardrail keys it defines,
+# transcribed from the sagemaker service-reference JSON (read 2026-10-04). A
+# tuning, processing, AutoML, monitoring, HyperPod or Studio action launches or
+# configures compute on its own keys, so a guard on CreateTrainingJob alone
+# leaves it open. A batch transform job takes its network posture from its
+# model, so CreateModel carries the network keys and CreateTransformJob the KMS
+# keys.
+SAGEMAKER_GUARDRAIL_KEYS = (
+    "sagemaker:VolumeKmsKeyArn",
+    "sagemaker:OutputKmsKeyArn",
+    "sagemaker:InterContainerTrafficEncryption",
+    "sagemaker:VpcSubnets",
+    "sagemaker:VpcSecurityGroupIds",
+    "sagemaker:NetworkIsolation",
+    "sagemaker:DirectInternetAccess",
+    "sagemaker:AppNetworkAccessType",
+    "sagemaker:RootAccess",
 )
-# The creation actions that define sagemaker:VpcSubnets and
-# sagemaker:VpcSecurityGroupIds. CreateTransformJob defines neither.
-SAGEMAKER_NETWORK_CREATE_ACTIONS = (
-    "sagemaker:CreateTrainingJob",
-    "sagemaker:CreateEndpointConfig",
-    "sagemaker:CreateNotebookInstance",
-    "sagemaker:CreateModel",
+_SM_ENC = (
+    "sagemaker:VolumeKmsKeyArn",
+    "sagemaker:OutputKmsKeyArn",
+    "sagemaker:InterContainerTrafficEncryption",
 )
-
-# Each guardrail category as (action, key group) requirements. Every requirement
-# must be enforced, and any one key of its group enforces it. Each key is listed
-# as an ActionConditionKey of its action in the sagemaker service-reference JSON
-# (read 2026-09-27). sagemaker:VolumeKmsKey and sagemaker:OutputKmsKey are listed
-# service-wide but no action defines them, so a condition on either enforces
-# nothing and neither is accepted.
-SAGEMAKER_CREATION_GUARDRAILS = (
+_SM_ENC_NET = (*_SM_ENC, "sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")
+SAGEMAKER_GUARDED_ACTION_KEYS = (
     (
-        "encryption",
+        "sagemaker:CreateTrainingJob",
+        "training-job",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateEndpointConfig",
+        "endpoint-config",
         (
-            ("sagemaker:CreateTrainingJob", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateTrainingJob", ("sagemaker:OutputKmsKeyArn",)),
-            (
-                "sagemaker:CreateTrainingJob",
-                ("sagemaker:InterContainerTrafficEncryption",),
-            ),
-            ("sagemaker:CreateEndpointConfig", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateTransformJob", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateTransformJob", ("sagemaker:OutputKmsKeyArn",)),
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:NetworkIsolation",
         ),
     ),
-    # The control asks for approved subnets and approved security groups, so
-    # each key is its own requirement: a guard on one admits any value of the
-    # other.
+    (
+        "sagemaker:CreateNotebookInstance",
+        "notebook-instance",
+        (
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:DirectInternetAccess",
+            "sagemaker:RootAccess",
+        ),
+    ),
+    (
+        "sagemaker:CreateModel",
+        "model",
+        (
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:NetworkIsolation",
+        ),
+    ),
+    (
+        "sagemaker:CreateTransformJob",
+        "transform-job",
+        ("sagemaker:VolumeKmsKeyArn", "sagemaker:OutputKmsKeyArn"),
+    ),
+    (
+        "sagemaker:CreateHyperParameterTuningJob",
+        "hyper-parameter-tuning-job",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateProcessingJob",
+        "processing-job",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    ("sagemaker:CreateAutoMLJob", "automl-job", _SM_ENC_NET),
+    ("sagemaker:CreateAutoMLJobV2", "automl-job", _SM_ENC_NET),
+    (
+        "sagemaker:CreateDataQualityJobDefinition",
+        "data-quality-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateModelBiasJobDefinition",
+        "model-bias-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateModelExplainabilityJobDefinition",
+        "model-explainability-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateModelQualityJobDefinition",
+        "model-quality-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateMonitoringSchedule",
+        "monitoring-schedule",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:UpdateMonitoringSchedule",
+        "monitoring-schedule",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateLabelingJob",
+        "labeling-job",
+        ("sagemaker:VolumeKmsKeyArn", "sagemaker:OutputKmsKeyArn"),
+    ),
+    (
+        "sagemaker:CreateJob",
+        "job",
+        (
+            "sagemaker:OutputKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+        ),
+    ),
+    (
+        "sagemaker:CreateCluster",
+        "cluster",
+        ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"),
+    ),
+    (
+        "sagemaker:UpdateCluster",
+        "cluster",
+        ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"),
+    ),
+    (
+        "sagemaker:CreateDomain",
+        "domain",
+        (
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:AppNetworkAccessType",
+        ),
+    ),
+    (
+        "sagemaker:UpdateDomain",
+        "domain",
+        (
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:AppNetworkAccessType",
+        ),
+    ),
+    ("sagemaker:CreateUserProfile", "user-profile", ("sagemaker:VpcSecurityGroupIds",)),
+    ("sagemaker:UpdateUserProfile", "user-profile", ("sagemaker:VpcSecurityGroupIds",)),
+    (
+        "sagemaker:UpdateNotebookInstance",
+        "notebook-instance",
+        ("sagemaker:RootAccess",),
+    ),
+)
+SAGEMAKER_GUARDED_CREATE_ACTIONS = tuple(
+    (action, resource_type)
+    for action, resource_type, _ in SAGEMAKER_GUARDED_ACTION_KEYS
+)
+
+
+def _guardrail_requirements(keys: tuple, actions: Optional[tuple] = None) -> tuple:
+    """One (action, (key,)) requirement per guardrail key each action defines."""
+    return tuple(
+        (action, (key,))
+        for action, _, defined in SAGEMAKER_GUARDED_ACTION_KEYS
+        if actions is None or action in actions
+        for key in keys
+        if key in defined
+    )
+
+
+# Each guardrail category as (action, key group) requirements. Every requirement
+# must be enforced, and any one key of its group enforces it.
+# sagemaker:VolumeKmsKey and sagemaker:OutputKmsKey are listed service-wide but
+# no action defines them, so a condition on either enforces nothing and neither
+# is accepted. The control asks for approved subnets and approved security
+# groups, so each key is its own requirement: a guard on one admits any value of
+# the other.
+SAGEMAKER_CREATION_GUARDRAILS = (
+    ("encryption", _guardrail_requirements(_SM_ENC)),
     (
         "approved network",
-        tuple(
-            (action, (key,))
-            for action in SAGEMAKER_NETWORK_CREATE_ACTIONS
-            for key in ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")
+        _guardrail_requirements(
+            ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")
         ),
     ),
     (
         "no direct internet access",
-        (
-            ("sagemaker:CreateTrainingJob", ("sagemaker:NetworkIsolation",)),
-            ("sagemaker:CreateEndpointConfig", ("sagemaker:NetworkIsolation",)),
-            ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
-            ("sagemaker:CreateModel", ("sagemaker:NetworkIsolation",)),
+        _guardrail_requirements(
+            (
+                "sagemaker:NetworkIsolation",
+                "sagemaker:DirectInternetAccess",
+                "sagemaker:AppNetworkAccessType",
+            )
         ),
     ),
 )
@@ -13840,12 +14226,14 @@ CREATION_KEY_COMPLIANT_VALUES = {
     "sagemaker:networkisolation": "true",
     "sagemaker:directinternetaccess": "disabled",
     "sagemaker:rootaccess": "disabled",
+    "sagemaker:appnetworkaccesstype": "vpconly",
 }
 CREATION_KEY_NONCOMPLIANT_VALUES = {
     "sagemaker:intercontainertrafficencryption": "false",
     "sagemaker:networkisolation": "false",
     "sagemaker:directinternetaccess": "enabled",
     "sagemaker:rootaccess": "enabled",
+    "sagemaker:appnetworkaccesstype": "publicinternetonly",
 }
 CREATION_PROBE_PARTITIONS = ("aws", "aws-cn", "aws-us-gov")
 # AIR-SGM-EP-08: the batch transform path. A transform job takes its network
@@ -13878,16 +14266,31 @@ NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE = (
     "https://docs.aws.amazon.com/whitepapers/latest/"
     "sagemaker-studio-admin-best-practices/permissions-management.html"
 )
-# AIR-SGM-TRN-05: each key below is an ActionConditionKey of
-# CreateNotebookInstance in the sagemaker service-reference JSON (read
-# 2026-09-27). The two presigned-URL actions define no action keys, so the
-# global aws:SourceIp and aws:SourceVpce keys restrict where they are called.
+# AIR-SGM-TRN-05: the notebook and Studio rows of SAGEMAKER_GUARDED_ACTION_KEYS,
+# each with the keys of the production bar it defines. UpdateNotebookInstance
+# can turn RootAccess back on, and UpdateDomain can set AppNetworkAccessType to
+# PublicInternetOnly or move the domain's subnets, so both are held as well. The
+# two presigned-URL actions define no action keys, so the global aws:SourceIp
+# and aws:SourceVpce keys restrict where they are called.
 NOTEBOOK_ACCESS_GUARDRAILS = (
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:RootAccess",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:VpcSubnets",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:VpcSecurityGroupIds",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
+    *_guardrail_requirements(
+        (
+            "sagemaker:RootAccess",
+            "sagemaker:DirectInternetAccess",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:AppNetworkAccessType",
+        ),
+        actions=(
+            "sagemaker:CreateNotebookInstance",
+            "sagemaker:UpdateNotebookInstance",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+            "sagemaker:CreateUserProfile",
+            "sagemaker:UpdateUserProfile",
+        ),
+    ),
     (
         "sagemaker:CreatePresignedNotebookInstanceUrl",
         ("aws:SourceIp", "aws:SourceVpce"),
@@ -13898,15 +14301,17 @@ GUARDED_ACTION_RESOURCE_TYPES = {
     **dict(SAGEMAKER_GUARDED_CREATE_ACTIONS),
     "sagemaker:CreatePresignedNotebookInstanceUrl": "notebook-instance",
     "sagemaker:CreatePresignedDomainUrl": "user-profile",
+    **{action: "endpoint" for action in INVOKE_SOURCE_SCP_ACTIONS},
     "lambda:CreateFunction": "lambda:function",
     "lambda:UpdateFunctionConfiguration": "lambda:function",
     "lambda:CreateNetworkConnector": "lambda:network-connector",
 }
-# A user profile ARN carries the domain id before the profile name, and a Lambda
-# function ARN separates its type from its name with a colon. A type with no
+# A user profile ARN carries the domain id before the profile name, a job ARN
+# carries its category before the job name, and a Lambda function ARN separates its type from its name with a colon. A type with no
 # service prefix is a SageMaker type.
 GUARDED_RESOURCE_PROBE_PATHS = {
     "user-profile": "user-profile/d-zzprobe/zz-probe",
+    "job": "job/zz-probe/zz-probe",
     "lambda:function": "function:zz-probe",
     "lambda:network-connector": "network-connector:zz-probe",
 }
@@ -14546,7 +14951,7 @@ def _creation_scp_reason(scp_leg: Dict[str, Any], scp: Dict[str, Any]) -> str:
 
 
 CREATION_GUARDRAIL_RESOLUTION = (
-    "Deny the named create action in a service control policy "
+    "Deny the named create or update action in a service control policy "
     "attached above this account when the key is outside the approved "
     "values (ArnNotEquals or StringNotEquals, which also fire when the key "
     "is absent), or add an Allow condition naming the approved values to "
@@ -14762,6 +15167,7 @@ def check_sagemaker_creation_guardrails(
         check_id="SM-34",
         finding_name=CREATION_GUARDRAIL_FINDING,
         reference=CREATION_GUARDRAIL_REFERENCE,
+        scope="at SageMaker creation and update time",
     )
 
 
@@ -14991,7 +15397,12 @@ def check_sagemaker_notebook_access_guardrails(
                         "policy attached above this account when RootAccess or "
                         "DirectInternetAccess is not Disabled, or VpcSubnets, "
                         "VpcSecurityGroupIds or VolumeKmsKeyArn is not an "
-                        "approved value, and deny "
+                        "approved value, deny UpdateNotebookInstance when "
+                        "RootAccess is not Disabled, deny CreateDomain and "
+                        "UpdateDomain when AppNetworkAccessType is not VpcOnly or "
+                        "a subnet, security group or volume key is not approved, "
+                        "deny CreateUserProfile and UpdateUserProfile outside the "
+                        "approved security groups, and deny "
                         "CreatePresignedNotebookInstanceUrl and "
                         "CreatePresignedDomainUrl outside the approved aws:SourceIp "
                         "range or aws:SourceVpce. An Allow condition on the key in "
@@ -15356,7 +15767,9 @@ def _regional_admin(
     get_administrator returns (administrator id, relationship status), or
     (None, None). Only an Enabled relationship counts. A caller with no
     administrator is its own when read_self_admin succeeds, because only an
-    administrator can read its organization configuration.
+    administrator can read its organization configuration. read_self_admin
+    returns a string when the service answered that the caller is not the
+    administrator, naming how it answered.
     """
     try:
         administrator, status = get_administrator()
@@ -15371,7 +15784,7 @@ def _regional_admin(
             None,
         )
     try:
-        read_self_admin()
+        answer = read_self_admin()
     except ClientError as error:
         if error.response.get("Error", {}).get("Code", "") in (
             ACCESS_DENIED_ERROR_CODES
@@ -15384,6 +15797,8 @@ def _regional_admin(
         )
     except Exception as error:
         return None, None, get_assessment_error_label(error)
+    if isinstance(answer, str):
+        return None, f"not the administrator ({answer})", None
     return (
         account_id,
         "is this account, which reads the organization configuration",
@@ -15391,13 +15806,128 @@ def _regional_admin(
     )
 
 
+# Live answers of account 178113193057 on 2026-10-04, a member with Macie
+# enabled in us-east-1 and not in us-west-1 or eu-north-1: GetAdministratorAccount
+# raised ResourceNotFoundException where Macie had no administrator and
+# AccessDeniedException "Macie is not enabled" where Macie was off, and
+# DescribeOrganizationConfiguration raised AccessDeniedException "...you must be
+# the Macie administrator for an organization..." in all three. An IAM denial
+# names the action instead, so the message tells them apart.
+MACIE_NOT_ENABLED_MESSAGE = "macie is not enabled"
+MACIE_NOT_ADMINISTRATOR_MESSAGE = "must be the macie administrator"
+
+
+def _client_error_message(error: ClientError) -> str:
+    return str(error.response.get("Error", {}).get("Message", "")).lower()
+
+
+def _macie_regional_admin(region: str, account_id: str):
+    """(administrator, how, unread reason) for Macie, or None when Macie is not
+    enabled for this account in this Region."""
+    macie = boto3.client("macie2", config=boto3_config, region_name=region)
+    try:
+        response = macie.get_administrator_account()
+    except ClientError as error:
+        response = error
+    if (
+        isinstance(response, ClientError)
+        and response.response.get("Error", {}).get("Code", "")
+        in ACCESS_DENIED_ERROR_CODES
+        and MACIE_NOT_ENABLED_MESSAGE in _client_error_message(response)
+    ):
+        return None
+
+    def _administrator():
+        if isinstance(response, ClientError):
+            if response.response.get("Error", {}).get("Code", "") == (
+                "ResourceNotFoundException"
+            ):
+                return None, None
+            raise response
+        return _account_and_status(
+            response, "administrator", "accountId", "relationshipStatus"
+        )
+
+    def _self():
+        try:
+            macie.describe_organization_configuration()
+        except ClientError as error:
+            if MACIE_NOT_ADMINISTRATOR_MESSAGE in _client_error_message(error):
+                return (
+                    "Macie answers DescribeOrganizationConfiguration only for "
+                    "the Macie administrator for an organization"
+                )
+            raise
+        return None
+
+    return _regional_admin(_administrator, _self, account_id)
+
+
+def _detective_regional_admin(region: str, account_id: str):
+    """(administrator, how, unread reason) for Detective.
+
+    A member reads the organization behavior graph's administrator from its
+    ListInvitations memberships, where the organization graph is the one whose
+    InvitationType is ORGANIZATION. A graph this account administers is the
+    organization graph only when DescribeOrganizationConfiguration answers for
+    it, because any account that enables Detective administers its own graph.
+    """
+    detective = boto3.client("detective", config=boto3_config, region_name=region)
+
+    def _pages(operation, key):
+        items, token, seen = [], None, set()
+        while True:
+            page = operation(**({"NextToken": token} if token else {}))
+            items.extend(page.get(key) or [])
+            token = page.get("NextToken")
+            if not token:
+                return items
+            # A repeated token would page forever, and the pages read so far
+            # are not the whole population.
+            if token in seen:
+                raise RuntimeError(f"{key} paging repeated a NextToken")
+            seen.add(token)
+
+    def _administrator():
+        for membership in _pages(detective.list_invitations, "Invitations"):
+            if membership.get("InvitationType") == "ORGANIZATION":
+                return membership.get("AdministratorId"), membership.get("Status")
+        return None, None
+
+    def _self():
+        graphs = _pages(detective.list_graphs, "GraphList")
+        if not graphs:
+            return "it administers no behavior graph in this Region"
+        for graph in graphs:
+            try:
+                detective.describe_organization_configuration(GraphArn=graph["Arn"])
+            except ClientError as error:
+                # Live on 2026-10-04 (account 178113193057, us-east-1), a
+                # graph that is not the organization graph answered
+                # ValidationException "...a delegated administrator account
+                # has not been enabled".
+                if error.response.get("Error", {}).get("Code", "") != (
+                    "ValidationException"
+                ):
+                    raise
+                continue
+            return None
+        return (
+            "its behavior graph is not the organization behavior graph: "
+            "DescribeOrganizationConfiguration did not answer for it"
+        )
+
+    return _regional_admin(_administrator, _self, account_id)
+
+
 def check_regional_security_admin(
     region: str = "", detector_inventory: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    SM-35: Verify GuardDuty, Security Hub and Amazon Inspector are administered
-    in this Region from one delegated administrator that is not the
-    organization management account (AIR-FND-ACC-09).
+    SM-35: Verify GuardDuty, Security Hub, Amazon Inspector, Amazon Macie and
+    Amazon Detective are administered in this Region from one delegated
+    administrator that is not the organization management account
+    (AIR-FND-ACC-09).
 
     Each of these services designates its administrator per Region, so the
     organization-wide delegated administrator list does not show a Region
@@ -15506,6 +16036,15 @@ def check_regional_security_admin(
     admins["Amazon Inspector"] = _regional_admin(
         _inspector_admin, _inspector_self, account_id
     )
+    macie_admin = _macie_regional_admin(region, account_id)
+    if macie_admin is None:
+        problems.append(
+            "Amazon Macie is not enabled for this account in this Region, so no "
+            "administrator administers it here"
+        )
+    else:
+        admins["Amazon Macie"] = macie_admin
+    admins["Amazon Detective"] = _detective_regional_admin(region, account_id)
 
     dedicated = {}
     for service, (administrator, how, reason) in admins.items():
@@ -15540,8 +16079,9 @@ def check_regional_security_admin(
             _row(
                 f"In {region}, " + "; ".join(problems) + ".",
                 "Designate the same dedicated security tooling account as the "
-                "delegated administrator of GuardDuty, Security Hub and Amazon "
-                "Inspector in every Region, and enroll this account as a member.",
+                "delegated administrator of GuardDuty, Security Hub, Amazon "
+                "Inspector, Amazon Macie and Amazon Detective in every Region, "
+                "and enroll this account as a member.",
                 "High",
                 "Failed",
             )
@@ -16029,7 +16569,8 @@ ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "GuardDuty foundational flow-log analysis covers EC2 network interfaces, not "
     "SageMaker endpoints, so the customer flow log is the only network telemetry "
     "for an endpoint, and AgentCore Runtime yields none either, so each runtime in "
-    "VPC network mode is judged like an endpoint and one in PUBLIC mode fails. The "
+    "VPC network mode is judged like an endpoint and one in PUBLIC mode fails, for "
+    "its latest version and every version a runtime endpoint serves. The "
     "state "
     "named for each alarm is its current StateValue, and its last entry into "
     "ALARM comes from the metric alarm's own StateUpdate history. An alarm with "
@@ -16287,7 +16828,13 @@ def _alarm_cannot_fire(
 def _agentcore_runtime_subnets(
     region: str,
 ) -> Tuple[Dict[str, List[str]], List[str]]:
-    """The subnets of each AgentCore runtime; an empty list for PUBLIC mode."""
+    """The subnets of each AgentCore runtime version an endpoint serves, by
+    label; an empty list for PUBLIC mode.
+
+    GetAgentRuntime without a version returns the latest version only, and
+    each version carries its own networkConfiguration, so every liveVersion
+    and targetVersion ListAgentRuntimeEndpoints names is read as well.
+    """
     try:
         client = boto3.client(
             "bedrock-agentcore-control", config=boto3_config, region_name=region
@@ -16300,22 +16847,60 @@ def _agentcore_runtime_subnets(
             f"bedrock-agentcore:ListAgentRuntimes ({get_assessment_error_label(error)})"
         ]
     subnets, unread = {}, []
-    for runtime in runtimes:
-        name = runtime.get("agentRuntimeName") or runtime.get("agentRuntimeId")
-        try:
-            detail = client.get_agent_runtime(agentRuntimeId=runtime["agentRuntimeId"])
-        except Exception as error:
-            unread.append(
-                f"AgentCore runtime '{name}' "
-                f"(bedrock-agentcore:GetAgentRuntime: {get_assessment_error_label(error)})"
-            )
-            continue
+
+    def _network_subnets(detail: Dict[str, Any]) -> List[str]:
         network = detail.get("networkConfiguration") or {}
-        subnets[name] = (
+        return (
             sorted((network.get("networkModeConfig") or {}).get("subnets") or [])
             if network.get("networkMode") == "VPC"
             else []
         )
+
+    for runtime in runtimes:
+        runtime_id = runtime["agentRuntimeId"]
+        name = runtime.get("agentRuntimeName") or runtime_id
+        label = f"AgentCore runtime '{name}'"
+        try:
+            detail = client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            unread.append(
+                f"{label} "
+                f"(bedrock-agentcore:GetAgentRuntime: {get_assessment_error_label(error)})"
+            )
+            continue
+        subnets[label] = _network_subnets(detail)
+        latest = str(
+            detail.get("agentRuntimeVersion")
+            or runtime.get("agentRuntimeVersion")
+            or ""
+        )
+        served = set()
+        try:
+            for page in client.get_paginator("list_agent_runtime_endpoints").paginate(
+                agentRuntimeId=runtime_id
+            ):
+                for endpoint in page.get("runtimeEndpoints", []):
+                    for field in ("liveVersion", "targetVersion"):
+                        if endpoint.get(field):
+                            served.add(str(endpoint[field]))
+        except Exception as error:
+            unread.append(
+                f"the endpoints of {label}, so the versions they serve "
+                "(bedrock-agentcore:ListAgentRuntimeEndpoints: "
+                f"{get_assessment_error_label(error)})"
+            )
+        for version in sorted(served - {latest}):
+            try:
+                detail = client.get_agent_runtime(
+                    agentRuntimeId=runtime_id, agentRuntimeVersion=version
+                )
+            except Exception as error:
+                unread.append(
+                    f"{label} version {version} (bedrock-agentcore:GetAgentRuntime: "
+                    f"{get_assessment_error_label(error)})"
+                )
+                continue
+            subnets[f"{label} version {version}"] = _network_subnets(detail)
     return subnets, unread
 
 
@@ -16387,8 +16972,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             endpoint_subnets[f"endpoint '{endpoint['name']}'"] = sorted(subnets)
     runtime_subnets, runtime_unread = _agentcore_runtime_subnets(region)
     unread.extend(runtime_unread)
-    for name, subnets in runtime_subnets.items():
-        endpoint_subnets[f"AgentCore runtime '{name}'"] = subnets
+    endpoint_subnets.update(runtime_subnets)
 
     if not inventory["endpoints"] and not runtime_subnets and not unread:
         findings["csv_data"].append(
@@ -16847,7 +17431,17 @@ MODEL_ARTIFACT_INSTANCE_RESOLUTION = (
     "move the model read to the workload's own role, such as an ECS task role "
     "or an EKS Pod Identity role, so the instance role cannot read the weights."
 )
+# AIR-SLF-CMP-08 read caps, measured on account 178113193057 in us-east-1 on
+# 2026-10-04 from outside AWS, so in-Region calls from the Lambda are at most
+# this slow: 1,000 sequential HeadObject calls took 60.4 s (median 53 ms, p95
+# 91 ms, slowest 1.8 s), and 10 ListObjectsV2 pages of 1,000 keys took a
+# median 171 ms each (slowest 1.0 s). The function's timeout is 600 s, so the
+# HeadObject cap holds about a tenth of it and the counting pages past it
+# about 9 s at the median (51 s at the slowest page seen). Objects past the
+# HeadObject cap are counted and reported as not read, which holds Passed at
+# N/A; a count stopped by the page cap is reported as a lower bound.
 SM43_PREFIX_OBJECT_CAP = 1000
+SM43_PREFIX_COUNT_PAGE_CAP = 50
 MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "A recorded ETag, ManifestEtag or ModelDataETag means an expected value is "
     "recorded; whether SageMaker or the container compared it to the object at "
@@ -16857,7 +17451,8 @@ MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "own server-side encryption is judged. Each object under an S3Prefix source "
     "or a multi-model prefix is listed and read with HeadObject for its "
     "server-side encryption, up to "
-    f"{SM43_PREFIX_OBJECT_CAP} objects per run. No SageMaker field records a "
+    f"{SM43_PREFIX_OBJECT_CAP} objects per run; objects past that are counted "
+    "and reported as not read. No SageMaker field records a "
     "SHA256 digest to compare. The execution role's s3:GetObject reach is judged "
     "per bucket from its Allow statements and permissions boundary, not against "
     "the artifact prefix; a Deny narrower than every resource, and SCPs, are not "
@@ -17073,6 +17668,7 @@ def check_sagemaker_model_artifact_integrity(
     model_roles = {}
     role_reach = {}
     prefix_budget = [SM43_PREFIX_OBJECT_CAP]
+    count_pages = [SM43_PREFIX_COUNT_PAGE_CAP]
     s3_client = boto3.client("s3", config=boto3_config, region_name=region)
 
     def _ecr(image_region):
@@ -17313,23 +17909,27 @@ def check_sagemaker_model_artifact_integrity(
 
     def _prefix_keys(uri):
         """The keys under a prefix up to the run's remaining HeadObject budget,
-        with whether more were left, or the error label of a failed listing."""
+        the count of keys past it, and whether that count stopped at the run's
+        page budget; or the error label of a failed listing."""
         if uri not in listings:
             bucket, _, prefix = uri[len("s3://") :].partition("/")
-            keys, more = [], False
+            keys, skipped, uncounted = [], 0, False
             try:
                 for page in s3_client.get_paginator("list_objects_v2").paginate(
                     Bucket=bucket, Prefix=prefix
                 ):
-                    for item in page.get("Contents") or []:
-                        if len(keys) >= prefix_budget[0]:
-                            more = True
-                            break
-                        keys.append(item["Key"])
-                    if more:
+                    contents = page.get("Contents") or []
+                    room = max(prefix_budget[0] - len(keys), 0)
+                    keys.extend(item["Key"] for item in contents[:room])
+                    skipped += max(len(contents) - room, 0)
+                    if not skipped or not page.get("IsTruncated"):
+                        continue
+                    if count_pages[0] <= 0:
+                        uncounted = True
                         break
+                    count_pages[0] -= 1
                 prefix_budget[0] -= len(keys)
-                listings[uri] = (bucket, keys, more)
+                listings[uri] = (bucket, keys, (skipped, uncounted))
             except Exception as error:
                 listings[uri] = get_assessment_error_label(error)
         return listings[uri]
@@ -17342,8 +17942,8 @@ def check_sagemaker_model_artifact_integrity(
                 f"{where} {uri} objects were not listed (s3:ListBucket: {listing})"
             )
             return problems, unreads
-        bucket, keys, more = listing
-        if not keys and not more:
+        bucket, keys, (skipped, uncounted) = listing
+        if not keys and not skipped:
             problems.append(
                 f"{where} {uri} lists no objects, so no object holds the model data"
             )
@@ -17353,11 +17953,18 @@ def check_sagemaker_model_artifact_integrity(
             )
             problems += object_problems
             unreads += object_unreads
-        if more:
+        if skipped:
             unreads.append(
                 f"{where} {uri} holds more objects than the "
                 f"{SM43_PREFIX_OBJECT_CAP} this run reads with HeadObject, so the "
-                f"objects after the first {len(keys)} listed were not read"
+                f"{skipped}{' or more' if uncounted else ''} object(s) after the "
+                f"first {len(keys)} listed were not read"
+                + (
+                    f" (the count stopped at the {SM43_PREFIX_COUNT_PAGE_CAP} "
+                    "listing pages this run spends on objects past that cap)"
+                    if uncounted
+                    else ""
+                )
             )
         return problems, unreads
 
@@ -18070,6 +18677,14 @@ RUNTIME_UNSUPPORTED_NOTE = (
     "EKS on Fargate, EKS Hybrid Nodes and ECS Managed Instances are not "
     "supported by Runtime Monitoring and fall to task- and network-level telemetry"
 )
+MICROVM_RUNTIME_TIER_FINDING = "Lambda MicroVM Runtime Detection Tier"
+MICROVM_RUNTIME_TIER_REFERENCE = (
+    "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/"
+    "logging-data-events-with-cloudtrail.html"
+)
+# The CloudTrail data-event table lists "API activity on
+# AWS::Lambda::MicrovmImage resources". Data events are not logged by default.
+MICROVM_DATA_EVENT_TYPE = "AWS::Lambda::MicrovmImage"
 
 
 def _runtime_coverage_findings(
@@ -18605,13 +19220,302 @@ def _lambda_runtime_tier_findings(
     return rows
 
 
+def _microvm_data_event_selectors(selectors: Any) -> Tuple[bool, List[str]]:
+    """
+    Whether advanced event selectors record every AWS::Lambda::MicrovmImage data
+    event, and the fields that narrow any selector naming the type.
+
+    A selector is credited only with eventCategory Equals Data, resources.type
+    Equals the type and no other field: eventName, readOnly, resources.ARN and
+    the rest each keep a subset of the calls.
+    """
+    narrowed = set()
+    for selector in selectors if isinstance(selectors, list) else []:
+        if not isinstance(selector, dict):
+            continue
+        fields = {
+            str(field.get("Field")): field
+            for field in selector.get("FieldSelectors") or []
+            if isinstance(field, dict)
+        }
+        if "Data" not in ((fields.get("eventCategory") or {}).get("Equals") or []):
+            continue
+        types = (fields.get("resources.type") or {}).get("Equals") or []
+        if MICROVM_DATA_EVENT_TYPE not in types:
+            continue
+        extra = set(fields) - {"eventCategory", "resources.type"}
+        if not extra:
+            return True, []
+        narrowed |= extra
+    return False, sorted(narrowed)
+
+
+def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
+    """
+    The logging trails covering this Region, then the ENABLED CloudTrail Lake
+    event data stores (this Region's, and multi-Region stores homed in every
+    other Region enabled for the account), that record every
+    AWS::Lambda::MicrovmImage data event. Stores are read only when no trail
+    is credited.
+    """
+    coverage: Dict[str, List[str]] = {"credited": [], "gaps": [], "unread": []}
+    try:
+        trails = (
+            boto3.client("cloudtrail", config=boto3_config, region_name=region)
+            .describe_trails(includeShadowTrails=True)
+            .get("trailList", [])
+        )
+    except Exception as error:
+        coverage["unread"].append(
+            f"cloudtrail:DescribeTrails ({get_assessment_error_label(error)})"
+        )
+        trails = []
+    for trail in trails:
+        name = trail.get("Name") or trail.get("TrailARN")
+        trail_id = trail.get("TrailARN") or name
+        if not trail.get("IsMultiRegionTrail") and trail.get("HomeRegion") != region:
+            continue
+        home_client = boto3.client(
+            "cloudtrail",
+            config=boto3_config,
+            region_name=trail.get("HomeRegion") or region,
+        )
+        try:
+            status = home_client.get_trail_status(Name=trail_id)
+            selectors = home_client.get_event_selectors(TrailName=trail_id)
+        except Exception as error:
+            coverage["unread"].append(
+                f"trail '{name}' ({get_assessment_error_label(error)})"
+            )
+            continue
+        credited, narrowed = _microvm_data_event_selectors(
+            selectors.get("AdvancedEventSelectors")
+        )
+        if status.get("IsLogging") is not True:
+            if credited:
+                coverage["gaps"].append(f"trail '{name}' is not logging")
+        elif credited:
+            coverage["credited"].append(f"trail '{name}'")
+        elif narrowed:
+            coverage["gaps"].append(
+                f"trail '{name}' narrows its {MICROVM_DATA_EVENT_TYPE} selector by "
+                f"{', '.join(narrowed)}"
+            )
+    if coverage["credited"]:
+        return coverage
+    regions = [region]
+    try:
+        for page in (
+            boto3.client("account", config=boto3_config)
+            .get_paginator("list_regions")
+            .paginate(RegionOptStatusContains=["ENABLED", "ENABLED_BY_DEFAULT"])
+        ):
+            regions.extend(
+                r["RegionName"]
+                for r in page.get("Regions") or []
+                if r.get("RegionName") and r["RegionName"] not in regions
+            )
+    except Exception as error:
+        coverage["unread"].append(
+            "the Regions where a multi-Region event data store may be homed "
+            f"(account:ListRegions: {get_assessment_error_label(error)})"
+        )
+    for store_region in regions:
+        client = boto3.client(
+            "cloudtrail", config=boto3_config, region_name=store_region
+        )
+        stores, token, seen = [], None, set()
+        try:
+            while True:
+                response = client.list_event_data_stores(
+                    **({"NextToken": token} if token else {})
+                )
+                stores.extend(response.get("EventDataStores") or [])
+                token = response.get("NextToken")
+                if not token:
+                    break
+                if token in seen:
+                    raise RuntimeError("ListEventDataStores repeated a NextToken")
+                seen.add(token)
+        except Exception as error:
+            coverage["unread"].append(
+                f"event data stores in {store_region} (cloudtrail:ListEventDataStores: "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        for store in stores:
+            arn = store.get("EventDataStoreArn")
+            name = f"event data store '{store.get('Name') or arn}' in {store_region}"
+            try:
+                detail = client.get_event_data_store(EventDataStore=arn)
+            except Exception as error:
+                coverage["unread"].append(
+                    f"{name} (cloudtrail:GetEventDataStore: "
+                    f"{get_assessment_error_label(error)})"
+                )
+                continue
+            if store_region != region and detail.get("MultiRegionEnabled") is not True:
+                continue
+            credited, narrowed = _microvm_data_event_selectors(
+                detail.get("AdvancedEventSelectors")
+            )
+            if detail.get("Status") != "ENABLED":
+                if credited:
+                    coverage["gaps"].append(
+                        f"{name} is {detail.get('Status') or 'of unreported status'}"
+                    )
+            elif credited:
+                coverage["credited"].append(name)
+            elif narrowed:
+                coverage["gaps"].append(
+                    f"{name} narrows its {MICROVM_DATA_EVENT_TYPE} selector by "
+                    f"{', '.join(narrowed)}"
+                )
+    return coverage
+
+
+def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
+    """
+    Runtime Monitoring does not cover Lambda MicroVMs, so their tier is VPC Flow
+    Logs on every egress connector subnet plus CloudTrail data events on the
+    AWS::Lambda::MicrovmImage resource type.
+    """
+    microvms, connectors, unread = _microvm_networks(region)
+    if not microvms and not unread:
+        return []
+    problems = []
+    subnet_users: Dict[str, List[str]] = {}
+    no_egress = []
+    for microvm in microvms:
+        if not microvm["egress"]:
+            no_egress.append(microvm["id"])
+        for connector in microvm["egress"]:
+            for subnet in (connectors.get(connector) or {}).get("SubnetIds") or []:
+                subnet_users.setdefault(subnet, []).append(microvm["id"])
+    if subnet_users:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        subnets = sorted(subnet_users)
+        subnet_vpc: Dict[str, str] = {}
+        flow_logs = []
+        try:
+            for batch in _chunked(subnets, SUBNET_LOOKUP_BATCH_SIZE):
+                for page in ec2_client.get_paginator("describe_subnets").paginate(
+                    Filters=[{"Name": "subnet-id", "Values": batch}]
+                ):
+                    for subnet in page.get("Subnets", []):
+                        if subnet.get("SubnetId") and subnet.get("VpcId"):
+                            subnet_vpc[subnet["SubnetId"]] = subnet["VpcId"]
+            resource_ids = sorted(set(subnets) | set(subnet_vpc.values()))
+            for batch in _chunked(resource_ids, SUBNET_LOOKUP_BATCH_SIZE):
+                for page in ec2_client.get_paginator("describe_flow_logs").paginate(
+                    Filter=[{"Name": "resource-id", "Values": batch}]
+                ):
+                    flow_logs.extend(page.get("FlowLogs", []))
+        except Exception as error:
+            unread.append(
+                "the egress connector subnets' flow logs "
+                f"({get_assessment_error_label(error)})"
+            )
+            subnets = []
+        logged = {
+            flow_log.get("ResourceId")
+            for flow_log in flow_logs
+            if flow_log.get("FlowLogStatus") == "ACTIVE"
+            and flow_log.get("TrafficType") == "ALL"
+        }
+        for subnet in subnets:
+            users = ", ".join(sorted(set(subnet_users[subnet])))
+            if subnet not in subnet_vpc:
+                unread.append(
+                    f"egress subnet {subnet} of MicroVM(s) {users} "
+                    "(DescribeSubnets did not return it)"
+                )
+            elif subnet not in logged and subnet_vpc[subnet] not in logged:
+                problems.append(
+                    f"egress subnet {subnet} of MicroVM(s) {users} has no ACTIVE "
+                    f"flow log recording ALL traffic on it or on {subnet_vpc[subnet]}"
+                )
+    events = _microvm_data_event_coverage(region)
+    unread.extend(events["unread"])
+    if not events["credited"] and not events["unread"]:
+        problems.append(
+            "no logging trail covering this Region, and no ENABLED event data store "
+            "read in any Region enabled for the account, records "
+            f"{MICROVM_DATA_EVENT_TYPE} data events with a selector narrowed by no "
+            "field but eventCategory and resources.type"
+            + (f" ({'; '.join(events['gaps'][:5])})" if events["gaps"] else "")
+        )
+    no_egress_note = (
+        f" MicroVM(s) {', '.join(no_egress)} have no egress network connector, so "
+        "no VPC Flow Log is expected for them."
+        if no_egress
+        else ""
+    )
+    rows = []
+    for problem in problems:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=MICROVM_RUNTIME_TIER_FINDING,
+                finding_details=(
+                    f"Lambda MicroVM runtime tier: {problem}. Runtime Monitoring "
+                    "does not cover MicroVMs, so flow logs and data events are "
+                    "their detection tier."
+                ),
+                resolution=(
+                    "Create an ACTIVE VPC Flow Log with TrafficType ALL on each "
+                    "egress connector subnet or its VPC, and add an advanced event "
+                    "selector with eventCategory Equals Data and resources.type "
+                    f"Equals {MICROVM_DATA_EVENT_TYPE}, and no other field, to a "
+                    "logging trail or event data store."
+                ),
+                reference=MICROVM_RUNTIME_TIER_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-38",
+                MICROVM_RUNTIME_TIER_FINDING,
+                unread,
+                f"{len(microvms)} running MicroVM(s) were read.{no_egress_note}",
+                MICROVM_RUNTIME_TIER_REFERENCE,
+                region,
+            )
+        )
+    elif not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=MICROVM_RUNTIME_TIER_FINDING,
+                finding_details=(
+                    f"All {len(subnet_users)} egress connector subnet(s) of the "
+                    f"{len(microvms)} MicroVM(s) that have not ended have an ACTIVE "
+                    "flow log recording ALL traffic on the subnet or its VPC, and "
+                    f"{', '.join(events['credited'])} record(s) every "
+                    f"{MICROVM_DATA_EVENT_TYPE} data event.{no_egress_note}"
+                ),
+                resolution="No action required",
+                reference=MICROVM_RUNTIME_TIER_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_guardduty_runtime_monitoring_coverage(
     region: str = "", detector_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
     """
     SM-38: Read Runtime Monitoring coverage per resource against the EKS and ECS
-    cluster population, EKS audit log monitoring where EKS clusters exist, and
-    the Lambda tier that stands in for a runtime agent.
+    cluster population, EKS audit log monitoring where EKS clusters exist, the
+    Lambda tier that stands in for a runtime agent, and the flow-log and
+    data-event tier of Lambda MicroVMs, which Runtime Monitoring does not cover.
     A detector with every agent-management option off and no manual agent
     fails here, where the feature flag alone reads as enabled.
     """
@@ -18633,6 +19537,7 @@ def check_guardduty_runtime_monitoring_coverage(
             )
         findings["csv_data"].extend(_eks_audit_log_findings(region, detail))
         findings["csv_data"].extend(_lambda_runtime_tier_findings(region, detail))
+        findings["csv_data"].extend(_microvm_runtime_tier_findings(region))
     except Exception as error:
         findings["csv_data"].append(
             create_finding(
@@ -19159,11 +20064,16 @@ def _ecs_services(region: str) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[s
     return services, unread
 
 
-def _lambda_functions(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _lambda_functions(
+    region: str, all_versions: bool = False
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Every Lambda function, or with all_versions every published version
+    and $LATEST, each carrying its own Role and VpcConfig snapshot."""
     try:
         lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
         functions = []
-        for page in lambda_client.get_paginator("list_functions").paginate():
+        paginate = lambda_client.get_paginator("list_functions").paginate
+        for page in paginate(FunctionVersion="ALL") if all_versions else paginate():
             functions.extend(page.get("Functions", []))
         return functions, []
     except Exception as error:
@@ -19896,7 +20806,7 @@ def _egress_workload_subnets(
 ) -> Tuple[List[Tuple[str, str]], List[str], List[Dict[str, Any]]]:
     """(workload label, subnet id) for each ECS awsvpc service and standalone
     task, VPC Lambda, EKS cluster and Fargate profile and EC2 instance, the
-    unread lists, and every Lambda function."""
+    unread lists, and every Lambda function version."""
     references = []
     services, unread = _ecs_services(region)
     for cluster_name, service in services:
@@ -19915,13 +20825,16 @@ def _egress_workload_subnets(
     for cluster_name, task in tasks:
         for subnet_id in _ecs_task_interfaces(task)[0]:
             references.append((_ecs_task_label(cluster_name, task), subnet_id))
-    functions, lambda_unread = _lambda_functions(region)
+    # A published version keeps the VpcConfig it was published with, so an
+    # alias can run a version in subnets $LATEST no longer names.
+    functions, lambda_unread = _lambda_functions(region, all_versions=True)
     unread.extend(lambda_unread)
     for function in functions:
+        label = f"Lambda function {function.get('FunctionName')}"
+        if function.get("Version") not in (None, "$LATEST"):
+            label += f" version {function['Version']}"
         for subnet_id in (function.get("VpcConfig") or {}).get("SubnetIds") or []:
-            references.append(
-                (f"Lambda function {function.get('FunctionName')}", subnet_id)
-            )
+            references.append((label, subnet_id))
     # AIR-SLF-RT-02: agents hosted on EKS or EC2 egress from the subnets of
     # the cluster, of each Fargate profile and of each instance's network
     # interfaces.
@@ -20001,6 +20914,170 @@ def _egress_workload_subnets(
     except Exception as error:
         unread.append(f"ec2:DescribeInstances ({get_assessment_error_label(error)})")
     return references, unread, functions
+
+
+# A training or processing job in any other status has no running instance, so
+# it has no egress to filter.
+RUNNING_JOB_STATUSES = ("InProgress", "Stopping")
+
+
+def _sagemaker_egress_workloads(
+    region: str,
+) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+    """
+    (workload label, subnet id) for each SageMaker endpoint, running training
+    and processing job, notebook instance and Studio domain in a VPC; the ones
+    with an internet path outside the customer VPC; and the unread lists.
+
+    A notebook with DirectInternetAccess other than Disabled, a domain whose
+    AppNetworkAccessType is not VpcOnly, and an endpoint or job with no VPC
+    that is not network isolated reach the internet through SageMaker's own
+    network, where neither firewall applies.
+    """
+    references: List[Tuple[str, str]] = []
+    open_paths: List[str] = []
+    unread: List[str] = []
+    outside = (
+        "reaches the internet through SageMaker's network, so no DNS Firewall "
+        "rule group or Network Firewall route applies to that egress."
+    )
+    client = boto3.client("sagemaker", config=boto3_config, region_name=region)
+    try:
+        inventory = _endpoint_hosting_inventory(client)
+    except Exception as error:
+        inventory = {"endpoints": [], "unread": []}
+        unread.append(f"sagemaker:ListEndpoints ({get_assessment_error_label(error)})")
+    unread.extend(inventory["unread"])
+    models: Dict[str, Optional[Dict[str, Any]]] = {}
+    for endpoint in inventory["endpoints"]:
+        label = f"SageMaker endpoint '{endpoint['name']}'"
+        config = endpoint["config"]
+        subnets = set((config.get("VpcConfig") or {}).get("Subnets") or [])
+        isolated = [config.get("EnableNetworkIsolation") is True] * bool(
+            endpoint["component_variants"]
+        )
+        complete = True
+        for model_name in endpoint["models"]:
+            if model_name not in models:
+                try:
+                    models[model_name] = client.describe_model(ModelName=model_name)
+                except Exception as error:
+                    models[model_name] = None
+                    unread.append(
+                        f"model '{model_name}' of {label} "
+                        f"({get_assessment_error_label(error)})"
+                    )
+            model = models[model_name]
+            if model is None:
+                complete = False
+                continue
+            subnets.update((model.get("VpcConfig") or {}).get("Subnets") or [])
+            isolated.append(model.get("EnableNetworkIsolation") is True)
+        references.extend((label, subnet) for subnet in sorted(subnets))
+        if complete and not subnets and not all(isolated):
+            open_paths.append(
+                f"{label} runs outside a VPC without network isolation and {outside}"
+            )
+    for operation, key, name_key, describe, network_of in (
+        (
+            "list_training_jobs",
+            "TrainingJobSummaries",
+            "TrainingJobName",
+            client.describe_training_job,
+            lambda detail: detail,
+        ),
+        (
+            "list_processing_jobs",
+            "ProcessingJobSummaries",
+            "ProcessingJobName",
+            client.describe_processing_job,
+            lambda detail: detail.get("NetworkConfig") or {},
+        ),
+    ):
+        kind = "training" if "Training" in key else "processing"
+        for status in RUNNING_JOB_STATUSES:
+            try:
+                names = [
+                    summary[name_key]
+                    for summary in _paged(client, operation, key, StatusEquals=status)
+                    if summary.get(name_key)
+                ]
+            except Exception as error:
+                unread.append(
+                    f"{status} SageMaker {kind} jobs "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            for job_name in names:
+                label = f"SageMaker {kind} job '{job_name}'"
+                try:
+                    network = network_of(describe(**{name_key: job_name}))
+                except Exception as error:
+                    unread.append(f"{label} ({get_assessment_error_label(error)})")
+                    continue
+                subnets = (network.get("VpcConfig") or {}).get("Subnets") or []
+                references.extend((label, subnet) for subnet in subnets)
+                if not subnets and network.get("EnableNetworkIsolation") is not True:
+                    open_paths.append(
+                        f"{label} runs outside a VPC without network isolation and {outside}"
+                    )
+    try:
+        notebooks = [
+            notebook["NotebookInstanceName"]
+            for notebook in _paged(
+                client, "list_notebook_instances", "NotebookInstances"
+            )
+            if notebook.get("NotebookInstanceName")
+        ]
+    except Exception as error:
+        notebooks = []
+        unread.append(
+            f"sagemaker:ListNotebookInstances ({get_assessment_error_label(error)})"
+        )
+    for notebook_name in notebooks:
+        label = f"SageMaker notebook instance '{notebook_name}'"
+        try:
+            detail = client.describe_notebook_instance(
+                NotebookInstanceName=notebook_name
+            )
+        except Exception as error:
+            unread.append(f"{label} ({get_assessment_error_label(error)})")
+            continue
+        if detail.get("SubnetId"):
+            references.append((label, detail["SubnetId"]))
+        if detail.get("DirectInternetAccess") != "Disabled":
+            open_paths.append(
+                f"{label} has DirectInternetAccess "
+                f"{detail.get('DirectInternetAccess') or 'not returned'}, so it "
+                + outside
+            )
+    try:
+        domains = [
+            domain["DomainId"]
+            for domain in _paged(client, "list_domains", "Domains")
+            if domain.get("DomainId")
+        ]
+    except Exception as error:
+        domains = []
+        unread.append(f"sagemaker:ListDomains ({get_assessment_error_label(error)})")
+    for domain_id in domains:
+        try:
+            detail = client.describe_domain(DomainId=domain_id)
+        except Exception as error:
+            unread.append(
+                f"SageMaker Studio domain {domain_id} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        label = f"SageMaker Studio domain '{detail.get('DomainName') or domain_id}'"
+        references.extend((label, subnet) for subnet in detail.get("SubnetIds") or [])
+        if detail.get("AppNetworkAccessType") != "VpcOnly":
+            open_paths.append(
+                f"{label} has AppNetworkAccessType "
+                f"{detail.get('AppNetworkAccessType') or 'not returned'}, so its "
+                "apps' traffic " + outside
+            )
+    return references, open_paths, unread
 
 
 def _describe_workload_subnets(
@@ -21646,7 +22723,8 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     """
     SM-39 (AIR-SLF-RT-02): judge DNS Firewall and Network Firewall egress for
     every VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS
-    cluster or an EC2 instance runs in.
+    cluster, an EC2 instance, or a SageMaker endpoint, running training or
+    processing job, notebook instance or Studio domain runs in.
 
     One DNS row and one Network Firewall row per VPC. An unread workload list
     or subnet description is reported N/A by name, never Passed. A Lambda
@@ -21674,6 +22752,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     )
     try:
         references, unread, functions = _egress_workload_subnets(region)
+        sagemaker_references, open_sagemaker, sagemaker_unread = (
+            _sagemaker_egress_workloads(region)
+        )
+        references.extend(sagemaker_references)
+        unread.extend(sagemaker_unread)
         named, named_unread = _ai_lambda_references(region)
         unread.extend(named_unread)
         # A MicroVM egresses through its VPC egress connector's subnets. AWS
@@ -21707,7 +22790,10 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
             )
         return findings
 
-    listed = {str(f.get("FunctionArn") or ""): f for f in functions}
+    # ListFunctions with FunctionVersion ALL qualifies $LATEST's ARN.
+    listed = {
+        str(f.get("FunctionArn") or "").removesuffix(":$LATEST"): f for f in functions
+    }
     open_functions = []
     for arn in sorted(named):
         match = LAMBDA_IN_URI.search(arn)
@@ -21743,6 +22829,21 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 "Medium",
                 region,
                 "agent Lambda functions outside a VPC",
+            )
+        )
+        findings["csv_data"].extend(
+            _capped_problem_rows(
+                "SM-39",
+                name,
+                open_sagemaker,
+                "Place each SageMaker endpoint, job, notebook instance and Studio "
+                "domain in private VPC subnets (VpcOnly for a domain, "
+                "DirectInternetAccess Disabled for a notebook) whose DNS Firewall "
+                "and Network Firewall filter its egress.",
+                reference,
+                "Medium",
+                region,
+                "SageMaker workloads with an internet path outside the VPC",
             )
         )
         if name == WORKLOAD_FIREWALL_EGRESS_FINDING:
@@ -21785,7 +22886,7 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 )
             )
     if not firewall_references:
-        if not unread and not open_functions:
+        if not unread and not open_functions and not open_sagemaker:
             for name, reference in legs:
                 if open_microvms and name == WORKLOAD_FIREWALL_EGRESS_FINDING:
                     continue
@@ -21793,9 +22894,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                     _na(
                         name,
                         "No ECS awsvpc service or task, VPC-attached Lambda "
-                        "function, EKS cluster or Fargate profile, EC2 instance or "
-                        "Lambda MicroVM egress connector in this Region runs in a "
-                        "VPC, so no workload VPC's egress was judged.",
+                        "function, EKS cluster or Fargate profile, EC2 instance, "
+                        "SageMaker endpoint, running job, notebook instance or "
+                        "Studio domain, or Lambda MicroVM egress connector in this "
+                        "Region runs in a VPC, so no workload VPC's egress was "
+                        "judged.",
                         "No action required",
                         reference,
                     )

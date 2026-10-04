@@ -1334,12 +1334,16 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Sid: WorkloadReadsOnWildcard
-            # Neither action has a resource type in the service authorization
-            # reference.
+            # None of these actions has a resource type in the service
+            # authorization reference. SM-37 lists each AgentCore runtime's
+            # endpoints for the versions they serve. SM-38 lists the CloudTrail
+            # Lake event data stores that may record MicroVM data events.
             Effect: Allow
             Action:
               - lambda:ListMicrovms # SM-39
               - ec2:DescribeNetworkInterfaces # SM-39
+              - bedrock-agentcore:ListAgentRuntimeEndpoints # SM-37
+              - cloudtrail:ListEventDataStores # SM-38
             Resource: '*'
           - Sid: TransitGatewayEgressRead
             # SM-39 follows a workload subnet's internet route through a transit
@@ -1406,6 +1410,43 @@ Resources:
             Action:
               - securityhub:GetConfigurationPolicy # SM-36
             Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:configuration-policy/*'
+          - Sid: RegionalSecurityAdminReadsOnWildcard
+            # SM-35 reads this account's Macie administrator and Detective
+            # behavior graph memberships in each Region, and whether it is
+            # itself the Macie organization administrator or administers a
+            # behavior graph. None of these actions has a resource type in
+            # the service authorization reference.
+            Effect: Allow
+            Action:
+              - macie2:GetAdministratorAccount # SM-35
+              - macie2:DescribeOrganizationConfiguration # SM-35
+              - detective:ListInvitations # SM-35
+              - detective:ListGraphs # SM-35
+            Resource: '*'
+          - Sid: DetectiveOrganizationConfigurationRead
+            # SM-35 asks whether the behavior graph this account administers
+            # is the organization behavior graph. Only the Detective
+            # administrator for the organization can call it.
+            Effect: Allow
+            Action:
+              - detective:DescribeOrganizationConfiguration # SM-35
+            Resource: !Sub 'arn:${AWS::Partition}:detective:*:${AWS::AccountId}:graph:*'
+          - Sid: MicrovmDataEventStoreRead
+            # SM-38 reads each event data store's Status and selectors for
+            # AWS::Lambda::MicrovmImage data events. GetEventDataStore has the
+            # eventdatastore resource type.
+            Effect: Allow
+            Action:
+              - cloudtrail:GetEventDataStore # SM-38
+            Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
+          - Sid: EnabledRegionsRead
+            # SM-38 lists the Regions enabled for the account, where a
+            # multi-Region event data store may be homed. ListRegions has the
+            # account resource type.
+            Effect: Allow
+            Action:
+              - account:ListRegions # SM-38
+            Resource: !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

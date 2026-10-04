@@ -2435,7 +2435,7 @@ MUTATIONS = [
         "whose encryption nobody read. Without the unread row the first 1,000 "
         "listed objects stand for the whole prefix and the endpoint passes",
         "find": (
-            "        if more:\n"
+            "        if skipped:\n"
             "            unreads.append(\n"
             '                f"{where} {uri} holds more objects than the "\n'
         ),
@@ -2465,11 +2465,477 @@ MUTATIONS = [
         "defect": "the control asks for approved subnets and approved security "
         "groups. Read as one key group, a Deny on the security groups alone "
         "passes the approved network category, and a job runs in any subnet",
-        "find": "            (action, (key,))\n",
-        "replace": (
-            '            (action, ("sagemaker:VpcSubnets", '
-            '"sagemaker:VpcSecurityGroupIds"))\n'
+        "find": (
+            "        _guardrail_requirements(\n"
+            '            ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")\n'
+            "        ),\n"
         ),
+        "replace": (
+            "        tuple(\n"
+            '            (a, ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"))\n'
+            "            for a, _, d in SAGEMAKER_GUARDED_ACTION_KEYS\n"
+            '            if "sagemaker:VpcSubnets" in d\n'
+            "        ),\n"
+        ),
+    },
+    # Round 9: the guarded population is the sagemaker service reference's.
+    # Each was killed by hand on a byte backup on 2026-10-04.
+    {
+        "name": "SM-34 guards only the five original create actions",
+        "file": SAGEMAKER,
+        "defect": "a tuning, processing, AutoML, monitoring, HyperPod or Studio "
+        "action launches compute on its own condition keys, so an SCP on "
+        "CreateTrainingJob alone passes while those paths stay open",
+        "find": "        for action, _, defined in SAGEMAKER_GUARDED_ACTION_KEYS\n",
+        "replace": "        for action, _, defined in SAGEMAKER_GUARDED_ACTION_KEYS[:5]\n",
+    },
+    {
+        "name": "SM-34 holds the tuning job to the encryption keys only",
+        "file": SAGEMAKER,
+        "defect": "CreateHyperParameterTuningJob defines sagemaker:VpcSubnets, "
+        "VpcSecurityGroupIds and NetworkIsolation, so a tuning job outside the "
+        "approved network passes",
+        "find": (
+            '        "sagemaker:CreateHyperParameterTuningJob",\n'
+            '        "hyper-parameter-tuning-job",\n'
+            '        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),\n'
+        ),
+        "replace": (
+            '        "sagemaker:CreateHyperParameterTuningJob",\n'
+            '        "hyper-parameter-tuning-job",\n'
+            "        _SM_ENC,\n"
+        ),
+    },
+    {
+        "name": "SM-34 drops the Studio internet key from its category",
+        "file": SAGEMAKER,
+        "defect": "CreateDomain and UpdateDomain take AppNetworkAccessType, so a "
+        "PublicInternetOnly domain passes the no direct internet access category",
+        "find": (
+            '                "sagemaker:DirectInternetAccess",\n'
+            '                "sagemaker:AppNetworkAccessType",\n'
+            "            )\n"
+        ),
+        "replace": '                "sagemaker:DirectInternetAccess",\n            )\n',
+    },
+    {
+        "name": "SM-34 has no non-compliant AppNetworkAccessType value",
+        "file": SAGEMAKER,
+        "defect": "a StringEqualsIfExists PublicInternetOnly Deny fires on an "
+        "omitted key and on the public value, so it enforces the key, but it "
+        "reads as a one-value deny and withholds the Passed",
+        "find": '    "sagemaker:appnetworkaccesstype": "publicinternetonly",\n',
+        "replace": "",
+    },
+    {
+        "name": "SM-34 probes a job ARN with no category segment",
+        "file": SAGEMAKER,
+        "defect": "a job ARN is job/<category>/<name>, so a Deny on job/*/* "
+        "covers every job but misses a probe with no category, and the "
+        "CreateJob guard reads as scoped to named resources",
+        "find": '    "job": "job/zz-probe/zz-probe",\n',
+        "replace": "",
+    },
+    {
+        "name": "SM-35 regional leg never reads Detective",
+        "file": SAGEMAKER,
+        "defect": "Detective designates its administrator per Region, so a Region where the organization behavior graph has no administrator, or the management account administers it, passes",
+        "find": '    admins["Amazon Detective"] = _detective_regional_admin(region, account_id)\n',
+        "replace": "",
+    },
+    {
+        "name": "SM-35 regional leg drops the Macie administrator it read",
+        "file": SAGEMAKER,
+        "defect": "Macie designates its administrator per Region, so a Region where the management account administers Macie passes",
+        "find": '        admins["Amazon Macie"] = macie_admin\n',
+        "replace": "        pass\n",
+    },
+    {
+        "name": "SM-35 takes any Detective membership as the organization graph",
+        "file": SAGEMAKER,
+        "defect": "any account that enables Detective administers its own behavior graph, so this account's standalone graph reads as the organization administrator",
+        "find": '            if membership.get("InvitationType") == "ORGANIZATION":\n',
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "SM-35 credits a standalone Detective graph",
+        "file": SAGEMAKER,
+        "defect": "DescribeOrganizationConfiguration answers only for the organization behavior graph, so skipping its ValidationException reads a standalone graph as the organization administrator",
+        "find": '                if error.response.get("Error", {}).get("Code", "") != (\n                    "ValidationException"\n                ):\n                    raise\n                continue\n',
+        "replace": "                pass\n",
+    },
+    {
+        "name": "SM-35 reads every Detective membership page as the first",
+        "file": SAGEMAKER,
+        "defect": "an organization membership past the first ListInvitations page is never read, so the Region reads as having no Detective administrator",
+        "find": '            items.extend(page.get(key) or [])\n            token = page.get("NextToken")\n',
+        "replace": "            items.extend(page.get(key) or [])\n            token = None\n",
+    },
+    {
+        "name": "SM-35 reads Macie's not-administrator answer as an unread",
+        "file": SAGEMAKER,
+        "defect": "Macie answers a member that is not its organization administrator with AccessDeniedException, so treating that answer as a denied read withholds a Failed the Region has earned",
+        "find": "            if MACIE_NOT_ADMINISTRATOR_MESSAGE in _client_error_message(error):\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "SM-35 reads every Macie AccessDenied as Macie being off",
+        "file": SAGEMAKER,
+        "defect": "an IAM denial of macie2:GetAdministratorAccount also answers AccessDeniedException, so without the message test a read the role cannot make fails the Region instead of withholding the Passed",
+        "find": "        and MACIE_NOT_ENABLED_MESSAGE in _client_error_message(response)\n",
+        "replace": "        and True\n",
+    },
+    {
+        "name": "SM-35 does not fail a Region where Macie is off",
+        "file": SAGEMAKER,
+        "defect": "a Region where Macie is not enabled has no Macie administrator, so it must fail as a Region without a GuardDuty detector does",
+        "find": "    ):\n        return None\n\n    def _administrator():\n",
+        "replace": "    ):\n        pass\n\n    def _administrator():\n",
+    },
+    {
+        "name": "SM-31 passes a capture that records one direction",
+        "file": SAGEMAKER,
+        "defect": "DescribeEndpoint reports Started for an Input-only capture, so without the endpoint config's CaptureOptions an endpoint that never records responses passes",
+        "find": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} <= modes)\n',
+        "replace": "                    and False\n",
+    },
+    {
+        "name": "SM-31 takes either capture direction for both",
+        "file": SAGEMAKER,
+        "defect": "an endpoint config with only Input or only Output then reads as capturing requests and responses",
+        "find": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} <= modes)\n',
+        "replace": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} & modes)\n',
+    },
+    {
+        "name": "SM-43 stops counting at the page that hit the cap",
+        "file": SAGEMAKER,
+        "defect": "the objects on later listing pages are past the cap too, so a count of the first page understates what was not read",
+        "find": "                    if count_pages[0] <= 0:\n",
+        "replace": "                    if True:\n",
+    },
+    {
+        "name": "SM-43 reports a stopped count as exact",
+        "file": SAGEMAKER,
+        "defect": "a count the page budget stopped is a lower bound, so stating it as exact claims what was not listed",
+        "find": "                        uncounted = True\n                        break\n",
+        "replace": "                        uncounted = False\n                        break\n",
+    },
+    {
+        "name": "SM-43 never spends the counting page budget",
+        "file": SAGEMAKER,
+        "defect": "an unbounded count over a prefix of millions of objects outruns the 600 s Lambda timeout",
+        "find": "                    count_pages[0] -= 1\n",
+        "replace": "                    pass\n",
+    },
+    {
+        "name": "SM-38 credits a MicroVM selector narrowed by another field",
+        "file": SAGEMAKER,
+        "defect": "a selector that adds eventName, readOnly or resources.ARN records a subset of the MicroVM calls, so crediting it passes a trail that misses some",
+        "find": "        if not extra:\n            return True, []\n        narrowed |= extra\n",
+        "replace": "        if True:\n            return True, []\n        narrowed |= extra\n",
+    },
+    {
+        "name": "SM-38 credits a MicroVM trail that is not logging",
+        "file": SAGEMAKER,
+        "defect": "a stopped trail records nothing, so its selectors cannot stand for the MicroVM data events",
+        "find": '        if status.get("IsLogging") is not True:\n            if credited:\n                coverage["gaps"].append(f"trail \'{name}\' is not logging")\n',
+        "replace": '        if status.get("IsLogging") is None:\n            if credited:\n                coverage["gaps"].append(f"trail \'{name}\' is not logging")\n',
+    },
+    {
+        "name": "SM-38 counts a single-Region event data store homed elsewhere",
+        "file": SAGEMAKER,
+        "defect": "a store that is not multi-Region records only its home Region's events, so it cannot record this Region's MicroVM calls",
+        "find": '            if store_region != region and detail.get("MultiRegionEnabled") is not True:\n                continue\n',
+        "replace": "            if False:\n                continue\n",
+    },
+    {
+        "name": "SM-38 credits an event data store that is not ENABLED",
+        "file": SAGEMAKER,
+        "defect": "a store that stopped ingestion records no new MicroVM events",
+        "find": '            if detail.get("Status") != "ENABLED":\n',
+        "replace": '            if detail.get("Status") is None:\n',
+    },
+    {
+        "name": "SM-38 never reports a failed ListRegions",
+        "file": SAGEMAKER,
+        "defect": "without the Region list a multi-Region store homed elsewhere goes unread, so the missing-store failure would rest on a partial read",
+        "find": '        coverage["unread"].append(\n            "the Regions where a multi-Region event data store may be homed "\n',
+        "replace": '        str(\n            "the Regions where a multi-Region event data store may be homed "\n',
+    },
+    {
+        "name": "SM-38 credits a MicroVM flow log in any status",
+        "file": SAGEMAKER,
+        "defect": "an INACTIVE flow log records no traffic from the egress subnet",
+        "find": '            if flow_log.get("FlowLogStatus") == "ACTIVE"\n            and flow_log.get("TrafficType") == "ALL"\n',
+        "replace": '            if flow_log.get("FlowLogStatus") is not None\n            and flow_log.get("TrafficType") == "ALL"\n',
+    },
+    {
+        "name": "SM-38 credits a MicroVM flow log of accepted traffic only",
+        "file": SAGEMAKER,
+        "defect": "an ACCEPT flow log drops every rejected connection, so the MicroVM egress it should record is partly unseen",
+        "find": '            and flow_log.get("TrafficType") == "ALL"\n        }\n',
+        "replace": '            and flow_log.get("TrafficType") in ("ALL", "ACCEPT")\n        }\n',
+    },
+    {
+        "name": "SM-38 credits only a subnet-level MicroVM flow log",
+        "file": SAGEMAKER,
+        "defect": "a flow log on the VPC covers every subnet in it, so ignoring it fails a logged egress subnet",
+        "find": "            elif subnet not in logged and subnet_vpc[subnet] not in logged:\n",
+        "replace": "            elif subnet not in logged:\n",
+    },
+    {
+        "name": "SM-38 fails the MicroVM data events on a partial read",
+        "file": SAGEMAKER,
+        "defect": "a trail or store that was not read may record the MicroVM data events, so no verdict follows",
+        "find": '    if not events["credited"] and not events["unread"]:\n',
+        "replace": '    if not events["credited"]:\n',
+    },
+    {
+        "name": "SM-38 never runs the MicroVM tier",
+        "file": SAGEMAKER,
+        "defect": "MicroVMs are outside Runtime Monitoring, so without this leg they are never in SM-38's population",
+        "find": '        findings["csv_data"].extend(_microvm_runtime_tier_findings(region))\n',
+        "replace": "        pass\n",
+    },
+    {
+        "name": "SM-39 drops the SageMaker workloads from its population",
+        "file": SAGEMAKER,
+        "defect": "SageMaker endpoints, running jobs, notebook instances and Studio domains run in customer VPCs whose egress SM-39 then never judges",
+        "find": "        references.extend(sagemaker_references)\n",
+        "replace": "        sagemaker_references.clear()\n",
+    },
+    {
+        "name": "SM-39 reads only InProgress jobs",
+        "file": SAGEMAKER,
+        "defect": "a Stopping job still runs and egresses until its instances are released",
+        "find": 'RUNNING_JOB_STATUSES = ("InProgress", "Stopping")\n',
+        "replace": 'RUNNING_JOB_STATUSES = ("InProgress",)\n',
+    },
+    {
+        "name": "SM-39 takes one isolated model for the whole endpoint",
+        "file": SAGEMAKER,
+        "defect": "an endpoint that also serves a model without network isolation and has no VPC reaches the internet through SageMaker's network",
+        "find": "        if complete and not subnets and not all(isolated):\n",
+        "replace": "        if complete and not subnets and not any(isolated):\n",
+    },
+    {
+        "name": "SM-39 ignores a running job's network isolation",
+        "file": SAGEMAKER,
+        "defect": "a network-isolated job outside a VPC has no egress, so failing it reports a path that does not exist",
+        "find": '                if not subnets and network.get("EnableNetworkIsolation") is not True:\n',
+        "replace": "                if not subnets:\n",
+    },
+    {
+        "name": "SM-39 drops an unread SageMaker job",
+        "file": SAGEMAKER,
+        "defect": "a job whose description failed may run in a VPC whose egress is then never judged, and nothing says so",
+        "find": '                    unread.append(f"{label} ({get_assessment_error_label(error)})")\n                    continue\n',
+        "replace": "                    continue\n",
+    },
+    {
+        "name": "SM-39 passes a notebook with direct internet access",
+        "file": SAGEMAKER,
+        "defect": "DirectInternetAccess Enabled adds SageMaker's own internet path beside the VPC, where neither firewall applies",
+        "find": '        if detail.get("DirectInternetAccess") != "Disabled":\n',
+        "replace": '        if detail.get("DirectInternetAccess") is None:\n',
+    },
+    {
+        "name": "SM-39 passes a Studio domain that is not VpcOnly",
+        "file": SAGEMAKER,
+        "defect": "PublicInternetOnly sends the domain's app internet traffic through SageMaker's network, where neither firewall applies",
+        "find": '        if detail.get("AppNetworkAccessType") != "VpcOnly":\n',
+        "replace": '        if detail.get("AppNetworkAccessType") is None:\n',
+    },
+    {
+        "name": "SM-39 reports no VPC workload beside an open SageMaker workload",
+        "file": SAGEMAKER,
+        "defect": "a SageMaker workload outside the VPC is a workload, so the no-workload N/A contradicts the Failed rows beside it",
+        "find": "        if not unread and not open_functions and not open_sagemaker:\n",
+        "replace": "        if not unread and not open_functions:\n",
+    },
+    {
+        "name": "SM-39 egress reads only each function's $LATEST",
+        "file": SAGEMAKER,
+        "defect": "a published version keeps its own VpcConfig, so an alias can run it in subnets whose egress is never judged",
+        "find": "    functions, lambda_unread = _lambda_functions(region, all_versions=True)\n    unread.extend(lambda_unread)\n    for function in functions:\n        label = ",
+        "replace": "    functions, lambda_unread = _lambda_functions(region)\n    unread.extend(lambda_unread)\n    for function in functions:\n        label = ",
+    },
+    {
+        "name": "SM-39 matches a named function against the qualified $LATEST ARN",
+        "file": SAGEMAKER,
+        "defect": "ListFunctions with FunctionVersion ALL appends :$LATEST, so an agent-named function is never found and its open egress reads as unread",
+        "find": '        str(f.get("FunctionArn") or "").removesuffix(":$LATEST"): f for f in functions\n',
+        "replace": '        str(f.get("FunctionArn") or ""): f for f in functions\n',
+    },
+    {
+        "name": "SM-35 reads a repeated Detective token as the last page",
+        "file": SAGEMAKER,
+        "defect": "a repeated NextToken means the memberships were not all read, so returning the pages so far can miss the organization graph and fail or pass on a partial read",
+        "find": '                raise RuntimeError(f"{key} paging repeated a NextToken")\n',
+        "replace": "                return items\n",
+    },
+    {
+        "name": "SM-38 reads a repeated store token as the last page",
+        "file": SAGEMAKER,
+        "defect": "the stores not yet listed may record the MicroVM data events, so a missing-store failure would rest on a partial read",
+        "find": '                    raise RuntimeError("ListEventDataStores repeated a NextToken")\n',
+        "replace": "                    break\n",
+    },
+    {
+        "name": "SM-11 invoke leg passes with the root user unbound",
+        "file": SAGEMAKER,
+        "defect": "identity policies bind roles and users only, so passing on them leaves the account root user free to call the public runtime endpoint",
+        "find": '        rows.append(_row(details, INVOKE_SOURCE_NETWORK_RESOLUTION, "Medium", "Failed"))\n',
+        "replace": '        rows.append(_row(details, "No action required", "Medium", "Passed"))\n',
+    },
+    {
+        "name": "SM-11 invoke leg credits an SCP that misses an invoke action",
+        "file": SAGEMAKER,
+        "defect": "InvokeEndpointAsync and InvokeEndpointWithResponseStream reach the same endpoint, so an SCP on InvokeEndpoint alone leaves two public paths",
+        "find": "        for action in INVOKE_SOURCE_SCP_ACTIONS\n    }\n    scp_open",
+        "replace": "        for action in INVOKE_SOURCE_SCP_ACTIONS[:1]\n    }\n    scp_open",
+    },
+    {
+        "name": "SM-11 invoke leg fails the root user on an unread SCP",
+        "file": SAGEMAKER,
+        "defect": "an SCP the check could not read may hold the root user, so a Failed claims what was not established",
+        "find": '    elif not open_principals and any(\n        leg["state"] in INVOKE_SOURCE_SCP_UNDETERMINED',
+        "replace": '    elif False and any(\n        leg["state"] in INVOKE_SOURCE_SCP_UNDETERMINED',
+    },
+    {
+        "name": "SM-11 invoke leg ignores an attached SCP",
+        "file": SAGEMAKER,
+        "defect": "an attached SCP Deny binds every principal, the root user included, so ignoring it fails a compliant account",
+        "find": "    if not scp_open:\n        policies = sorted(",
+        "replace": "    if False:\n        policies = sorted(",
+    },
+    {
+        "name": "SM-37 reads only the latest AgentCore runtime version",
+        "file": SAGEMAKER,
+        "defect": "each runtime version carries its own networkConfiguration, so an older version an endpoint serves on other subnets or in PUBLIC mode goes unjudged",
+        "find": "        for version in sorted(served - {latest}):\n",
+        "replace": "        for version in sorted(set()):\n",
+    },
+    {
+        "name": "SM-37 ignores an endpoint's targetVersion",
+        "file": SAGEMAKER,
+        "defect": "an endpoint mid-update serves its targetVersion next, so its network is in scope",
+        "find": '                    for field in ("liveVersion", "targetVersion"):\n                        if endpoint.get(field):\n                            served.add(str(endpoint[field]))\n',
+        "replace": '                    for field in ("liveVersion",):\n                        if endpoint.get(field):\n                            served.add(str(endpoint[field]))\n',
+    },
+    {
+        "name": "SM-37 passes on unlisted AgentCore runtime endpoints",
+        "file": SAGEMAKER,
+        "defect": "a failed ListAgentRuntimeEndpoints leaves the served versions unread",
+        "find": '            unread.append(\n                f"the endpoints of {label}, so the versions they serve "\n',
+        "replace": '            [].append(\n                f"the endpoints of {label}, so the versions they serve "\n',
+    },
+    {
+        "name": "SM-37 drops a served AgentCore version it could not read",
+        "file": SAGEMAKER,
+        "defect": "a served version GetAgentRuntime did not return has no network read",
+        "find": '                unread.append(\n                    f"{label} version {version} (bedrock-agentcore:GetAgentRuntime: "\n',
+        "replace": '                [].append(\n                    f"{label} version {version} (bedrock-agentcore:GetAgentRuntime: "\n',
+    },
+    {
+        "name": "SM-11 lists only the $LATEST Lambda version",
+        "file": SAGEMAKER,
+        "defect": "a published version keeps its own Role and VpcConfig, so reading $LATEST alone leaves a version outside a VPC unjudged",
+        "find": "    functions, lambda_unread = _lambda_functions(region, all_versions=True)\n    unread.extend(lambda_unread)\n    granted_functions = []\n",
+        "replace": "    functions, lambda_unread = _lambda_functions(region)\n    unread.extend(lambda_unread)\n    granted_functions = []\n",
+    },
+    {
+        "name": "SM-11 skips every version of a named Lambda function",
+        "file": SAGEMAKER,
+        "defect": "an agent names the unqualified function, which runs $LATEST, so its published versions still need judging by grant",
+        "find": '            version == "$LATEST" and str(arn).rsplit(":", 1)[0] in named\n',
+        "replace": '            str(arn).rsplit(":", 1)[0] in named\n',
+    },
+    {
+        "name": "SM-02 never marks a Lambda target AI by grant",
+        "file": SAGEMAKER,
+        "defect": "an API fronting a Lambda function whose role may invoke a model passes unseen",
+        "find": '        target = _ai_integration_target(method["uri"], ai_functions, granted)\n',
+        "replace": '        target = _ai_integration_target(method["uri"], ai_functions)\n',
+    },
+    {
+        "name": "SM-02 reads only the $LATEST role of a Lambda target",
+        "file": SAGEMAKER,
+        "defect": "an alias can run a published version whose role differs from $LATEST",
+        "find": "    functions, lambda_unread = _lambda_functions(region, all_versions=True)\n    unread.extend(lambda_unread)\n    if lambda_unread:\n",
+        "replace": "    functions, lambda_unread = _lambda_functions(region)\n    unread.extend(lambda_unread)\n    if lambda_unread:\n",
+    },
+    {
+        "name": "SM-02 drops a Lambda target ListFunctions did not return",
+        "file": SAGEMAKER,
+        "defect": "a target in another account or Region has no role read, so dropping it lets the leg pass",
+        "find": "        if arn not in versions:\n            unread.append(\n",
+        "replace": "        if arn not in versions:\n            [].append(\n",
+    },
+    {
+        "name": "SM-02 passes on a failed Lambda listing",
+        "file": SAGEMAKER,
+        "defect": "a failed ListFunctions leaves every unnamed Lambda target unjudged",
+        "find": "    unread.extend(lambda_unread)\n    if lambda_unread:\n        return {}\n",
+        "replace": "    if lambda_unread:\n        return {}\n",
+    },
+    {
+        "name": "SM-02 passes without the cache on an unnamed Lambda target",
+        "file": SAGEMAKER,
+        "defect": "without the IAM cache no Lambda target can be marked AI by grant, so the leg is unread",
+        "find": "    if unnamed and permission_cache is None:\n        unread.append(\n",
+        "replace": "    if unnamed and permission_cache is None:\n        [].append(\n",
+    },
+    {
+        "name": "SM-22 drops shadow variants from the deployed-model trace",
+        "file": SAGEMAKER,
+        "defect": "a shadow variant serves a copy of live traffic, so skipping it leaves a model on an unapproved package out of the deployed population",
+        "find": '                (variant, " (shadow)")\n                for variant in config.get("ShadowProductionVariants") or []\n',
+        "replace": '                (variant, " (shadow)")\n                for variant in []\n',
+    },
+    {
+        "name": "SM-22 approver leg passes over unread versions",
+        "file": SAGEMAKER,
+        "defect": "a version DescribeModelPackage or ListModelPackages did not return has no approver read, so passing the leg credits it",
+        "find": "                region,\n                versions_unread=len(unread),\n",
+        "replace": "                region,\n                versions_unread=0,\n",
+    },
+    {
+        "name": "SM-22 lifecycle leg passes over unread versions",
+        "file": SAGEMAKER,
+        "defect": "a version that was not read has no ModelLifeCycle read, so passing the leg credits it",
+        "find": "                    region,\n                    versions_unread=len(unread),\n",
+        "replace": "                    region,\n                    versions_unread=0,\n",
+    },
+    {
+        "name": "SM-22 leaves ListModelPackages to its UNVERSIONED default",
+        "file": SAGEMAKER,
+        "defect": "ListModelPackages documents UNVERSIONED as the default type and a group holds versioned packages, so the default can return none of them",
+        "find": 'ModelPackageGroupName=group_name, ModelPackageType="Both"',
+        "replace": "ModelPackageGroupName=group_name",
+    },
+    {
+        "name": "SM-31 passes an endpoint whose config was not read",
+        "file": SAGEMAKER,
+        "defect": "a denied DescribeEndpointConfig leaves the capture modes unknown, so crediting them puts an unread endpoint in the Passed count",
+        "find": "                        continue\n                    modes = {\n",
+        "replace": '                        config = {"DataCaptureConfig": {"CaptureOptions": [{"CaptureMode": "InputAndOutput"}]}}\n                    modes = {\n',
+    },
+    {
+        "name": "SM-09 holds no Studio domain or update action",
+        "file": SAGEMAKER,
+        "defect": "UpdateNotebookInstance can turn RootAccess back on and "
+        "CreateDomain or UpdateDomain can open a domain to the internet, so a "
+        "bar on CreateNotebookInstance alone passes Studio unexamined",
+        "find": (
+            '            "sagemaker:CreateNotebookInstance",\n'
+            '            "sagemaker:UpdateNotebookInstance",\n'
+            '            "sagemaker:CreateDomain",\n'
+            '            "sagemaker:UpdateDomain",\n'
+            '            "sagemaker:CreateUserProfile",\n'
+            '            "sagemaker:UpdateUserProfile",\n'
+        ),
+        "replace": '            "sagemaker:CreateNotebookInstance",\n',
     },
     {
         "name": "SM-09 credits a key-group Deny with a weak half",
@@ -6264,6 +6730,67 @@ GROUPS: dict[str, str] = {
         "in `SM-43`'s artifact reads"
     ),
     "SM-34 lets either network key stand for both": "in the SageMaker verdict legs",
+    "SM-34 guards only the five original create actions": "in the SageMaker verdict legs",
+    "SM-34 holds the tuning job to the encryption keys only": "in the SageMaker verdict legs",
+    "SM-34 drops the Studio internet key from its category": "in the SageMaker verdict legs",
+    "SM-34 has no non-compliant AppNetworkAccessType value": "in the SageMaker verdict legs",
+    "SM-34 probes a job ARN with no category segment": "in the SageMaker verdict legs",
+    "SM-09 holds no Studio domain or update action": "in the SageMaker verdict legs",
+    "SM-31 passes a capture that records one direction": "in the SageMaker verdict legs",
+    "SM-31 takes either capture direction for both": "in the SageMaker verdict legs",
+    "SM-31 passes an endpoint whose config was not read": "in the SageMaker verdict legs",
+    "SM-43 stops counting at the page that hit the cap": "in the SageMaker verdict legs",
+    "SM-43 reports a stopped count as exact": "in the SageMaker verdict legs",
+    "SM-43 never spends the counting page budget": "in the SageMaker verdict legs",
+    "SM-38 credits a MicroVM selector narrowed by another field": "in the SageMaker verdict legs",
+    "SM-38 credits a MicroVM trail that is not logging": "in the SageMaker verdict legs",
+    "SM-38 counts a single-Region event data store homed elsewhere": "in the SageMaker verdict legs",
+    "SM-38 credits an event data store that is not ENABLED": "in the SageMaker verdict legs",
+    "SM-38 never reports a failed ListRegions": "in the SageMaker verdict legs",
+    "SM-38 credits a MicroVM flow log in any status": "in the SageMaker verdict legs",
+    "SM-38 credits a MicroVM flow log of accepted traffic only": "in the SageMaker verdict legs",
+    "SM-38 credits only a subnet-level MicroVM flow log": "in the SageMaker verdict legs",
+    "SM-38 fails the MicroVM data events on a partial read": "in the SageMaker verdict legs",
+    "SM-38 never runs the MicroVM tier": "in the SageMaker verdict legs",
+    "SM-39 drops the SageMaker workloads from its population": "in the SageMaker verdict legs",
+    "SM-39 reads only InProgress jobs": "in the SageMaker verdict legs",
+    "SM-39 takes one isolated model for the whole endpoint": "in the SageMaker verdict legs",
+    "SM-39 ignores a running job's network isolation": "in the SageMaker verdict legs",
+    "SM-39 drops an unread SageMaker job": "in the SageMaker verdict legs",
+    "SM-39 passes a notebook with direct internet access": "in the SageMaker verdict legs",
+    "SM-39 passes a Studio domain that is not VpcOnly": "in the SageMaker verdict legs",
+    "SM-39 reports no VPC workload beside an open SageMaker workload": "in the SageMaker verdict legs",
+    "SM-39 egress reads only each function's $LATEST": "in the SageMaker verdict legs",
+    "SM-39 matches a named function against the qualified $LATEST ARN": "in the SageMaker verdict legs",
+    "SM-35 reads a repeated Detective token as the last page": "in the SageMaker verdict legs",
+    "SM-38 reads a repeated store token as the last page": "in the SageMaker verdict legs",
+    "SM-11 invoke leg passes with the root user unbound": "in the SageMaker verdict legs",
+    "SM-11 invoke leg credits an SCP that misses an invoke action": "in the SageMaker verdict legs",
+    "SM-11 invoke leg fails the root user on an unread SCP": "in the SageMaker verdict legs",
+    "SM-11 invoke leg ignores an attached SCP": "in the SageMaker verdict legs",
+    "SM-37 reads only the latest AgentCore runtime version": "in the SageMaker verdict legs",
+    "SM-37 ignores an endpoint's targetVersion": "in the SageMaker verdict legs",
+    "SM-37 passes on unlisted AgentCore runtime endpoints": "in the SageMaker verdict legs",
+    "SM-37 drops a served AgentCore version it could not read": "in the SageMaker verdict legs",
+    "SM-11 lists only the $LATEST Lambda version": "in the SageMaker verdict legs",
+    "SM-11 skips every version of a named Lambda function": "in the SageMaker verdict legs",
+    "SM-02 never marks a Lambda target AI by grant": "in the SageMaker verdict legs",
+    "SM-02 reads only the $LATEST role of a Lambda target": "in the SageMaker verdict legs",
+    "SM-02 drops a Lambda target ListFunctions did not return": "in the SageMaker verdict legs",
+    "SM-02 passes on a failed Lambda listing": "in the SageMaker verdict legs",
+    "SM-02 passes without the cache on an unnamed Lambda target": "in the SageMaker verdict legs",
+    "SM-22 drops shadow variants from the deployed-model trace": "in the SageMaker verdict legs",
+    "SM-22 approver leg passes over unread versions": "in the SageMaker verdict legs",
+    "SM-22 lifecycle leg passes over unread versions": "in the SageMaker verdict legs",
+    "SM-22 leaves ListModelPackages to its UNVERSIONED default": "in the SageMaker verdict legs",
+    "SM-35 regional leg never reads Detective": "in the SageMaker verdict legs",
+    "SM-35 regional leg drops the Macie administrator it read": "in the SageMaker verdict legs",
+    "SM-35 takes any Detective membership as the organization graph": "in the SageMaker verdict legs",
+    "SM-35 credits a standalone Detective graph": "in the SageMaker verdict legs",
+    "SM-35 reads every Detective membership page as the first": "in the SageMaker verdict legs",
+    "SM-35 reads Macie's not-administrator answer as an unread": "in the SageMaker verdict legs",
+    "SM-35 reads every Macie AccessDenied as Macie being off": "in the SageMaker verdict legs",
+    "SM-35 does not fail a Region where Macie is off": "in the SageMaker verdict legs",
     "SM-09 credits a key-group Deny with a weak half": "in the SageMaker verdict legs",
     "SM-33 exempts S3 interface endpoints from private DNS": "in the SageMaker verdict legs",
     "SM-04 passes GuardDuty findings nobody reviewed": "in the SageMaker verdict legs",

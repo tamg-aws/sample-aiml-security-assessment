@@ -434,6 +434,93 @@ section.
     `DataCaptureConfig.KmsKeyId`, and an asynchronous config with no
     `AsyncInferenceConfig.OutputConfig.KmsKeyId` fail, an AWS managed key
     on any of them fails, and an unread endpoint holds back `Passed`.
+- `SM-34` and the `SM-09` notebook access row hold every SageMaker action
+  that defines a guardrail key in the sagemaker service reference (read
+  2026-10-04), not five hand-picked create actions. `SM-34` now requires the
+  KMS, VPC and isolation keys on `CreateHyperParameterTuningJob`,
+  `CreateProcessingJob`, `CreateAutoMLJob`, `CreateAutoMLJobV2`, the four
+  monitoring job definitions, `CreateMonitoringSchedule` and
+  `UpdateMonitoringSchedule`, `CreateLabelingJob`, `CreateJob`,
+  `CreateCluster` and `UpdateCluster`, and `CreateDomain` and `UpdateDomain`
+  with `sagemaker:AppNetworkAccessType`. `SM-09` adds
+  `UpdateNotebookInstance`, the two domain actions and the two user profile
+  actions. An SCP on `CreateTrainingJob` alone no longer passes, because a
+  tuning or processing job launches compute on its own keys.
+- `SM-35`'s `Security Service Regional Delegated Administrator` row reads
+  Amazon Macie and Amazon Detective beside GuardDuty, Security Hub and
+  Inspector, because both designate their administrator per Region. Macie's
+  administrator comes from `GetAdministratorAccount`, Detective's from the
+  `ORGANIZATION` membership `ListInvitations` returns. A Region where Macie is
+  not enabled, where either service has no administrator, or where the
+  management account or a second account administers it fails. A behavior
+  graph this account administers counts only when
+  `DescribeOrganizationConfiguration` answers for it, so a standalone graph is
+  not taken for the organization graph.
+- `SM-31` reads each capturing endpoint's config and passes it only when
+  `DataCaptureConfig.CaptureOptions` covers both `Input` and `Output`.
+  `DescribeEndpoint` reports `Started` for an `Input`-only capture, so an
+  endpoint that never recorded responses passed. An unread endpoint config
+  holds that endpoint out of the `Passed` count as `N/A`.
+- `SM-22` traces the model on each `ShadowProductionVariants` entry to its
+  model package, so a shadow variant serving an unapproved package fails
+  `Deployed Model Registration`. The `Model Registry Lifecycle Stage` and
+  approver attribution rows are `N/A` when `ListModelPackages` or
+  `DescribeModelPackage` failed for some versions; they passed on the
+  versions read before. `ListModelPackages` is called with
+  `ModelPackageType` `Both`, because the API documents `UNVERSIONED` as its
+  default.
+- `SM-11` lists Lambda functions with `FunctionVersion` `ALL`, so a published
+  version, which keeps the role and `VpcConfig` it was published with, is
+  judged by its own grant and subnets. It read `$LATEST` only before.
+- `SM-02` marks an API's Lambda integration target AI when a version of the
+  function runs as a role granted an AI invoke action, as `SM-11` does. Only
+  functions an agent action group or gateway target named were in scope
+  before. A target `ListFunctions` does not return, a failed listing, or a
+  missing IAM cache holds the `Passed` row.
+- `SM-37` judges every AgentCore runtime version a runtime endpoint serves as
+  `liveVersion` or `targetVersion`, read with a version-qualified
+  `GetAgentRuntime`, beside the latest version. Each version carries its own
+  `networkConfiguration`, so an older version an endpoint serves on other
+  subnets or in `PUBLIC` mode passed unseen.
+- `SM-11`'s `SageMaker Endpoint Invocation Source Network` row reads the
+  service control policies `SM-34` reads. An attached SCP Deny on
+  `InvokeEndpoint`, `InvokeEndpointAsync` and
+  `InvokeEndpointWithResponseStream` outside `aws:SourceVpce` or
+  `aws:SourceVpc` passes on its own. Without one the row fails, even when
+  every role and user is held by an identity condition, because the account
+  root user is bound by no identity policy. It passed on roles and users
+  before. An SCP the check could not read holds the row at `N/A`.
+- `SM-43` counts the objects under a prefix past its 1,000-object
+  `HeadObject` cap with further `ListObjectsV2` pages and names that count in
+  its not-read row, as a lower bound when the run's 50-page counting budget
+  ends first. The code comment records the live latency both caps were set
+  from (account 178113193057, us-east-1, 2026-10-04).
+- `SM-38` adds a `Lambda MicroVM Runtime Detection Tier` row for each Region
+  with a MicroVM that has not ended. Runtime Monitoring does not cover
+  MicroVMs, so they were outside `SM-38` before. The row fails an egress
+  connector subnet with no `ACTIVE` flow log recording `ALL` traffic on the
+  subnet or its VPC, and fails when no logging trail covering the Region and
+  no `ENABLED` CloudTrail Lake event data store (this Region's, or a
+  multi-Region store homed in any Region enabled for the account) records
+  `AWS::Lambda::MicrovmImage` data events through a selector narrowed by no
+  field but `eventCategory` and `resources.type`. A failed read holds the row
+  at `N/A`.
+- `SM-39` judges the egress of every VPC a SageMaker endpoint, an
+  `InProgress` or `Stopping` training or processing job, a notebook instance
+  or a Studio domain runs in, beside the ECS, Lambda, EKS, EC2 and MicroVM
+  workloads it judged before. It fails, on both legs, a notebook whose
+  `DirectInternetAccess` is not `Disabled`, a domain that is not `VpcOnly`,
+  and an endpoint or running job with no VPC that is not network isolated,
+  since their internet traffic leaves through SageMaker's network. A failed
+  SageMaker read is named in the incomplete row.
+- `SM-39` reads the subnets of every published Lambda version with
+  `ListFunctions` `FunctionVersion` `ALL`. A version keeps the `VpcConfig` it
+  was published with, so an alias could run a version in subnets whose egress
+  was never judged.
+- `SM-35`'s Detective membership read and `SM-38`'s event data store
+  listing stop when a `NextToken` repeats and report the read as incomplete.
+  Both looped forever on a repeated token, which hung the SageMaker
+  assessment's handler.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
@@ -1793,6 +1880,31 @@ denied action.
 service authorization reference, and all are read-only. Until the stack is
 updated, the `SM-41` audit row reads as incomplete, and so does an `SM-23`
 schedule whose latest execution is still running.
+
+**SageMaker AgentCore runtime endpoint reads.**
+`SageMakerAssessmentReadsPolicy2` gains
+`bedrock-agentcore:ListAgentRuntimeEndpoints` on `'*'` (`SM-37`), which has
+no resource type in the service authorization reference and is read-only.
+Until the stack is updated, each AgentCore runtime reads `N/A` in the `SM-37`
+row, naming its endpoints as unread.
+
+**SageMaker MicroVM data-event store reads.**
+`SageMakerAssessmentReadsPolicy2` gains `cloudtrail:ListEventDataStores` on
+`'*'`, which has no resource type in the service authorization reference,
+`cloudtrail:GetEventDataStore` on
+`arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*` and
+`account:ListRegions` on `arn:${AWS::Partition}:account::${AWS::AccountId}:account`
+(all `SM-38`, all read-only). Until the stack is updated, a Region with a
+Lambda MicroVM and no trail recording its data events reads `N/A` in the
+`SM-38` MicroVM tier row, naming the event data stores as unread.
+
+**SageMaker Macie and Detective administrator reads.**
+`SageMakerAssessmentReadsPolicy2` gains `macie2:GetAdministratorAccount`,
+`macie2:DescribeOrganizationConfiguration`, `detective:ListInvitations` and
+`detective:ListGraphs` on `'*'`, since none has a resource type, and
+`detective:DescribeOrganizationConfiguration` on this account's `graph:*`
+(`SM-35`). All are read-only. Until the stack is updated, the regional
+administrator row reads `N/A` naming Macie and Detective as unread.
 
 **SageMaker VPC and DHCP option reads.** `SageMakerAssessmentReadsPolicy`
 gains `ec2:DescribeVpcs` and `ec2:DescribeDhcpOptions` on `'*'` (`SM-37`);

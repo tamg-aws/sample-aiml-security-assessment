@@ -438,6 +438,15 @@ _EXPECTED_ACTIONS = {
         "ecs:ListTasks",
         "eks:DescribeFargateProfile",
         "securityhub:GetConfigurationPolicy",
+        "macie2:GetAdministratorAccount",
+        "macie2:DescribeOrganizationConfiguration",
+        "detective:ListInvitations",
+        "detective:ListGraphs",
+        "detective:DescribeOrganizationConfiguration",
+        "bedrock-agentcore:ListAgentRuntimeEndpoints",
+        "cloudtrail:ListEventDataStores",
+        "cloudtrail:GetEventDataStore",
+        "account:ListRegions",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -1848,6 +1857,40 @@ _SAGEMAKER_MANAGED_GRANTS_2 = [
         "Allow",
         "securityhub:GetConfigurationPolicy",
         _sagemaker_policy2_arn("securityhub:*:ACCOUNT:configuration-policy/*"),
+        None,
+    ),
+    # SM-35's Macie and Detective Regional administrator reads. The four
+    # actions on '*' have no resource type in the service authorization
+    # reference (2026-10-04); DescribeOrganizationConfiguration has Graph.
+    ("Allow", "macie2:GetAdministratorAccount", '"*"', None),
+    ("Allow", "macie2:DescribeOrganizationConfiguration", '"*"', None),
+    ("Allow", "detective:ListInvitations", '"*"', None),
+    ("Allow", "detective:ListGraphs", '"*"', None),
+    (
+        "Allow",
+        "detective:DescribeOrganizationConfiguration",
+        _sagemaker_policy2_arn("detective:*:ACCOUNT:graph:*"),
+        None,
+    ),
+    # SM-37 reads the AgentCore runtime versions each endpoint serves.
+    # ListAgentRuntimeEndpoints has no resource type in the service
+    # authorization reference (2026-10-04).
+    ("Allow", "bedrock-agentcore:ListAgentRuntimeEndpoints", '"*"', None),
+    # SM-38 reads the event data stores that may record MicroVM data events.
+    # ListEventDataStores has no resource type in the service authorization
+    # reference (2026-10-04); GetEventDataStore has eventdatastore and
+    # ListRegions has account.
+    ("Allow", "cloudtrail:ListEventDataStores", '"*"', None),
+    (
+        "Allow",
+        "cloudtrail:GetEventDataStore",
+        _sagemaker_policy2_arn("cloudtrail:*:ACCOUNT:eventdatastore/*"),
+        None,
+    ),
+    (
+        "Allow",
+        "account:ListRegions",
+        _sagemaker_policy2_arn("account::ACCOUNT:account"),
         None,
     ),
 ]
