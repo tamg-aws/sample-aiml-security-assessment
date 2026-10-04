@@ -10114,6 +10114,15 @@ def _guardrail_blocked_categories(detail: Dict[str, Any]) -> Dict[str, List[str]
     return {"input": blocked("input"), "output": blocked("output")}
 
 
+GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING = (
+    "AccessDeniedException: bedrock:ListGuardrails refused to list the versions "
+    "of a guardrail another account owns. A guardrail resource policy can allow "
+    "only bedrock:ApplyGuardrail and bedrock:GetGuardrail, so this account "
+    "cannot enumerate another account's versions, and the versions a pin with no "
+    "version lets a caller name cannot be read from here (an AWS limit)"
+)
+
+
 def _read_guardrail_directions(
     value: str, region: str, clients: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -10141,12 +10150,23 @@ def _read_guardrail_directions(
     versions = [reference["version"]] if reference["version"] else []
     try:
         if not versions:
-            summaries = _list_all_items(
-                client,
-                "list_guardrails",
-                "guardrails",
-                guardrailIdentifier=reference["identifier"],
-            )
+            try:
+                summaries = _list_all_items(
+                    client,
+                    "list_guardrails",
+                    "guardrails",
+                    guardrailIdentifier=reference["identifier"],
+                )
+            except ClientError as error:
+                if get_assessment_error_label(
+                    error
+                ) == "AccessDeniedException" and GUARDRAIL_CROSS_ACCOUNT_DENIAL in str(
+                    error.response.get("Error", {}).get("Message", "")
+                ):
+                    result["unread"] = GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING
+                    result["ceiling"] = True
+                    return result
+                raise
             versions = sorted(
                 {
                     str(summary.get("version"))
@@ -10551,11 +10571,13 @@ def check_bedrock_guardrail_iam_enforcement(
         blocked_by_value = []
         missing = []
         unread = []
+        ceilings = 0
         for value in sorted(named_values):
             reading = _read_guardrail_directions(value, region, clients)
             holders = ", ".join(sorted(named_values[value])[:3])
             if reading["unread"]:
                 unread.append(f"{value} ({reading['unread']})")
+                ceilings += bool(reading.get("ceiling"))
             elif reading["missing"]:
                 missing.append(value)
             elif reading["gaps"]:
@@ -10608,7 +10630,16 @@ def check_bedrock_guardrail_iam_enforcement(
                     finding_details=(
                         "{} guardrail(s) required on invocation could not be "
                         "read, so whether they filter input and output is not "
-                        "known: {}.".format(len(unread), "; ".join(unread[:5]))
+                        "known: {}.{}".format(
+                            len(unread),
+                            "; ".join(unread[:5]),
+                            " A pin with no version to another account's "
+                            "guardrail stays N/A at that limit; pinning the "
+                            "condition to a version lets bedrock:GetGuardrail "
+                            "read it under the owner's resource policy."
+                            if ceilings
+                            else "",
+                        )
                     ),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=GUARDRAIL_IAM_REFERENCE,

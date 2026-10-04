@@ -8042,6 +8042,51 @@ class TestBR10GuardrailBinding:
         assert GR_ARN + ":1" in findings[0]["Finding_Details"]
         assert "could not be read" in findings[0]["Finding_Details"]
 
+    def test_a_versionless_cross_account_pin_is_na_at_the_listing_ceiling(self):
+        """Two pins: the cross-account versionless one is the ceiling, the other is not."""
+        client = MagicMock()
+        client.list_guardrails.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        versionless = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+        pinned = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-two:2"
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "OrgRole": _br10_identity(_br10_bound(versionless)),
+                    "PinRole": _br10_identity(_br10_bound(pinned)),
+                }
+            ),
+            client=client,
+        )
+        assert "Passed" not in [f["Status"] for f in findings]
+        (row,) = [f for f in findings if "could not be read" in f["Finding_Details"]]
+        details = row["Finding_Details"]
+        assert row["Status"] == "N/A"
+        assert (
+            f"{versionless} ({bedrock_app.GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING})"
+            in (details)
+        )
+        assert f"{pinned} ({CROSS_ACCOUNT_GUARDRAIL_ERROR})" in details
+        assert "stays N/A at that limit" in details
+
+    def test_a_cross_account_get_denial_names_no_listing_ceiling(self):
+        client = MagicMock()
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        pinned = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-two:2"
+        findings, _ = self._run(
+            _br10_cache(roles={"PinRole": _br10_identity(_br10_bound(pinned))}),
+            client=client,
+        )
+        (row,) = [f for f in findings if "could not be read" in f["Finding_Details"]]
+        assert CROSS_ACCOUNT_GUARDRAIL_ERROR in row["Finding_Details"]
+        assert "stays N/A at that limit" not in row["Finding_Details"]
+
     def test_a_missing_guardrail_is_named_but_not_failed(self):
         client = MagicMock()
         client.get_guardrail.side_effect = ClientError(
@@ -50787,6 +50832,35 @@ class TestInvocationDeadline:
             {"us-east-1": bedrock},
         )
         assert reading["unread"] == CROSS_ACCOUNT_GUARDRAIL_ERROR
+
+    def test_br10_a_denied_cross_account_version_listing_names_list_guardrails(self):
+        """A versionless pin to another account fails at ListGuardrails, not GetGuardrail."""
+        bedrock = MagicMock()
+        bedrock.list_guardrails.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        reading = bedrock_app._read_guardrail_directions(
+            "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org",
+            "us-east-1",
+            {"us-east-1": bedrock},
+        )
+        bedrock.get_guardrail.assert_not_called()
+        assert reading["unread"] == bedrock_app.GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING
+        assert reading["ceiling"] is True
+        assert "bedrock:ListGuardrails" in reading["unread"]
+        assert "does not allow bedrock:GetGuardrail" not in reading["unread"]
+
+    def test_br10_a_same_account_list_denial_is_not_the_ceiling(self):
+        """An in-account ListGuardrails denial is a missing grant, not the AWS limit."""
+        bedrock = MagicMock()
+        bedrock.list_guardrails.side_effect = _make_client_error(
+            "AccessDeniedException", "User is not authorized"
+        )
+        reading = bedrock_app._read_guardrail_directions(
+            "gr-1", "us-east-1", {"us-east-1": bedrock}
+        )
+        assert reading["unread"] == "AccessDeniedException"
+        assert "ceiling" not in reading
 
     def test_the_redaction_source_listing_stops_at_the_deadline(self):
         s3 = MagicMock()
