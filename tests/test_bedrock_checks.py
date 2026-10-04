@@ -44325,12 +44325,14 @@ class TestInvocationLogGuardrailEvidence:
         s3_objects=None,
         s3_error=None,
         guardrails=None,
+        trail=None,
     ):
         """
         ``pages`` maps a filter pattern to a list of pages of records.
         ``s3_objects`` maps an S3 key to its body, listed two keys per page.
         ``guardrails`` maps (identifier, version) to a GetGuardrail detail or an
-        exception.
+        exception. ``trail`` maps an event name to the pages LookupEvents
+        returns for it, each one event or a list of events, or to an exception.
         """
         bedrock = MagicMock()
         self.guardrail_reads = []
@@ -44406,7 +44408,38 @@ class TestInvocationLogGuardrailEvidence:
         s3.get_object.side_effect = get_object
         sts = MagicMock()
         sts.get_caller_identity.return_value = {"Account": "111122223333"}
-        clients = {"bedrock": bedrock, "logs": logs, "s3": s3, "sts": sts}
+        cloudtrail = MagicMock()
+        self.trail_requests = []
+
+        def lookup_events(LookupAttributes, NextToken=None, **kwargs):
+            ((attribute,),) = (LookupAttributes,)
+            assert attribute["AttributeKey"] == "EventName"
+            self.trail_requests.append(
+                {"name": attribute["AttributeValue"], "NextToken": NextToken, **kwargs}
+            )
+            answer = (trail or {}).get(attribute["AttributeValue"], [])
+            if isinstance(answer, Exception):
+                raise answer
+            index = int(NextToken or 0)
+            page = answer[index] if answer else []
+            response = {
+                "Events": [
+                    {"CloudTrailEvent": json.dumps(event)}
+                    for event in (page if isinstance(page, list) else [page])
+                ]
+            }
+            if index + 1 < len(answer):
+                response["NextToken"] = str(index + 1)
+            return response
+
+        cloudtrail.lookup_events.side_effect = lookup_events
+        clients = {
+            "bedrock": bedrock,
+            "logs": logs,
+            "s3": s3,
+            "sts": sts,
+            "cloudtrail": cloudtrail,
+        }
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
@@ -45085,7 +45118,7 @@ class TestInvocationLogGuardrailEvidence:
                 "guardrail": {"outputs": [{"g1": self.GROUNDS}]}
             }
         config = {"tagSuffix": suffix} if suffix else {}
-        return self._record(
+        record = self._record(
             request_id,
             "InvokeModel",
             inp={
@@ -45094,6 +45127,21 @@ class TestInvocationLogGuardrailEvidence:
             },
             out=out,
         )
+        record["timestamp"] = self.CALL_TIME
+        return record
+
+    CALL_TIME = "2026-10-04T14:19:18Z"
+
+    @staticmethod
+    def _trail_event(request_id, guardrail="gr-g", version="1"):
+        parameters = {"modelId": "anthropic.test"}
+        if guardrail:
+            parameters.update(guardrailIdentifier=guardrail, guardrailVersion=version)
+        return {
+            "eventName": "InvokeModel",
+            "requestID": request_id,
+            "requestParameters": parameters,
+        }
 
     def test_an_invoke_call_missing_a_grounding_tag_fails(self):
         rows = self._grounding(
@@ -45135,8 +45183,9 @@ class TestInvocationLogGuardrailEvidence:
 
         assert [row["Status"] for row in rows] == ["Passed"]
         assert (
-            "every one of the 2 guarded InvokeModel call(s) wrapped both a "
-            "groundingSource and a query tag"
+            "every one of the 2 guarded InvokeModel call(s) that sent a grounding "
+            "tag or ran through a guardrail version with contextual grounding "
+            "filters wrapped both a groundingSource and a query tag"
         ) in rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
@@ -45144,8 +45193,9 @@ class TestInvocationLogGuardrailEvidence:
         [
             (
                 "bare",
-                "which sent no grounding tag and names its guardrail only in "
-                "request headers the invocation log does not record",
+                "which sent no grounding tag and has no CloudTrail event with its "
+                "requestID in cloudtrail:LookupEvents within 5 minutes of the "
+                "logged calls, so which guardrail ran is not known",
             ),
             (
                 "no-suffix",
@@ -45172,6 +45222,178 @@ class TestInvocationLogGuardrailEvidence:
             f"req-u (InvokeModel anthropic.test), {phrase}"
             in rows[0]["Finding_Details"]
         )
+
+    def test_an_untagged_invoke_call_through_a_grounding_guardrail_fails(self):
+        """The guardrail of an InvokeModel call is a request header, which the
+        invocation log omits and CloudTrail's requestParameters record."""
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.GUARDED: [
+                    [
+                        self._grounded_invoke("req-g", []),
+                        self._grounded_invoke("req-p", []),
+                    ]
+                ],
+            },
+            guardrails=self._grounding_guardrails(),
+            trail={
+                "InvokeModel": [
+                    self._trail_event("req-other"),
+                    self._trail_event("req-p", guardrail="gr-p"),
+                    self._trail_event("req-g"),
+                ]
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 1 guarded InvokeModel call(s)" in detail
+        assert (
+            "req-g (InvokeModel anthropic.test) through guardrail gr-g version 1"
+            in detail
+        )
+        assert "req-p" not in detail
+        assert sorted(set(self.guardrail_reads)) == [("gr-g", "1"), ("gr-p", "1")]
+        assert {request["name"] for request in self.trail_requests} == {"InvokeModel"}
+        assert all(
+            request["StartTime"]
+            <= _dt(2026, 10, 4, 14, 19, 18, tzinfo=_tz.utc)
+            <= request["EndTime"]
+            for request in self.trail_requests
+        )
+
+    def test_an_untagged_invoke_call_through_a_guardrail_without_grounding_is_excluded(
+        self,
+    ):
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.GUARDED: [
+                    [
+                        self._grounded_invoke("req-p", []),
+                        self._grounded_invoke("req-a", ["groundingSource", "query"]),
+                    ]
+                ],
+            },
+            guardrails=self._grounding_guardrails(),
+            trail={"InvokeModel": [self._trail_event("req-p", guardrail="gr-p")]},
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "every one of the 1 guarded InvokeModel call(s) that sent a grounding "
+            "tag or ran through a guardrail version with contextual grounding "
+            "filters wrapped both a groundingSource and a query tag"
+        ) in detail
+        assert "req-p" not in detail
+
+    def _spread_calls(self, count):
+        """``count`` untagged guarded calls, one a minute from 13:00 UTC."""
+        calls = []
+        for index in range(count):
+            call = self._grounded_invoke(f"req-{index:02d}", [])
+            call["timestamp"] = "2026-10-04T13:{:02d}:00Z".format(index)
+            calls.append(call)
+        return calls
+
+    def test_thirty_untagged_invoke_calls_over_three_pages_all_resolve(self):
+        """One LookupEvents stream covers every call; there is no per-call cap."""
+        calls = self._spread_calls(30)
+        events = [self._trail_event(call["requestId"]) for call in calls]
+        rows = self._grounding(
+            {self.GROUNDING: [[self._scored("req-s", 0.4)]], self.GUARDED: [calls]},
+            guardrails=self._grounding_guardrails(),
+            trail={"InvokeModel": [events[0:10], events[10:20], events[20:30]]},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "30 of the 30 guarded InvokeModel call(s)" in detail
+        assert "Not read" not in detail
+        assert [request.get("NextToken") for request in self.trail_requests] == [
+            None,
+            "1",
+            "2",
+        ]
+        (window,) = {
+            (request["StartTime"], request["EndTime"])
+            for request in self.trail_requests
+        }
+        assert window == (
+            _dt(2026, 10, 4, 12, 55, tzinfo=_tz.utc),
+            _dt(2026, 10, 4, 13, 34, tzinfo=_tz.utc),
+        )
+
+    def test_a_join_page_cap_leaves_the_rest_na_with_a_count(self):
+        calls = self._spread_calls(30)
+        events = [self._trail_event(call["requestId"]) for call in calls]
+        with patch.object(bedrock_app, "GROUNDING_JOIN_MAX_PAGES", 2):
+            rows = self._grounding(
+                {
+                    self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                    self.GUARDED: [calls],
+                },
+                guardrails=self._grounding_guardrails(),
+                trail={"InvokeModel": [events[0:10], events[10:20], events[20:30]]},
+            )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "20 of the 20 guarded InvokeModel call(s)" in detail
+        assert (
+            "10 untagged guarded InvokeModel call(s) were not matched to CloudTrail "
+            "within the first 2 LookupEvents pages of their window, so their "
+            "guardrail is not known: req-20 (InvokeModel anthropic.test)"
+        ) in detail
+        assert len(self.trail_requests) == 2
+
+    @pytest.mark.parametrize(
+        "trail, guardrails, phrase",
+        [
+            (
+                {"InvokeModel": _make_client_error("AccessDeniedException")},
+                None,
+                "whose CloudTrail event was not read (cloudtrail:LookupEvents, "
+                "AccessDeniedException)",
+            ),
+            (
+                {"InvokeModel": [{"requestID": "req-u", "requestParameters": {}}]},
+                None,
+                "whose CloudTrail event names no guardrailIdentifier",
+            ),
+            (
+                {
+                    "InvokeModel": [
+                        {
+                            "requestID": "req-u",
+                            "requestParameters": {
+                                "guardrailIdentifier": "gr-g",
+                                "guardrailVersion": "1",
+                            },
+                        }
+                    ]
+                },
+                {("gr-g", "1"): _make_client_error("AccessDeniedException")},
+                "guardrail gr-g version 1 was not read with bedrock:GetGuardrail",
+            ),
+        ],
+    )
+    def test_an_unresolved_invoke_guardrail_withholds_the_pass(
+        self, trail, guardrails, phrase
+    ):
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.GUARDED: [[self._grounded_invoke("req-u", [])]],
+            },
+            guardrails=guardrails,
+            trail=trail,
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
 
     def test_s3_only_grounding_with_no_score_is_na(self):
         rows = self._grounding(
