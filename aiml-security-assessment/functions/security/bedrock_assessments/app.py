@@ -20593,85 +20593,109 @@ def _invoke_grounding_tags(body: Any) -> Optional[Set[str]]:
 
 
 # An InvokeModel call names its guardrail in request headers, which the
-# invocation log omits and CloudTrail's requestParameters record, so an
-# untagged call is joined to its event by requestID within this window of its
-# log record, at most this many pages per call and this many calls per run.
+# invocation log omits and CloudTrail's requestParameters record, so untagged
+# calls are joined to their events by requestID: one LookupEvents stream per
+# operation name, over the span of the calls widened by this window.
 GROUNDING_JOIN_WINDOW = timedelta(minutes=5)
 
-GROUNDING_JOIN_MAX_PAGES = 5
+# A live LookupEvents page of 50 events took 0.30 s to 0.60 s warm and 1.06 s
+# cold (us-east-1, 2026-10-04, nine pages), and LookupEvents allows 2 TPS, so
+# a page costs at most about 1.06 s. 50 pages per operation, 100 for both, stay
+# under 106 s, a fifth of the function's 600 s timeout, and cover 2,500 events
+# per operation.
+GROUNDING_JOIN_MAX_PAGES = 50
 
-GROUNDING_JOIN_MAX_CALLS = 10
 
-
-def _invoke_call_guardrail(region: str, call: Dict[str, Any]) -> Dict[str, Any]:
+def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Find the CloudTrail event whose requestID is ``call["request_id"]`` among
-    the ``call["operation"]`` events LookupEvents returns within
-    GROUNDING_JOIN_WINDOW of ``call["time"]``. Returns {"guardrail",
-    "version"} from its requestParameters, or {"reason"} when no event names
-    one.
+    Join each call {"label", "request_id", "operation", "time"} to the
+    CloudTrail event with its requestID. Each operation is one LookupEvents
+    stream by EventName, from GROUNDING_JOIN_WINDOW before its earliest call to
+    GROUNDING_JOIN_WINDOW after its latest, paged until every call is matched,
+    the stream ends or GROUNDING_JOIN_MAX_PAGES pages are read. Returns
+    {"resolved": {request_id: {"guardrail", "version"} or {"reason"}},
+    "capped": [labels unmatched when the page cap stopped the stream]}.
     """
-    try:
-        when = datetime.strptime(call["time"], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-    except (TypeError, ValueError):
-        return {"reason": "which logs no timestamp to find its CloudTrail event by"}
-    client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
-    request = {
-        "LookupAttributes": [
-            {"AttributeKey": "EventName", "AttributeValue": call["operation"]}
-        ],
-        "StartTime": when - GROUNDING_JOIN_WINDOW,
-        "EndTime": when + GROUNDING_JOIN_WINDOW,
-        "MaxResults": 50,
-    }
-    try:
-        for _ in range(GROUNDING_JOIN_MAX_PAGES):
-            response = client.lookup_events(**request)
-            if not isinstance(response, dict):
-                raise TypeError("LookupEvents returned no response object")
-            for event in response.get("Events") or []:
-                try:
-                    detail = json.loads(event.get("CloudTrailEvent") or "")
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(detail, dict):
-                    continue
-                if detail.get("requestID") != call["request_id"]:
-                    continue
-                parameters = detail.get("requestParameters") or {}
-                guardrail = parameters.get("guardrailIdentifier")
-                if not guardrail:
-                    return {
-                        "reason": "whose CloudTrail event names no guardrailIdentifier"
-                    }
-                return {
-                    "guardrail": str(guardrail),
-                    "version": str(
-                        parameters.get("guardrailVersion") or GUARDRAIL_DRAFT_VERSION
-                    ),
-                }
-            next_token = response.get("NextToken")
-            if not isinstance(next_token, str) or not next_token:
-                break
-            request["NextToken"] = next_token
-        else:
-            return {
-                "reason": "whose CloudTrail event was not found in the first "
-                f"{GROUNDING_JOIN_MAX_PAGES} LookupEvents pages of its window"
+    resolved: Dict[str, Dict[str, str]] = {}
+    capped = []
+    by_operation: Dict[str, List[tuple]] = {}
+    for call in calls:
+        try:
+            when = datetime.strptime(call["time"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except (TypeError, ValueError):
+            resolved[call["request_id"]] = {
+                "reason": "which logs no timestamp to find its CloudTrail event by"
             }
-    except (ClientError, BotoCoreError, TypeError) as error:
-        return {
-            "reason": "whose CloudTrail event was not read (cloudtrail:LookupEvents, "
-            f"{get_assessment_error_label(error)})"
+            continue
+        by_operation.setdefault(call["operation"], []).append((when, call))
+    client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
+    for operation, timed in by_operation.items():
+        pending = {call["request_id"] for _, call in timed}
+        request = {
+            "LookupAttributes": [
+                {"AttributeKey": "EventName", "AttributeValue": operation}
+            ],
+            "StartTime": min(when for when, _ in timed) - GROUNDING_JOIN_WINDOW,
+            "EndTime": max(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,
+            "MaxResults": 50,
         }
-    return {
-        "reason": "which sent no grounding tag and has no CloudTrail event with its "
-        "requestID in cloudtrail:LookupEvents within "
-        f"{int(GROUNDING_JOIN_WINDOW.total_seconds() // 60)} minutes of its log "
-        "record, so which guardrail ran is not known"
-    }
+        unmatched = (
+            "which sent no grounding tag and has no CloudTrail event with its "
+            "requestID in cloudtrail:LookupEvents within "
+            f"{int(GROUNDING_JOIN_WINDOW.total_seconds() // 60)} minutes of the "
+            "logged calls, so which guardrail ran is not known"
+        )
+        try:
+            for _ in range(GROUNDING_JOIN_MAX_PAGES):
+                response = client.lookup_events(**request)
+                if not isinstance(response, dict):
+                    raise TypeError("LookupEvents returned no response object")
+                for event in response.get("Events") or []:
+                    try:
+                        detail = json.loads(event.get("CloudTrailEvent") or "")
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(detail, dict):
+                        continue
+                    request_id = detail.get("requestID")
+                    if request_id not in pending:
+                        continue
+                    pending.discard(request_id)
+                    parameters = detail.get("requestParameters") or {}
+                    guardrail = parameters.get("guardrailIdentifier")
+                    resolved[request_id] = (
+                        {
+                            "guardrail": str(guardrail),
+                            "version": str(
+                                parameters.get("guardrailVersion")
+                                or GUARDRAIL_DRAFT_VERSION
+                            ),
+                        }
+                        if guardrail
+                        else {
+                            "reason": "whose CloudTrail event names no "
+                            "guardrailIdentifier"
+                        }
+                    )
+                next_token = response.get("NextToken")
+                if not pending or not isinstance(next_token, str) or not next_token:
+                    break
+                request["NextToken"] = next_token
+            else:
+                capped.extend(
+                    call["label"] for _, call in timed if call["request_id"] in pending
+                )
+                pending = set()
+        except (ClientError, BotoCoreError, TypeError) as error:
+            unmatched = (
+                "whose CloudTrail event was not read (cloudtrail:LookupEvents, "
+                f"{get_assessment_error_label(error)})"
+            )
+        for request_id in pending:
+            resolved[request_id] = {"reason": unmatched}
+    return {"resolved": resolved, "capped": capped}
 
 
 def _converse_guarded(body: Any, output: Any) -> bool:
@@ -21562,20 +21586,22 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 f"first {invoke_scan['read']} "
                 f"({'page cap' if source['log_group'] else 'object cap'})"
             )
-        if len(invoke_untagged) > GROUNDING_JOIN_MAX_CALLS:
-            unjudged.append(
-                "{} untagged guarded InvokeModel call(s) past the first {}, which "
-                "were not joined to CloudTrail to name their guardrail".format(
-                    len(invoke_untagged) - GROUNDING_JOIN_MAX_CALLS,
-                    GROUNDING_JOIN_MAX_CALLS,
+        joins = (
+            _invoke_call_guardrails(
+                region, [call for call in invoke_untagged if call["request_id"]]
+            )
+            if invoke_untagged
+            else {"resolved": {}, "capped": []}
+        )
+        for call in invoke_untagged:
+            if not call["request_id"]:
+                unjudged.append(
+                    f"{call['label']}, which logs no request ID to join to CloudTrail"
                 )
-            )
-        for call in invoke_untagged[:GROUNDING_JOIN_MAX_CALLS]:
-            joined = (
-                _invoke_call_guardrail(region, call)
-                if call["request_id"]
-                else {"reason": "which logs no request ID to join to CloudTrail"}
-            )
+                continue
+            joined = joins["resolved"].get(call["request_id"])
+            if joined is None:
+                continue
             if "reason" in joined:
                 unjudged.append(f"{call['label']}, {joined['reason']}")
                 continue
@@ -21586,6 +21612,17 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 "{} through guardrail {} version {}".format(
                     call["label"], joined["guardrail"], joined["version"]
                 )
+            )
+        if joins["capped"]:
+            unjudged.insert(
+                0,
+                "{} untagged guarded InvokeModel call(s) were not matched to "
+                "CloudTrail within the first {} LookupEvents pages of their "
+                "window, so their guardrail is not known: {}".format(
+                    len(joins["capped"]),
+                    GROUNDING_JOIN_MAX_PAGES,
+                    ", ".join(joins["capped"][:5]),
+                ),
             )
         if unqualified or invoke_unqualified:
             findings["status"] = "FAIL"

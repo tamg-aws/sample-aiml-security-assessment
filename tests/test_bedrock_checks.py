@@ -44331,8 +44331,8 @@ class TestInvocationLogGuardrailEvidence:
         ``pages`` maps a filter pattern to a list of pages of records.
         ``s3_objects`` maps an S3 key to its body, listed two keys per page.
         ``guardrails`` maps (identifier, version) to a GetGuardrail detail or an
-        exception. ``trail`` maps an event name to the CloudTrail events
-        LookupEvents returns for it, one per page, or to an exception.
+        exception. ``trail`` maps an event name to the pages LookupEvents
+        returns for it, each one event or a list of events, or to an exception.
         """
         bedrock = MagicMock()
         self.guardrail_reads = []
@@ -44414,15 +44414,19 @@ class TestInvocationLogGuardrailEvidence:
         def lookup_events(LookupAttributes, NextToken=None, **kwargs):
             ((attribute,),) = (LookupAttributes,)
             assert attribute["AttributeKey"] == "EventName"
-            self.trail_requests.append({"name": attribute["AttributeValue"], **kwargs})
+            self.trail_requests.append(
+                {"name": attribute["AttributeValue"], "NextToken": NextToken, **kwargs}
+            )
             answer = (trail or {}).get(attribute["AttributeValue"], [])
             if isinstance(answer, Exception):
                 raise answer
             index = int(NextToken or 0)
+            page = answer[index] if answer else []
             response = {
-                "Events": [{"CloudTrailEvent": json.dumps(answer[index])}]
-                if answer
-                else []
+                "Events": [
+                    {"CloudTrailEvent": json.dumps(event)}
+                    for event in (page if isinstance(page, list) else [page])
+                ]
             }
             if index + 1 < len(answer):
                 response["NextToken"] = str(index + 1)
@@ -45190,8 +45194,8 @@ class TestInvocationLogGuardrailEvidence:
             (
                 "bare",
                 "which sent no grounding tag and has no CloudTrail event with its "
-                "requestID in cloudtrail:LookupEvents within 5 minutes of its log "
-                "record, so which guardrail ran is not known",
+                "requestID in cloudtrail:LookupEvents within 5 minutes of the "
+                "logged calls, so which guardrail ran is not known",
             ),
             (
                 "no-suffix",
@@ -45284,6 +45288,66 @@ class TestInvocationLogGuardrailEvidence:
             "filters wrapped both a groundingSource and a query tag"
         ) in detail
         assert "req-p" not in detail
+
+    def _spread_calls(self, count):
+        """``count`` untagged guarded calls, one a minute from 13:00 UTC."""
+        calls = []
+        for index in range(count):
+            call = self._grounded_invoke(f"req-{index:02d}", [])
+            call["timestamp"] = "2026-10-04T13:{:02d}:00Z".format(index)
+            calls.append(call)
+        return calls
+
+    def test_thirty_untagged_invoke_calls_over_three_pages_all_resolve(self):
+        """One LookupEvents stream covers every call; there is no per-call cap."""
+        calls = self._spread_calls(30)
+        events = [self._trail_event(call["requestId"]) for call in calls]
+        rows = self._grounding(
+            {self.GROUNDING: [[self._scored("req-s", 0.4)]], self.GUARDED: [calls]},
+            guardrails=self._grounding_guardrails(),
+            trail={"InvokeModel": [events[0:10], events[10:20], events[20:30]]},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "30 of the 30 guarded InvokeModel call(s)" in detail
+        assert "Not read" not in detail
+        assert [request.get("NextToken") for request in self.trail_requests] == [
+            None,
+            "1",
+            "2",
+        ]
+        (window,) = {
+            (request["StartTime"], request["EndTime"])
+            for request in self.trail_requests
+        }
+        assert window == (
+            _dt(2026, 10, 4, 12, 55, tzinfo=_tz.utc),
+            _dt(2026, 10, 4, 13, 34, tzinfo=_tz.utc),
+        )
+
+    def test_a_join_page_cap_leaves_the_rest_na_with_a_count(self):
+        calls = self._spread_calls(30)
+        events = [self._trail_event(call["requestId"]) for call in calls]
+        with patch.object(bedrock_app, "GROUNDING_JOIN_MAX_PAGES", 2):
+            rows = self._grounding(
+                {
+                    self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                    self.GUARDED: [calls],
+                },
+                guardrails=self._grounding_guardrails(),
+                trail={"InvokeModel": [events[0:10], events[10:20], events[20:30]]},
+            )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "20 of the 20 guarded InvokeModel call(s)" in detail
+        assert (
+            "10 untagged guarded InvokeModel call(s) were not matched to CloudTrail "
+            "within the first 2 LookupEvents pages of their window, so their "
+            "guardrail is not known: req-20 (InvokeModel anthropic.test)"
+        ) in detail
+        assert len(self.trail_requests) == 2
 
     @pytest.mark.parametrize(
         "trail, guardrails, phrase",

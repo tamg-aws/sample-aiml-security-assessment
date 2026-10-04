@@ -1864,22 +1864,32 @@ MUTATIONS = [
         "replace": "                pass\n",
     },
     {
-        "name": "BR-27 InvokeModel: any CloudTrail event in the window is the call's",
+        "name": "BR-27 InvokeModel: a matched call stays pending",
         "file": BEDROCK,
-        "defect": "an untagged InvokeModel call took the guardrail of another call's event",
-        "find": '                if detail.get("requestID") != call["request_id"]:\n',
-        "replace": "                if False:\n",
+        "defect": "an untagged InvokeModel call matched to its CloudTrail event was still reported unmatched",
+        "find": "                    pending.discard(request_id)\n",
+        "replace": "                    pass\n",
     },
     {
         "name": "BR-27 InvokeModel: the CloudTrail join reads one page",
         "file": BEDROCK,
         "defect": "an untagged InvokeModel call whose event is on a later LookupEvents page went unjudged",
-        "find": "            if not isinstance(next_token, str) or not next_token:\n"
-        "                break\n"
-        '            request["NextToken"] = next_token\n',
-        "replace": "            if not isinstance(next_token, str) or not next_token:\n"
-        "                break\n"
-        "            break\n",
+        "find": '                request["NextToken"] = next_token\n            else:\n',
+        "replace": "                break\n            else:\n",
+    },
+    {
+        "name": "BR-27 InvokeModel: the windowed query stops at the first page",
+        "file": BEDROCK,
+        "defect": "the LookupEvents stream ended after one page with calls still unmatched",
+        "find": "                if not pending or not isinstance(next_token, str) or not next_token:\n",
+        "replace": "                if True:\n",
+    },
+    {
+        "name": "BR-27 InvokeModel: the window ends at the earliest call",
+        "file": BEDROCK,
+        "defect": "the LookupEvents window missed the events of every call after the first",
+        "find": '            "EndTime": max(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,\n',
+        "replace": '            "EndTime": min(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,\n',
     },
     # ------------------------------------------- SageMaker round-6 check logic
     # SM-39's egress legs for ECS and Lambda VPCs (AIR-SLF-RT-02) and SM-43's
@@ -4077,10 +4087,16 @@ GROUPS: dict[str, str] = {
     "BR-27 InvokeModel: an unjoined call is dropped": (
         "in the Bedrock invocation log guardrail evidence"
     ),
-    "BR-27 InvokeModel: any CloudTrail event in the window is the call's": (
+    "BR-27 InvokeModel: a matched call stays pending": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     "BR-27 InvokeModel: the CloudTrail join reads one page": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: the windowed query stops at the first page": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: the window ends at the earliest call": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     DERIVED_PARTIAL_QUALIFIER_NAME: "in the tag column",
