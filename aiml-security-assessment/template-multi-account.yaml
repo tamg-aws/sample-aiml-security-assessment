@@ -2051,6 +2051,23 @@ Resources:
             Action:
               - apigateway:GET # AC-35
             Resource: !Sub 'arn:${AWS::Partition}:apigateway:*::/restapis/*/stages/*/exports/*'
+          - Sid: BuiltInToolRead
+            # The checks read this account's custom Code Interpreters and
+            # browsers, and AC-01 and AC-06 also read the AWS managed ones,
+            # whose ARNs name account aws in the code-interpreter and browser
+            # types. The service authorization reference lists only the custom
+            # types for these two actions; a read it does not authorize
+            # returns an error the checks report as Not Applicable, never
+            # Passed.
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:GetCodeInterpreter # AC-01, AC-15, AC-45, AC-48, AC-49
+              - bedrock-agentcore:GetBrowser # AC-01, AC-06, AC-16, AC-45, AC-48, AC-49
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:code-interpreter-custom/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:aws:code-interpreter/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:aws:browser/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
@@ -2197,8 +2214,6 @@ Resources:
                 - bedrock-agentcore:GetGateway
                 - bedrock-agentcore:GetPolicyEngine
                 - bedrock-agentcore:GetResourcePolicy
-                - bedrock-agentcore:GetCodeInterpreter
-                - bedrock-agentcore:GetBrowser
                 - bedrock-agentcore:GetOnlineEvaluationConfig
                 - bedrock-agentcore:ListPolicies
                 # AC-24 and AC-25 read a gateway's rate limits and targets. The

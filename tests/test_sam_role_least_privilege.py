@@ -385,6 +385,8 @@ _EXPECTED_ACTIONS = {
         "apigateway:GET",
         "network-firewall:ListRuleGroups",
         "logs:DescribeLogStreams",
+        "bedrock-agentcore:GetBrowser",
+        "bedrock-agentcore:GetCodeInterpreter",
     },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
@@ -576,9 +578,7 @@ _EXPECTED_ACTIONS = {
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
-        "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:GetCapacityProvider",
-        "bedrock-agentcore:GetCodeInterpreter",
         "bedrock-agentcore:GetConsentPortal",
         "bedrock-agentcore:GetGateway",
         "bedrock-agentcore:GetGatewayTarget",
@@ -2270,6 +2270,30 @@ _AGENTCORE_MANAGED_GRANTS = [
         "Allow",
         "s3:GetObject",
         json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*/*"}),
+    ),
+    # Moved from the inline policy with its custom-tool ARNs, plus the AWS
+    # managed browser and Code Interpreter AC-01 and AC-06 read (RT-08, RT-09).
+    *(
+        (
+            "Allow",
+            action,
+            json.dumps(
+                [
+                    {"Fn::Sub": f"arn:${{AWS::Partition}}:bedrock-agentcore:*:{arn}"}
+                    for arn in (
+                        "${AWS::AccountId}:code-interpreter-custom/*",
+                        "${AWS::AccountId}:browser-custom/*",
+                        "aws:code-interpreter/*",
+                        "aws:browser/*",
+                    )
+                ],
+                sort_keys=True,
+            ),
+        )
+        for action in (
+            "bedrock-agentcore:GetCodeInterpreter",
+            "bedrock-agentcore:GetBrowser",
+        )
     ),
 ]
 

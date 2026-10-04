@@ -646,8 +646,12 @@ AI_SUBJECT_ROWS = [
         "returns no live-view member in the pinned botocore, and the liveViewStream "
         "GetBrowserSession returns carries only a streamEndpoint, so no setting "
         "records whether anyone watches a session. "
-        "The AWS managed browser has no recording configuration and is "
-        "outside the population",
+        "The AWS managed browser aws.browser.v1, listed with ListBrowsers type SYSTEM "
+        "and read with GetBrowser, returns no recording, so its row fails naming each "
+        "cached role and user whose Allow reaches StartBrowserSession on its ARN, a "
+        "pattern in any segment included, with no unconditioned Deny or boundary "
+        "removing it; it passes when none can, and is N/A when the cache or a "
+        "principal in it was not read",
         [],
         4,
     ),
@@ -771,8 +775,10 @@ AI_SUBJECT_ROWS = [
         "no principal starts its sessions or a policy cannot be parsed. A grant "
         "survives only when no unconditioned Deny in the principal's policies or "
         "boundary reaches any action and resource of it and a boundary, if set, has an "
-        "unconditioned Allow covering it; a conditioned Deny is not subtracted and the "
-        "row names its policy. Session policies and SCPs are not read",
+        "unconditioned Allow covering it. A conditioned Deny reaching a compared grant "
+        "is not subtracted; it holds the row at Not Applicable naming its policy and "
+        "condition keys, since equal-or-fewer privileges is not established, and is "
+        "still named when the row fails. Session policies and SCPs are not read",
         [],
         4,
     ),
@@ -1142,7 +1148,12 @@ AI_SUBJECT_ROWS = [
         "interpreter it walks the Route 53 Resolver DNS Firewall rules in "
         "evaluation order and passes only when the first rule over * is a BLOCK "
         "that names no query type and the firewall config has FirewallFailOpen "
-        "DISABLED",
+        "DISABLED. AC-01 also lists the AWS managed browser and Code Interpreter "
+        "(type SYSTEM) and reads each with its get call: absent or PUBLIC network "
+        "mode fails at High and SANDBOX at Medium, naming each cached role and user "
+        "whose Allow reaches StartBrowserSession or StartCodeInterpreterSession on "
+        "the tool's ARN with no unconditioned Deny or boundary removing it; a tool "
+        "none can start passes, and an unread cache or principal is N/A",
         [],
         4,
     ),
