@@ -403,6 +403,16 @@ _EXPECTED_ACTIONS = {
         "lambda:GetFunctionConfiguration",
         "apigateway:GET",
     },
+    "SageMakerAssessmentReadsPolicy2": {
+        "lambda:ListMicrovms",
+        "ec2:DescribeNetworkInterfaces",
+        "lambda:GetMicrovm",
+        "lambda:GetNetworkConnector",
+        "ecs:DescribeTasks",
+        "ecs:ListTasks",
+        "eks:DescribeFargateProfile",
+        "securityhub:GetConfigurationPolicy",
+    },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
         "config:DescribeComplianceByConfigRule",
@@ -1225,6 +1235,7 @@ def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(templat
         "AgentCoreAssessmentReadsPolicy",
         "BedrockAssessmentReadsPolicy",
         "SageMakerAssessmentReadsPolicy",
+        "SageMakerAssessmentReadsPolicy2",
     }
     properties = data["Resources"]["BedrockAssessmentReadsPolicy"]["Properties"]
     assert not {"Roles", "Users", "Groups"} & set(properties)
@@ -1591,6 +1602,154 @@ def test_sagemaker_managed_policy_is_attached_only_to_the_sagemaker_function(tem
     ]
     assert references == [{"Fn::Ref": "SageMakerAssessmentReadsPolicy"}]
     assert not _references(data.get("Outputs", {}), "SageMakerAssessmentReadsPolicy")
+
+
+def _sagemaker_policy2_arn(suffix):
+    return json.dumps(
+        {
+            "Fn::Sub": "arn:${AWS::Partition}:"
+            + suffix.replace("ACCOUNT", "${AWS::AccountId}")
+        }
+    )
+
+
+_SAGEMAKER_MANAGED_GRANTS_2 = [
+    ("Allow", "lambda:ListMicrovms", '"*"', None),
+    ("Allow", "ec2:DescribeNetworkInterfaces", '"*"', None),
+    (
+        "Allow",
+        "lambda:GetMicrovm",
+        _sagemaker_policy2_arn("lambda:*:ACCOUNT:microvm-image:*"),
+        None,
+    ),
+    (
+        "Allow",
+        "lambda:GetNetworkConnector",
+        _sagemaker_policy2_arn("lambda:*:ACCOUNT:network-connector:*"),
+        None,
+    ),
+    (
+        "Allow",
+        "ecs:DescribeTasks",
+        _sagemaker_policy2_arn("ecs:*:ACCOUNT:task/*"),
+        None,
+    ),
+    (
+        "Allow",
+        "ecs:ListTasks",
+        '"*"',
+        json.dumps(
+            {
+                "ArnLike": {
+                    "ecs:cluster": {
+                        "Fn::Sub": "arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:"
+                        "cluster/*"
+                    }
+                }
+            },
+            sort_keys=True,
+        ),
+    ),
+    (
+        "Allow",
+        "eks:DescribeFargateProfile",
+        _sagemaker_policy2_arn("eks:*:ACCOUNT:fargateprofile/*/*/*"),
+        None,
+    ),
+    (
+        "Allow",
+        "securityhub:GetConfigurationPolicy",
+        _sagemaker_policy2_arn("securityhub:*:ACCOUNT:configuration-policy/*"),
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+@pytest.mark.parametrize("partition", ["aws", "aws-us-gov"])
+def test_sagemaker_managed_policy_2_renders_within_its_budget(template, partition):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    document = data["Resources"]["SageMakerAssessmentReadsPolicy2"]["Properties"][
+        "PolicyDocument"
+    ]
+    rendered = json.dumps(
+        _render_policy_intrinsics(document, partition), separators=(",", ":")
+    )
+    assert partition + ":" in rendered
+    assert len(rendered) <= _MANAGED_POLICY_BUDGET, (
+        f"{os.path.basename(template)} SageMakerAssessmentReadsPolicy2 renders to "
+        f"{len(rendered):,} characters in {partition}; keep it below the "
+        f"{_MANAGED_POLICY_BUDGET:,}-character project budget and never exceed "
+        f"IAM's {_MANAGED_POLICY_LIMIT:,}-character managed policy limit."
+    )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_sagemaker_managed_policy_2_holds_exactly_the_approved_grants(template):
+    """Only ecs:ListTasks takes a Condition: '*' bounded by ecs:cluster."""
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    resource = data["Resources"]["SageMakerAssessmentReadsPolicy2"]
+    assert resource["Type"] == "AWS::IAM::ManagedPolicy"
+    assert "ManagedPolicyName" not in resource["Properties"]
+    document = resource["Properties"]["PolicyDocument"]
+    assert all(
+        set(s) <= {"Sid", "Effect", "Action", "Resource", "Condition"}
+        for s in document["Statement"]
+    )
+    grants = sorted(
+        (
+            statement["Effect"],
+            action,
+            json.dumps(statement["Resource"], sort_keys=True),
+            json.dumps(statement["Condition"], sort_keys=True)
+            if "Condition" in statement
+            else None,
+        )
+        for statement in document["Statement"]
+        for action in statement["Action"]
+    )
+    assert grants == sorted(_SAGEMAKER_MANAGED_GRANTS_2)
+    actions = {action for _, action, _, _ in grants}
+    assert not actions & _actions(template, "SagemakerSecurityAssessmentFunction")
+    assert not actions & _actions(template, "SageMakerAssessmentReadsPolicy")
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_sagemaker_managed_policy_2_is_attached_only_to_the_sagemaker_function(
+    template,
+):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    properties = data["Resources"]["SageMakerAssessmentReadsPolicy2"]["Properties"]
+    assert not {"Roles", "Users", "Groups"} & set(properties)
+    referencing = {
+        logical_id
+        for logical_id, resource in data["Resources"].items()
+        if logical_id != "SageMakerAssessmentReadsPolicy2"
+        and _references(resource, "SageMakerAssessmentReadsPolicy2")
+    }
+    assert referencing == {"SagemakerSecurityAssessmentFunction"}
+    policies = data["Resources"]["SagemakerSecurityAssessmentFunction"]["Properties"][
+        "Policies"
+    ]
+    references = [
+        p for p in policies if _references(p, "SageMakerAssessmentReadsPolicy2")
+    ]
+    assert references == [{"Fn::Ref": "SageMakerAssessmentReadsPolicy2"}]
+    assert not _references(data.get("Outputs", {}), "SageMakerAssessmentReadsPolicy2")
+
+
+def test_sagemaker_managed_policy_2_is_identical_in_both_templates():
+    blocks = [
+        _resource_block(path, "SageMakerAssessmentReadsPolicy2")
+        for path in _SAM_TEMPLATES
+    ]
+    assert blocks[0] == blocks[1]
 
 
 _AGENTCORE_MANAGED_GRANTS = [

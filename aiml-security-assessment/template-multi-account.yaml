@@ -1267,6 +1267,69 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
               - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+  SageMakerAssessmentReadsPolicy2:
+    # Reads that do not fit SageMakerAssessmentReadsPolicy's 5,500-character
+    # budget. Attached only to SagemakerSecurityAssessmentFunction through its
+    # Policies list.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Further read-only grants for the SageMaker security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: WorkloadReadsOnWildcard
+            # Neither action has a resource type in the service authorization
+            # reference.
+            Effect: Allow
+            Action:
+              - lambda:ListMicrovms # SM-39
+              - ec2:DescribeNetworkInterfaces # SM-39
+            Resource: '*'
+          - Sid: MicrovmRead
+            # SM-39 reads each MicroVM's network connectors. GetMicrovm has the
+            # microvmImage resource type.
+            Effect: Allow
+            Action:
+              - lambda:GetMicrovm # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
+          - Sid: MicrovmNetworkConnectorRead
+            # SM-39 reads the subnets and security groups of each MicroVM
+            # egress connector.
+            Effect: Allow
+            Action:
+              - lambda:GetNetworkConnector # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:network-connector:*'
+          - Sid: ECSStandaloneTaskRead
+            # SM-11, SM-39 and SM-40 read each ECS task started outside a
+            # service. DescribeTasks has the task resource type.
+            Effect: Allow
+            Action:
+              - ecs:DescribeTasks # SM-11, SM-39, SM-40
+            Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/*'
+          - Sid: ECSStandaloneTaskList
+            # ListTasks has the container-instance resource type, which a
+            # listing by cluster does not name, so the grant takes '*' scoped
+            # by the ecs:cluster key, as the Bedrock role's ECSTaskList does.
+            Effect: Allow
+            Action:
+              - ecs:ListTasks # SM-11, SM-39, SM-40
+            Resource: '*'
+            Condition:
+              ArnLike:
+                ecs:cluster: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/*'
+          - Sid: EKSFargateProfileRead
+            # SM-39 reads the subnets of each Fargate profile.
+            Effect: Allow
+            Action:
+              - eks:DescribeFargateProfile # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:fargateprofile/*/*/*'
+          - Sid: SecurityHubConfigurationPolicyRead
+            # SM-36 reads the central configuration policy associated with
+            # this account. Only the delegated administrator can call it.
+            Effect: Allow
+            Action:
+              - securityhub:GetConfigurationPolicy # SM-36
+            Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:configuration-policy/*'
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1632,6 +1695,7 @@ Resources:
                 - s3:GetObject # SM-43
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
         - !Ref SageMakerAssessmentReadsPolicy
+        - !Ref SageMakerAssessmentReadsPolicy2
 
   AgentCoreAssessmentReadsPolicy:
     # Reads that do not fit the AgentCore function's 9000-byte inline policy

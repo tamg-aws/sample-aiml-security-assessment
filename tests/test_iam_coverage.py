@@ -1284,6 +1284,17 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "lambda:SecurityGroupIds",
 }
 
+# Verified on 2026-10-04 for SM-39's Lambda network connector guardrail with one
+# SERVICE_CONTROL_POLICY ValidatePolicy run. It reported INVALID_ACTION for the
+# negative control lambda:CreateNetworkConnectorz at Action index 2 and nothing
+# at indexes 0 and 1. The lambda service-reference JSON lists both actions, and
+# lambda:SubnetIds and lambda:SecurityGroupIds as ActionConditionKeys of
+# CreateNetworkConnector only.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "lambda:CreateNetworkConnector",
+    "lambda:UpdateNetworkConnector",
+}
+
 # AC-18 reads CloudTrail Lake event data stores. validate-policy on 2026-10-03
 # reported the negative control cloudtrail:GetEventDataStorez as INVALID_ACTION
 # at Action index 2 and nothing at indexes 0 and 1. Both names are also in the

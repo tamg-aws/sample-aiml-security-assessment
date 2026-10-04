@@ -1699,11 +1699,15 @@ AI_SUBJECT_ROWS = [
         "inference job whose vpcConfig is absent or names a subnet routed to an igw- "
         "gateway. SM-11 also reads every Lambda function a Bedrock agent action "
         "group (actionGroupExecutor.lambda, every agent version) or an AgentCore "
-        "gateway target (mcp.lambda.lambdaArn) names, fails one outside a VPC and "
-        "resolves the subnets of one inside. Ceiling: Lambda GetFunctionConfiguration "
-        "and ECS DescribeServices return no field that marks a function or service as "
-        "AI inference, so a Lambda function no agent or gateway names, and ECS "
-        "compute, are not in the population",
+        "gateway target (mcp.lambda.lambdaArn) names, and, as BR-02 marks AI "
+        "workloads, every Lambda function, ECS service and ECS task started outside "
+        "a service whose role is granted a Bedrock model, agent, flow or knowledge "
+        "base invoke, an AgentCore InvokeAgentRuntime or a SageMaker InvokeEndpoint "
+        "action after account-wide Denies and the permissions boundary (a task's "
+        "overridden task role first). It fails such a Lambda function outside a "
+        "VPC and resolves the subnets of each one inside and of each ECS awsvpc "
+        "workload. A granted ECS workload without awsvpc, a role the IAM cache does "
+        "not hold and a run without the cache are Not Applicable by name",
         [],
         5,
     ),
@@ -1931,18 +1935,27 @@ FOUNDATION_ROWS = [
         ["AC-01", "SM-39"],
         "The population is the account's AgentCore runtimes, code interpreters and "
         "browsers, where AgentCore runs the customer's own agent container and tools, "
-        "plus every ECS service and Lambda function, since no API field marks a task "
-        "or function as agent code. SM-39 fails an ECS service or Lambda function "
-        "whose security groups together allow egress to any destination. For each "
-        "VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS cluster "
-        "or an EC2 instance runs in, it "
+        "plus every ECS service, ECS task started outside a service, Lambda "
+        "function and Lambda MicroVM that has not ended, since no API field marks "
+        "a task or function as agent code. SM-39 fails an ECS service or task, Lambda "
+        "function or MicroVM egress network connector whose security groups "
+        "together allow egress to any destination, and a MicroVM with no egress "
+        "connector. For each VPC an ECS awsvpc service or task, a VPC-attached "
+        "Lambda function, an EKS cluster or Fargate profile or an EC2 instance "
+        "runs in, it "
         "fails a DNS Firewall whose first rule in force over every name is not a "
         "BLOCK, or that fails open, and fails an internet route that reaches an "
         "internet gateway, on its own or through a NAT gateway, without passing a "
         "Network Firewall whose policy holds an ALLOWLIST domain rule group over "
         "TLS_SNI and HTTP_HOST. Its Global leg requires an attached SCP that denies "
         "lambda:CreateFunction and lambda:UpdateFunctionConfiguration outside "
-        "approved lambda:VpcIds, lambda:SubnetIds or lambda:SecurityGroupIds. "
+        "approved lambda:VpcIds, lambda:SubnetIds or lambda:SecurityGroupIds, and "
+        "a second Global leg requires one that denies lambda:CreateNetworkConnector "
+        "outside approved lambda:SubnetIds or lambda:SecurityGroupIds; "
+        "lambda:UpdateNetworkConnector defines no condition key, so a change to an "
+        "existing connector is not judged. A MicroVM egress connector's subnets "
+        "join the Network Firewall leg only, and a MicroVM with no egress connector "
+        "fails it. "
         "A Lambda function an agent action group or AgentCore gateway target names "
         "fails both legs when it runs outside a VPC. AC-01 unions the outbound "
         "ranges of every security group on each resource and fails one whose groups "
@@ -2103,8 +2116,12 @@ FOUNDATION_ROWS = [
         "share a token authorizer and its scopes. For an IAM authorizer it fails "
         "an execute-api:Invoke Resource pattern of an identity in the IAM cache "
         "that reaches both a read and a write AI method of one API, after "
-        "account-wide Denies and the permissions boundary; API resource policies "
-        "are not read. A Lambda authorizer is not judged, because the split sits "
+        "account-wide Denies and the permissions boundary, and an Allow in a REST "
+        "API's resource policy whose execute-api:Invoke Resource reaches both a "
+        "read and a write AI method of that API, after the policy's own "
+        "unconditioned Denies for the same principal. A resource-policy Allow or "
+        "Deny under a condition other than a network key is Not Applicable. A "
+        "Lambda authorizer is not judged, because the split sits "
         "in authorizer code. Verified Permissions policy stores are not read: no "
         "field ties a policy store to an AI workload",
         [],
@@ -2123,8 +2140,13 @@ FOUNDATION_ROWS = [
         "standard the control also asks for: it reads GetEnabledStandards in each "
         "Region and passes when a StandardsArn contains "
         "standards/ai-security-best-practices/v/1.0.0 with StandardsStatus READY "
-        "or INCOMPLETE. It fails otherwise, and a Region where Security Hub is not "
-        "enabled fails with that reason",
+        "or INCOMPLETE and the AWS Foundational Security Best Practices standard is "
+        "enabled too. It fails otherwise, and a Region where Security Hub is not "
+        "enabled fails with that reason. Under central configuration it reads the "
+        "associated policy with GetConfigurationPolicy and fails one that does not "
+        "enable Security Hub and both standards; outside the delegated "
+        "administrator account that read is denied, and the leg is Not Applicable "
+        "naming the account",
         [],
         6,
     ),
@@ -2493,7 +2515,9 @@ FOUNDATION_ROWS = [
         "segment, since that policy grants every device the same reach, or a "
         "device the reach of every thing whose name starts or ends with its "
         "own. It also fails a Connect Allow with no "
-        "iot:Connection.Thing.IsAttached condition. A policy attached to a "
+        "iot:Connection.Thing.IsAttached condition that requires true on every "
+        "value; a ForAllValues: condition, which holds on an absent key, does "
+        "not count. A policy attached to a "
         "thing group reaches the certificates of the group's things, child "
         "groups included, and each is judged like a certificate attached "
         "directly",
@@ -2516,11 +2540,16 @@ FOUNDATION_ROWS = [
         "sets network policy on its NodeClass and runs no managed vpc-cni add-on. "
         "SM-39 also fails a cluster that enforces network policy in standard "
         "mode, where a pod accepts all traffic until a NetworkPolicy selects it, "
-        "and reads the security groups of every ECS service, Lambda function and "
-        "EC2 instance (the instances of one Auto Scaling group count as one "
-        "workload). It fails a group shared between workloads, a rule to the VPC "
+        "and reads the security groups of every ECS service, ECS task started "
+        "outside a service, Lambda function, Lambda MicroVM egress network "
+        "connector and EC2 instance (the instances of one Auto Scaling group "
+        "count as one workload, and so do the MicroVMs of one connector). It "
+        "fails a group shared between workloads, a rule to the VPC "
         "default group, and a CIDR of /16 (IPv6 /48) or wider, named directly or "
-        "in a customer-managed prefix list",
+        "in a customer-managed prefix list, and a MicroVM with no egress "
+        "connector. It fails a MicroVM that has not ended whose ingress "
+        "connectors name SHELL_INGRESS; the ports an auth token allows are fixed at token "
+        "creation and are not readable",
         [],
         6,
     ),
@@ -2535,10 +2564,12 @@ FOUNDATION_ROWS = [
         "falls within its schedule plus one day. It fails a secret with rotation "
         "off, one that has never rotated, and one whose schedule allows a gap "
         "longer than 90 days, the default of Security Hub control "
-        "SecretsManager.4. It fails an ECS secret that rotates while no "
+        "SecretsManager.4. It fails an ECS secret, in a service or in a task "
+        "started outside a service, that rotates while no "
         "EventBridge rotation rule has a target, an ECS secret injected from "
         "Parameter Store, and a credential-named plaintext environment variable "
-        "in an ECS container, a Lambda function, a SageMaker model container or "
+        "in an ECS container or task override, a Lambda function, a SageMaker "
+        "model container or "
         "a Lambda MicroVM image version. It fails an ACTIVE Lambda MicroVM image "
         "version whose hooks.microvmHooks.resume is not ENABLED; the image's "
         "code artifact is not read, so what the hook runs is not judged. "
