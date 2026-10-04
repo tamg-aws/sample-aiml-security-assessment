@@ -10,11 +10,14 @@ Each check is tested for:
 """
 
 import contextlib
+import gzip
+import io
 import json
 import time
 import sys
 import os
 import importlib.util
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 from unittest.mock import call, patch, MagicMock
 from botocore.exceptions import (
     EndpointConnectionError,
@@ -14333,7 +14336,14 @@ class TestBR46KnowledgeBaseSourceClassification:
         pii_jobs_error=None,
         batch_jobs=(),
         batch_error=None,
+        s3_objects=None,
+        s3_list_error=None,
+        s3_get_error=None,
     ):
+        """
+        ``s3_objects`` maps a bucket to {key: (LastModified, body)}; a body of
+        None is an object whose content the test never reads.
+        """
         agent_client = MagicMock()
         ingestion_jobs = ingestion_jobs or {}
         ingestion_pages = ingestion_pages or {}
@@ -14470,6 +14480,36 @@ class TestBR46KnowledgeBaseSourceClassification:
         )
         self.sagemaker_client = sagemaker_client
 
+        s3_client = MagicMock()
+        s3_objects = s3_objects or {}
+        self.s3_gets = []
+
+        def paginate(Bucket, Prefix):
+            if s3_list_error:
+                raise s3_list_error
+            yield {
+                "Contents": [
+                    {"Key": key, "LastModified": modified}
+                    for key, (modified, _) in sorted(
+                        (s3_objects.get(Bucket) or {}).items()
+                    )
+                    if key.startswith(Prefix)
+                ]
+            }
+
+        def get_object(Bucket, Key):
+            self.s3_gets.append(Key)
+            if s3_get_error:
+                raise s3_get_error
+            return {"Body": io.BytesIO(s3_objects[Bucket][Key][1])}
+
+        s3_paginator = MagicMock()
+        s3_paginator.paginate.side_effect = paginate
+        s3_client.get_paginator.side_effect = lambda operation: {
+            "list_objects_v2": s3_paginator
+        }[operation]
+        s3_client.get_object.side_effect = get_object
+
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
@@ -14478,6 +14518,7 @@ class TestBR46KnowledgeBaseSourceClassification:
                 "macie2": macie_client,
                 "sagemaker": sagemaker_client,
                 "comprehend": comprehend_client,
+                "s3": s3_client,
             }[service],
         ):
             return extract_csv_data(
@@ -15158,18 +15199,25 @@ class TestBR46ClassificationJobCoverage:
             "job was created at 2026-08-15T00:00:00Z",
         )
 
-    def test_br46_ingestion_after_the_last_run_is_na_and_says_so(self):
-        """The latest ingestion started after the job's last run, so an object
-        written between the two may have been ingested unclassified."""
+    # hr's job last ran 2026-09-01 and its latest ingestion started 2026-09-10.
+    HR_OBJECTS = {
+        "hr-bucket": {
+            "old.pdf": ("2026-08-25T00:00:00Z", None),
+            "between.pdf": ("2026-09-05T00:00:00Z", None),
+            "later.pdf": ("2026-09-12T00:00:00Z", None),
+        }
+    }
+
+    def test_br46_an_object_written_between_the_last_run_and_ingestion_fails(self):
+        """The object written between the two was ingested unclassified. This
+        case was N/A when object write times were not read; it now fails."""
         findings = self._run(
             [self._job("nightly-hr")],
             {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
             ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
+            s3_objects=self.HR_OBJECTS,
         )
-        assert not [f for f in findings if f["Status"] == "Failed"]
-        passed = [f for f in findings if f["Status"] == "Passed"]
-        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
-        details = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        details = self._hr_rows(findings, "Failed")[0]["Finding_Details"]
         assert (
             "the first ingestion job started at 2026-08-20T00:00:00Z, after the job "
             "was created" in details
@@ -15178,7 +15226,172 @@ class TestBR46ClassificationJobCoverage:
             "the latest ingestion job started at 2026-09-10T00:00:00Z, after the "
             "last run" in details
         )
-        assert "object write times are not read" in details
+        assert "1 object(s) were written between the two" in details
+        assert "between.pdf" in details
+        assert "old.pdf" not in details and "later.pdf" not in details
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+
+    def test_br46_no_object_written_between_the_last_run_and_ingestion_passes(self):
+        objects = {"hr-bucket": dict(self.HR_OBJECTS["hr-bucket"])}
+        del objects["hr-bucket"]["between.pdf"]
+        objects["hr-bucket"]["old.pdf.metadata.json"] = (
+            "2026-08-25T00:00:00Z",
+            self._sidecar({"tier": "x"}),
+        )
+        objects["hr-bucket"]["later.pdf.metadata.json"] = (
+            "2026-09-12T00:00:00Z",
+            self._sidecar({"tier": "x"}),
+        )
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
+            s3_objects=objects,
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "2 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert (
+            "none of the 4 object(s) listed was written between the two"
+            in passed[0]["Finding_Details"]
+        )
+
+    def test_br46_unlisted_objects_after_the_last_run_are_na_and_say_so(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
+            s3_list_error=_make_client_error("AccessDenied"),
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        details = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert "object write times were not read" in details
+        assert "(s3:ListBucket on s3://hr-bucket, AccessDenied)" in details
+
+    def test_br46_a_customization_job_after_the_last_run_reads_unclassified(self):
+        """A customization job is a read too: an object written after the last
+        run and before the job started was read unclassified."""
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            customization_jobs={
+                "tune": {
+                    "jobName": "tune",
+                    "creationTime": "2026-09-10T00:00:00Z",
+                    "trainingDataConfig": {"s3Uri": "s3://hr-bucket/train/"},
+                    "outputDataConfig": {"s3Uri": "s3://out-bucket/"},
+                }
+            },
+            s3_objects={
+                "hr-bucket": {
+                    "train/new.jsonl": ("2026-09-05T00:00:00Z", None),
+                    "train/old.jsonl": ("2026-08-05T00:00:00Z", None),
+                }
+            },
+        )
+        failed = [
+            f["Finding_Details"]
+            for f in findings
+            if f["Status"] == "Failed"
+            and "customization job 'tune'" in f["Finding_Details"]
+        ]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert "train/new.jsonl" in failed[0]
+        assert "train/old.jsonl" not in failed[0]
+
+    @staticmethod
+    def _sidecar(attributes):
+        return json.dumps({"metadataAttributes": attributes}).encode()
+
+    def test_br46_a_document_without_a_metadata_sidecar_fails(self):
+        objects = {
+            "hr-bucket": {
+                "a.pdf": ("2026-08-01T00:00:00Z", None),
+                "a.pdf.metadata.json": (
+                    "2026-08-01T00:00:00Z",
+                    self._sidecar({"classification": "PII"}),
+                ),
+                "b.pdf": ("2026-08-01T00:00:00Z", None),
+                "c.pdf": ("2026-08-01T00:00:00Z", None),
+                "c.pdf.metadata.json": ("2026-08-01T00:00:00Z", self._sidecar({})),
+                "folder/": ("2026-08-01T00:00:00Z", None),
+            }
+        }
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+        )
+        failed = self._hr_rows(findings, "Failed")
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert failed[0]["Severity"] == "Medium"
+        detail = failed[0]["Finding_Details"]
+        assert "1 of its 3 document(s) have no .metadata.json sidecar (b.pdf)" in detail
+        assert "1 sidecar(s) hold no metadataAttributes (c.pdf.metadata.json)" in detail
+        assert "a.pdf," not in detail and "folder/" not in detail
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert "(bucket hr-bucket)" not in passed[0]["Finding_Details"]
+
+    def test_br46_every_document_with_a_labelled_sidecar_passes(self):
+        objects = {
+            "hr-bucket": {
+                key: ("2026-08-01T00:00:00Z", self._sidecar({"tier": "x"}))
+                for key in (
+                    "a.pdf",
+                    "a.pdf.metadata.json",
+                    "b.txt",
+                    "b.txt.metadata.json",
+                )
+            }
+        }
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            "each of its 2 document(s) has a .metadata.json sidecar with "
+            "metadataAttributes" in passed[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize("unread", ["get_error", "cap"])
+    def test_br46_an_unread_sidecar_is_na_not_passed(self, unread, monkeypatch):
+        objects = {
+            "hr-bucket": {
+                key: ("2026-08-01T00:00:00Z", self._sidecar({"tier": "x"}))
+                for key in (
+                    "a.pdf",
+                    "a.pdf.metadata.json",
+                    "b.txt",
+                    "b.txt.metadata.json",
+                )
+            }
+        }
+        kwargs = {}
+        if unread == "cap":
+            monkeypatch.setattr(bedrock_app, "METADATA_SIDECAR_READ_CAP", 1)
+        else:
+            kwargs["s3_get_error"] = _make_client_error("AccessDenied")
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+            **kwargs,
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert "not every .metadata.json sidecar was read" in detail
+        assert (
+            "past the first 1" if unread == "cap" else "(s3:GetObject, AccessDenied)"
+        ) in detail
 
     def test_br46_an_incomplete_source_list_withholds_passed(self):
         findings = self._run(
@@ -33653,8 +33866,19 @@ class TestBR04RetentionDepth:
     def _not_found(code, operation):
         return ClientError({"Error": {"Code": code, "Message": "x"}}, operation)
 
-    def _rows(self, logging_config, lifecycles, locks=None, replication=None):
-        """lifecycles, locks, replication: {bucket: response or exception}."""
+    def _rows(
+        self,
+        logging_config,
+        lifecycles,
+        locks=None,
+        replication=None,
+        objects=None,
+        head_error=None,
+    ):
+        """
+        lifecycles, locks, replication: {bucket: response or exception}.
+        objects: {bucket: {key: ReplicationStatus or None}}.
+        """
 
         def per_bucket(table, missing_code, operation):
             def read(Bucket):
@@ -33685,6 +33909,27 @@ class TestBR04RetentionDepth:
             "GetBucketReplication",
         )
         s3.get_bucket_encryption.return_value = {}
+        listed = objects or {}
+        self.heads = []
+
+        def paginate(Bucket, Prefix, **kwargs):
+            yield {
+                "Contents": [
+                    {"Key": key}
+                    for key in sorted(listed.get(Bucket) or {})
+                    if key.startswith(Prefix)
+                ]
+            }
+
+        def head_object(Bucket, Key):
+            self.heads.append((Bucket, Key))
+            if head_error is not None:
+                raise head_error
+            status = listed[Bucket][Key]
+            return {"ReplicationStatus": status} if status else {}
+
+        s3.get_paginator.return_value.paginate.side_effect = paginate
+        s3.head_object.side_effect = head_object
         bedrock = MagicMock()
         bedrock.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": logging_config
@@ -33693,9 +33938,11 @@ class TestBR04RetentionDepth:
         logs.describe_log_groups.return_value = {
             "logGroups": [{"logGroupName": "/bedrock/logs", "retentionInDays": 30}]
         }
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "111122223333"}
 
         def factory(service, **kwargs):
-            return {"s3": s3, "bedrock": bedrock, "logs": logs}.get(
+            return {"s3": s3, "bedrock": bedrock, "logs": logs, "sts": sts}.get(
                 service, MagicMock()
             )
 
@@ -33791,6 +34038,8 @@ class TestBR04RetentionDepth:
                 ),
             },
             replication={"logs": self._replicates("replica")},
+            objects={"logs": {self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         assert sorted(r["Status"] for r in rows) == ["N/A", "N/A"]
         na = [r for r in rows if r["Status"] == "N/A"]
@@ -33844,11 +34093,17 @@ class TestBR04RetentionDepth:
         assert "'large'" not in passed["Finding_Details"]
         assert "S3 bucket 'logs' lifecycle" in passed["Finding_Details"]
 
-    def test_enabled_replication_leaves_the_replication_status_unread(self):
+    LOG_KEY = "AWSLogs/111122223333/BedrockModelInvocationLogs/us-east-1/2026/"
+
+    def test_an_unread_replication_status_leaves_the_bucket_unjudged(self):
+        """Was the default when s3:GetObject was not granted; now a HeadObject
+        failure."""
         rows, _ = self._rows(
             {"s3Config": {"bucketName": "logs"}},
             {"logs": EXPIRING, "replica": EXPIRING},
             replication={"logs": self._replicates("replica")},
+            objects={"logs": {self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
         na = [r for r in rows if r["Status"] == "N/A"][0]
@@ -33856,9 +34111,67 @@ class TestBR04RetentionDepth:
             "S3 bucket 'logs': an enabled replication rule copies it to 'replica'"
             in (na["Finding_Details"])
         )
-        assert "HeadObject" in na["Finding_Details"]
-        assert "s3:GetObject" in na["Finding_Details"]
+        assert "ReplicationStatus" in na["Finding_Details"]
+        assert "s3:GetObject, AccessDenied" in na["Finding_Details"]
         assert "action named above" in na["Resolution"]
+
+    def test_a_failed_replication_holds_log_objects_back_from_expiry(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "ok.json.gz": "COMPLETED",
+                    self.LOG_KEY + "stuck.json.gz": "FAILED",
+                    self.LOG_KEY + "fresh.json.gz": "PENDING",
+                    # Outside the Bedrock log path, so never read.
+                    "AWSLogs/111122223333/CloudTrail/x.json.gz": "FAILED",
+                }
+            },
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert "ReplicationStatus FAILED on 1 of the 3 invocation log" in detail
+        assert "stuck.json.gz" in detail
+        assert "ok.json.gz" not in detail and "CloudTrail" not in detail
+        assert not any("CloudTrail" in key for _, key in self.heads)
+
+    def test_every_replicated_log_object_read_and_none_failed_is_retained(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "ok.json.gz": "COMPLETED",
+                    self.LOG_KEY + "plain.json.gz": None,
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "no ReplicationStatus FAILED on any of the 2 invocation log object(s)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_the_head_object_cap_leaves_the_rest_unread(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "REPLICATION_STATUS_HEAD_CAP", 1)
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "a.json.gz": "COMPLETED",
+                    self.LOG_KEY + "b.json.gz": "FAILED",
+                }
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        na = [r for r in rows if r["Status"] == "N/A"][0]
+        assert "past the first 1 were not read" in na["Finding_Details"]
 
     def test_a_replicated_or_unread_replication_bucket_is_not_passed(self):
         # The source bucket's own expiry is held back for objects whose
@@ -33867,6 +34180,8 @@ class TestBR04RetentionDepth:
             {"s3Config": {"bucketName": "logs"}},
             {"logs": EXPIRING, "replica": EXPIRING},
             replication={"logs": self._replicates("replica")},
+            objects={"logs": {self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         passed = [r for r in rows if r["Status"] == "Passed"]
         assert len(passed) == 1
@@ -33887,6 +34202,8 @@ class TestBR04RetentionDepth:
             self.LARGE,
             {"logs": EXPIRING, "large": EXPIRING, "replica": EXPIRING},
             replication={"large": self._replicates("replica")},
+            objects={"large": {"big/" + self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         na = [r for r in rows if r["Status"] == "N/A"]
         assert len(na) == 1
@@ -37841,6 +38158,14 @@ class TestInvocationLogGuardrailEvidence:
     LOG_GROUP = "/aws/bedrock/model-invocation-logs"
     TAG = "amazon-bedrock-guardrails-guardContent"
     BODY_TEXT = "SECRET-PROMPT-TEXT"
+    S3_HOUR = _dt.now(_tz.utc).strftime("%Y/%m/%d/%H/")
+    S3_ROOT = "inv/AWSLogs/111122223333/BedrockModelInvocationLogs/us-east-1/"
+    S3_CONFIG = {
+        "loggingConfig": {
+            "textDataDeliveryEnabled": True,
+            "s3Config": {"bucketName": "logs", "keyPrefix": "inv"},
+        }
+    }
 
     def _record(self, request_id, operation="InvokeModel", inp=None, out=None):
         record = {
@@ -37866,7 +38191,10 @@ class TestInvocationLogGuardrailEvidence:
         return self._record(
             request_id,
             operation,
-            inp={"prompt": prompt},
+            inp={
+                "prompt": prompt,
+                "amazon-bedrock-guardrailConfig": {"tagSuffix": "xyz"},
+            },
             out={"amazon-bedrock-guardrailAction": "NONE", "completion": "x"},
         )
 
@@ -37923,8 +38251,13 @@ class TestInvocationLogGuardrailEvidence:
         config_error=None,
         logs_error=None,
         endless=False,
+        s3_objects=None,
+        s3_error=None,
     ):
-        """``pages`` maps a filter pattern to a list of pages of records."""
+        """
+        ``pages`` maps a filter pattern to a list of pages of records.
+        ``s3_objects`` maps an S3 key to its body, listed two keys per page.
+        """
         bedrock = MagicMock()
         if config_error is not None:
             bedrock.get_model_invocation_logging_configuration.side_effect = (
@@ -37964,7 +38297,32 @@ class TestInvocationLogGuardrailEvidence:
 
         logs.filter_log_events.side_effect = filter_log_events
         self.logs = logs
-        clients = {"bedrock": bedrock, "logs": logs}
+        s3 = MagicMock()
+        objects = s3_objects or {}
+        self.s3_gets = []
+
+        def list_objects_v2(Bucket, Prefix, ContinuationToken=None):
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            index = int(ContinuationToken or 0)
+            response = {
+                "Contents": [{"Key": k} for k in keys[index : index + 2]],
+                "IsTruncated": index + 2 < len(keys),
+            }
+            if response["IsTruncated"]:
+                response["NextContinuationToken"] = str(index + 2)
+            return response
+
+        def get_object(Bucket, Key):
+            if s3_error is not None:
+                raise s3_error
+            self.s3_gets.append(Key)
+            return {"Body": io.BytesIO(objects[Key])}
+
+        s3.list_objects_v2.side_effect = list_objects_v2
+        s3.get_object.side_effect = get_object
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "111122223333"}
+        clients = {"bedrock": bedrock, "logs": logs, "s3": s3, "sts": sts}
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
@@ -38095,9 +38453,14 @@ class TestInvocationLogGuardrailEvidence:
                             "textDataDeliveryEnabled": True,
                             "s3Config": {"bucketName": "logs"},
                         }
-                    }
+                    },
+                    "s3_objects": {
+                        "AWSLogs/111122223333/BedrockModelInvocationLogs/"
+                        "us-east-1/" + S3_HOUR + "a.json.gz": b"",
+                    },
+                    "s3_error": _make_client_error("AccessDenied"),
                 },
-                "delivered to Amazon S3 only",
+                "(s3:GetObject, AccessDenied)",
             ),
             (
                 {"config_error": _make_client_error("AccessDeniedException")},
@@ -38177,9 +38540,14 @@ class TestInvocationLogGuardrailEvidence:
                             "textDataDeliveryEnabled": True,
                             "s3Config": {"bucketName": "logs"},
                         }
-                    }
+                    },
+                    "s3_objects": {
+                        "AWSLogs/111122223333/BedrockModelInvocationLogs/"
+                        "us-east-1/" + S3_HOUR + "a.json.gz": b"",
+                    },
+                    "s3_error": _make_client_error("AccessDenied"),
                 },
-                "delivered to Amazon S3 only",
+                "(s3:GetObject, AccessDenied)",
             ),
             (
                 {"config_error": _make_client_error("AccessDeniedException")},
@@ -38192,3 +38560,232 @@ class TestInvocationLogGuardrailEvidence:
 
         assert [row["Status"] for row in rows] == ["N/A"]
         assert phrase in rows[0]["Finding_Details"]
+
+    @staticmethod
+    def _s3_body(records, compress=True):
+        text = "\n".join(json.dumps(record) for record in records).encode()
+        return gzip.compress(text) if compress else text
+
+    def _converse(self, request_id, turns, guarded=True, intervened=False):
+        body = {
+            "messages": [{"role": role, "content": content} for role, content in turns]
+        }
+        if guarded:
+            body["guardrailConfig"] = {"guardrailIdentifier": "g1"}
+        out = {"stopReason": "guardrail_intervened" if intervened else "end_turn"}
+        return self._record(request_id, "Converse", inp=body, out=out)
+
+    CONVERSE = '{ ($.operation = "Converse") || ($.operation = "ConverseStream") }'
+    TEXT_BLOCK = {"text": "SECRET-PROMPT-TEXT"}
+    GUARD_BLOCK = {"guardContent": {"text": {"text": "SECRET-PROMPT-TEXT"}}}
+
+    @pytest.mark.parametrize(
+        "body, status",
+        [
+            # The tag names a suffix other than the configured one.
+            (
+                {
+                    "prompt": f"<{TAG}_abc>SECRET-PROMPT-TEXT</{TAG}_abc>",
+                    "amazon-bedrock-guardrailConfig": {"tagSuffix": "xyz"},
+                },
+                "Failed",
+            ),
+            # An opening tag with no closing tag wraps nothing.
+            (
+                {
+                    "prompt": f"<{TAG}_xyz>SECRET-PROMPT-TEXT",
+                    "amazon-bedrock-guardrailConfig": {"tagSuffix": "xyz"},
+                },
+                "Failed",
+            ),
+            # No tagSuffix and no tag at all.
+            ({"prompt": "SECRET-PROMPT-TEXT"}, "Failed"),
+            # The tag name appears but no tagSuffix says which tag counts.
+            ({"prompt": f"<{TAG}_xyz>SECRET-PROMPT-TEXT</{TAG}_xyz>"}, "N/A"),
+        ],
+    )
+    def test_the_input_tag_must_match_the_configured_tag_suffix(self, body, status):
+        guarded = self._record(
+            "req-odd",
+            inp=body,
+            out={"amazon-bedrock-guardrailAction": "NONE"},
+        )
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-ok", True), guarded]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == [status]
+        detail = rows[0]["Finding_Details"]
+        assert "req-odd (InvokeModel anthropic.test)" in detail
+        assert "req-ok" not in detail
+        if status == "N/A":
+            assert "names no tagSuffix" in detail
+
+    def test_a_guarded_converse_turn_without_guard_content_fails(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])]),
+                        # The earlier user turn is marked, the latest is not.
+                        self._converse(
+                            "req-c-late",
+                            [
+                                ("user", [self.GUARD_BLOCK]),
+                                ("assistant", [{"text": "a"}]),
+                                ("user", [self.TEXT_BLOCK]),
+                            ],
+                        ),
+                        self._converse(
+                            "req-c-unguarded", [("user", [self.TEXT_BLOCK])], False
+                        ),
+                    ],
+                    [
+                        self._converse(
+                            "req-c-blocked",
+                            [("user", [self.TEXT_BLOCK])],
+                            guarded=False,
+                            intervened=True,
+                        )
+                    ],
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "2 of the 3 guarded Converse call(s)" in detail
+        assert "req-c-late (Converse anthropic.test)" in detail
+        assert "req-c-blocked (Converse anthropic.test)" in detail
+        for other in ("req-c-ok", "req-c-unguarded", "InvokeModel call(s)"):
+            assert other not in detail
+
+    def test_every_guarded_converse_turn_marked_passes(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])])]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "every one of the 1 guarded Converse call(s)" in detail
+        assert "counts as guarded only when" in detail
+
+    def test_s3_only_records_are_read_and_an_untagged_call_fails(self):
+        old_hour = (_dt.now(_tz.utc) - _td(hours=30)).strftime("%Y/%m/%d/%H/")
+        stale = self._guarded("req-stale", False)
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                # Three record objects listed across two pages.
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._catch("req-catch"), self._guarded("req-ok", True)]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz": self._s3_body(
+                    [self._record("req-plain")]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "c.json": self._s3_body(
+                    [self._guarded("req-untagged", False)], compress=False
+                ),
+                # A large-data body is not a record.
+                self.S3_ROOT + self.S3_HOUR + "data/x_input.json.gz": b"not json",
+                # Outside the 24-hour folders.
+                self.S3_ROOT + old_hour + "z.json.gz": self._s3_body([stale]),
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 2 guarded InvokeModel call(s)" in detail
+        assert f"s3://logs/{self.S3_ROOT}" in detail
+        assert "req-untagged" in detail
+        assert "1 prompt attack block(s)" in detail
+        assert "req-stale" not in detail
+        assert not any("/data/" in key for key in self.s3_gets)
+        assert self.logs.filter_log_events.call_count == 0
+
+    def test_an_s3_record_older_than_24_hours_is_not_judged(self):
+        stale = self._guarded("req-stale", False)
+        stale["timestamp"] = (_dt.now(_tz.utc) - _td(hours=25)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        fresh = self._guarded("req-fresh", True)
+        fresh["timestamp"] = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        catch = self._catch("req-catch")
+        catch["input"]["inputBodyJson"] = {
+            "messages": [{"role": "user", "content": [self.GUARD_BLOCK]}]
+        }
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [catch, stale, fresh]
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "req-stale" not in detail
+        assert "Every one of the 1 guarded InvokeModel call(s)" in detail
+        assert "every one of the 1 guarded Converse call(s)" in detail
+
+    def test_the_s3_object_cap_is_na_not_passed(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "INVOCATION_LOG_S3_MAX_OBJECTS", 1)
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._catch("req-catch"), self._guarded("req-ok", True)]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz": self._s3_body(
+                    [self._guarded("req-ok-2", True)]
+                ),
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "(object cap)" in rows[0]["Finding_Details"]
+
+    def test_s3_only_grounding_scores_are_read(self):
+        rows = self._grounding(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._scored("req-x", None), self._scored("req-g", 0.4)]
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert f"s3://logs/{self.S3_ROOT}" in detail
+        assert "req-g GROUNDING score 0.4" in detail
+        assert "req-x" not in detail
+
+    def test_s3_only_grounding_with_no_score_is_na(self):
+        rows = self._grounding(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._scored("req-x", None)]
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]

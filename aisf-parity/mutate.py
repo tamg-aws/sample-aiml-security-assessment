@@ -707,6 +707,31 @@ MUTATIONS = [
         "replace": '                    Prefix="",\n',
     },
     {
+        "name": "BR-04 retains a log object whose replication FAILED",
+        "file": BEDROCK,
+        "defect": "BR-04 ignores ReplicationStatus FAILED, so a replicated log "
+        "bucket whose objects S3 Lifecycle never expires passes",
+        "find": '                if status == "FAILED":\n',
+        "replace": "                if False:\n",
+    },
+    {
+        "name": "BR-46 passes an object written between the last run and the latest read",
+        "file": BEDROCK,
+        "defect": "BR-46 lists the source but ignores each LastModified, so an "
+        "object ingested after the Macie job last ran passes unclassified",
+        "find": "            elif after_run > 0 and before_read >= 0:\n",
+        "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-46 credits a document with no metadata sidecar",
+        "file": BEDROCK,
+        "defect": "BR-46 stops pairing documents with their .metadata.json "
+        "sidecars, so a knowledge base whose classification never reaches "
+        "per-document metadata passes",
+        "find": "    missing = [key for key in documents if key + METADATA_SIDECAR_SUFFIX not in keys]\n",
+        "replace": "    missing = []\n",
+    },
+    {
         "name": "an unread list read lets the BR-53 sweep summary pass",
         "file": BEDROCK,
         "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
@@ -767,8 +792,52 @@ MUTATIONS = [
         "file": BEDROCK,
         "defect": "BR-34 stops reading the request body for the guardContent tag, so "
         "an InvokeModel prompt the prompt attack filter never evaluated passes",
-        "find": "            elif GUARDRAIL_INPUT_TAG not in json.dumps(body):\n",
-        "replace": "            elif False:\n",
+        "find": '            if state == "untagged":\n',
+        "replace": "            if False:\n",
+    },
+    # Round 7: the tagSuffix match, the Converse turn, the S3-only destination
+    # and the large-data skip. Each was killed by hand on a byte backup on
+    # 2026-10-03 before it was added here.
+    {
+        "name": "BR-34 credits an input tag with another tagSuffix",
+        "file": BEDROCK,
+        "defect": "BR-34 credits any guardContent tag, so a prompt wrapped in a "
+        "tag whose suffix is not the configured tagSuffix passes, although the "
+        "prompt attack filter evaluates only the configured tag",
+        "find": "        tagged = any(\n",
+        "replace": "        tagged = GUARDRAIL_INPUT_TAG in text or any(\n",
+    },
+    {
+        "name": "BR-34 judges the first Converse user turn",
+        "file": BEDROCK,
+        "defect": "BR-34 reads the first user message of a Converse request, so a "
+        "call whose earlier turn was marked and whose latest turn was not passes",
+        "find": "    for message in reversed(messages if isinstance(messages, list) else []):\n",
+        "replace": "    for message in messages if isinstance(messages, list) else []:\n",
+    },
+    {
+        "name": "BR-34 credits a Converse turn with no guardContent block",
+        "file": BEDROCK,
+        "defect": "BR-34 accepts any content block as a mark, so a guarded Converse "
+        "call that sent plain text passes",
+        "find": '                isinstance(block, dict) and "guardContent" in block for block in turn\n',
+        "replace": "                isinstance(block, dict) for block in turn\n",
+    },
+    {
+        "name": "BR-27 and BR-34 read nothing from an S3-only log destination",
+        "file": BEDROCK,
+        "defect": "the S3 reader returns an empty read, so an untagged call or a "
+        "grounding score in an S3-only invocation log is never seen",
+        "find": '    return _scan_invocation_log_s3(region, source["s3"], match, visit)\n',
+        "replace": '    return {"read": 0, "capped": False, "error": None, "action": "s3:GetObject"}\n',
+    },
+    {
+        "name": "BR-34 reads a large-data body as an invocation log record",
+        "file": BEDROCK,
+        "defect": "the S3 reader opens the data/ objects too, which hold request "
+        "bodies and not records, and reads prompts it does not need",
+        "find": '                    if "/data/" in key[len(request["Prefix"]) - 1 :]:\n',
+        "replace": "                    if False:\n",
     },
     {
         "name": "BR-27 reads an absent text delivery flag as delivered",
@@ -2312,6 +2381,15 @@ GROUPS: dict[str, str] = {
     "BR-04 credits any object in the log bucket as a retained entry": (
         "in the Bedrock invocation log entries"
     ),
+    "BR-04 retains a log object whose replication FAILED": (
+        "in the Bedrock invocation log entries"
+    ),
+    "BR-46 passes an object written between the last run and the latest read": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-46 credits a document with no metadata sidecar": (
+        "in the Bedrock knowledge base classification"
+    ),
     "an unread list read lets the BR-53 sweep summary pass": (
         "in the Bedrock owner tag sweep"
     ),
@@ -2337,6 +2415,21 @@ GROUPS: dict[str, str] = {
         "in the Bedrock invocation log guardrail evidence"
     ),
     "BR-27 reads an absent text delivery flag as delivered": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 credits an input tag with another tagSuffix": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 judges the first Converse user turn": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 credits a Converse turn with no guardContent block": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 and BR-34 read nothing from an S3-only log destination": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 reads a large-data body as an invocation log record": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     "SM-39 evaluates DNS Firewall rule groups in list order": (

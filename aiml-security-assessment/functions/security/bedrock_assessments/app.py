@@ -15,6 +15,7 @@ from botocore.awsrequest import AWSRequest
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 import fnmatch
+import gzip
 import random
 import re
 import json
@@ -4436,6 +4437,60 @@ def _replica_buckets(s3_client: Any, bucket_name: str) -> List[str]:
     return sorted(replicas)
 
 
+# HeadObject is read for at most this many invocation log objects in one
+# bucket; the rest are reported as not read.
+REPLICATION_STATUS_HEAD_CAP = 500
+
+
+def _replication_held_log_objects(
+    s3_client: Any, bucket_name: str, key_prefix: Optional[str]
+) -> Dict[str, Any]:
+    """
+    Read ReplicationStatus with HeadObject on each invocation log object under
+    <keyPrefix>/AWSLogs/<account>/BedrockModelInvocationLogs/ and name those
+    whose replication FAILED, which S3 Lifecycle never expires.
+    """
+    stripped_prefix = (key_prefix or "").strip("/")
+    log_root = f"{stripped_prefix}/AWSLogs/" if stripped_prefix else "AWSLogs/"
+    failed: List[str] = []
+    read = 0
+    action = "sts:GetCallerIdentity"
+    try:
+        account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+        root = f"{log_root}{account}/BedrockModelInvocationLogs/"
+        action = "s3:ListBucket"
+        for page in s3_client.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket_name, Prefix=root
+        ):
+            for item in page.get("Contents") or []:
+                if read >= REPLICATION_STATUS_HEAD_CAP:
+                    return {
+                        "failed": failed,
+                        "read": read,
+                        "error": (
+                            f"objects under s3://{bucket_name}/{root} past the first "
+                            f"{REPLICATION_STATUS_HEAD_CAP} were not read"
+                        ),
+                    }
+                action = "s3:GetObject"
+                status = s3_client.head_object(Bucket=bucket_name, Key=item["Key"]).get(
+                    "ReplicationStatus"
+                )
+                read += 1
+                if status == "FAILED":
+                    failed.append(item["Key"])
+                action = "s3:ListBucket"
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "failed": failed,
+            "read": read,
+            "error": f"{action}, {get_assessment_error_label(error)}",
+        }
+    return {"failed": failed, "read": read, "error": ""}
+
+
 def _judge_log_bucket_retention(
     bucket_name: str,
     key_prefix: Optional[str],
@@ -4501,15 +4556,29 @@ def _judge_log_bucket_retention(
             f"{label} '{bucket_name}' lifecycle: {'; '.join(lifecycle['expirations'])}"
         )
     if replicas:
-        undetermined.append(
+        held = _replication_held_log_objects(s3_client, bucket_name, key_prefix)
+        copies = (
             f"{label} '{bucket_name}': an enabled replication rule copies it to "
             f"{', '.join(repr(r) for r in replicas)}, and S3 Lifecycle takes no "
-            "action on an object whose replication status is PENDING or FAILED. "
-            "That status is returned per object only by HeadObject "
-            "(ReplicationStatus), which needs s3:GetObject on the bucket, and the "
-            "assessment role holds s3:GetObject only on its own report bucket, so "
-            "whether any log object is held back from expiry was not read"
+            "action on an object whose replication status is PENDING or FAILED"
         )
+        if held["failed"]:
+            unretained.append(
+                f"{copies}. HeadObject reports ReplicationStatus FAILED on "
+                f"{len(held['failed'])} of the {held['read']} invocation log "
+                f"object(s) read, so they are held back from expiry: "
+                f"{', '.join(held['failed'][:5])}"
+            )
+        if held["error"]:
+            undetermined.append(
+                f"{copies}, and the ReplicationStatus of every invocation log "
+                f"object was not read: {held['error']}"
+            )
+        elif not held["failed"]:
+            retained.append(
+                f"{copies}; HeadObject reports no ReplicationStatus FAILED on any "
+                f"of the {held['read']} invocation log object(s)"
+            )
     for replica in replicas:
         replica_label = f"Replica S3 bucket (copied from '{bucket_name}')"
         try:
@@ -17035,6 +17104,14 @@ GUARDRAIL_INPUT_TAG = "amazon-bedrock-guardrails-guardContent"
 # API reference example response.
 GUARDRAIL_ACTION_FIELD = "amazon-bedrock-guardrailAction"
 
+INVOKE_GUARDRAIL_TAG_OPERATIONS = ("InvokeModel", "InvokeModelWithResponseStream")
+
+CONVERSE_OPERATIONS = ("Converse", "ConverseStream")
+
+CONVERSE_LOG_PATTERN = (
+    '{ ($.operation = "Converse") || ($.operation = "ConverseStream") }'
+)
+
 PROMPT_ATTACK_EVIDENCE_FINDING = "Guardrail Prompt Attack Invocation Evidence"
 
 GROUNDING_EVIDENCE_FINDING = "Guardrail Contextual Grounding Score Evidence"
@@ -17084,6 +17161,110 @@ def _scan_invocation_log(
     return {"read": read, "capped": True, "error": None}
 
 
+# An S3-only invocation log destination is read through at most this many
+# record objects, each a gzip file of JSON lines under the hour folder of
+# AWSLogs/<account>/BedrockModelInvocationLogs/<region>/YYYY/MM/DD/HH/.
+INVOCATION_LOG_S3_MAX_OBJECTS = 40
+
+
+def _scan_invocation_log_s3(
+    region: str,
+    target: Dict[str, str],
+    match: Callable[[str, Dict[str, Any]], bool],
+    visit: Callable[[Dict[str, Any]], None],
+) -> Dict[str, Any]:
+    """
+    Pass each record of the last 24 hours in the S3 invocation log destination
+    that ``match`` accepts to ``visit``. The hour folders are UTC. Large-data
+    bodies under data/ are not records and are skipped. Returns the same
+    summary as _scan_invocation_log, with the action a failed read needed.
+    """
+    client = boto3.client("s3", config=boto3_config, region_name=region)
+    now = datetime.now(timezone.utc)
+    start = now - INVOCATION_LOG_SCAN_LOOKBACK
+    hour = start.replace(minute=0, second=0, microsecond=0)
+    read = 0
+    objects = 0
+    action = "s3:ListBucket"
+    try:
+        while hour <= now:
+            request = {
+                "Bucket": target["bucket"],
+                "Prefix": target["root"] + hour.strftime("%Y/%m/%d/%H/"),
+            }
+            hour += timedelta(hours=1)
+            while True:
+                action = "s3:ListBucket"
+                response = client.list_objects_v2(**request)
+                for item in response.get("Contents") or []:
+                    key = item.get("Key") or ""
+                    if "/data/" in key[len(request["Prefix"]) - 1 :]:
+                        continue
+                    if objects >= INVOCATION_LOG_S3_MAX_OBJECTS:
+                        return {
+                            "read": read,
+                            "capped": True,
+                            "error": None,
+                            "action": action,
+                        }
+                    objects += 1
+                    action = "s3:GetObject"
+                    raw = client.get_object(Bucket=target["bucket"], Key=key)[
+                        "Body"
+                    ].read()
+                    if raw[:2] == b"\x1f\x8b":
+                        raw = gzip.decompress(raw)
+                    for line in raw.decode("utf-8", "replace").splitlines():
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(record, dict) or not match(line, record):
+                            continue
+                        stamp = record.get("timestamp")
+                        try:
+                            when = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+                        except (TypeError, ValueError):
+                            when = None
+                        if when and when.replace(tzinfo=timezone.utc) < start:
+                            continue
+                        read += 1
+                        visit(record)
+                token = response.get("NextContinuationToken")
+                if response.get("IsTruncated") is not True or not isinstance(
+                    token, str
+                ):
+                    break
+                request["ContinuationToken"] = token
+    except (ClientError, BotoCoreError, OSError, EOFError) as error:
+        return {
+            "read": read,
+            "capped": False,
+            "error": get_assessment_error_label(error),
+            "action": action,
+        }
+    return {"read": read, "capped": False, "error": None, "action": action}
+
+
+def _scan_invocation_records(
+    region: str,
+    source: Dict[str, Any],
+    pattern: str,
+    match: Callable[[str, Dict[str, Any]], bool],
+    visit: Callable[[Dict[str, Any]], None],
+) -> Dict[str, Any]:
+    """
+    Read the invocation log records of the last 24 hours from the CloudWatch
+    Logs group when one is configured, or else from the S3 destination.
+    ``pattern`` filters the log group and ``match`` filters S3 records.
+    """
+    if source["log_group"]:
+        scan = _scan_invocation_log(region, source["log_group"], pattern, visit)
+        scan["action"] = "logs:FilterLogEvents"
+        return scan
+    return _scan_invocation_log_s3(region, source["s3"], match, visit)
+
+
 def _nested_dicts(value: Any):
     """Yield every dict nested in a decoded JSON value."""
     if isinstance(value, dict):
@@ -17095,37 +17276,127 @@ def _nested_dicts(value: Any):
             yield from _nested_dicts(item)
 
 
+def _invoke_input_tag_state(body: Any) -> str:
+    """
+    Return "tagged" when an InvokeModel body wraps input in the guardContent
+    tag named by its amazon-bedrock-guardrailConfig tagSuffix, "untagged" when
+    it does not, and "unknown" when the tag appears with no tagSuffix to match.
+    """
+    text = json.dumps(body, ensure_ascii=False)
+    suffixes = {
+        item["amazon-bedrock-guardrailConfig"].get("tagSuffix")
+        for item in _nested_dicts(body)
+        if isinstance(item.get("amazon-bedrock-guardrailConfig"), dict)
+    }
+    suffixes = {suffix for suffix in suffixes if isinstance(suffix, str) and suffix}
+    if suffixes:
+        tagged = any(
+            f"<{GUARDRAIL_INPUT_TAG}_{suffix}>" in text
+            and f"</{GUARDRAIL_INPUT_TAG}_{suffix}>" in text
+            for suffix in suffixes
+        )
+        return "tagged" if tagged else "untagged"
+    return "unknown" if GUARDRAIL_INPUT_TAG in text else "untagged"
+
+
+def _converse_guarded(body: Any, output: Any) -> bool:
+    """Whether a logged Converse call names or reports a guardrail."""
+    if isinstance(body, dict) and body.get("guardrailConfig"):
+        return True
+    for item in _nested_dicts(output):
+        trace = item.get("trace")
+        if item.get("stopReason") == "guardrail_intervened" or (
+            isinstance(trace, dict) and trace.get("guardrail")
+        ):
+            return True
+    return False
+
+
+def _latest_user_turn(body: Any) -> Optional[List[Any]]:
+    """Return the content blocks of the last user message in a Converse request."""
+    messages = body.get("messages") if isinstance(body, dict) else None
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            return content if isinstance(content, list) else []
+    return None
+
+
 def _invocation_log_source(region: str) -> Dict[str, Any]:
     """
-    Return the invocation log group whose records carry request and response
-    text, or the reason none can be read.
+    Return the invocation log group, or else the S3 destination, whose records
+    carry request and response text, or the reason none can be read.
     """
-    try:
-        log_group, text_delivery = _get_invocation_log_group_name(region)
-    except (ClientError, BotoCoreError) as error:
+
+    def unread(logging_state, reason):
         return {
             "log_group": None,
-            "logging": None,
-            "reason": "the invocation logging configuration was not read "
+            "s3": None,
+            "where": None,
+            "logging": logging_state,
+            "reason": reason,
+        }
+
+    try:
+        response = boto3.client(
+            "bedrock", config=boto3_config, region_name=region
+        ).get_model_invocation_logging_configuration()
+    except (ClientError, BotoCoreError) as error:
+        return unread(
+            None,
+            "the invocation logging configuration was not read "
             "(bedrock:GetModelInvocationLoggingConfiguration, "
             f"{get_assessment_error_label(error)})",
-        }
+        )
+    logging_config = (
+        response.get("loggingConfig") if isinstance(response, dict) else None
+    )
+    if not isinstance(logging_config, dict):
+        logging_config = {}
+    text_delivery = logging_config.get("textDataDeliveryEnabled")
     if text_delivery is not True:
-        return {
-            "log_group": None,
-            "logging": False,
-            "reason": "invocation logging does not deliver text "
+        return unread(
+            False,
+            "invocation logging does not deliver text "
             f"(textDataDeliveryEnabled is {text_delivery}), so no request or "
             "response body is logged",
-        }
-    if not log_group:
+        )
+    log_group = (logging_config.get("cloudWatchConfig") or {}).get("logGroupName")
+    if isinstance(log_group, str) and log_group:
         return {
-            "log_group": None,
+            "log_group": log_group,
+            "s3": None,
+            "where": log_group,
             "logging": True,
-            "reason": "invocation logs are delivered to Amazon S3 only, which "
-            "this check does not read",
+            "reason": None,
         }
-    return {"log_group": log_group, "logging": True, "reason": None}
+    s3_config = logging_config.get("s3Config") or {}
+    bucket = s3_config.get("bucketName")
+    if not isinstance(bucket, str) or not bucket:
+        return unread(
+            None,
+            "invocation logging names neither a CloudWatch Logs group nor an S3 bucket",
+        )
+    try:
+        account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+    except (ClientError, BotoCoreError) as error:
+        return unread(
+            None,
+            "the account of the S3 invocation log path was not read "
+            f"(sts:GetCallerIdentity, {get_assessment_error_label(error)})",
+        )
+    prefix = (s3_config.get("keyPrefix") or "").strip("/")
+    root = f"{prefix}/" if prefix else ""
+    root += f"AWSLogs/{account}/BedrockModelInvocationLogs/{region}/"
+    return {
+        "log_group": None,
+        "s3": {"bucket": bucket, "root": root},
+        "where": f"s3://{bucket}/{root}",
+        "logging": True,
+        "reason": None,
+    }
 
 
 def check_guardrail_prompt_attack_invocation_evidence(
@@ -17161,13 +17432,13 @@ def check_guardrail_prompt_attack_invocation_evidence(
 
     try:
         source = _invocation_log_source(region)
-        if not source["log_group"]:
+        if not source["where"]:
             findings["status"] = "N/A"
             row(
                 f"No invocation log record in {region} was read for a prompt "
                 f"attack catch or input tagging: {source['reason']}.",
-                "Deliver invocation logs with text to a CloudWatch Logs group, "
-                "or review the S3 records for a PROMPT_ATTACK block.",
+                "Deliver invocation logs with text to a CloudWatch Logs group "
+                "or an S3 bucket.",
                 "Informational",
                 "N/A",
             )
@@ -17175,6 +17446,8 @@ def check_guardrail_prompt_attack_invocation_evidence(
         catches = []
         guarded = []
         untagged = []
+        converse_guarded = []
+        converse_untagged = []
         unread = []
 
         def visit_catch(record):
@@ -17185,49 +17458,90 @@ def check_guardrail_prompt_attack_invocation_evidence(
             ):
                 catches.append(str(record.get("requestId") or "no request ID"))
 
+        def label_of(record):
+            return "{} ({} {})".format(
+                record.get("requestId") or "no request ID",
+                record.get("operation"),
+                record.get("modelId") or "no model ID",
+            )
+
         def visit_guarded(record):
-            if record.get("operation") not in (
-                "InvokeModel",
-                "InvokeModelWithResponseStream",
-            ):
+            if record.get("operation") not in INVOKE_GUARDRAIL_TAG_OPERATIONS:
                 return
             output = (record.get("output") or {}).get("outputBodyJson")
             if not any(
                 GUARDRAIL_ACTION_FIELD in item for item in _nested_dicts(output)
             ):
                 return
-            label = "{} ({} {})".format(
-                record.get("requestId") or "no request ID",
-                record.get("operation"),
-                record.get("modelId") or "no model ID",
-            )
+            label = label_of(record)
             guarded.append(label)
             body = (record.get("input") or {}).get("inputBodyJson")
             if body is None:
                 unread.append(f"{label}, whose request body is not inline")
-            elif GUARDRAIL_INPUT_TAG not in json.dumps(body):
+                return
+            state = _invoke_input_tag_state(body)
+            if state == "untagged":
                 untagged.append(label)
+            elif state == "unknown":
+                unread.append(
+                    f"{label}, whose body names no tagSuffix in "
+                    "amazon-bedrock-guardrailConfig to match its input tag against"
+                )
 
-        log_group = source["log_group"]
-        catch_scan = _scan_invocation_log(
-            region, log_group, '"PROMPT_ATTACK"', visit_catch
+        def visit_converse(record):
+            if record.get("operation") not in CONVERSE_OPERATIONS:
+                return
+            body = (record.get("input") or {}).get("inputBodyJson")
+            output = (record.get("output") or {}).get("outputBodyJson")
+            if not _converse_guarded(body, output):
+                return
+            label = label_of(record)
+            converse_guarded.append(label)
+            turn = _latest_user_turn(body)
+            if turn is None:
+                unread.append(f"{label}, whose logged request holds no user turn")
+            elif not any(
+                isinstance(block, dict) and "guardContent" in block for block in turn
+            ):
+                converse_untagged.append(label)
+
+        catch_scan = _scan_invocation_records(
+            region,
+            source,
+            '"PROMPT_ATTACK"',
+            lambda line, record: "PROMPT_ATTACK" in line,
+            visit_catch,
         )
-        tag_scan = _scan_invocation_log(
-            region, log_group, f'"{GUARDRAIL_ACTION_FIELD}"', visit_guarded
+        tag_scan = _scan_invocation_records(
+            region,
+            source,
+            f'"{GUARDRAIL_ACTION_FIELD}"',
+            lambda line, record: GUARDRAIL_ACTION_FIELD in line,
+            visit_guarded,
         )
+        converse_scan = _scan_invocation_records(
+            region,
+            source,
+            CONVERSE_LOG_PATTERN,
+            lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
+            visit_converse,
+        )
+        where = source["where"]
+        cap = "page cap" if source["log_group"] else "object cap"
         for scan, what in (
             (catch_scan, "PROMPT_ATTACK"),
             (tag_scan, GUARDRAIL_ACTION_FIELD),
+            (converse_scan, "a Converse operation"),
         ):
             if scan["error"]:
                 unread.append(
-                    f"records matching {what} in {log_group} (logs:FilterLogEvents, "
+                    f"records matching {what} in {where} ({scan['action']}, "
                     f"{scan['error']})"
                 )
             elif scan["capped"]:
                 unread.append(
-                    f"records matching {what} in {log_group} past the first "
-                    f"{scan['read']} (page cap)"
+                    f"records matching {what} in {where} past the first "
+                    f"{scan['read']} ({cap})"
                 )
         unread_note = " Not read: {}.".format("; ".join(unread[:5])) if unread else ""
         catch_note = (
@@ -17237,32 +17551,54 @@ def check_guardrail_prompt_attack_invocation_evidence(
             if catches
             else "No PROMPT_ATTACK block was logged in the last 24 hours."
         )
-        if untagged:
+        guarded_scope = (
+            "A Converse call counts as guarded only when its logged request "
+            "names guardrailConfig or its response carries a guardrail trace or "
+            "intervention."
+        )
+        if untagged or converse_untagged:
             findings["status"] = "FAIL"
+            failures = []
+            if untagged:
+                failures.append(
+                    "{} of the {} guarded InvokeModel call(s) logged in {} in the "
+                    "last 24 hours sent no {}_<tagSuffix> input tag matching the "
+                    "tagSuffix in amazon-bedrock-guardrailConfig, so the prompt "
+                    "attack filter did not evaluate their input: {}.".format(
+                        len(untagged),
+                        len(guarded),
+                        where,
+                        GUARDRAIL_INPUT_TAG,
+                        "; ".join(untagged[:5]),
+                    )
+                )
+            if converse_untagged:
+                failures.append(
+                    "{} of the {} guarded Converse call(s) logged in {} in the "
+                    "last 24 hours sent their latest user turn with no "
+                    "guardContent block, so the guardrail cannot tell that turn "
+                    "from the application's own instructions: {}.".format(
+                        len(converse_untagged),
+                        len(converse_guarded),
+                        where,
+                        "; ".join(converse_untagged[:5]),
+                    )
+                )
             row(
-                "{} of the {} guarded InvokeModel call(s) logged in {} in the last "
-                "24 hours sent no {} input tag, so the prompt attack filter did not "
-                "evaluate their input: {}. {}{}".format(
-                    len(untagged),
-                    len(guarded),
-                    log_group,
-                    GUARDRAIL_INPUT_TAG,
-                    "; ".join(untagged[:5]),
-                    catch_note,
-                    unread_note,
-                ),
+                "{} {}{}".format(" ".join(failures), catch_note, unread_note),
                 "Wrap the user-supplied part of each InvokeModel prompt in "
-                "amazon-bedrock-guardrails-guardContent_<tagSuffix> tags, or move "
-                "the caller to Converse with guardContent blocks.",
+                "amazon-bedrock-guardrails-guardContent_<tagSuffix> tags that "
+                "match the tagSuffix in amazon-bedrock-guardrailConfig, and mark "
+                "the user turn of each Converse call with a guardContent block.",
                 "High",
                 "Failed",
             )
         elif unread:
             findings["status"] = "N/A"
             row(
-                "No guarded InvokeModel call read in {} sent untagged input, but "
-                "the records were not all read. {}{}".format(
-                    log_group, catch_note, unread_note
+                "No guarded InvokeModel or Converse call read in {} sent untagged "
+                "input, but the records were not all read. {}{}".format(
+                    where, catch_note, unread_note
                 ),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
@@ -17271,10 +17607,15 @@ def check_guardrail_prompt_attack_invocation_evidence(
         elif not catches:
             findings["status"] = "N/A"
             row(
-                "{} Every one of the {} guarded InvokeModel call(s) logged in {} "
-                "in the last 24 hours tagged its input. No example catch was read, "
-                "which does not show the filter is off.".format(
-                    catch_note, len(guarded), log_group
+                "{} Every one of the {} guarded InvokeModel call(s) and {} guarded "
+                "Converse call(s) logged in {} in the last 24 hours tagged its "
+                "input. No example catch was read, which does not show the filter "
+                "is off. {}".format(
+                    catch_note,
+                    len(guarded),
+                    len(converse_guarded),
+                    where,
+                    guarded_scope,
                 ),
                 "No action required.",
                 "Informational",
@@ -17283,9 +17624,16 @@ def check_guardrail_prompt_attack_invocation_evidence(
         else:
             row(
                 "{} Every one of the {} guarded InvokeModel call(s) logged in {} "
-                "in the last 24 hours tagged its input with {}. Converse calls are "
-                "not judged for guardContent blocks.".format(
-                    catch_note, len(guarded), log_group, GUARDRAIL_INPUT_TAG
+                "in the last 24 hours tagged its input with {}_<tagSuffix> "
+                "matching its amazon-bedrock-guardrailConfig tagSuffix, and every "
+                "one of the {} guarded Converse call(s) marked its latest user "
+                "turn with a guardContent block. {}".format(
+                    catch_note,
+                    len(guarded),
+                    where,
+                    GUARDRAIL_INPUT_TAG,
+                    len(converse_guarded),
+                    guarded_scope,
                 ),
                 "No action required.",
                 "High",
@@ -17348,15 +17696,12 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 "Failed",
             )
             return findings
-        if not source["log_group"]:
+        if not source["where"]:
             findings["status"] = "N/A"
             row(
                 f"No scored grounding assessment in {region} was read: "
                 f"{source['reason']}.",
-                COULD_NOT_ASSESS_RESOLUTION
-                if source["logging"] is None
-                else "Review the S3 invocation log records for a "
-                "contextualGroundingPolicy score.",
+                COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
                 "N/A",
             )
@@ -17380,9 +17725,13 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                         )
                     )
 
-        log_group = source["log_group"]
-        scan = _scan_invocation_log(
-            region, log_group, '"contextualGroundingPolicy"', visit
+        log_group = source["where"]
+        scan = _scan_invocation_records(
+            region,
+            source,
+            '"contextualGroundingPolicy"',
+            lambda line, record: "contextualGroundingPolicy" in line,
+            visit,
         )
         if scored:
             row(
@@ -17397,7 +17746,7 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
             findings["status"] = "N/A"
             row(
                 f"The invocation log records in {log_group} were not read "
-                f"(logs:FilterLogEvents, {scan['error']}), so no scored grounding "
+                f"({scan['action']}, {scan['error']}), so no scored grounding "
                 "assessment was read.",
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
@@ -17412,7 +17761,13 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 "the caller enables the guardrail trace.".format(
                     log_group,
                     scan["read"],
-                    " (page cap reached)" if scan["capped"] else "",
+                    (
+                        " (page cap reached)"
+                        if source["log_group"]
+                        else " (object cap reached)"
+                    )
+                    if scan["capped"]
+                    else "",
                 ),
                 "No action required.",
                 "Informational",
@@ -28433,6 +28788,7 @@ def _ingestion_job_window(
     ordered = sorted(started, key=lambda value: _days_between(epoch, value) or 0.0)
     return {
         "label": label,
+        "latest_label": "the latest ingestion job",
         "first": ordered[0] if ordered else None,
         "latest": ordered[-1] if ordered else None,
         "error": "",
@@ -28440,16 +28796,19 @@ def _ingestion_job_window(
 
 
 def _classification_order(
-    detail: Dict[str, Any], first_read: Optional[Dict[str, Any]]
+    detail: Dict[str, Any],
+    first_read: Optional[Dict[str, Any]],
+    objects: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> Dict[str, str]:
     """
     Compare a passing Macie job's createdAt and lastRunTime with when the
     source was first and last read.
 
     A reader that started before the job was created read objects the job had
-    not classified, so that is Failed. A latest ingestion after the last run
-    read any object written between the two unclassified, and object write
-    times are not read, so that is N/A.
+    not classified, so that is Failed. When the latest read started after the
+    last run, ``objects`` lists the source, and an object whose LastModified
+    falls between the two was read before any run classified it, so that is
+    Failed. A listing that did not finish is N/A.
     """
     if not first_read:
         return {"status": "Passed", "detail": ""}
@@ -28490,15 +28849,141 @@ def _classification_order(
     latest = first_read.get("latest")
     gap = _days_between(detail.get("lastRunTime"), latest) if latest else None
     if gap is not None and gap > 0:
+        last_run = detail.get("lastRunTime")
+        window = (
+            f"; {first_read.get('latest_label') or first_read['label']} started at "
+            f"{latest}, after the last run at {last_run}"
+        )
+        listing = objects() if objects else {"items": [], "error": "not listed"}
+        if listing["error"]:
+            return {
+                "status": "N/A",
+                "detail": (
+                    note[2:] + window + ", and object write times were not read "
+                    f"({listing['error']}), so whether an object written between "
+                    "the two was read unclassified is unknown"
+                ),
+            }
+        unclassified, undated = [], []
+        for key, modified in listing["items"]:
+            after_run = _days_between(last_run, modified)
+            before_read = _days_between(modified, latest)
+            if after_run is None or before_read is None:
+                undated.append(key)
+            elif after_run > 0 and before_read >= 0:
+                unclassified.append(key)
+        if unclassified:
+            return {
+                "status": "Failed",
+                "detail": (
+                    note[2:] + window + f", and {len(unclassified)} object(s) were "
+                    "written between the two, so they were read before this job "
+                    f"classified them: {', '.join(unclassified[:5])}"
+                ),
+            }
+        if undated:
+            return {
+                "status": "N/A",
+                "detail": (
+                    note[2:] + window + f", and {len(undated)} object(s) report no "
+                    f"LastModified to order: {', '.join(undated[:5])}"
+                ),
+            }
+        note += (
+            window + f", and none of the {len(listing['items'])} object(s) listed "
+            "was written between the two"
+        )
+    return {"status": "Passed", "detail": note}
+
+
+# A knowledge base source is read for at most this many .metadata.json
+# sidecars; the rest are reported as not read.
+METADATA_SIDECAR_READ_CAP = 50
+
+METADATA_SIDECAR_SUFFIX = ".metadata.json"
+
+
+def _source_object_listing(
+    region: str, bucket: str, prefixes: List[str]
+) -> Dict[str, Any]:
+    """
+    List every object under an S3 source's prefixes as (key, LastModified)
+    pairs, up to the REDACTION_SOURCE_LIST_PAGE_CAP pages, or the reason the
+    listing did not finish.
+    """
+    client = boto3.client("s3", config=boto3_config, region_name=region)
+    items, pages = [], 0
+    try:
+        for prefix in prefixes or [""]:
+            for page in client.get_paginator("list_objects_v2").paginate(
+                Bucket=bucket, Prefix=prefix
+            ):
+                pages += 1
+                if pages > REDACTION_SOURCE_LIST_PAGE_CAP:
+                    return {
+                        "items": items,
+                        "error": (
+                            f"s3://{bucket} holds more objects than the "
+                            f"{REDACTION_SOURCE_LIST_PAGE_CAP * 1000:,} this check "
+                            "lists"
+                        ),
+                    }
+                for item in page.get("Contents") or []:
+                    items.append((str(item.get("Key")), item.get("LastModified")))
+    except (ClientError, BotoCoreError) as error:
         return {
-            "status": "N/A",
-            "detail": (
-                note[2:] + f"; the latest ingestion job started at {latest}, after "
-                "the last run, so an object written between the two was ingested "
-                "before this job classified it, and object write times are not read"
+            "items": items,
+            "error": (
+                f"s3:ListBucket on s3://{bucket}, {get_assessment_error_label(error)}"
             ),
         }
-    return {"status": "Passed", "detail": note}
+    return {"items": items, "error": ""}
+
+
+def _metadata_sidecar_gaps(
+    region: str, bucket: str, items: List[Tuple[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Pair each document of a knowledge base source with the
+    <document>.metadata.json sidecar the knowledge base reads its metadata from,
+    and read up to METADATA_SIDECAR_READ_CAP of them for a non-empty
+    metadataAttributes object.
+    """
+    keys = {key for key, _ in items}
+    documents = sorted(
+        key
+        for key in keys
+        if not key.endswith("/") and not key.endswith(METADATA_SIDECAR_SUFFIX)
+    )
+    missing = [key for key in documents if key + METADATA_SIDECAR_SUFFIX not in keys]
+    present = [key for key in documents if key + METADATA_SIDECAR_SUFFIX in keys]
+    client = boto3.client("s3", config=boto3_config, region_name=region)
+    empty, unread = [], []
+    for key in present[:METADATA_SIDECAR_READ_CAP]:
+        sidecar = key + METADATA_SIDECAR_SUFFIX
+        try:
+            body = client.get_object(Bucket=bucket, Key=sidecar)["Body"].read()
+            attributes = json.loads(body).get("metadataAttributes")
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"{sidecar} (s3:GetObject, {get_assessment_error_label(error)})"
+            )
+            continue
+        except (ValueError, AttributeError):
+            attributes = None
+        if not isinstance(attributes, dict) or not attributes:
+            empty.append(sidecar)
+    if len(present) > METADATA_SIDECAR_READ_CAP:
+        unread.append(
+            f"{len(present) - METADATA_SIDECAR_READ_CAP} sidecar(s) past the first "
+            f"{METADATA_SIDECAR_READ_CAP}"
+        )
+    return {
+        "documents": len(documents),
+        "missing": missing,
+        "empty": empty,
+        "unread": unread,
+    }
 
 
 def _classification_source_verdict(
@@ -28507,6 +28992,7 @@ def _classification_source_verdict(
     candidates: List[Dict[str, str]],
     describe,
     criteria_jobs: List[Dict[str, str]],
+    objects: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Judge one source against every classification job that can reach it.
@@ -28541,7 +29027,7 @@ def _classification_source_verdict(
                 "were not compared with what the source ingests"
             )
             continue
-        order = _classification_order(detail, source.get("first_read"))
+        order = _classification_order(detail, source.get("first_read"), objects)
         if order["status"] == "Failed":
             reasons.append(f"Macie job '{name}' names it, but {order['detail']}")
             continue
@@ -28697,7 +29183,7 @@ def check_bedrock_knowledge_base_source_classification(
                         "first_read": {
                             "label": f"customization job '{location['job']}'",
                             "first": location.get("started"),
-                            "latest": None,
+                            "latest": location.get("started"),
                             "error": "",
                         },
                     }
@@ -28721,7 +29207,7 @@ def check_bedrock_knowledge_base_source_classification(
                     "first_read": {
                         "label": f"SageMaker training job '{location['job']}'",
                         "first": location.get("started"),
-                        "latest": None,
+                        "latest": location.get("started"),
                         "error": "",
                     },
                 }
@@ -28757,7 +29243,7 @@ def check_bedrock_knowledge_base_source_classification(
                     "first_read": {
                         "label": f"batch inference job '{name}'",
                         "first": job.get("submitTime"),
-                        "latest": None,
+                        "latest": job.get("submitTime"),
                         "error": "",
                     },
                 }
@@ -28941,7 +29427,9 @@ def check_bedrock_knowledge_base_source_classification(
 
         passed = []
         failed = []
+        unlabelled = []
         indeterminate = []
+        listings: Dict[Tuple[str, Tuple[str, ...]], Dict[str, Any]] = {}
         for source in sources:
             bucket_name = source["bucket"]
             record = macie_buckets.get(bucket_name)
@@ -28978,9 +29466,66 @@ def check_bedrock_knowledge_base_source_classification(
             last_job = str((record.get("jobDetails") or {}).get("lastJobId") or "")
             if last_job and last_job not in {job["id"] for job in candidates}:
                 candidates.append({"id": last_job, "name": last_job})
+            listing_key = (bucket_name, tuple(source["prefixes"]))
+
+            def objects(listing_key=listing_key):
+                if listing_key not in listings:
+                    listings[listing_key] = _source_object_listing(
+                        region, listing_key[0], list(listing_key[1])
+                    )
+                return listings[listing_key]
+
             verdict = _classification_source_verdict(
-                source, record, candidates, describe, job_index["criteria_jobs"]
+                source,
+                record,
+                candidates,
+                describe,
+                job_index["criteria_jobs"],
+                objects,
             )
+            if verdict["status"] == "Passed" and source.get("knowledge_base_id"):
+                listing = objects()
+                sidecars = (
+                    None
+                    if listing["error"]
+                    else _metadata_sidecar_gaps(region, bucket_name, listing["items"])
+                )
+                if sidecars is None:
+                    verdict = {
+                        "status": "N/A",
+                        "detail": (
+                            f"{verdict['detail']}, but its .metadata.json sidecars "
+                            f"were not listed ({listing['error']})"
+                        ),
+                    }
+                elif sidecars["missing"] or sidecars["empty"]:
+                    unlabelled.append(
+                        "{}, but {} of its {} document(s) have no .metadata.json "
+                        "sidecar ({}) and {} sidecar(s) hold no metadataAttributes "
+                        "({}), so the classification is not carried into "
+                        "per-document metadata".format(
+                            verdict["detail"],
+                            len(sidecars["missing"]),
+                            sidecars["documents"],
+                            ", ".join(sidecars["missing"][:5]) or "none",
+                            len(sidecars["empty"]),
+                            ", ".join(sidecars["empty"][:5]) or "none",
+                        )
+                    )
+                    continue
+                elif sidecars["unread"]:
+                    verdict = {
+                        "status": "N/A",
+                        "detail": (
+                            f"{verdict['detail']}, but not every .metadata.json "
+                            f"sidecar was read: {'; '.join(sidecars['unread'][:5])}"
+                        ),
+                    }
+                else:
+                    verdict["detail"] += (
+                        f"; each of its {sidecars['documents']} document(s) has a "
+                        ".metadata.json sidecar with metadataAttributes"
+                    )
             automated = str(record.get("automatedDiscoveryMonitoringStatus") or "")
             if precondition["ready"]:
                 sampled = (
@@ -29020,6 +29565,25 @@ def check_bedrock_knowledge_base_source_classification(
                 )
             )
 
+        for detail in unlabelled:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=f"{detail}.",
+                    resolution=(
+                        "Write a <document>.metadata.json sidecar beside each "
+                        "source document whose metadataAttributes carry the "
+                        "classification Macie reports, then sync the data source."
+                    ),
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
         if passed:
             findings["csv_data"].append(
                 create_finding(
@@ -29028,12 +29592,15 @@ def check_bedrock_knowledge_base_source_classification(
                     finding_details=(
                         "{} of {} AI data source(s) are classified by a recurring, "
                         "full-depth Macie job: {}. Each job's createdAt is compared "
-                        "with when its source was first read. Object write times are "
-                        "not read, so whether each object was classified before the "
-                        "ingestion or training job that read it is not judged. "
-                        "Whether the classification is carried into per-document "
-                        "metadata is held in the .metadata.json objects beside each "
-                        "source document, which are not read, and is not "
+                        "with when its source was first read, and when a read "
+                        "started after the job's last run, each object's "
+                        "LastModified is compared with the two. An object written "
+                        "before the last run is not ordered against each earlier "
+                        "read, because Macie returns only lastRunTime and not every "
+                        "run. Each knowledge base source document is paired with "
+                        "its .metadata.json sidecar and the sidecar's "
+                        "metadataAttributes is read; which attribute names the "
+                        "classification in per-document metadata is not "
                         "judged.{}".format(
                             len(passed),
                             len(sources),

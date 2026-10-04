@@ -101,10 +101,14 @@ AI_SUBJECT_ROWS = [
         "BR-34 requires a PROMPT_ATTACK filter with inputEnabled, BLOCK and HIGH "
         "on the STANDARD tier for every reached guardrail version. Its 'Guardrail "
         "Prompt Attack Invocation Evidence' row reads the last 24 hours of "
-        "CloudWatch invocation log records with logs:FilterLogEvents, fails a "
-        "guarded InvokeModel call whose input carries no guardContent tag, and "
-        "passes on a logged PROMPT_ATTACK block with every guarded call tagged. "
-        "Converse guardContent blocks and S3-only log destinations are not read",
+        "invocation log records, from CloudWatch Logs with logs:FilterLogEvents or "
+        "from an S3-only destination with s3:GetObject, fails a guarded InvokeModel "
+        "call whose input is not wrapped in the guardContent tag its "
+        "amazon-bedrock-guardrailConfig tagSuffix names, fails a guarded Converse "
+        "call whose latest user turn has no guardContent block, and passes on a "
+        "logged PROMPT_ATTACK block with every guarded call marked. A Converse call "
+        "counts as guarded only when its logged request names guardrailConfig or "
+        "its response carries a guardrail trace or intervention",
         [],
         3,
     ),
@@ -119,8 +123,9 @@ AI_SUBJECT_ROWS = [
         "threshold above 0 and at most 0.99. Its 'Guardrail Contextual Grounding "
         "Score Evidence' row fails when invocation logging delivers no text, so "
         "no score is logged, and passes on a scored GROUNDING or RELEVANCE entry "
-        "read from the last 24 hours of CloudWatch invocation log records. Whether "
-        "callers supply the grounding qualifiers is not recorded by any API",
+        "read from the last 24 hours of invocation log records, from CloudWatch "
+        "Logs or from an S3-only destination with s3:GetObject. Whether callers "
+        "supply the grounding qualifiers is not recorded by any API",
         [],
         3,
     ),
@@ -178,12 +183,14 @@ AI_SUBJECT_ROWS = [
         "bedrock_assessments",
         ["BR-46"],
         "BR-46 passes a knowledge base S3 source only when a recurring, full-depth "
-        "Macie job scopes in its prefix, the latest ingestion did not start after "
-        "the job's last run, and every source list was read. With Macie off, a "
-        "source that no completed "
-        "Comprehend PII detection job read fails, and a Comprehend-screened source "
-        "is N/A. Whether classification is carried into per-document metadata needs "
-        "s3:GetObject on the metadata sidecars, which the Bedrock role is not granted",
+        "Macie job scopes in its prefix, no object's LastModified falls between "
+        "the job's last run and a later ingestion, every document has a "
+        ".metadata.json sidecar with non-empty metadataAttributes, read with "
+        "s3:GetObject, and every source list was read. With Macie off, a source "
+        "that no completed Comprehend PII detection job read fails, and a "
+        "Comprehend-screened source is N/A. An object written before the last run "
+        "is not ordered against each earlier ingestion, because Macie returns only "
+        "lastRunTime, and which attribute names the classification is not judged",
         [],
         3,
     ),
@@ -1822,8 +1829,10 @@ FOUNDATION_ROWS = [
         "version that is never deleted. A missing Status means the bucket was "
         "never versioned, and the Expiration rule alone decides it. An Object Lock "
         "default retention beside the rule fails, since Lifecycle does not delete a "
-        "retained version. A replicated log bucket is N/A, because per-object "
-        "ReplicationStatus needs s3:GetObject, which is not granted. Every page of "
+        "retained version. On a replicated log bucket each invocation log object's "
+        "ReplicationStatus is read with HeadObject, at most 500 a bucket, and a "
+        "FAILED status fails the bucket, since Lifecycle never expires it; an unread "
+        "or capped read is N/A. Every page of "
         "ListMemories is read and each AgentCore memory's eventExpiryDuration is read "
         "with GetMemory: a read memory is Passed and its period in days is named as a "
         "service-enforced expiry, with no claim that deletion ran, and an unread list "

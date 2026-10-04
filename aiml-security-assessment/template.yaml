@@ -545,6 +545,22 @@ Resources:
             Action:
               - sso:DescribeInstanceAccessControlAttributeConfiguration # BR-51
             Resource: !Sub 'arn:${AWS::Partition}:sso:::instance/*'
+          - Sid: InvocationLogAndSidecarObjectRead
+            # BR-27 and BR-34 read the invocation log records of an S3-only
+            # destination, and BR-04 reads ReplicationStatus with HeadObject,
+            # which s3:GetObject authorizes, on each record of a replicated
+            # log bucket. Bedrock writes them under
+            # <keyPrefix>/AWSLogs/<account>/BedrockModelInvocationLogs/. BR-46
+            # reads the <document>.metadata.json sidecar beside each knowledge
+            # base source document. The service authorization reference gives
+            # GetObject the object resource type; the buckets are not known in
+            # advance, so only the bucket segment is open.
+            Effect: Allow
+            Action:
+              - s3:GetObject # BR-04, BR-27, BR-34, BR-46
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::*/*AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::*/*.metadata.json'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

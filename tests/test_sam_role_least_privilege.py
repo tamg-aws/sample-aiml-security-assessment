@@ -170,6 +170,7 @@ _EXPECTED_ACTIONS = {
         "redshift-serverless:GetNamespace",
         "redshift-serverless:ListWorkgroups",
         "redshift:DescribeClusters",
+        "s3:GetObject",
         "s3:ListBucket",
         "sagemaker:DescribeEndpoint",
         "sagemaker:DescribeEndpointConfig",
@@ -988,10 +989,31 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "bedrock-mantle:ListProjects",
                 "bedrock-mantle:*:${AWS::AccountId}:project/*",
             ),
+            (
+                "Allow",
+                "s3:GetObject",
+                json.dumps(
+                    [
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:s3:::*/*AWSLogs/"
+                            "${AWS::AccountId}/BedrockModelInvocationLogs/*"
+                        },
+                        {"Fn::Sub": "arn:${AWS::Partition}:s3:::*/*.metadata.json"},
+                    ]
+                ),
+            ),
         ]
     )
+    # s3:GetObject is the one action in both: the inline grant reads the
+    # permission cache in the report bucket, and the managed grant reads
+    # invocation log records and knowledge base sidecars, never that bucket.
     inline = _actions(template, "BedrockSecurityAssessmentFunction")
-    assert not {action for _, action, _ in grants} & inline
+    assert {action for _, action, _ in grants} & inline == {"s3:GetObject"}
+    assert not [
+        grant
+        for grant in grants
+        if grant[1] == "s3:GetObject" and "AIMLAssessmentBucket" in grant[2]
+    ]
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
