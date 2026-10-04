@@ -3541,8 +3541,8 @@ MUTATIONS = [
         "name": "AC-49 sync: an earlier BLOCK does not withdraw a name",
         "file": AGENTCORE,
         "defect": "a name an earlier DNS Firewall BLOCK refuses counted as allowed",
-        "find": "                allowed.extend(domain for domain in domains if domain not in blocked)\n",
-        "replace": "                allowed.extend(domains)\n",
+        "find": "                    if not _domain_patterns_cover(\n",
+        "replace": "                    if True or not _domain_patterns_cover(\n",
     },
     {
         "name": "AC-49 sync: a DNS Firewall answering every name is compared",
@@ -3680,6 +3680,21 @@ MUTATIONS = [
         ),
         "find": "            scans[key] = error\n",
         "replace": "            pass\n",
+    },
+    {
+        "name": "AC-49 sync: a wildcard BLOCK is matched literally",
+        "file": AGENTCORE,
+        "defect": (
+            "an earlier DNS Firewall BLOCK on *.example.com withdrew only the "
+            "entry *.example.com, so the subdomains it refuses counted as allowed"
+        ),
+        "find": (
+            "                blocked.extend(_domain_pattern(domain, False) "
+            "for domain in domains)\n"
+        ),
+        "replace": (
+            "                blocked.extend((domain, True, False) for domain in domains)\n"
+        ),
     },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
@@ -4480,6 +4495,7 @@ GROUPS: dict[str, str] = {
     "AC-08 data path: a tools-only Region is not judged": "in the AgentCore verdict legs",
     "AC-34 image: a digest already read is downloaded again": "in the AgentCore verdict legs",
     "AC-34 image: a digest that failed is downloaded again": "in the AgentCore verdict legs",
+    "AC-49 sync: a wildcard BLOCK is matched literally": "in the AgentCore verdict legs",
 }
 
 

@@ -373,6 +373,11 @@ section.
     again for every tag, version or runtime naming the same image, and at up
     to 512 MiB per pull that could run the Lambda past its 600-second timeout
     and return no rows. A failed read is also kept, so it is not retried.
+  - `AC-49`'s `AgentCore Egress Allow-List Sync` row withdraws every name an
+    earlier DNS Firewall `BLOCK` covers, matched as DNS Firewall matches: a
+    `BLOCK` on `*.example.com` refuses each subdomain and not `example.com`.
+    Before, only an identical entry was withdrawn, so a subdomain the BLOCK
+    refuses was counted as allowed and a firewall missing it failed the row.
 
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.

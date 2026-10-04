@@ -37679,8 +37679,9 @@ def _dns_firewall_allowed_names(
 
     The rules are walked in the order AC-49's DNS row walks them. An ALLOW or
     ALERT rule over a customer domain list answers its names, less any an
-    earlier BLOCK lists as the same entry; a BLOCK over an AWS managed list or
-    a rule scoped to one query type admits nothing. Returns (names, "", None)
+    earlier BLOCK covers as DNS Firewall matches ("*.example.com" covers every
+    subdomain of example.com, not example.com); a BLOCK over an AWS managed
+    list or a rule scoped to one query type admits nothing. Returns (names, "", None)
     for an allow-list, or (None, reason, action), action naming the grant to
     retry with when a read failed.
     """
@@ -37717,7 +37718,7 @@ def _dns_firewall_allowed_names(
     )
     managed: Optional[Set[str]] = None
     allowed: List[str] = []
-    blocked: Set[str] = set()
+    blocked: List[Tuple[str, bool, bool]] = []
     for association in live:
         group_id = association.get("FirewallRuleGroupId") or "unknown"
         try:
@@ -37794,9 +37795,15 @@ def _dns_firewall_allowed_names(
                     None,
                 )
             if action == "BLOCK":
-                blocked.update(domains)
+                blocked.extend(_domain_pattern(domain, False) for domain in domains)
             else:
-                allowed.extend(domain for domain in domains if domain not in blocked)
+                allowed.extend(
+                    domain
+                    for domain in domains
+                    if not _domain_patterns_cover(
+                        blocked, _domain_pattern(domain, False)
+                    )
+                )
     return (
         None,
         f'the DNS Firewall associated with {vpc_id} has no BLOCK over "*", so it '

@@ -52542,6 +52542,47 @@ class TestAC49EgressAllowListSync:
         assert rows["vpc-a"]["Status"] == "Passed"
         assert rows["vpc-b"]["Status"] == "Failed"
 
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_wildcard_block_removes_the_names_it_covers(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        # DNS Firewall's "*.partner.io" matches every subdomain of partner.io
+        # and not partner.io itself, so the later ALLOW still answers the apex
+        # and answers neither api.partner.io nor anything under eu.partner.io.
+        rules = [
+            ("BLOCK", ["*.partner.io."]),
+            ("ALLOW", ["example.com.", "partner.io.", "api.partner.io."]),
+            ("ALLOW", ["*.eu.partner.io."]),
+            ("BLOCK", ["*."]),
+        ]
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {"vpc-a": rules, "vpc-b": rules},
+            {
+                "fw1": ["example.com", "partner.io"],
+                "fw2": ["example.com", "partner.io", "api.partner.io"],
+            },
+        )
+
+        assert rows["vpc-a"]["Status"] == "Passed"
+        assert (
+            "admit the same 2 DNS Firewall name(s)" in rows["vpc-a"]["Finding_Details"]
+        )
+        assert rows["vpc-b"]["Status"] == "Failed"
+        assert (
+            "firewall fw2's ALLOWLIST admits api.partner.io, which the DNS Firewall "
+            "allow-list does not" in rows["vpc-b"]["Finding_Details"]
+        )
+        assert (
+            "the DNS Firewall allow-list admits" not in rows["vpc-b"]["Finding_Details"]
+        )
+
     @pytest.mark.parametrize(
         "vpc_a, text, action",
         [
