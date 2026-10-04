@@ -683,6 +683,34 @@ MUTATIONS = [
         "replace": "        if True:\n",
     },
     {
+        "name": "BR-26 probe blames no owner policy for a cross-account denial",
+        "file": BEDROCK,
+        "defect": "BR-26 reports an ApplyGuardrail denial on another account's guardrail as a missing grant in this account, though the owner's resource policy is what refused it",
+        "find": "\n            if _guardrail_apply_denied_cross_account(error, identifier, accounts):\n",
+        "replace": "\n            if False:\n",
+    },
+    {
+        "name": "BR-26 probe calls every ARN denial cross-account",
+        "file": BEDROCK,
+        "defect": "BR-26 blames the owner's resource policy for an ApplyGuardrail denial on this account's own guardrail",
+        "find": '\n    return isinstance(accounts["self"], str) and parts[4] != accounts["self"]\n',
+        "replace": "\n    return True\n",
+    },
+    {
+        "name": "BR-26 probe ignores the different-account denial message",
+        "file": BEDROCK,
+        "defect": "BR-26 misses Bedrock's 'from a different account' denial on a guardrail named by id, so the owner's resource policy goes unnamed",
+        "find": '\n    ):\n        return True\n    parts = identifier.split(":")\n',
+        "replace": '\n    ):\n        pass\n    parts = identifier.split(":")\n',
+    },
+    {
+        "name": "BR-26 probe blames the owner when this account is unknown",
+        "file": BEDROCK,
+        "defect": "BR-26 names the owner's resource policy for an ARN denial although sts:GetCallerIdentity failed, so whose guardrail it is was not established",
+        "find": '\n    return isinstance(accounts["self"], str) and parts[4]',
+        "replace": "\n    return parts[4]",
+    },
+    {
         "name": "BR-51 stops matching the tag key to its access control attribute",
         "file": BEDROCK,
         "defect": "BR-51 never finds the configured attribute for a Deny's tag key, "
@@ -6982,6 +7010,18 @@ GROUPS: dict[str, str] = {
         "in the Bedrock knowledge base redaction"
     ),
     "a guardrail that lets an example key through passes the BR-26 probe": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe blames no owner policy for a cross-account denial": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe calls every ARN denial cross-account": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe ignores the different-account denial message": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe blames the owner when this account is unknown": (
         "in the Bedrock guardrail output probe"
     ),
     "BR-51 stops matching the tag key to its access control attribute": (

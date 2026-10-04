@@ -722,6 +722,17 @@ Resources:
             Action:
               - bedrock:GetGuardrail # BR-10, BR-26, BR-27, BR-34, BR-41, BR-46
             Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:*:guardrail/*'
+          - Sid: CrossAccountGuardrailOutputProbe
+            # BR-26 applies an org-enforced or other cross-account guardrail
+            # version to its fixed OUTPUT probe string. The call succeeds only
+            # when the owner's guardrail resource policy also allows
+            # bedrock:ApplyGuardrail (guardrails-resource-based-policies.html).
+            # The service authorization reference marks ApplyGuardrail IsWrite
+            # false and gives it the guardrail resource type.
+            Effect: Allow
+            Action:
+              - bedrock:ApplyGuardrail # BR-26
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:*:guardrail/*'
           - Sid: MicrovmRead
             # GetMicrovm authorizes on the microvmImage resource type. A
             # MicroVM may run an AWS-managed image, whose ARN has the account

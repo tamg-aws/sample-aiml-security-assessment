@@ -21107,6 +21107,34 @@ SENSITIVE_OUTPUT_PROBE_TEXT = (
 SENSITIVE_OUTPUT_PROBE_TYPES = ("AWS_ACCESS_KEY", "AWS_SECRET_KEY")
 
 
+def _guardrail_apply_denied_cross_account(
+    error: Exception, identifier: str, accounts: Dict[str, Any]
+) -> bool:
+    """
+    Whether an ApplyGuardrail AccessDeniedException is on a guardrail another
+    account owns: Bedrock says the ARN is from a different account, or the
+    guardrail ARN's account segment is not this account. ``accounts`` caches
+    this account's id under "self" (None when sts:GetCallerIdentity failed).
+    """
+    if get_assessment_error_label(error) != "AccessDeniedException":
+        return False
+    if GUARDRAIL_CROSS_ACCOUNT_DENIAL in str(
+        getattr(error, "response", {}).get("Error", {}).get("Message", "")
+    ):
+        return True
+    parts = identifier.split(":")
+    if not identifier.startswith("arn:") or len(parts) < 6 or not parts[4]:
+        return False
+    if "self" not in accounts:
+        try:
+            accounts["self"] = boto3.client(
+                "sts", config=boto3_config
+            ).get_caller_identity()["Account"]
+        except (ClientError, BotoCoreError, KeyError, TypeError):
+            accounts["self"] = None
+    return isinstance(accounts["self"], str) and parts[4] != accounts["self"]
+
+
 def _sensitive_output_probe_findings(
     region: str, attachment_inventory: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -21131,7 +21159,7 @@ def _sensitive_output_probe_findings(
             region=region,
         )
 
-    clients, rows = {}, []
+    clients, rows, accounts = {}, [], {}
     for (identifier, version), entry in sorted(
         (attachment_inventory.get("versions") or {}).items()
     ):
@@ -21156,13 +21184,27 @@ def _sensitive_output_probe_findings(
                 outputScope="INTERVENTIONS",
             )
         except (ClientError, BotoCoreError) as error:
+            reason = get_assessment_error_label(error)
+            resolution = (
+                "Grant bedrock:ApplyGuardrail on the guardrail and re-run the "
+                "assessment."
+            )
+            if _guardrail_apply_denied_cross_account(error, identifier, accounts):
+                reason = (
+                    f"{reason}: the owner's guardrail resource policy does not "
+                    "allow bedrock:ApplyGuardrail to this account"
+                )
+                resolution = (
+                    "Ask the guardrail's owner to allow bedrock:ApplyGuardrail to "
+                    "this account in the guardrail resource policy, and re-run the "
+                    "assessment."
+                )
             rows.append(
                 row(
                     f"The {label} was not probed with bedrock:ApplyGuardrail "
-                    f"({get_assessment_error_label(error)}), so whether it acts on "
-                    "credentials in model output was not observed.",
-                    "Grant bedrock:ApplyGuardrail on the guardrail and re-run the "
-                    "assessment.",
+                    f"({reason}), so whether it acts on credentials in model "
+                    "output was not observed.",
+                    resolution,
                     "Informational",
                     "N/A",
                 )

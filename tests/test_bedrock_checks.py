@@ -38770,8 +38770,9 @@ def _probe_response(action, **entities):
     }
 
 
-def _probe_rows(versions, responses):
+def _probe_rows(versions, responses, account="123456789012"):
     client = MagicMock()
+    client.get_caller_identity.return_value = {"Account": account}
     regions = []
 
     def make_client(service, region_name=None, **_):
@@ -38881,6 +38882,78 @@ def test_br26_output_probe_error_is_na_and_does_not_hide_the_next_version():
         in (rows[0]["Finding_Details"])
     )
     assert len(calls) == 2
+
+
+_PROBE_OWNER_POLICY = (
+    "AccessDeniedException: the owner's guardrail resource policy does not "
+    "allow bedrock:ApplyGuardrail to this account"
+)
+
+
+def test_br26_output_probe_cross_account_denial_names_the_owner_policy():
+    """Two denied ARNs: only the one another account owns blames its policy."""
+    other = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+    own = "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-own"
+    rows, calls, _ = _probe_rows(
+        {
+            (other, "1"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+            (own, "1"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+        },
+        {
+            (other, "1"): _make_client_error("AccessDeniedException", "denied"),
+            (own, "1"): _make_client_error("AccessDeniedException", "denied"),
+        },
+    )
+    assert len(calls) == 2
+    by_arn = {
+        arn: next(r for r in rows if f"guardrail {arn} version" in r["Finding_Details"])
+        for arn in (other, own)
+    }
+    assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+    assert _PROBE_OWNER_POLICY in by_arn[other]["Finding_Details"]
+    assert "guardrail resource policy" in by_arn[other]["Resolution"]
+    assert "owner's" not in by_arn[own]["Finding_Details"]
+    assert by_arn[own]["Resolution"].startswith("Grant bedrock:ApplyGuardrail")
+
+
+def test_br26_output_probe_different_account_message_names_the_owner_policy():
+    rows, _, _ = _probe_rows(
+        {("gr-org", "2"): (_PROBE_PASSING_DETAIL, "us-east-1")},
+        {
+            ("gr-org", "2"): _make_client_error(
+                "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+            )
+        },
+    )
+    assert [r["Status"] for r in rows] == ["N/A"]
+    assert _PROBE_OWNER_POLICY in rows[0]["Finding_Details"]
+
+
+def test_br26_output_probe_unread_caller_account_does_not_blame_the_owner():
+    other = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+    rows, _, _ = _probe_rows(
+        {(other, "1"): (_PROBE_PASSING_DETAIL, "us-east-1")},
+        {(other, "1"): _make_client_error("AccessDeniedException", "denied")},
+        account=None,
+    )
+    assert [r["Status"] for r in rows] == ["N/A"]
+    assert "owner's" not in rows[0]["Finding_Details"]
+
+
+def test_br26_output_probe_runs_on_a_guardrail_another_account_owns():
+    other = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+    rows, calls, _ = _probe_rows(
+        {(other, "1"): (_PROBE_PASSING_DETAIL, "us-east-1")},
+        {
+            (other, "1"): _probe_response(
+                "GUARDRAIL_INTERVENED",
+                AWS_ACCESS_KEY="BLOCKED",
+                AWS_SECRET_KEY="BLOCKED",
+            )
+        },
+    )
+    assert [(i, v) for i, v, _ in calls] == [(other, "1")]
+    assert [r["Status"] for r in rows] == ["Passed"]
 
 
 def test_br26_output_probe_skips_failing_and_unread_versions_and_uses_their_region():
