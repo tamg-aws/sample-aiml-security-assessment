@@ -55,7 +55,10 @@ AI_SUBJECT_ROWS = [
         "configuration API records whether a workload screens those fields, so every "
         "row states it. The knowledge base redaction leg never passes: a "
         "transformation Lambda's logic is not read and a RetrieveAndGenerate caller "
-        "supplies its guardrail per request, so a screened knowledge base is N/A",
+        "supplies its guardrail per request, so a screened knowledge base is N/A. A guardrail another account owns, such as an "
+        "organization-enforced guardrail, is read with a cross-account "
+        "bedrock:GetGuardrail grant, and a read its owner's resource policy "
+        "denies is N/A naming that policy",
         [],
         3,
     ),
@@ -175,7 +178,10 @@ AI_SUBJECT_ROWS = [
         "us-east-1 on 2026-10-04 did not appear in CloudTrail LookupEvents, so it "
         "is not a management event, and the call leaves no stored configuration. "
         "Whether an application screens toolUse input and toolResult content, "
-        "which the filter never evaluates, is runtime behaviour no API reports",
+        "which the filter never evaluates, is runtime behaviour no API reports. A guardrail another account owns, such as an "
+        "organization-enforced guardrail, is read with a cross-account "
+        "bedrock:GetGuardrail grant, and a read its owner's resource policy "
+        "denies is N/A naming that policy",
         [],
         3,
     ),
@@ -229,7 +235,10 @@ AI_SUBJECT_ROWS = [
         "requestParameters name the guardrail and version: it fails when that "
         "version has contextual grounding filters, is excluded when it has none, "
         "and is N/A with no matching event or a failed read. "
-        "Automated Reasoning checks are reported, not judged",
+        "Automated Reasoning checks are reported, not judged. A guardrail another account owns, such as an "
+        "organization-enforced guardrail, is read with a cross-account "
+        "bedrock:GetGuardrail grant, and a read its owner's resource policy "
+        "denies is N/A naming that policy",
         [],
         3,
     ),

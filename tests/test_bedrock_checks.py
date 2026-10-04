@@ -9250,6 +9250,15 @@ def _make_client_error(code, message="error"):
     return ClientError({"Error": {"Code": code, "Message": message}}, "operation")
 
 
+# What GetGuardrail on another account's guardrail answered on 2026-10-04, and
+# the error text each guardrail read gives it.
+CROSS_ACCOUNT_DENIAL = "The provided resource ARN is from a different account."
+CROSS_ACCOUNT_GUARDRAIL_ERROR = (
+    "AccessDeniedException: the owner's guardrail resource policy does not allow "
+    "bedrock:GetGuardrail to this account, or the guardrail does not exist there"
+)
+
+
 def _sagemaker_search(training_jobs, training_error=None, trial_components=None):
     """
     A SageMaker Search side effect. Resource TrainingJob returns each
@@ -10896,6 +10905,47 @@ class TestBR41CentralGuardrailEnforcement:
         ]
         assert [f["Status"] for f in share] == ["Failed"]
         assert "grants no other account" in share[0]["Finding_Details"]
+
+    # GRD-10: the Automated Reasoning read of an enforced version in the
+    # administrator account is denied by that account's resource policy.
+    def test_br41_a_denied_cross_account_reasoning_read_names_the_resource_policy(
+        self,
+    ):
+        client = MagicMock()
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        with patch("bedrock_app.boto3.client", return_value=client):
+            reading = bedrock_app._enforced_guardrail_reasoning_policies(
+                self.GUARDRAIL_ARN, "3", "us-east-1", {}
+            )
+        assert reading["read"] is False
+        assert (
+            f"bedrock:GetGuardrail ({CROSS_ACCOUNT_GUARDRAIL_ERROR})"
+            in (reading["error"])
+        )
+
+    # GRD-10: a guardrail resource policy can allow only ApplyGuardrail and
+    # GetGuardrail, so the share is a ceiling outside the owner account.
+    def test_br41_a_share_outside_its_owner_account_is_a_ceiling(self):
+        client = MagicMock()
+        with patch("bedrock_app.boto3.client", return_value=client):
+            row = bedrock_app._guardrail_share_finding(
+                "arn:aws:bedrock:us-east-1:523402589643:guardrail/gr-org",
+                "178113193057",
+                "https://example.com",
+                "us-east-1",
+            )
+        client.get_resource_policy.assert_not_called()
+        assert row["Status"] == "N/A"
+        assert (
+            "can allow only bedrock:ApplyGuardrail and bedrock:GetGuardrail"
+            in row["Finding_Details"]
+            and "no policy can let account 178113193057 call "
+            "bedrock:GetResourcePolicy on it"
+            in row["Finding_Details"]
+        )
+        assert "readable only there" not in row["Finding_Details"]
 
     def test_br41_share_to_every_principal_fails(self):
         _, findings = self._run(
@@ -17513,6 +17563,27 @@ class TestBR46PromptPiiScreening:
         (passed,) = self._status(findings, "Passed")
         assert "logged invocation req-1" in passed["Finding_Details"]
 
+    def test_br46_prompt_denied_cross_account_guardrail_names_the_resource_policy(
+        self,
+    ):
+        arn = "arn:aws:bedrock:us-east-1:999988887777:guardrail/g9"
+        findings = self._run(
+            guardrails=["g1"],
+            details={
+                "g1": self.INPUT_PII,
+                (arn, "4"): _make_client_error(
+                    "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+                ),
+            },
+            joins={"resolved": {"req-1": {"guardrail": arn, "version": "4"}}},
+        )
+        assert not self._status(findings, "Passed")
+        assert any(
+            f"bedrock:GetGuardrail ({CROSS_ACCOUNT_GUARDRAIL_ERROR})"
+            in row["Finding_Details"]
+            for row in findings
+        )
+
     def test_br46_prompt_unread_guardrail_holds_passed_at_na(self):
         """GetGuardrail failing on any listed guardrail keeps the leg off Passed."""
         findings = self._run(
@@ -21935,6 +22006,47 @@ class TestKnowledgeBaseScreening:
             call(agentId="A1", agentVersion="3", maxResults=100),
         ]
 
+    # GRD-02: an agent's guardrail in another account that its owner does not
+    # share is named as such.
+    def test_inventory_names_a_denied_cross_account_agent_guardrail(self):
+        arn = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+        client = MagicMock()
+        client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [{"knowledgeBaseId": "KB1", "name": "one"}]
+        }
+        client.list_data_sources.return_value = {"dataSourceSummaries": []}
+        client.list_agents.return_value = {
+            "agentSummaries": [{"agentId": "A1", "agentName": "agent"}]
+        }
+        client.list_agent_aliases.return_value = {
+            "agentAliasSummaries": [{"routingConfiguration": [{"agentVersion": "3"}]}]
+        }
+        client.get_agent_version.return_value = {
+            "agentVersion": {
+                "guardrailConfiguration": {
+                    "guardrailIdentifier": arn,
+                    "guardrailVersion": "1",
+                }
+            }
+        }
+        client.list_agent_knowledge_bases.return_value = {
+            "agentKnowledgeBaseSummaries": [
+                {"knowledgeBaseId": "KB1", "knowledgeBaseState": "ENABLED"}
+            ]
+        }
+        client.list_flows.return_value = {"flowSummaries": []}
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        with patch("bedrock_app.boto3.client", return_value=client):
+            inventory = bedrock_app.get_knowledge_base_screening_inventory(
+                self.REGION, {"attachments": [], "versions": {}, "errors": []}
+            )
+        assert inventory["details"][(arn, "1")] == {
+            "detail": None,
+            "error": CROSS_ACCOUNT_GUARDRAIL_ERROR,
+        }
+
     def test_inventory_records_an_unread_agent_for_every_knowledge_base(self):
         client = MagicMock()
         client.list_knowledge_bases.return_value = {
@@ -22814,7 +22926,15 @@ class TestGuardrailConditionPins:
             "management_account": management,
         }
 
-    def _run(self, cache, scps=None, effective=None, versions=None, in_use=True):
+    def _run(
+        self,
+        cache,
+        scps=None,
+        effective=None,
+        versions=None,
+        in_use=True,
+        get_guardrail=None,
+    ):
         agent_client = MagicMock()
         agent_client.list_agents.return_value = {"agentSummaries": []}
         agent_client.list_flows.return_value = {"flowSummaries": []}
@@ -22825,9 +22945,9 @@ class TestGuardrailConditionPins:
         bedrock_client.list_guardrails.return_value = {
             "guardrails": [{"id": "gr-9", "version": v} for v in versions or []]
         }
-        bedrock_client.get_guardrail.side_effect = lambda **kwargs: {
-            "guardrail": dict(kwargs)
-        }
+        bedrock_client.get_guardrail.side_effect = get_guardrail or (
+            lambda **kwargs: {"guardrail": dict(kwargs)}
+        )
         orgs_client = MagicMock()
         if effective is None:
             orgs_client.describe_effective_policy.side_effect = ClientError(
@@ -22900,6 +23020,61 @@ class TestGuardrailConditionPins:
             (self.PINNED, "2"),
             (self.PINNED, "DRAFT"),
         ]
+
+    # GRD-01: a pin with no version lets a caller name the working draft or any
+    # of up to 20 published versions; a read cap of 20 left all 21 unread.
+    def test_an_unversioned_pin_reads_all_twenty_versions_and_the_draft(self):
+        cache = _br10_cache(
+            roles={"Pinned": _br10_identity(_br10_bound(self.PINNED))}, errors=[]
+        )
+        versions = [str(number) for number in range(1, 21)]
+        inventory = self._run(cache, versions=versions)
+        assert inventory["errors"] == []
+        assert sorted(inventory["versions"]) == sorted(
+            (self.PINNED, version) for version in versions + ["DRAFT"]
+        )
+        assert all(entry["detail"] for entry in inventory["versions"].values())
+
+    def test_guardrail_version_reads_stop_at_the_deadline(self, monkeypatch):
+        cache = _br10_cache(
+            roles={"Pinned": _br10_identity(_br10_bound(f"{self.PINNED}:3"))},
+            errors=[],
+        )
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        inventory = self._run(cache)
+        entry = inventory["versions"][(self.PINNED, "3")]
+        assert (entry["detail"], entry["error"]) == (None, bedrock_app.DEADLINE_STOP)
+
+    # GRD-01: an organization-enforced guardrail lives in another account, and
+    # its owner's resource policy decides whether this account can read it.
+    OWNED_ELSEWHERE = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+
+    def test_a_denied_cross_account_pin_names_the_owner_resource_policy(self):
+        cache = _br10_cache(
+            roles={
+                "Org": _br10_identity(_br10_bound(f"{self.OWNED_ELSEWHERE}:1")),
+                "Local": _br10_identity(_br10_bound(f"{self.PINNED}:2")),
+            },
+            errors=[],
+        )
+
+        def get_guardrail(guardrailIdentifier, guardrailVersion):
+            if guardrailIdentifier == self.OWNED_ELSEWHERE:
+                raise _make_client_error("AccessDeniedException", CROSS_ACCOUNT_DENIAL)
+            raise _make_client_error(
+                "AccessDeniedException",
+                "User: arn:aws:sts::123456789012:assumed-role/r/s is not "
+                "authorized to perform: bedrock:GetGuardrail",
+            )
+
+        inventory = self._run(cache, get_guardrail=get_guardrail)
+        assert (
+            inventory["versions"][(self.OWNED_ELSEWHERE, "1")]["error"]
+            == CROSS_ACCOUNT_GUARDRAIL_ERROR
+        )
+        assert inventory["versions"][(self.PINNED, "2")]["error"] == (
+            "AccessDeniedException"
+        )
 
     def test_a_wildcard_pin_is_reported_and_not_enumerated(self):
         cache = _br10_cache(
@@ -47268,6 +47443,30 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["N/A"]
         assert phrase in rows[0]["Finding_Details"]
 
+    # GRD-09: a grounding version in another account that its owner's resource
+    # policy does not share is named as such.
+    def test_a_denied_cross_account_grounding_version_names_the_resource_policy(
+        self,
+    ):
+        guardrails = self._grounding_guardrails()
+        guardrails[("gr-g", "1")] = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.CONVERSE: [
+                    [self._qualified("req-u", ["grounding_source", "query"])]
+                ],
+            },
+            guardrails=guardrails,
+        )
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "guardrail gr-g version 1 was not read with bedrock:GetGuardrail "
+            f"({CROSS_ACCOUNT_GUARDRAIL_ERROR})" in rows[0]["Finding_Details"]
+        )
+
     # GRD-09: an InvokeModel caller marks the grounding source and query with
     # suffixed tags in the body, which were never read.
     def _grounded_invoke(self, request_id, tags, assessed=False, suffix="xyz"):
@@ -50160,6 +50359,33 @@ class TestInvocationDeadline:
         assert reading["unread"] == (
             f"the read of its versions from 2 on stopped {bedrock_app.DEADLINE_STOP}"
         )
+
+    # GRD-01: every version a versionless value can name is read; a cap of 20
+    # held the value unread at 21 (20 published versions and the draft).
+    def test_br10_guardrail_directions_read_all_twenty_one_versions(self):
+        bedrock = MagicMock()
+        bedrock.list_guardrails.return_value = {
+            "guardrails": [{"version": str(number)} for number in range(1, 21)]
+        }
+        bedrock.get_guardrail.return_value = {}
+        reading = bedrock_app._read_guardrail_directions(
+            "gr-1", "us-east-1", {"us-east-1": bedrock}
+        )
+        assert bedrock.get_guardrail.call_count == 21
+        assert reading["unread"] == ""
+        assert len(reading["blocked"]) == 21
+
+    def test_br10_a_denied_cross_account_value_names_the_owner_resource_policy(self):
+        bedrock = MagicMock()
+        bedrock.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        reading = bedrock_app._read_guardrail_directions(
+            "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org:1",
+            "us-east-1",
+            {"us-east-1": bedrock},
+        )
+        assert reading["unread"] == CROSS_ACCOUNT_GUARDRAIL_ERROR
 
     def test_the_redaction_source_listing_stops_at_the_deadline(self):
         s3 = MagicMock()

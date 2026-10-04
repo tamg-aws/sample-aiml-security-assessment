@@ -146,6 +146,7 @@ _EXPECTED_ACTIONS = {
         "athena:ListDataCatalogs",
         "bedrock-agentcore:ListHarnesses",
         "bedrock-agentcore:ListTagsForResource",
+        "bedrock:GetGuardrail",
         "bedrock:ListCustomModelDeployments",
         "bedrock:ListPromptRouters",
         "bedrock:ListTagsForResource",
@@ -1370,6 +1371,18 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
                 '"*"',
             ),
             ("AIOwnerTagRead", "Allow", "sagemaker:ListTags", owner_tag_arns),
+            # A guardrail another account owns, such as an organization-enforced
+            # guardrail in the administrator account, needs the account segment
+            # open; the owner's resource policy must also allow the read.
+            (
+                "CrossAccountGuardrailRead",
+                "Allow",
+                "bedrock:GetGuardrail",
+                json.dumps(
+                    {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:*:guardrail/*"},
+                    sort_keys=True,
+                ),
+            ),
             (
                 "AIOwnerTagRead",
                 "Allow",

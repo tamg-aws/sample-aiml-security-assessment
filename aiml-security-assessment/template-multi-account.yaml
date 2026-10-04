@@ -700,6 +700,16 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:cluster/*'
               - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
+          - Sid: CrossAccountGuardrailRead
+            # BR-10, BR-26, BR-27, BR-34, BR-41 and BR-46 read guardrails that
+            # another account owns, such as an organization-enforced guardrail
+            # in the administrator account. The read succeeds only when the
+            # owner's guardrail resource policy also allows bedrock:GetGuardrail
+            # (Amazon Bedrock User Guide, guardrails-resource-based-policies.html).
+            Effect: Allow
+            Action:
+              - bedrock:GetGuardrail # BR-10, BR-26, BR-27, BR-34, BR-41, BR-46
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:*:guardrail/*'
           - Sid: MicrovmRead
             # GetMicrovm authorizes on the microvmImage resource type. A
             # MicroVM may run an AWS-managed image, whose ARN has the account

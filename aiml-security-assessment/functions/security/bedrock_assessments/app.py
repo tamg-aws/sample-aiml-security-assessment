@@ -642,13 +642,6 @@ def get_guardrail_attachment_inventory(
                     }
                     | {GUARDRAIL_DRAFT_VERSION}
                 )
-                if len(versions) > MAX_GUARDRAIL_VERSION_READS:
-                    errors.append(
-                        f"guardrail {value} has {len(versions)} versions, over the "
-                        f"read cap of {MAX_GUARDRAIL_VERSION_READS}, and "
-                        f"{', '.join(sorted(surfaces))} names it with no version"
-                    )
-                    continue
             for version in versions:
                 for surface in sorted(surfaces):
                     attach(surface, value, version)
@@ -674,6 +667,9 @@ def get_guardrail_attachment_inventory(
         if attachment.get("narrowings"):
             entry["narrowings"][attachment["surface"]] = attachment["narrowings"]
         inventory["versions"][key] = entry
+        if _deadline_reached():
+            entry["error"] = DEADLINE_STOP
+            continue
         if target_region not in clients:
             clients[target_region] = boto3.client(
                 "bedrock", config=boto3_config, region_name=target_region
@@ -685,7 +681,7 @@ def get_guardrail_attachment_inventory(
             )
             entry["detail"] = response.get("guardrail", response)
         except (ClientError, BotoCoreError) as error:
-            entry["error"] = get_assessment_error_label(error)
+            entry["error"] = _guardrail_read_error(error)
     return inventory
 
 
@@ -9973,7 +9969,28 @@ GUARDRAIL_ALLOW_OPERATORS = (
     "arnlike",
 )
 
-MAX_GUARDRAIL_VERSION_READS = 20
+# Bedrock answers a GetGuardrail on another account's guardrail with this
+# AccessDeniedException message when the role's own grant allows the read, and
+# gives the same answer for a guardrail that does not exist there (measured
+# 2026-10-04). A cross-account read needs the owner's resource policy too.
+GUARDRAIL_CROSS_ACCOUNT_DENIAL = "from a different account"
+
+
+def _guardrail_read_error(error: Exception) -> str:
+    """Label a failed GetGuardrail, naming a denied cross-account read as such."""
+    label = get_assessment_error_label(error)
+    if (
+        isinstance(error, ClientError)
+        and label == "AccessDeniedException"
+        and GUARDRAIL_CROSS_ACCOUNT_DENIAL
+        in str(error.response.get("Error", {}).get("Message", ""))
+    ):
+        return (
+            f"{label}: the owner's guardrail resource policy does not allow "
+            "bedrock:GetGuardrail to this account, or the guardrail does not "
+            "exist there"
+        )
+    return label
 
 
 def _guardrail_allow_binding(statement: Dict[str, Any]) -> Dict[str, Any]:
@@ -10138,12 +10155,6 @@ def _read_guardrail_directions(
                 }
                 | {GUARDRAIL_DRAFT_VERSION}
             )
-        if len(versions) > MAX_GUARDRAIL_VERSION_READS:
-            result["unread"] = (
-                f"{len(versions)} versions exceed the read cap of "
-                f"{MAX_GUARDRAIL_VERSION_READS}"
-            )
-            return result
         for version in versions:
             if _deadline_reached():
                 result["unread"] = (
@@ -10173,7 +10184,7 @@ def _read_guardrail_directions(
         if error.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
             result["missing"] = True
         else:
-            result["unread"] = get_assessment_error_label(error)
+            result["unread"] = _guardrail_read_error(error)
     except BotoCoreError as error:
         result["unread"] = get_assessment_error_label(error)
     return result
@@ -13228,8 +13239,10 @@ def _guardrail_share_finding(
     """
     Judge whether a centrally enforced guardrail is shared with member accounts.
 
-    The resource policy is readable only by the guardrail's owner, so a run in
-    another account reports the share as not read.
+    A guardrail resource policy can allow only bedrock:ApplyGuardrail and
+    bedrock:GetGuardrail, so no policy lets another account call
+    bedrock:GetResourcePolicy on it, and a run in another account reports the
+    share as a ceiling.
     """
     parts = guardrail_arn.split(":")
     owner = parts[4] if len(parts) > 4 else ""
@@ -13249,10 +13262,13 @@ def _guardrail_share_finding(
 
     if owner != caller_account:
         return row(
-            f"Guardrail {guardrail_arn} is owned by account {owner}, and its "
-            "resource policy is readable only there, so whether it is shared with "
-            "the member accounts that enforce it was not read from account "
-            f"{caller_account or 'unknown'}.",
+            f"Guardrail {guardrail_arn} is owned by account {owner}. A guardrail "
+            "resource policy can allow only bedrock:ApplyGuardrail and "
+            "bedrock:GetGuardrail (Amazon Bedrock User Guide, "
+            "guardrails-resource-based-policies.html), so no policy can let "
+            f"account {caller_account or 'unknown'} call bedrock:GetResourcePolicy "
+            "on it, and whether it is shared with the member accounts that enforce "
+            "it cannot be read outside its owner account.",
             "Run the assessment in the guardrail's owning account to read the share.",
             "Informational",
             "N/A",
@@ -13351,7 +13367,7 @@ def _enforced_guardrail_reasoning_policies(
                     guardrail or "unnamed",
                     version or "none",
                     scan_region,
-                    get_assessment_error_label(error),
+                    _guardrail_read_error(error),
                 ),
             }
     return cache[key]
@@ -19332,7 +19348,7 @@ def get_knowledge_base_screening_inventory(
         except (ClientError, BotoCoreError) as error:
             inventory["details"][key] = {
                 "detail": None,
-                "error": get_assessment_error_label(error),
+                "error": _guardrail_read_error(error),
             }
     return inventory
 
@@ -22928,7 +22944,7 @@ def check_guardrail_grounding_score_evidence(
                     unjudged.append(
                         f"guardrail {identifier} version {version} was not read "
                         "with bedrock:GetGuardrail "
-                        f"({get_assessment_error_label(error)})"
+                        f"({_guardrail_read_error(error)})"
                     )
             return grounding_versions[key]
 
@@ -37006,7 +37022,7 @@ def check_bedrock_prompt_pii_screening(
                 )
                 entry["detail"] = response.get("guardrail", response)
             except (ClientError, BotoCoreError) as error:
-                entry["error"] = get_assessment_error_label(error)
+                entry["error"] = _guardrail_read_error(error)
 
         screening, unscreened = [], []
         for (identifier, version), entry in sorted(used.items()):
