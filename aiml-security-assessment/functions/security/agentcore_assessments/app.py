@@ -14,8 +14,10 @@ import logging
 import os
 import re
 import time
+import zipfile
+import zlib
 from fnmatch import fnmatchcase
-from io import StringIO
+from io import BytesIO, StringIO
 from urllib.parse import parse_qsl, unquote, urlsplit
 from urllib.request import urlopen
 from datetime import datetime, timezone
@@ -23874,13 +23876,19 @@ CREDENTIAL_TEXT_PATTERN = re.compile(
 
 # What every passing AC-34 finding states it could not read.
 AC34_CODE_CEILING = (
-    "The agent's code was not scanned: GetAgentRuntime names it in "
-    "agentRuntimeArtifact.codeConfiguration.code.s3, but the assessment role is "
-    "not granted s3:GetObject to fetch it. A container image's configuration is "
-    "judged in the AgentCore Runtime Image Inline Credentials row, and its file "
-    "system layers are not scanned."
+    "The agent's code that agentRuntimeArtifact names in S3 is judged in the "
+    "AgentCore Runtime Code Inline Credentials row. A container image's configuration is judged in the "
+    "AgentCore Runtime Image Inline Credentials row, and its file system layers "
+    "are not scanned."
 )
 AC34_IMAGE_FINDING = "AgentCore Runtime Image Inline Credentials"
+AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
+# Bounds on the code archive AC-34 reads from S3: the archive is held in memory
+# whole, each file is read on its own, and a file larger than its bound is
+# counted as not scanned.
+AC34_CODE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
+AC34_CODE_FILE_MAX_BYTES = 4 * 1024 * 1024
+AC34_CODE_UNPACKED_MAX_BYTES = 256 * 1024 * 1024
 # The manifest media types BatchGetImage is asked to return. An image index or
 # manifest list names one manifest per platform, and each is read.
 ECR_IMAGE_MANIFEST_TYPES = (
@@ -24156,6 +24164,7 @@ def _harness_inline_credentials(harness: Dict[str, Any]) -> Tuple[List[str], int
 
 def _agentcore_runtime_credential_findings(
     images: Optional[Dict[str, Tuple[str, Set[str]]]] = None,
+    codes: Optional[Dict[str, Set[Tuple[str, str, str]]]] = None,
 ) -> List[Dict[str, Any]]:
     """AC-34's runtime leg: one finding per runtime version's environment variables.
 
@@ -24165,9 +24174,11 @@ def _agentcore_runtime_credential_findings(
     ListAgentRuntimeEndpoints reports is read and judged on its own row, as
     AC-30 does for the inbound authorizer. When images is given, the container
     image URI of each version read is recorded in it, keyed by runtime label,
-    for the image leg.
+    for the image leg, and codes gets each version's S3 code location for the
+    code leg.
     """
     images = {} if images is None else images
+    codes = {} if codes is None else codes
 
     def record_image(label: str, details: Dict[str, Any]) -> None:
         uri = (
@@ -24179,6 +24190,19 @@ def _agentcore_runtime_credential_findings(
                 label, (_arn_account(details.get("agentRuntimeArn")) or "", set())
             )
             uris.add(uri)
+        location = (
+            (
+                (details.get("agentRuntimeArtifact") or {}).get("codeConfiguration")
+                or {}
+            ).get("code")
+            or {}
+        ).get("s3") or {}
+        bucket, key = location.get("bucket"), location.get("prefix")
+        if isinstance(bucket, str) and isinstance(key, str) and bucket and key:
+            version_id = location.get("versionId")
+            codes.setdefault(label, set()).add(
+                (bucket, key, version_id if isinstance(version_id, str) else "")
+            )
 
     try:
         runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
@@ -24343,6 +24367,205 @@ def _agentcore_runtime_credential_findings(
             findings.append(judge(version_label, version_details))
             record_image(label, version_details)
 
+    return findings
+
+
+def _read_s3_object_bounded(
+    bucket: str,
+    key: str,
+    max_bytes: int,
+    version_id: Optional[str] = None,
+    expected_owner: Optional[str] = None,
+) -> bytes:
+    """Read one named S3 object, refusing one larger than max_bytes.
+
+    Only the exact key is read; nothing is listed. Raises ClientError,
+    BotoCoreError or ValueError, so a caller never treats an unread object as
+    clean.
+    """
+    request: Dict[str, str] = {"Bucket": bucket, "Key": key}
+    if version_id:
+        request["VersionId"] = version_id
+    if expected_owner:
+        request["ExpectedBucketOwner"] = expected_owner
+    response = s3_client.get_object(**request)
+    body = response["Body"]
+    try:
+        size = response.get("ContentLength")
+        if isinstance(size, int) and size > max_bytes:
+            raise ValueError(
+                f"the object is {size} bytes, more than the {max_bytes} byte bound"
+            )
+        data = body.read(max_bytes + 1)
+    finally:
+        body.close()
+    if len(data) > max_bytes:
+        raise ValueError(f"the object is more than the {max_bytes} byte bound")
+    return data
+
+
+def _code_archive_credentials(
+    bucket: str, key: str, version_id: Optional[str]
+) -> Tuple[List[str], int, List[str]]:
+    """Scan every file of a runtime's code archive for inline credentials.
+
+    Returns the findings (file names, and variable names for a .env file,
+    never values), the files scanned, and the files not scanned because they
+    exceed AC34_CODE_FILE_MAX_BYTES. Raises ValueError for an archive over its
+    bound, one that is not a zip, or a file that cannot be read, so a partly
+    read archive is never reported clean.
+    """
+    data = _read_s3_object_bounded(
+        bucket, key, AC34_CODE_ARCHIVE_MAX_BYTES, version_id=version_id
+    )
+    try:
+        archive = zipfile.ZipFile(BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("the object is not a zip archive") from None
+    found: List[str] = []
+    oversized: List[str] = []
+    scanned = 0
+    unpacked = 0
+    with archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            if info.file_size > AC34_CODE_FILE_MAX_BYTES:
+                oversized.append(info.filename)
+                continue
+            unpacked += info.file_size
+            if unpacked > AC34_CODE_UNPACKED_MAX_BYTES:
+                raise ValueError(
+                    "the archive unpacks to more than the "
+                    f"{AC34_CODE_UNPACKED_MAX_BYTES} byte bound"
+                )
+            try:
+                text = archive.read(info).decode("utf-8", "ignore")
+            except (RuntimeError, NotImplementedError, zipfile.BadZipFile, zlib.error):
+                raise ValueError(
+                    f"file {info.filename} in the archive could not be read"
+                ) from None
+            scanned += 1
+            if _text_holds_a_credential(text):
+                found.append(info.filename)
+            if info.filename.rsplit("/", 1)[-1].endswith(".env"):
+                environment = {}
+                for line in text.splitlines():
+                    name, separator, value = line.strip().partition("=")
+                    if separator and name and not name.startswith("#"):
+                        name = name.removeprefix("export ").strip()
+                        environment[name] = value.strip().strip("'\"")
+                literals, _ = _credential_entries(environment)
+                found.extend(f"{info.filename} variable {name}" for name in literals)
+    return found, scanned, oversized
+
+
+def _agentcore_runtime_code_credential_findings(
+    codes: Dict[str, Set[Tuple[str, str, str]]],
+) -> List[Dict[str, Any]]:
+    """AC-34's code leg: scan each runtime's code archive in S3.
+
+    agentRuntimeArtifact.codeConfiguration.code.s3 names a bucket, an object
+    key (prefix) and an optional version. Only that exact object is read; no
+    bucket is listed. codes holds the locations of every version the runtime
+    leg read, keyed by runtime label. Each file is matched for an AWS access
+    key ID or a private key block, and a .env file's variables are judged as
+    the environment variable row judges them.
+    """
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-34",
+            finding_name=AC34_CODE_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    bounds = (
+        f"Archives over {AC34_CODE_ARCHIVE_MAX_BYTES // (1024 * 1024)} MiB, or "
+        f"unpacking to over {AC34_CODE_UNPACKED_MAX_BYTES // (1024 * 1024)} MiB, "
+        "are not read, and files over "
+        f"{AC34_CODE_FILE_MAX_BYTES // (1024 * 1024)} MiB are not scanned."
+    )
+    findings: List[Dict[str, Any]] = []
+    for label, locations in codes.items():
+        found: List[str] = []
+        unread: List[str] = []
+        scanned: List[str] = []
+        for bucket, key, version_id in sorted(locations):
+            where = f"s3://{bucket}/{key}" + (
+                f" (version {version_id})" if version_id else ""
+            )
+            try:
+                credentials, files, oversized = _code_archive_credentials(
+                    bucket, key, version_id or None
+                )
+            except (BotoCoreError, ClientError, ValueError) as error:
+                # A ValueError is raised by this scan with a message naming
+                # only a size, a bound or a file name, never file content.
+                reason = (
+                    str(error)
+                    if type(error) is ValueError
+                    else _assessment_error_label(error)
+                )
+                unread.append(f"{where} could not be read ({reason})")
+                continue
+            found.extend(f"{name} in {where}" for name in credentials)
+            scanned.append(
+                f"{where} ({files} file(s) scanned"
+                + (
+                    f", {len(oversized)} over the per-file bound not scanned"
+                    if oversized
+                    else ""
+                )
+                + ")"
+            )
+        if found:
+            findings.append(
+                finding(
+                    f"{label} runs code holding credential material inline: "
+                    f"{', '.join(found)}. The values are withheld from this "
+                    "report." + (f" Not read: {'; '.join(unread)}." if unread else ""),
+                    "Remove the credential from the code, read it at run time "
+                    "from the AgentCore Identity token vault or AWS Secrets "
+                    "Manager, and rotate the exposed credential.",
+                    SeverityEnum.HIGH,
+                    StatusEnum.FAILED,
+                )
+            )
+        elif unread:
+            findings.append(
+                finding(
+                    f"{label}: whether its code holds an inline credential was not "
+                    f"judged: {'; '.join(unread)}."
+                    + (
+                        f" Scanned with none found: {'; '.join(scanned)}."
+                        if scanned
+                        else ""
+                    )
+                    + f" {bounds}",
+                    "Grant s3:GetObject on the code object, or reduce the archive "
+                    "below the bound, and retry.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    f"{label} runs code {'; '.join(scanned)}. No file holds an AWS "
+                    "access key ID or a private key block, and no .env file holds "
+                    f"credential material inline. {bounds}",
+                    "No action required. Files are matched only for those two "
+                    "credential forms; a .env file's variables are judged by name "
+                    "and value shape, as the environment variable row does.",
+                    SeverityEnum.HIGH,
+                    StatusEnum.PASSED,
+                )
+            )
     return findings
 
 
@@ -24779,8 +25002,8 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
     target's sensitive fields, and each harness's sensitive fields. Only names
     and field paths are reported, never values, because the APIs model these
     fields as sensitive. A container image's Env, Entrypoint and Cmd are read
-    from its ECR configuration blob. The agent's code in S3 is named by
-    agentRuntimeArtifact but not fetched, because the role holds no read of it.
+    from its ECR configuration blob, and the code archive agentRuntimeArtifact
+    names in S3 is read by its exact key, within a byte bound.
     """
     if agentcore_client is None:
         return [
@@ -24796,8 +25019,10 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
         ]
 
     images: Dict[str, Tuple[str, Set[str]]] = {}
+    codes: Dict[str, Set[Tuple[str, str, str]]] = {}
     findings = (
-        _agentcore_runtime_credential_findings(images)
+        _agentcore_runtime_credential_findings(images, codes)
+        + _agentcore_runtime_code_credential_findings(codes)
         + _agentcore_runtime_image_credential_findings(images)
         + _agentcore_gateway_target_credential_findings()
         + _agentcore_harness_credential_findings()
@@ -25850,20 +26075,51 @@ def _smithy_required_inputs(model: Dict[str, Any]) -> Dict[str, Set[str]]:
     }
 
 
+# The largest tool schema AC-35 reads from S3.
+AC35_SCHEMA_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _s3_schema_text(configuration: Dict[str, Any]) -> str:
+    """Read the one S3 object a gateway target's S3Configuration names.
+
+    The object is read by its exact key, within AC35_SCHEMA_MAX_BYTES, and
+    held to bucketOwnerAccountId when the target names one.
+    """
+    uri = str(configuration.get("uri") or "")
+    bucket, _, key = uri.removeprefix("s3://").partition("/")
+    if not uri.startswith("s3://") or not bucket or not key:
+        raise ValueError("its URI does not name an S3 object")
+    owner = configuration.get("bucketOwnerAccountId")
+    return _read_s3_object_bounded(
+        bucket,
+        key,
+        AC35_SCHEMA_MAX_BYTES,
+        expected_owner=owner if isinstance(owner, str) else None,
+    ).decode("utf-8")
+
+
+def _s3_schema_unread(label: str, error: Exception) -> str:
+    """Name why a tool schema in S3 was not read, never its content."""
+    reason = str(error) if type(error) is ValueError else _assessment_error_label(error)
+    return f"its {label} in S3 was not read ({reason})"
+
+
 def _gateway_tool_required_inputs(
     gateway_id: str,
 ) -> Tuple[Dict[str, Set[str]], Dict[str, str], Dict[str, Set[str]]]:
     """Map each tool of a gateway's targets to its required input paths.
 
-    Returns `{target___tool: required paths}` for every tool an inline Lambda
-    tool schema defines, nested required properties included, and `{target
-    name: reason}` for every target whose tool schemas were not read: an S3
-    tool schema, an MCP server, API Gateway or connector target, an OpenAPI
-    or Smithy payload in S3 or not in JSON, or a target that could not be
-    read. An inline OpenAPI or Smithy target's tools go in the third map, the
-    paths its schema marks required: those are unproven, because how the
-    gateway exposes them in context.input is not documented, so only a read
-    the schema does not mark required is judged on them.
+    Returns `{target___tool: required paths}` for every tool a Lambda tool
+    schema defines, inline or in S3, nested required properties included, and
+    `{target name: reason}` for every target whose tool schemas were not read:
+    an MCP server, API Gateway or connector target, a schema not in JSON, an
+    S3 schema that could not be fetched within AC35_SCHEMA_MAX_BYTES, or a
+    target that could not be read. An OpenAPI or Smithy target's tools, inline
+    or in S3, go in the third map, the paths its schema marks required: those
+    are unproven, because how the gateway exposes them in context.input is not
+    documented, so only a read the schema does not mark required is judged on
+    them. An S3 schema is read by the exact key the target names; no bucket is
+    listed.
     """
     tools: Dict[str, Set[str]] = {}
     unread: Dict[str, str] = {}
@@ -25890,32 +26146,48 @@ def _gateway_tool_required_inputs(
         ):
             if kind not in mcp:
                 continue
-            payload = (mcp.get(kind) or {}).get("inlinePayload")
+            source = mcp.get(kind) or {}
+            payload = source.get("inlinePayload")
             if payload is None:
-                unread[name] = f"its {label} schema is in S3"
-                break
+                try:
+                    payload = _s3_schema_text(source.get("s3") or {})
+                except (BotoCoreError, ClientError, ValueError) as error:
+                    unread[name] = _s3_schema_unread(f"{label} schema", error)
+                    break
             try:
                 document = json.loads(payload)
                 if not isinstance(document, dict):
                     raise ValueError("not a JSON object")
                 operations = reader(document)
             except (TypeError, ValueError) as error:
-                unread[name] = f"its inline {label} schema was not read ({error})"
+                unread[name] = (
+                    f"its {'inline ' if 'inlinePayload' in source else ''}{label} "
+                    f"schema was not read ({error})"
+                )
                 break
             for operation, required in operations.items():
                 unproven[f"{name}___{operation}"] = required
             break
         else:
             schema = (mcp.get("lambda") or {}).get("toolSchema") or {}
-            if "inlinePayload" not in schema:
+            if "inlinePayload" in schema:
+                definitions = schema.get("inlinePayload") or []
+            elif schema.get("s3"):
+                try:
+                    definitions = json.loads(_s3_schema_text(schema["s3"]))
+                    if not isinstance(definitions, list) or not all(
+                        isinstance(tool, dict) for tool in definitions
+                    ):
+                        raise ValueError("it is not a JSON list of tool definitions")
+                except (BotoCoreError, ClientError, ValueError) as error:
+                    unread[name] = _s3_schema_unread("tool schema", error)
+                    continue
+            else:
                 unread[name] = (
-                    "its tool schema is in S3"
-                    if schema.get("s3")
-                    else "it is not a Lambda, OpenAPI or Smithy target with an "
-                    "inline schema"
+                    "it is not a Lambda, OpenAPI or Smithy target with a tool schema"
                 )
                 continue
-            for tool in schema.get("inlinePayload") or []:
+            for tool in definitions:
                 tools[f"{name}___{tool.get('name')}"] = _schema_required_paths(
                     tool.get("inputSchema") or {}
                 )
@@ -26119,8 +26391,9 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                     f"enforces policy engine {policy_engine_id}, but whether its "
                     "forbids guard the optional inputs they read was not judged: "
                     f"{'; '.join(not_judged)}.",
-                    "Define the tools inline in a Lambda target's tool schema, or "
-                    "review these forbids by hand, and retry.",
+                    "Define the tools in a Lambda target's tool schema, grant "
+                    "s3:GetObject on a schema held in S3, or review these forbids "
+                    "by hand, and retry.",
                 )
             )
         else:
@@ -26129,7 +26402,8 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                     StatusEnum.PASSED,
                     f"enforces policy engine {policy_engine_id}, and every "
                     "enforcing forbid reads a context.input path only when its "
-                    "tools' inline Lambda inputSchema lists that path and every "
+                    "tools' Lambda inputSchema, inline or read from S3, lists that "
+                    "path and every "
                     "path above it as required, or after a has() test on it.",
                     "No action required",
                 )

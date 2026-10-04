@@ -1391,8 +1391,8 @@ MUTATIONS = [
         "name": "AC-34 claims the agent code is unreadable through any API",
         "file": AGENTCORE,
         "defect": "GetAgentRuntime returns the code's S3 location and the image URI, so the ceiling the Passed row states is false",
-        "find": '    "The agent\'s code was not scanned: GetAgentRuntime names it in "\n',
-        "replace": '    "The agent\'s code is not readable through any API: GetAgentRuntime names it in "\n',
+        "find": '    "The agent\'s code that agentRuntimeArtifact names in S3 is judged in the "\n',
+        "replace": '    "The agent\'s code is not readable through any API; in S3 it is judged in the "\n',
     },
     {
         "name": "AC-26 accepts several exempt principals on the tamper SCP",
@@ -1930,8 +1930,8 @@ MUTATIONS = [
         "name": "AC-35 input guard reads an S3 tool schema as empty",
         "file": AGENTCORE,
         "defect": "a forbid over a tool whose schema is in S3 passed",
-        "find": '        if "inlinePayload" not in schema:\n',
-        "replace": "        if False:\n",
+        "find": '                    definitions = json.loads(_s3_schema_text(schema["s3"]))\n',
+        "replace": "                    definitions = []\n",
     },
     {
         "name": "AG-39 omits the unread front doors",
@@ -2226,6 +2226,34 @@ MUTATIONS = [
         "defect": "an image in another account's registry was fetched with this account's reads",
         "find": "            if account and registry != account:\n",
         "replace": "            if False:\n",
+    },
+    {
+        "name": "AC-34 code: files are not matched for credentials",
+        "file": AGENTCORE,
+        "defect": "a code archive file holding an access key ID passed",
+        "find": "            if _text_holds_a_credential(text):\n                found.append(info.filename)\n",
+        "replace": "            if False:\n                found.append(info.filename)\n",
+    },
+    {
+        "name": "AC-34 code: a .env file's variables are not judged",
+        "file": AGENTCORE,
+        "defect": "a .env file in the code archive holding a credential passed",
+        "find": '                found.extend(f"{info.filename} variable {name}" for name in literals)\n',
+        "replace": "                pass\n",
+    },
+    {
+        "name": "AC-34 code: the unpacked bound is not enforced",
+        "file": AGENTCORE,
+        "defect": "an archive unpacking past its bound was scanned and passed",
+        "find": "            if unpacked > AC34_CODE_UNPACKED_MAX_BYTES:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "AC-35 input guard: an S3 schema is not held to its owner",
+        "file": AGENTCORE,
+        "defect": "an S3 tool schema was read without the bucket owner the target names",
+        "find": "        expected_owner=owner if isinstance(owner, str) else None,\n",
+        "replace": "        expected_owner=None,\n",
     },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
@@ -2701,6 +2729,10 @@ GROUPS: dict[str, str] = {
     "AC-34 image: only the first platform of an index is read": "in the AgentCore verdict legs",
     "AC-34 image: Entrypoint and Cmd are not scanned": "in the AgentCore verdict legs",
     "AC-34 image: another account's registry is read": "in the AgentCore verdict legs",
+    "AC-34 code: files are not matched for credentials": "in the AgentCore verdict legs",
+    "AC-34 code: a .env file's variables are not judged": "in the AgentCore verdict legs",
+    "AC-34 code: the unpacked bound is not enforced": "in the AgentCore verdict legs",
+    "AC-35 input guard: an S3 schema is not held to its owner": "in the AgentCore verdict legs",
 }
 
 

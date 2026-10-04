@@ -20,7 +20,10 @@ import json
 import inspect
 import os
 import importlib.util
+import io
 import textwrap
+import zipfile
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 
@@ -19187,9 +19190,8 @@ class TestAC34RuntimeInlineCredentials:
 
     @patch("agentcore_app.agentcore_client")
     def test_the_passing_row_names_why_code_was_not_scanned(self, mock_ac):
-        # GetAgentRuntime returns where the code and the image live. The role
-        # is not granted the S3 read that fetches the code; the image is judged
-        # on its own row.
+        # GetAgentRuntime returns where the code and the image live; each is
+        # judged on its own row.
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [self._RUNTIMES[0]]
         }
@@ -19201,7 +19203,7 @@ class TestAC34RuntimeInlineCredentials:
 
         assert "not readable through any" not in resolution
         assert "agentRuntimeArtifact" in resolution
-        assert "s3:GetObject" in resolution
+        assert "AgentCore Runtime Code Inline Credentials row" in resolution
         assert "AgentCore Runtime Image Inline Credentials row" in resolution
         assert "file system layers are not scanned" in resolution
 
@@ -19926,6 +19928,177 @@ class TestAC34Harnesses:
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
         assert "GetHarness" in findings[0]["Resolution"]
+
+
+class TestAC34RuntimeCode:
+    """AC-34: a credential written into a runtime's code archive in S3."""
+
+    _ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret - AWS doc example
+
+    @staticmethod
+    def _zip(files):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, text in files.items():
+                archive.writestr(name, text)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _detail(key, version_id=None, version="1"):
+        s3 = {"bucket": "code-bucket", "prefix": key}
+        if version_id:
+            s3["versionId"] = version_id
+        return {
+            "agentRuntimeVersion": version,
+            "agentRuntimeArtifact": {"codeConfiguration": {"code": {"s3": s3}}},
+        }
+
+    def _run(self, runtimes, objects, endpoints=None, detail=None):
+        """runtimes: {id: code key}. objects: {"bucket/key": bytes}."""
+        mock_ac = MagicMock()
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": rid, "agentRuntimeName": rid} for rid in runtimes
+            ]
+        }
+        mock_ac.get_agent_runtime.side_effect = detail or (
+            lambda agentRuntimeId, **kw: self._detail(runtimes[agentRuntimeId])
+        )
+        mock_ac.list_agent_runtime_endpoints.return_value = {
+            "runtimeEndpoints": endpoints or []
+        }
+        self.s3 = _s3_objects_client(objects)
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.s3_client", self.s3),
+        ):
+            findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+        return [f for f in findings if f["Finding"] == agentcore_app.AC34_CODE_FINDING]
+
+    def test_code_holding_an_access_key_fails_and_clean_code_passes(self):
+        rows = self._run(
+            {"rt-a": "a.zip", "rt-b": "b.zip"},
+            {
+                "code-bucket/a.zip": self._zip({"main.py": "print('ok')\n"}),
+                "code-bucket/b.zip": self._zip(
+                    {
+                        "main.py": "print('ok')\n",
+                        "lib/cfg.py": f"K = '{self._ACCESS_KEY}'",
+                    }
+                ),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        assert "(rt-a)" in rows[0]["Finding_Details"]
+        assert "1 file(s) scanned" in rows[0]["Finding_Details"]
+        assert "64 MiB" in rows[0]["Finding_Details"]
+        assert "files over 4 MiB are not scanned" in rows[0]["Finding_Details"]
+        assert "lib/cfg.py in s3://code-bucket/b.zip" in rows[1]["Finding_Details"]
+        assert rows[1]["Severity"] == "High"
+        for row in rows:
+            assert self._ACCESS_KEY not in json.dumps(row)
+            assert row["Check_ID"] == "AC-34"
+            assert_finding_schema(row)
+        # Only the named keys are read; no bucket is listed.
+        assert sorted(c.kwargs["Key"] for c in self.s3.get_object.call_args_list) == [
+            "a.zip",
+            "b.zip",
+        ]
+        assert not [c for c in self.s3.method_calls if c[0].startswith("list")]
+
+    def test_a_dotenv_file_holding_a_credential_fails(self):
+        rows = self._run(
+            {"rt-a": "a.zip", "rt-b": "b.zip"},
+            {
+                "code-bucket/a.zip": self._zip({"app/.env": "LOG_LEVEL=INFO\n"}),
+                "code-bucket/b.zip": self._zip(
+                    {"app/.env": f"# keys\nexport API_KEY='{_SECRET_VALUE}'\n"}
+                ),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        assert "app/.env variable API_KEY" in rows[1]["Finding_Details"]
+        assert _SECRET_VALUE not in json.dumps(rows[1])
+
+    def test_the_named_version_is_read(self):
+        rows = self._run(
+            {"rt-a": "a.zip"},
+            {"code-bucket/a.zip": self._zip({"main.py": "x = 1\n"})},
+            detail=lambda agentRuntimeId, **kw: self._detail("a.zip", "v-7"),
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "(version v-7)" in rows[0]["Finding_Details"]
+        assert self.s3.get_object.call_args.kwargs["VersionId"] == "v-7"
+
+    def test_a_file_over_its_bound_is_counted_not_scanned(self):
+        with patch.object(agentcore_app, "AC34_CODE_FILE_MAX_BYTES", 16):
+            rows = self._run(
+                {"rt-a": "a.zip"},
+                {
+                    "code-bucket/a.zip": self._zip(
+                        {"small.py": "x = 1\n", "big.bin": "y" * 64}
+                    )
+                },
+            )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "1 file(s) scanned, 1 over the per-file bound not scanned"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "objects, patches, reason",
+        [
+            ({}, {}, "could not be read (AccessDenied)"),
+            ({"code-bucket/b.zip": b"PK not a zip"}, {}, "not a zip archive"),
+            (
+                {"code-bucket/b.zip": b"x" * 400},
+                {"AC34_CODE_ARCHIVE_MAX_BYTES": 300},
+                "the object is 400 bytes, more than the 300 byte bound",
+            ),
+            (
+                None,
+                {"AC34_CODE_UNPACKED_MAX_BYTES": 8},
+                "unpacks to more than the 8 byte bound",
+            ),
+        ],
+        ids=["denied", "not-zip", "archive-bound", "unpacked-bound"],
+    )
+    def test_code_that_cannot_be_read_is_not_reported_clean(
+        self, objects, patches, reason
+    ):
+        clean = self._zip({"main.py": "x\n"})
+        assert len(clean) < 300
+        objects = (
+            {"code-bucket/b.zip": self._zip({"main.py": "x = 1\n" * 4})}
+            if objects is None
+            else objects
+        )
+        with patch.multiple(agentcore_app, **patches) if patches else nullcontext():
+            rows = self._run(
+                {"rt-a": "a.zip", "rt-b": "b.zip"},
+                {"code-bucket/a.zip": clean, **objects},
+            )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert reason in rows[1]["Finding_Details"]
+        assert "s3:GetObject" in rows[1]["Resolution"]
+
+    def test_an_older_served_version_runs_its_own_code(self):
+        rows = self._run(
+            {"rt-a": "new.zip"},
+            {
+                "code-bucket/new.zip": self._zip({"main.py": "x\n"}),
+                "code-bucket/old.zip": self._zip({"main.py": f"'{self._ACCESS_KEY}'"}),
+            },
+            endpoints=[{"name": "prod", "liveVersion": "1"}],
+            detail=lambda agentRuntimeId, **kw: (
+                self._detail("old.zip", version="1")
+                if kw.get("agentRuntimeVersion") == "1"
+                else self._detail("new.zip", version="2")
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "main.py in s3://code-bucket/old.zip" in rows[0]["Finding_Details"]
 
 
 class TestAC34RuntimeImages:
@@ -52730,6 +52903,23 @@ def _input_forbid(condition, action='action == AgentCore::Action::"pay___transfe
     )
 
 
+def _s3_objects_client(objects):
+    """A mock s3_client whose GetObject serves `objects` ("bucket/key" to
+    bytes) and denies every other key."""
+    client = MagicMock()
+
+    def get_object(Bucket, Key, **kwargs):
+        body = objects.get(f"{Bucket}/{Key}")
+        if body is None:
+            raise _make_client_error("AccessDenied", "no")
+        stream = MagicMock()
+        stream.read.side_effect = lambda size=-1: body[:size] if size >= 0 else body
+        return {"Body": stream, "ContentLength": len(body)}
+
+    client.get_object.side_effect = get_object
+    return client
+
+
 class TestAC35PolicyInputGuards:
     """AIR-ACR-POL-01: an enforcing forbid that reads an optional
     context.input field with no has() guard errors when the call omits it, and
@@ -52760,9 +52950,11 @@ class TestAC35PolicyInputGuards:
         },
     ]
 
-    def _run(self, statements, targets=None, target_error=None):
+    def _run(self, statements, targets=None, target_error=None, s3_objects=None):
         """Gateway gw-a enforces `statements[0]`, gw-b `statements[1]`; both
-        front Lambda target pay with the inline tools above, plus `targets`."""
+        front Lambda target pay with the inline tools above, plus `targets`.
+        `s3_objects` maps "bucket/key" to the bytes GetObject returns; any other
+        key is denied, so no test reaches S3."""
         mock_ac = MagicMock()
         mock_ac.list_gateways.return_value = {
             "items": [
@@ -52808,7 +53000,11 @@ class TestAC35PolicyInputGuards:
             return details[targetId]
 
         mock_ac.get_gateway_target.side_effect = get_target
-        with patch("agentcore_app.agentcore_client", mock_ac):
+        self.s3 = _s3_objects_client(s3_objects or {})
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.s3_client", self.s3),
+        ):
             findings = agentcore_app.check_agentcore_policy_input_guards()
         for finding in findings:
             assert finding["Check_ID"] == "AC-35"
@@ -52948,7 +53144,7 @@ class TestAC35PolicyInputGuards:
         assert "target api's tools" in rows["gw-a"]["Finding_Details"]
         assert rows["gw-b"]["Status"] == "N/A"
         assert (
-            "ledger___post (its tool schema is in S3)"
+            "ledger___post (its tool schema in S3 was not read (AccessDenied))"
             in (rows["gw-b"]["Finding_Details"])
         )
 
@@ -53220,9 +53416,139 @@ class TestAC35PolicyInputGuards:
         )
         assert rows["gw-a"]["Status"] == "N/A"
         assert (
-            "api___send (its OpenAPI schema is in S3)"
+            "api___send (its OpenAPI schema in S3 was not read (AccessDenied))"
             in rows["gw-a"]["Finding_Details"]
         )
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    def _s3_lambda_target(self, uri, owner=None):
+        s3 = {"uri": uri}
+        if owner:
+            s3["bucketOwnerAccountId"] = owner
+        return {
+            "t-ledger": {
+                "name": "ledger",
+                "targetConfiguration": {
+                    "mcp": {
+                        "lambda": {
+                            "lambdaArn": "arn:aws:lambda:us-east-1:123456789012:function:l",
+                            "toolSchema": {"s3": s3},
+                        }
+                    }
+                },
+            }
+        }
+
+    _LEDGER_TOOLS = [
+        {
+            "name": "post",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number"},
+                    "memo": {"type": "string"},
+                },
+                "required": ["amount"],
+            },
+        }
+    ]
+
+    def test_an_s3_tool_schema_is_read_and_judged(self):
+        post = 'action == AgentCore::Action::"ledger___post"'
+        rows = self._run(
+            [
+                _input_forbid('when { context.input.memo == "x" }', action=post),
+                _input_forbid("when { context.input.amount > 500 }", action=post),
+            ],
+            targets=self._s3_lambda_target(
+                "s3://schemas/ledger.json", owner="123456789012"
+            ),
+            s3_objects={"schemas/ledger.json": json.dumps(self._LEDGER_TOOLS).encode()},
+        )
+        assert rows["gw-a"]["Status"] == "Failed"
+        assert "context.input.memo on ledger___post" in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+        assert "inline or read from S3" in rows["gw-b"]["Finding_Details"]
+        # Only the named key is read, held to the named owner; nothing is listed.
+        for call in self.s3.get_object.call_args_list:
+            assert call.kwargs == {
+                "Bucket": "schemas",
+                "Key": "ledger.json",
+                "ExpectedBucketOwner": "123456789012",
+            }
+        assert not [c for c in self.s3.method_calls if c[0].startswith("list")]
+
+    @pytest.mark.parametrize(
+        "body, reason",
+        [
+            (b"{}", "it is not a JSON list of tool definitions"),
+            (b"[1]", "it is not a JSON list of tool definitions"),
+            (b"not json", "JSONDecodeError"),
+            (
+                b" " * (agentcore_app.AC35_SCHEMA_MAX_BYTES + 1),
+                f"the object is {agentcore_app.AC35_SCHEMA_MAX_BYTES + 1} bytes, "
+                f"more than the {agentcore_app.AC35_SCHEMA_MAX_BYTES} byte bound",
+            ),
+        ],
+        ids=["object", "list-of-non-objects", "not-json", "oversized"],
+    )
+    def test_an_s3_tool_schema_that_cannot_be_judged_is_na(self, body, reason):
+        post = 'action == AgentCore::Action::"ledger___post"'
+        rows = self._run(
+            [
+                _input_forbid('when { context.input.memo == "x" }', action=post),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=self._s3_lambda_target("s3://schemas/ledger.json"),
+            s3_objects={"schemas/ledger.json": body},
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert (
+            f"its tool schema in S3 was not read ({reason})"
+            in rows["gw-a"]["Finding_Details"]
+        )
+        assert rows["gw-b"]["Status"] == "Passed"
+
+    def test_an_s3_uri_naming_no_object_is_na(self):
+        post = 'action == AgentCore::Action::"ledger___post"'
+        rows = self._run(
+            [
+                _input_forbid('when { context.input.memo == "x" }', action=post),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=self._s3_lambda_target("s3://schemas"),
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert "its URI does not name an S3 object" in rows["gw-a"]["Finding_Details"]
+        self.s3.get_object.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            ('when { context.input.note == "x" }', "Failed"),
+            ("when { context.input.amount > 500 }", "N/A"),
+        ],
+    )
+    def test_an_s3_openapi_schema_is_read_and_judged(self, condition, status):
+        send = 'action == AgentCore::Action::"api___send"'
+        rows = self._run(
+            [
+                _input_forbid(condition, action=send),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets={
+                "t-api": {
+                    "name": "api",
+                    "targetConfiguration": {
+                        "mcp": {
+                            "openApiSchema": {"s3": {"uri": "s3://schemas/api.json"}}
+                        }
+                    },
+                }
+            },
+            s3_objects={"schemas/api.json": json.dumps(self._OPENAPI).encode()},
+        )
+        assert rows["gw-a"]["Status"] == status
         assert rows["gw-b"]["Status"] == "Passed"
 
     _SMITHY = {
