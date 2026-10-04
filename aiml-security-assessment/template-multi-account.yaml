@@ -336,6 +336,9 @@ Resources:
             Action:
               - aoss:ListAccessPolicies # BR-20
               - aoss:GetAccessPolicy # BR-20
+              - aoss:ListSecurityPolicies # BR-20
+              - aoss:GetSecurityPolicy # BR-20
+              - sagemaker:Search # BR-42, BR-46, BR-47, BR-52
               - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
               - sagemaker:ListTransformJobs # BR-47
               - sagemaker:ListProcessingJobs # BR-47, BR-53
@@ -364,14 +367,19 @@ Resources:
             # BR-51 lists the Regions enabled for this account. BR-33 names the
             # targets of each default-bus rule that matches Inspector findings.
             # BR-34 reads whether each GuardDuty detector has AI Protection on.
+            # BR-46 reads when each knowledge base data source last ingested.
+            # BR-37 lists every bedrock-mantle project to read its
+            # data_retention mode.
             # The service authorization reference gives GetEventDataStore the
             # eventdatastore resource type, DescribeDeliveryStream the
             # deliverystream type, ListRegions the account type,
-            # ListTargetsByRule the rule type and GetDetector the detector
-            # type. An action matches only ARNs of its own service, so none is
-            # granted on another's ARN. It holds the former Sids
+            # ListTargetsByRule the rule type, GetDetector the detector type,
+            # ListIngestionJobs the knowledge-base type and ListProjects the
+            # project type. An action matches only ARNs of its own service, so
+            # none is granted on another's ARN. It holds the former Sids
             # CloudTrailEventDataStoreRead, EventDataStoreAndArchiveStreamRead,
-            # AccountListRegions and EventBridgeRuleTargetList, merged to keep
+            # AccountListRegions, EventBridgeRuleTargetList,
+            # BedrockIngestionJobList and BedrockMantleProjectList, merged to keep
             # this policy under its 5,500-character budget.
             Effect: Allow
             Action:
@@ -380,18 +388,16 @@ Resources:
               - account:ListRegions # BR-51
               - events:ListTargetsByRule # BR-33
               - guardduty:GetDetector # BR-34
+              - bedrock:ListIngestionJobs # BR-46
+              - bedrock-mantle:ListProjects # BR-37
             Resource:
               - !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
               - !Sub 'arn:${AWS::Partition}:firehose:*:${AWS::AccountId}:deliverystream/*'
               - !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
               - !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
               - !Sub 'arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*'
-          - Sid: BedrockIngestionJobList
-            # BR-46 reads when each knowledge base data source last ingested.
-            Effect: Allow
-            Action:
-              - bedrock:ListIngestionJobs # BR-46
-            Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-mantle:*:${AWS::AccountId}:project/*'
           - Sid: AIDataPathJobRead
             # BR-46, BR-47 and BR-52 resolve each training job's input
             # channels and output path to the S3 buckets it reads and writes.
@@ -536,14 +542,6 @@ Resources:
               - iam:GetPolicy # BR-51
               - iam:GetPolicyVersion # BR-51
             Resource: !Sub 'arn:${AWS::Partition}:iam::aws:policy/*'
-          - Sid: BedrockMantleProjectList
-            # BR-37 lists every bedrock-mantle project to read its data_retention
-            # mode. The service authorization reference gives ListProjects the
-            # project resource type.
-            Effect: Allow
-            Action:
-              - bedrock-mantle:ListProjects # BR-37
-            Resource: !Sub 'arn:${AWS::Partition}:bedrock-mantle:*:${AWS::AccountId}:project/*'
           - Sid: KnowledgeBaseStoreRead
             # BR-20 reads PubliclyAccessible on each instance of the Aurora
             # cluster behind a knowledge base, the KMS key of the Kendra index
@@ -586,12 +584,15 @@ Resources:
             # BR-26 lists the objects an S3 knowledge base source ingests to
             # compare each LastModified with its Comprehend redaction job, and
             # BR-04 lists one object under an invocation log bucket's AWSLogs/
-            # root. The
-            # service authorization reference gives ListBucket the bucket
-            # resource type; the source buckets are not known in advance.
+            # root. BR-32 reads the event notifications of an S3-only invocation
+            # log bucket. The
+            # service authorization reference gives ListBucket and
+            # GetBucketNotification the bucket resource type; the buckets are
+            # not known in advance.
             Effect: Allow
             Action:
               - s3:ListBucket # BR-04, BR-26
+              - s3:GetBucketNotification # BR-32
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
           - Sid: GuardrailOutputProbe
             # BR-26 applies each deployed guardrail version that passes its
@@ -641,6 +642,40 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:s3:::*/*AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/*'
               - !Sub 'arn:${AWS::Partition}:s3:::*/*.metadata.json'
+  BedrockAssessmentReadsPolicy2:
+    # Further reads for the Bedrock function, beyond the budget of
+    # BedrockAssessmentReadsPolicy. Attached only to
+    # BedrockSecurityAssessmentFunction through its Policies list.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Further read-only grants for the Bedrock security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManagedReadsOnWildcard2
+            # The action has no resource type in the service authorization
+            # reference.
+            Effect: Allow
+            Action:
+              - lambda:ListMicrovms # BR-57
+            Resource: '*'
+          - Sid: MicrovmRead
+            # GetMicrovm authorizes on the microvmImage resource type. A
+            # MicroVM may run an AWS-managed image, whose ARN has the account
+            # segment "aws".
+            Effect: Allow
+            Action:
+              - lambda:GetMicrovm # BR-57
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
+              - !Sub 'arn:${AWS::Partition}:lambda:*:aws:microvm-image:*'
+          - Sid: LogBucketVersionsRead
+            # ListObjectVersions authorizes on the bucket resource type. A log,
+            # replica or SageMaker inference bucket can be any bucket.
+            Effect: Allow
+            Action:
+              - s3:ListBucketVersions # BR-04
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1036,6 +1071,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
                 - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
         - !Ref BedrockAssessmentReadsPolicy
+        - !Ref BedrockAssessmentReadsPolicy2
   SageMakerAssessmentReadsPolicy:
     # Reads that do not fit the SageMaker function's 9000-byte inline policy
     # budget. Attached only to SagemakerSecurityAssessmentFunction through its
