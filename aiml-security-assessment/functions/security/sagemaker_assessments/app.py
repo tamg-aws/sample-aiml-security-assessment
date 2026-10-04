@@ -405,8 +405,13 @@ def _subnet_exposure_findings(
 
 def iter_model_packages(sagemaker_client, group_name: str) -> Iterator[Dict[str, Any]]:
     """Yield every model package in a SageMaker model package group."""
+    # ListModelPackages documents UNVERSIONED as its default ModelPackageType,
+    # and a group holds only versioned packages, so the type is named rather
+    # than left to that default.
     paginator = sagemaker_client.get_paginator("list_model_packages")
-    for page in paginator.paginate(ModelPackageGroupName=group_name):
+    for page in paginator.paginate(
+        ModelPackageGroupName=group_name, ModelPackageType="Both"
+    ):
         yield from page.get("ModelPackageSummaryList", [])
 
 
@@ -9280,6 +9285,7 @@ def _approval_attribution_findings(
     approvals_without_approver: List[Dict[str, Any]],
     versions_examined: int,
     region: str,
+    versions_unread: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Report the approver-metadata leg of AIR-SGM-GOV-01.
@@ -9339,12 +9345,16 @@ def _approval_attribution_findings(
                 finding_details=(
                     f"{len(approvals_with_approver)} of {versions_examined} "
                     "approved model package versions examined record an approver "
-                    f"identity: {described}."
+                    f"identity: {described}." + _versions_unread_clause(versions_unread)
                 ),
-                resolution="No action required.",
+                resolution=(
+                    "No action required."
+                    if not versions_unread
+                    else COULD_NOT_ASSESS_RESOLUTION
+                ),
                 reference=APPROVER_ATTRIBUTION_REFERENCE,
-                severity="Medium",
-                status="Passed",
+                severity="Medium" if not versions_unread else "Informational",
+                status="Passed" if not versions_unread else "N/A",
                 region=region,
             )
         )
@@ -9352,8 +9362,17 @@ def _approval_attribution_findings(
     return emitted
 
 
+def _versions_unread_clause(versions_unread: int) -> str:
+    if not versions_unread:
+        return ""
+    return (
+        f" {versions_unread} model package read(s) failed, so the versions they "
+        "cover were not examined and this is not established for them."
+    )
+
+
 def _lifecycle_finding(
-    unstaged: List[str], examined: int, region: str
+    unstaged: List[str], examined: int, region: str, versions_unread: int = 0
 ) -> Dict[str, Any]:
     """Report whether each approved version carries a ModelLifeCycle stage."""
     if unstaged:
@@ -9380,13 +9399,16 @@ def _lifecycle_finding(
         check_id="SM-22",
         finding_name=MODEL_LIFECYCLE_FINDING,
         finding_details=(
-            f"All {examined} approved model package versions carry a ModelLifeCycle "
-            "Stage and StageStatus."
+            f"All {examined} approved model package versions examined carry a "
+            "ModelLifeCycle Stage and StageStatus."
+            + _versions_unread_clause(versions_unread)
         ),
-        resolution="No action required",
+        resolution=(
+            "No action required" if not versions_unread else COULD_NOT_ASSESS_RESOLUTION
+        ),
         reference=MODEL_LIFECYCLE_REFERENCE,
-        severity="Low",
-        status="Passed",
+        severity="Low" if not versions_unread else "Informational",
+        status="Passed" if not versions_unread else "N/A",
         region=region,
     )
 
@@ -9469,16 +9491,25 @@ def _endpoint_variant_models(
                 config_name = sagemaker_client.describe_endpoint(
                     EndpointName=endpoint
                 ).get("EndpointConfigName")
-                variants = sagemaker_client.describe_endpoint_config(
+                config = sagemaker_client.describe_endpoint_config(
                     EndpointConfigName=config_name
-                ).get("ProductionVariants", [])
+                )
             except Exception as error:
                 unread.append(
                     f"endpoint {endpoint} ({get_assessment_error_label(error)})"
                 )
                 continue
-            for variant in variants:
-                label = f"{endpoint}/{variant.get('VariantName')}"
+            # A shadow variant serves a copy of live traffic, so its model is
+            # deployed as much as a production variant's.
+            variants = [
+                (variant, "") for variant in config.get("ProductionVariants") or []
+            ]
+            variants += [
+                (variant, " (shadow)")
+                for variant in config.get("ShadowProductionVariants") or []
+            ]
+            for variant, role in variants:
+                label = f"{endpoint}/{variant.get('VariantName')}{role}"
                 if variant.get("ModelName"):
                     models.setdefault(variant["ModelName"], []).append(label)
                     continue
@@ -9924,12 +9955,16 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                 approvals_without_approver,
                 approval_versions_examined,
                 region,
+                versions_unread=len(unread),
             )
         )
         if approval_versions_examined:
             findings["csv_data"].append(
                 _lifecycle_finding(
-                    unstaged_versions, approval_versions_examined, region
+                    unstaged_versions,
+                    approval_versions_examined,
+                    region,
+                    versions_unread=len(unread),
                 )
             )
         findings["csv_data"].extend(

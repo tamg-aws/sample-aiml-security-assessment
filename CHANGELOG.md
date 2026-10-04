@@ -461,6 +461,14 @@ section.
   `DescribeEndpoint` reports `Started` for an `Input`-only capture, so an
   endpoint that never recorded responses passed. An unread endpoint config
   holds that endpoint out of the `Passed` count as `N/A`.
+- `SM-22` traces the model on each `ShadowProductionVariants` entry to its
+  model package, so a shadow variant serving an unapproved package fails
+  `Deployed Model Registration`. The `Model Registry Lifecycle Stage` and
+  approver attribution rows are `N/A` when `ListModelPackages` or
+  `DescribeModelPackage` failed for some versions; they passed on the
+  versions read before. `ListModelPackages` is called with
+  `ModelPackageType` `Both`, because the API documents `UNVERSIONED` as its
+  default.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule

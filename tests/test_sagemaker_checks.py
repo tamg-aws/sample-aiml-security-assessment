@@ -1443,7 +1443,7 @@ class TestSM05MLOps:
 
         assert not any("minimal versioning" in f["Finding_Details"] for f in findings)
         package_paginator.paginate.assert_called_once_with(
-            ModelPackageGroupName="group-a"
+            ModelPackageGroupName="group-a", ModelPackageType="Both"
         )
 
 
@@ -1601,7 +1601,7 @@ class TestSM08ModelRegistry:
 
         assert not any("No Approved Models" in f["Finding"] for f in findings)
         package_paginator.paginate.assert_called_once_with(
-            ModelPackageGroupName="group-a"
+            ModelPackageGroupName="group-a", ModelPackageType="Both"
         )
 
 
@@ -4533,9 +4533,13 @@ class TestSM22RegistryLegs:
         ram=None,
         errors=None,
         transform_jobs=None,
+        shadow=None,
+        unreadable=(),
+        unlisted=(),
     ):
         errors = errors or {}
         endpoints = endpoints or {}
+        shadow = shadow or {}
         transform_jobs = transform_jobs or {}
         models = models or {}
         components = components or {}
@@ -4565,6 +4569,8 @@ class TestSM22RegistryLegs:
                     ]
                 if name == "list_model_packages":
                     group = kwargs["ModelPackageGroupName"]
+                    if group in unlisted:
+                        raise _make_client_error("AccessDeniedException", name)
                     return [
                         {
                             "ModelPackageSummaryList": [
@@ -4608,6 +4614,10 @@ class TestSM22RegistryLegs:
 
         def describe_model_package(ModelPackageName):
             fail("describe_model_package")
+            if ModelPackageName in unreadable:
+                raise _make_client_error(
+                    "AccessDeniedException", "describe_model_package"
+                )
             return packages[ModelPackageName]
 
         mock_sm.describe_model_package.side_effect = describe_model_package
@@ -4615,7 +4625,10 @@ class TestSM22RegistryLegs:
             "EndpointConfigName": f"{EndpointName}-config"
         }
         mock_sm.describe_endpoint_config.side_effect = lambda EndpointConfigName: {
-            "ProductionVariants": endpoints[EndpointConfigName[: -len("-config")]]
+            "ProductionVariants": endpoints[EndpointConfigName[: -len("-config")]],
+            "ShadowProductionVariants": shadow.get(
+                EndpointConfigName[: -len("-config")], []
+            ),
         }
 
         def describe_model(ModelName):
@@ -5018,6 +5031,120 @@ class TestSM22RegistryLegs:
         )
         rows = self._rows(sagemaker_app.REGISTRY_SHARING_FINDING)
         assert [r["Status"] for r in rows] == ["N/A"]
+
+
+class TestRound9SM22ShadowVariantsAndPartialReads:
+    """AIR-SGM-GOV-01 round 9: a shadow variant's model is traced to the
+    registry, and the approver and lifecycle legs hold at N/A when some
+    model package versions were not read."""
+
+    APPROVER = TestSM22RegistryLegs.APPROVER
+    STAGED = TestSM22RegistryLegs.STAGED
+    _client = staticmethod(TestSM22RegistryLegs._client)
+    _good_package = classmethod(TestSM22RegistryLegs._good_package.__func__)
+    _rows = staticmethod(TestSM22RegistryLegs._rows)
+
+    PROD = {"VariantName": "prod", "ModelName": "m-good"}
+    MODELS = {
+        "m-good": {"PrimaryContainer": {"ModelPackageName": "p1"}},
+        "m-shadow": {"PrimaryContainer": {"ModelPackageName": "p2"}},
+    }
+
+    def _two_endpoints(self, mock_client, shadow_status):
+        self._client(
+            mock_client,
+            {
+                "p1": self._good_package(),
+                "p2": self._good_package(
+                    ModelPackageName="fraud/2", ModelApprovalStatus=shadow_status
+                ),
+            },
+            endpoints={"ep-a": [self.PROD], "ep-b": [self.PROD]},
+            shadow={"ep-b": [{"VariantName": "canary", "ModelName": "m-shadow"}]},
+            models=self.MODELS,
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_shadow_variant_on_an_unapproved_package_fails(self, mock_client):
+        self._two_endpoints(mock_client, "PendingManualApproval")
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "m-shadow" in rows[0]["Finding_Details"]
+        assert "ep-b/canary (shadow)" in rows[0]["Finding_Details"]
+        assert "PendingManualApproval" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_shadow_variant_on_an_approved_package_is_counted(self, mock_client):
+        self._two_endpoints(mock_client, "Approved")
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 2 model(s)" in rows[0]["Finding_Details"]
+
+    def _one_unread_version(self, mock_client, **reads):
+        self._client(
+            mock_client,
+            {
+                "p1": self._good_package(),
+                "p2": self._good_package(ModelPackageName="fraud/2"),
+            },
+            **reads,
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_undescribed_version_holds_the_lifecycle_pass(self, mock_client):
+        self._one_unread_version(mock_client, unreadable={"p2"})
+        rows = self._rows(sagemaker_app.MODEL_LIFECYCLE_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "All 1 approved" in rows[0]["Finding_Details"]
+        assert "1 model package read(s) failed" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_undescribed_version_holds_the_approver_pass(self, mock_client):
+        self._one_unread_version(mock_client, unreadable={"p2"})
+        rows = self._rows(sagemaker_app.APPROVER_ATTRIBUTION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "1 of 1 approved" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_unlisted_group_holds_both_passes(self, mock_client):
+        self._client(
+            mock_client,
+            {
+                "p1": self._good_package(),
+                "q1": self._good_package(
+                    ModelPackageName="risk/1", ModelPackageGroupName="risk"
+                ),
+            },
+            groups=("fraud", "risk"),
+            unlisted={"risk"},
+        )
+        rows = self._rows(sagemaker_app.MODEL_LIFECYCLE_FINDING) + self._rows(
+            sagemaker_app.APPROVER_ATTRIBUTION_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unstaged_read_version_still_fails_beside_an_unread_one(
+        self, mock_client
+    ):
+        self._client(
+            mock_client,
+            {
+                "p1": self._good_package(ModelLifeCycle={}),
+                "p2": self._good_package(ModelPackageName="fraud/2"),
+            },
+            unreadable={"p2"},
+        )
+        rows = self._rows(sagemaker_app.MODEL_LIFECYCLE_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_every_version_read_still_passes_both(self, mock_client):
+        self._one_unread_version(mock_client)
+        rows = self._rows(sagemaker_app.MODEL_LIFECYCLE_FINDING) + self._rows(
+            sagemaker_app.APPROVER_ATTRIBUTION_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
 
 
 class TestSM31EndpointDataCapture:
