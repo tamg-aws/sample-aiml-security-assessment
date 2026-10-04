@@ -24792,7 +24792,11 @@ def _image_layer_credentials(
 
 
 def _image_config_credentials(
-    registry: str, region_name: str, repository: str, reference: str
+    registry: str,
+    region_name: str,
+    repository: str,
+    reference: str,
+    scans: Dict[Tuple[str, str, str], Any],
 ) -> Tuple[List[str], int, int, int, int, int]:
     """Scan the configuration and layers of every platform an ECR image names.
 
@@ -24801,7 +24805,9 @@ def _image_config_credentials(
     read, the layers read, the layer files scanned, and the layer files over
     the per-file bound not scanned. Raises ClientError, BotoCoreError,
     OSError or ValueError on a read that fails, so the caller never reports
-    an unread image as clean.
+    an unread image as clean. scans holds the result, or the error, of each
+    image digest already read, so an image that several tags, versions or
+    runtimes name is downloaded once.
     """
     client = _ecr_client_for(region_name)
     image_id = (
@@ -24810,7 +24816,7 @@ def _image_config_credentials(
         else {"imageTag": reference[1:] if reference.startswith(":") else "latest"}
     )
 
-    def manifest(image: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+    def manifest(image: Dict[str, str]) -> Tuple[str, Dict[str, Any], str]:
         images = (
             client.batch_get_image(
                 registryId=registry,
@@ -24828,9 +24834,37 @@ def _image_config_credentials(
         media_type = str(
             images[0].get("imageManifestMediaType") or document.get("mediaType") or ""
         )
-        return media_type, document
+        digest = str((images[0].get("imageId") or {}).get("imageDigest") or "")
+        return media_type, document, digest
 
-    media_type, document = manifest(image_id)
+    media_type, document, image_digest = manifest(image_id)
+    key = (registry, region_name, image_digest)
+    if image_digest and key in scans:
+        if isinstance(scans[key], Exception):
+            raise scans[key]
+        return scans[key]
+    try:
+        result = _image_contents_credentials(
+            client, registry, repository, media_type, document, manifest
+        )
+    except (BotoCoreError, ClientError, OSError, ValueError) as error:
+        if image_digest:
+            scans[key] = error
+        raise
+    if image_digest:
+        scans[key] = result
+    return result
+
+
+def _image_contents_credentials(
+    client: Any,
+    registry: str,
+    repository: str,
+    media_type: str,
+    document: Dict[str, Any],
+    manifest: Callable[[Dict[str, str]], Tuple[str, Dict[str, Any], str]],
+) -> Tuple[List[str], int, int, int, int, int]:
+    """The configuration and layer scan _image_config_credentials returns."""
     if media_type in ECR_IMAGE_INDEX_TYPES:
         children = [
             str(entry.get("digest"))
@@ -24938,6 +24972,7 @@ def _agentcore_runtime_image_credential_findings(
         "MiB are not scanned."
     )
     findings: List[Dict[str, Any]] = []
+    scans: Dict[Tuple[str, str, str], Any] = {}
     for label, (account, uris) in images.items():
         found: List[str] = []
         unread: List[str] = []
@@ -24963,7 +24998,7 @@ def _agentcore_runtime_image_credential_findings(
                     files,
                     oversized,
                 ) = _image_config_credentials(
-                    registry, image_region, repository, uri[match.end() :]
+                    registry, image_region, repository, uri[match.end() :], scans
                 )
             except (BotoCoreError, ClientError, OSError, ValueError) as error:
                 # A ValueError is raised by this scan with a message naming

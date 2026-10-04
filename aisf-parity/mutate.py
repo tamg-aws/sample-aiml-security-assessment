@@ -3660,6 +3660,27 @@ MUTATIONS = [
         "find": "            if not hosting_references and not hosting_errors:\n",
         "replace": "            if True:\n",
     },
+    {
+        "name": "AC-34 image: a digest already read is downloaded again",
+        "file": AGENTCORE,
+        "defect": (
+            "an image that two tags, versions or runtimes name was pulled once "
+            "per URI, so repeated 512 MiB pulls could run the Lambda past its "
+            "timeout and return no rows"
+        ),
+        "find": "    if image_digest and key in scans:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "AC-34 image: a digest that failed is downloaded again",
+        "file": AGENTCORE,
+        "defect": (
+            "an image whose read failed was pulled again for every URI that "
+            "names its digest"
+        ),
+        "find": "            scans[key] = error\n",
+        "replace": "            pass\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -4457,6 +4478,8 @@ GROUPS: dict[str, str] = {
     "AC-08 data path: an unresolved hosting VPC is not reported": "in the AgentCore verdict legs",
     "AC-45 shell: a matching character pair ends the pattern overlap": "in the AgentCore verdict legs",
     "AC-08 data path: a tools-only Region is not judged": "in the AgentCore verdict legs",
+    "AC-34 image: a digest already read is downloaded again": "in the AgentCore verdict legs",
+    "AC-34 image: a digest that failed is downloaded again": "in the AgentCore verdict legs",
 }
 
 

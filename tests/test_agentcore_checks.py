@@ -20167,16 +20167,26 @@ class TestAC34RuntimeImages:
         return buffer.getvalue()
 
     def _wire(
-        self, mock_ac, mock_ecr, mock_open, runtimes, configs, index=None, layers=None
+        self,
+        mock_ac,
+        mock_ecr,
+        mock_open,
+        runtimes,
+        configs,
+        index=None,
+        layers=None,
+        digests=None,
     ):
         """runtimes: {id: uri}. configs: {config digest: response}.
 
         A URI's tag (or digest) names its manifest; index maps a tag to the
         child manifest digests of an image index. Since round 8 each manifest
         names one layer, lyr-<ref>, whose bytes layers holds and which is a
-        clean file by default.
+        clean file by default. digests maps a tag to the image digest
+        BatchGetImage reports for it; a tag absent from it reports none.
         """
         layers = layers or {}
+        digests = digests or {}
         clean_layer = self._layer({"app/main.py": b"print('ok')\n"})
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [
@@ -20210,9 +20220,13 @@ class TestAC34RuntimeImages:
                         }
                     ]
                 }
+            identity = (
+                {"imageId": {"imageDigest": digests[ref]}} if ref in digests else {}
+            )
             return {
                 "images": [
                     {
+                        **identity,
                         "imageManifestMediaType": (
                             "application/vnd.oci.image.manifest.v1+json"
                         ),
@@ -20535,6 +20549,108 @@ class TestAC34RuntimeImages:
 
         assert [r["Status"] for r in rows] == ["Failed"]
         assert f"Env API_KEY of {self._URI}:old" in rows[0]["Finding_Details"]
+
+    def _wire_shared_digest(self, mock_ac, mock_ecr, mock_open, **wire):
+        """rt-a serves :v1 on its prod endpoint and :v2 as its latest version,
+        rt-b runs :alias, and all three tags name one image digest; rt-c runs
+        :other, a different image."""
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {
+                "rt-a": f"{self._URI}:v2",
+                "rt-b": f"{self._URI}:alias",
+                "rt-c": f"{self._URI}:other",
+            },
+            {
+                f"cfg-{ref}": self._config(env=["A=1"])
+                for ref in ("v1", "v2", "alias", "other")
+            },
+            digests={
+                "v1": "sha256:same",
+                "v2": "sha256:same",
+                "alias": "sha256:same",
+                "other": "sha256:other",
+            },
+            **wire,
+        )
+        uris = {"rt-a": f"{self._URI}:v2", "rt-b": f"{self._URI}:alias"}
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId, **kw: (
+            self._detail(agentRuntimeId, f"{self._URI}:v1", "1")
+            if agentRuntimeId == "rt-a" and kw.get("agentRuntimeVersion") == "1"
+            else self._detail(
+                agentRuntimeId,
+                uris.get(agentRuntimeId, f"{self._URI}:other"),
+                "2",
+            )
+        )
+        mock_ac.list_agent_runtime_endpoints.side_effect = lambda agentRuntimeId, **kw: {
+            "runtimeEndpoints": (
+                [{"name": "prod", "liveVersion": "1"}]
+                if agentRuntimeId == "rt-a"
+                else []
+            )
+        }
+
+    @staticmethod
+    def _opened(mock_open, prefix):
+        return [
+            c.args[0].rsplit("/", 1)[1]
+            for c in mock_open.call_args_list
+            if c.args[0].rsplit("/", 1)[1].startswith(prefix)
+        ]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_digest_is_downloaded_once_per_invocation(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        # Two versions of rt-a and the image rt-b runs share one digest, so
+        # their configuration and layer are fetched once; :other is its own
+        # image and is fetched too.
+        self._wire_shared_digest(mock_ac, mock_ecr, mock_open)
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "Passed", "Passed"]
+        for uri in (f"{self._URI}:v1", f"{self._URI}:v2"):
+            assert f"{uri} (1 platform(s)" in rows[0]["Finding_Details"]
+        assert f"{self._URI}:alias (1 platform(s)" in rows[1]["Finding_Details"]
+        shared = ("lyr-v1", "lyr-v2", "lyr-alias")
+        assert len([u for u in self._opened(mock_open, "lyr-") if u in shared]) == 1
+        assert self._opened(mock_open, "lyr-other") == ["lyr-other"]
+        assert len(self._opened(mock_open, "cfg-")) == 2
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_digest_that_failed_is_not_fetched_again(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire_shared_digest(mock_ac, mock_ecr, mock_open)
+        original = mock_open.side_effect
+
+        def open_url(url, timeout):
+            if url.rsplit("/", 1)[1] in ("lyr-v1", "lyr-v2", "lyr-alias"):
+                raise OSError("timed out")
+            return original(url, timeout)
+
+        mock_open.side_effect = open_url
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["N/A", "N/A", "Passed"]
+        for uri in (f"{self._URI}:v1", f"{self._URI}:v2"):
+            assert f"{uri} could not be read (" in rows[0]["Finding_Details"]
+        assert f"{self._URI}:alias could not be read (" in rows[1]["Finding_Details"]
+        shared = ("lyr-v1", "lyr-v2", "lyr-alias")
+        assert len([u for u in self._opened(mock_open, "lyr-") if u in shared]) == 1
 
     @patch("agentcore_app.boto3")
     @patch("agentcore_app.urlopen")

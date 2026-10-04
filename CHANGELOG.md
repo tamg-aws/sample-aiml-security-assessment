@@ -368,6 +368,11 @@ section.
     stop at `No AgentCore resources found`, so the S3, DynamoDB and SageMaker
     endpoint policies those tools reach went unjudged. The presence legs stay
     `N/A`, since no AgentCore endpoint is required there.
+  - `AC-34` downloads each container image once per run, keyed by the image
+    digest `BatchGetImage` reports. It pulled the configuration and layers
+    again for every tag, version or runtime naming the same image, and at up
+    to 512 MiB per pull that could run the Lambda past its 600-second timeout
+    and return no rows. A failed read is also kept, so it is not retried.
 
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.
