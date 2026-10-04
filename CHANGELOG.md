@@ -434,6 +434,18 @@ section.
     `DataCaptureConfig.KmsKeyId`, and an asynchronous config with no
     `AsyncInferenceConfig.OutputConfig.KmsKeyId` fail, an AWS managed key
     on any of them fails, and an unread endpoint holds back `Passed`.
+- `SM-34` and the `SM-09` notebook access row hold every SageMaker action
+  that defines a guardrail key in the sagemaker service reference (read
+  2026-10-04), not five hand-picked create actions. `SM-34` now requires the
+  KMS, VPC and isolation keys on `CreateHyperParameterTuningJob`,
+  `CreateProcessingJob`, `CreateAutoMLJob`, `CreateAutoMLJobV2`, the four
+  monitoring job definitions, `CreateMonitoringSchedule` and
+  `UpdateMonitoringSchedule`, `CreateLabelingJob`, `CreateJob`,
+  `CreateCluster` and `UpdateCluster`, and `CreateDomain` and `UpdateDomain`
+  with `sagemaker:AppNetworkAccessType`. `SM-09` adds
+  `UpdateNotebookInstance`, the two domain actions and the two user profile
+  actions. An SCP on `CreateTrainingJob` alone no longer passes, because a
+  tuning or processing job launches compute on its own keys.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule

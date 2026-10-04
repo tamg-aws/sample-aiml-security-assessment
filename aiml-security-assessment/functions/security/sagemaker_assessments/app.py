@@ -13769,65 +13769,206 @@ CREATION_GUARDRAIL_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/security_iam_service-with-iam.html"
 )
 
-# The creation actions this control names, with the resource type each creates.
-# A batch transform job takes its network posture from its model, so
-# CreateModel carries the network keys and CreateTransformJob the KMS keys.
-SAGEMAKER_GUARDED_CREATE_ACTIONS = (
-    ("sagemaker:CreateTrainingJob", "training-job"),
-    ("sagemaker:CreateEndpointConfig", "endpoint-config"),
-    ("sagemaker:CreateNotebookInstance", "notebook-instance"),
-    ("sagemaker:CreateModel", "model"),
-    ("sagemaker:CreateTransformJob", "transform-job"),
+# AIR-SGM-TRN-01, TRN-02, TRN-05 and TRN-08: every sagemaker create or update
+# action whose ActionConditionKeys hold one of the guardrail keys below, with the
+# resource type the action is named after and the guardrail keys it defines,
+# transcribed from the sagemaker service-reference JSON (read 2026-10-04). A
+# tuning, processing, AutoML, monitoring, HyperPod or Studio action launches or
+# configures compute on its own keys, so a guard on CreateTrainingJob alone
+# leaves it open. A batch transform job takes its network posture from its
+# model, so CreateModel carries the network keys and CreateTransformJob the KMS
+# keys.
+SAGEMAKER_GUARDRAIL_KEYS = (
+    "sagemaker:VolumeKmsKeyArn",
+    "sagemaker:OutputKmsKeyArn",
+    "sagemaker:InterContainerTrafficEncryption",
+    "sagemaker:VpcSubnets",
+    "sagemaker:VpcSecurityGroupIds",
+    "sagemaker:NetworkIsolation",
+    "sagemaker:DirectInternetAccess",
+    "sagemaker:AppNetworkAccessType",
+    "sagemaker:RootAccess",
 )
-# The creation actions that define sagemaker:VpcSubnets and
-# sagemaker:VpcSecurityGroupIds. CreateTransformJob defines neither.
-SAGEMAKER_NETWORK_CREATE_ACTIONS = (
-    "sagemaker:CreateTrainingJob",
-    "sagemaker:CreateEndpointConfig",
-    "sagemaker:CreateNotebookInstance",
-    "sagemaker:CreateModel",
+_SM_ENC = (
+    "sagemaker:VolumeKmsKeyArn",
+    "sagemaker:OutputKmsKeyArn",
+    "sagemaker:InterContainerTrafficEncryption",
 )
-
-# Each guardrail category as (action, key group) requirements. Every requirement
-# must be enforced, and any one key of its group enforces it. Each key is listed
-# as an ActionConditionKey of its action in the sagemaker service-reference JSON
-# (read 2026-09-27). sagemaker:VolumeKmsKey and sagemaker:OutputKmsKey are listed
-# service-wide but no action defines them, so a condition on either enforces
-# nothing and neither is accepted.
-SAGEMAKER_CREATION_GUARDRAILS = (
+_SM_ENC_NET = (*_SM_ENC, "sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")
+SAGEMAKER_GUARDED_ACTION_KEYS = (
     (
-        "encryption",
+        "sagemaker:CreateTrainingJob",
+        "training-job",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateEndpointConfig",
+        "endpoint-config",
         (
-            ("sagemaker:CreateTrainingJob", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateTrainingJob", ("sagemaker:OutputKmsKeyArn",)),
-            (
-                "sagemaker:CreateTrainingJob",
-                ("sagemaker:InterContainerTrafficEncryption",),
-            ),
-            ("sagemaker:CreateEndpointConfig", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateTransformJob", ("sagemaker:VolumeKmsKeyArn",)),
-            ("sagemaker:CreateTransformJob", ("sagemaker:OutputKmsKeyArn",)),
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:NetworkIsolation",
         ),
     ),
-    # The control asks for approved subnets and approved security groups, so
-    # each key is its own requirement: a guard on one admits any value of the
-    # other.
+    (
+        "sagemaker:CreateNotebookInstance",
+        "notebook-instance",
+        (
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:DirectInternetAccess",
+            "sagemaker:RootAccess",
+        ),
+    ),
+    (
+        "sagemaker:CreateModel",
+        "model",
+        (
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:NetworkIsolation",
+        ),
+    ),
+    (
+        "sagemaker:CreateTransformJob",
+        "transform-job",
+        ("sagemaker:VolumeKmsKeyArn", "sagemaker:OutputKmsKeyArn"),
+    ),
+    (
+        "sagemaker:CreateHyperParameterTuningJob",
+        "hyper-parameter-tuning-job",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateProcessingJob",
+        "processing-job",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    ("sagemaker:CreateAutoMLJob", "automl-job", _SM_ENC_NET),
+    ("sagemaker:CreateAutoMLJobV2", "automl-job", _SM_ENC_NET),
+    (
+        "sagemaker:CreateDataQualityJobDefinition",
+        "data-quality-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateModelBiasJobDefinition",
+        "model-bias-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateModelExplainabilityJobDefinition",
+        "model-explainability-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateModelQualityJobDefinition",
+        "model-quality-job-definition",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateMonitoringSchedule",
+        "monitoring-schedule",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:UpdateMonitoringSchedule",
+        "monitoring-schedule",
+        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),
+    ),
+    (
+        "sagemaker:CreateLabelingJob",
+        "labeling-job",
+        ("sagemaker:VolumeKmsKeyArn", "sagemaker:OutputKmsKeyArn"),
+    ),
+    (
+        "sagemaker:CreateJob",
+        "job",
+        (
+            "sagemaker:OutputKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+        ),
+    ),
+    (
+        "sagemaker:CreateCluster",
+        "cluster",
+        ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"),
+    ),
+    (
+        "sagemaker:UpdateCluster",
+        "cluster",
+        ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"),
+    ),
+    (
+        "sagemaker:CreateDomain",
+        "domain",
+        (
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:AppNetworkAccessType",
+        ),
+    ),
+    (
+        "sagemaker:UpdateDomain",
+        "domain",
+        (
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:AppNetworkAccessType",
+        ),
+    ),
+    ("sagemaker:CreateUserProfile", "user-profile", ("sagemaker:VpcSecurityGroupIds",)),
+    ("sagemaker:UpdateUserProfile", "user-profile", ("sagemaker:VpcSecurityGroupIds",)),
+    (
+        "sagemaker:UpdateNotebookInstance",
+        "notebook-instance",
+        ("sagemaker:RootAccess",),
+    ),
+)
+SAGEMAKER_GUARDED_CREATE_ACTIONS = tuple(
+    (action, resource_type)
+    for action, resource_type, _ in SAGEMAKER_GUARDED_ACTION_KEYS
+)
+
+
+def _guardrail_requirements(keys: tuple, actions: Optional[tuple] = None) -> tuple:
+    """One (action, (key,)) requirement per guardrail key each action defines."""
+    return tuple(
+        (action, (key,))
+        for action, _, defined in SAGEMAKER_GUARDED_ACTION_KEYS
+        if actions is None or action in actions
+        for key in keys
+        if key in defined
+    )
+
+
+# Each guardrail category as (action, key group) requirements. Every requirement
+# must be enforced, and any one key of its group enforces it.
+# sagemaker:VolumeKmsKey and sagemaker:OutputKmsKey are listed service-wide but
+# no action defines them, so a condition on either enforces nothing and neither
+# is accepted. The control asks for approved subnets and approved security
+# groups, so each key is its own requirement: a guard on one admits any value of
+# the other.
+SAGEMAKER_CREATION_GUARDRAILS = (
+    ("encryption", _guardrail_requirements(_SM_ENC)),
     (
         "approved network",
-        tuple(
-            (action, (key,))
-            for action in SAGEMAKER_NETWORK_CREATE_ACTIONS
-            for key in ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")
+        _guardrail_requirements(
+            ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")
         ),
     ),
     (
         "no direct internet access",
-        (
-            ("sagemaker:CreateTrainingJob", ("sagemaker:NetworkIsolation",)),
-            ("sagemaker:CreateEndpointConfig", ("sagemaker:NetworkIsolation",)),
-            ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
-            ("sagemaker:CreateModel", ("sagemaker:NetworkIsolation",)),
+        _guardrail_requirements(
+            (
+                "sagemaker:NetworkIsolation",
+                "sagemaker:DirectInternetAccess",
+                "sagemaker:AppNetworkAccessType",
+            )
         ),
     ),
 )
@@ -13840,12 +13981,14 @@ CREATION_KEY_COMPLIANT_VALUES = {
     "sagemaker:networkisolation": "true",
     "sagemaker:directinternetaccess": "disabled",
     "sagemaker:rootaccess": "disabled",
+    "sagemaker:appnetworkaccesstype": "vpconly",
 }
 CREATION_KEY_NONCOMPLIANT_VALUES = {
     "sagemaker:intercontainertrafficencryption": "false",
     "sagemaker:networkisolation": "false",
     "sagemaker:directinternetaccess": "enabled",
     "sagemaker:rootaccess": "enabled",
+    "sagemaker:appnetworkaccesstype": "publicinternetonly",
 }
 CREATION_PROBE_PARTITIONS = ("aws", "aws-cn", "aws-us-gov")
 # AIR-SGM-EP-08: the batch transform path. A transform job takes its network
@@ -13878,16 +14021,31 @@ NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE = (
     "https://docs.aws.amazon.com/whitepapers/latest/"
     "sagemaker-studio-admin-best-practices/permissions-management.html"
 )
-# AIR-SGM-TRN-05: each key below is an ActionConditionKey of
-# CreateNotebookInstance in the sagemaker service-reference JSON (read
-# 2026-09-27). The two presigned-URL actions define no action keys, so the
-# global aws:SourceIp and aws:SourceVpce keys restrict where they are called.
+# AIR-SGM-TRN-05: the notebook and Studio rows of SAGEMAKER_GUARDED_ACTION_KEYS,
+# each with the keys of the production bar it defines. UpdateNotebookInstance
+# can turn RootAccess back on, and UpdateDomain can set AppNetworkAccessType to
+# PublicInternetOnly or move the domain's subnets, so both are held as well. The
+# two presigned-URL actions define no action keys, so the global aws:SourceIp
+# and aws:SourceVpce keys restrict where they are called.
 NOTEBOOK_ACCESS_GUARDRAILS = (
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:RootAccess",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:VpcSubnets",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:VpcSecurityGroupIds",)),
-    ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
+    *_guardrail_requirements(
+        (
+            "sagemaker:RootAccess",
+            "sagemaker:DirectInternetAccess",
+            "sagemaker:VpcSubnets",
+            "sagemaker:VpcSecurityGroupIds",
+            "sagemaker:VolumeKmsKeyArn",
+            "sagemaker:AppNetworkAccessType",
+        ),
+        actions=(
+            "sagemaker:CreateNotebookInstance",
+            "sagemaker:UpdateNotebookInstance",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+            "sagemaker:CreateUserProfile",
+            "sagemaker:UpdateUserProfile",
+        ),
+    ),
     (
         "sagemaker:CreatePresignedNotebookInstanceUrl",
         ("aws:SourceIp", "aws:SourceVpce"),
@@ -13902,11 +14060,12 @@ GUARDED_ACTION_RESOURCE_TYPES = {
     "lambda:UpdateFunctionConfiguration": "lambda:function",
     "lambda:CreateNetworkConnector": "lambda:network-connector",
 }
-# A user profile ARN carries the domain id before the profile name, and a Lambda
-# function ARN separates its type from its name with a colon. A type with no
+# A user profile ARN carries the domain id before the profile name, a job ARN
+# carries its category before the job name, and a Lambda function ARN separates its type from its name with a colon. A type with no
 # service prefix is a SageMaker type.
 GUARDED_RESOURCE_PROBE_PATHS = {
     "user-profile": "user-profile/d-zzprobe/zz-probe",
+    "job": "job/zz-probe/zz-probe",
     "lambda:function": "function:zz-probe",
     "lambda:network-connector": "network-connector:zz-probe",
 }
@@ -14546,7 +14705,7 @@ def _creation_scp_reason(scp_leg: Dict[str, Any], scp: Dict[str, Any]) -> str:
 
 
 CREATION_GUARDRAIL_RESOLUTION = (
-    "Deny the named create action in a service control policy "
+    "Deny the named create or update action in a service control policy "
     "attached above this account when the key is outside the approved "
     "values (ArnNotEquals or StringNotEquals, which also fire when the key "
     "is absent), or add an Allow condition naming the approved values to "
@@ -14762,6 +14921,7 @@ def check_sagemaker_creation_guardrails(
         check_id="SM-34",
         finding_name=CREATION_GUARDRAIL_FINDING,
         reference=CREATION_GUARDRAIL_REFERENCE,
+        scope="at SageMaker creation and update time",
     )
 
 
@@ -14991,7 +15151,12 @@ def check_sagemaker_notebook_access_guardrails(
                         "policy attached above this account when RootAccess or "
                         "DirectInternetAccess is not Disabled, or VpcSubnets, "
                         "VpcSecurityGroupIds or VolumeKmsKeyArn is not an "
-                        "approved value, and deny "
+                        "approved value, deny UpdateNotebookInstance when "
+                        "RootAccess is not Disabled, deny CreateDomain and "
+                        "UpdateDomain when AppNetworkAccessType is not VpcOnly or "
+                        "a subnet, security group or volume key is not approved, "
+                        "deny CreateUserProfile and UpdateUserProfile outside the "
+                        "approved security groups, and deny "
                         "CreatePresignedNotebookInstanceUrl and "
                         "CreatePresignedDomainUrl outside the approved aws:SourceIp "
                         "range or aws:SourceVpce. An Allow condition on the key in "

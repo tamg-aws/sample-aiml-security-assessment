@@ -1967,11 +1967,92 @@ MUTATIONS = [
         "defect": "the control asks for approved subnets and approved security "
         "groups. Read as one key group, a Deny on the security groups alone "
         "passes the approved network category, and a job runs in any subnet",
-        "find": "            (action, (key,))\n",
-        "replace": (
-            '            (action, ("sagemaker:VpcSubnets", '
-            '"sagemaker:VpcSecurityGroupIds"))\n'
+        "find": (
+            "        _guardrail_requirements(\n"
+            '            ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds")\n'
+            "        ),\n"
         ),
+        "replace": (
+            "        tuple(\n"
+            '            (a, ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"))\n'
+            "            for a, _, d in SAGEMAKER_GUARDED_ACTION_KEYS\n"
+            '            if "sagemaker:VpcSubnets" in d\n'
+            "        ),\n"
+        ),
+    },
+    # Round 9: the guarded population is the sagemaker service reference's.
+    # Each was killed by hand on a byte backup on 2026-10-04.
+    {
+        "name": "SM-34 guards only the five original create actions",
+        "file": SAGEMAKER,
+        "defect": "a tuning, processing, AutoML, monitoring, HyperPod or Studio "
+        "action launches compute on its own condition keys, so an SCP on "
+        "CreateTrainingJob alone passes while those paths stay open",
+        "find": "        for action, _, defined in SAGEMAKER_GUARDED_ACTION_KEYS\n",
+        "replace": "        for action, _, defined in SAGEMAKER_GUARDED_ACTION_KEYS[:5]\n",
+    },
+    {
+        "name": "SM-34 holds the tuning job to the encryption keys only",
+        "file": SAGEMAKER,
+        "defect": "CreateHyperParameterTuningJob defines sagemaker:VpcSubnets, "
+        "VpcSecurityGroupIds and NetworkIsolation, so a tuning job outside the "
+        "approved network passes",
+        "find": (
+            '        "sagemaker:CreateHyperParameterTuningJob",\n'
+            '        "hyper-parameter-tuning-job",\n'
+            '        (*_SM_ENC_NET, "sagemaker:NetworkIsolation"),\n'
+        ),
+        "replace": (
+            '        "sagemaker:CreateHyperParameterTuningJob",\n'
+            '        "hyper-parameter-tuning-job",\n'
+            "        _SM_ENC,\n"
+        ),
+    },
+    {
+        "name": "SM-34 drops the Studio internet key from its category",
+        "file": SAGEMAKER,
+        "defect": "CreateDomain and UpdateDomain take AppNetworkAccessType, so a "
+        "PublicInternetOnly domain passes the no direct internet access category",
+        "find": (
+            '                "sagemaker:DirectInternetAccess",\n'
+            '                "sagemaker:AppNetworkAccessType",\n'
+            "            )\n"
+        ),
+        "replace": '                "sagemaker:DirectInternetAccess",\n            )\n',
+    },
+    {
+        "name": "SM-34 has no non-compliant AppNetworkAccessType value",
+        "file": SAGEMAKER,
+        "defect": "a StringEqualsIfExists PublicInternetOnly Deny fires on an "
+        "omitted key and on the public value, so it enforces the key, but it "
+        "reads as a one-value deny and withholds the Passed",
+        "find": '    "sagemaker:appnetworkaccesstype": "publicinternetonly",\n',
+        "replace": "",
+    },
+    {
+        "name": "SM-34 probes a job ARN with no category segment",
+        "file": SAGEMAKER,
+        "defect": "a job ARN is job/<category>/<name>, so a Deny on job/*/* "
+        "covers every job but misses a probe with no category, and the "
+        "CreateJob guard reads as scoped to named resources",
+        "find": '    "job": "job/zz-probe/zz-probe",\n',
+        "replace": "",
+    },
+    {
+        "name": "SM-09 holds no Studio domain or update action",
+        "file": SAGEMAKER,
+        "defect": "UpdateNotebookInstance can turn RootAccess back on and "
+        "CreateDomain or UpdateDomain can open a domain to the internet, so a "
+        "bar on CreateNotebookInstance alone passes Studio unexamined",
+        "find": (
+            '            "sagemaker:CreateNotebookInstance",\n'
+            '            "sagemaker:UpdateNotebookInstance",\n'
+            '            "sagemaker:CreateDomain",\n'
+            '            "sagemaker:UpdateDomain",\n'
+            '            "sagemaker:CreateUserProfile",\n'
+            '            "sagemaker:UpdateUserProfile",\n'
+        ),
+        "replace": '            "sagemaker:CreateNotebookInstance",\n',
     },
     {
         "name": "SM-09 credits a key-group Deny with a weak half",
@@ -5037,6 +5118,12 @@ GROUPS: dict[str, str] = {
         "in `SM-43`'s artifact reads"
     ),
     "SM-34 lets either network key stand for both": "in the SageMaker verdict legs",
+    "SM-34 guards only the five original create actions": "in the SageMaker verdict legs",
+    "SM-34 holds the tuning job to the encryption keys only": "in the SageMaker verdict legs",
+    "SM-34 drops the Studio internet key from its category": "in the SageMaker verdict legs",
+    "SM-34 has no non-compliant AppNetworkAccessType value": "in the SageMaker verdict legs",
+    "SM-34 probes a job ARN with no category segment": "in the SageMaker verdict legs",
+    "SM-09 holds no Studio domain or update action": "in the SageMaker verdict legs",
     "SM-09 credits a key-group Deny with a weak half": "in the SageMaker verdict legs",
     "SM-33 exempts S3 interface endpoints from private DNS": "in the SageMaker verdict legs",
     "SM-04 passes GuardDuty findings nobody reviewed": "in the SageMaker verdict legs",

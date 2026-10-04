@@ -6728,44 +6728,77 @@ def _scp_deny(action, operator, key, value, resource="*"):
 
 
 APPROVED_KEY = "arn:aws:kms:us-east-1:123456789012:key/approved"
+# AIR-SGM-TRN-01/02/08: the actions that define each key in the sagemaker
+# service-reference JSON (read 2026-10-04), written out here so the fixtures do
+# not read the map under test.
+TRAINING_LIKE_ACTIONS = [
+    "sagemaker:CreateTrainingJob",
+    "sagemaker:CreateHyperParameterTuningJob",
+    "sagemaker:CreateProcessingJob",
+    "sagemaker:CreateDataQualityJobDefinition",
+    "sagemaker:CreateModelBiasJobDefinition",
+    "sagemaker:CreateModelExplainabilityJobDefinition",
+    "sagemaker:CreateModelQualityJobDefinition",
+    "sagemaker:CreateMonitoringSchedule",
+    "sagemaker:UpdateMonitoringSchedule",
+]
+AUTOML_ACTIONS = ["sagemaker:CreateAutoMLJob", "sagemaker:CreateAutoMLJobV2"]
 SCP_ENCRYPTION_DENIES = [
     _scp_deny(
-        ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+        [
+            *TRAINING_LIKE_ACTIONS,
+            *AUTOML_ACTIONS,
+            "sagemaker:CreateTransformJob",
+            "sagemaker:CreateLabelingJob",
+        ],
         "ArnNotEquals",
         "sagemaker:VolumeKmsKeyArn",
         [APPROVED_KEY],
     ),
     _scp_deny(
-        ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+        [
+            *TRAINING_LIKE_ACTIONS,
+            *AUTOML_ACTIONS,
+            "sagemaker:CreateTransformJob",
+            "sagemaker:CreateLabelingJob",
+            "sagemaker:CreateJob",
+        ],
         "ArnNotEquals",
         "sagemaker:OutputKmsKeyArn",
         [APPROVED_KEY],
     ),
     _scp_deny(
-        "sagemaker:CreateTrainingJob",
+        [*TRAINING_LIKE_ACTIONS, *AUTOML_ACTIONS],
         "BoolIfExists",
         "sagemaker:InterContainerTrafficEncryption",
         "false",
     ),
     _scp_deny(
-        ["sagemaker:CreateEndpointConfig", "sagemaker:CreateNotebookInstance"],
+        [
+            "sagemaker:CreateEndpointConfig",
+            "sagemaker:CreateNotebookInstance",
+            "sagemaker:CreateDomain",
+        ],
         "ArnNotEqualsIfExists",
         "sagemaker:VolumeKmsKeyArn",
         [APPROVED_KEY],
     ),
 ]
+SAGEMAKER_CREATE_OR_UPDATE = ["sagemaker:Create*", "sagemaker:Update*"]
 SCP_NETWORK_DENIES = [
-    _scp_deny("sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"),
+    _scp_deny(SAGEMAKER_CREATE_OR_UPDATE, "Null", "sagemaker:VpcSubnets", "true"),
     _scp_deny(
-        "sagemaker:Create*",
+        SAGEMAKER_CREATE_OR_UPDATE,
         "ForAnyValue:StringNotEquals",
         "sagemaker:VpcSubnets",
         ["subnet-1"],
     ),
     # AIR-SGM-TRN-08: approved security groups are a requirement of their own.
-    _scp_deny("sagemaker:Create*", "Null", "sagemaker:VpcSecurityGroupIds", "true"),
     _scp_deny(
-        "sagemaker:Create*",
+        SAGEMAKER_CREATE_OR_UPDATE, "Null", "sagemaker:VpcSecurityGroupIds", "true"
+    ),
+    _scp_deny(
+        SAGEMAKER_CREATE_OR_UPDATE,
         "ForAnyValue:StringNotEquals",
         "sagemaker:VpcSecurityGroupIds",
         ["sg-1"],
@@ -6774,7 +6807,7 @@ SCP_NETWORK_DENIES = [
 SCP_INTERNET_DENIES = [
     _scp_deny(
         [
-            "sagemaker:CreateTrainingJob",
+            *TRAINING_LIKE_ACTIONS,
             "sagemaker:CreateEndpointConfig",
             "sagemaker:CreateModel",
         ],
@@ -6787,6 +6820,12 @@ SCP_INTERNET_DENIES = [
         "StringNotEquals",
         "sagemaker:DirectInternetAccess",
         "Disabled",
+    ),
+    _scp_deny(
+        ["sagemaker:CreateDomain", "sagemaker:UpdateDomain"],
+        "StringNotEquals",
+        "sagemaker:AppNetworkAccessType",
+        "VpcOnly",
     ),
 ]
 OPEN_SAGEMAKER_ALLOW = {"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"}
@@ -7049,12 +7088,7 @@ class TestSM34CreationGuardrails:
                     "DenyOneSubnet",
                     [
                         _scp_deny(
-                            [
-                                "sagemaker:CreateTrainingJob",
-                                "sagemaker:CreateEndpointConfig",
-                                "sagemaker:CreateNotebookInstance",
-                                "sagemaker:CreateModel",
-                            ],
+                            SAGEMAKER_CREATE_OR_UPDATE,
                             "StringEquals",
                             "sagemaker:VpcSubnets",
                             "subnet-legacy",
@@ -7163,7 +7197,7 @@ class TestSM34CreationGuardrails:
         )
         row = self._by_category(findings)["encryption"]
         assert row["Status"] == "Failed"
-        assert "7 of 7 encryption requirements" in row["Finding_Details"]
+        assert "41 of 41 encryption requirements" in row["Finding_Details"]
 
     def test_a_key_guards_only_the_actions_it_is_paired_with(self):
         findings = self._run(
@@ -7183,7 +7217,7 @@ class TestSM34CreationGuardrails:
         )
         row = self._by_category(findings)["encryption"]
         assert row["Status"] == "Failed"
-        assert "7 of 7 encryption requirements" in row["Finding_Details"]
+        assert "41 of 41 encryption requirements" in row["Finding_Details"]
         assert (
             "CreateTrainingJob on sagemaker:VolumeKmsKeyArn" in row["Finding_Details"]
         )
@@ -7241,7 +7275,7 @@ class TestSM34CreationGuardrails:
                     "IsolationBool",
                     [
                         _scp_deny(
-                            "sagemaker:Create*",
+                            SAGEMAKER_CREATE_OR_UPDATE,
                             "Bool",
                             "sagemaker:NetworkIsolation",
                             "false",
@@ -7265,7 +7299,7 @@ class TestSM34CreationGuardrails:
                             "SubnetAllowList",
                             [
                                 _scp_deny(
-                                    "sagemaker:Create*",
+                                    SAGEMAKER_CREATE_OR_UPDATE,
                                     operator,
                                     "sagemaker:VpcSubnets",
                                     ["subnet-1"] if operator != "Null" else "true",
@@ -7309,10 +7343,10 @@ class TestSM34CreationGuardrails:
             else SCP_NETWORK_DENIES[:2]
         )
         for statements in (
-            [_scp_deny("sagemaker:Create*", operator, key, values)],
+            [_scp_deny(SAGEMAKER_CREATE_OR_UPDATE, operator, key, values)],
             [
-                _scp_deny("sagemaker:Create*", "Null", key, "true"),
-                _scp_deny("sagemaker:Create*", operator, key, values),
+                _scp_deny(SAGEMAKER_CREATE_OR_UPDATE, "Null", key, "true"),
+                _scp_deny(SAGEMAKER_CREATE_OR_UPDATE, operator, key, values),
             ],
         ):
             row = self._by_category(
@@ -7331,7 +7365,7 @@ class TestSM34CreationGuardrails:
             "BareNegated",
             [
                 _scp_deny(
-                    "sagemaker:Create*",
+                    SAGEMAKER_CREATE_OR_UPDATE,
                     "StringNotEquals",
                     "sagemaker:VpcSubnets",
                     ["subnet-1"],
@@ -7347,13 +7381,13 @@ class TestSM34CreationGuardrails:
 
     def test_a_deny_with_a_second_condition_or_narrow_resource_is_not_enforcing(self):
         conjunctive = _scp_deny(
-            "sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"
+            SAGEMAKER_CREATE_OR_UPDATE, "Null", "sagemaker:VpcSubnets", "true"
         )
         conjunctive["Condition"]["ArnNotLike"] = {
             "aws:PrincipalArn": "arn:aws:iam::*:role/BreakGlass"
         }
         narrow = _scp_deny(
-            "sagemaker:Create*",
+            SAGEMAKER_CREATE_OR_UPDATE,
             "StringNotEquals",
             "sagemaker:VpcSubnets",
             ["subnet-1"],
@@ -19000,7 +19034,7 @@ class TestSM09NotebookConfigRules:
 # ===================================================================
 SCP_NOTEBOOK_ACCESS_DENIES = [
     _scp_deny(
-        "sagemaker:CreateNotebookInstance",
+        ["sagemaker:CreateNotebookInstance", "sagemaker:UpdateNotebookInstance"],
         "StringNotEquals",
         "sagemaker:RootAccess",
         "Disabled",
@@ -19012,31 +19046,60 @@ SCP_NOTEBOOK_ACCESS_DENIES = [
         "Disabled",
     ),
     _scp_deny(
-        "sagemaker:CreateNotebookInstance",
+        [
+            "sagemaker:CreateNotebookInstance",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+        ],
         "ForAnyValue:StringNotEquals",
         "sagemaker:VpcSubnets",
         ["subnet-1"],
     ),
     _scp_deny(
-        "sagemaker:CreateNotebookInstance", "Null", "sagemaker:VpcSubnets", "true"
+        [
+            "sagemaker:CreateNotebookInstance",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+        ],
+        "Null",
+        "sagemaker:VpcSubnets",
+        "true",
     ),
     _scp_deny(
-        "sagemaker:CreateNotebookInstance",
+        [
+            "sagemaker:CreateNotebookInstance",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+            "sagemaker:CreateUserProfile",
+            "sagemaker:UpdateUserProfile",
+        ],
         "ForAnyValue:StringNotEquals",
         "sagemaker:VpcSecurityGroupIds",
         ["sg-1"],
     ),
     _scp_deny(
-        "sagemaker:CreateNotebookInstance",
+        [
+            "sagemaker:CreateNotebookInstance",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+            "sagemaker:CreateUserProfile",
+            "sagemaker:UpdateUserProfile",
+        ],
         "Null",
         "sagemaker:VpcSecurityGroupIds",
         "true",
     ),
     _scp_deny(
-        "sagemaker:CreateNotebookInstance",
+        ["sagemaker:CreateNotebookInstance", "sagemaker:CreateDomain"],
         "ArnNotEquals",
         "sagemaker:VolumeKmsKeyArn",
         [APPROVED_KEY],
+    ),
+    _scp_deny(
+        ["sagemaker:CreateDomain", "sagemaker:UpdateDomain"],
+        "StringNotEquals",
+        "sagemaker:AppNetworkAccessType",
+        "VpcOnly",
     ),
     _scp_deny(
         [
@@ -19068,7 +19131,7 @@ class TestSM09NotebookAccessGuardrails:
     def test_attached_scp_holding_all_seven_passes(self):
         rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES)
         assert [r["Status"] for r in rows] == ["Passed"]
-        assert "All 7 notebook access requirements" in rows[0]["Finding_Details"]
+        assert "All 17 notebook access requirements" in rows[0]["Finding_Details"]
         assert rows[0]["Check_ID"] == "SM-09"
 
     @pytest.mark.parametrize("dropped", range(len(SCP_NOTEBOOK_ACCESS_DENIES)))
@@ -20163,6 +20226,7 @@ class TestSM34ValuePinning:
                     "sagemaker:DirectInternetAccess",
                     "true",
                 ),
+                SCP_INTERNET_DENIES[2],
             ]
         )
         rows = self._rows(statements)
@@ -20170,20 +20234,20 @@ class TestSM34ValuePinning:
         assert rows["approved network"]["Status"] == "Passed"
         internet = rows["no direct internet access"]
         assert internet["Status"] == "Failed"
-        assert "1 of 4 no direct internet access" in internet["Finding_Details"]
+        assert "1 of 14 no direct internet access" in internet["Finding_Details"]
         assert "admits any value" in internet["Finding_Details"]
         assert "CreateNotebookInstance" in internet["Finding_Details"]
 
     def test_a_null_or_wildcard_deny_on_a_kms_key_does_not_pin_it(self):
         for weak in (
             _scp_deny(
-                ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+                SCP_ENCRYPTION_DENIES[0]["Action"],
                 "Null",
                 "sagemaker:VolumeKmsKeyArn",
                 "true",
             ),
             _scp_deny(
-                ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+                SCP_ENCRYPTION_DENIES[0]["Action"],
                 "ArnNotLike",
                 "sagemaker:VolumeKmsKeyArn",
                 ["arn:aws:kms:*:123456789012:key/*"],
@@ -20191,7 +20255,7 @@ class TestSM34ValuePinning:
         ):
             row = self._rows([weak] + SCP_ENCRYPTION_DENIES[1:])["encryption"]
             assert row["Status"] == "Failed"
-            assert "2 of 7 encryption requirements" in row["Finding_Details"]
+            assert "13 of 41 encryption requirements" in row["Finding_Details"]
             assert (
                 "CreateTrainingJob on sagemaker:VolumeKmsKeyArn"
                 in (row["Finding_Details"])
@@ -20240,56 +20304,44 @@ class TestSM34ValuePinning:
         _assert_open_only_to_root(rows["approved network"])
 
     def test_the_model_and_transform_job_actions_are_guarded(self):
-        three_actions = [
-            "sagemaker:CreateTrainingJob",
+        # Every fixture deny with CreateModel and CreateTransformJob taken out.
+        dropped = {"sagemaker:CreateModel", "sagemaker:CreateTransformJob"}
+        network_actions = [
+            *TRAINING_LIKE_ACTIONS,
+            *AUTOML_ACTIONS,
             "sagemaker:CreateEndpointConfig",
             "sagemaker:CreateNotebookInstance",
+            "sagemaker:CreateJob",
+            "sagemaker:CreateCluster",
+            "sagemaker:UpdateCluster",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+            "sagemaker:CreateUserProfile",
+            "sagemaker:UpdateUserProfile",
         ]
         statements = [
-            _scp_deny(
-                three_actions,
-                "ArnNotEquals",
-                "sagemaker:VolumeKmsKeyArn",
-                [APPROVED_KEY],
-            ),
-            _scp_deny(
-                "sagemaker:CreateTrainingJob",
-                "ArnNotEquals",
-                "sagemaker:OutputKmsKeyArn",
-                [APPROVED_KEY],
-            ),
-            SCP_ENCRYPTION_DENIES[2],
-            _scp_deny(three_actions, "Null", "sagemaker:VpcSubnets", "true"),
-            _scp_deny(
-                three_actions,
-                "ForAnyValue:StringNotEquals",
-                "sagemaker:VpcSubnets",
-                ["subnet-1"],
-            ),
-            _scp_deny(three_actions, "Null", "sagemaker:VpcSecurityGroupIds", "true"),
-            _scp_deny(
-                three_actions,
-                "ForAnyValue:StringNotEquals",
-                "sagemaker:VpcSecurityGroupIds",
-                ["sg-1"],
-            ),
-            _scp_deny(
-                ["sagemaker:CreateTrainingJob", "sagemaker:CreateEndpointConfig"],
-                "BoolIfExists",
-                "sagemaker:NetworkIsolation",
-                "false",
-            ),
+            {
+                **statement,
+                "Action": [a for a in statement["Action"] if a not in dropped],
+            }
+            for statement in SCP_ENCRYPTION_DENIES + SCP_INTERNET_DENIES
+            if isinstance(statement["Action"], list)
+        ] + [
             SCP_INTERNET_DENIES[1],
+            *[
+                {**statement, "Action": network_actions}
+                for statement in SCP_NETWORK_DENIES
+            ],
         ]
         rows = self._rows(statements)
         encryption = rows["encryption"]["Finding_Details"]
         assert rows["encryption"]["Status"] == "Failed"
-        assert "2 of 7 encryption requirements" in encryption
+        assert "2 of 41 encryption requirements" in encryption
         assert "CreateTransformJob on sagemaker:VolumeKmsKeyArn" in encryption
         assert "CreateTransformJob on sagemaker:OutputKmsKeyArn" in encryption
         network = rows["approved network"]["Finding_Details"]
         assert rows["approved network"]["Status"] == "Failed"
-        assert "2 of 8 approved network requirements" in network
+        assert "2 of 40 approved network requirements" in network
         assert "CreateModel on sagemaker:VpcSubnets" in network
         assert "CreateModel on sagemaker:VpcSecurityGroupIds" in network
         internet = rows["no direct internet access"]["Finding_Details"]
@@ -20447,7 +20499,7 @@ class TestSM34ValuePinning:
             (
                 [
                     _scp_deny(
-                        "sagemaker:Create*",
+                        SAGEMAKER_CREATE_OR_UPDATE,
                         "StringEquals",
                         "sagemaker:VpcSubnets",
                         "subnet-bad",
@@ -24739,24 +24791,24 @@ class TestSM34ApprovedNetworkNeedsSubnetsAndGroups:
     def test_a_security_group_only_guard_does_not_pass(self):
         row = self._network(SCP_SG_DENIES)
         assert row["Status"] == "Failed"
-        assert "4 of 8 approved network requirements" in row["Finding_Details"]
+        assert "19 of 40 approved network requirements" in row["Finding_Details"]
         assert "CreateTrainingJob on sagemaker:VpcSubnets" in row["Finding_Details"]
         assert "on sagemaker:VpcSubnets or" not in row["Finding_Details"]
 
     def test_a_subnet_only_guard_does_not_pass(self):
         row = self._network(SCP_NETWORK_DENIES[:2])
         assert row["Status"] == "Failed"
-        assert "4 of 8 approved network requirements" in row["Finding_Details"]
+        assert "21 of 40 approved network requirements" in row["Finding_Details"]
         assert "on sagemaker:VpcSecurityGroupIds" in row["Finding_Details"]
 
     def test_both_guards_pass(self):
         row = self._network(SCP_NETWORK_DENIES[:2] + SCP_SG_DENIES)
         assert row["Status"] == "Passed"
-        assert "All 8 approved network requirements" in row["Finding_Details"]
+        assert "All 40 approved network requirements" in row["Finding_Details"]
 
     def test_one_deny_naming_both_keys_fires_only_when_both_are_bad(self):
         both = _scp_deny(
-            "sagemaker:Create*",
+            SAGEMAKER_CREATE_OR_UPDATE,
             "ForAnyValue:StringNotEquals",
             "sagemaker:VpcSubnets",
             ["subnet-1"],
@@ -24781,22 +24833,22 @@ class TestSM34ApprovedNetworkNeedsSubnetsAndGroups:
         cache = _creation_cache({"Modeler": [subnets_only]})
         # Every requirement but the CreateModel security groups is held by
         # the SCP, so the Allow alone decides that one.
-        groups_but_model = _scp_deny(
-            [
-                "sagemaker:CreateTrainingJob",
-                "sagemaker:CreateEndpointConfig",
-                "sagemaker:CreateNotebookInstance",
-            ],
-            "ForAnyValue:StringNotEquals",
-            "sagemaker:VpcSecurityGroupIds",
-            ["sg-1"],
-        )
+        groups_but_model = {
+            "Effect": "Deny",
+            "NotAction": "sagemaker:CreateModel",
+            "Resource": "*",
+            "Condition": {
+                "ForAnyValue:StringNotEquals": {
+                    "sagemaker:VpcSecurityGroupIds": ["sg-1"]
+                }
+            },
+        }
         row = self._network(
             SCP_NETWORK_DENIES[:3] + [groups_but_model],
             cache=cache,
         )
         assert row["Status"] == "Failed"
-        assert "1 of 8 approved network requirements" in row["Finding_Details"]
+        assert "1 of 40 approved network requirements" in row["Finding_Details"]
         assert "CreateModel on sagemaker:VpcSecurityGroupIds" in row["Finding_Details"]
         assert "Role 'Modeler'" in row["Finding_Details"]
 
@@ -26392,3 +26444,286 @@ class TestSM39EgressForEveryAgentHost:
             "bedrock-agent:ListAgents (AccessDeniedException)" in r["Finding_Details"]
             for r in incomplete
         )
+
+
+# ===================================================================
+# Round 9: AIR-SGM-TRN-01, TRN-02, TRN-05 and TRN-08 guarded population
+# ===================================================================
+SAGEMAKER_REFERENCE = json.loads(
+    open(
+        os.path.join(
+            os.path.dirname(__file__),
+            "fixtures",
+            "sagemaker_service_reference_2026-10-04.json",
+        )
+    ).read()
+)["actions"]
+# The guardrail keys the four controls name, written out here.
+ROUND9_GUARDRAIL_KEYS = {
+    "sagemaker:VolumeKmsKeyArn",
+    "sagemaker:OutputKmsKeyArn",
+    "sagemaker:InterContainerTrafficEncryption",
+    "sagemaker:VpcSubnets",
+    "sagemaker:VpcSecurityGroupIds",
+    "sagemaker:NetworkIsolation",
+    "sagemaker:DirectInternetAccess",
+    "sagemaker:AppNetworkAccessType",
+    "sagemaker:RootAccess",
+}
+# One enforcing Deny per key, each over every action but the excluded ones.
+ROUND9_ENFORCING_CONDITIONS = [
+    ("ArnNotEquals", "sagemaker:VolumeKmsKeyArn", [APPROVED_KEY]),
+    ("ArnNotEquals", "sagemaker:OutputKmsKeyArn", [APPROVED_KEY]),
+    ("BoolIfExists", "sagemaker:InterContainerTrafficEncryption", "false"),
+    ("Null", "sagemaker:VpcSubnets", "true"),
+    ("ForAnyValue:StringNotEquals", "sagemaker:VpcSubnets", ["subnet-1"]),
+    ("Null", "sagemaker:VpcSecurityGroupIds", "true"),
+    ("ForAnyValue:StringNotEquals", "sagemaker:VpcSecurityGroupIds", ["sg-1"]),
+    ("BoolIfExists", "sagemaker:NetworkIsolation", "false"),
+    ("StringNotEquals", "sagemaker:DirectInternetAccess", "Disabled"),
+    ("StringNotEquals", "sagemaker:AppNetworkAccessType", "VpcOnly"),
+    ("StringNotEquals", "sagemaker:RootAccess", "Disabled"),
+]
+ROUND9_NEW_ACTIONS = [
+    "sagemaker:CreateHyperParameterTuningJob",
+    "sagemaker:CreateProcessingJob",
+    "sagemaker:CreateAutoMLJob",
+    "sagemaker:CreateAutoMLJobV2",
+    "sagemaker:CreateDataQualityJobDefinition",
+    "sagemaker:CreateModelBiasJobDefinition",
+    "sagemaker:CreateModelExplainabilityJobDefinition",
+    "sagemaker:CreateModelQualityJobDefinition",
+    "sagemaker:CreateMonitoringSchedule",
+    "sagemaker:UpdateMonitoringSchedule",
+    "sagemaker:CreateLabelingJob",
+    "sagemaker:CreateJob",
+    "sagemaker:CreateCluster",
+    "sagemaker:UpdateCluster",
+    "sagemaker:CreateDomain",
+    "sagemaker:UpdateDomain",
+    "sagemaker:CreateUserProfile",
+    "sagemaker:UpdateUserProfile",
+]
+
+
+def _denies_except(excluded, conditions=ROUND9_ENFORCING_CONDITIONS):
+    return [
+        {
+            "Effect": "Deny",
+            "NotAction": list(excluded) or ["sagemaker:ListTags"],
+            "Resource": "*",
+            "Condition": {operator: {key: value}},
+        }
+        for operator, key, value in conditions
+    ]
+
+
+class TestRound9GuardedPopulationFromTheServiceReference:
+    """The guarded actions and their keys are the sagemaker service reference's,
+    so a tuning, processing, AutoML, monitoring, HyperPod or Studio path is held
+    to the same keys as CreateTrainingJob."""
+
+    _sm34 = TestSM34CreationGuardrails()
+    _sm09 = TestSM09NotebookAccessGuardrails()
+
+    def _sm34_rows(self, statements):
+        inventory = self._sm34._inventory(self._sm34._scp("Guard", statements))
+        return self._sm34._by_category(self._sm34._run(inventory))
+
+    def test_the_action_table_is_every_reference_action_defining_a_key(self):
+        expected = {
+            f"sagemaker:{name}": set(entry["condition_keys"]) & ROUND9_GUARDRAIL_KEYS
+            for name, entry in SAGEMAKER_REFERENCE.items()
+            if set(entry["condition_keys"]) & ROUND9_GUARDRAIL_KEYS
+        }
+        table = {
+            action: set(keys)
+            for action, _, keys in sagemaker_app.SAGEMAKER_GUARDED_ACTION_KEYS
+        }
+        assert table == expected
+        for action, resource_type, _ in sagemaker_app.SAGEMAKER_GUARDED_ACTION_KEYS:
+            assert (
+                resource_type
+                in SAGEMAKER_REFERENCE[action.split(":", 1)[1]]["resources"]
+            )
+
+    def test_every_defined_key_is_an_sm34_requirement_of_its_category(self):
+        categories = {
+            "encryption": {
+                "sagemaker:VolumeKmsKeyArn",
+                "sagemaker:OutputKmsKeyArn",
+                "sagemaker:InterContainerTrafficEncryption",
+            },
+            "approved network": {
+                "sagemaker:VpcSubnets",
+                "sagemaker:VpcSecurityGroupIds",
+            },
+            "no direct internet access": {
+                "sagemaker:NetworkIsolation",
+                "sagemaker:DirectInternetAccess",
+                "sagemaker:AppNetworkAccessType",
+            },
+        }
+        guardrails = dict(sagemaker_app.SAGEMAKER_CREATION_GUARDRAILS)
+        for category, keys in categories.items():
+            expected = {
+                (f"sagemaker:{name}", key)
+                for name, entry in SAGEMAKER_REFERENCE.items()
+                for key in set(entry["condition_keys"]) & keys
+            }
+            actual = {
+                (action, key) for action, group in guardrails[category] for key in group
+            }
+            assert actual == expected, category
+
+    def test_a_scp_on_the_five_original_actions_no_longer_passes(self):
+        legacy = ["sagemaker:CreateTrainingJob", "sagemaker:CreateEndpointConfig"]
+        legacy += ["sagemaker:CreateNotebookInstance", "sagemaker:CreateModel"]
+        legacy += ["sagemaker:CreateTransformJob"]
+        statements = [
+            {**statement, "NotAction": [], "Action": legacy}
+            for statement in _denies_except([])
+        ]
+        for statement in statements:
+            del statement["NotAction"]
+        rows = self._sm34_rows(statements)
+        for category in ("encryption", "approved network", "no direct internet access"):
+            assert rows[category]["Status"] == "Failed", category
+            assert (
+                "CreateHyperParameterTuningJob on"
+                in (rows[category]["Finding_Details"])
+            )
+
+    def test_every_key_on_every_action_passes(self):
+        rows = self._sm34_rows(_denies_except([]))
+        assert [rows[c]["Status"] for c in rows] == ["Passed"] * 3
+        assert (
+            "at SageMaker creation and update time"
+            in (rows["encryption"]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize("action", ROUND9_NEW_ACTIONS)
+    def test_leaving_one_new_action_out_fails_each_category_it_defines(self, action):
+        rows = self._sm34_rows(_denies_except([action]))
+        defined = dict(
+            (a, set(keys)) for a, _, keys in sagemaker_app.SAGEMAKER_GUARDED_ACTION_KEYS
+        )[action]
+        short = action.split(":", 1)[1]
+        for category, keys in (
+            (
+                "encryption",
+                {
+                    "sagemaker:VolumeKmsKeyArn",
+                    "sagemaker:OutputKmsKeyArn",
+                    "sagemaker:InterContainerTrafficEncryption",
+                },
+            ),
+            (
+                "approved network",
+                {"sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"},
+            ),
+            (
+                "no direct internet access",
+                {"sagemaker:NetworkIsolation", "sagemaker:AppNetworkAccessType"},
+            ),
+        ):
+            row = rows[category]
+            if defined & keys:
+                assert row["Status"] == "Failed", category
+                assert f"{short} on " in row["Finding_Details"]
+                assert f"{len(defined & keys)} of " in row["Finding_Details"]
+            else:
+                assert row["Status"] == "Passed", category
+
+    @pytest.mark.parametrize(
+        ("operator", "status"),
+        [("StringEqualsIfExists", "Passed"), ("StringEquals", "Failed")],
+    )
+    def test_a_studio_public_internet_deny_must_fire_on_an_omitted_key(
+        self, operator, status
+    ):
+        conditions = [
+            c
+            for c in ROUND9_ENFORCING_CONDITIONS
+            if c[1] != "sagemaker:AppNetworkAccessType"
+        ] + [(operator, "sagemaker:AppNetworkAccessType", "PublicInternetOnly")]
+        row = self._sm34_rows(_denies_except([], conditions))[
+            "no direct internet access"
+        ]
+        assert row["Status"] == status
+        if status == "Failed":
+            assert (
+                "CreateDomain on sagemaker:AppNetworkAccessType"
+                in (row["Finding_Details"])
+            )
+            assert (
+                "does not deny a request that omits the key" in (row["Finding_Details"])
+            )
+
+    @pytest.mark.parametrize(
+        ("resource", "status"),
+        [
+            ("arn:aws:sagemaker:*:*:job/*/*", "Passed"),
+            ("arn:aws:sagemaker:*:*:job/batch/*", "N/A"),
+        ],
+    )
+    def test_a_job_arn_carries_its_category_before_the_name(self, resource, status):
+        scoped = [
+            {**s, "NotAction": ["sagemaker:CreateJob"]} for s in _denies_except([])
+        ]
+        scoped.append(
+            _scp_deny(
+                "sagemaker:CreateJob",
+                "ArnNotEquals",
+                "sagemaker:OutputKmsKeyArn",
+                [APPROVED_KEY],
+                resource=resource,
+            )
+        )
+        assert self._sm34_rows(scoped)["encryption"]["Status"] == status
+
+    def test_a_create_only_notebook_bar_leaves_the_update_paths_open(self):
+        rows = self._sm09._run(
+            [
+                *[
+                    _scp_deny(
+                        [
+                            "sagemaker:CreateNotebookInstance",
+                            "sagemaker:CreateDomain",
+                            "sagemaker:CreateUserProfile",
+                        ],
+                        operator,
+                        key,
+                        value,
+                    )
+                    for operator, key, value in ROUND9_ENFORCING_CONDITIONS
+                ],
+                SCP_NOTEBOOK_ACCESS_DENIES[-1],
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "5 of 17 notebook access requirements" in details
+        assert "UpdateDomain on sagemaker:AppNetworkAccessType" in details
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "sagemaker:UpdateNotebookInstance",
+            "sagemaker:CreateDomain",
+            "sagemaker:UpdateDomain",
+            "sagemaker:CreateUserProfile",
+            "sagemaker:UpdateUserProfile",
+        ],
+    )
+    def test_each_studio_action_is_held_to_the_notebook_bar(self, action):
+        statements = _denies_except([action]) + [SCP_NOTEBOOK_ACCESS_DENIES[-1]]
+        rows = self._sm09._run(statements)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"{action.split(':', 1)[1]} on " in rows[0]["Finding_Details"]
+        assert [
+            r["Status"]
+            for r in self._sm09._run(
+                _denies_except([]) + [SCP_NOTEBOOK_ACCESS_DENIES[-1]]
+            )
+        ] == ["Passed"]
