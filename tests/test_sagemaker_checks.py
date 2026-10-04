@@ -11754,11 +11754,50 @@ class TestSM38RuntimeCoverageAndLambdaTier:
         instances=None,
         fargate=None,
         clusters=None,
+        trail_selectors=None,
+        stores=None,
+        ecs_tasks=None,
+        capacity=None,
+        task_definitions=None,
+        subnets=None,
+        flow_logs=None,
     ):
         """fargate maps an EKS cluster to its Fargate profile names or an
         exception; an unnamed cluster has none. clusters maps an EKS cluster
-        to its DescribeCluster fields or an exception."""
+        to its DescribeCluster fields or an exception. trail_selectors is the
+        GetEventSelectors response of the one logging multi-Region trail, by
+        default a basic selector over every Lambda function with management
+        events; stores is the list of GetEventDataStore details in us-east-1.
+        capacity maps an ECS cluster to its DescribeCapacityProviders entries,
+        ecs_tasks an ECS cluster to its running DescribeTasks entries,
+        task_definitions an ARN to its containerDefinitions, subnets a subnet
+        to its VPC, and flow_logs is the DescribeFlowLogs list."""
         errors = errors or {}
+        trail_selectors = (
+            {
+                "EventSelectors": [
+                    {
+                        "ReadWriteType": "All",
+                        "IncludeManagementEvents": True,
+                        "DataResources": [
+                            {
+                                "Type": "AWS::Lambda::Function",
+                                "Values": ["arn:aws:lambda"],
+                            }
+                        ],
+                    }
+                ]
+            }
+            if trail_selectors is None
+            else trail_selectors
+        )
+        stores = stores or []
+        ecs_tasks = ecs_tasks or {}
+        capacity = capacity or {}
+        task_definitions = task_definitions or {}
+        subnets = subnets or {}
+        flow_logs = flow_logs or []
+        self.capacity_calls = []
         fargate = fargate or {}
         clusters = clusters or {}
         self.ec2_calls = []
@@ -11821,8 +11860,85 @@ class TestSM38RuntimeCoverageAndLambdaTier:
                 arns = [
                     f"arn:aws:ecs:us-east-1:111122223333:cluster/{n}" for n in ecs or []
                 ]
+
+                def list_tasks(cluster, desiredStatus):
+                    if "list_tasks" in errors:
+                        raise errors["list_tasks"]
+                    assert desiredStatus == "RUNNING"
+                    # One task per page, so a first-page reader misses the rest.
+                    return [
+                        {"taskArns": [t["taskArn"]]}
+                        for t in ecs_tasks.get(cluster.rsplit("/", 1)[-1], [])
+                    ]
+
                 client.get_paginator.side_effect = _pager(
-                    {"list_clusters": source("ecs", [{"clusterArns": arns}])}
+                    {
+                        "list_clusters": source("ecs", [{"clusterArns": arns}]),
+                        "list_tasks": list_tasks,
+                    }
+                )
+
+                def describe_capacity_providers(cluster, nextToken=None):
+                    self.capacity_calls.append((cluster, nextToken))
+                    if "capacity" in errors:
+                        raise errors["capacity"]
+                    found = capacity.get(cluster.rsplit("/", 1)[-1], [])
+                    # One provider per page.
+                    index = int(nextToken or 0)
+                    page = {"capacityProviders": found[index : index + 1]}
+                    if index + 1 < len(found):
+                        page["nextToken"] = str(index + 1)
+                    return page
+
+                client.describe_capacity_providers.side_effect = (
+                    describe_capacity_providers
+                )
+
+                def describe_tasks(cluster, tasks):
+                    by_arn = {
+                        t["taskArn"]: t for found in ecs_tasks.values() for t in found
+                    }
+                    return {"tasks": [by_arn[a] for a in tasks]}
+
+                client.describe_tasks.side_effect = describe_tasks
+
+                def describe_task_definition(taskDefinition):
+                    if "task_definition" in errors:
+                        raise errors["task_definition"]
+                    return {
+                        "taskDefinition": {
+                            "taskDefinitionArn": taskDefinition,
+                            "containerDefinitions": task_definitions[taskDefinition],
+                        }
+                    }
+
+                client.describe_task_definition.side_effect = describe_task_definition
+            elif service == "cloudtrail":
+                trail = {
+                    "Name": "org",
+                    "TrailARN": "arn:aws:cloudtrail:us-east-1:111122223333:trail/org",
+                    "IsMultiRegionTrail": True,
+                    "HomeRegion": "us-east-1",
+                }
+                client.describe_trails.return_value = {
+                    "trailList": [trail] if trail_selectors else []
+                }
+                client.get_trail_status.return_value = {"IsLogging": True}
+                client.get_event_selectors.return_value = trail_selectors
+                client.list_event_data_stores.return_value = {
+                    "EventDataStores": [
+                        {"EventDataStoreArn": f"arn:eds/{i}", "Name": f"eds{i}"}
+                        for i in range(len(stores))
+                    ]
+                    if kwargs.get("region_name") == "us-east-1"
+                    else []
+                }
+                client.get_event_data_store.side_effect = lambda EventDataStore: stores[
+                    int(EventDataStore.rsplit("/", 1)[-1])
+                ]
+            elif service == "account":
+                client.get_paginator.side_effect = _pager(
+                    {"list_regions": [{"Regions": [{"RegionName": "us-east-1"}]}]}
                 )
             elif service == "inspector2":
                 if "status" in errors:
@@ -11850,8 +11966,36 @@ class TestSM38RuntimeCoverageAndLambdaTier:
                         raise errors["ec2"]
                     return [{"Reservations": [{"Instances": instances or []}]}]
 
+                def describe_subnets(Filters):
+                    wanted = Filters[0]["Values"]
+                    return [
+                        {
+                            "Subnets": [
+                                {"SubnetId": s, "VpcId": v}
+                                for s, v in subnets.items()
+                                if s in wanted
+                            ]
+                        }
+                    ]
+
+                def describe_flow_logs(Filter):
+                    if "flow" in errors:
+                        raise errors["flow"]
+                    wanted = Filter[0]["Values"]
+                    return [
+                        {
+                            "FlowLogs": [
+                                f for f in flow_logs if f["ResourceId"] in wanted
+                            ]
+                        }
+                    ]
+
                 client.get_paginator.side_effect = _pager(
-                    {"describe_instances": describe_instances}
+                    {
+                        "describe_instances": describe_instances,
+                        "describe_subnets": describe_subnets,
+                        "describe_flow_logs": describe_flow_logs,
+                    }
                 )
             return client
 
@@ -12366,6 +12510,295 @@ _SM38_OTHER_TYPE = {
 }
 
 
+class TestRound11SM38LambdaInvokeAndManagedInstances:
+    """AIR-SLF-RT-04 round 11: the Lambda tier reads CloudTrail Invoke data
+    events, and tasks on ECS Managed Instances capacity are judged on their
+    task-level tier and are not failed as uncovered clusters."""
+
+    suite = TestSM38RuntimeCoverageAndLambdaTier()
+    LAMBDA = sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING
+    MI = sagemaker_app.ECS_MANAGED_INSTANCES_TIER_FINDING
+    TD = "arn:aws:ecs:us-east-1:111122223333:task-definition/web:1"
+    PROVIDERS = [
+        {"name": "FARGATE", "type": "FARGATE"},
+        {"name": "mi-cp", "type": "MANAGED_INSTANCES"},
+    ]
+
+    def _run(self, **kwargs):
+        return self.suite._run(self.suite._detail(), **kwargs)
+
+    def _named(self, rows, name):
+        return [r for r in rows if r["Finding"].startswith(name)]
+
+    @staticmethod
+    def _basic(values=("arn:aws:lambda",), read_write="All", management=True):
+        return {
+            "EventSelectors": [
+                {
+                    "ReadWriteType": read_write,
+                    "IncludeManagementEvents": management,
+                    "DataResources": [
+                        {"Type": "AWS::Lambda::Function", "Values": list(values)}
+                    ],
+                }
+            ]
+        }
+
+    @staticmethod
+    def _advanced(*extra, resource_type="AWS::Lambda::Function"):
+        fields = [
+            {"Field": "eventCategory", "Equals": ["Data"]},
+            {"Field": "resources.type", "Equals": [resource_type]},
+        ]
+        fields.extend({"Field": name, "Equals": ["false"]} for name in extra)
+        return {"AdvancedEventSelectors": [{"Name": "fn", "FieldSelectors": fields}]}
+
+    def test_a_trail_over_every_function_passes_and_is_named(self):
+        rows = self._named(self._run(), self.LAMBDA)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "trail 'org' record(s) every AWS::Lambda::Function data event, so each "
+            "function's Invoke calls are recorded"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "selectors, narrowed",
+        [
+            ({}, None),
+            (
+                {
+                    "EventSelectors": [
+                        {"ReadWriteType": "All", "IncludeManagementEvents": True}
+                    ]
+                },
+                None,
+            ),
+            ("named", "DataResources values (1 named function(s))"),
+            ("write", "ReadWriteType WriteOnly"),
+            ("readonly", "readOnly"),
+            ("microvm", None),
+        ],
+    )
+    def test_a_trail_that_misses_any_invoke_fails(self, selectors, narrowed):
+        selectors = (
+            {
+                "named": self._basic(
+                    ["arn:aws:lambda:us-east-1:111122223333:function:agent"]
+                ),
+                "write": self._basic(read_write="WriteOnly"),
+                "readonly": self._advanced("readOnly"),
+                "microvm": self._advanced(resource_type="AWS::Lambda::MicrovmImage"),
+            }.get(selectors, selectors)
+            if isinstance(selectors, str)
+            else selectors
+        )
+        rows = self._named(self._run(trail_selectors=selectors), self.LAMBDA)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "records every AWS::Lambda::Function data event, so no function's" in (
+            details
+        )
+        if narrowed:
+            assert (
+                f"narrows its AWS::Lambda::Function selector by {narrowed}" in details
+            )
+
+    def test_an_exact_advanced_selector_passes(self):
+        rows = self._named(self._run(trail_selectors=self._advanced()), self.LAMBDA)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "status, passes", [("ENABLED", True), ("STOPPED_INGESTION", False)]
+    )
+    def test_an_event_data_store_stands_in_for_a_trail(self, status, passes):
+        store = dict(self._advanced(), Status=status, MultiRegionEnabled=True)
+        rows = self._named(self._run(trail_selectors={}, stores=[store]), self.LAMBDA)
+        assert [r["Status"] for r in rows] == (["Passed"] if passes else ["Failed"])
+        if passes:
+            assert (
+                "event data store 'eds0' in us-east-1 record(s) every"
+                in (rows[0]["Finding_Details"])
+            )
+
+    def test_no_function_reads_no_data_events(self):
+        rows = self._named(self._run(functions=[], trail_selectors={}), self.LAMBDA)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Invoke" not in rows[0]["Finding_Details"]
+
+    @classmethod
+    def _task(cls, task_id, provider="mi-cp", subnet="subnet-1", eni=None):
+        task = {
+            "taskArn": f"arn:aws:ecs:us-east-1:111122223333:task/mi/{task_id}",
+            "group": "service:web",
+            "capacityProviderName": provider,
+            "taskDefinitionArn": cls.TD,
+        }
+        if subnet:
+            task["attachments"] = [
+                {
+                    "type": "ElasticNetworkInterface",
+                    "details": [
+                        {"name": "subnetId", "value": subnet},
+                        {
+                            "name": "networkInterfaceId",
+                            "value": eni or f"eni-{task_id}",
+                        },
+                    ],
+                }
+            ]
+        return task
+
+    def _mi(self, tasks=None, containers=None, flow_logs=None, **kwargs):
+        logged = {"logConfiguration": {"logDriver": "awslogs"}}
+        return self._run(
+            ecs=["mi"],
+            capacity={"mi": self.PROVIDERS},
+            ecs_tasks={
+                "mi": [self._task("t1"), self._task("t2", subnet="subnet-2")]
+                if tasks is None
+                else tasks
+            },
+            task_definitions={
+                self.TD: containers
+                or [dict(logged, name="app"), dict(logged, name="sidecar")]
+            },
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+            flow_logs=(
+                [
+                    {"ResourceId": r, "FlowLogStatus": "ACTIVE", "TrafficType": "ALL"}
+                    for r in ("vpc-1", "vpc-2")
+                ]
+                if flow_logs is None
+                else flow_logs
+            ),
+            **kwargs,
+        )
+
+    def test_a_managed_instances_cluster_is_judged_on_its_tier(self):
+        rows = self._mi()
+        coverage = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert all("ECS cluster mi" not in r["Finding_Details"] for r in coverage)
+        tier = self._named(rows, self.MI)
+        assert [r["Status"] for r in tier] == ["Passed"]
+        details = tier[0]["Finding_Details"]
+        assert details.startswith(
+            "All 2 running task(s) on the ECS Managed Instances capacity of "
+            "cluster(s) mi run in awsvpc mode"
+        )
+        assert "trail 'org' record(s) read and write ECS management events" in details
+        assert (
+            "managed process- and file-level behavioral detection does not exist"
+            in (details)
+        )
+        # Both pages of DescribeCapacityProviders were read.
+        assert [token for _, token in self.suite.capacity_calls] == [None, "1"]
+
+    def test_a_task_off_the_managed_instances_capacity_keeps_the_cluster_uncovered(
+        self,
+    ):
+        rows = self._mi(tasks=[self._task("t1"), self._task("f1", provider="FARGATE")])
+        coverage = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert [r["Status"] for r in coverage] == ["Failed"]
+        assert (
+            "ECS cluster mi has no Runtime Monitoring coverage for its 1 running "
+            "task(s) outside its ECS Managed Instances capacity"
+        ) in coverage[0]["Finding_Details"]
+
+    def test_a_cluster_without_managed_instances_is_still_uncovered(self):
+        rows = self._run(ecs=["plain"], capacity={"plain": self.PROVIDERS[:1]})
+        coverage = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert [r["Status"] for r in coverage] == ["Failed"]
+        assert (
+            "ECS cluster plain has no Runtime Monitoring coverage."
+            in (coverage[0]["Finding_Details"])
+        )
+        assert self._named(rows, self.MI) == []
+
+    def test_only_the_task_without_a_flow_log_fails(self):
+        rows = self._named(
+            self._mi(
+                flow_logs=[
+                    {
+                        "ResourceId": "eni-t1",
+                        "FlowLogStatus": "ACTIVE",
+                        "TrafficType": "ALL",
+                    },
+                    {
+                        "ResourceId": "vpc-2",
+                        "FlowLogStatus": "ACTIVE",
+                        "TrafficType": "ACCEPT",
+                    },
+                ]
+            ),
+            self.MI,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith(
+            "ECS Managed Instances runtime tier: ECS task t2 (service:web) in mi has "
+            "no ACTIVE flow log recording ALL traffic on its network interface eni-t2"
+        )
+
+    def test_a_task_without_an_awsvpc_interface_fails(self):
+        rows = self._named(
+            self._mi(tasks=[self._task("t1"), self._task("t2", subnet=None)]), self.MI
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "ECS task t2 (service:web) in mi on capacity provider mi-cp has no "
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_container_without_awslogs_fails(self):
+        rows = self._named(
+            self._mi(
+                tasks=[self._task("t1")],
+                containers=[
+                    {"name": "app", "logConfiguration": {"logDriver": "awslogs"}},
+                    {"name": "sidecar", "logConfiguration": {"logDriver": "json-file"}},
+                ],
+            ),
+            self.MI,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "runs container(s) sidecar of web:1 without the awslogs log driver"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_no_trail_recording_ecs_management_events_fails(self):
+        rows = self._named(
+            self._mi(trail_selectors=self._basic(management=False)), self.MI
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "records read and write ECS management events"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_unread_capacity_read_withholds_both_passes(self):
+        rows = self._mi(
+            errors={"capacity": _make_client_error("AccessDeniedException")}
+        )
+        coverage = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert [r["Status"] for r in coverage] == ["N/A"]
+        assert (
+            "ECS cluster mi, whose ECS Managed Instances capacity was not read"
+            in (coverage[0]["Finding_Details"])
+        )
+        tier = self._named(rows, self.MI)
+        assert [(r["Finding"], r["Status"]) for r in tier] == [
+            (f"{self.MI} Incomplete", "N/A")
+        ]
+
+    def test_a_managed_instances_cluster_with_no_task_is_not_applicable(self):
+        rows = self._named(self._mi(tasks=[]), self.MI)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "have ECS Managed Instances capacity but no task runs on it"
+            in (rows[0]["Finding_Details"])
+        )
+
+
 class TestRound9SM38MicrovmTier:
     """AIR-SLF-RT-04: Lambda MicroVMs, which Runtime Monitoring does not cover,
     are judged on flow logs over their egress subnets and on
@@ -12877,6 +13310,11 @@ class TestRound9SM38MicrovmTier:
             patch.object(
                 sagemaker_app, "_microvm_runtime_tier_findings", return_value=[row]
             ) as leg,
+            patch.object(
+                sagemaker_app,
+                "_ecs_managed_instance_tasks",
+                return_value={"clusters": {}, "unread": [], "unread_clusters": []},
+            ),
         ):
             result = sagemaker_app.check_guardduty_runtime_monitoring_coverage(
                 region="us-east-1",
@@ -24528,6 +24966,9 @@ class TestSM39WorkloadEgress:
         sagemaker=None,
         versions=(),
         bedrock=None,
+        security_groups=None,
+        prefix_lists=None,
+        cluster_groups=None,
     ):
         """associations: {vpc: [associations]}; rules: {group: [rules] or pages};
         tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}};
@@ -24541,13 +24982,20 @@ class TestSM39WorkloadEgress:
         entry}; tgw_truncated: route tables whose last page reports
         AdditionalRoutesAvailable; sagemaker: {"endpoints": [{"EndpointName",
         "config"}], "models": {name: DescribeModel}, "training" and
-        "processing": {status: [Describe*Job entries]}, "notebooks":
+        "processing": {status: [Describe*Job entries]}, "transform": {status:
+        [DescribeTransformJob entries]}, "notebooks":
         [DescribeNotebookInstance entries], "studio": [DescribeDomain
         entries], "hyperpod": [DescribeCluster entries]}; versions: published
         Lambda versions, which ListFunctions returns only with FunctionVersion
         ALL, as it then qualifies the $LATEST ARN; bedrock: {"customization":
         {status: [GetModelCustomizationJob entries]}, "invocation": {status:
-        [ListModelInvocationJobs summaries]}}."""
+        [ListModelInvocationJobs summaries]}}; security_groups: {group id:
+        DescribeSecurityGroups entry}; prefix_lists: {prefix list id: (owner,
+        [cidrs])}; cluster_groups: {EKS cluster: resourcesVpcConfig security
+        group fields}."""
+        security_groups = security_groups or {}
+        prefix_lists = prefix_lists or {}
+        cluster_groups = cluster_groups or {}
         sagemaker = sagemaker or {}
         bedrock = bedrock or {}
         tgw_attachments = tgw_attachments or []
@@ -24734,8 +25182,43 @@ class TestSM39WorkloadEgress:
                 client.search_transit_gateway_routes.side_effect = guarded(
                     "tgw_routes", search_tgw_routes
                 )
+
+                def describe_security_groups(Filters):
+                    wanted = Filters[0]["Values"]
+                    # One group per page, so a first-page reader misses the rest.
+                    return [
+                        {"SecurityGroups": [dict(security_groups[g], GroupId=g)]}
+                        for g in wanted
+                        if g in security_groups
+                    ]
+
                 client.get_paginator.side_effect = _pager(
                     {
+                        "describe_security_groups": guarded(
+                            "security_groups", describe_security_groups
+                        ),
+                        "describe_managed_prefix_lists": guarded(
+                            "prefix_lists",
+                            lambda PrefixListIds: [
+                                {
+                                    "PrefixLists": [
+                                        {
+                                            "PrefixListId": i,
+                                            "OwnerId": prefix_lists[i][0],
+                                        }
+                                        for i in PrefixListIds
+                                        if i in prefix_lists
+                                    ]
+                                }
+                            ],
+                        ),
+                        "get_managed_prefix_list_entries": lambda PrefixListId: [
+                            {
+                                "Entries": [
+                                    {"Cidr": c} for c in prefix_lists[PrefixListId][1]
+                                ]
+                            }
+                        ],
                         "describe_transit_gateway_attachments": guarded(
                             "tgw_attachments", describe_tgw_attachments
                         ),
@@ -24795,7 +25278,12 @@ class TestSM39WorkloadEgress:
                 client.describe_cluster.side_effect = guarded(
                     "describe_cluster",
                     lambda name: {
-                        "cluster": {"resourcesVpcConfig": {"subnetIds": clusters[name]}}
+                        "cluster": {
+                            "resourcesVpcConfig": {
+                                "subnetIds": clusters[name],
+                                **cluster_groups.get(name, {}),
+                            }
+                        }
                     },
                 )
             elif service == "route53resolver":
@@ -24933,7 +25421,7 @@ class TestSM39WorkloadEgress:
                         for found in sagemaker.get(kind, {}).values()
                         for j in found
                     }
-                    for kind in ("training", "processing")
+                    for kind in ("training", "processing", "transform")
                 }
 
                 def job_pages(kind):
@@ -24965,6 +25453,9 @@ class TestSM39WorkloadEgress:
                         ),
                         "list_processing_jobs": guarded(
                             "sm_processing", job_pages("processing")
+                        ),
+                        "list_transform_jobs": guarded(
+                            "sm_transform", job_pages("transform")
                         ),
                         "list_notebook_instances": guarded(
                             "sm_notebooks",
@@ -25027,6 +25518,10 @@ class TestSM39WorkloadEgress:
                 client.describe_processing_job.side_effect = guarded(
                     "sm_processing_job",
                     lambda ProcessingJobName: jobs["processing"][ProcessingJobName],
+                )
+                client.describe_transform_job.side_effect = guarded(
+                    "sm_transform_job",
+                    lambda TransformJobName: jobs["transform"][TransformJobName],
                 )
                 notebooks = {
                     n["NotebookInstanceName"]: n for n in sagemaker.get("notebooks", [])
@@ -28124,7 +28619,13 @@ class TestRound9SM39SageMakerWorkloads:
             errors={key: _make_client_error("AccessDeniedException")},
         )
         incomplete = [r for r in rows if r["Finding"].endswith("Incomplete")]
-        assert len(incomplete) == 2
+        # The security group egress row judges the same workloads, so an
+        # unread one withholds its pass too.
+        assert [r["Finding"] for r in incomplete] == [
+            "Agent Workload DNS Egress Control Incomplete",
+            "Agent Workload Network Firewall Egress Incomplete",
+            "Agent Workload Security Group Egress Incomplete",
+        ]
         assert all(r["Status"] == "N/A" for r in incomplete)
         assert all(text in r["Finding_Details"] for r in incomplete)
 
@@ -28320,7 +28821,13 @@ class TestRound10SM39HyperPodAndBedrockJobs:
             errors={key: _make_client_error("AccessDeniedException")},
         )
         incomplete = [r for r in rows if r["Finding"].endswith("Incomplete")]
-        assert len(incomplete) == 2
+        # The security group egress row judges the same workloads, so an
+        # unread one withholds its pass too.
+        assert [r["Finding"] for r in incomplete] == [
+            "Agent Workload DNS Egress Control Incomplete",
+            "Agent Workload Network Firewall Egress Incomplete",
+            "Agent Workload Security Group Egress Incomplete",
+        ]
         assert all(r["Status"] == "N/A" for r in incomplete)
         assert all(text in r["Finding_Details"] for r in incomplete)
 
@@ -28366,6 +28873,480 @@ class TestRound9SM39LambdaVersions:
         assert rows[0]["Finding_Details"].startswith(
             "Lambda function tool, named by gateway gw target t, runs outside a VPC"
         )
+
+
+class TestRound11SM39TransformJobsAndGroupEgress:
+    """AIR-FND-NET-03 round 11: running SageMaker transform jobs join SM-39's
+    workload population, and the security groups of the SageMaker, EKS and
+    Bedrock workloads are failed when their all-protocol egress reaches any
+    destination."""
+
+    suite = TestSM39WorkloadEgress()
+    FINDING = "Agent Workload Security Group Egress"
+    OPEN_V4 = {
+        "IpPermissionsEgress": [
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+        ]
+    }
+    CLOSED = {
+        "IpPermissionsEgress": [
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 443,
+                "ToPort": 443,
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+            }
+        ]
+    }
+
+    def _rows(self, rows):
+        return [r for r in rows if r["Finding"].startswith(self.FINDING)]
+
+    @staticmethod
+    def _transform(name, model):
+        return {"TransformJobName": name, "ModelName": model}
+
+    @staticmethod
+    def _vpc_model(groups=("sg-closed",), subnets=("subnet-a1",)):
+        return {
+            "EnableNetworkIsolation": False,
+            "VpcConfig": {"Subnets": list(subnets), "SecurityGroupIds": list(groups)},
+        }
+
+    def test_every_running_transform_job_is_judged_on_its_model_vpc(self):
+        rows = self.suite._run(
+            sagemaker={
+                "transform": {
+                    "InProgress": [
+                        self._transform("x1", "m1"),
+                        self._transform("x2", "m2"),
+                    ],
+                    "Stopping": [self._transform("x3", "m1")],
+                    "Completed": [self._transform("x4", "m3")],
+                },
+                "models": {
+                    "m1": self._vpc_model(subnets=["subnet-a1"]),
+                    "m2": self._vpc_model(subnets=["subnet-b1"]),
+                    "m3": self._vpc_model(subnets=["subnet-b1"]),
+                },
+            },
+            security_groups={"sg-closed": self.CLOSED},
+        )
+        details = " | ".join(r["Finding_Details"] for r in self.suite._dns(rows))
+        for job in ("x1", "x2", "x3"):
+            assert f"SageMaker transform job '{job}'" in details
+        assert "'x4'" not in details
+
+    @pytest.mark.parametrize(
+        "model, opens",
+        [
+            ({"EnableNetworkIsolation": False}, True),
+            ({"EnableNetworkIsolation": True}, False),
+        ],
+    )
+    def test_a_transform_job_outside_a_vpc_fails_unless_its_model_is_isolated(
+        self, model, opens
+    ):
+        rows = self.suite._run(
+            sagemaker={
+                "transform": {"InProgress": [self._transform("x", "m")]},
+                "models": {"m": model},
+            }
+        )
+        opened = [
+            r
+            for r in rows
+            if r["Finding_Details"].startswith(
+                "SageMaker transform job 'x' runs model 'm' outside a VPC"
+            )
+        ]
+        assert [r["Status"] for r in opened] == (["Failed", "Failed"] if opens else [])
+
+    @pytest.mark.parametrize(
+        "key, text",
+        [
+            (
+                "sm_transform",
+                "InProgress SageMaker transform jobs (AccessDeniedException)",
+            ),
+            ("sm_transform_job", "SageMaker transform job 'x' (AccessDeniedException)"),
+            (
+                "sm_model",
+                "model 'm' of SageMaker transform job 'x' (AccessDeniedException)",
+            ),
+        ],
+    )
+    def test_an_unread_transform_job_withholds_the_pass(self, key, text):
+        rows = self.suite._run(
+            sagemaker={
+                "transform": {"InProgress": [self._transform("x", "m")]},
+                "models": {"m": self._vpc_model()},
+            },
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+            security_groups={"sg-closed": self.CLOSED},
+            errors={key: _make_client_error("AccessDeniedException")},
+        )
+        incomplete = [r for r in rows if r["Finding"].endswith(" Incomplete")]
+        assert len(incomplete) == 3
+        assert all(text in r["Finding_Details"] for r in incomplete)
+
+    def _sagemaker_population(self, open_label):
+        """Two workloads of each kind, one open when its label is open_label."""
+
+        def sg(label):
+            return f"sg-{label}" if label == open_label else "sg-closed"
+
+        return {
+            "endpoints": [
+                TestRound9SM39SageMakerWorkloads._endpoint(n, models=[f"m-{n}"])
+                for n in ("ep1", "ep2")
+            ],
+            "models": {
+                f"m-{n}": self._vpc_model([sg(n)]) for n in ("ep1", "ep2", "x1", "x2")
+            },
+            "transform": {
+                "InProgress": [self._transform(n, f"m-{n}") for n in ("x1", "x2")]
+            },
+            "training": {
+                "InProgress": [
+                    {
+                        "TrainingJobName": n,
+                        "VpcConfig": {
+                            "Subnets": ["subnet-a1"],
+                            "SecurityGroupIds": [sg(n)],
+                        },
+                    }
+                    for n in ("t1", "t2")
+                ]
+            },
+            "processing": {
+                "InProgress": [
+                    {
+                        "ProcessingJobName": n,
+                        "NetworkConfig": {
+                            "VpcConfig": {
+                                "Subnets": ["subnet-a1"],
+                                "SecurityGroupIds": [sg(n)],
+                            }
+                        },
+                    }
+                    for n in ("p1", "p2")
+                ]
+            },
+            "notebooks": [
+                {
+                    "NotebookInstanceName": n,
+                    "SubnetId": "subnet-a1",
+                    "DirectInternetAccess": "Disabled",
+                    "SecurityGroups": [sg(n)],
+                }
+                for n in ("nb1", "nb2")
+            ],
+            "hyperpod": [
+                {
+                    "ClusterName": "hp",
+                    "VpcConfig": {
+                        "Subnets": ["subnet-a1"],
+                        "SecurityGroupIds": [sg("hp")],
+                    },
+                    "InstanceGroups": [
+                        {"InstanceGroupName": "inherits"},
+                        {
+                            "InstanceGroupName": "g2",
+                            "OverrideVpcConfig": {
+                                "Subnets": ["subnet-b1"],
+                                "SecurityGroupIds": [sg("g2")],
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "open_label, named",
+        [
+            ("ep2", "SageMaker endpoint 'ep2'"),
+            ("x2", "SageMaker transform job 'x2'"),
+            ("t2", "SageMaker training job 't2'"),
+            ("p2", "SageMaker processing job 'p2'"),
+            ("nb2", "SageMaker notebook instance 'nb2'"),
+            ("hp", "SageMaker HyperPod cluster 'hp'"),
+            ("g2", "instance group 'g2' of SageMaker HyperPod cluster 'hp'"),
+        ],
+    )
+    def test_only_the_sagemaker_workload_with_open_egress_fails(
+        self, open_label, named
+    ):
+        rows = self._rows(
+            self.suite._run(
+                sagemaker=self._sagemaker_population(open_label),
+                security_groups={
+                    "sg-closed": self.CLOSED,
+                    f"sg-{open_label}": self.OPEN_V4,
+                },
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith(
+            f"{named} runs in security group(s) sg-{open_label} whose all-protocol "
+            "outbound rules together reach every IPv4 address "
+            f"(sg-{open_label} all traffic to 0.0.0.0/0)"
+        )
+        assert "names no port list" in rows[0]["Finding_Details"]
+
+    def test_every_closed_sagemaker_workload_passes_and_states_the_rule(self):
+        rows = self._rows(
+            self.suite._run(
+                sagemaker=self._sagemaker_population(None),
+                security_groups={"sg-closed": self.CLOSED},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        # 2 endpoints, 2 transform, 2 training, 2 processing, 2 notebooks, the
+        # cluster for its inheriting group, and the overriding group.
+        assert details.startswith("None of the 12 SageMaker endpoint")
+        assert "does not judge a rule over a named protocol and port range" in details
+
+    @pytest.mark.parametrize(
+        "groups, fails",
+        [
+            # Two halves held by two groups together reach every address.
+            (
+                {
+                    "sg-low": {
+                        "IpPermissionsEgress": [
+                            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/1"}]}
+                        ]
+                    },
+                    "sg-high": {
+                        "IpPermissionsEgress": [
+                            {
+                                "IpProtocol": "-1",
+                                "IpRanges": [{"CidrIp": "128.0.0.0/1"}],
+                            }
+                        ]
+                    },
+                },
+                "every IPv4 address",
+            ),
+            (
+                {
+                    "sg-low": {
+                        "IpPermissionsEgress": [
+                            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/1"}]}
+                        ]
+                    },
+                    "sg-high": {"IpPermissionsEgress": []},
+                },
+                None,
+            ),
+            (
+                {
+                    "sg-low": {
+                        "IpPermissionsEgress": [
+                            {"IpProtocol": "-1", "Ipv6Ranges": [{"CidrIpv6": "::/0"}]}
+                        ]
+                    },
+                    "sg-high": {"IpPermissionsEgress": []},
+                },
+                "every IPv6 address",
+            ),
+            # A port-scoped rule to everywhere is not judged.
+            (
+                {
+                    "sg-low": {
+                        "IpPermissionsEgress": [
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 0,
+                                "ToPort": 65535,
+                                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                            }
+                        ]
+                    },
+                    "sg-high": {"IpPermissionsEgress": []},
+                },
+                None,
+            ),
+            (
+                {
+                    "sg-low": {
+                        "IpPermissionsEgress": [
+                            {
+                                "IpProtocol": "-1",
+                                "PrefixListIds": [{"PrefixListId": "pl-c"}],
+                            }
+                        ]
+                    },
+                    "sg-high": {"IpPermissionsEgress": []},
+                },
+                "every IPv4 address",
+            ),
+            # An AWS-managed list names one service's ranges.
+            (
+                {
+                    "sg-low": {
+                        "IpPermissionsEgress": [
+                            {
+                                "IpProtocol": "-1",
+                                "PrefixListIds": [{"PrefixListId": "pl-aws"}],
+                            }
+                        ]
+                    },
+                    "sg-high": {"IpPermissionsEgress": []},
+                },
+                None,
+            ),
+        ],
+    )
+    def test_the_groups_of_one_workload_are_judged_together(self, groups, fails):
+        rows = self._rows(
+            self.suite._run(
+                sagemaker={
+                    "notebooks": [
+                        {
+                            "NotebookInstanceName": "nb",
+                            "SubnetId": "subnet-a1",
+                            "DirectInternetAccess": "Disabled",
+                            "SecurityGroups": ["sg-low", "sg-high"],
+                        }
+                    ]
+                },
+                security_groups=groups,
+                prefix_lists={
+                    "pl-c": ("111122223333", ["0.0.0.0/1", "128.0.0.0/1"]),
+                    "pl-aws": ("AWS", ["0.0.0.0/0"]),
+                },
+            )
+        )
+        if fails:
+            assert [r["Status"] for r in rows] == ["Failed"]
+            assert f"together reach {fails}" in rows[0]["Finding_Details"]
+        else:
+            assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_an_eks_cluster_security_group_is_judged(self):
+        rows = self._rows(
+            self.suite._run(
+                clusters={"a": ["subnet-a1"], "b": ["subnet-a1"]},
+                cluster_groups={
+                    "a": {"clusterSecurityGroupId": "sg-closed"},
+                    "b": {
+                        "securityGroupIds": ["sg-closed"],
+                        "clusterSecurityGroupId": "sg-open",
+                    },
+                },
+                security_groups={"sg-closed": self.CLOSED, "sg-open": self.OPEN_V4},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith(
+            "EKS cluster b runs in security group(s) sg-closed, sg-open"
+        )
+
+    def test_a_bedrock_job_security_group_is_judged(self):
+        vpc = {"subnetIds": ["subnet-a1"], "securityGroupIds": ["sg-closed"]}
+        rows = self._rows(
+            self.suite._run(
+                bedrock={
+                    "customization": {
+                        "InProgress": [
+                            {"jobName": "c1", "vpcConfig": vpc},
+                            {
+                                "jobName": "c2",
+                                "vpcConfig": dict(vpc, securityGroupIds=["sg-open"]),
+                            },
+                        ]
+                    },
+                    "invocation": {
+                        "Scheduled": [
+                            {"jobName": "b1", "vpcConfig": vpc},
+                            {
+                                "jobName": "b2",
+                                "vpcConfig": dict(vpc, securityGroupIds=["sg-open"]),
+                            },
+                        ]
+                    },
+                },
+                security_groups={"sg-closed": self.CLOSED, "sg-open": self.OPEN_V4},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert rows[0]["Finding_Details"].startswith(
+            "Bedrock model customization job 'c2' runs"
+        )
+        assert rows[1]["Finding_Details"].startswith(
+            "Bedrock batch inference job 'b2' runs"
+        )
+
+    def test_a_group_the_account_does_not_return_withholds_the_pass(self):
+        rows = self._rows(
+            self.suite._run(
+                sagemaker={
+                    "notebooks": [
+                        {
+                            "NotebookInstanceName": "nb",
+                            "SubnetId": "subnet-a1",
+                            "DirectInternetAccess": "Disabled",
+                            "SecurityGroups": ["sg-closed", "sg-gone"],
+                        }
+                    ]
+                },
+                security_groups={"sg-closed": self.CLOSED},
+            )
+        )
+        assert [(r["Finding"], r["Status"]) for r in rows] == [
+            (f"{self.FINDING} Incomplete", "N/A")
+        ]
+        assert (
+            "security group(s) sg-gone of SageMaker notebook instance 'nb'"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "key, text",
+        [
+            ("security_groups", "ec2:DescribeSecurityGroups (AccessDeniedException)"),
+            ("prefix_lists", "ec2:DescribeManagedPrefixLists: AccessDeniedException"),
+        ],
+    )
+    def test_an_unread_group_or_prefix_list_withholds_the_pass(self, key, text):
+        rows = self._rows(
+            self.suite._run(
+                sagemaker={
+                    "notebooks": [
+                        {
+                            "NotebookInstanceName": "nb",
+                            "SubnetId": "subnet-a1",
+                            "DirectInternetAccess": "Disabled",
+                            "SecurityGroups": ["sg-pl"],
+                        }
+                    ]
+                },
+                security_groups={
+                    "sg-pl": {
+                        "IpPermissionsEgress": [
+                            {
+                                "IpProtocol": "-1",
+                                "PrefixListIds": [{"PrefixListId": "pl-c"}],
+                            }
+                        ]
+                    }
+                },
+                prefix_lists={"pl-c": ("111122223333", ["10.0.0.0/8"])},
+                errors={key: _make_client_error("AccessDeniedException")},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert text in rows[0]["Finding_Details"]
+
+    def test_no_workload_with_security_groups_adds_no_row(self):
+        rows = self.suite._run(
+            functions=[self.suite._function("agent-fn", ["subnet-a1"])]
+        )
+        assert self._rows(rows) == []
 
 
 class TestSM39EgressForEveryAgentHost:
@@ -28423,14 +29404,16 @@ class TestSM39EgressForEveryAgentHost:
         assert "i-1" not in dns[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
-        "key, named",
+        "key, named, legs",
         [
-            ("eks", "eks:ListClusters"),
-            ("describe_cluster", "eks:DescribeCluster agents"),
-            ("instances", "ec2:DescribeInstances"),
+            # An unread EKS cluster also withholds the security group egress
+            # row, which judges the cluster's security groups.
+            ("eks", "eks:ListClusters", 3),
+            ("describe_cluster", "eks:DescribeCluster agents", 3),
+            ("instances", "ec2:DescribeInstances", 2),
         ],
     )
-    def test_an_unread_host_withholds_the_pass(self, key, named):
+    def test_an_unread_host_withholds_the_pass(self, key, named, legs):
         rows = self.suite._run(
             functions=[self.suite._function("agent-fn", ["subnet-a1"])],
             clusters={"agents": ["subnet-a1"]},
@@ -28438,7 +29421,11 @@ class TestSM39EgressForEveryAgentHost:
             errors={key: _make_client_error("AccessDeniedException")},
         )
         incomplete = [r for r in rows if r["Finding"].endswith(" Incomplete")]
-        assert len(incomplete) == 2
+        assert len(incomplete) == legs
+        assert (
+            "Agent Workload Security Group Egress Incomplete"
+            in [r["Finding"] for r in incomplete]
+        ) == (legs == 3)
         assert all(r["Status"] == "N/A" for r in incomplete)
         assert all(named in r["Finding_Details"] for r in incomplete)
 

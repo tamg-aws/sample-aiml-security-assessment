@@ -448,6 +448,7 @@ _EXPECTED_ACTIONS = {
         "lambda:GetNetworkConnector",
         "ecs:DescribeTasks",
         "ecs:ListTasks",
+        "ecs:DescribeCapacityProviders",
         "eks:DescribeFargateProfile",
         "securityhub:GetConfigurationPolicy",
         "macie2:GetAdministratorAccount",
@@ -1932,6 +1933,12 @@ _SAGEMAKER_MANAGED_GRANTS_2 = [
         "Allow",
         "ecs:DescribeTasks",
         _sagemaker_policy2_arn("ecs:*:ACCOUNT:task/*"),
+        None,
+    ),
+    (
+        "Allow",
+        "ecs:DescribeCapacityProviders",
+        _sagemaker_policy2_arn("ecs:*:ACCOUNT:capacity-provider/*"),
         None,
     ),
     (
