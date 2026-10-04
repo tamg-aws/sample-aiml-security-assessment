@@ -1133,6 +1133,41 @@ MUTATIONS = [
         "replace": "",
     },
     {
+        "name": "BR-53 trusts GetResources for Bedrock job tags",
+        "file": BEDROCK,
+        "defect": "BR-53 sends Bedrock job ARNs to GetResources, which may not return jobs, so a job's own tags are never read",
+        "find": '        job_arns = [arn for arn in arns if inventory["arns"][arn] in BEDROCK_JOB_LABELS]\n',
+        "replace": "        job_arns = []\n",
+    },
+    {
+        "name": "BR-53 reads Bedrock job tags with the tagging API's key case",
+        "file": BEDROCK,
+        "defect": "BR-53 reads Key and Value from bedrock:ListTagsForResource, whose tags use key and value, so every owned job fails",
+        "find": '{"Key": tag.get("key"), "Value": tag.get("value")}',
+        "replace": '{"Key": tag.get("Key"), "Value": tag.get("Value")}',
+    },
+    {
+        "name": "BR-53 fails a job whose tags were not read",
+        "file": BEDROCK,
+        "defect": "BR-53 treats an unread job tag read as no tags, so AccessDenied fails the job",
+        "find": "                unread.append(arn)\n",
+        "replace": "                tags_by_arn[arn] = []\n",
+    },
+    {
+        "name": "BR-53 lists workload identities past the page cap",
+        "file": BEDROCK,
+        "defect": "BR-53 asks ListWorkloadIdentities for 100 per page, above its maximum of 20, so the read fails",
+        "find": '{"max_results": 20}',
+        "replace": "{}",
+    },
+    {
+        "name": "BR-53 drops never-tagged pipelines",
+        "file": BEDROCK,
+        "defect": "BR-53 reads the wrong result key for ListPipelines, so a pipeline never tagged passes unseen",
+        "find": '"PipelineSummaries",',
+        "replace": '"Pipelines",',
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2954,6 +2989,17 @@ GROUPS: dict[str, str] = {
         "in the Bedrock knowledge base redaction"
     ),
     "BR-26 ignores Glue redaction jobs": ("in the Bedrock knowledge base redaction"),
+    "BR-53 trusts GetResources for Bedrock job tags": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-53 reads Bedrock job tags with the tagging API's key case": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-53 fails a job whose tags were not read": ("in the Bedrock owner tag sweep"),
+    "BR-53 lists workload identities past the page cap": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-53 drops never-tagged pipelines": ("in the Bedrock owner tag sweep"),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

@@ -149,11 +149,13 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:GetMemory",
         "bedrock-agentcore:GetResourcePolicy",
         "bedrock-agentcore:ListCodeInterpreters",
+        "bedrock-agentcore:ListWorkloadIdentities",
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
         "bedrock:ApplyGuardrail",
         "bedrock:GetEvaluationJob",
         "bedrock:ListIngestionJobs",
+        "bedrock:ListTagsForResource",
         "cloudtrail:GetEventDataStore",
         "ecs:DescribeContainerInstances",
         "ecs:DescribeTasks",
@@ -189,6 +191,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeTransformJob",
         "sagemaker:ListDomains",
         "sagemaker:ListInferenceComponents",
+        "sagemaker:ListPipelines",
         "sagemaker:ListProcessingJobs",
         "sagemaker:ListTrainingJobs",
         "sagemaker:ListTransformJobs",
@@ -860,22 +863,33 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             ("Allow", "sagemaker:ListTransformJobs", '"*"'),
             ("Allow", "sagemaker:ListProcessingJobs", '"*"'),
             ("Allow", "sagemaker:ListInferenceComponents", '"*"'),
+            ("Allow", "sagemaker:ListPipelines", '"*"'),
             ("Allow", "eks:ListClusters", '"*"'),
             ("Allow", "sagemaker:ListDomains", '"*"'),
             ("Allow", "bedrock-agentcore:ListCodeInterpreters", '"*"'),
             ("Allow", "ecs:ListTasks", '"*"'),
-            scoped(
-                "sagemaker:DescribeEndpoint",
-                "sagemaker:*:${AWS::AccountId}:endpoint/*",
-            ),
-            scoped(
-                "sagemaker:DescribeEndpointConfig",
-                "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
-            ),
-            scoped("sagemaker:DescribeModel", "sagemaker:*:${AWS::AccountId}:model/*"),
-            scoped(
-                "sagemaker:DescribeInferenceComponent",
-                "sagemaker:*:${AWS::AccountId}:inference-component/*",
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "sagemaker:*:${AWS::AccountId}:endpoint/*",
+                                "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
+                                "sagemaker:*:${AWS::AccountId}:model/*",
+                                "sagemaker:*:${AWS::AccountId}:inference-component/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "sagemaker:DescribeEndpoint",
+                    "sagemaker:DescribeEndpointConfig",
+                    "sagemaker:DescribeModel",
+                    "sagemaker:DescribeInferenceComponent",
+                )
             ),
             scoped("eks:DescribeCluster", "eks:*:${AWS::AccountId}:cluster/*"),
             scoped(
@@ -942,6 +956,8 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                                 "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
                                 "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
                                 "bedrock-agentcore:*:${AWS::AccountId}:runtime/*",
+                                "bedrock-agentcore:*:${AWS::AccountId}:"
+                                "workload-identity-directory/*",
                             )
                         ]
                     ),
@@ -950,6 +966,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "bedrock-agentcore:GetBrowser",
                     "bedrock-agentcore:GetMemory",
                     "bedrock-agentcore:GetResourcePolicy",
+                    "bedrock-agentcore:ListWorkloadIdentities",
                 )
             ),
             (
@@ -1016,6 +1033,14 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                                 "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
                                 "${AWS::AccountId}:evaluation-job/*"
                             },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                                "${AWS::AccountId}:model-invocation-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                                "${AWS::AccountId}:model-customization-job/*"
+                            },
                         ]
                     ),
                 )
@@ -1023,6 +1048,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "sagemaker:DescribeTransformJob",
                     "sagemaker:DescribeProcessingJob",
                     "bedrock:GetEvaluationJob",
+                    "bedrock:ListTagsForResource",
                 )
             ),
             (
@@ -1120,11 +1146,26 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             ),
         ]
     )
-    # s3:GetObject is the one action in both: the inline grant reads the
-    # permission cache in the report bucket, and the managed grant reads
-    # invocation log records and knowledge base sidecars, never that bucket.
+    # s3:GetObject and bedrock:ListTagsForResource are the actions in both.
+    # The inline s3:GetObject grant reads the permission cache in the report
+    # bucket, and the managed grant reads invocation log records and knowledge
+    # base sidecars, never that bucket. The inline tag read covers application
+    # inference profiles only, and the managed one covers the three job types.
     inline = _actions(template, "BedrockSecurityAssessmentFunction")
-    assert {action for _, action, _ in grants} & inline == {"s3:GetObject"}
+    assert {action for _, action, _ in grants} & inline == {
+        "s3:GetObject",
+        "bedrock:ListTagsForResource",
+    }
+    profile_tags = _statement_block(
+        template, "BedrockSecurityAssessmentFunction", "BedrockInferenceProfileTagRead"
+    )
+    assert "bedrock:*:${AWS::AccountId}:inference-profile/*" in profile_tags
+    assert "-job/*" not in profile_tags
+    assert not [
+        grant
+        for grant in grants
+        if grant[1] == "bedrock:ListTagsForResource" and "inference-profile" in grant[2]
+    ]
     assert not [
         grant
         for grant in grants
@@ -2418,19 +2459,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "events:ListTargetsByRule",
             "events:*:${AWS::AccountId}:rule/*",
         ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointRead"): (
+        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointPathRead"): (
             "sagemaker:DescribeEndpoint",
-            "sagemaker:*:${AWS::AccountId}:endpoint/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointConfigRead"): (
             "sagemaker:DescribeEndpointConfig",
-            "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerModelRead"): (
             "sagemaker:DescribeModel",
-            "sagemaker:*:${AWS::AccountId}:model/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerInferenceComponentRead"): (
             "sagemaker:DescribeInferenceComponent",
             "sagemaker:*:${AWS::AccountId}:inference-component/*",
         ),

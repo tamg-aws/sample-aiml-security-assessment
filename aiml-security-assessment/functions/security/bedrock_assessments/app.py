@@ -32951,6 +32951,13 @@ OWNER_PLACEHOLDER_VALUES = frozenset(
 # GetResources accepts at most 100 ARNs in ResourceARNList.
 TAGGING_ARN_BATCH = 100
 
+# BR-53 inventory labels whose tags come from bedrock:ListTagsForResource.
+BEDROCK_JOB_LABELS = (
+    "batch inference job",
+    "model customization job",
+    "evaluation job",
+)
+
 MAX_REPORTED_UNOWNED_RESOURCES = 25
 
 
@@ -32981,8 +32988,9 @@ def _owner_tag_rejection(tag: Dict[str, Any]) -> Optional[str]:
 def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
     """
     List the ARN of every Bedrock agent, knowledge base, flow, prompt,
-    guardrail, custom and imported model, provisioned throughput and application
-    inference profile in the Region.
+    guardrail, custom and imported model, provisioned throughput, application
+    inference profile, and batch inference, model customization and evaluation
+    job in the Region.
 
     The population comes from the Bedrock list APIs, never from a tag query,
     because a tag query cannot return a resource that was never tagged.
@@ -33042,6 +33050,30 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
             "inferenceProfileArn",
             None,
         ),
+        (
+            "batch inference job",
+            bedrock_client,
+            "list_model_invocation_jobs",
+            "invocationJobSummaries",
+            "jobArn",
+            None,
+        ),
+        (
+            "model customization job",
+            bedrock_client,
+            "list_model_customization_jobs",
+            "modelCustomizationJobSummaries",
+            "jobArn",
+            None,
+        ),
+        (
+            "evaluation job",
+            bedrock_client,
+            "list_evaluation_jobs",
+            "jobSummaries",
+            "jobArn",
+            None,
+        ),
     )
     resource_types = {"agent": "agent", "knowledge base": "knowledge-base"}
     for label, client, operation, result_key, arn_field, id_field in legs:
@@ -33077,8 +33109,9 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
 def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
     """
     BR-53: Verify every Bedrock agent, knowledge base, flow, prompt, guardrail,
-    custom and imported model, provisioned throughput and application inference
-    profile carries an owner tag whose value names someone.
+    custom and imported model, provisioned throughput, application inference
+    profile and batch inference, customization and evaluation job carries an
+    owner tag whose value names someone.
     """
     logger.debug("Starting check for Bedrock resource owner tags")
     check_name = RESOURCE_OWNER_FINDING
@@ -33120,10 +33153,9 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
             findings["csv_data"].append(
                 row(
                     "No Bedrock agent, knowledge base, flow, prompt, guardrail, custom "
-                    "or imported model, provisioned throughput or application "
-                    "inference profile was listed in {}.".format(
-                        region or "this region"
-                    ),
+                    "or imported model, provisioned throughput, application "
+                    "inference profile, or batch inference, model customization or "
+                    "evaluation job was listed in {}.".format(region or "this region"),
                     "No action required",
                     "Informational",
                     "N/A",
@@ -33137,10 +33169,30 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
         arns = sorted(inventory["arns"])
         tags_by_arn: Dict[str, List[Dict[str, Any]]] = {}
         unread = []
+        # Whether GetResources returns Bedrock jobs is not documented, so a job's
+        # tags are read from bedrock:ListTagsForResource, which names all three
+        # job resource types.
+        job_arns = [arn for arn in arns if inventory["arns"][arn] in BEDROCK_JOB_LABELS]
+        if job_arns:
+            bedrock_client = boto3.client(
+                "bedrock", config=boto3_config, region_name=region
+            )
+        for arn in job_arns:
+            try:
+                response = bedrock_client.list_tags_for_resource(resourceARN=arn)
+            except (ClientError, BotoCoreError) as error:
+                unread.append(arn)
+                unread_error = get_assessment_error_label(error)
+                continue
+            tags_by_arn[arn] = [
+                {"Key": tag.get("key"), "Value": tag.get("value")}
+                for tag in response.get("tags") or []
+            ]
         # ResourceARNList cannot be combined with a pagination token, so each
         # batch is one call. An ARN missing from the response has no tags.
-        for start in range(0, len(arns), TAGGING_ARN_BATCH):
-            batch = arns[start : start + TAGGING_ARN_BATCH]
+        tagged_arns = sorted(set(arns) - set(job_arns))
+        for start in range(0, len(tagged_arns), TAGGING_ARN_BATCH):
+            batch = tagged_arns[start : start + TAGGING_ARN_BATCH]
             try:
                 response = tagging_client.get_resources(ResourceARNList=batch)
             except Exception as error:
@@ -33337,6 +33389,39 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         {},
     ),
     (
+        "sagemaker",
+        "SageMaker",
+        "inference component",
+        "sagemaker",
+        "list_inference_components",
+        "InferenceComponents",
+        "InferenceComponentArn",
+        "sagemaker:ListInferenceComponents",
+        {},
+    ),
+    (
+        "sagemaker",
+        "SageMaker",
+        "pipeline",
+        "sagemaker",
+        "list_pipelines",
+        "PipelineSummaries",
+        "PipelineArn",
+        "sagemaker:ListPipelines",
+        {},
+    ),
+    (
+        "sagemaker",
+        "SageMaker",
+        "processing job",
+        "sagemaker",
+        "list_processing_jobs",
+        "ProcessingJobSummaries",
+        "ProcessingJobArn",
+        "sagemaker:ListProcessingJobs",
+        {},
+    ),
+    (
         "bedrock-agentcore",
         "AgentCore",
         "agent runtime",
@@ -33391,14 +33476,26 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         "bedrock-agentcore:ListCodeInterpreters",
         {"type": "CUSTOM"},
     ),
+    (
+        "bedrock-agentcore",
+        "AgentCore",
+        "workload identity",
+        "bedrock-agentcore-control",
+        "list_workload_identities",
+        "workloadIdentities",
+        "workloadIdentityArn",
+        "bedrock-agentcore:ListWorkloadIdentities",
+        {"max_results": 20},
+    ),
 )
 
 # Resource types the list reads above do not enumerate, so one never tagged is
 # still invisible to this check.
 RESOURCE_OWNER_SWEEP_GAP = (
     "SageMaker and AgentCore resource types other than endpoints, models, "
-    "notebook instances, training jobs, domains, agent runtimes, memories, "
-    "gateways, custom browsers and custom code interpreters are read only "
+    "notebook instances, training jobs, domains, inference components, "
+    "pipelines, processing jobs, agent runtimes, memories, gateways, custom "
+    "browsers, custom code interpreters and workload identities are read only "
     "through GetResources, which returns only resources that are or were "
     "tagged, so a resource never tagged is not listed "
     "(https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/"
@@ -33582,7 +33679,7 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
         )
     unread_note = " These reads failed: {}.".format("; ".join(unread)) if unread else ""
     # Every list read and every GetResources filter was read, and nothing read
-    # lacks an owner: the ten listed types are judged whole, so the row passes
+    # lacks an owner: the fourteen listed types are judged whole, so the row passes
     # and names the types only GetResources reaches.
     complete = owned > 0 and not unowned and not unread
     findings["csv_data"].append(

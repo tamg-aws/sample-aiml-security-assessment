@@ -32607,6 +32607,10 @@ class TestBR53OwnerTagSweep:
         "list_training_jobs": "TrainingJobSummaries",
         "list_domains": "Domains",
         "list_code_interpreters": "codeInterpreterSummaries",
+        "list_inference_components": "InferenceComponents",
+        "list_pipelines": "PipelineSummaries",
+        "list_processing_jobs": "ProcessingJobSummaries",
+        "list_workload_identities": "workloadIdentities",
     }
 
     def _run(self, pages, errors=None, runtimes=None, lists=None):
@@ -32707,9 +32711,10 @@ class TestBR53OwnerTagSweep:
         assert "APIReference/API_GetResources.html)." in details
         assert (
             "SageMaker and AgentCore resource types other than endpoints, models, "
-            "notebook instances, training jobs, domains, agent runtimes, memories, "
-            "gateways, custom browsers and custom code interpreters are read only "
-            "through GetResources" in details
+            "notebook instances, training jobs, domains, inference components, "
+            "pipelines, processing jobs, agent runtimes, memories, gateways, custom "
+            "browsers, custom code interpreters and workload identities are read "
+            "only through GetResources" in details
         )
         assert "not granted" not in details
         assert "ceiling reached" not in details
@@ -32747,6 +32752,81 @@ class TestBR53OwnerTagSweep:
         assert (
             "bedrock-agentcore:ListMemories (AccessDeniedException)"
             in rows[0]["Finding_Details"]
+        )
+
+    def test_never_tagged_components_pipelines_jobs_and_identities_fail(self):
+        component = "arn:aws:sagemaker:us-east-1:123456789012:inference-component/{}"
+        identity = (
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+            "workload-identity-directory/default/workload-identity/{}"
+        )
+        pipeline = "arn:aws:sagemaker:us-east-1:123456789012:pipeline/never"
+        processing = "arn:aws:sagemaker:us-east-1:123456789012:processing-job/never"
+        _, rows, tagging = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": component.format("tagged"),
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        }
+                    ]
+                ],
+                "bedrock-agentcore": [
+                    [
+                        {
+                            "ResourceARN": identity.format("tagged"),
+                            "Tags": [{"Key": "Owner", "Value": "agents"}],
+                        }
+                    ]
+                ],
+            },
+            lists={
+                "list_inference_components": [
+                    {"InferenceComponentArn": component.format("tagged")},
+                    {"InferenceComponentArn": component.format("never")},
+                ],
+                "list_pipelines": [{"PipelineArn": pipeline}],
+                "list_processing_jobs": [{"ProcessingJobArn": processing}],
+                "list_workload_identities": [
+                    {"workloadIdentityArn": identity.format("tagged")},
+                    {"workloadIdentityArn": identity.format("never")},
+                ],
+            },
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 4
+        for arn, action in (
+            (component.format("never"), "sagemaker:ListInferenceComponents"),
+            (pipeline, "sagemaker:ListPipelines"),
+            (processing, "sagemaker:ListProcessingJobs"),
+            (identity.format("never"), "bedrock-agentcore:ListWorkloadIdentities"),
+        ):
+            assert any(
+                arn in details and f"listed by {action}" in details
+                for details in failed
+            ), arn
+        assert not any("/tagged" in details for details in failed)
+        assert tagging.list_workload_identities.call_args.kwargs["maxResults"] == 20
+
+    def test_an_unread_pipeline_list_withholds_the_pass(self):
+        _, rows, _ = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": self.SM_OWNED,
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        }
+                    ]
+                ]
+            },
+            lists={"list_pipelines": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "sagemaker:ListPipelines (AccessDeniedException), so pipelines never "
+            "tagged are not listed" in rows[0]["Finding_Details"]
         )
 
     def test_no_resource_at_all_is_na_not_passed(self):
@@ -33016,11 +33096,28 @@ class TestBR53ResourceOwnerTag:
     GUARDRAIL_BARE = "arn:aws:bedrock:us-east-1:123456789012:guardrail/g-bare"
     AGENT = "arn:aws:bedrock:us-east-1:123456789012:agent/AGENT1"
 
-    def _run(self, listings=None, tag_mappings=None, tag_error=None, list_errors=None):
+    def _run(
+        self,
+        listings=None,
+        tag_mappings=None,
+        tag_error=None,
+        list_errors=None,
+        job_tags=None,
+    ):
+        """``job_tags`` maps a job ARN to its ListTagsForResource tags or an error."""
         listings = listings or {}
         list_errors = list_errors or {}
+        job_tags = job_tags or {}
         bedrock = MagicMock()
         agent = MagicMock()
+
+        def list_tags_for_resource(resourceARN):
+            tags = job_tags.get(resourceARN, [])
+            if isinstance(tags, Exception):
+                raise tags
+            return {"tags": tags}
+
+        bedrock.list_tags_for_resource.side_effect = list_tags_for_resource
         result_keys = {
             "list_agents": "agentSummaries",
             "list_knowledge_bases": "knowledgeBaseSummaries",
@@ -33031,6 +33128,9 @@ class TestBR53ResourceOwnerTag:
             "list_flows": "flowSummaries",
             "list_prompts": "promptSummaries",
             "list_inference_profiles": "inferenceProfileSummaries",
+            "list_model_invocation_jobs": "invocationJobSummaries",
+            "list_model_customization_jobs": "modelCustomizationJobSummaries",
+            "list_evaluation_jobs": "jobSummaries",
         }
         for operation, key in result_keys.items():
             client = (
@@ -33136,6 +33236,69 @@ class TestBR53ResourceOwnerTag:
         assert "arn:aws:bedrock:us-east-1:123456789012:knowledge-base/KB1" in arns
         assert len(arns) == 3
         assert [r["Status"] for r in rows] == ["Failed"] * 3
+
+    JOB = "arn:aws:bedrock:us-east-1:123456789012:{}/{}"
+
+    def test_br53_bedrock_jobs_are_judged_by_their_own_tags(self):
+        batch_owned = self.JOB.format("model-invocation-job", "b-owned")
+        batch_bare = self.JOB.format("model-invocation-job", "b-bare")
+        custom = self.JOB.format("model-customization-job", "c-tbd")
+        evaluation = self.JOB.format("evaluation-job", "e-unread")
+        result, rows, tagging = self._run(
+            {
+                "list_guardrails": [{"arn": self.GUARDRAIL_OWNED}],
+                "list_model_invocation_jobs": [
+                    {"jobArn": batch_owned},
+                    {"jobArn": batch_bare},
+                ],
+                "list_model_customization_jobs": [{"jobArn": custom}],
+                "list_evaluation_jobs": [{"jobArn": evaluation}],
+            },
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                }
+            ],
+            job_tags={
+                batch_owned: [{"key": "owner", "value": "data-team"}],
+                batch_bare: [{"key": "env", "value": "dev"}],
+                custom: [{"key": "Owner", "value": "TBD"}],
+                evaluation: _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "N/A", "N/A"]
+        assert f"Bedrock model customization job {custom}" in rows[0]["Finding_Details"]
+        assert "placeholder 'TBD'" in rows[0]["Finding_Details"]
+        assert (
+            f"Bedrock batch inference job {batch_bare} has no owner tag"
+            in rows[1]["Finding_Details"]
+        )
+        assert "tag keys: env" in rows[1]["Finding_Details"]
+        assert "2 of the 5 Bedrock resource(s)" in rows[2]["Finding_Details"]
+        assert batch_owned in rows[2]["Finding_Details"]
+        assert "not a verdict on every resource" in rows[2]["Finding_Details"]
+        assert "AccessDeniedException" in rows[3]["Finding_Details"]
+        assert evaluation in rows[3]["Finding_Details"]
+        tagging.get_resources.assert_called_once_with(
+            ResourceARNList=[self.GUARDRAIL_OWNED]
+        )
+
+    def test_br53_an_unread_job_list_downgrades_the_pass(self):
+        _, rows, _ = self._run(
+            {"list_guardrails": [{"arn": self.GUARDRAIL_OWNED}]},
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "owner", "Value": "a"}],
+                }
+            ],
+            list_errors={
+                "list_evaluation_jobs": _make_client_error("AccessDeniedException")
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "evaluation jobs: AccessDeniedException" in rows[0]["Finding_Details"]
 
     def test_br53_arns_are_sent_in_batches_of_100(self):
         guardrails = [
