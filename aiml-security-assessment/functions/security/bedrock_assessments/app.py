@@ -2514,12 +2514,14 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
             if endpoint.get("type") == "Gateway"
         }
     ):
-        tables: Dict[str, Any] = {"main": None, "subnets": {}}
+        tables: Dict[str, Any] = {"main": None, "subnets": {}, "all": set()}
         try:
             for page in ec2_client.get_paginator("describe_route_tables").paginate(
                 Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
             ):
                 for table in page.get("RouteTables", []):
+                    if table.get("RouteTableId"):
+                        tables["all"].add(table["RouteTableId"])
                     for association in table.get("Associations") or []:
                         if association.get("Main"):
                             tables["main"] = table.get("RouteTableId")
@@ -3193,6 +3195,14 @@ def _sagemaker_endpoint_workloads(region: str, inventory: Dict[str, Any]) -> Non
             )
 
 
+# Workloads whose pods' subnets are not read, so a gateway endpoint covers them
+# only by naming every route table of the cluster VPC.
+EKS_WORKLOAD_KINDS = (
+    "EKS pod identity association",
+    "EKS IAM role for service accounts",
+)
+
+
 def _eks_irsa_workloads(oidc_clusters: List[tuple], inventory: Dict[str, Any]) -> None:
     """
     Add each IAM role an EKS cluster can give its pods through IAM roles for
@@ -3594,6 +3604,17 @@ def _workload_connectivity_findings(
         """Return (gap, unread) for a surface only a gateway endpoint may carry."""
         subnets = workload.get("subnets")
         if not subnets:
+            # A pod's subnets are not read, but a gateway endpoint that names
+            # every route table of the cluster VPC reaches any subnet in it.
+            tables = (route_tables or {}).get(vpc_id) or {}
+            every = tables.get("all")
+            if (
+                workload["kind"] in EKS_WORKLOAD_KINDS
+                and "error" not in tables
+                and every
+                and every <= gateway_routes[(vpc_id, surface)]
+            ):
+                return None, None
             return None, (
                 f"the subnets of {workload['kind']} '{workload['name']}' in "
                 f"{vpc_id} were not read, so its route tables were not compared "
@@ -3715,7 +3736,9 @@ def _workload_connectivity_findings(
         "DynamoDB surfaces are required only of a workload granted a Bedrock, "
         "AgentCore or SageMaker runtime surface. A gateway endpoint covers a "
         "workload only when it names the route table of each of the workload's "
-        "subnets, the subnet's own association or else the VPC's main table. "
+        "subnets, the subnet's own association or else the VPC's main table; an "
+        "EKS workload, whose pod subnets are not read, only when it names every "
+        "route table of the cluster VPC. "
         "Only endpoints in the available "
         f"state are counted. {SCP_NOT_EVALUATED_NOTE} {WORKLOAD_CONNECTIVITY_CEILING}"
     )

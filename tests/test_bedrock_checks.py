@@ -1396,6 +1396,105 @@ class TestBR02WorkloadConnectivity:
         assert "Passed" not in [row["Status"] for row in rows]
         assert any(phrase in row["Finding_Details"] for row in rows)
 
+    # NET-02: an EKS workload's pod subnets are not read, so a gateway endpoint
+    # covers it only by naming every route table of the cluster VPC.
+    EVERY_ROUTE = {
+        "vpc-1": {
+            "main": "rtb-main",
+            "subnets": {"subnet-a": "rtb-a"},
+            "all": {"rtb-main", "rtb-a", "rtb-b"},
+        }
+    }
+
+    @staticmethod
+    def _pod_workload(kind, role):
+        return {"kind": kind, "name": "ml/infer", "vpc_id": "vpc-1", "role": role}
+
+    @pytest.mark.parametrize(
+        "kind", ["EKS pod identity association", "EKS IAM role for service accounts"]
+    )
+    def test_br02_an_eks_workload_is_covered_by_a_gateway_on_every_route_table(
+        self, kind
+    ):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint(
+                    "s3", "Gateway", routes=["rtb-b", "rtb-a", "rtb-main"]
+                ),
+            ],
+            [self._pod_workload(kind, "Role")],
+            route_tables=self.EVERY_ROUTE,
+        )
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert f"{kind} 'ml/infer' in vpc-1" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kind", ["EKS pod identity association", "EKS IAM role for service accounts"]
+    )
+    def test_br02_an_eks_workload_off_one_route_table_stays_unread(self, kind):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=["rtb-a", "rtb-main"]),
+            ],
+            [self._pod_workload(kind, "Role")],
+            route_tables=self.EVERY_ROUTE,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(
+            f"the subnets of {kind} 'ml/infer' in vpc-1 were not read"
+            in row["Finding_Details"]
+            for row in rows
+        )
+
+    def test_br02_a_lambda_without_subnets_is_not_credited_every_route_table(self):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint(
+                    "s3", "Gateway", routes=["rtb-b", "rtb-a", "rtb-main"]
+                ),
+            ],
+            [self._function("app", "Role")],
+            route_tables=self.EVERY_ROUTE,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(
+            "the subnets of Lambda function 'app' in vpc-1 were not read"
+            in row["Finding_Details"]
+            for row in rows
+        )
+
+    @pytest.mark.parametrize(
+        "route_tables",
+        [
+            {},
+            {"vpc-1": {"main": "rtb-main", "subnets": {}, "all": set()}},
+            {
+                "vpc-1": {
+                    "all": {"rtb-main"},
+                    "error": "the route tables of vpc-1 were not read with "
+                    "ec2:DescribeRouteTables (UnauthorizedOperation)",
+                }
+            },
+        ],
+    )
+    def test_br02_an_eks_workload_in_an_unread_vpc_stays_unread(self, route_tables):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=["rtb-main"]),
+            ],
+            [self._pod_workload("EKS pod identity association", "Role")],
+            route_tables=route_tables,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+
     def test_br02_the_collector_reads_route_tables_of_gateway_vpcs_only(self):
         ec2_client = MagicMock()
         pages = {
@@ -1461,6 +1560,7 @@ class TestBR02WorkloadConnectivity:
             "vpc-1": {
                 "main": "rtb-main",
                 "subnets": {"subnet-a": "rtb-a", "subnet-b": "rtb-a"},
+                "all": {"rtb-main", "rtb-a"},
             }
         }
         assert result["data_path_endpoints"][0]["route_tables"] == ["rtb-a"]
