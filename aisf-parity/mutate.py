@@ -795,6 +795,31 @@ MUTATIONS = [
         "replace": "",
     },
     {
+        "name": "BR-55 credits an all-zero PCR pin",
+        "file": BEDROCK,
+        "defect": "BR-55 reads a pin on the all-zero measurement a debug-mode "
+        "enclave presents as an exact image measurement, so a debug enclave can "
+        "decrypt",
+        "find": '        "*" in str(value) or "?" in str(value) or not str(value).strip("0")\n',
+        "replace": '        "*" in str(value) or "?" in str(value)\n',
+    },
+    {
+        "name": "BR-48 ignores a service section with no leaf",
+        "file": BEDROCK,
+        "defect": "BR-48 reads a service section that delegates operators but sets "
+        "no opt_out_policy as delegating nothing, so a child can opt the service in",
+        "find": '            if list(control) != ["@@none"] and "opt_out_policy" not in node:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-26 credits a secrets regex that acts on the output only",
+        "file": BEDROCK,
+        "defect": "BR-26 passes a guardrail whose secrets regex acts on the output "
+        "only, so a credential the built-in types do not name reaches the model",
+        "find": '    for side in ("output", "input"):\n        if not side_regexes[side]:\n',
+        "replace": '    for side in ("output",):\n        if not side_regexes[side]:\n',
+    },
+    {
         "name": "an unread list read lets the BR-53 sweep summary pass",
         "file": BEDROCK,
         "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
@@ -2479,6 +2504,13 @@ GROUPS: dict[str, str] = {
     ),
     "BR-47 drops the Bedrock evaluation job buckets": (
         "in the Bedrock data path inventory"
+    ),
+    "BR-55 credits an all-zero PCR pin": ("in the Bedrock attestation pins"),
+    "BR-48 ignores a service section with no leaf": (
+        "in the Bedrock AI opt-out delegation"
+    ),
+    "BR-26 credits a secrets regex that acts on the output only": (
+        "in the Bedrock guardrail secrets regex"
     ),
     "an unread list read lets the BR-53 sweep summary pass": (
         "in the Bedrock owner tag sweep"

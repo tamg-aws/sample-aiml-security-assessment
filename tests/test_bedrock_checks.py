@@ -19546,6 +19546,54 @@ class TestDeployedGuardrailVersions:
         assert rows[0]["Status"] == "Failed"
         assert "no custom regex blocks or masks secrets" in rows[0]["Finding_Details"]
 
+    # GRD-03: a secrets regex that acts on the output only used to pass, so a
+    # credential the built-in types do not name went to the model on input.
+    @pytest.mark.parametrize(
+        "input_action, status", [("NONE", "Failed"), ("ANONYMIZE", "Passed")]
+    )
+    def test_br26_a_secrets_regex_must_act_on_the_input(self, input_action, status):
+        policy = dict(
+            self.GOOD_PII,
+            regexes=[
+                {
+                    "name": "api-key",
+                    "pattern": "key_[0-9a-f]{40}",
+                    "inputAction": input_action,
+                    "outputAction": "BLOCK",
+                }
+            ],
+        )
+        result = self._pii(
+            {"Regex": policy},
+            self._attachments(
+                {
+                    ("gr-0", "1"): (
+                        ["agent 'a' version 1"],
+                        {"sensitiveInformationPolicy": policy},
+                    )
+                }
+            ),
+        )
+        draft = self._rows(result, "Guardrail Sensitive Information Filter Check")
+        deployed = self._rows(result, "Deployed Guardrail Sensitive Information Filter")
+        assert [row["Status"] for row in draft + deployed] == [status, status]
+        for row in draft + deployed:
+            details = row["Finding_Details"]
+            if status == "Failed":
+                assert (
+                    "no custom regex blocks or masks secrets, credentials or "
+                    "internal identifiers on the input" in details
+                )
+                assert "internal identifiers on the output" not in details
+        if status == "Passed":
+            assert (
+                "with a custom regex acting on each side" in draft[0]["Finding_Details"]
+            )
+            assert (
+                "custom regex 'api-key' acts on the input and 'api-key' on the output"
+                in deployed[0]["Finding_Details"]
+            )
+
     def test_br26_two_guardrails_reach_both_verdicts(self):
         result = self._pii(
             {
@@ -25832,6 +25880,43 @@ class TestBR48AIServicesOptOut:
         assert "'ai-lock' (attached to root r-root) delegates @@assign" in details
         assert "no policy attached below it can opt a service back in" not in details
         assert [f["Status"] for f in clean] == ["Passed"]
+
+    # DAT-09: a service section that allows @@assign to child policies but
+    # holds no opt_out_policy leaf used to record no delegation, so the row
+    # passed while a child could add services.lex.opt_out_policy optIn. A
+    # section whose own leaf is locked with @@none still passes.
+    @pytest.mark.parametrize(
+        "lex, status",
+        [
+            ({"@@operators_allowed_for_child_policies": ["@@assign"]}, "Failed"),
+            (
+                {
+                    "@@operators_allowed_for_child_policies": ["@@assign"],
+                    "opt_out_policy": {
+                        "@@operators_allowed_for_child_policies": ["@@none"],
+                        "@@assign": "optOut",
+                    },
+                },
+                "Passed",
+            ),
+        ],
+        ids=["section-without-leaf", "section-with-locked-leaf"],
+    )
+    def test_br48_a_service_section_with_no_leaf_still_delegates(self, lex, status):
+        policy = json.loads(json.dumps(self.LOCKED))
+        policy["services"]["lex"] = lex
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": policy},
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        details = findings[0]["Finding_Details"]
+        if status == "Failed":
+            assert "'ai-lock' (attached to root r-root) delegates @@assign" in details
+        else:
+            assert "delegates" not in details
 
     def test_br48_opt_out_value_is_compared_case_sensitively(self):
         findings = self._run(
@@ -32696,6 +32781,55 @@ class TestBR55EnclaveKeyBinding:
             result = bedrock_app.check_kms_enclave_key_binding(region="us-east-1")
         return result, extract_csv_data(result), kms
 
+    # DAT-10: a debug-mode enclave presents all zeros for each PCR, so a pin
+    # to zeros admits any image run in debug mode. Allow and Deny pins to the
+    # zero value used to be credited as exact; the real digest still passes.
+    ZERO = "0" * 96
+
+    def test_br55_an_all_zero_allow_pin_is_not_a_measurement(self):
+        zero = self._enclave_allow()
+        zero["Condition"] = {
+            "StringEqualsIgnoreCase": {
+                "kms:RecipientAttestation:ImageSha384": self.ZERO,
+                self.PCR3: self.ZERO,
+            }
+        }
+        _, rows, _ = self._run(
+            {
+                "a-zero": [self._admin(), zero],
+                "b-real": [self._admin(), self._enclave_allow()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-zero" in rows[0]["Finding_Details"]
+        assert (
+            "statement 'EnclaveDecrypt' allows kms:decrypt, kms:generatedatakey "
+            "with no exact attestation measurement" in rows[0]["Finding_Details"]
+        )
+        assert "arn:k/a-zero" not in rows[1]["Finding_Details"]
+
+    def test_br55_an_all_zero_deny_pin_is_not_a_measurement(self):
+        def zeroed(statement):
+            key = next(iter(statement["Condition"]["StringNotEqualsIgnoreCase"]))
+            return dict(
+                statement,
+                Condition={"StringNotEqualsIgnoreCase": {key: self.ZERO}},
+            )
+
+        _, rows, _ = self._run(
+            {
+                "a-zero": [
+                    self.ROOT,
+                    zeroed(self._deployment_deny()),
+                    zeroed(self._image_deny()),
+                ],
+                "b-real": [self.ROOT, self._deployment_deny(), self._image_deny()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-zero" in rows[0]["Finding_Details"]
+        assert "arn:k/a-zero" not in rows[1]["Finding_Details"]
+
     def test_br55_first_key_pinned_second_root_bypass_fails(self):
         result, rows, _ = self._run(
             {
@@ -32752,7 +32886,9 @@ class TestBR55EnclaveKeyBinding:
         ):
             _, rows, _ = self._run({"k": [self._enclave_allow(condition=condition)]})
             assert [r["Status"] for r in rows] == ["Failed"], condition
-            assert "with no attestation condition" in rows[0]["Finding_Details"]
+            # The statement carries an attestation test, so the text now says
+            # no exact measurement instead of no attestation condition.
+            assert "with no exact attestation measurement" in rows[0]["Finding_Details"]
 
     def test_br55_set_operator_prefix_on_the_operator_is_stripped(self):
         _, rows, _ = self._run(
@@ -33398,7 +33534,14 @@ _PROBE_PASSING_DETAIL = {
             {"type": t, "inputAction": "BLOCK", "outputAction": "ANONYMIZE"}
             for t in ("AWS_ACCESS_KEY", "AWS_SECRET_KEY", "PASSWORD")
         ],
-        "regexes": [{"name": "k", "pattern": "k", "outputAction": "BLOCK"}],
+        "regexes": [
+            {
+                "name": "k",
+                "pattern": "k",
+                "inputAction": "BLOCK",
+                "outputAction": "BLOCK",
+            }
+        ],
     }
 }
 

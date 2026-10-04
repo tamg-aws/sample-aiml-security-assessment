@@ -16281,7 +16281,7 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
     Judge one guardrail version's sensitive-information policy by the action
     each entity and regex takes. A version passes when each credential entity
     type (CREDENTIAL_PII_ENTITY_TYPES) blocks or masks on the input and on the
-    output, and a custom regex blocks or masks on the output for the secrets
+    output, and a custom regex blocks or masks on each side for the secrets
     the built-in types do not name.
     """
     policy = detail.get("sensitiveInformationPolicy") or {}
@@ -16304,11 +16304,14 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
         ]
         for side in ("input", "output")
     }
-    output_regexes = [
-        f"'{r.get('name') or 'unnamed'}'"
-        for r in regexes
-        if _sensitive_information_action(r, "output") in SENSITIVE_INFORMATION_ACTING
-    ]
+    side_regexes = {
+        side: [
+            f"'{r.get('name') or 'unnamed'}'"
+            for r in regexes
+            if _sensitive_information_action(r, side) in SENSITIVE_INFORMATION_ACTING
+        ]
+        for side in ("input", "output")
+    }
     gaps = []
     for side in ("output", "input"):
         if not acting[side]:
@@ -16329,10 +16332,12 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
                 "the credential PII entity type(s) {} do not block or mask on "
                 "the {}".format(", ".join(missing), side)
             )
-    if not output_regexes:
-        gaps.append(
-            "no custom regex blocks or masks secrets, credentials or internal identifiers on the output"
-        )
+    for side in ("output", "input"):
+        if not side_regexes[side]:
+            gaps.append(
+                "no custom regex blocks or masks secrets, credentials or internal "
+                f"identifiers on the {side}"
+            )
     detect_only = sorted(
         label
         for label, element in elements
@@ -16349,12 +16354,13 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
     return (
         "Passed",
         "PII entities or regexes block or mask on the input ({}) and the output ({}), "
-        "including {} on both, and custom regex {} acts on the output; the regex "
-        "patterns themselves are not evaluated.{}".format(
+        "including {} on both, and custom regex {} acts on the input and {} on "
+        "the output; the regex patterns themselves are not evaluated.{}".format(
             ", ".join(acting["input"]),
             ", ".join(acting["output"]),
             ", ".join(CREDENTIAL_PII_ENTITY_TYPES),
-            ", ".join(output_regexes),
+            ", ".join(side_regexes["input"]),
+            ", ".join(side_regexes["output"]),
             observed,
         ),
     )
@@ -16363,7 +16369,7 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
 SENSITIVE_INFORMATION_RESOLUTION = (
     "Set the required PII entity types, including AWS_ACCESS_KEY, AWS_SECRET_KEY and "
     "PASSWORD, to BLOCK or ANONYMIZE on both the input and the output, add custom regexes for secrets, credentials and internal identifiers with "
-    "BLOCK or ANONYMIZE on the output, and screen tool inputs and results in the "
+    "BLOCK or ANONYMIZE on the input and the output, and screen tool inputs and results in the "
     "application or through ApplyGuardrail."
 )
 
@@ -16929,7 +16935,7 @@ def check_bedrock_guardrail_pii_filters(
                     create_finding(
                         check_id="BR-26",
                         finding_name="Guardrail Sensitive Information Filter Check",
-                        finding_details=f"The working drafts of {len(guardrails_with_pii)} guardrail(s) ({', '.join(sorted(guardrails_with_pii))}) block or mask sensitive information on the input and the output, with a custom regex on the output. The deployed versions are judged in the Deployed Guardrail Sensitive Information Filter rows. {SENSITIVE_INFORMATION_TOOL_CEILING}",
+                        finding_details=f"The working drafts of {len(guardrails_with_pii)} guardrail(s) ({', '.join(sorted(guardrails_with_pii))}) block or mask sensitive information on the input and the output, with a custom regex acting on each side. The deployed versions are judged in the Deployed Guardrail Sensitive Information Filter rows. {SENSITIVE_INFORMATION_TOOL_CEILING}",
                         resolution="No action required. Review the PII entity types and regex patterns against the data the workload handles.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html",
                         severity="Low",
@@ -32758,6 +32764,18 @@ ENCLAVE_SENSITIVE_GRANT_OPERATIONS = {
 }
 
 
+def _attestation_values_exact(values: List[Any]) -> bool:
+    """
+    Return True when every value names one measurement: no wildcard, and not
+    the all-zero value a debug-mode enclave presents for each PCR, since a pin
+    to zeros admits any image run in debug mode.
+    """
+    return bool(values) and not any(
+        "*" in str(value) or "?" in str(value) or not str(value).strip("0")
+        for value in values
+    )
+
+
 def _exact_attestation_keys(statement: Dict[str, Any], negated: bool) -> set:
     """
     Return the attestation keys a statement tests against exact values.
@@ -32777,9 +32795,7 @@ def _exact_attestation_keys(statement: Dict[str, Any], negated: bool) -> set:
             continue
         if operator.startswith("foranyvalue:" if negated else "forallvalues:"):
             continue
-        if values and not any(
-            "*" in str(value) or "?" in str(value) for value in values
-        ):
+        if _attestation_values_exact(values):
             keys.add(key)
     return keys
 
@@ -32826,9 +32842,7 @@ def _allow_pins_enclave_image(statement: Dict[str, Any]) -> bool:
             continue
         if operator.startswith("forallvalues:"):
             continue
-        if values and not any(
-            "*" in str(value) or "?" in str(value) for value in values
-        ):
+        if _attestation_values_exact(values):
             return True
     return False
 
@@ -32873,9 +32887,7 @@ def _deny_attestation_test(statement: Dict[str, Any]) -> Optional[str]:
         if "not" in test and operator.startswith("foranyvalue:"):
             continue
         if "not" in test:
-            if values and not any(
-                "*" in str(value) or "?" in str(value) for value in values
-            ):
+            if _attestation_values_exact(values):
                 return "pins"
             outcome = "missing"
         elif test == "null" and any(str(value).lower() == "true" for value in values):
@@ -32988,6 +33000,16 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
                 f"statement '{label}' grants {', '.join(open_actions)} to the "
                 "account, which lets any IAM principal the account's policies "
                 "allow use the key with no attestation"
+            )
+        elif any(
+            ATTESTATION_BINDING_KEY.match(key)
+            for _, key, _ in _condition_keys_by_operator(statement)
+        ):
+            bypasses.append(
+                f"statement '{label}' allows {', '.join(open_actions)} with no "
+                "exact attestation measurement (its test is a wildcard, "
+                "negated, IfExists or Null test, or names the all-zero value of "
+                "a debug-mode enclave)"
             )
         else:
             bypasses.append(
@@ -34846,7 +34868,9 @@ def _collect_child_operator_delegations(
 
     An unset @@operators_allowed_for_child_policies means @@all, and a value set
     on a parent key applies to every key below it. Only ["@@none"] locks an
-    opt_out_policy value against child policies.
+    opt_out_policy value against child policies. A section that sets operators
+    other than ["@@none"] and holds no opt_out_policy leaf delegates them too,
+    because a child policy can then add the leaf beneath it.
     """
     delegated = set()
     if isinstance(node, dict):
@@ -34857,6 +34881,8 @@ def _collect_child_operator_delegations(
                 for operator in _as_list(node[AI_OPT_OUT_CHILD_OPERATORS_KEY])
                 if operator
             )
+            if list(control) != ["@@none"] and "opt_out_policy" not in node:
+                delegated.update(control)
         for key, value in node.items():
             if str(key) == AI_OPT_OUT_CHILD_OPERATORS_KEY:
                 continue

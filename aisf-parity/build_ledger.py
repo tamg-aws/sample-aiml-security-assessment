@@ -47,8 +47,15 @@ AI_SUBJECT_ROWS = [
         "settings is then applied once with bedrock:ApplyGuardrail, source OUTPUT and "
         "outputScope INTERVENTIONS, to a fixed probe string built from AWS's documented "
         "example access key and secret key: both blocked or anonymized is Passed, either "
-        "let through is Failed, and an ApplyGuardrail error is N/A. PASSWORD detection "
-        "of the probe text and the custom regex patterns are stated, not judged",
+        "let through is Failed, and an ApplyGuardrail error is N/A. A custom regex "
+        "must block or mask on the input and on the output, and a regex acting on one "
+        "side only fails naming the other. PASSWORD detection of the probe text and "
+        "the custom regex patterns are stated, not judged. The guardrail filter does "
+        "not reach toolUse input, toolResult content or a toolSpec, and no "
+        "configuration API records whether a workload screens those fields, so every "
+        "row states it. The knowledge base redaction leg never passes: a "
+        "transformation Lambda's logic is not read and a RetrieveAndGenerate caller "
+        "supplies its guardrail per request, so a screened knowledge base is N/A",
         [],
         3,
     ),
@@ -1431,7 +1438,8 @@ AI_SUBJECT_ROWS = [
         "services.default.opt_out_policy. A lock on the value alone lets a child add a "
         "service section that opts back in, so it fails, as does a locking policy "
         'that sets a child operator other than ["@@none"] on a section below its '
-        "lock, and an unread path or policy is N/A. optOut and optIn are compared exactly, as the policy syntax spells "
+        "lock, including a service section with no opt_out_policy of its own, and "
+        "an unread path or policy is N/A. optOut and optIn are compared exactly, as the policy syntax spells "
         "them. The policy type does not govern Amazon Bedrock, and every row says it "
         "does not establish how Bedrock handles content",
         [],
@@ -2150,7 +2158,9 @@ FOUNDATION_ROWS = [
         "enclave-bound, and every other key is Not Applicable. The condition keys "
         "come in two families, ImageSha384 and PCR<n> for Nitro Enclaves and "
         "NitroTPMPCR<n> for NitroTPM. Both are judged and each row names the "
-        "family. An exact value on any of those keys pins the key. An "
+        "family. An exact value on any of those keys pins the key. The all-zero "
+        "value a debug-mode enclave presents is not an exact value, so a pin on "
+        "zeros is credited neither in an Allow nor in a Deny. An "
         "enclave-bound key fails when no statement pins it, and when an Allow "
         "grants kms:Decrypt, kms:DeriveSharedSecret, kms:GenerateDataKey, "
         "kms:GenerateDataKeyPair or kms:ReEncryptFrom, which carries no "

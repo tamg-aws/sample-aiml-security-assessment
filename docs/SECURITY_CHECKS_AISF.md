@@ -467,10 +467,10 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 255/255 find-strings validated`, aborting and naming each entry whose
+   `entries 258/258 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 255 ways and requires a ledger gate or a test to go red for
+   breaks the code 258 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
    in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names
    the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown
@@ -481,7 +481,7 @@ timestamp and `--csv-dir` says it cannot.
    the Bedrock condition parsers, 1 in the Bedrock endpoint collector, 1 in
    the Bedrock cross-Region agent roles, 1 in the Bedrock CloudTrail Lake
    reader, 1 in the Bedrock training bucket policies, 1 in the Bedrock
-   AI user population, 2 in the Bedrock knowledge base stores, 2 in the Bedrock data path TLS exemptions, 1 in the Bedrock AgentCore memory retention, 2 in the Bedrock knowledge base redaction, 1 in the Bedrock guardrail output probe, 1 in the Bedrock Identity Center attributes, 2 in the Bedrock invocation log entries, 2 in the Bedrock knowledge base classification, 1 in the Bedrock owner tag sweep, 1 in the Bedrock profiles in use, 2 in the Bedrock agent workload identity, 2 in the Bedrock container image scanning, 3 in the Bedrock management-account SCP credit, 2 in the Bedrock Region deny service prefixes, 3 in the Bedrock data path inventory and 8 in the Bedrock invocation log guardrail evidence and 175 in the AgentCore verdict legs. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
+   AI user population, 2 in the Bedrock knowledge base stores, 2 in the Bedrock data path TLS exemptions, 1 in the Bedrock AgentCore memory retention, 2 in the Bedrock knowledge base redaction, 1 in the Bedrock guardrail output probe, 1 in the Bedrock Identity Center attributes, 2 in the Bedrock invocation log entries, 2 in the Bedrock knowledge base classification, 1 in the Bedrock owner tag sweep, 1 in the Bedrock profiles in use, 2 in the Bedrock agent workload identity, 2 in the Bedrock container image scanning, 3 in the Bedrock management-account SCP credit, 2 in the Bedrock Region deny service prefixes, 3 in the Bedrock data path inventory, 1 in the Bedrock attestation pins, 1 in the Bedrock AI opt-out delegation, 1 in the Bedrock guardrail secrets regex and 8 in the Bedrock invocation log guardrail evidence and 175 in the AgentCore verdict legs. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
    fails if this paragraph disagrees with it, because the earlier copy of this
    sentence went stale at 17 while the battery grew to 22 and nothing read the
    two together. The last of those entries is what keeps gate 20 itself honest:
