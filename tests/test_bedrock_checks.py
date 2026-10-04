@@ -2723,6 +2723,180 @@ class TestBR02WorkloadConnectivity:
 # ===================================================================
 # BR-03: check_marketplace_subscription_access
 # ===================================================================
+class TestBR02DataPathEndpointPolicy:
+    """
+    AIR-FND-NET-02: the S3, DynamoDB and SageMaker endpoints in a VPC that holds
+    an AI workload or a Bedrock or AgentCore endpoint need a least-privilege
+    endpoint policy too, whether or not the VPC holds an AgentCore endpoint.
+    """
+
+    br02 = TestBR02WorkloadConnectivity
+    OPEN = TestBR02VPCEndpointHardening._OPEN_POLICY
+
+    @staticmethod
+    def _data_endpoint(surface, policy, vpc_id="vpc-1", endpoint_id="vpce-d"):
+        return {
+            "vpc_id": vpc_id,
+            "service": f"com.amazonaws.us-east-1.{surface}",
+            "endpoint_id": endpoint_id,
+            "private_dns": None,
+            "policy": policy,
+            "type": "Gateway" if surface in ("s3", "dynamodb") else "Interface",
+            "route_tables": [],
+        }
+
+    @staticmethod
+    def _policy(**statement):
+        base = {"Effect": "Allow", "Principal": "*", "Action": "*", "Resource": "*"}
+        base.update(statement)
+        return json.dumps({"Statement": [base]})
+
+    def _run(self, data_path, workloads=(), roles=None, errors=None, bedrock=()):
+        roles = roles or {"InvokeRole": self.br02._role(["bedrock:InvokeModel"])}
+        with (
+            patch(
+                "bedrock_app.check_bedrock_vpc_endpoints",
+                return_value={
+                    "has_endpoints": bool(bedrock),
+                    "found_endpoints": list(bedrock),
+                    "agentcore_endpoints": [],
+                    "data_path_endpoints": list(data_path),
+                    "all_vpcs": ["vpc-1", "vpc-2"],
+                    "route_tables": {},
+                },
+            ),
+            patch(
+                "bedrock_app.get_bedrock_vpc_workload_inventory",
+                return_value={"workloads": list(workloads), "errors": errors or []},
+            ),
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_access_and_vpc_endpoints(
+                    self.br02._cache(roles), region="us-east-1"
+                )
+            )
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"] == bedrock_app.DATA_PATH_ENDPOINT_POLICY_FINDING
+        ]
+
+    def test_open_s3_gateway_endpoint_in_an_ai_vpc_fails_beside_a_scoped_one(self):
+        rows = self._run(
+            [
+                self._data_endpoint("s3", self.OPEN, endpoint_id="vpce-open"),
+                self._data_endpoint(
+                    "dynamodb",
+                    self._policy(
+                        Condition={"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}
+                    ),
+                    endpoint_id="vpce-org",
+                ),
+                self._data_endpoint(
+                    "s3", self.OPEN, vpc_id="vpc-2", endpoint_id="vpce-other-vpc"
+                ),
+            ],
+            workloads=[self.br02._function("fn", "InvokeRole", vpc_id="vpc-1")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert all(row["Check_ID"] == "BR-02" for row in rows)
+        assert (
+            "vpce-open (com.amazonaws.us-east-1.s3 in vpc-1)"
+            in rows[0]["Finding_Details"]
+        )
+        assert "vpce-org" not in rows[0]["Finding_Details"]
+        assert "vpce-other-vpc" not in rows[0]["Finding_Details"]
+        assert "vpce-org" in rows[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "resource, status",
+        [
+            ("arn:aws:s3:::training-data/*", "Passed"),
+            (["arn:aws:s3:::training-data", "arn:aws:s3:::logs/*"], "Passed"),
+            ("arn:aws:s3:::*", "Failed"),
+            ("arn:aws:s3:::train*/*", "Failed"),
+            ("*", "Failed"),
+        ],
+    )
+    def test_a_bucket_scoped_s3_policy_is_least_privilege_and_a_wildcard_is_not(
+        self, resource, status
+    ):
+        rows = self._run(
+            [self._data_endpoint("s3", self._policy(Resource=resource))],
+            bedrock=[TestBR02VPCEndpointHardening._endpoint()],
+        )
+
+        assert [row["Status"] for row in rows] == [status]
+
+    @pytest.mark.parametrize(
+        "resource, status",
+        [
+            ("arn:aws:dynamodb:us-east-1:123456789012:table/Prompts", "Passed"),
+            ("arn:aws:dynamodb:us-east-1:123456789012:table/*", "Failed"),
+            ("arn:aws:dynamodb:*:123456789012:table/Prompts", "Failed"),
+        ],
+    )
+    def test_a_table_scoped_dynamodb_policy_needs_a_named_table(self, resource, status):
+        rows = self._run(
+            [self._data_endpoint("dynamodb", self._policy(Resource=resource))],
+            bedrock=[TestBR02VPCEndpointHardening._endpoint()],
+        )
+
+        assert [row["Status"] for row in rows] == [status]
+
+    def test_a_deny_outside_the_org_scopes_a_sagemaker_endpoint(self):
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "sagemaker:*",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringNotEquals": {"aws:PrincipalOrgID": "o-abc123"}
+                        },
+                    },
+                ]
+            }
+        )
+        rows = self._run(
+            [self._data_endpoint("sagemaker.runtime", policy)],
+            bedrock=[TestBR02VPCEndpointHardening._endpoint()],
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+
+    def test_an_unread_workload_population_keeps_a_scoped_endpoint_from_passing(self):
+        rows = self._run(
+            [
+                self._data_endpoint(
+                    "s3", self._policy(Resource="arn:aws:s3:::training-data/*")
+                )
+            ],
+            workloads=[self.br02._function("fn", "InvokeRole", vpc_id="vpc-1")],
+            errors=["EC2 instances were not read with ec2:DescribeInstances (Denied)"],
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "not reported as Passed" in rows[0]["Finding_Details"]
+
+    def test_no_data_path_endpoint_in_an_ai_vpc_writes_no_row(self):
+        rows = self._run(
+            [self._data_endpoint("s3", self.OPEN, vpc_id="vpc-2")],
+            workloads=[self.br02._function("fn", "InvokeRole", vpc_id="vpc-1")],
+        )
+
+        assert rows == []
+
+
 class TestBR03MarketplaceAccess:
     """BR-03: Check marketplace subscription access."""
 
@@ -2955,8 +3129,17 @@ class TestBR04LoggingConfiguration:
             mock_s3.get_bucket_lifecycle_configuration.return_value = lifecycle
         # A bucket that was never versioned returns no Status key.
         mock_s3.get_bucket_versioning.return_value = versioning or {}
+        mock_s3.list_objects_v2.return_value = {"Contents": [], "IsTruncated": False}
+        mock_s3.list_object_versions.return_value = {"IsTruncated": False}
+        mock_sts = MagicMock()
+        mock_sts.get_caller_identity.return_value = {"Account": "111122223333"}
 
-        clients = {"bedrock": mock_bedrock, "logs": mock_logs, "s3": mock_s3}
+        clients = {
+            "bedrock": mock_bedrock,
+            "logs": mock_logs,
+            "s3": mock_s3,
+            "sts": mock_sts,
+        }
         return (lambda service_name, **kwargs: clients[service_name]), clients
 
     def _retention_findings(self, findings):
@@ -7840,6 +8023,7 @@ class TestBR12InvocationLogArchive:
     """AIR-FND-DET-09: each invocation log destination holds a WORM copy."""
 
     ACCOUNT = "123456789012"
+    ARCHIVE_ACCOUNT = "999999999999"
     STREAM = "arn:aws:firehose:us-east-1:123456789012:deliverystream/archive"
 
     @staticmethod
@@ -7865,17 +8049,31 @@ class TestBR12InvocationLogArchive:
         }
 
     def _run(
-        self, buckets=(), locks=None, log_group=None, filter_pages=None, stream=None
+        self,
+        buckets=(),
+        locks=None,
+        log_group=None,
+        filter_pages=None,
+        stream=None,
+        owners=None,
     ):
         """
         ``locks`` maps a bucket to a GetObjectLockConfiguration response or an
         error; ``filter_pages`` is the DescribeSubscriptionFilters pages or an
-        error.
+        error. ``owners`` maps a bucket to its owning account, the Log Archive
+        account by default; a call naming another ExpectedBucketOwner is
+        denied, as S3 answers it.
         """
         locks = locks or {}
+        owners = owners or {}
         s3 = MagicMock()
 
-        def get_object_lock_configuration(Bucket):
+        def get_object_lock_configuration(Bucket, ExpectedBucketOwner=None):
+            owner = owners.get(Bucket, self.ARCHIVE_ACCOUNT)
+            if ExpectedBucketOwner is not None and isinstance(owner, Exception):
+                raise owner
+            if ExpectedBucketOwner is not None and ExpectedBucketOwner != owner:
+                raise _make_client_error("AccessDenied")
             value = locks[Bucket]
             if isinstance(value, Exception):
                 raise value
@@ -7939,7 +8137,10 @@ class TestBR12InvocationLogArchive:
             "bucket 'locked', whose default retention is COMPLIANCE mode for 365 day(s)"
             in rows[0]["Finding_Details"]
         )
-        assert "separate Log Archive account is not read" in rows[0]["Finding_Details"]
+        assert (
+            "and which another account owns: S3 denied the read naming this "
+            "account 123456789012 as ExpectedBucketOwner" in rows[0]["Finding_Details"]
+        )
         assert "GOVERNANCE mode" in rows[1]["Finding_Details"]
         assert (
             "bucket 'unlocked', which has Object Lock off" in rows[2]["Finding_Details"]
@@ -7950,6 +8151,52 @@ class TestBR12InvocationLogArchive:
         assert (
             "s3:GetBucketObjectLockConfiguration on bucket 'denied'"
             in rows[4]["Finding_Details"]
+        )
+
+    # DET-09: the control prescribes a separate Log Archive account, so a
+    # COMPLIANCE bucket this account owns fails, directly or behind Firehose.
+    def test_a_locked_bucket_this_account_owns_fails_beside_an_archive_one(self):
+        rows = self._run(
+            buckets=["local", "archive"],
+            locks={"local": self._lock(), "archive": self._lock()},
+            owners={"local": self.ACCOUNT},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "bucket 'local', whose default retention is COMPLIANCE mode for 365 "
+            "day(s), but which this account 123456789012 owns, not a separate Log "
+            "Archive account" in rows[0]["Finding_Details"]
+        )
+        assert "bucket 'archive'" in rows[1]["Finding_Details"]
+
+    def test_a_forward_to_a_bucket_this_account_owns_fails(self):
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=[
+                [
+                    {
+                        "filterName": "all",
+                        "filterPattern": "",
+                        "destinationArn": self.STREAM,
+                    }
+                ]
+            ],
+            locks={"archive-bucket": self._lock()},
+            owners={"archive-bucket": self.ACCOUNT},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "which this account 123456789012 owns" in rows[0]["Finding_Details"]
+
+    def test_an_unread_owner_comparison_is_not_passed(self):
+        rows = self._run(
+            buckets=["archive"],
+            locks={"archive": self._lock()},
+            owners={"archive": _make_client_error("ThrottlingException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "the owner of bucket 'archive' was not compared with this account "
+            "(ThrottlingException)" in rows[0]["Finding_Details"]
         )
 
     def test_a_locked_bucket_with_no_default_retention_fails(self):
@@ -8513,6 +8760,45 @@ def _make_client_error(code, message="error"):
     return ClientError({"Error": {"Code": code, "Message": message}}, "operation")
 
 
+def _sagemaker_search(training_jobs, training_error=None, trial_components=None):
+    """
+    A SageMaker Search side effect. Resource TrainingJob returns each
+    {name: detail} of ``training_jobs`` as one page, or raises
+    ``training_error``. Resource ExperimentTrialComponent returns
+    ``trial_components`` ({kind: {name: detail}}) for the kind its Source.SourceArn
+    filter names.
+    """
+
+    def search(**kwargs):
+        if kwargs["Resource"] == "TrainingJob":
+            if training_error:
+                raise training_error
+            return {
+                "Results": [
+                    {"TrainingJob": {"TrainingJobName": name, **detail}}
+                    for name, detail in (training_jobs or {}).items()
+                ]
+            }
+        assert kwargs["Resource"] == "ExperimentTrialComponent"
+        (test,) = kwargs["SearchExpression"]["Filters"]
+        assert (test["Name"], test["Operator"]) == ("Source.SourceArn", "Contains")
+        kind = test["Value"].strip(":/").rsplit("-job", 1)[0]
+        key = {"transform": "TransformJob", "processing": "ProcessingJob"}[kind]
+        return {
+            "Results": [
+                {
+                    "TrialComponent": {
+                        "TrialComponentName": f"{name}-aws-{kind}-job",
+                        "SourceDetail": {key: {f"{key}Name": name, **detail}},
+                    }
+                }
+                for name, detail in ((trial_components or {}).get(kind) or {}).items()
+            ]
+        }
+
+    return search
+
+
 def _bedrock_event(region="us-east-1", region_index=0):
     return {
         "Region": region,
@@ -8705,6 +8991,7 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_data_path_object_lock": "BR-52",
         "check_bedrock_resource_owner_tag": "BR-53",
         "check_ai_resource_owner_tag_sweep": "BR-53",
+        "check_ai_workload_subnet_privacy": "BR-39",
         "check_lambda_public_invoke_configuration": "BR-54",
         "check_kms_enclave_key_binding": "BR-55",
         "check_bedrock_llm_jacking_activity": "BR-56",
@@ -10881,6 +11168,38 @@ class TestBR42ModelAllowList:
             in (result["errors"][0])
         )
         assert "sagemaker:Search" in result["errors"][0]
+
+    def test_br42_a_searched_job_the_list_missed_is_read(self):
+        client = self._training_client(["tj-new"], searched=["tj-new", "tj-late"])
+        result = self._locations(client)
+        assert result["errors"] == []
+        assert sorted(location["job"] for location in result["locations"]) == [
+            "tj-late",
+            "tj-new",
+        ]
+        assert client.describe_training_job.call_count == 0
+
+    def test_br42_a_failed_list_reads_the_search_results(self):
+        client = self._training_client([], searched=["tj-new", "tj-old"])
+        client.list_training_jobs.side_effect = _make_client_error("AccessDenied")
+        result = self._locations(client)
+        assert result["errors"] == []
+        assert sorted(location["job"] for location in result["locations"]) == [
+            "tj-new",
+            "tj-old",
+        ]
+
+    def test_br42_a_failed_list_and_search_read_nothing(self):
+        client = self._training_client(
+            ["tj-new"], searched=[], search_error=_make_client_error("AccessDenied")
+        )
+        client.list_training_jobs.side_effect = _make_client_error("Throttling")
+        result = self._locations(client)
+        assert result["locations"] == []
+        assert result["errors"] == [
+            "SageMaker training jobs were not read with sagemaker:Search "
+            "(AccessDenied) or sagemaker:ListTrainingJobs (Throttling)"
+        ]
 
     def test_br42_a_failed_search_under_the_cap_reads_every_job(self):
         names = ["tj-new", "tj-old"]
@@ -13642,6 +13961,108 @@ class TestBR43AIServiceRegionControl:
             )
             assert "aws-guardrails-RegionDeny" in detail
 
+    @staticmethod
+    def _not_action_deny(not_action):
+        return {
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "NotAction": not_action,
+                    "Resource": "*",
+                    "Condition": {
+                        "StringNotEquals": {"aws:RequestedRegion": ["us-east-1"]}
+                    },
+                }
+            ]
+        }
+
+    # ACC-02 / DAT-04: a NotAction entry that names one action of a service
+    # leaves that action open in every Region, so the Deny does not cover the
+    # whole prefix even though it still covers the listed actions.
+    def test_not_action_exempting_one_service_action_leaves_that_prefix_open(self):
+        findings = self._run(
+            [
+                (
+                    "RegionDeny",
+                    self._not_action_deny(
+                        [
+                            "iam:*",
+                            "sagemaker:CreateInferenceComponent",
+                            "bedrock:CreateAgent",
+                            "es:CreateDomain",
+                        ]
+                    ),
+                )
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "denies sagemaker:*, bedrock:*, es:* outside" in detail
+        assert (
+            "its NotAction exempts sagemaker:CreateInferenceComponent, "
+            "bedrock:CreateAgent, es:CreateDomain, so it does not deny all of "
+            "sagemaker:*, bedrock:*, es:*" in detail
+        )
+
+    @pytest.mark.parametrize(
+        "exempt, status",
+        [
+            (["iam:*", "sage*:Describe*"], "Failed"),
+            (["iam:*", "*:List*"], "Failed"),
+            (["iam:*", "Kendra:Query"], "Failed"),
+            (["iam:*", "cloud*:*", "s3vector:*"], "Passed"),
+        ],
+    )
+    def test_not_action_wildcard_reaching_a_service_leaves_it_open(
+        self, exempt, status
+    ):
+        findings = self._run([("RegionDeny", self._not_action_deny(exempt))])
+
+        assert [f["Status"] for f in findings] == [status]
+
+    def test_control_tower_default_s3_exemptions_are_credited_and_named(self):
+        findings = self._run(
+            [
+                (
+                    "aws-guardrails-RegionDeny",
+                    self._not_action_deny(
+                        [
+                            "iam:*",
+                            "sts:*",
+                            "s3:ListAllMyBuckets",
+                            "s3:GetBucketLocation",
+                        ]
+                    ),
+                ),
+                (
+                    "ExtraS3Exemption",
+                    self._not_action_deny(["iam:*", "s3:PutObject"]),
+                ),
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        detail = findings[0]["Finding_Details"]
+        assert (
+            "it keeps the Control Tower default exemptions s3:ListAllMyBuckets, "
+            "s3:GetBucketLocation" in detail
+        )
+        assert "its NotAction exempts s3:PutObject" in detail
+
+    def test_invocation_controls_drop_only_the_exempted_prefix(self):
+        controls = bedrock_app._scp_region_controls(
+            self._not_action_deny(["iam:*", "bedrock:CreateAgent"])
+        )
+
+        assert len(controls) == 1
+        actions = controls[0]["actions"]
+        assert bedrock_app._region_probe("bedrock") not in actions
+        assert bedrock_app._region_probe("bedrock-agentcore") in actions
+        assert bedrock_app._region_probe("bedrock-mantle") in actions
+        assert "bedrock:invokemodel" in actions
+        assert controls[0]["exempted"] == ["bedrock:CreateAgent"]
+
     def test_bedrock_only_allow_list_leaves_sagemaker_open(self):
         findings = self._run(
             [
@@ -15814,6 +16235,7 @@ class TestBR46KnowledgeBaseSourceClassification:
         ingestion_error=None,
         training_jobs=None,
         training_error=None,
+        trial_components=None,
         ingestion_pages=None,
         pii_jobs=(),
         pii_jobs_error=None,
@@ -15960,6 +16382,9 @@ class TestBR46KnowledgeBaseSourceClassification:
             }
         sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
             training_jobs[TrainingJobName]
+        )
+        sagemaker_client.search.side_effect = _sagemaker_search(
+            training_jobs, training_error, trial_components
         )
         self.sagemaker_client = sagemaker_client
 
@@ -17252,12 +17677,11 @@ class TestBR46ClassificationJobCoverage:
         unread = [
             f
             for f in findings
-            if f["Status"] == "N/A"
-            and "sagemaker:ListTrainingJobs" in f["Finding_Details"]
+            if f["Status"] == "N/A" and "sagemaker:Search" in f["Finding_Details"]
         ]
         assert len(unread) == 1, [f["Finding_Details"] for f in findings]
 
-    def test_br46_training_jobs_past_the_read_cap_are_named(self):
+    def test_br46_training_jobs_past_the_describe_cap_are_all_read(self):
         estate = TestBR46KnowledgeBaseSourceClassification()
         jobs = {
             f"tj-{index}": self._training_job("s3://support-bucket/data/")
@@ -17272,10 +17696,9 @@ class TestBR46ClassificationJobCoverage:
                 ],
                 training_jobs=jobs,
             )
-        assert estate.sagemaker_client.describe_training_job.call_count == 2
-        assert "1 older SageMaker training job(s) past the newest 2" in " ".join(
-            f["Finding_Details"] for f in findings if f["Status"] == "N/A"
-        )
+        estate.sagemaker_client.describe_training_job.assert_not_called()
+        assert "past the newest" not in " ".join(f["Finding_Details"] for f in findings)
+        assert estate.sagemaker_client.search.call_count >= 1
 
     def test_br46_job_naming_another_bucket_does_not_clear_this_one(self):
         findings = self._run([self._job("nightly-other", ["unrelated-bucket"])])
@@ -26553,6 +26976,7 @@ class TestBR47DataPathBucketTLS:
         batch_error=None,
         training_jobs=None,
         training_error=None,
+        trial_components=None,
         runtimes=None,
         browsers=None,
         agentcore_error=None,
@@ -26561,6 +26985,7 @@ class TestBR47DataPathBucketTLS:
         endpoints=None,
         evaluation_jobs=None,
         evaluation_error=None,
+        evaluation_paged=False,
     ):
         agent_client = MagicMock()
         if list_knowledge_bases_error:
@@ -26646,6 +27071,9 @@ class TestBR47DataPathBucketTLS:
         sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
             training_jobs[TrainingJobName]
         )
+        sagemaker_client.search.side_effect = _sagemaker_search(
+            training_jobs, training_error, trial_components
+        )
         # transform_jobs and processing_jobs map a name to its Describe
         # response; endpoints map a name to (DescribeEndpoint,
         # DescribeEndpointConfig); evaluation_jobs map a name to its Get
@@ -26686,17 +27114,28 @@ class TestBR47DataPathBucketTLS:
             lambda EndpointConfigName: answer(endpoints[EndpointConfigName][1])
         )
         self.sagemaker_client = sagemaker_client
+        summaries = [
+            {
+                "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:evaluation-job/{name}",
+                "jobName": name,
+            }
+            for name in evaluation_jobs
+        ]
         if evaluation_error:
             bedrock_client.list_evaluation_jobs.side_effect = evaluation_error
+        elif evaluation_paged:
+            # One job a page, so every job past the first is on a later page.
+            def list_evaluation_jobs(nextToken=None, **kwargs):
+                index = int(nextToken or 0)
+                page = {"jobSummaries": summaries[index : index + 1]}
+                if index + 1 < len(summaries):
+                    page["nextToken"] = str(index + 1)
+                return page
+
+            bedrock_client.list_evaluation_jobs.side_effect = list_evaluation_jobs
         else:
             bedrock_client.list_evaluation_jobs.return_value = {
-                "jobSummaries": [
-                    {
-                        "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:evaluation-job/{name}",
-                        "jobName": name,
-                    }
-                    for name in evaluation_jobs
-                ]
+                "jobSummaries": summaries
             }
         bedrock_client.get_evaluation_job.side_effect = lambda jobIdentifier: answer(
             evaluation_jobs[jobIdentifier.rsplit("/", 1)[-1]]
@@ -26726,8 +27165,23 @@ class TestBR47DataPathBucketTLS:
                     for browser_id in browsers
                 ]
             }
+        # A runtime spec may carry "endpoints" (its ListAgentRuntimeEndpoints
+        # page) and "versions" ({version: Get response}).
         agentcore_client.get_agent_runtime.side_effect = (
-            lambda agentRuntimeId, agentRuntimeVersion: runtimes[agentRuntimeId]
+            lambda agentRuntimeId, agentRuntimeVersion: answer(
+                runtimes[agentRuntimeId]["versions"][agentRuntimeVersion]
+                if "versions" in runtimes[agentRuntimeId]
+                else runtimes[agentRuntimeId]
+            )
+        )
+        agentcore_client.list_agent_runtime_endpoints.side_effect = (
+            lambda agentRuntimeId, **kwargs: answer(
+                runtimes[agentRuntimeId].get(
+                    "endpoints_error", {"runtimeEndpoints": []}
+                )
+                if "endpoints_error" in runtimes[agentRuntimeId]
+                else {"runtimeEndpoints": runtimes[agentRuntimeId].get("endpoints", [])}
+            )
         )
         agentcore_client.get_browser.side_effect = lambda browserId: browsers[browserId]
         self.agentcore_client = agentcore_client
@@ -27132,6 +27586,60 @@ class TestBR47DataPathBucketTLS:
         passed = [f for f in findings if f["Status"] == "Passed"]
         assert "2 of 3 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
 
+    @staticmethod
+    def _code(bucket):
+        return {
+            "agentRuntimeArtifact": {
+                "codeConfiguration": {"code": {"s3": {"bucket": bucket, "prefix": "a"}}}
+            }
+        }
+
+    def test_br47_code_buckets_of_every_endpoint_version_are_read(self):
+        findings = self._run(
+            runtimes={
+                "rt-1": {
+                    "endpoints": [
+                        {"liveVersion": "2", "targetVersion": "1"},
+                        {"liveVersion": "3"},
+                    ],
+                    "versions": {
+                        "1": self._code("code-v1"),
+                        "2": self._code("code-v2"),
+                        "3": self._code("code-v3"),
+                    },
+                }
+            },
+            bucket_policies=self._enforced("code-v1", "code-v3"),
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert "Bucket code-v2" in failed[0]["Finding_Details"]
+        assert (
+            "the code artifact of AgentCore runtime 'rt-1' version 2"
+            in failed[0]["Finding_Details"]
+        )
+        assert [
+            c.kwargs["agentRuntimeVersion"]
+            for c in self.agentcore_client.get_agent_runtime.call_args_list
+        ] == ["1", "2", "3"]
+
+    def test_br47_unlisted_runtime_endpoints_withhold_the_pass(self):
+        findings = self._run(
+            runtimes={
+                "rt-1": dict(
+                    self._code("code-v3"),
+                    endpoints_error=_client_error(
+                        "AccessDeniedException", "no", "ListAgentRuntimeEndpoints"
+                    ),
+                )
+            },
+            bucket_policies=self._enforced("code-v3"),
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert "bedrock-agentcore:ListAgentRuntimeEndpoints" in " ".join(
+            f["Finding_Details"] for f in findings
+        )
+
     def test_br47_agentcore_code_and_recording_buckets_are_on_the_data_path(self):
         """A browser with recording off adds no bucket."""
         findings = self._run(
@@ -27181,7 +27689,7 @@ class TestBR47DataPathBucketTLS:
         "unread, action",
         [
             ("batch_error", "bedrock:ListModelInvocationJobs"),
-            ("training_error", "sagemaker:ListTrainingJobs"),
+            ("training_error", "sagemaker:Search"),
             ("agentcore_error", "bedrock-agentcore:ListAgentRuntimes"),
             ("agentcore_error", "bedrock-agentcore:ListBrowsers"),
         ],
@@ -27530,6 +28038,116 @@ class TestBR47DataPathBucketTLS:
         assert action in " ".join(
             f["Finding_Details"] for f in findings if f["Status"] == "N/A"
         )
+
+    def test_br47_training_jobs_past_the_describe_cap_are_judged(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                training_jobs={
+                    "tj-new": {"OutputDataConfig": {"S3OutputPath": "s3://tls-ok/"}},
+                    "tj-old": {"OutputDataConfig": {"S3OutputPath": "s3://no-tls/"}},
+                },
+                bucket_policies=self._enforced("tls-ok"),
+            )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "no-tls" in failed[0]["Finding_Details"]
+        assert "past the newest" not in " ".join(f["Finding_Details"] for f in findings)
+        self.sagemaker_client.describe_training_job.assert_not_called()
+
+    def test_br47_evaluation_jobs_past_the_old_cap_are_all_read(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                evaluation_jobs={
+                    "ev-new": {"outputDataConfig": {"s3Uri": "s3://tls-ok/"}},
+                    "ev-mid": {"outputDataConfig": {"s3Uri": "s3://tls-ok/"}},
+                    "ev-old": {"outputDataConfig": {"s3Uri": "s3://no-tls/"}},
+                },
+                evaluation_paged=True,
+                bucket_policies=self._enforced("tls-ok"),
+            )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "no-tls" in failed[0]["Finding_Details"]
+        assert "past the newest" not in " ".join(f["Finding_Details"] for f in findings)
+        assert self.bedrock_client.get_evaluation_job.call_count == 3
+
+    def test_br47_evaluation_jobs_past_the_read_cap_are_named(self):
+        with patch.object(bedrock_app, "MAX_EVALUATION_JOB_READS", 1):
+            findings = self._run(
+                evaluation_jobs={
+                    "ev-new": {"outputDataConfig": {"s3Uri": "s3://tls-ok/"}},
+                    "ev-old": {"outputDataConfig": {"s3Uri": "s3://no-tls/"}},
+                },
+                bucket_policies=self._enforced("tls-ok"),
+            )
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            "1 older evaluation job(s) past the newest 1 were not read with "
+            "bedrock:GetEvaluationJob: ev-old" in details
+        )
+        assert self.bedrock_client.get_evaluation_job.call_count == 1
+
+    def test_br47_batch_jobs_a_trial_component_holds_need_no_describe(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                transform_jobs={
+                    "tj-a": {},
+                    "tj-b": {},
+                    "tj-c": {"TransformOutput": {"S3OutputPath": "s3://tf-c/"}},
+                },
+                processing_jobs={"pj": {}},
+                trial_components={
+                    "transform": {
+                        "tj-a": {"TransformOutput": {"S3OutputPath": "s3://tf-a/"}},
+                        "tj-b": {"TransformOutput": {"S3OutputPath": "s3://tf-b/"}},
+                    },
+                    "processing": {
+                        "pj": {
+                            "ProcessingOutputConfig": {
+                                "Outputs": [
+                                    {
+                                        "OutputName": "out",
+                                        "S3Output": {"S3Uri": "s3://pj-out/"},
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                },
+                bucket_policies=self._enforced("tf-a", "tf-b", "tf-c"),
+            )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1 and "pj-out" in failed[0]["Finding_Details"]
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "past the newest" not in details
+        assert [
+            c.kwargs
+            for c in self.sagemaker_client.describe_transform_job.call_args_list
+        ] == [{"TransformJobName": "tj-c"}]
+        self.sagemaker_client.describe_processing_job.assert_not_called()
+
+    def test_br47_batch_jobs_no_trial_component_holds_past_the_cap_are_named(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                transform_jobs={
+                    "tj-a": {},
+                    "tj-b": {"TransformOutput": {"S3OutputPath": "s3://tf-b/"}},
+                    "tj-c": {},
+                },
+                trial_components={
+                    "transform": {
+                        "tj-a": {"TransformOutput": {"S3OutputPath": "s3://tf-a/"}}
+                    }
+                },
+                bucket_policies=self._enforced("tf-a", "tf-b"),
+            )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            "1 older transform job(s) past the newest 1 were not read with "
+            "sagemaker:DescribeTransformJob, and no trial component holds them"
+        ) in " ".join(f["Finding_Details"] for f in findings)
+        assert self.sagemaker_client.describe_transform_job.call_count == 1
 
     def test_br47_transform_jobs_past_the_read_cap_withhold_the_pass(self):
         cap = bedrock_app.MAX_SAGEMAKER_TRAINING_JOB_READS
@@ -30464,6 +31082,134 @@ def _customer_policy(name, *statements):
         "arn": f"arn:aws:iam::123456789012:policy/{name}",
         "document": _policy(*statements),
     }
+
+
+class TestBR39AIWorkloadSubnetPrivacy:
+    """
+    BR-39 / AIR-FND-NET-01: every Lambda function, ECS service and EC2
+    instance BR-02 inventories whose role is granted an AI surface must run in
+    a VPC on subnets that route to no internet gateway.
+    """
+
+    net = TestBR39MarketplaceSubnetPrivacy
+    br02 = TestBR02WorkloadConnectivity
+
+    @staticmethod
+    def _workload(kind, name, role, vpc_id="vpc-1", subnets=("subnet-private",)):
+        return {
+            "kind": kind,
+            "name": name,
+            "vpc_id": vpc_id,
+            "role": role,
+            "subnets": list(subnets) if subnets is not None else None,
+        }
+
+    def _run(self, workloads, roles=None, errors=None, cache_errors=None, ec2=None):
+        roles = roles or {
+            "InvokeRole": self.br02._role(["bedrock:InvokeModel"]),
+            "PlainRole": self.br02._role(["s3:GetObject"]),
+        }
+        rows = extract_csv_data(
+            bedrock_app.check_ai_workload_subnet_privacy(
+                self.br02._cache(roles, cache_errors),
+                region="us-east-1",
+                workload_inventory={
+                    "workloads": list(workloads),
+                    "errors": list(errors or []),
+                },
+                ec2_client=ec2
+                or self.net._ec2(
+                    [
+                        self.net._subnet("subnet-private"),
+                        self.net._subnet("subnet-public"),
+                    ],
+                    [self.net._PRIVATE_TABLE, self.net._PUBLIC_TABLE],
+                ),
+            )
+        )
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-39"
+        return rows
+
+    def test_public_subnet_ecs_service_and_vpc_less_lambda_fail_beside_a_private_one(
+        self,
+    ):
+        rows = self._run(
+            [
+                self._workload("Lambda function", "private-fn", "InvokeRole"),
+                self._workload(
+                    "ECS service",
+                    "public-svc",
+                    "InvokeRole",
+                    subnets=["subnet-private", "subnet-public"],
+                ),
+                self._workload(
+                    "Lambda function", "no-vpc", "InvokeRole", vpc_id=None, subnets=None
+                ),
+                self._workload(
+                    "EC2 instance", "i-plain", "PlainRole", subnets=["subnet-public"]
+                ),
+            ]
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        failed = rows[0]["Finding_Details"]
+        assert "2 AI workload(s)" in failed
+        assert "ECS service 'public-svc' in vpc-1" in failed
+        assert "subnet-public (route table rtb-public sends 0.0.0.0/0" in failed
+        assert "Lambda function 'no-vpc' (role 'InvokeRole') is not attached" in failed
+        assert "private-fn" not in failed
+        assert "i-plain" not in failed
+        assert "1 AI workload(s)" in rows[1]["Finding_Details"]
+        assert "Lambda function 'private-fn' in vpc-1" in rows[1]["Finding_Details"]
+
+    def test_every_ai_workload_private_passes_and_a_non_ai_public_one_is_ignored(self):
+        rows = self._run(
+            [
+                self._workload("EC2 instance", "i-ai", "InvokeRole"),
+                self._workload(
+                    "EC2 instance", "i-web", "PlainRole", subnets=["subnet-public"]
+                ),
+            ]
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "i-web" not in rows[0]["Finding_Details"]
+
+    def test_an_unread_inventory_part_or_uncached_role_keeps_it_from_passing(self):
+        rows = self._run(
+            [
+                self._workload("Lambda function", "private-fn", "InvokeRole"),
+                self._workload("ECS service", "unknown", "MissingRole"),
+            ],
+            errors=["ECS clusters were not listed with ecs:ListClusters (Denied)"],
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A", "N/A"]
+        assert "not reported as Passed" in rows[0]["Finding_Details"]
+        assert "ECS clusters were not listed" in rows[1]["Finding_Details"]
+        assert "role 'MissingRole', which the IAM cache" in rows[1]["Finding_Details"]
+
+    def test_a_route_table_read_failure_never_passes(self):
+        rows = self._run(
+            [self._workload("Lambda function", "private-fn", "InvokeRole")],
+            ec2=self.net._ec2(
+                [self.net._subnet("subnet-private")],
+                tables_error=_make_client_error("UnauthorizedOperation"),
+            ),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "UnauthorizedOperation" in rows[0]["Finding_Details"]
+
+    def test_no_ai_workload_is_na(self):
+        rows = self._run(
+            [self._workload("EC2 instance", "i-web", "PlainRole")],
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "runs as a role granted a Bedrock" in rows[0]["Finding_Details"]
 
 
 class TestBR39JobVpc:
@@ -33402,25 +34148,25 @@ class TestBR52DataPathObjectLock:
         training jobs alone. ``pages`` is a list of pages of {name: detail}.
         """
 
-        def list_training_jobs(**kwargs):
+        def search(**kwargs):
+            if kwargs["Resource"] == "ExperimentTrialComponent":
+                return {"Results": []}
+            assert kwargs["Resource"] == "TrainingJob"
             if list_error:
                 raise list_error
             index = int(kwargs.get("NextToken", "page-0").split("-")[1])
             response = {
-                "TrainingJobSummaries": [
-                    {"TrainingJobName": name} for name in pages[index]
+                "Results": [
+                    {"TrainingJob": {"TrainingJobName": name, **job}}
+                    for name, job in pages[index].items()
                 ]
             }
             if index + 1 < len(pages):
                 response["NextToken"] = f"page-{index + 1}"
             return response
 
-        details = {name: job for page in pages for name, job in page.items()}
         sagemaker = MagicMock()
-        sagemaker.list_training_jobs.side_effect = list_training_jobs
-        sagemaker.describe_training_job.side_effect = lambda TrainingJobName: details[
-            TrainingJobName
-        ]
+        sagemaker.search.side_effect = search
         sagemaker.list_transform_jobs.return_value = {"TransformJobSummaries": []}
         sagemaker.list_processing_jobs.return_value = {"ProcessingJobSummaries": []}
         sagemaker.list_endpoints.return_value = {"Endpoints": []}
@@ -33473,7 +34219,12 @@ class TestBR52DataPathObjectLock:
             ]
         )
         assert inventory["errors"] == []
-        assert sagemaker.describe_training_job.call_count == 2
+        assert [
+            c.kwargs.get("NextToken")
+            for c in sagemaker.search.call_args_list
+            if c.kwargs["Resource"] == "TrainingJob"
+        ] == [None, "page-1"]
+        sagemaker.describe_training_job.assert_not_called()
         _, rows = self._run(
             inventory["buckets"],
             {
@@ -33499,9 +34250,7 @@ class TestBR52DataPathObjectLock:
             {"lock-a": ["kb"]}, {"lock-a": self.COMPLIANT}, errors=inventory["errors"]
         )
         assert [r["Status"] for r in rows] == ["N/A", "N/A"]
-        assert "sagemaker:ListTrainingJobs" in " ".join(
-            r["Finding_Details"] for r in rows
-        )
+        assert "sagemaker:Search" in " ".join(r["Finding_Details"] for r in rows)
 
     def test_br52_no_data_path_bucket_is_na(self):
         _, rows = self._run({}, {})
@@ -33845,6 +34594,7 @@ class TestBR53OwnerTagSweep:
         "list_inference_components": "InferenceComponents",
         "list_pipelines": "PipelineSummaries",
         "list_processing_jobs": "ProcessingJobSummaries",
+        "list_transform_jobs": "TransformJobSummaries",
         "list_workload_identities": "workloadIdentities",
     }
 
@@ -33947,9 +34697,9 @@ class TestBR53OwnerTagSweep:
         assert (
             "SageMaker and AgentCore resource types other than endpoints, models, "
             "notebook instances, training jobs, domains, inference components, "
-            "pipelines, processing jobs, agent runtimes, memories, gateways, custom "
-            "browsers, custom code interpreters and workload identities are read "
-            "only through GetResources" in details
+            "pipelines, processing jobs, transform jobs, agent runtimes, memories, "
+            "gateways, custom browsers, custom code interpreters and workload "
+            "identities are read only through GetResources" in details
         )
         assert "not granted" not in details
         assert "ceiling reached" not in details
@@ -33988,6 +34738,34 @@ class TestBR53OwnerTagSweep:
             "bedrock-agentcore:ListMemories (AccessDeniedException)"
             in rows[0]["Finding_Details"]
         )
+
+    # GOV-02: a transform job never tagged is absent from GetResources, so
+    # only sagemaker:ListTransformJobs puts it in the population.
+    def test_never_tagged_transform_job_fails_beside_a_tagged_one(self):
+        transform = "arn:aws:sagemaker:us-east-1:123456789012:transform-job/{}"
+        _, rows, _ = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": transform.format("tagged"),
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        }
+                    ]
+                ]
+            },
+            lists={
+                "list_transform_jobs": [
+                    {"TransformJobArn": transform.format("tagged")},
+                    {"TransformJobArn": transform.format("never")},
+                ]
+            },
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert transform.format("never") in failed[0]
+        assert "sagemaker:ListTransformJobs" in failed[0]
+        assert transform.format("tagged") not in failed[0]
 
     def test_never_tagged_components_pipelines_jobs_and_identities_fail(self):
         component = "arn:aws:sagemaker:us-east-1:123456789012:inference-component/{}"
@@ -34366,6 +35144,7 @@ class TestBR53ResourceOwnerTag:
             "list_model_invocation_jobs": "invocationJobSummaries",
             "list_model_customization_jobs": "modelCustomizationJobSummaries",
             "list_evaluation_jobs": "jobSummaries",
+            "list_marketplace_model_endpoints": "marketplaceModelEndpoints",
         }
         for operation, key in result_keys.items():
             client = (
@@ -34428,6 +35207,37 @@ class TestBR53ResourceOwnerTag:
         tagging.get_resources.assert_called_once_with(
             ResourceARNList=sorted([self.GUARDRAIL_OWNED, self.GUARDRAIL_BARE])
         )
+
+    # GOV-02: a Marketplace model endpoint is a Bedrock resource the inventory
+    # must list, so one never tagged fails beside an owned guardrail.
+    def test_br53_never_tagged_marketplace_endpoint_fails(self):
+        endpoint = "arn:aws:sagemaker:us-east-1:123456789012:endpoint/{}"
+        result, rows, tagging = self._run(
+            {
+                "list_guardrails": [{"arn": self.GUARDRAIL_OWNED}],
+                "list_marketplace_model_endpoints": [
+                    {"endpointArn": endpoint.format("mkt-owned")},
+                    {"endpointArn": endpoint.format("mkt-bare")},
+                ],
+            },
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                },
+                {
+                    "ResourceARN": endpoint.format("mkt-owned"),
+                    "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                },
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "Bedrock marketplace model endpoint " + endpoint.format("mkt-bare")
+            in rows[0]["Finding_Details"]
+        )
+        assert "2 of the 3 Bedrock resource(s)" in rows[1]["Finding_Details"]
+        assert result["status"] == "WARN"
 
     def test_br53_empty_owner_value_fails_and_key_match_is_case_insensitive(self):
         _, rows, _ = self._run(
@@ -35411,8 +36221,26 @@ class TestBR55EnclaveKeyBinding:
         policy_error=None,
         grants=None,
         grants_error=None,
+        events=None,
+        events_error=None,
     ):
+        """events: {key ARN: [page of LookupEvents events, ...]}."""
         kms = MagicMock()
+
+        def lookup_events(LookupAttributes, MaxResults, NextToken=None):
+            (attribute,) = LookupAttributes
+            assert attribute["AttributeKey"] == "ResourceName"
+            arn = attribute["AttributeValue"]
+            if events_error and arn in events_error:
+                raise events_error[arn]
+            pages_for_key = (events or {}).get(arn, [[]])
+            index = int(NextToken or 0)
+            response = {"Events": pages_for_key[index]}
+            if index + 1 < len(pages_for_key):
+                response["NextToken"] = str(index + 1)
+            return response
+
+        kms.lookup_events.side_effect = lookup_events
 
         def list_grants(KeyId, **kwargs):
             if grants_error and KeyId in grants_error:
@@ -35863,6 +36691,131 @@ class TestBR55EnclaveKeyBinding:
                 bedrock_app.check_kms_enclave_key_binding(region="us-east-1")
             )
         assert_could_not_assess_finding(rows[0])
+
+    @staticmethod
+    def _event(event_id, digest, name="Decrypt"):
+        """A LookupEvents event; digest None is a request with no Recipient."""
+        record = {"eventName": name, "eventID": event_id}
+        if digest is not None:
+            record["additionalEventData"] = {
+                "recipient": {
+                    "attestationDocumentModuleId": "i-0abc-enc0def",
+                    "attestationDocumentEnclaveImageDigest": digest,
+                    "attestationDocumentEnclavePCR1": digest,
+                }
+            }
+        return {
+            "EventId": event_id,
+            "EventName": name,
+            "CloudTrailEvent": json.dumps(record),
+        }
+
+    def test_br55_a_zero_digest_kms_event_fails_its_key_beside_a_clean_one(self):
+        """AIR-FND-DAT-10: a debug-mode enclave's request is detected, not assumed."""
+        _, rows, kms = self._run(
+            {
+                "a": [self._admin(), self._enclave_allow()],
+                "b": [self._admin(), self._enclave_allow()],
+            },
+            events={
+                "arn:k/a": [
+                    [
+                        self._event("ev-clean", self.DIGEST),
+                        self._event("ev-zero", self.ZERO, "GenerateDataKey"),
+                    ]
+                ],
+                "arn:k/b": [
+                    [self._event("ev-b", self.DIGEST), self._event("ev-plain", None)]
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        failed = rows[0]["Finding_Details"]
+        assert "KMS key arn:k/a" in failed
+        assert (
+            "CloudTrail event history records 1 request(s) on the key "
+            "(GenerateDataKey) whose attestation document carries an all-zero "
+            "enclave image digest, which an enclave run with --debug-mode or "
+            "--attach-console presents: ev-zero" in failed
+        )
+        assert "ev-clean" not in failed
+        passed = rows[1]["Finding_Details"]
+        assert "arn:k/a" not in passed
+        assert (
+            "CloudTrail event history (LookupEvents) holds 2 event(s) on these "
+            "keys, 1 with an attestation document, and none whose enclave image "
+            "digest is all zeros" in passed
+        )
+        kms.lookup_events.assert_any_call(
+            LookupAttributes=[
+                {"AttributeKey": "ResourceName", "AttributeValue": "arn:k/b"}
+            ],
+            MaxResults=50,
+        )
+
+    def test_br55_a_base64_zero_digest_is_zero_too(self):
+        _, rows, _ = self._run(
+            {"a": [self._admin(), self._enclave_allow()]},
+            events={"arn:k/a": [[self._event("ev-zero", "A" * 64)]]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ev-zero" in rows[0]["Finding_Details"]
+
+    def test_br55_every_page_of_event_history_is_read(self):
+        _, rows, _ = self._run(
+            {"a": [self._admin(), self._enclave_allow()]},
+            events={
+                "arn:k/a": [
+                    [self._event("ev-1", self.DIGEST)],
+                    [self._event("ev-2", self.ZERO)],
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ev-2" in rows[0]["Finding_Details"]
+
+    def test_br55_unread_event_history_withholds_the_pass(self):
+        _, rows, _ = self._run(
+            {
+                "a": [self._admin(), self._enclave_allow()],
+                "b": [self._admin(), self._enclave_allow()],
+            },
+            events_error={"arn:k/a": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "arn:k/a" not in rows[0]["Finding_Details"]
+        assert (
+            "arn:k/a: its key policy binds attestation, but its CloudTrail event "
+            "history was not read" in rows[1]["Finding_Details"]
+        )
+        assert "cloudtrail:LookupEvents" in rows[1]["Finding_Details"]
+
+    def test_br55_event_history_past_the_page_cap_withholds_the_pass(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "ENCLAVE_EVENT_MAX_PAGES", 1)
+        _, rows, _ = self._run(
+            {"a": [self._admin(), self._enclave_allow()]},
+            events={
+                "arn:k/a": [
+                    [self._event("ev-1", self.DIGEST)],
+                    [self._event("ev-2", self.ZERO)],
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "events past the first 1 page(s) were not read"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_br55_unread_event_history_is_named_beside_a_policy_gap(self):
+        _, rows, _ = self._run(
+            {"a": [self.ROOT, self._enclave_allow()]},
+            events_error={"arn:k/a": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "its CloudTrail event history was not read" in (rows[0]["Finding_Details"])
+        )
 
     def test_br55_rows_pass_the_schema(self):
         _, rows, _ = self._run(
@@ -37238,10 +38191,19 @@ class TestBR04RetentionDepth:
         replication=None,
         objects=None,
         head_error=None,
+        written=None,
+        list_error=None,
+        page_size=None,
+        versions=None,
+        versions_error=None,
     ):
         """
         lifecycles, locks, replication: {bucket: response or exception}.
         objects: {bucket: {key: ReplicationStatus or None}}.
+        written: {bucket: {key: LastModified}}; an object not named was
+        written now.
+        versions: {bucket: [(key, version id, days since written, is a delete
+        marker)]}; a bucket named here has versioning Enabled.
         """
 
         def per_bucket(table, missing_code, operation):
@@ -37261,7 +38223,9 @@ class TestBR04RetentionDepth:
             "NoSuchLifecycleConfiguration",
             "GetBucketLifecycleConfiguration",
         )
-        s3.get_bucket_versioning.return_value = {}
+        s3.get_bucket_versioning.side_effect = lambda Bucket: (
+            {"Status": "Enabled"} if Bucket in (versions or {}) else {}
+        )
         s3.get_object_lock_configuration.side_effect = per_bucket(
             locks,
             "ObjectLockConfigurationNotFoundError",
@@ -37292,8 +38256,87 @@ class TestBR04RetentionDepth:
             status = listed[Bucket][Key]
             return {"ReplicationStatus": status} if status else {}
 
+        stamps = written or {}
+        now = _dt.now(_tz.utc)
+
+        def list_objects_v2(
+            Bucket, Prefix, Delimiter=None, ContinuationToken=None, **kwargs
+        ):
+            if list_error is not None:
+                raise list_error
+            entries = []
+            for key in sorted(listed.get(Bucket) or {}):
+                if not key.startswith(Prefix):
+                    continue
+                rest = key[len(Prefix) :]
+                if Delimiter and Delimiter in rest:
+                    folder = Prefix + rest.split(Delimiter)[0] + Delimiter
+                    if ("folder", folder) not in entries:
+                        entries.append(("folder", folder))
+                else:
+                    entries.append(("key", key))
+            start = int(ContinuationToken or 0)
+            end = len(entries) if page_size is None else start + page_size
+            chunk = entries[start:end]
+            page = {
+                "Contents": [
+                    {
+                        "Key": key,
+                        "LastModified": (stamps.get(Bucket) or {}).get(key, now),
+                    }
+                    for kind, key in chunk
+                    if kind == "key"
+                ],
+                "CommonPrefixes": [
+                    {"Prefix": folder} for kind, folder in chunk if kind == "folder"
+                ],
+                "IsTruncated": end < len(entries),
+            }
+            if end < len(entries):
+                page["NextContinuationToken"] = str(end)
+            return page
+
+        def list_object_versions(
+            Bucket, Prefix, Delimiter, KeyMarker=None, VersionIdMarker=None
+        ):
+            if versions_error is not None:
+                raise versions_error
+            entries = []
+            for key, version_id, age, marker in sorted((versions or {})[Bucket]):
+                if not key.startswith(Prefix):
+                    continue
+                rest = key[len(Prefix) :]
+                if Delimiter in rest:
+                    folder = Prefix + rest.split(Delimiter)[0] + Delimiter
+                    if ("folder", folder) not in entries:
+                        entries.append(("folder", folder))
+                else:
+                    item = {
+                        "Key": key,
+                        "VersionId": version_id,
+                        "LastModified": now - _td(days=age),
+                    }
+                    entries.append(("marker" if marker else "version", item))
+            start = int(KeyMarker or 0)
+            end = len(entries) if page_size is None else start + page_size
+            chunk = entries[start:end]
+            page = {
+                "Versions": [item for kind, item in chunk if kind == "version"],
+                "DeleteMarkers": [item for kind, item in chunk if kind == "marker"],
+                "CommonPrefixes": [
+                    {"Prefix": folder} for kind, folder in chunk if kind == "folder"
+                ],
+                "IsTruncated": end < len(entries),
+            }
+            if end < len(entries):
+                page["NextKeyMarker"] = str(end)
+                page["NextVersionIdMarker"] = "v"
+            return page
+
         s3.get_paginator.return_value.paginate.side_effect = paginate
         s3.head_object.side_effect = head_object
+        s3.list_objects_v2.side_effect = list_objects_v2
+        s3.list_object_versions.side_effect = list_object_versions
         bedrock = MagicMock()
         bedrock.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": logging_config
@@ -37343,7 +38386,11 @@ class TestBR04RetentionDepth:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "3 destination(s)" in rows[0]["Finding_Details"]
         assert "Large-data S3 bucket 'large' lifecycle" in rows[0]["Finding_Details"]
-        assert "Whether lifecycle deletion has run" in rows[0]["Finding_Details"]
+        assert (
+            "lifecycle deletion is judged from the age of the oldest current "
+            "object, and on a versioned bucket the oldest noncurrent version is "
+            "read the same way"
+        ) in rows[0]["Finding_Details"]
 
     def test_large_data_bucket_equal_to_the_log_bucket_is_read_once(self):
         config = {
@@ -37521,6 +38568,8 @@ class TestBR04RetentionDepth:
         )
 
     def test_the_head_object_cap_leaves_the_rest_unread(self, monkeypatch):
+        # An overdue object is the one a FAILED replication status would hold,
+        # so past the cap only an object older than the rule withholds the pass.
         monkeypatch.setattr(bedrock_app, "REPLICATION_STATUS_HEAD_CAP", 1)
         rows, _ = self._rows(
             {"s3Config": {"bucketName": "logs"}},
@@ -37532,10 +38581,277 @@ class TestBR04RetentionDepth:
                     self.LOG_KEY + "b.json.gz": "FAILED",
                 }
             },
+            written={
+                "logs": {self.LOG_KEY + "a.json.gz": _dt.now(_tz.utc) - _td(days=40)}
+            },
         )
-        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A", "Passed"]
         na = [r for r in rows if r["Status"] == "N/A"][0]
         assert "past the first 1 were not read" in na["Finding_Details"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]
+        assert "past its 30-day rule" in failed["Finding_Details"]
+        assert (
+            "S3 bucket 'logs'"
+            not in ([r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"])
+        )
+
+    def test_the_head_object_cap_with_no_overdue_object_is_retained(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "REPLICATION_STATUS_HEAD_CAP", 1)
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "a.json.gz": "COMPLETED",
+                    self.LOG_KEY + "b.json.gz": "FAILED",
+                }
+            },
+            written={
+                "logs": {self.LOG_KEY + "a.json.gz": _dt.now(_tz.utc) - _td(days=20)}
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "no ReplicationStatus FAILED on the first 1 invocation log" in detail
+        assert "the objects past them were not read" in detail
+        assert "written 20 day(s) ago and is not past its 30-day rule" in detail
+
+    def test_an_overdue_log_object_fails_beside_an_on_schedule_bucket(self):
+        rows, _ = self._rows(
+            self.LARGE,
+            {"logs": EXPIRING, "large": EXPIRING},
+            objects={
+                "logs": {self.LOG_KEY + "09/01/00/old.json.gz": None},
+                "large": {"big/" + self.LOG_KEY + "09/20/00/new.json.gz": None},
+            },
+            written={
+                "logs": {
+                    self.LOG_KEY + "09/01/00/old.json.gz": _dt.now(_tz.utc)
+                    - _td(days=40)
+                },
+                "large": {
+                    "big/" + self.LOG_KEY + "09/20/00/new.json.gz": _dt.now(_tz.utc)
+                    - _td(days=31)
+                },
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]["Finding_Details"]
+        passed = [r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"]
+        assert (
+            "S3 bucket 'logs': the oldest object under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/', "
+            f"'{self.LOG_KEY}09/01/00/old.json.gz', was written 40 day(s) ago, "
+            "past its 30-day rule plus 2 day(s) for the daily lifecycle run, so "
+            "lifecycle deletion has not removed it on schedule" in failed
+        )
+        assert "'large'" not in failed
+        assert "S3 bucket 'logs' lifecycle" not in passed
+        assert (
+            "Large-data S3 bucket 'large' lifecycle: expire expires objects after "
+            "30 day(s); the oldest object under "
+            "'big/AWSLogs/111122223333/BedrockModelInvocationLogs/', "
+            f"'big/{self.LOG_KEY}09/20/00/new.json.gz', was written 31 day(s) "
+            "ago and is not past its 30-day rule plus 2 day(s)" in passed
+        )
+        assert "Whether lifecycle deletion has run" not in passed
+
+    def test_the_oldest_object_is_found_in_every_region_and_the_earliest_date(self):
+        old = "AWSLogs/111122223333/BedrockModelInvocationLogs/us-west-2/2025/12/31/23/x.json.gz"
+        keys = [
+            self.LOG_KEY + "01/01/00/a.json.gz",
+            self.LOG_KEY + "02/01/00/b.json.gz",
+            old,
+            "AWSLogs/111122223333/BedrockModelInvocationLogs/us-west-2/2026/01/01/00/y.json.gz",
+        ]
+        now = _dt.now(_tz.utc)
+        rows, s3 = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            objects={"logs": {key: None for key in keys}},
+            written={
+                "logs": {key: now - _td(days=10) for key in keys}
+                | {old: now - _td(days=50)}
+            },
+            page_size=1,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"'{old}', was written 50 day(s) ago" in rows[0]["Finding_Details"]
+        listed = [c.kwargs["Prefix"] for c in s3.list_objects_v2.call_args_list]
+        # Only the earliest month of a year is entered; both Regions are.
+        assert not any(p.endswith("/2026/02/") for p in listed)
+        assert any(p.endswith("/us-east-1/2026/01/01/00/") for p in listed)
+
+    def test_an_unread_listing_withholds_the_pass(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            list_error=_make_client_error("AccessDenied"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "S3 bucket 'logs': whether lifecycle deletion has run was not read"
+            in rows[0]["Finding_Details"]
+        )
+        assert "s3:ListBucket" in rows[0]["Finding_Details"]
+
+    def test_an_empty_log_root_has_no_deletion_due(self):
+        rows, _ = self._rows({"s3Config": {"bucketName": "logs"}}, {"logs": EXPIRING})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "ListObjectsV2 returns no object under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/', so no deletion is "
+            "yet due" in rows[0]["Finding_Details"]
+        )
+
+    def test_a_date_rule_past_its_date_with_an_object_left_fails(self):
+        dated = {
+            "Rules": [
+                {
+                    "ID": "dated",
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": ""},
+                    "Expiration": {"Date": _dt(2026, 1, 1, tzinfo=_tz.utc)},
+                }
+            ]
+        }
+        key = self.LOG_KEY + "01/01/00/a.json.gz"
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": dated},
+            objects={"logs": {key: None}},
+            written={"logs": {key: _dt.now(_tz.utc) - _td(days=3)}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "past its expiry date 2026-01-01 plus 2 day(s)"
+            in (rows[0]["Finding_Details"])
+        )
+
+    VERSIONED = {
+        "Rules": [
+            {
+                "ID": "expire",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "Expiration": {"Days": 30},
+                "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+            }
+        ]
+    }
+
+    def test_an_overdue_noncurrent_version_fails_beside_an_on_schedule_bucket(self):
+        old = self.LOG_KEY + "08/01/00/a.json.gz"
+        new = "big/" + self.LOG_KEY + "09/20/00/b.json.gz"
+        rows, _ = self._rows(
+            self.LARGE,
+            {"logs": self.VERSIONED, "large": self.VERSIONED},
+            versions={
+                # Expired 20 days ago: the delete marker made v1 noncurrent.
+                "logs": [(old, "v1", 40, False), (old, "m1", 20, True)],
+                "large": [(new, "v1", 10, False), (new, "v2", 5, False)],
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]["Finding_Details"]
+        passed = [r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"]
+        assert (
+            "S3 bucket 'logs': the noncurrent version under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/' that became "
+            f"noncurrent longest ago, '{old}' version v1, did so 20 day(s) ago, "
+            "past its 7-day noncurrent rule plus 2 day(s) for the daily lifecycle "
+            "run, so lifecycle deletion has not removed it on schedule" in failed
+        )
+        assert "'large'" not in failed
+        assert "S3 bucket 'logs' lifecycle" not in passed
+        assert (
+            f"'{new}' version v1, did so 5 day(s) ago and is not past its 7-day "
+            "noncurrent rule plus 2 day(s)" in passed
+        )
+        assert "the oldest noncurrent version is read the same way" in passed
+
+    def test_noncurrent_age_counts_from_the_successor_write(self):
+        key = self.LOG_KEY + "01/01/00/a.json.gz"
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            objects={"logs": {key: None}},
+            versions={"logs": [(key, "v1", 100, False), (key, "v2", 3, False)]},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "version v1, did so 3 day(s) ago" in rows[0]["Finding_Details"]
+
+    def test_a_date_folder_of_delete_markers_is_passed_over(self):
+        gone = self.LOG_KEY + "01/01/00/a.json.gz"
+        kept = self.LOG_KEY + "02/01/00/b.json.gz"
+        later = self.LOG_KEY + "03/01/00/c.json.gz"
+        rows, s3 = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            versions={
+                "logs": [
+                    (gone, "m0", 60, True),
+                    (kept, "v1", 50, False),
+                    (kept, "m1", 30, True),
+                    (later, "v1", 40, False),
+                    (later, "m1", 4, True),
+                ]
+            },
+            page_size=1,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"'{kept}' version v1, did so 30 day(s) ago" in (rows[0]["Finding_Details"])
+        )
+        listed = [c.kwargs["Prefix"] for c in s3.list_object_versions.call_args_list]
+        assert not any(p.endswith("/2026/03/") for p in listed)
+
+    def test_an_unread_version_listing_withholds_the_pass(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            versions={"logs": []},
+            versions_error=_make_client_error("AccessDenied"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "s3:ListBucketVersions" in rows[0]["Finding_Details"]
+        assert (
+            "whether lifecycle deletion has run was not read"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_no_noncurrent_version_is_stated(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": self.VERSIONED},
+            versions={"logs": []},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "ListObjectVersions returns no noncurrent version under "
+            "'AWSLogs/111122223333/BedrockModelInvocationLogs/'"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_never_versioned_bucket_lists_no_versions(self):
+        rows, s3 = self._rows({"s3Config": {"bucketName": "logs"}}, {"logs": EXPIRING})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        s3.list_object_versions.assert_not_called()
+
+    def test_an_overdue_object_in_a_replica_fails_the_replica(self):
+        key = self.LOG_KEY + "01/01/00/a.json.gz"
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={"logs": {key: "COMPLETED"}, "replica": {key: None}},
+            written={"replica": {key: _dt.now(_tz.utc) - _td(days=60)}},
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]["Finding_Details"]
+        assert "Replica S3 bucket (copied from 'logs') 'replica': the oldest" in failed
+        passed = [r for r in rows if r["Status"] == "Passed"][0]["Finding_Details"]
+        assert "'replica' lifecycle" not in passed
 
     def test_a_replicated_or_unread_replication_bucket_is_not_passed(self):
         # The source bucket's own expiry is held back for objects whose
@@ -41033,6 +42349,91 @@ class TestBR57AgentHandoffSourceIdentity:
         assert "'c'" not in detail
         assert not self._status(rows, "Passed")
 
+    MICROVM_IMAGE = "arn:aws:lambda:us-east-1:123456789012:microvm-image:"
+
+    @classmethod
+    def _microvm_label(cls, image, microvm_id, version="1"):
+        return (
+            f"Lambda MicroVM image {cls.MICROVM_IMAGE}{image} version {version} "
+            f"(MicroVM {microvm_id})"
+        )
+
+    def test_a_shell_ingress_microvm_fails_beside_one_without(self):
+        shell = self._microvm_label("coder", "mv-2")
+        inventory = self._inventory(
+            {
+                "planner-role": [self._microvm_label("planner", "mv-1")],
+                "coder-role": [shell],
+            }
+        )
+        inventory["microvm_count"] = 2
+        inventory["microvm_shell"] = [shell]
+        cache = self._cache({"planner-role": _identity(), "coder-role": _identity()})
+        result, rows, _ = self._run(cache, inventory, {})
+        failed = self._status(rows, "Failed")
+        assert result["status"] == "WARN" and len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert (
+            f"{shell} was run with the SHELL_INGRESS network connector, so any "
+            "principal allowed lambda:CreateMicrovmShellAuthToken on its image "
+            "gets an interactive shell in it"
+        ) in detail
+        assert "mv-1" not in detail
+
+    def test_a_roleless_shell_ingress_microvm_still_fails(self):
+        shell = self._microvm_label("coder", "mv-9")
+        inventory = self._inventory({})
+        inventory["microvm_count"] = 1
+        inventory["microvm_shell"] = [shell]
+        result, rows, _ = self._run(self._cache({}), inventory, {})
+        assert result["status"] == "WARN"
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert shell in rows[0]["Finding_Details"]
+
+    def test_microvms_of_one_image_share_a_role_and_two_images_do_not(self):
+        cache = self._cache({"planner-role": _identity(), "pair-role": _identity()})
+        planner = self._role_arn("planner-role")
+        pair = self._role_arn("pair-role")
+        inventory = self._inventory(
+            {
+                "planner-role": [
+                    self._microvm_label("planner", "mv-1"),
+                    self._microvm_label("planner", "mv-2"),
+                    self._microvm_label("planner", "mv-3", version="2"),
+                ],
+                "pair-role": [
+                    self._microvm_label("coder", "mv-4"),
+                    self._microvm_label("tester", "mv-5"),
+                ],
+            }
+        )
+        inventory["microvm_count"] = 5
+        inventory["microvm_shell"] = []
+        result, rows, _ = self._run(cache, inventory, {})
+        failed = self._status(rows, "Failed")
+        assert len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert f"role {pair} is run by 2 agents" in detail
+        assert f"role {planner}" not in detail
+
+    def test_passed_names_the_microvms_read_and_the_ceiling_names_their_roles(self):
+        inventory = self._inventory(
+            {"planner-role": [self._microvm_label("planner", "mv-1")]}
+        )
+        inventory["microvm_count"] = 1
+        inventory["microvm_shell"] = []
+        cache = self._cache({"planner-role": _identity()})
+        result, rows, _ = self._run(cache, inventory, {})
+        passed = self._status(rows, "Passed")
+        assert result["status"] == "PASS" and len(passed) == 1
+        detail = passed[0]["Finding_Details"]
+        assert (
+            "1 Lambda MicroVM(s) were read, and none was run with the "
+            "SHELL_INGRESS network connector."
+        ) in detail
+        assert "Lambda MicroVM execution roles (GetMicrovm executionRoleArn)" in detail
+        assert "Lambda execution roles" not in detail
+
     def test_one_agent_across_versions_on_one_role_is_not_sharing(self):
         cache = self._cache({"agent-a": _identity()})
         result, rows, _ = self._run(
@@ -41131,8 +42532,13 @@ class TestBR57AgentRoleInventory:
         runtime_error=None,
         collaborators=None,
         policies=None,
+        microvms=None,
+        microvm_error=None,
     ):
-        """agents: id -> {"name", "versions": {v: (role, collab)}, "aliases": {id: [v]}}"""
+        """agents: id -> {"name", "versions": {v: (role, collab)}, "aliases": {id: [v]}}
+
+        microvms: pages of ListMicrovms items, each item carrying the GetMicrovm
+        "detail" (or an Exception) beside its summary fields."""
         agent = MagicMock()
         agent.list_agents.return_value = {
             "agentSummaries": [
@@ -41231,14 +42637,154 @@ class TestBR57AgentRoleInventory:
 
         control.get_resource_policy.side_effect = get_resource_policy
 
+        microvm = MagicMock()
+        pages = microvms if microvms is not None else [[]]
+        details = {
+            item["microvmId"]: item.get("detail") for page in pages for item in page
+        }
+
+        def list_microvms(**kwargs):
+            if microvm_error is not None:
+                raise microvm_error
+            index = int(kwargs.get("nextToken") or 0)
+            response = {
+                "items": [
+                    {key: value for key, value in item.items() if key != "detail"}
+                    for item in pages[index]
+                ]
+            }
+            if index + 1 < len(pages):
+                response["nextToken"] = str(index + 1)
+            return response
+
+        def get_microvm(microvmIdentifier):
+            outcome = details[microvmIdentifier]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return dict(outcome, microvmId=microvmIdentifier)
+
+        microvm.list_microvms.side_effect = list_microvms
+        microvm.get_microvm.side_effect = get_microvm
+
         def client(service, **kwargs):
-            return {"bedrock-agent": agent, "bedrock-agentcore-control": control}[
-                service
-            ]
+            return {
+                "bedrock-agent": agent,
+                "bedrock-agentcore-control": control,
+                "lambda-microvms": microvm,
+            }[service]
 
         with patch("boto3.client", side_effect=client):
             inventory = bedrock_app.get_agent_role_inventory("us-east-1")
+        self.microvm = microvm
         return inventory, agent, control
+
+    SHELL = "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:SHELL_INGRESS"
+    ALL = "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:ALL_INGRESS"
+
+    @classmethod
+    def _image(cls, name):
+        return f"arn:aws:lambda:us-east-1:{cls.ACCOUNT}:microvm-image:{name}"
+
+    @classmethod
+    def _microvm(
+        cls, microvm_id, image, role, state="RUNNING", ingress=(), version="1"
+    ):
+        return {
+            "microvmId": microvm_id,
+            "state": state,
+            "imageArn": cls._image(image),
+            "imageVersion": version,
+            "detail": {
+                "state": state,
+                "imageArn": cls._image(image),
+                "imageVersion": version,
+                "executionRoleArn": cls._role(role) if role else None,
+                "ingressNetworkConnectors": list(ingress),
+            },
+        }
+
+    def test_microvm_execution_roles_join_the_agent_roles_on_every_page(self):
+        inventory, _, _ = self._run(
+            {},
+            microvms=[
+                [
+                    self._microvm("mv-1", "planner", "planner-role"),
+                    self._microvm("mv-2", "planner", "planner-role", "SUSPENDED"),
+                ],
+                [
+                    self._microvm("mv-3", "coder", "coder-role", version="4"),
+                    self._microvm("mv-4", "old", "old-role", "TERMINATED"),
+                ],
+            ],
+        )
+        assert inventory["roles"] == {
+            self._role("planner-role"): [
+                f"Lambda MicroVM image {self._image('planner')} version 1 "
+                "(MicroVM mv-1)",
+                f"Lambda MicroVM image {self._image('planner')} version 1 "
+                "(MicroVM mv-2)",
+            ],
+            self._role("coder-role"): [
+                f"Lambda MicroVM image {self._image('coder')} version 4 (MicroVM mv-3)"
+            ],
+        }
+        assert inventory["microvm_count"] == 3
+        assert not inventory["errors"] and inventory["microvm_shell"] == []
+        called = {
+            c.kwargs["microvmIdentifier"]
+            for c in self.microvm.get_microvm.call_args_list
+        }
+        assert called == {"mv-1", "mv-2", "mv-3"}
+
+    def test_only_a_shell_ingress_microvm_is_recorded_as_shell_reachable(self):
+        inventory, _, _ = self._run(
+            {},
+            microvms=[
+                [
+                    self._microvm(
+                        "mv-1", "planner", "planner-role", ingress=[self.ALL]
+                    ),
+                    self._microvm(
+                        "mv-2", "coder", "coder-role", ingress=[self.ALL, self.SHELL]
+                    ),
+                ]
+            ],
+        )
+        assert inventory["microvm_shell"] == [
+            f"Lambda MicroVM image {self._image('coder')} version 1 (MicroVM mv-2)"
+        ]
+
+    def test_unread_microvm_listing_and_detail_are_named_outside_bedrock(self):
+        denied = _client_error("AccessDeniedException", "denied", "ListMicrovms")
+        inventory, _, _ = self._run({}, microvm_error=denied)
+        assert inventory["errors"] == [
+            "Lambda MicroVMs were not listed with lambda:ListMicrovms "
+            "(AccessDeniedException)"
+        ]
+        assert inventory["roles"] == {}
+
+        bad = self._microvm("mv-2", "coder", "coder-role")
+        bad["detail"] = _client_error("AccessDeniedException", "denied", "GetMicrovm")
+        inventory, _, _ = self._run(
+            {},
+            microvms=[[self._microvm("mv-1", "planner", "planner-role"), bad]],
+        )
+        assert inventory["errors"] == [
+            "Lambda MicroVM mv-2 was not read with lambda:GetMicrovm "
+            "(AccessDeniedException)"
+        ]
+        assert list(inventory["roles"]) == [self._role("planner-role")]
+
+    def test_microvms_are_read_when_runtimes_cannot_be_listed(self):
+        inventory, _, _ = self._run(
+            {},
+            runtime_error=_client_error(
+                "AccessDeniedException", "d", "ListAgentRuntimes"
+            ),
+            microvms=[[self._microvm("mv-1", "planner", "planner-role")]],
+        )
+        assert list(inventory["roles"]) == [self._role("planner-role")]
+        assert inventory["runtime_error"]
 
     def test_routed_versions_and_runtime_endpoint_versions_are_read(self):
         inventory, agent, control = self._run(
@@ -43804,6 +45350,49 @@ class TestBR04SageMakerInferenceRetention:
             _ for _ in ()
         ).throw(_make_client_error("ObjectLockConfigurationNotFoundError"))
         client.get_bucket_replication.side_effect = replication
+
+        def list_objects_v2(Bucket, Prefix, Delimiter, ContinuationToken=None):
+            # objects: {key: days since written}.
+            objects = buckets.get(Bucket, {}).get("objects") or {}
+            contents, folders = [], []
+            for key in sorted(objects):
+                if not key.startswith(Prefix):
+                    continue
+                rest = key[len(Prefix) :]
+                if Delimiter in rest:
+                    folder = Prefix + rest.split(Delimiter)[0] + Delimiter
+                    if folder not in folders:
+                        folders.append(folder)
+                else:
+                    contents.append(
+                        {
+                            "Key": key,
+                            "LastModified": _dt.now(_tz.utc) - _td(days=objects[key]),
+                        }
+                    )
+            return {
+                "Contents": contents,
+                "CommonPrefixes": [{"Prefix": f} for f in folders],
+                "IsTruncated": False,
+            }
+
+        client.list_objects_v2.side_effect = list_objects_v2
+
+        def list_object_versions(Bucket, Prefix, Delimiter):
+            # versions: [(key, version id, days since written)], flat keys only.
+            listed = [
+                {
+                    "Key": key,
+                    "VersionId": version_id,
+                    "LastModified": _dt.now(_tz.utc) - _td(days=age),
+                }
+                for key, version_id, age in buckets.get(Bucket, {}).get("versions")
+                or []
+                if key.startswith(Prefix) and Delimiter not in key[len(Prefix) :]
+            ]
+            return {"Versions": listed, "IsTruncated": False}
+
+        client.list_object_versions.side_effect = list_object_versions
         return client
 
     def _rows(self, uris, buckets, errors=()):
@@ -43906,6 +45495,76 @@ class TestBR04SageMakerInferenceRetention:
         assert (
             "the ReplicationStatus of the objects under 'capture/ep1/' was not read"
             in rows[1]["Finding_Details"]
+        )
+
+    def test_an_overdue_capture_object_fails_beside_an_on_schedule_one(self):
+        rows = self._rows(
+            [self.CAPTURE, self.ASYNC],
+            {
+                "capture-a": {
+                    "rules": [self._rule("capture/")],
+                    "objects": {
+                        "capture/ep1/AllTraffic/2026/08/01/00/a.jsonl": 45,
+                        "capture/ep1/AllTraffic/2026/09/01/00/b.jsonl": 5,
+                        "capture/ep1/Shadow/2026/09/20/00/c.jsonl": 3,
+                    },
+                },
+                "async-b": {
+                    "rules": [self._rule("out/")],
+                    "objects": {"out/0f1e.out": 31, "out/9a2b.out": 2},
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "the oldest object under 'capture/ep1/', "
+            "'capture/ep1/AllTraffic/2026/08/01/00/a.jsonl', was written 45 "
+            "day(s) ago, past its 30-day rule" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "the oldest object under 'out/', 'out/0f1e.out', was written 31 "
+            "day(s) ago and is not past its 30-day rule"
+        ) in rows[1]["Finding_Details"]
+        assert "capture-a" not in rows[1]["Finding_Details"]
+
+    def test_an_overdue_noncurrent_async_output_version_fails(self):
+        rows = self._rows(
+            [self.ASYNC],
+            {
+                "async-b": {
+                    "rules": [self._rule("out/", noncurrent=True)],
+                    "versioning": "Enabled",
+                    "versions": [
+                        ("out/0f1e.out", "v1", 40),
+                        ("out/0f1e.out", "v2", 12),
+                    ],
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "the noncurrent version under 'out/' that became noncurrent longest "
+            "ago, 'out/0f1e.out' version v1, did so 12 day(s) ago, past its 7-day "
+            "noncurrent rule" in rows[0]["Finding_Details"]
+        )
+
+    def test_the_oldest_capture_object_is_found_under_every_variant(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {
+                "capture-a": {
+                    "rules": [self._rule("capture/")],
+                    "objects": {
+                        "capture/ep1/AllTraffic/2026/09/01/00/b.jsonl": 5,
+                        "capture/ep1/Shadow/2026/07/20/00/c.jsonl": 70,
+                    },
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "Shadow/2026/07/20/00/c.jsonl', was written 70"
+            in (rows[0]["Finding_Details"])
         )
 
     def test_an_unread_endpoint_withholds_the_pass(self):

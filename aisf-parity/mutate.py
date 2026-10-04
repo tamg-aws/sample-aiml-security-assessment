@@ -1825,8 +1825,8 @@ MUTATIONS = [
         "name": "BR-42 training: Search results ignored",
         "file": BEDROCK,
         "defect": "training jobs past the DescribeTrainingJob cap were reported unread although Search returned them",
-        "find": '                    searched[found["TrainingJobName"]] = found\n',
-        "replace": "                    pass\n",
+        "find": '                searched[found["TrainingJobName"]] = found\n',
+        "replace": "                pass\n",
     },
     {
         "name": "BR-34 Converse: a tool-result turn is judged as the latest turn",
@@ -3571,6 +3571,295 @@ MUTATIONS = [
         "replace": "        expected_owner=None,\n",
     },
     # ------------------------------------- end of the AgentCore verdict legs
+    {
+        "name": "BR-43 credits a NotAction Deny that exempts an action of a probed service",
+        "file": BEDROCK,
+        "defect": "BR-43 credits a whole-prefix probe to a NotAction Deny that exempts "
+        "bedrock:CreateAgent or es:CreateDomain, so those actions run in any Region "
+        "while the row passes",
+        "find": "                if open_patterns:\n",
+        "replace": "                if False:\n",
+    },
+    {
+        "name": "BR-43 stops crediting the Control Tower default S3 exemptions",
+        "file": BEDROCK,
+        "defect": "BR-43 fails the Control Tower Region deny for the S3 account-level "
+        "and Multi-Region Access Point actions it exempts by default",
+        "find": "                    if pattern.lower() not in CONTROL_TOWER_REGION_DENY_EXEMPTIONS\n",
+        "replace": "                    if pattern.lower() not in ()\n",
+    },
+    {
+        "name": "BR-53 drops Marketplace model endpoints from the Bedrock inventory",
+        "file": BEDROCK,
+        "defect": "BR-53 reads no Marketplace model endpoint ARN, so one never tagged "
+        "passes unseen under the complete Passed row",
+        "find": '            "marketplaceModelEndpoints",\n            "endpointArn",\n',
+        "replace": '            "marketplaceModelEndpoints",\n            "missingArn",\n',
+    },
+    {
+        "name": "BR-53 drops SageMaker transform jobs from the sweep lists",
+        "file": BEDROCK,
+        "defect": "BR-53 reads no transform job ARN from sagemaker:ListTransformJobs, "
+        "so a transform job never tagged passes unseen",
+        "find": '        "TransformJobSummaries",\n        "TransformJobArn",\n',
+        "replace": '        "TransformJobSummaries",\n        "MissingArn",\n',
+    },
+    {
+        "name": "BR-39 passes an AI workload on a subnet routed to an internet gateway",
+        "file": BEDROCK,
+        "defect": "BR-39 stops failing an AI workload whose subnet routes to an igw- "
+        "gateway, so an ECS service granted Bedrock in a public subnet passes",
+        "find": "            if public:\n                failed.append(\n"
+        "                    \"{} in {} (role '{}') runs on subnet(s) that route to an \"\n",
+        "replace": "            if False:\n                failed.append(\n"
+        "                    \"{} in {} (role '{}') runs on subnet(s) that route to an \"\n",
+    },
+    {
+        "name": "BR-39 stops failing an AI workload outside any VPC",
+        "file": BEDROCK,
+        "defect": "BR-39 reads a Lambda function granted Bedrock with no VpcConfig as "
+        "unread instead of failing it",
+        "find": '            if not workload.get("vpc_id"):\n                failed.append(\n'
+        "                    f\"{label} (role '{role}') is not attached to a VPC, so it runs \"\n",
+        "replace": "            if False:\n                failed.append(\n"
+        "                    f\"{label} (role '{role}') is not attached to a VPC, so it runs \"\n",
+    },
+    {
+        "name": "BR-02 skips the data path endpoint policies in AI VPCs",
+        "file": BEDROCK,
+        "defect": "BR-02 judges no S3, DynamoDB or SageMaker endpoint policy, so a "
+        "default full-access S3 gateway endpoint in an AI VPC goes unreported",
+        "find": '        if endpoint.get("vpc_id") in ai_vpcs["vpcs"]\n',
+        "replace": "        if False\n",
+    },
+    {
+        "name": "BR-02 credits a wildcard bucket name in a data path endpoint policy",
+        "file": BEDROCK,
+        "defect": "BR-02 reads arn:aws:s3:::* as naming a bucket, so an endpoint "
+        "policy open to every bucket passes as least privilege",
+        "find": "    if not name or _resource_has_wildcard(name):\n",
+        "replace": "    if not name:\n",
+    },
+    {
+        "name": "BR-12 passes a COMPLIANCE bucket the assessed account owns",
+        "file": BEDROCK,
+        "defect": "BR-12 credits an Object Lock bucket in the assessed account as the "
+        "WORM archive, though the control prescribes a separate Log Archive account",
+        "find": '    if owner == "same":\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-57 drops Lambda MicroVM roles from the agent roles",
+        "file": BEDROCK,
+        "defect": "BR-57 reads no Lambda MicroVM execution role, so two agent images "
+        "on one role and a MicroVM role's trust edges go unjudged",
+        "find": '    for role_arn, label in microvms["microvms"]:\n        add_role(role_arn, label)\n',
+        "replace": '    for role_arn, label in microvms["microvms"]:\n        pass\n',
+    },
+    {
+        "name": "BR-57 passes a MicroVM run with the SHELL_INGRESS connector",
+        "file": BEDROCK,
+        "defect": "BR-57 ignores the ingress connectors, so a MicroVM any shell-token "
+        "holder can open a shell in passes",
+        "find": '            result["shell"].append(label)\n',
+        "replace": "            pass\n",
+    },
+    {
+        "name": "BR-57 reads a terminated MicroVM as an agent",
+        "file": BEDROCK,
+        "defect": "BR-57 counts MicroVMs that no longer run, so a terminated "
+        "MicroVM's role fails a live agent for sharing it",
+        "find": 'MICROVM_LIVE_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED")\n',
+        "replace": 'MICROVM_LIVE_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATED")\n',
+    },
+    {
+        "name": "BR-57 drops a failure when no agent role exists",
+        "file": BEDROCK,
+        "defect": "BR-57 replaces a roleless SHELL_INGRESS MicroVM's failure with "
+        "the empty-estate N/A row",
+        "find": "        if not agent_roles and not unread and not failures:\n",
+        "replace": "        if not agent_roles and not unread:\n",
+    },
+    {
+        "name": "BR-47 caps the training job Search at the describe cap",
+        "file": BEDROCK,
+        "defect": "BR-47 reads only the newest training jobs Search returns, so a "
+        "Region with more jobs than the cap never judges the older ones",
+        "find": "    names = listed + [name for name in searched if name not in set(listed)]\n",
+        "replace": "    names = (listed + [name for name in searched if name not in set(listed)])[\n        :MAX_SAGEMAKER_TRAINING_JOB_READS\n    ]\n",
+    },
+    {
+        "name": "BR-47 ignores the trial component job descriptions",
+        "file": BEDROCK,
+        "defect": "BR-47 describes every transform and processing job, so a Region "
+        "past the cap stays N/A though trial components hold every job",
+        "find": "        held = _trial_component_job_details(client, kind)\n",
+        "replace": "        held = {}\n",
+    },
+    {
+        "name": "BR-47 skips the jobs a trial component holds",
+        "file": BEDROCK,
+        "defect": "BR-47 reads only the jobs it describes, so a transform or "
+        "processing job held by a trial component goes unjudged",
+        "find": "        for job in [job for job in jobs if job.get(name_key) in held] + read:\n",
+        "replace": "        for job in read:\n",
+    },
+    {
+        "name": "BR-47 reads only each runtime's listed version for code buckets",
+        "file": BEDROCK,
+        "defect": "BR-47 skips the versions a runtime endpoint serves, so a live "
+        "version's code bucket with no TLS deny goes unjudged",
+        "find": '        for endpoint in endpoints:\n            for field in ("liveVersion", "targetVersion"):\n                if endpoint.get(field):\n                    versions.add(str(endpoint[field]))\n        for version in sorted(',
+        "replace": '        for endpoint in []:\n            for field in ("liveVersion", "targetVersion"):\n                if endpoint.get(field):\n                    versions.add(str(endpoint[field]))\n        for version in sorted(',
+    },
+    {
+        "name": "BR-47 passes beside an unlisted runtime endpoint set",
+        "file": BEDROCK,
+        "defect": "BR-47 reports Passed when a runtime's endpoints were not listed, "
+        "so the versions they serve were never read",
+        "find": '            endpoints = []\n            errors.append(\n                f"the endpoints of AgentCore runtime',
+        "replace": '            endpoints = []\n            [].append(\n                f"the endpoints of AgentCore runtime',
+    },
+    {
+        "name": "BR-04 passes an overdue log object",
+        "file": BEDROCK,
+        "defect": "BR-04 never reports an object kept past its lifecycle rule, so deletion that has not run reads as retention",
+        "find": "    if now > due + timedelta(days=LIFECYCLE_DELETION_GRACE_DAYS):\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-04 enters the latest date folder",
+        "file": BEDROCK,
+        "defect": "BR-04 descends into the newest date folder, so the oldest object it reports is not the oldest held",
+        "find": "            pending.append(min(folders))\n",
+        "replace": "            pending.append(max(folders))\n",
+    },
+    {
+        "name": "BR-04 reads one ListObjectsV2 page per level",
+        "file": BEDROCK,
+        "defect": "BR-04 stops after the first ListObjectsV2 page of each level, so an older object on a later page goes unread",
+        "find": '            if not page.get("IsTruncated") or not token:\n',
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "BR-04 passes a bucket whose deletion evidence was not read",
+        "file": BEDROCK,
+        "defect": "BR-04 names a bucket as retained when its ListObjectsV2 read failed",
+        "find": '    on_schedule = not deletion["overdue"] and not deletion["error"]\n',
+        "replace": '    on_schedule = not deletion["overdue"]\n',
+    },
+    {
+        "name": "BR-04 keeps the HeadObject cap N/A with no overdue object",
+        "file": BEDROCK,
+        "defect": "BR-04 leaves a replicated log bucket past the HeadObject cap N/A even when no object is past its rule",
+        "find": '        if held["capped"] and not held["failed"] and on_schedule:\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-04 passes an overdue replica",
+        "file": BEDROCK,
+        "defect": "BR-04 never fails a replica bucket that kept an object past its lifecycle rule",
+        "find": '            if replica_deletion["overdue"]:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-04 never dues a Date rule",
+        "file": BEDROCK,
+        "defect": "BR-04 reads an Expiration Date as never due, so an object left past the date passes",
+        "find": '            dues.append((max(date, written), f"expiry date',
+        "replace": '            dues.append((date + timedelta(days=36500), f"expiry date',
+    },
+    {
+        "name": "BR-55 ignores an all-zero digest in KMS event history",
+        "file": BEDROCK,
+        "defect": "BR-55 never fails a key whose CloudTrail event history records a request from a debug-mode enclave",
+        "find": 'if events["zero"]:',
+        "replace": "if False:",
+    },
+    {
+        "name": "BR-55 reads one LookupEvents page per key",
+        "file": BEDROCK,
+        "defect": "BR-55 stops after the first LookupEvents page, so a debug-mode request on a later page goes unread",
+        "find": '            request["NextToken"] = token\n',
+        "replace": "            break\n",
+    },
+    {
+        "name": "BR-55 passes a key whose event history was not read",
+        "file": BEDROCK,
+        "defect": "BR-55 drops a LookupEvents error, so a key whose event history was never read is Passed",
+        "find": '        error = f"cloudtrail:LookupEvents, {get_assessment_error_label(lookup_error)}"',
+        "replace": '        error = ""',
+    },
+    {
+        "name": "BR-55 reads a base64 all-zero digest as a measurement",
+        "file": BEDROCK,
+        "defect": "BR-55 recognizes only a hex all-zero digest, so a base64-encoded one passes",
+        "find": "    return bool(decoded) and not any(decoded)\n",
+        "replace": "    return False\n",
+    },
+    {
+        "name": "BR-55 passes past the event history page cap",
+        "file": BEDROCK,
+        "defect": "BR-55 reports a key Passed after reading only the first pages of its event history",
+        "find": '    error = f"events past the first {ENCLAVE_EVENT_MAX_PAGES} page(s) were not read"',
+        "replace": '    error = ""',
+    },
+    {
+        "name": "BR-04 passes an overdue noncurrent version",
+        "file": BEDROCK,
+        "defect": "BR-04 never reports a noncurrent version kept past its NoncurrentDays rule",
+        "find": '    if now > oldest["since"] + timedelta(days=days + LIFECYCLE_DELETION_GRACE_DAYS):',
+        "replace": "    if False:",
+    },
+    {
+        "name": "BR-04 ages a noncurrent version from its own write",
+        "file": BEDROCK,
+        "defect": "BR-04 counts NoncurrentDays from a version's own write, not from when the next version made it noncurrent",
+        "find": '                        "since": newer["LastModified"],',
+        "replace": '                        "since": item["LastModified"],',
+    },
+    {
+        "name": "BR-04 enters only the first date folder for versions",
+        "file": BEDROCK,
+        "defect": "BR-04 stops at the earliest date folder even when it holds only delete markers, so a later noncurrent version goes unread",
+        "find": "            if dated and found:",
+        "replace": "            if dated:",
+    },
+    {
+        "name": "BR-04 passes a bucket whose version listing failed",
+        "file": BEDROCK,
+        "defect": "BR-04 drops a ListObjectVersions error and names the bucket as retained",
+        "find": "        return dict(current, error=describe_api_error(error, action, region))",
+        "replace": "        return current",
+    },
+    {
+        "name": "BR-04 lists no versions on a versioned bucket",
+        "file": BEDROCK,
+        "defect": "BR-04 never reads noncurrent versions, so a versioned bucket's NoncurrentDays rule is taken on trust",
+        "find": '            noncurrent_days if versioning_status in ("Enabled", "Suspended") else []',
+        "replace": "            []",
+    },
+    {
+        "name": "BR-04 reads one ListObjectVersions page per level",
+        "file": BEDROCK,
+        "defect": "BR-04 stops after the first ListObjectVersions page of each level, so a later folder goes unread",
+        "find": '            request["KeyMarker"] = key_marker\n',
+        "replace": "            break\n",
+    },
+    {
+        "name": "BR-47 caps evaluation jobs at the SageMaker describe cap",
+        "file": BEDROCK,
+        "defect": "BR-47 reads only the newest 200 evaluation jobs, so an older job's buckets go unjudged",
+        "find": "    for job in jobs[:MAX_EVALUATION_JOB_READS]:",
+        "replace": "    for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:",
+    },
+    {
+        "name": "BR-47 drops the evaluation jobs past the read cap",
+        "file": BEDROCK,
+        "defect": "BR-47 says nothing of the evaluation jobs past its read cap, so the Passed row stands with jobs unread",
+        "find": "    if unread:\n        rest = len(unread) - EVALUATION_JOBS_NAMED_PAST_CAP\n",
+        "replace": "    if False:\n        rest = len(unread) - EVALUATION_JOBS_NAMED_PAST_CAP\n",
+    },
 ]
 
 # Directories whose contents are generated by the suites and hidden from git by
@@ -4360,6 +4649,116 @@ GROUPS: dict[str, str] = {
     "AC-34 code: a .env file's variables are not judged": "in the AgentCore verdict legs",
     "AC-34 code: the unpacked bound is not enforced": "in the AgentCore verdict legs",
     "AC-35 input guard: an S3 schema is not held to its owner": "in the AgentCore verdict legs",
+    "BR-43 credits a NotAction Deny that exempts an action of a probed service": (
+        "in the Bedrock Region deny service prefixes"
+    ),
+    "BR-43 stops crediting the Control Tower default S3 exemptions": (
+        "in the Bedrock Region deny service prefixes"
+    ),
+    "BR-53 drops Marketplace model endpoints from the Bedrock inventory": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-53 drops SageMaker transform jobs from the sweep lists": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-39 passes an AI workload on a subnet routed to an internet gateway": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-39 stops failing an AI workload outside any VPC": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-02 skips the data path endpoint policies in AI VPCs": (
+        "in the Bedrock data path endpoint policies"
+    ),
+    "BR-02 credits a wildcard bucket name in a data path endpoint policy": (
+        "in the Bedrock data path endpoint policies"
+    ),
+    "BR-12 passes a COMPLIANCE bucket the assessed account owns": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-57 drops Lambda MicroVM roles from the agent roles": (
+        "in the Bedrock Lambda MicroVM agent legs"
+    ),
+    "BR-57 passes a MicroVM run with the SHELL_INGRESS connector": (
+        "in the Bedrock Lambda MicroVM agent legs"
+    ),
+    "BR-57 reads a terminated MicroVM as an agent": (
+        "in the Bedrock Lambda MicroVM agent legs"
+    ),
+    "BR-57 drops a failure when no agent role exists": (
+        "in the Bedrock Lambda MicroVM agent legs"
+    ),
+    "BR-47 caps the training job Search at the describe cap": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 ignores the trial component job descriptions": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 skips the jobs a trial component holds": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 reads only each runtime's listed version for code buckets": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 passes beside an unlisted runtime endpoint set": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-04 passes an overdue log object": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 enters the latest date folder": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 reads one ListObjectsV2 page per level": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 passes a bucket whose deletion evidence was not read": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 keeps the HeadObject cap N/A with no overdue object": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 passes an overdue replica": ("in the Bedrock lifecycle deletion evidence"),
+    "BR-04 never dues a Date rule": ("in the Bedrock lifecycle deletion evidence"),
+    "BR-55 ignores an all-zero digest in KMS event history": (
+        "in the Bedrock attestation event history"
+    ),
+    "BR-55 reads one LookupEvents page per key": (
+        "in the Bedrock attestation event history"
+    ),
+    "BR-55 passes a key whose event history was not read": (
+        "in the Bedrock attestation event history"
+    ),
+    "BR-55 reads a base64 all-zero digest as a measurement": (
+        "in the Bedrock attestation event history"
+    ),
+    "BR-55 passes past the event history page cap": (
+        "in the Bedrock attestation event history"
+    ),
+    "BR-04 passes an overdue noncurrent version": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 ages a noncurrent version from its own write": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 enters only the first date folder for versions": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 passes a bucket whose version listing failed": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 lists no versions on a versioned bucket": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-04 reads one ListObjectVersions page per level": (
+        "in the Bedrock lifecycle deletion evidence"
+    ),
+    "BR-47 caps evaluation jobs at the SageMaker describe cap": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 drops the evaluation jobs past the read cap": (
+        "in the Bedrock data path inventory"
+    ),
 }
 
 

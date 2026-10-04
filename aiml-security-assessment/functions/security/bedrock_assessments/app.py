@@ -19,6 +19,8 @@ import gzip
 import random
 import re
 import json
+import base64
+import binascii
 from functools import lru_cache
 from schema import create_finding
 
@@ -3747,9 +3749,18 @@ def _principal_is_bounded(principal: Any) -> bool:
     )
 
 
-def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
+def _vpc_endpoint_policy_scope(
+    document: Any,
+    action: str = "bedrock:invokemodel",
+    service_label: str = "Bedrock",
+    resource_is_named: Optional[Callable[[Any], bool]] = None,
+) -> Dict[str, Any]:
     """
     Describe the network scope a Bedrock interface endpoint policy grants.
+
+    ``action`` is the call a scoping Deny must cover. With ``resource_is_named``,
+    an Allow whose every Resource that test accepts is bounded too, which is how
+    an S3 or DynamoDB endpoint policy names the buckets or tables it carries.
 
     The default endpoint policy allows Principal "*" every action on every
     resource, so any principal whose traffic reaches the endpoint inherits full
@@ -3791,7 +3802,7 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
                 str(resource).strip() != "*"
                 for resource in _as_list(statement.get("Resource", "*"))
             )
-            or not _statement_matches_action(statement, "bedrock:invokemodel")
+            or not _statement_matches_action(statement, action)
         ):
             continue
         operator, key, values = conditions[0]
@@ -3841,6 +3852,21 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
             )
         elif scope_keys:
             bounded.append(f"statement '{label}' requires {', '.join(scope_keys)}")
+        elif (
+            resource_is_named is not None
+            and "NotResource" not in statement
+            and _as_list(statement.get("Resource"))
+            and all(
+                resource_is_named(resource)
+                for resource in _as_list(statement.get("Resource"))
+            )
+        ):
+            bounded.append(
+                "statement '{}' names only {}".format(
+                    label,
+                    ", ".join(map(str, _as_list(statement.get("Resource"))[:3])),
+                )
+            )
         elif _principal_is_bounded(statement.get("Principal")):
             bounded.append(
                 "statement '{}' names {} principal(s)".format(
@@ -3890,7 +3916,7 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
         "scoped": True,
         "detail": (
             "its endpoint policy carries no Allow statement, so no principal can "
-            "reach Bedrock through it"
+            f"reach {service_label} through it"
         ),
     }
 
@@ -4081,6 +4107,177 @@ def _vpc_endpoint_hardening_findings(
     return rows
 
 
+DATA_PATH_ENDPOINT_POLICY_FINDING = "AI Data Path VPC Endpoint Policy Scope"
+
+# The call a Deny in each data path endpoint's policy must cover to scope it.
+DATA_PATH_ENDPOINT_PROBE_ACTIONS = {
+    "s3": "s3:getobject",
+    "dynamodb": "dynamodb:getitem",
+    "sagemaker.api": "sagemaker:createendpoint",
+    "sagemaker.runtime": "sagemaker:invokeendpoint",
+}
+
+
+def _data_path_resource_is_named(resource: Any) -> bool:
+    """
+    True when a Resource entry names one bucket, table or endpoint.
+
+    A wildcard in the partition, service, Region or account segment, or in the
+    resource name, widens it. A trailing /* below a named bucket or table (its
+    objects, or a table's indexes and streams) does not. Every resource type
+    other than an S3 bucket carries its name after a "/", so "table/*" names
+    no table.
+    """
+    if not isinstance(resource, str):
+        return False
+    parts = resource.strip().split(":", 5)
+    if len(parts) < 6 or parts[0] != "arn":
+        return False
+    if any(_resource_has_wildcard(part) for part in parts[1:5]):
+        return False
+    name = parts[5][:-2] if parts[5].endswith("/*") else parts[5]
+    if not name or _resource_has_wildcard(name):
+        return False
+    return parts[2] == "s3" or "/" in name
+
+
+def _ai_vpcs(
+    permission_cache: Dict[str, Any],
+    endpoints: List[Dict[str, Any]],
+    workload_inventory: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Return the VPCs that hold a Bedrock or AgentCore endpoint or a workload
+    whose role is granted an AI surface, and the parts of the population that
+    could not be classified.
+    """
+    vpcs = {endpoint.get("vpc_id") for endpoint in endpoints if endpoint.get("vpc_id")}
+    unread = list(workload_inventory.get("errors") or [])
+    roles = permission_cache.get("role_permissions") or {}
+    for workload in workload_inventory.get("workloads") or []:
+        role = workload.get("role")
+        if not role or not workload.get("vpc_id"):
+            continue
+        if role not in roles:
+            unread.append(
+                "{} '{}' runs as role '{}', which the IAM cache does not hold".format(
+                    workload["kind"], workload["name"], role
+                )
+            )
+            continue
+        try:
+            if _granted_bedrock_surfaces(roles[role], AI_WORKLOAD_SURFACES):
+                vpcs.add(workload["vpc_id"])
+        except (ValueError, TypeError, AttributeError):
+            unread.append(
+                "{} '{}' runs as role '{}', whose policies could not be parsed".format(
+                    workload["kind"], workload["name"], role
+                )
+            )
+    return {"vpcs": vpcs, "unread": unread}
+
+
+def _data_path_endpoint_policy_findings(
+    endpoints: List[Dict[str, Any]], ai_vpcs: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Judge the endpoint policy of every S3, DynamoDB and SageMaker endpoint in a
+    VPC that holds an AI workload or a Bedrock or AgentCore endpoint. A policy is
+    least privilege when it bounds the principals or source network, or names
+    the buckets, tables or endpoints it carries.
+    """
+    prefix = f"com.amazonaws.{region}."
+    judged = [
+        endpoint
+        for endpoint in endpoints
+        if endpoint.get("vpc_id") in ai_vpcs["vpcs"]
+        and str(endpoint.get("service", "")).startswith(prefix)
+        and str(endpoint["service"])[len(prefix) :] in DATA_PATH_ENDPOINT_PROBE_ACTIONS
+    ]
+    unscoped = []
+    scoped = []
+    unreadable = []
+    for endpoint in judged:
+        surface = str(endpoint["service"])[len(prefix) :]
+        verdict = _vpc_endpoint_policy_scope(
+            endpoint.get("policy"),
+            action=DATA_PATH_ENDPOINT_PROBE_ACTIONS[surface],
+            service_label=surface,
+            resource_is_named=_data_path_resource_is_named,
+        )
+        entry = f"{_endpoint_label(endpoint)}: {verdict['detail']}"
+        if not verdict["readable"]:
+            unreadable.append(entry)
+        elif verdict["scoped"]:
+            scoped.append(entry)
+        else:
+            unscoped.append(entry)
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-02",
+            finding_name=DATA_PATH_ENDPOINT_POLICY_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=VPC_ENDPOINT_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    rows = []
+    total = len(judged)
+    if unscoped:
+        rows.append(
+            row(
+                "{} of {} S3, DynamoDB or SageMaker endpoint(s) in a VPC holding an "
+                "AI workload or a Bedrock or AgentCore endpoint carry a policy that "
+                "bounds neither the principals nor the source network and names "
+                "no specific bucket, table or endpoint: {}.".format(
+                    len(unscoped), total, "; ".join(unscoped[:5])
+                ),
+                "Attach an endpoint policy that names the buckets, tables or "
+                "endpoints the workloads use, or conditions access on "
+                "aws:PrincipalOrgID, aws:PrincipalArn or aws:SourceVpc.",
+                "Medium",
+                "Failed",
+            )
+        )
+    if scoped:
+        rows.append(
+            row(
+                "{} of {} S3, DynamoDB or SageMaker endpoint(s) in a VPC holding an "
+                "AI workload or a Bedrock or AgentCore endpoint carry a policy that "
+                "bounds who may use it or what it reaches: {}.{}".format(
+                    len(scoped),
+                    total,
+                    "; ".join(scoped[:5]),
+                    " This is not reported as Passed because part of the workload "
+                    "population was not read, so an endpoint in another AI VPC may "
+                    "be missing: {}.".format("; ".join(ai_vpcs["unread"][:5]))
+                    if ai_vpcs["unread"]
+                    else "",
+                ),
+                "No action required for the endpoint policy.",
+                "Medium",
+                "N/A" if ai_vpcs["unread"] else "Passed",
+            )
+        )
+    if unreadable:
+        rows.append(
+            row(
+                "{} of {} S3, DynamoDB or SageMaker endpoint(s) have no readable "
+                "endpoint policy: {}.".format(
+                    len(unreadable), total, "; ".join(unreadable[:5])
+                ),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    return rows
+
+
 def check_bedrock_access_and_vpc_endpoints(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
@@ -4194,6 +4391,19 @@ def check_bedrock_access_and_vpc_endpoints(
         if any(row["Status"] == "Failed" for row in workload_rows):
             findings["status"] = "WARN"
         findings["csv_data"].extend(workload_rows)
+        data_path_rows = _data_path_endpoint_policy_findings(
+            vpc_endpoint_check.get("data_path_endpoints", []),
+            _ai_vpcs(
+                permission_cache,
+                vpc_endpoint_check["found_endpoints"]
+                + vpc_endpoint_check.get("agentcore_endpoints", []),
+                workload_inventory,
+            ),
+            region,
+        )
+        if any(row["Status"] == "Failed" for row in data_path_rows):
+            findings["status"] = "WARN"
+        findings["csv_data"].extend(data_path_rows)
         if not bedrock_access_found:
             findings["details"] = "No Bedrock access found in roles or users"
 
@@ -4422,8 +4632,10 @@ def _bucket_expiration_rules(
     covers that root counts. On a bucket that is or was versioned, expiring the
     current object leaves a noncurrent version behind, so a rule that expires
     noncurrent versions is required as well. Returns ``expirations`` (the rules
-    that count), ``deficiency`` (why the bucket keeps logs forever) and
-    ``undetermined`` (why that could not be read). ``root`` replaces the
+    that count), ``schedules`` (each counted rule's Days or Date),
+    ``noncurrent_schedules`` (each counted NoncurrentDays, on a bucket that is
+    or was versioned), ``deficiency`` (why the bucket keeps logs forever) and ``undetermined``
+    (why that could not be read). ``root`` replaces the
     AWSLogs/ root for data another service writes under its own prefix, and
     ``records`` and ``objects`` name that data in the text.
     """
@@ -4441,7 +4653,9 @@ def _bucket_expiration_rules(
         log_root = root
 
     expirations = []
+    schedules: List[Any] = []
     noncurrent_expirations = []
+    noncurrent_days: List[int] = []
     uncovering = []
     for rule in response.get("Rules", []):
         if rule.get("Status") != "Enabled":
@@ -4472,18 +4686,23 @@ def _bucket_expiration_rules(
             expirations.append(
                 f"{rule_id} expires objects after {expiration['Days']} day(s)"
             )
+            schedules.append(expiration["Days"])
         elif expiration.get("Date"):
             expirations.append(f"{rule_id} expires objects on {expiration['Date']}")
+            schedules.append(expiration["Date"])
         if noncurrent.get("NoncurrentDays"):
             noncurrent_expirations.append(
                 f"{rule_id} expires noncurrent versions after "
                 f"{noncurrent['NoncurrentDays']} day(s)"
             )
+            noncurrent_days.append(noncurrent["NoncurrentDays"])
 
     uncovered_note = f" ({'; '.join(uncovering)})" if uncovering else ""
     if not expirations:
         return {
             "expirations": [],
+            "schedules": [],
+            "noncurrent_schedules": [],
             "deficiency": (
                 "has no enabled lifecycle rule that expires objects under "
                 f"'{log_root}', so {records} are kept indefinitely{uncovered_note}"
@@ -4498,6 +4717,8 @@ def _bucket_expiration_rules(
     except Exception as error:
         return {
             "expirations": expirations,
+            "schedules": schedules,
+            "noncurrent_schedules": [],
             "deficiency": None,
             "undetermined": describe_api_error(error, "s3:GetBucketVersioning", region),
         }
@@ -4506,6 +4727,8 @@ def _bucket_expiration_rules(
     if versioning_status in ("Enabled", "Suspended") and not noncurrent_expirations:
         return {
             "expirations": expirations,
+            "schedules": schedules,
+            "noncurrent_schedules": [],
             "deficiency": (
                 f"has versioning {versioning_status} and no enabled lifecycle rule "
                 f"that expires noncurrent versions under '{log_root}', so "
@@ -4516,6 +4739,10 @@ def _bucket_expiration_rules(
         }
     return {
         "expirations": expirations + noncurrent_expirations,
+        "schedules": schedules,
+        "noncurrent_schedules": (
+            noncurrent_days if versioning_status in ("Enabled", "Suspended") else []
+        ),
         "deficiency": None,
         "undetermined": None,
     }
@@ -4600,6 +4827,7 @@ def _replication_held_log_objects(
                     return {
                         "failed": failed,
                         "read": read,
+                        "capped": True,
                         "error": (
                             f"objects under s3://{bucket_name}/{root} past the first "
                             f"{REPLICATION_STATUS_HEAD_CAP} were not read"
@@ -4617,9 +4845,314 @@ def _replication_held_log_objects(
         return {
             "failed": failed,
             "read": read,
+            "capped": False,
             "error": f"{action}, {get_assessment_error_label(error)}",
         }
-    return {"failed": failed, "read": read, "error": ""}
+    return {"failed": failed, "read": read, "capped": False, "error": ""}
+
+
+# S3 Lifecycle rounds an object's expiry up to the next midnight UTC and runs
+# once a day, so an object is overdue only this many days past its rule.
+LIFECYCLE_DELETION_GRACE_DAYS = 2
+
+# ListObjectsV2 calls one search for a bucket's oldest object may make.
+OLDEST_OBJECT_LIST_CAP = 200
+
+DATE_FOLDER_PATTERN = re.compile(r"\d{4}|\d{2}")
+
+
+def _oldest_object_under(s3_client: Any, bucket_name: str, root: str) -> Dict[str, Any]:
+    """
+    Find the least recently written object under ``root`` with ListObjectsV2.
+
+    Each level is listed with Delimiter '/'. Keys are returned in key order, so
+    at a level whose every folder is a date component (yyyy, mm, dd or hh) the
+    first folder holds the oldest objects and only it is entered. Every other
+    folder (a Region, an endpoint, a variant) is entered. Returns ``oldest``
+    (the ListObjectsV2 item, or None when no object exists) and ``error``.
+    """
+    oldest = None
+    calls = 0
+    pending = [root]
+    while pending:
+        prefix = pending.pop()
+        folders: List[str] = []
+        token = None
+        while True:
+            if calls >= OLDEST_OBJECT_LIST_CAP:
+                return {
+                    "oldest": oldest,
+                    "error": (
+                        f"the listing under s3://{bucket_name}/{root} stopped "
+                        f"after {OLDEST_OBJECT_LIST_CAP} ListObjectsV2 calls"
+                    ),
+                }
+            request = {"Bucket": bucket_name, "Prefix": prefix, "Delimiter": "/"}
+            if token:
+                request["ContinuationToken"] = token
+            page = s3_client.list_objects_v2(**request)
+            calls += 1
+            for item in page.get("Contents") or []:
+                if oldest is None or item["LastModified"] < oldest["LastModified"]:
+                    oldest = item
+            folders.extend(
+                common["Prefix"] for common in page.get("CommonPrefixes") or []
+            )
+            token = page.get("NextContinuationToken")
+            if not page.get("IsTruncated") or not token:
+                break
+        if folders and all(
+            DATE_FOLDER_PATTERN.fullmatch(folder[len(prefix) :].rstrip("/"))
+            for folder in folders
+        ):
+            pending.append(min(folders))
+        else:
+            pending.extend(folders)
+    return {"oldest": oldest, "error": ""}
+
+
+def _oldest_noncurrent_version_under(
+    s3_client: Any, bucket_name: str, root: str
+) -> Dict[str, Any]:
+    """
+    Find the version under ``root`` that became noncurrent longest ago, with
+    ListObjectVersions. A version becomes noncurrent when the next newer
+    version or delete marker of its key is written, and NoncurrentDays counts
+    from then. Each level is listed with Delimiter '/'. At a level whose every
+    folder is a date component the folders are entered in key order until one
+    holds a noncurrent version, because a folder whose versions have expired
+    can still hold delete markers. Returns ``oldest`` ({Key, VersionId,
+    since}, or None) and ``error``.
+    """
+    calls = 0
+    capped = (
+        f"the version listing under s3://{bucket_name}/{root} stopped after "
+        f"{OLDEST_OBJECT_LIST_CAP} ListObjectVersions calls"
+    )
+
+    def walk(prefix: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        nonlocal calls
+        entries: List[Tuple[Dict[str, Any], bool]] = []
+        folders: List[str] = []
+        request = {"Bucket": bucket_name, "Prefix": prefix, "Delimiter": "/"}
+        while True:
+            if calls >= OLDEST_OBJECT_LIST_CAP:
+                return None, capped
+            page = s3_client.list_object_versions(**request)
+            calls += 1
+            entries.extend((item, True) for item in page.get("Versions") or [])
+            entries.extend((item, False) for item in page.get("DeleteMarkers") or [])
+            folders.extend(
+                common["Prefix"] for common in page.get("CommonPrefixes") or []
+            )
+            if not page.get("IsTruncated"):
+                break
+            key_marker = page.get("NextKeyMarker")
+            request["KeyMarker"] = key_marker
+            if page.get("NextVersionIdMarker"):
+                request["VersionIdMarker"] = page["NextVersionIdMarker"]
+            else:
+                request.pop("VersionIdMarker", None)
+        oldest = None
+        by_key: Dict[str, List[Tuple[Dict[str, Any], bool]]] = {}
+        for item, is_version in entries:
+            by_key.setdefault(item["Key"], []).append((item, is_version))
+        for items in by_key.values():
+            items.sort(key=lambda pair: pair[0]["LastModified"], reverse=True)
+            for (newer, _), (item, is_version) in zip(items, items[1:]):
+                if is_version and (
+                    oldest is None or newer["LastModified"] < oldest["since"]
+                ):
+                    oldest = {
+                        "Key": item["Key"],
+                        "VersionId": item.get("VersionId"),
+                        "since": newer["LastModified"],
+                    }
+        dated = bool(folders) and all(
+            DATE_FOLDER_PATTERN.fullmatch(folder[len(prefix) :].rstrip("/"))
+            for folder in folders
+        )
+        for folder in sorted(folders):
+            found, error = walk(folder)
+            if error:
+                return None, error
+            if found and (oldest is None or found["since"] < oldest["since"]):
+                oldest = found
+            if dated and found:
+                break
+        return oldest, ""
+
+    oldest, error = walk(root)
+    return {"oldest": oldest, "error": error}
+
+
+def _noncurrent_deletion_evidence(
+    found: Dict[str, Any], root: str, noncurrent_schedules: List[int]
+) -> Dict[str, Any]:
+    """Judge the version that became noncurrent longest ago against NoncurrentDays."""
+    oldest = found["oldest"]
+    if oldest is None:
+        return {
+            "overdue": None,
+            "evidence": (
+                f"ListObjectVersions returns no noncurrent version under '{root}'"
+            ),
+        }
+    days = min(noncurrent_schedules)
+    now = datetime.now(timezone.utc)
+    age = int((now - oldest["since"]).total_seconds() // 86400)
+    stated = (
+        f"the noncurrent version under '{root}' that became noncurrent longest "
+        f"ago, '{oldest['Key']}' version {oldest['VersionId']}, did so {age} "
+        "day(s) ago"
+    )
+    allowance = (
+        f"plus {LIFECYCLE_DELETION_GRACE_DAYS} day(s) for the daily lifecycle run"
+    )
+    if now > oldest["since"] + timedelta(days=days + LIFECYCLE_DELETION_GRACE_DAYS):
+        return {
+            "overdue": (
+                f"{stated}, past its {days}-day noncurrent rule {allowance}, so "
+                "lifecycle deletion has not removed it on schedule"
+            ),
+            "evidence": "",
+        }
+    return {
+        "overdue": None,
+        "evidence": f"{stated} and is not past its {days}-day noncurrent rule {allowance}",
+    }
+
+
+def _lifecycle_deletion_evidence(
+    s3_client: Any,
+    bucket_name: str,
+    key_prefix: Optional[str],
+    root: Optional[str],
+    schedules: List[Any],
+    region: str,
+    noncurrent_schedules: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """
+    Judge whether lifecycle deletion has run from the age of the oldest object
+    under the bucket's record root (AIR-FND-DAT-08). Every counted rule covers
+    the whole root, so an object kept past the earliest of their expiries,
+    plus the daily run, was not deleted on schedule. With
+    ``noncurrent_schedules`` the version that became noncurrent longest ago is
+    judged the same way against the shortest NoncurrentDays. Without ``root``
+    the root is <keyPrefix>/AWSLogs/<account>/BedrockModelInvocationLogs/.
+    Returns ``overdue`` (the Failed text), ``evidence`` (the text a retained
+    line carries) and ``error``.
+    """
+    current = _current_deletion_evidence(
+        s3_client, bucket_name, key_prefix, root, schedules, region
+    )
+    if not noncurrent_schedules or current["error"]:
+        return current
+    action = "s3:ListBucketVersions"
+    try:
+        found = _oldest_noncurrent_version_under(
+            s3_client, bucket_name, current["root"]
+        )
+    except (ClientError, BotoCoreError) as error:
+        return dict(current, error=describe_api_error(error, action, region))
+    if found["error"]:
+        return dict(current, error=found["error"])
+    noncurrent = _noncurrent_deletion_evidence(
+        found, current["root"], noncurrent_schedules
+    )
+    overdue = [text for text in (current["overdue"], noncurrent["overdue"]) if text]
+    return {
+        "overdue": "; ".join(overdue) or None,
+        "evidence": ""
+        if overdue
+        else f"{current['evidence']}; {noncurrent['evidence']}",
+        "error": "",
+        "root": current["root"],
+    }
+
+
+def _current_deletion_evidence(
+    s3_client: Any,
+    bucket_name: str,
+    key_prefix: Optional[str],
+    root: Optional[str],
+    schedules: List[Any],
+    region: str,
+) -> Dict[str, Any]:
+    """The current-object half of _lifecycle_deletion_evidence."""
+    action = "s3:ListBucket"
+    try:
+        if root is None:
+            action = "sts:GetCallerIdentity"
+            stripped_prefix = (key_prefix or "").strip("/")
+            account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+                "Account"
+            ]
+            root = (
+                f"{stripped_prefix + '/' if stripped_prefix else ''}AWSLogs/"
+                f"{account}/BedrockModelInvocationLogs/"
+            )
+            action = "s3:ListBucket"
+        found = _oldest_object_under(s3_client, bucket_name, root)
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "overdue": None,
+            "evidence": "",
+            "error": describe_api_error(error, action, region),
+            "root": root,
+        }
+    if found["error"]:
+        return {"overdue": None, "evidence": "", "error": found["error"], "root": root}
+    oldest = found["oldest"]
+    if oldest is None:
+        return {
+            "overdue": None,
+            "evidence": (
+                f"ListObjectsV2 returns no object under '{root}', so no deletion "
+                "is yet due"
+            ),
+            "error": "",
+            "root": root,
+        }
+    written = oldest["LastModified"]
+    dues = []
+    for schedule in schedules:
+        if isinstance(schedule, datetime):
+            date = (
+                schedule if schedule.tzinfo else schedule.replace(tzinfo=timezone.utc)
+            )
+            dues.append((max(date, written), f"expiry date {date.date().isoformat()}"))
+        else:
+            dues.append((written + timedelta(days=schedule), f"{schedule}-day rule"))
+    due, named = min(dues, key=lambda pair: pair[0])
+    now = datetime.now(timezone.utc)
+    age = int((now - written).total_seconds() // 86400)
+    stated = (
+        f"the oldest object under '{root}', '{oldest['Key']}', was written "
+        f"{age} day(s) ago"
+    )
+    allowance = (
+        f"plus {LIFECYCLE_DELETION_GRACE_DAYS} day(s) for the daily lifecycle run"
+    )
+    if now > due + timedelta(days=LIFECYCLE_DELETION_GRACE_DAYS):
+        return {
+            "overdue": (
+                f"{stated}, past its {named} {allowance}, so lifecycle deletion "
+                "has not removed it on schedule"
+            ),
+            "evidence": "",
+            "error": "",
+            "root": root,
+        }
+    return {
+        "overdue": None,
+        "evidence": (
+            f"{stated} and is not past its {named} {allowance}, so no object is "
+            "held past it"
+        ),
+        "error": "",
+        "root": root,
+    }
 
 
 def _judge_log_bucket_retention(
@@ -4694,9 +5227,27 @@ def _judge_log_bucket_retention(
             f"{describe_api_error(error, 's3:GetReplicationConfiguration', region)}"
         )
         return
-    if not lock and not replicas:
+    deletion = _lifecycle_deletion_evidence(
+        s3_client,
+        bucket_name,
+        key_prefix,
+        root,
+        lifecycle["schedules"],
+        region,
+        lifecycle["noncurrent_schedules"],
+    )
+    if deletion["overdue"]:
+        unretained.append(f"{label} '{bucket_name}': {deletion['overdue']}")
+    if deletion["error"]:
+        undetermined.append(
+            f"{label} '{bucket_name}': whether lifecycle deletion has run was not "
+            f"read ({deletion['error']})"
+        )
+    on_schedule = not deletion["overdue"] and not deletion["error"]
+    if not lock and not replicas and on_schedule:
         retained.append(
-            f"{label} '{bucket_name}' lifecycle: {'; '.join(lifecycle['expirations'])}"
+            f"{label} '{bucket_name}' lifecycle: "
+            f"{'; '.join(lifecycle['expirations'])}; {deletion['evidence']}"
         )
     if replicas and root is not None:
         undetermined.append(
@@ -4720,15 +5271,24 @@ def _judge_log_bucket_retention(
                 f"object(s) read, so they are held back from expiry: "
                 f"{', '.join(held['failed'][:5])}"
             )
-        if held["error"]:
+        if held["capped"] and not held["failed"] and on_schedule:
+            # An object a FAILED status holds back past the rule would be
+            # older than the rule, and the oldest object is not.
+            retained.append(
+                f"{copies}; HeadObject reports no ReplicationStatus FAILED on the "
+                f"first {held['read']} invocation log object(s), and the objects "
+                f"past them were not read, but {deletion['evidence']}"
+            )
+        elif held["error"]:
             undetermined.append(
                 f"{copies}, and the ReplicationStatus of every invocation log "
                 f"object was not read: {held['error']}"
             )
-        elif not held["failed"]:
+        elif not held["failed"] and on_schedule:
             retained.append(
                 f"{copies}; HeadObject reports no ReplicationStatus FAILED on any "
-                f"of the {held['read']} invocation log object(s)"
+                f"of the {held['read']} invocation log object(s); "
+                f"{deletion['evidence']}"
             )
     for replica in replicas:
         replica_label = f"Replica S3 bucket (copied from '{bucket_name}')"
@@ -4751,10 +5311,30 @@ def _judge_log_bucket_retention(
                 f"{replica_label} '{replica}' {replica_lifecycle['deficiency']}"
             )
         else:
-            retained.append(
-                f"{replica_label} '{replica}' lifecycle: "
-                f"{'; '.join(replica_lifecycle['expirations'])}"
+            replica_deletion = _lifecycle_deletion_evidence(
+                s3_client,
+                replica,
+                key_prefix,
+                root,
+                replica_lifecycle["schedules"],
+                region,
+                replica_lifecycle["noncurrent_schedules"],
             )
+            if replica_deletion["overdue"]:
+                unretained.append(
+                    f"{replica_label} '{replica}': {replica_deletion['overdue']}"
+                )
+            elif replica_deletion["error"]:
+                undetermined.append(
+                    f"{replica_label} '{replica}': whether lifecycle deletion has "
+                    f"run was not read ({replica_deletion['error']})"
+                )
+            else:
+                retained.append(
+                    f"{replica_label} '{replica}' lifecycle: "
+                    f"{'; '.join(replica_lifecycle['expirations'])}; "
+                    f"{replica_deletion['evidence']}"
+                )
 
 
 def _invocation_log_retention_findings(
@@ -4840,9 +5420,11 @@ def _invocation_log_retention_findings(
                     "Invocation log retention is stated on "
                     f"{len(retained)} destination(s): {'; '.join(retained)}. "
                     "Confirm the stated period meets your own record-retention "
-                    "policy. Whether lifecycle deletion has run, and any legal "
-                    "hold on an individual object version, are not read by this "
-                    "check."
+                    "policy. On an S3 destination, lifecycle deletion is judged "
+                    "from the age of the oldest current object, and on a "
+                    "versioned bucket the oldest noncurrent version is read the "
+                    "same way; any legal hold on an individual object version is "
+                    "not read by this check."
                 ),
                 resolution="No action required",
                 reference=INVOCATION_LOG_RETENTION_REFERENCE,
@@ -5332,8 +5914,10 @@ def _sagemaker_inference_retention_findings(region: str) -> List[Dict[str, Any]]
         rows.append(
             row(
                 f"SageMaker inference data retention is stated on {len(retained)} "
-                f"destination(s): {'; '.join(retained)}. Whether lifecycle "
-                "deletion has run is not read by this check."
+                f"destination(s): {'; '.join(retained)}. Lifecycle deletion is "
+                "judged from the age of the oldest current object, and on a "
+                "versioned bucket the oldest noncurrent version is read the same "
+                "way."
                 + (
                     " This is not reported as Passed, because not every "
                     "destination was read."
@@ -10273,12 +10857,20 @@ INVOCATION_LOG_ARCHIVE_RESOLUTION = (
 
 
 def _invocation_log_bucket_lock(
-    s3_client, bucket: str, lock_cache: Dict[str, Tuple[str, Any]]
+    s3_client,
+    bucket: str,
+    lock_cache: Dict[str, Tuple[str, Any]],
+    account: Optional[str] = None,
 ) -> Tuple[str, str]:
     """
     Judge one bucket's Object Lock default retention: ("ok", text), ("bad",
     text) or ("unread", text). Only COMPLIANCE mode holds against a principal
     with s3:BypassGovernanceRetention.
+
+    A COMPLIANCE bucket must also sit in a separate Log Archive account. The
+    lock read is repeated with ExpectedBucketOwner set to ``account``: S3
+    answers it when this account owns the bucket and denies it otherwise, so
+    a denial after the plain read succeeded means another account owns it.
     """
     if bucket not in lock_cache:
         try:
@@ -10323,8 +10915,43 @@ def _invocation_log_bucket_lock(
         if retention.get("Days")
         else f"{retention.get('Years')} year(s)"
     )
-    return "ok", (
+    locked = (
         f"bucket '{bucket}', whose default retention is COMPLIANCE mode for {period}"
+    )
+    if not account:
+        return "unread", (
+            f"{locked}; the owner of bucket '{bucket}' was not compared with this "
+            "account, because sts:GetCallerIdentity returned no account"
+        )
+    owner_key = f"owner:{bucket}"
+    if owner_key not in lock_cache:
+        try:
+            s3_client.get_object_lock_configuration(
+                Bucket=bucket, ExpectedBucketOwner=account
+            )
+            lock_cache[owner_key] = ("read", "same")
+        except ClientError as error:
+            label = get_assessment_error_label(error)
+            lock_cache[owner_key] = (
+                ("read", "other") if label == "AccessDenied" else ("error", label)
+            )
+        except BotoCoreError as error:
+            lock_cache[owner_key] = ("error", get_assessment_error_label(error))
+    state, owner = lock_cache[owner_key]
+    if state == "error":
+        return "unread", (
+            f"{locked}; the owner of bucket '{bucket}' was not compared with this "
+            f"account ({owner})"
+        )
+    if owner == "same":
+        return "bad", (
+            f"{locked}, but which this account {account} owns, not a separate Log "
+            "Archive account, so this account's administrator controls the bucket "
+            "that holds the copy"
+        )
+    return "ok", (
+        f"{locked}, and which another account owns: S3 denied the read naming "
+        f"this account {account} as ExpectedBucketOwner"
     )
 
 
@@ -10419,7 +11046,9 @@ def _invocation_log_subscription_archive(
             )
             continue
         bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
-        state, text = _invocation_log_bucket_lock(s3_client, bucket, lock_cache)
+        state, text = _invocation_log_bucket_lock(
+            s3_client, bucket, lock_cache, account
+        )
         verdicts.append((state, f"{stream_label}, which delivers to {text}"))
     if not verdicts:
         return "bad", f"{stream_label} reports no destination"
@@ -10441,8 +11070,9 @@ def _invocation_log_archive_findings(
     a WORM copy. Log events in CloudWatch Logs have no WORM storage of their
     own, so the log group must be forwarded by a subscription filter through
     Firehose to a bucket with Object Lock in COMPLIANCE mode; an S3 destination
-    is itself judged on its Object Lock default retention. Whether a bucket is
-    in a separate Log Archive account is not read.
+    is itself judged on its Object Lock default retention, and a COMPLIANCE
+    bucket this account owns fails, because the control prescribes a separate
+    Log Archive account.
     """
 
     def row(details: str, resolution: str, severity: str, status: str):
@@ -10459,14 +11089,21 @@ def _invocation_log_archive_findings(
 
     lock_cache: Dict[str, Tuple[str, Any]] = {}
     rows = []
+    try:
+        account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+    except (ClientError, BotoCoreError, KeyError, TypeError):
+        account = None
     for bucket in buckets:
-        state, text = _invocation_log_bucket_lock(s3_client, bucket, lock_cache)
+        state, text = _invocation_log_bucket_lock(
+            s3_client, bucket, lock_cache, account
+        )
         if state == "ok":
             rows.append(
                 row(
                     f"Invocation log {text}, so the records written to it cannot be "
-                    "deleted or overwritten until it expires. Whether the bucket "
-                    "is in a separate Log Archive account is not read.",
+                    "deleted or overwritten until it expires.",
                     "No action required",
                     "Medium",
                     "Passed",
@@ -10475,7 +11112,7 @@ def _invocation_log_archive_findings(
         elif state == "unread":
             rows.append(
                 row(
-                    f"Object Lock on the invocation log bucket was not read: {text}.",
+                    f"The invocation log bucket was not judged in full: {text}.",
                     COULD_NOT_ASSESS_RESOLUTION,
                     "Informational",
                     "N/A",
@@ -10542,8 +11179,7 @@ def _invocation_log_archive_findings(
         rows.append(
             row(
                 f"Invocation log group '{log_group_name}' forwards every event by "
-                f"{passed[0]}. Whether the bucket is in a separate Log Archive "
-                "account is not read.",
+                f"{passed[0]}.",
                 "No action required",
                 "Medium",
                 "Passed",
@@ -25823,6 +26459,200 @@ def check_bedrock_job_vpc(
     return findings
 
 
+AI_WORKLOAD_SUBNET_FINDING = "AI Workload Subnet Privacy"
+
+
+def check_ai_workload_subnet_privacy(
+    permission_cache: Dict[str, Any],
+    region: str = "",
+    workload_inventory: Optional[Dict[str, Any]] = None,
+    ec2_client: Any = None,
+) -> Dict[str, Any]:
+    """
+    BR-39: Require every workload whose role is granted a Bedrock, AgentCore or
+    SageMaker runtime surface to run in a VPC on subnets that route to no
+    internet gateway.
+
+    The population is BR-02's workload inventory: every Lambda function, ECS
+    service and standalone task, EC2 instance, SageMaker notebook instance and
+    endpoint, EKS pod identity association and VPC-mode AgentCore runtime
+    version. A workload is AI compute when its role is granted one of those
+    surfaces, the test BR-02 applies.
+    """
+    findings = {"csv_data": []}
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-39",
+            finding_name=AI_WORKLOAD_SUBNET_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=VPC_ENDPOINT_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        inventory = workload_inventory or get_bedrock_vpc_workload_inventory(region)
+        roles = permission_cache.get("role_permissions") or {}
+        unread = list(inventory.get("errors") or [])
+        in_vpc = []
+        failed = []
+        for workload in inventory.get("workloads") or []:
+            label = "{} '{}'".format(workload["kind"], workload["name"])
+            role = workload.get("role")
+            if not role:
+                continue
+            if role not in roles:
+                unread.append(
+                    f"{label} runs as role '{role}', which the IAM cache does not hold"
+                )
+                continue
+            try:
+                granted = _granted_bedrock_surfaces(roles[role], AI_WORKLOAD_SURFACES)
+            except (ValueError, TypeError, AttributeError):
+                unread.append(
+                    f"{label} runs as role '{role}', whose policies could not be parsed"
+                )
+                continue
+            if not granted:
+                continue
+            if not workload.get("vpc_id"):
+                failed.append(
+                    f"{label} (role '{role}') is not attached to a VPC, so it runs "
+                    "outside any private network boundary"
+                )
+            elif not workload.get("subnets"):
+                unread.append(
+                    f"the subnets of {label} in {workload['vpc_id']} were not read"
+                )
+            else:
+                in_vpc.append((label, role, workload))
+
+        subnets = sorted(
+            {subnet for _, _, workload in in_vpc for subnet in workload["subnets"]}
+        )
+        privacy = (
+            _subnet_route_privacy(region, subnets, ec2_client)
+            if subnets
+            else {"public": {}, "private": [], "unresolved": {}, "error": ""}
+        )
+        private = []
+        for label, role, workload in in_vpc:
+            if privacy["error"]:
+                unread.append(
+                    f"the subnets of {label} were not resolved to a route table "
+                    f"({privacy['error']})"
+                )
+                continue
+            public = [
+                f"{subnet} ({privacy['public'][subnet]})"
+                for subnet in workload["subnets"]
+                if subnet in privacy["public"]
+            ]
+            if public:
+                failed.append(
+                    "{} in {} (role '{}') runs on subnet(s) that route to an "
+                    "internet gateway: {}".format(
+                        label, workload["vpc_id"], role, "; ".join(public[:5])
+                    )
+                )
+                continue
+            unresolved = [
+                f"{subnet} ({privacy['unresolved'].get(subnet, 'not resolved')})"
+                for subnet in workload["subnets"]
+                if subnet not in privacy["private"]
+            ]
+            if unresolved:
+                unread.append(
+                    "the subnet(s) of {} were not resolved: {}".format(
+                        label, "; ".join(unresolved[:5])
+                    )
+                )
+                continue
+            private.append(f"{label} in {workload['vpc_id']}")
+
+        if failed:
+            findings["csv_data"].append(
+                row(
+                    "{} AI workload(s) run outside a private network boundary: "
+                    "{}.".format(len(failed), "; ".join(failed[:10])),
+                    "Run each workload granted Bedrock, AgentCore or SageMaker "
+                    "runtime access in a VPC on subnets whose route tables carry no "
+                    "internet gateway route, and reach AWS services from them "
+                    "through VPC endpoints or a NAT gateway.",
+                    "High",
+                    "Failed",
+                )
+            )
+        if private:
+            findings["csv_data"].append(
+                row(
+                    "{} AI workload(s) run in a VPC on subnets whose route tables "
+                    "carry no internet gateway route: {}.{}".format(
+                        len(private),
+                        "; ".join(private[:10]),
+                        " This is not reported as Passed because part of the "
+                        "workload population was not read."
+                        if unread
+                        else "",
+                    ),
+                    "No action required",
+                    "High",
+                    "N/A" if unread else "Passed",
+                )
+            )
+        if unread:
+            findings["csv_data"].append(
+                row(
+                    "{} part(s) of the AI workload population were not read, so "
+                    "their subnets were not judged: {}.".format(
+                        len(unread), "; ".join(unread[:10])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if not findings["csv_data"]:
+            findings["csv_data"].append(
+                row(
+                    "No Lambda function, ECS service or task, EC2 instance, "
+                    "SageMaker notebook instance or endpoint, EKS pod identity "
+                    "association or AgentCore runtime in "
+                    f"{region or 'this Region'} runs as a role granted a Bedrock, "
+                    "AgentCore or SageMaker runtime surface.",
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        return _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-39",
+            AI_WORKLOAD_SUBNET_FINDING,
+            VPC_ENDPOINT_REFERENCE,
+            region,
+            principal_types=("role",),
+        )
+    except Exception as error:
+        logger.error(
+            f"Error in check_ai_workload_subnet_privacy: {str(error)}", exc_info=True
+        )
+        return {
+            "csv_data": [
+                row(
+                    build_could_not_assess_detail(error, region),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            ]
+        }
+
+
 def check_bedrock_marketplace_endpoint_cmk(
     region: str = "",
     endpoint_inventory: Dict[str, Any] = None,
@@ -27388,6 +28218,64 @@ def _region_probe(service: str) -> str:
     return f"{service}:{REGION_SERVICE_PROBE}"
 
 
+def _pattern_reaches_service(pattern: str, service: str) -> bool:
+    """
+    Return True when an IAM action pattern matches some action of ``service``.
+
+    The pattern is walked over ``service:`` one character at a time, keeping
+    every position it can be at, so a wildcard in the service segment
+    ("sage*:Describe*", "*:List*") is caught as well as a literal one. Runs of
+    * are collapsed first, so the walk stays linear in the pattern's length.
+    """
+    pattern = re.sub(r"\*+", "*", pattern.strip().lower())
+    states = {0}
+    for char in service + ":":
+        expanded = set()
+        for index in states:
+            while index < len(pattern) and pattern[index] == "*":
+                expanded.add(index)
+                index += 1
+            expanded.add(index)
+        states = set()
+        for index in expanded:
+            if index < len(pattern):
+                if pattern[index] == "*":
+                    states.add(index)
+                elif pattern[index] in ("?", char):
+                    states.add(index + 1)
+        if not states:
+            return False
+    return any(index < len(pattern) for index in states)
+
+
+# The S3 actions the Control Tower Region deny (CT.MULTISERVICE.PV.1 and the
+# landing zone control) exempts by default, as its published SCP artifact lists
+# them. Each acts on an account-level or Multi-Region Access Point resource, not
+# on a bucket in a Region, so keeping them open does not let a bucket be created
+# outside the approved Regions. Matched literally; any other exemption counts.
+CONTROL_TOWER_REGION_DENY_EXEMPTIONS = frozenset(
+    (
+        "s3:createmultiregionaccesspoint",
+        "s3:deletemultiregionaccesspoint",
+        "s3:describemultiregionaccesspointoperation",
+        "s3:getaccountpublicaccessblock",
+        "s3:getbucketlocation",
+        "s3:getbucketpolicystatus",
+        "s3:getbucketpublicaccessblock",
+        "s3:getmultiregionaccesspoint",
+        "s3:getmultiregionaccesspointpolicy",
+        "s3:getmultiregionaccesspointpolicystatus",
+        "s3:getstoragelensconfiguration",
+        "s3:getstoragelensdashboard",
+        "s3:listallmybuckets",
+        "s3:listmultiregionaccesspoints",
+        "s3:liststoragelensconfigurations",
+        "s3:putaccountpublicaccessblock",
+        "s3:putmultiregionaccesspointpolicy",
+    )
+)
+
+
 def _region_action_label(action: str) -> str:
     """Name an action for finding text, writing a service probe as service:*."""
     if action.endswith(":" + REGION_SERVICE_PROBE):
@@ -27621,11 +28509,36 @@ def _scp_region_controls(
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "DENY":
             continue
-        covered = [
-            action_name
-            for action_name in actions
-            if _statement_matches_action(statement, action_name)
-        ]
+        # A probe stands for every action of its service, so a NotAction entry
+        # that names any action of that service leaves the prefix uncovered.
+        covered = []
+        exempted = []
+        open_prefixes = []
+        default_exempted = []
+        for action_name in actions:
+            if not _statement_matches_action(statement, action_name):
+                continue
+            if action_name.endswith(":" + REGION_SERVICE_PROBE):
+                service = action_name.split(":", 1)[0]
+                reaching = [
+                    pattern.strip()
+                    for pattern in _as_list(statement.get("NotAction"))
+                    if isinstance(pattern, str)
+                    and _pattern_reaches_service(pattern, service)
+                ]
+                open_patterns = [
+                    pattern
+                    for pattern in reaching
+                    if pattern.lower() not in CONTROL_TOWER_REGION_DENY_EXEMPTIONS
+                ]
+                if open_patterns:
+                    exempted.extend(p for p in open_patterns if p not in exempted)
+                    open_prefixes.append(action_name)
+                    continue
+                default_exempted.extend(
+                    p for p in reaching if p not in default_exempted
+                )
+            covered.append(action_name)
         if not covered:
             continue
         conditions = _condition_keys_by_operator(statement)
@@ -27716,6 +28629,9 @@ def _scp_region_controls(
                 "exemptions": exemptions,
                 "gaps": list(gaps),
                 "profile_scope": profile_scope,
+                "exempted": exempted,
+                "open_prefixes": open_prefixes,
+                "default_exempted": default_exempted,
             }
             if negated:
                 if str(operator).lower().startswith("foranyvalue:"):
@@ -27791,6 +28707,18 @@ def _describe_region_control(policy_name: str, control: Dict[str, Any]) -> str:
         text += ", but it is not credited because " + " and ".join(control["gaps"])
     if control["exemptions"]:
         text += "; it exempts principals matching " + "; ".join(control["exemptions"])
+    if control["exempted"]:
+        text += "; its NotAction exempts {}, so it does not deny all of {}".format(
+            ", ".join(control["exempted"]),
+            ", ".join(map(_region_action_label, control["open_prefixes"])),
+        )
+    if control["default_exempted"]:
+        text += (
+            "; it keeps the Control Tower default exemptions {}, which act on "
+            "account-level and Multi-Region Access Point resources".format(
+                ", ".join(control["default_exempted"])
+            )
+        )
     return text
 
 
@@ -34347,8 +35275,8 @@ def _customization_job_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "errors": errors}
 
 
-# DescribeTrainingJob is one call per job, so where it is the only reader the
-# most recent jobs are read and the rest are named as unread.
+# Describe and Get calls are one per job, so the most recent jobs a bulk read
+# does not return are read and the rest are named as unread.
 MAX_SAGEMAKER_TRAINING_JOB_READS = 200
 
 
@@ -34356,19 +35284,38 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 locations of the SageMaker training jobs in ``region``.
 
-    ListTrainingJobs summaries carry no S3 location, so each job takes one
-    DescribeTrainingJob call: every InputDataConfig channel's S3Uri is training
-    data, OutputDataConfig.S3OutputPath is output and
-    ModelArtifacts.S3ModelArtifacts is a model artifact. Every page is listed,
-    newest first. Search returns the same TrainingJob record 100 jobs a page,
-    so every Search page is read and only a listed job Search did not return
-    takes a DescribeTrainingJob call. Those calls stop at
+    Search with Resource TrainingJob returns each job's full description, 100
+    to a page, and every page is read: every InputDataConfig channel's S3Uri is
+    training data, OutputDataConfig.S3OutputPath is output and
+    ModelArtifacts.S3ModelArtifacts is a model artifact. Every ListTrainingJobs
+    page is also listed, newest first, and only a listed job Search did not
+    return takes a DescribeTrainingJob call. Those calls stop at
     MAX_SAGEMAKER_TRAINING_JOB_READS and the jobs past it are named in
-    ``errors``. Each location is {"role", "uri", "job", "started"}.
+    ``errors``. When ListTrainingJobs fails, the Search results are the
+    population; when both fail, nothing is read. Each location is {"role",
+    "uri", "job", "started"}.
     """
     locations = []
     errors = []
     client = boto3.client("sagemaker", config=boto3_config, region_name=region)
+    searched = {}
+    search_error = ""
+    try:
+        for record in _list_all_items(
+            client,
+            "search",
+            "Results",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            Resource="TrainingJob",
+            SortBy="CreationTime",
+            SortOrder="Descending",
+        ):
+            found = record.get("TrainingJob") if isinstance(record, dict) else None
+            if isinstance(found, dict) and found.get("TrainingJobName"):
+                searched[found["TrainingJobName"]] = found
+    except (ClientError, BotoCoreError, TypeError) as error:
+        search_error = get_assessment_error_label(error)
     try:
         jobs = _list_all_items(
             client,
@@ -34380,31 +35327,19 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
             SortOrder="Descending",
         )
     except (ClientError, BotoCoreError, TypeError) as error:
-        return {
-            "locations": [],
-            "errors": [
-                "SageMaker training jobs were not read with "
-                f"sagemaker:ListTrainingJobs ({get_assessment_error_label(error)})"
-            ],
-        }
-    searched = {}
-    search_error = ""
-    if jobs:
-        try:
-            for record in _list_all_items(
-                client,
-                "search",
-                "Results",
-                max_results_param="MaxResults",
-                token_param="NextToken",
-                Resource="TrainingJob",
-            ):
-                found = record.get("TrainingJob") if isinstance(record, dict) else None
-                if isinstance(found, dict) and found.get("TrainingJobName"):
-                    searched[found["TrainingJobName"]] = found
-        except (ClientError, BotoCoreError, TypeError) as error:
-            search_error = get_assessment_error_label(error)
-    unsearched = [job for job in jobs if job.get("TrainingJobName") not in searched]
+        if search_error:
+            return {
+                "locations": [],
+                "errors": [
+                    "SageMaker training jobs were not read with sagemaker:Search "
+                    f"({search_error}) or sagemaker:ListTrainingJobs "
+                    f"({get_assessment_error_label(error)})"
+                ],
+            }
+        jobs = []
+    listed = [job.get("TrainingJobName") or "unnamed" for job in jobs]
+    names = listed + [name for name in searched if name not in set(listed)]
+    unsearched = [name for name in listed if name not in searched]
     if len(unsearched) > MAX_SAGEMAKER_TRAINING_JOB_READS:
         errors.append(
             "{} older SageMaker training job(s) past the newest {} were not read "
@@ -34416,12 +35351,8 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
                 else ", and sagemaker:Search did not return them",
             )
         )
-    described = {
-        job.get("TrainingJobName") or "unnamed"
-        for job in unsearched[:MAX_SAGEMAKER_TRAINING_JOB_READS]
-    }
-    for job in jobs:
-        name = job.get("TrainingJobName") or "unnamed"
+    described = set(unsearched[:MAX_SAGEMAKER_TRAINING_JOB_READS])
+    for name in names:
         if name in searched:
             detail = searched[name]
         elif name not in described:
@@ -34464,11 +35395,54 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "errors": errors}
 
 
+def _trial_component_job_details(client, kind: str) -> Dict[str, Any]:
+    """
+    Map each SageMaker {kind} job name to its description, from the trial
+    component SageMaker records for it: Search with Resource
+    ExperimentTrialComponent returns SourceDetail.TransformJob or
+    SourceDetail.ProcessingJob in full, 100 to a page. A job with no trial
+    component is absent, and a failed search returns {}, so each such job is
+    left to its Describe call.
+    """
+    detail_key = {"transform": "TransformJob", "processing": "ProcessingJob"}[kind]
+    name_key = f"{detail_key}Name"
+    try:
+        results = _list_all_items(
+            client,
+            "search",
+            "Results",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            Resource="ExperimentTrialComponent",
+            SearchExpression={
+                "Filters": [
+                    {
+                        "Name": "Source.SourceArn",
+                        "Operator": "Contains",
+                        "Value": f":{kind}-job/",
+                    }
+                ]
+            },
+        )
+    except (ClientError, BotoCoreError, TypeError):
+        return {}
+    details = {}
+    for result in results:
+        detail = ((result.get("TrialComponent") or {}).get("SourceDetail") or {}).get(
+            detail_key
+        )
+        if isinstance(detail, dict) and detail.get(name_key):
+            details[detail[name_key]] = detail
+    return details
+
+
 def _sagemaker_batch_job_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 input and output of the SageMaker transform and processing
-    jobs in ``region``, newest first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs
-    of each kind; older jobs are named in ``errors``. A transform job reads
+    jobs in ``region``. Every job is listed; a job whose trial component holds
+    its description is read from that, and the rest are described, newest
+    first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs of each kind, with older
+    ones named in ``errors``. A transform job reads
     TransformInput.DataSource.S3DataSource.S3Uri and writes
     TransformOutput.S3OutputPath; a processing job reads each
     ProcessingInputs[].S3Input.S3Uri and writes each
@@ -34512,20 +35486,23 @@ def _sagemaker_batch_job_locations(region: str = "") -> Dict[str, Any]:
                 f"({get_assessment_error_label(error)})"
             )
             continue
-        if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
+        held = _trial_component_job_details(client, kind)
+        undescribed = [job for job in jobs if job.get(name_key) not in held]
+        if len(undescribed) > MAX_SAGEMAKER_TRAINING_JOB_READS:
             errors.append(
                 "{} older {} job(s) past the newest {} were not read with "
-                "sagemaker:{}".format(
-                    len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
+                "sagemaker:{}, and no trial component holds them".format(
+                    len(undescribed) - MAX_SAGEMAKER_TRAINING_JOB_READS,
                     kind,
                     MAX_SAGEMAKER_TRAINING_JOB_READS,
                     actions[1],
                 )
             )
-        for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
+        read = undescribed[:MAX_SAGEMAKER_TRAINING_JOB_READS]
+        for job in [job for job in jobs if job.get(name_key) in held] + read:
             name = job.get(name_key) or "unnamed"
             try:
-                detail = getattr(client, describe)(**{name_key: name})
+                detail = held.get(name) or getattr(client, describe)(**{name_key: name})
             except (ClientError, BotoCoreError) as error:
                 errors.append(
                     f"{kind} job '{name}' was not read with sagemaker:{actions[1]} "
@@ -34643,11 +35620,22 @@ def _sagemaker_endpoint_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "uris": uris, "errors": errors}
 
 
+# Evaluation job summaries carry no S3 location, so each job is read with
+# GetEvaluationJob. A live call took 0.079 s at the median and 0.188 s at the
+# slowest of ten (us-east-1, 2026-10-04), and the account quota allows 5,000
+# evaluation jobs, which at 0.188 s is 940 s against the function's 600 s
+# timeout. 600 reads stay under 113 s, a fifth of that timeout.
+MAX_EVALUATION_JOB_READS = 600
+
+# Jobs past MAX_EVALUATION_JOB_READS named in the N/A text; the rest are counted.
+EVALUATION_JOBS_NAMED_PAST_CAP = 50
+
+
 def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 datasets and output of the Bedrock evaluation jobs in
-    ``region``, newest first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs; older
-    jobs are named in ``errors``. Each automated or human dataset's
+    ``region`` (ListEvaluationJobs, every page), newest first, to
+    MAX_EVALUATION_JOB_READS jobs; older jobs are named in ``errors``. Each automated or human dataset's
     datasetLocation.s3Uri is read and outputDataConfig.s3Uri is written.
     Returns {"locations": [(bucket, label)], "errors"}.
     """
@@ -34670,15 +35658,22 @@ def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
                 f"({get_assessment_error_label(error)})"
             ],
         }
-    if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
+    unread = [
+        job.get("jobName") or job.get("jobArn") or "unnamed"
+        for job in jobs[MAX_EVALUATION_JOB_READS:]
+    ]
+    if unread:
+        rest = len(unread) - EVALUATION_JOBS_NAMED_PAST_CAP
         errors.append(
             "{} older evaluation job(s) past the newest {} were not read with "
-            "bedrock:GetEvaluationJob".format(
-                len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
-                MAX_SAGEMAKER_TRAINING_JOB_READS,
+            "bedrock:GetEvaluationJob: {}{}".format(
+                len(unread),
+                MAX_EVALUATION_JOB_READS,
+                ", ".join(unread[:EVALUATION_JOBS_NAMED_PAST_CAP]),
+                f", and {rest} more" if rest > 0 else "",
             )
         )
-    for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
+    for job in jobs[:MAX_EVALUATION_JOB_READS]:
         name = job.get("jobName") or job.get("jobArn") or "unnamed"
         try:
             detail = client.get_evaluation_job(jobIdentifier=job.get("jobArn"))
@@ -34833,7 +35828,8 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
 def _agentcore_s3_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 buckets AgentCore reads code from or writes recordings to: the
-    code artifact of every runtime's listed version and the session recording
+    code artifact of every runtime version that is listed or that an endpoint
+    serves as its live or target version, and the session recording
     destination of every browser with recording enabled. Every page is read.
     Returns {"locations": [(bucket, label)], "errors"}.
     """
@@ -34852,32 +35848,53 @@ def _agentcore_s3_locations(region: str = "") -> Dict[str, Any]:
         )
     for runtime in runtimes:
         name = runtime.get("agentRuntimeName") or runtime.get("agentRuntimeId")
+        versions = {str(runtime.get("agentRuntimeVersion") or "")}
         try:
-            detail = client.get_agent_runtime(
+            endpoints = _list_all_items(
+                client,
+                "list_agent_runtime_endpoints",
+                "runtimeEndpoints",
                 agentRuntimeId=runtime.get("agentRuntimeId"),
-                agentRuntimeVersion=str(runtime.get("agentRuntimeVersion") or ""),
             )
-        except (ClientError, BotoCoreError) as error:
+        except (ClientError, BotoCoreError, TypeError) as error:
+            endpoints = []
             errors.append(
-                f"AgentCore runtime '{name}' was not read with "
-                f"bedrock-agentcore:GetAgentRuntime ({get_assessment_error_label(error)})"
+                f"the endpoints of AgentCore runtime '{name}' were not listed with "
+                "bedrock-agentcore:ListAgentRuntimeEndpoints, so only its listed "
+                f"version was read ({get_assessment_error_label(error)})"
             )
-            continue
-        code = (
-            (
-                (detail.get("agentRuntimeArtifact") or {}).get("codeConfiguration")
-                or {}
-            ).get("code")
-            or {}
-        ).get("s3") or {}
-        if code.get("bucket"):
-            locations.append(
-                (
-                    str(code["bucket"]),
-                    f"the code artifact of AgentCore runtime '{name}' version "
-                    f"{runtime.get('agentRuntimeVersion')}",
+        for endpoint in endpoints:
+            for field in ("liveVersion", "targetVersion"):
+                if endpoint.get(field):
+                    versions.add(str(endpoint[field]))
+        for version in sorted(version for version in versions if version):
+            try:
+                detail = client.get_agent_runtime(
+                    agentRuntimeId=runtime.get("agentRuntimeId"),
+                    agentRuntimeVersion=version,
                 )
-            )
+            except (ClientError, BotoCoreError) as error:
+                errors.append(
+                    f"AgentCore runtime '{name}' version {version} was not read with "
+                    "bedrock-agentcore:GetAgentRuntime "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            code = (
+                (
+                    (detail.get("agentRuntimeArtifact") or {}).get("codeConfiguration")
+                    or {}
+                ).get("code")
+                or {}
+            ).get("s3") or {}
+            if code.get("bucket"):
+                locations.append(
+                    (
+                        str(code["bucket"]),
+                        f"the code artifact of AgentCore runtime '{name}' version "
+                        f"{version}",
+                    )
+                )
     try:
         browsers = _list_all_items(
             client, "list_browsers", "browserSummaries", type="CUSTOM"
@@ -35748,8 +36765,8 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
     """
     List the ARN of every Bedrock agent, knowledge base, flow, prompt,
     guardrail, custom and imported model, provisioned throughput, application
-    inference profile, and batch inference, model customization and evaluation
-    job in the Region.
+    inference profile, batch inference, model customization and evaluation
+    job, and Marketplace model endpoint in the Region.
 
     The population comes from the Bedrock list APIs, never from a tag query,
     because a tag query cannot return a resource that was never tagged.
@@ -35833,6 +36850,14 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
             "jobArn",
             None,
         ),
+        (
+            "marketplace model endpoint",
+            bedrock_client,
+            "list_marketplace_model_endpoints",
+            "marketplaceModelEndpoints",
+            "endpointArn",
+            None,
+        ),
     )
     resource_types = {"agent": "agent", "knowledge base": "knowledge-base"}
     for label, client, operation, result_key, arn_field, id_field in legs:
@@ -35869,8 +36894,8 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
     """
     BR-53: Verify every Bedrock agent, knowledge base, flow, prompt, guardrail,
     custom and imported model, provisioned throughput, application inference
-    profile and batch inference, customization and evaluation job carries an
-    owner tag whose value names someone.
+    profile, batch inference, customization and evaluation job, and Marketplace
+    model endpoint carries an owner tag whose value names someone.
     """
     logger.debug("Starting check for Bedrock resource owner tags")
     check_name = RESOURCE_OWNER_FINDING
@@ -35913,8 +36938,9 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
                 row(
                     "No Bedrock agent, knowledge base, flow, prompt, guardrail, custom "
                     "or imported model, provisioned throughput, application "
-                    "inference profile, or batch inference, model customization or "
-                    "evaluation job was listed in {}.".format(region or "this region"),
+                    "inference profile, batch inference, model customization or "
+                    "evaluation job, or Marketplace model endpoint was listed in "
+                    "{}.".format(region or "this region"),
                     "No action required",
                     "Informational",
                     "N/A",
@@ -36181,6 +37207,17 @@ RESOURCE_OWNER_SWEEP_LISTS = (
         {},
     ),
     (
+        "sagemaker",
+        "SageMaker",
+        "transform job",
+        "sagemaker",
+        "list_transform_jobs",
+        "TransformJobSummaries",
+        "TransformJobArn",
+        "sagemaker:ListTransformJobs",
+        {},
+    ),
+    (
         "bedrock-agentcore",
         "AgentCore",
         "agent runtime",
@@ -36253,9 +37290,9 @@ RESOURCE_OWNER_SWEEP_LISTS = (
 RESOURCE_OWNER_SWEEP_GAP = (
     "SageMaker and AgentCore resource types other than endpoints, models, "
     "notebook instances, training jobs, domains, inference components, "
-    "pipelines, processing jobs, agent runtimes, memories, gateways, custom "
-    "browsers, custom code interpreters and workload identities are read only "
-    "through GetResources, which returns only resources that are or were "
+    "pipelines, processing jobs, transform jobs, agent runtimes, memories, "
+    "gateways, custom browsers, custom code interpreters and workload identities "
+    "are read only through GetResources, which returns only resources that are or were "
     "tagged, so a resource never tagged is not listed "
     "(https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/"
     "API_GetResources.html)."
@@ -37350,6 +38387,77 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
     }
 
 
+# LookupEvents pages read per attestation-bound key. At 50 events a page, a key
+# with more events in its 90-day event history is reported as not read in full.
+ENCLAVE_EVENT_MAX_PAGES = 20
+
+
+def _zero_measurement(value: Any) -> bool:
+    """True when an attestation measurement is all zeros, as hex or as base64."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if re.fullmatch(r"0+", text):
+        return True
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    return bool(decoded) and not any(decoded)
+
+
+def _enclave_attestation_events(cloudtrail_client: Any, key_arn: str) -> Dict[str, Any]:
+    """
+    Read the key's CloudTrail event history (LookupEvents by ResourceName) and
+    name each request whose additionalEventData.recipient carries an all-zero
+    attestationDocumentEnclaveImageDigest. KMS records the recipient block
+    only for a request that supplied an attestation document, and an enclave
+    run with --debug-mode or --attach-console presents every PCR as zeros.
+    """
+    read = 0
+    attested = 0
+    zero: List[str] = []
+    names: List[str] = []
+    request = {
+        "LookupAttributes": [
+            {"AttributeKey": "ResourceName", "AttributeValue": key_arn}
+        ],
+        "MaxResults": LOOKUP_EVENTS_PAGE_SIZE,
+    }
+    error = f"events past the first {ENCLAVE_EVENT_MAX_PAGES} page(s) were not read"
+    try:
+        for _ in range(ENCLAVE_EVENT_MAX_PAGES):
+            response = cloudtrail_client.lookup_events(**request)
+            for event in response.get("Events") or []:
+                read += 1
+                record = json.loads(event.get("CloudTrailEvent") or "{}")
+                recipient = (record.get("additionalEventData") or {}).get("recipient")
+                if not isinstance(recipient, dict):
+                    continue
+                attested += 1
+                if _zero_measurement(
+                    recipient.get("attestationDocumentEnclaveImageDigest")
+                ):
+                    zero.append(str(event.get("EventId") or record.get("eventID")))
+                    name = str(event.get("EventName") or record.get("eventName"))
+                    if name not in names:
+                        names.append(name)
+            token = response.get("NextToken")
+            if not token:
+                error = ""
+                break
+            request["NextToken"] = token
+    except (ClientError, BotoCoreError) as lookup_error:
+        error = f"cloudtrail:LookupEvents, {get_assessment_error_label(lookup_error)}"
+    return {
+        "read": read,
+        "attested": attested,
+        "zero": zero,
+        "names": names,
+        "error": error,
+    }
+
+
 def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
     """
     BR-55: For every KMS key whose policy declares a RecipientAttestation
@@ -37379,6 +38487,9 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
             )
 
         kms_client = boto3.client("kms", config=boto3_config, region_name=region)
+        cloudtrail_client = boto3.client(
+            "cloudtrail", config=boto3_config, region_name=region
+        )
         keys = _list_all_items(
             kms_client,
             "list_keys",
@@ -37391,6 +38502,8 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
 
         undeclared = 0
         passed = []
+        events_read = 0
+        events_attested = 0
         indeterminate = []
         for key in keys:
             key_id = key.get("KeyArn") or key.get("KeyId")
@@ -37459,6 +38572,18 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                                 ", ".join(released),
                             )
                         )
+            events = _enclave_attestation_events(cloudtrail_client, key_id)
+            if events["zero"]:
+                deficiencies.append(
+                    "CloudTrail event history records {} request(s) on the key "
+                    "({}) whose attestation document carries an all-zero enclave "
+                    "image digest, which an enclave run with --debug-mode or "
+                    "--attach-console presents: {}".format(
+                        len(events["zero"]),
+                        ", ".join(events["names"]),
+                        ", ".join(events["zero"][:5]),
+                    )
+                )
             if grants_error and not deficiencies:
                 indeterminate.append(
                     f"{key_id}: its key policy binds attestation, but its grants "
@@ -37466,13 +38591,28 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "key material with no attestation"
                 )
                 continue
+            if events["error"] and not deficiencies:
+                indeterminate.append(
+                    f"{key_id}: its key policy binds attestation, but its "
+                    f"CloudTrail event history was not read ({events['error']}), "
+                    "so a request from a debug-mode enclave was not ruled out"
+                )
+                continue
             if grants_error:
                 deficiencies.append(
                     f"its grants were not read ({grants_error}), so a grant "
                     "path was not ruled out"
                 )
+            if events["error"]:
+                deficiencies.append(
+                    f"its CloudTrail event history was not read "
+                    f"({events['error']}), so a request from a debug-mode enclave "
+                    "was not ruled out"
+                )
             if not deficiencies:
                 passed.append(f"{key_id} ({family})")
+                events_read += events["read"]
+                events_attested += events["attested"]
                 continue
             findings["status"] = "WARN"
             findings["csv_data"].append(
@@ -37505,7 +38645,14 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "(kms:ReEncryptFrom), which carries no attestation, is "
                     "allowed only by a statement that requires attestation or "
                     "is refused by a Deny, so no grant or statement releases it "
-                    "unattested: {}.".format(len(passed), ", ".join(passed[:5])),
+                    "unattested. CloudTrail event history (LookupEvents) holds {} "
+                    "event(s) on these keys, {} with an attestation document, and "
+                    "none whose enclave image digest is all zeros: {}.".format(
+                        len(passed),
+                        events_read,
+                        events_attested,
+                        ", ".join(passed[:5]),
+                    ),
                     "No action required",
                     "High",
                     "Passed",
@@ -37846,12 +38993,15 @@ AGENT_HANDOFF_REFERENCE = (
 
 AGENT_HANDOFF_CEILING = (
     "Agent roles are the Bedrock agent roles (GetAgent and GetAgentVersion "
-    "agentResourceRoleArn) and the AgentCore runtime roles (GetAgentRuntime "
-    "roleArn) of this Region. No AWS API marks which ECS task roles, Lambda "
-    "execution roles or other roles host an agent, so they are not read. A "
-    "runtime's JWT authorizer names the tokens it accepts, not which agent "
+    "agentResourceRoleArn), the AgentCore runtime roles (GetAgentRuntime "
+    "roleArn) and the Lambda MicroVM execution roles (GetMicrovm "
+    "executionRoleArn) of this Region. No AWS API marks which ECS task roles, "
+    "Lambda function roles or other roles host an agent, so they are not read. "
+    "A runtime's JWT authorizer names the tokens it accepts, not which agent "
     "presented one, so a JWT caller's identity is not read; a role in another "
-    "account that trusts an agent role is not read either."
+    "account that trusts an agent role is not read either. Which ports a "
+    "MicroVM auth token allows is not read, because CreateMicrovmAuthToken "
+    "returns the token and no lambda-microvms API lists issued tokens."
 )
 
 # Condition keys that bind the caller's source identity into an AssumeRole
@@ -37986,6 +39136,58 @@ def _identity_allows_assume_role(permissions: Dict[str, Any], role_arn: str) -> 
     return False
 
 
+# ListMicrovms also returns MicroVMs that no longer run; only these hold a role.
+MICROVM_LIVE_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED")
+
+# The Lambda MicroVMs guide: create-microvm-shell-auth-token works only on a
+# MicroVM run with the connector ...:network-connector:aws-network-connector:SHELL_INGRESS.
+MICROVM_SHELL_CONNECTOR = "network-connector:aws-network-connector:SHELL_INGRESS"
+
+
+def _microvm_agent_roles(region: str) -> Dict[str, Any]:
+    """
+    Read the executionRoleArn and ingressNetworkConnectors of every live Lambda
+    MicroVM. A MicroVM holds exactly one execution role, so each one is an agent
+    identity; ``shell`` names each MicroVM run with the SHELL_INGRESS connector.
+    """
+    result = {"microvms": [], "shell": [], "errors": []}
+    client = boto3.client("lambda-microvms", config=boto3_config, region_name=region)
+    try:
+        items = _list_all_items(client, "list_microvms", "items", max_results=50)
+    except (ClientError, BotoCoreError, TypeError) as error:
+        result["errors"].append(
+            "Lambda MicroVMs were not listed with lambda:ListMicrovms "
+            f"({get_assessment_error_label(error)})"
+        )
+        return result
+    for item in items:
+        microvm_id = item.get("microvmId")
+        if item.get("state") not in MICROVM_LIVE_STATES:
+            continue
+        try:
+            detail = client.get_microvm(microvmIdentifier=microvm_id)
+        except (ClientError, BotoCoreError, TypeError) as error:
+            result["errors"].append(
+                f"Lambda MicroVM {microvm_id} was not read with lambda:GetMicrovm "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        if detail.get("state") not in MICROVM_LIVE_STATES:
+            continue
+        label = "Lambda MicroVM image {} version {} (MicroVM {})".format(
+            detail.get("imageArn") or item.get("imageArn"),
+            detail.get("imageVersion") or item.get("imageVersion"),
+            microvm_id,
+        )
+        result["microvms"].append((detail.get("executionRoleArn"), label))
+        if any(
+            str(connector).endswith(":" + MICROVM_SHELL_CONNECTOR)
+            for connector in detail.get("ingressNetworkConnectors") or []
+        ):
+            result["shell"].append(label)
+    return result
+
+
 def get_agent_role_inventory(region: str) -> Dict[str, Any]:
     """
     Read the roles Bedrock agents and AgentCore runtimes run as, and the
@@ -37998,6 +39200,8 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
     ``runtime_gates`` holds each runtime version's authorizerConfiguration, and
     ``runtime_policies`` the resource policy of each runtime and endpoint ARN
     (None when it has none), with ``gate_errors`` naming each one not read.
+    Each live Lambda MicroVM's execution role is an agent role too, and
+    ``microvm_shell`` names each MicroVM run with the SHELL_INGRESS connector.
     """
     inventory = {
         "roles": {},
@@ -38009,6 +39213,8 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
         "runtime_gates": [],
         "runtime_policies": {},
         "gate_errors": [],
+        "microvm_count": 0,
+        "microvm_shell": [],
     }
 
     def add_role(role_arn, label):
@@ -38132,6 +39338,13 @@ def get_agent_role_inventory(region: str) -> Dict[str, Any]:
                         else None,
                     }
                 )
+
+    microvms = _microvm_agent_roles(region)
+    inventory["errors"] += microvms["errors"]
+    inventory["microvm_count"] = len(microvms["microvms"])
+    inventory["microvm_shell"] = microvms["shell"]
+    for role_arn, label in microvms["microvms"]:
+        add_role(role_arn, label)
 
     runtime_client = boto3.client(
         "bedrock-agentcore-control", config=boto3_config, region_name=region
@@ -38416,6 +39629,12 @@ def check_agent_handoff_source_identity(
             )
 
         failures += _runtime_inbound_gate_failures(inventory)
+        failures += [
+            f"{label} was run with the SHELL_INGRESS network connector, so any "
+            "principal allowed lambda:CreateMicrovmShellAuthToken on its image "
+            "gets an interactive shell in it"
+            for label in inventory.get("microvm_shell") or []
+        ]
         unread += inventory.get("gate_errors") or []
 
         role_cache = (permission_cache or {}).get("role_permissions") or {}
@@ -38512,17 +39731,19 @@ def check_agent_handoff_source_identity(
                     "Give each agent and each collaborator its own role, and add a "
                     "StringEquals sts:SourceIdentity condition naming the calling "
                     "agent, with sts:SetSourceIdentity allowed, to every trust "
-                    "statement an agent role can assume.",
+                    "statement an agent role can assume. Run Lambda MicroVMs "
+                    "without the SHELL_INGRESS connector.",
                     "High",
                     "Failed",
                 )
             )
 
-        if not agent_roles and not unread:
+        if not agent_roles and not unread and not failures:
             findings["status"] = "N/A"
             findings["csv_data"].append(
                 row(
-                    "No Bedrock agent or AgentCore runtime with a role exists in "
+                    "No Bedrock agent, AgentCore runtime or Lambda MicroVM with a "
+                    "role exists in "
                     f"{region or 'this Region'}, so no agent handoff exists.",
                     "No action required",
                     "Informational",
@@ -38561,6 +39782,10 @@ def check_agent_handoff_source_identity(
                         ).values()
                         if document is not None
                     ),
+                )
+                + " {} Lambda MicroVM(s) were read, and none was run with the "
+                "SHELL_INGRESS network connector.".format(
+                    inventory.get("microvm_count", 0)
                 )
                 + " "
                 + AGENT_HANDOFF_SCOPE_NOTE
@@ -41330,6 +42555,15 @@ def lambda_handler(event, context):
 
         logger.info("Running Bedrock job VPC check (BR-39)")
         all_findings.append(check_bedrock_job_vpc(region=region))
+
+        logger.info("Running AI workload subnet privacy check (BR-39)")
+        all_findings.append(
+            _permission_cache_unavailable_result(
+                "BR-39", AI_WORKLOAD_SUBNET_FINDING, region
+            )
+            if permission_cache is None
+            else check_ai_workload_subnet_privacy(permission_cache, region=region)
+        )
 
         logger.info("Running Marketplace endpoint CMK check (BR-40)")
         all_findings.append(
