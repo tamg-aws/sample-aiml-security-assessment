@@ -369,6 +369,8 @@ _EXPECTED_ACTIONS = {
         "logs:ListScheduledQueries",
         "logs:GetScheduledQuery",
         "apigateway:GET",
+        "network-firewall:ListRuleGroups",
+        "logs:DescribeLogStreams",
     },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
@@ -1935,6 +1937,16 @@ def test_sagemaker_managed_policy_2_is_identical_in_both_templates():
 
 
 _AGENTCORE_MANAGED_GRANTS = [
+    # AC-49's threat categories and ALERT log read. ListRuleGroups has no
+    # resource type in the service authorization reference (2026-10-04).
+    ("Allow", "network-firewall:ListRuleGroups", json.dumps("*")),
+    (
+        "Allow",
+        "logs:DescribeLogStreams",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*"}
+        ),
+    ),
     # AC-53's scheduled query reads: ListScheduledQueries has no resource type
     # in the service authorization reference (2026-10-04), GetScheduledQuery
     # takes scheduled-query.

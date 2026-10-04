@@ -37654,6 +37654,99 @@ NETWORK_FIREWALL_NAME_KEYWORDS = re.compile(r"\b(?:tls\.sni|http\.host|tls_sni)\
 SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
 
 
+def _network_firewall_threat_categories() -> Set[str]:
+    """List the AWS managed ThreatSignatures categories this Region offers.
+
+    AIR-FND-NET-04 names ThreatSignaturesBotnet, ThreatSignaturesIOC and
+    ThreatSignaturesEmergingEvents "and the other categories", so the set is
+    read from the service: ListRuleGroups in us-east-1 on 2026-10-04 listed 16
+    categories, each in a StrictOrder and an ActionOrder variant, which are
+    folded to one name. Raises BotoCoreError or ClientError on a failed read.
+    """
+    return {
+        name
+        for group in _paginate_aws_list(
+            network_firewall_client,
+            "list_rule_groups",
+            "RuleGroups",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            Scope="MANAGED",
+            ManagedType="AWS_MANAGED_THREAT_SIGNATURES",
+        )
+        for name in [_network_firewall_managed_group_name(str(group.get("Arn") or ""))]
+        if name and name.startswith(NETWORK_FIREWALL_THREAT_SIGNATURE_PREFIX)
+    }
+
+
+def _network_firewall_latest_detection(
+    firewall_name: str, log_configs: List[Dict[str, Any]]
+) -> Tuple[str, Optional[str]]:
+    """Describe the newest detection in a firewall's ALERT log.
+
+    For a CloudWatch Logs destination, the log stream with the newest event is
+    read with DescribeLogStreams, whose lastEventTimestamp CloudWatch Logs
+    updates eventually, typically within an hour of ingestion. A group that
+    also receives another log type gives no detection time, since its newest
+    event need not be an alert. An S3 or Firehose destination is named and not
+    read. Returns (text, None), or ("", why) when the read failed.
+    """
+    alert = [
+        config
+        for config in log_configs
+        if config.get("LogType") == NETWORK_FIREWALL_ALERT_LOG_TYPE
+    ]
+    texts: List[str] = []
+    for config in alert:
+        kind = str(config.get("LogDestinationType") or "")
+        destination = config.get("LogDestination") or {}
+        if kind != "CloudWatchLogs":
+            where = destination.get("bucketName") or destination.get("deliveryStream")
+            texts.append(
+                f"firewall {firewall_name}'s ALERT log goes to {kind} {where}, "
+                "whose detections are not read"
+            )
+            continue
+        group = str(destination.get("logGroup") or "")
+        if any(
+            other.get("LogType") != NETWORK_FIREWALL_ALERT_LOG_TYPE
+            and (other.get("LogDestination") or {}).get("logGroup") == group
+            for other in log_configs
+        ):
+            texts.append(
+                f"firewall {firewall_name}'s ALERT log shares log group {group} "
+                "with another log type, so its newest detection was not told apart"
+            )
+            continue
+        try:
+            streams = (
+                logs_client.describe_log_streams(
+                    logGroupName=group,
+                    orderBy="LastEventTime",
+                    descending=True,
+                    limit=1,
+                ).get("logStreams")
+                or []
+            )
+        except (BotoCoreError, ClientError, AttributeError) as error:
+            return "", (
+                f"the ALERT log group {group} of firewall {firewall_name} could not "
+                f"be read ({_assessment_error_label(error)})"
+            )
+        newest = streams[0].get("lastEventTimestamp") if streams else None
+        texts.append(
+            f"firewall {firewall_name}'s ALERT log group {group} last recorded a "
+            "detection at "
+            + datetime.fromtimestamp(newest / 1000, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            if newest
+            else f"firewall {firewall_name}'s ALERT log group {group} holds no "
+            "detection"
+        )
+    return "; ".join(texts), None
+
+
 def _network_firewall_managed_group_name(arn: str) -> Optional[str]:
     """Return an AWS managed stateful group's name without its order variant."""
     parts = str(arn).split(":", 5)
@@ -37903,8 +37996,13 @@ def _network_firewall_policy_gaps(
     rule_groups: Dict[str, Dict[str, Any]],
     subnet_cidrs: Dict[str, str],
     remote_vpc: str = "",
+    threat_categories: Set[str] = frozenset(),
 ) -> Tuple[List[str], List[str], List[str]]:
     """Return (allow-list gaps, threat inspection gaps, unread notes) for a policy.
+
+    The threat leg requires a dropping reference to each ThreatSignatures
+    category in threat_categories and to each domain reputation group the
+    control names.
 
     rule_groups maps each customer stateful group ARN the policy references to
     its DescribeRuleGroup RuleGroup. HOME_NET is compared to the hosting subnets
@@ -38158,11 +38256,30 @@ def _network_firewall_policy_gaps(
             f"{NETWORK_FIREWALL_THREAT_SIGNATURE_PREFIX} rule group that drops"
             f"{alert_note}"
         )
+    missing_categories = sorted(threat_categories - set(signatures))
+    if signatures and missing_categories:
+        threat_gaps.append(
+            f"firewall {firewall_name}'s policy drops on {len(set(signatures))} "
+            f"of the {len(threat_categories | set(signatures))} AWS managed "
+            f"{NETWORK_FIREWALL_THREAT_SIGNATURE_PREFIX} categories, and not on "
+            f"{', '.join(missing_categories)}{alert_note}"
+        )
     if not reputation:
         threat_gaps.append(
             f"firewall {firewall_name}'s policy references none of the domain "
             f"reputation groups {', '.join(NETWORK_FIREWALL_REPUTATION_GROUPS)} "
             f"that drops{alert_note if signatures else ''}"
+        )
+    elif set(reputation) != set(NETWORK_FIREWALL_REPUTATION_GROUPS):
+        threat_gaps.append(
+            f"firewall {firewall_name}'s policy drops on domain reputation "
+            f"group(s) {', '.join(sorted(set(reputation)))} but not on "
+            + ", ".join(
+                group
+                for group in NETWORK_FIREWALL_REPUTATION_GROUPS
+                if group not in reputation
+            )
+            + (alert_note if not missing_categories else "")
         )
     return allow_gaps, threat_gaps, unread
 
@@ -38697,10 +38814,12 @@ def check_agentcore_network_firewall_egress(
     firewall's policy for an ALLOWLIST domain group matching TLS_SNI and
     HTTP_HOST, no REJECTLIST or ALERTLIST domain group beside it under
     DEFAULT_ACTION_ORDER, and a HOME_NET that holds the hosting subnets where one
-    is set. The threat row requires an AWS managed ThreatSignatures group and a
-    domain reputation group that are not overridden to DROP_TO_ALERT, and an
-    ALERT log destination on each reached firewall, which records the
-    detections; the log's content is not read. Both rows
+    is set. The threat row requires a reference to every AWS managed
+    ThreatSignatures category ListRuleGroups lists and to each domain
+    reputation group the control names, none overridden to DROP_TO_ALERT, and
+    an ALERT log destination on each reached firewall, which records the
+    detections; its Passed text reports the newest detection in a CloudWatch
+    Logs destination (see _network_firewall_latest_detection). Both rows
     fail a stateless default action of aws:pass, a customer stateless aws:pass
     rule from the hosting subnets to internet addresses, and a customer stateful
     pass rule that is not scoped to a TLS SNI or HTTP Host name and acts before
@@ -38770,6 +38889,9 @@ def check_agentcore_network_firewall_egress(
             status=StatusEnum.NA,
         )
 
+    # Read once, on the first VPC that reaches a firewall: the set, or a
+    # string naming why it was not read.
+    threat_categories: Any = None
     subnet_ids = sorted({subnet_id for _, subnet_id in subnet_references})
     try:
         described, missing_subnets = _describe_subnets_reporting_missing(subnet_ids)
@@ -39001,14 +39123,27 @@ def check_agentcore_network_firewall_egress(
         threat_gaps: List[str] = []
         unread: List[str] = []
         log_unread: List[str] = []
+        log_actions: List[str] = []
+        detections: List[str] = []
         allow_targets: Dict[str, List[str]] = {}
         policy_action = None
+        if reached and threat_categories is None:
+            try:
+                threat_categories = _network_firewall_threat_categories()
+            except (BotoCoreError, ClientError) as error:
+                threat_categories = (
+                    "the AWS managed threat signature categories could not be "
+                    f"listed ({_assessment_error_label(error)})"
+                )
+        if reached and isinstance(threat_categories, str):
+            log_unread.append(threat_categories)
+            log_actions.append("network-firewall:ListRuleGroups")
         for arn in sorted(reached):
             firewall = reached[arn]
             name = firewall.get("FirewallName") or arn
             try:
-                log_types = {
-                    str(config.get("LogType") or "")
+                log_configs = [
+                    config
                     for config in (
                         network_firewall_client.describe_logging_configuration(
                             FirewallArn=arn
@@ -39017,19 +39152,31 @@ def check_agentcore_network_firewall_egress(
                     ).get("LogDestinationConfigs")
                     or []
                     if config.get("LogDestination")
-                }
+                ]
             except (BotoCoreError, ClientError) as error:
                 log_unread.append(
                     f"the logging configuration of firewall {name} could not be "
                     f"read ({_assessment_error_label(error)})"
                 )
+                log_actions.append("network-firewall:DescribeLoggingConfiguration")
             else:
-                if NETWORK_FIREWALL_ALERT_LOG_TYPE not in log_types:
+                if NETWORK_FIREWALL_ALERT_LOG_TYPE not in {
+                    str(config.get("LogType") or "") for config in log_configs
+                }:
                     threat_gaps.append(
                         f"firewall {name} sends no {NETWORK_FIREWALL_ALERT_LOG_TYPE} "
                         "log to a destination, so the detections its stateful "
                         "rules make are not kept"
                     )
+                else:
+                    detection, detection_error = _network_firewall_latest_detection(
+                        name, log_configs
+                    )
+                    if detection_error:
+                        log_unread.append(detection_error)
+                        log_actions.append("logs:DescribeLogStreams")
+                    else:
+                        detections.append(detection)
             try:
                 policy = (
                     network_firewall_client.describe_firewall_policy(
@@ -39085,7 +39232,14 @@ def check_agentcore_network_firewall_egress(
                 for target in list_source.get("Targets") or []
             ]
             gaps, threats, notes = _network_firewall_policy_gaps(
-                name, policy, groups, hosting, remote.get(arn, "")
+                name,
+                policy,
+                groups,
+                hosting,
+                remote.get(arn, ""),
+                threat_categories
+                if isinstance(threat_categories, set)
+                else frozenset(),
             )
             allow_gaps.extend(gaps)
             threat_gaps.extend(threats)
@@ -39140,8 +39294,7 @@ def check_agentcore_network_firewall_egress(
                 resolution = (
                     f"Grant {policy_action} and retry."
                     if policy_action
-                    else "Grant network-firewall:DescribeLoggingConfiguration and "
-                    "retry."
+                    else f"Grant {' and '.join(sorted(set(log_actions)))} and retry."
                     if not unread
                     else "Set HOME_NET in one place that holds every hosting subnet."
                 )
@@ -39175,10 +39328,12 @@ def check_agentcore_network_firewall_egress(
                         "whose policy holds a domain allow-list over TLS_SNI and "
                         "HTTP_HOST. IP and CIDR rules beside it are not judged."
                         if row_name == egress_name
-                        else "whose policy drops on an AWS managed ThreatSignatures "
-                        "group and a domain reputation group, and which send their "
-                        f"{NETWORK_FIREWALL_ALERT_LOG_TYPE} log to a destination. "
-                        "The detections in that log are not read."
+                        else "whose policy drops on every AWS managed "
+                        "ThreatSignatures category the Region lists and on the "
+                        f"domain reputation groups "
+                        f"{', '.join(NETWORK_FIREWALL_REPUTATION_GROUPS)}, and which "
+                        f"send their {NETWORK_FIREWALL_ALERT_LOG_TYPE} log to a "
+                        f"destination. Recent detections: {'; '.join(detections)}."
                     )
                     + route_text
                 )

@@ -1908,6 +1908,22 @@ Resources:
             Action:
               - logs:GetScheduledQuery # AC-53
             Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:scheduled-query:*'
+          - Sid: FirewallThreatCategoryList
+            # AC-49 lists the AWS managed ThreatSignatures categories the
+            # Region offers, so the threat leg requires each one.
+            # ListRuleGroups has no resource type in the service authorization
+            # reference, so it takes '*'.
+            Effect: Allow
+            Action:
+              - network-firewall:ListRuleGroups # AC-49
+            Resource: '*'
+          - Sid: FirewallAlertLogStreamRead
+            # AC-49 reads the newest stream of each firewall's ALERT log group
+            # in this account for the time of its latest detection.
+            Effect: Allow
+            Action:
+              - logs:DescribeLogStreams # AC-49
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
           - Sid: GatewayTargetApiExportRead
             # AC-35 reads the OpenAPI export of the REST API stage an API
             # Gateway target names. The ARN reference lists no export resource

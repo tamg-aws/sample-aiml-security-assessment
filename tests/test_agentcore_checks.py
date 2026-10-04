@@ -50086,9 +50086,22 @@ def _nfw_allow_group(
     return group
 
 
+# The ThreatSignatures categories ListRuleGroups returns in the stubbed Region.
+# The live us-east-1 list holds 16; two are enough to tell "every category"
+# from "any category".
+_NFW_THREAT_CATEGORIES = ("ThreatSignaturesBotnet", "ThreatSignaturesIOC")
+_NFW_FULL_MANAGED = (
+    "ThreatSignaturesBotnetStrictOrder",
+    "ThreatSignaturesIOCStrictOrder",
+    "MalwareDomainsStrictOrder",
+    "BotNetCommandAndControlDomainsStrictOrder",
+    "AbusedLegitMalwareDomainsStrictOrder",
+)
+
+
 def _nfw_policy(
     groups=(_NFW_ALLOW_ARN,),
-    managed=("ThreatSignaturesBotnetStrictOrder", "MalwareDomainsStrictOrder"),
+    managed=_NFW_FULL_MANAGED,
     order="STRICT_ORDER",
     overrides=(),
     home_net=None,
@@ -50114,6 +50127,22 @@ def _nfw_policy(
     return policy
 
 
+# 2026-10-04T12:00:00Z, the newest event of the stubbed ALERT log group.
+_NFW_NEWEST_ALERT_MS = 1_791_115_200_000
+
+
+@pytest.fixture
+def nfw_alert_streams():
+    """Stub the ALERT log group read: its newest stream's last event time."""
+    logs = MagicMock()
+    logs.describe_log_streams.return_value = {
+        "logStreams": [{"lastEventTimestamp": _NFW_NEWEST_ALERT_MS}]
+    }
+    with patch("agentcore_app.logs_client", logs):
+        yield logs
+
+
+@pytest.mark.usefixtures("nfw_alert_streams")
 class TestAC49NetworkFirewallEgress:
     """AC-49's Network Firewall leg follows each hosting subnet's default route."""
 
@@ -50130,6 +50159,7 @@ class TestAC49NetworkFirewallEgress:
         nat_subnets=None,
         log_types=None,
         tgw=None,
+        threat_categories=_NFW_THREAT_CATEGORIES,
     ):
         """Stub VPC-mode runtimes, their subnets' routes and the firewalls.
 
@@ -50256,6 +50286,16 @@ class TestAC49NetworkFirewallEgress:
         mock_nfw.describe_logging_configuration.side_effect = (
             describe_logging_configuration
         )
+        if isinstance(threat_categories, Exception):
+            mock_nfw.list_rule_groups.side_effect = threat_categories
+        else:
+            mock_nfw.list_rule_groups.return_value = {
+                "RuleGroups": [
+                    {"Name": name + order, "Arn": _NFW_MANAGED + name + order}
+                    for name in threat_categories
+                    for order in ("StrictOrder", "ActionOrder")
+                ]
+            }
         tgw = tgw or {}
 
         def tgw_read(key, select):
@@ -50550,6 +50590,142 @@ class TestAC49NetworkFirewallEgress:
         assert (
             "none of the domain reputation groups" in rows["threat"]["Finding_Details"]
         )
+
+    @pytest.mark.parametrize(
+        "managed, missing",
+        [
+            # One category of two: "any category" passed this before.
+            (
+                (
+                    "ThreatSignaturesBotnetStrictOrder",
+                    *_NFW_FULL_MANAGED[2:],
+                ),
+                "and not on ThreatSignaturesIOC",
+            ),
+            # Two reputation groups of three: "any group" passed this before.
+            (
+                _NFW_FULL_MANAGED[:4],
+                "but not on AbusedLegitMalwareDomains",
+            ),
+        ],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_category_and_named_reputation_group_is_required(
+        self, mock_ac, mock_ec2, mock_nfw, managed, missing
+    ):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                policies={"p1": _nfw_policy(managed=managed)},
+            )
+        )
+
+        assert rows["threat"]["Status"] == "Failed"
+        assert missing in rows["threat"]["Finding_Details"]
+        assert rows["egress"]["Status"] == "Passed"
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlisted_category_set_holds_the_threat_row_at_na(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                threat_categories=_make_client_error("AccessDeniedException", "no"),
+            )
+        )
+
+        assert rows["threat"]["Status"] == "N/A"
+        assert (
+            "categories could not be listed (AccessDenied"
+            in (rows["threat"]["Finding_Details"])
+        )
+        assert rows["threat"]["Resolution"] == (
+            "Grant network-firewall:ListRuleGroups and retry."
+        )
+        assert rows["egress"]["Status"] == "Passed"
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_alert_log_group_holds_the_threat_row_at_na(
+        self, mock_ac, mock_ec2, mock_nfw, nfw_alert_streams
+    ):
+        nfw_alert_streams.describe_log_streams.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+        rows = self._rows(self._run(mock_ac, mock_ec2, mock_nfw))
+
+        assert rows["threat"]["Status"] == "N/A"
+        assert (
+            "ALERT log group /nfw/ALERT of firewall"
+            in (rows["threat"]["Finding_Details"])
+        )
+        assert "logs:DescribeLogStreams" in rows["threat"]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "configs, text",
+        [
+            (
+                [("ALERT", "S3", {"bucketName": "alerts-bucket"})],
+                "ALERT log goes to S3 alerts-bucket, whose detections are not read",
+            ),
+            (
+                [
+                    ("ALERT", "CloudWatchLogs", {"logGroup": "/nfw/shared"}),
+                    ("FLOW", "CloudWatchLogs", {"logGroup": "/nfw/shared"}),
+                ],
+                "shares log group /nfw/shared with another log type",
+            ),
+        ],
+    )
+    def test_a_detection_time_is_claimed_only_from_an_alert_only_group(
+        self, configs, text, nfw_alert_streams
+    ):
+        detail, error = agentcore_app._network_firewall_latest_detection(
+            "fw1",
+            [
+                {"LogType": t, "LogDestinationType": k, "LogDestination": d}
+                for t, k, d in configs
+            ],
+        )
+
+        assert error is None
+        assert text in detail
+        assert "last recorded a detection" not in detail
+        nfw_alert_streams.describe_log_streams.assert_not_called()
+
+    def test_an_empty_alert_group_holds_no_detection(self, nfw_alert_streams):
+        nfw_alert_streams.describe_log_streams.return_value = {"logStreams": []}
+        detail, error = agentcore_app._network_firewall_latest_detection(
+            "fw1",
+            [
+                {
+                    "LogType": "ALERT",
+                    "LogDestinationType": "CloudWatchLogs",
+                    "LogDestination": {"logGroup": "/nfw/a"},
+                }
+            ],
+        )
+
+        assert (detail, error) == (
+            "firewall fw1's ALERT log group /nfw/a holds no detection",
+            None,
+        )
+        assert nfw_alert_streams.describe_log_streams.call_args.kwargs == {
+            "logGroupName": "/nfw/a",
+            "orderBy": "LastEventTime",
+            "descending": True,
+            "limit": 1,
+        }
 
     @patch("agentcore_app.network_firewall_client")
     @patch("agentcore_app.ec2_client")
@@ -53281,6 +53457,7 @@ class TestAC49EgressAllowListSync:
         assert "Route 53 Resolver client is not available" in row["Finding_Details"]
 
 
+@pytest.mark.usefixtures("nfw_alert_streams")
 class TestAC49FirewallBypasses:
     """AC-49 follows every route toward an internet address and reads what the
     firewall passes without stateful inspection."""
@@ -57299,6 +57476,7 @@ class TestAC51FirewallManagerAndSrt:
         mock_sh.get_subscription_state.assert_not_called()
 
 
+@pytest.mark.usefixtures("nfw_alert_streams")
 class TestAC49FirewallAlertLogging:
     """AIR-FND-NET-04: the threat row requires each reached firewall to send
     its ALERT log, which records the detections, to a destination."""
@@ -57347,7 +57525,8 @@ class TestAC49FirewallAlertLogging:
             in (rows["threat"]["Finding_Details"])
         )
         assert (
-            "detections in that log are not read" in (rows["threat"]["Finding_Details"])
+            "firewall fw2's ALERT log group /nfw/ALERT last recorded a detection "
+            "at 2026-10-04T12:00:00Z" in (rows["threat"]["Finding_Details"])
         )
 
     @pytest.mark.parametrize("types", [("FLOW",), ("TLS", "FLOW"), ()])
