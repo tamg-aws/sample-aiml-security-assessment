@@ -13422,6 +13422,37 @@ def _aurora_member_access(
     }
 
 
+AURORA_IAM_AUTH_RESOLUTION = (
+    "Enable IAM database authentication on the Aurora cluster that backs the "
+    "knowledge base, so database access is granted through IAM policy as access "
+    "to the source data is."
+)
+
+
+def _aurora_iam_authentication(cluster: Dict[str, Any]) -> Dict[str, str]:
+    """Judge the Aurora cluster's IAMDatabaseAuthenticationEnabled for BR-20."""
+    enabled = cluster.get("IAMDatabaseAuthenticationEnabled")
+    if enabled is True:
+        return {
+            "status": "Passed",
+            "detail": "IAM database authentication is enabled "
+            "(IAMDatabaseAuthenticationEnabled true); whether password logins "
+            "also remain is not read.",
+        }
+    if enabled is False:
+        return {
+            "status": "Failed",
+            "detail": "IAM database authentication is off "
+            "(IAMDatabaseAuthenticationEnabled false), so database users "
+            "authenticate only with passwords that no IAM policy governs.",
+        }
+    return {
+        "status": "N/A",
+        "detail": "DescribeDBClusters returned no IAMDatabaseAuthenticationEnabled, "
+        "so whether IAM governs database logins was not read.",
+    }
+
+
 def _store_with_access(
     key_status: str, key_detail: str, access: Dict[str, str], resolution: str
 ) -> Dict[str, str]:
@@ -13452,8 +13483,9 @@ def _assess_storage_layer_encryption(
     Neptune Analytics the graph's kmsKeyIdentifier (GetGraph). Each key is then
     read with DescribeKey, so an AWS managed or disabled key fails. The domain
     access policy and the graph's publicConnectivity, returned by the same
-    reads, are judged beside the key, and so is PubliclyAccessible on each
-    Aurora member instance (DescribeDBInstances). A
+    reads, are judged beside the key, and so are PubliclyAccessible on each
+    Aurora member instance (DescribeDBInstances) and the cluster's
+    IAMDatabaseAuthenticationEnabled. A
     third-party store is judged on its credentials secret only, and never
     passes, because the vectors' own key is held by the provider.
     """
@@ -13575,11 +13607,26 @@ def _assess_storage_layer_encryption(
                 "returned no KmsKeyId, so whose key it is could not be read.",
             )
         status, observed = _kms_key_verdict(key, store_region)
+        legs = (
+            (
+                _aurora_member_access(rds_client, cluster, store_region),
+                AURORA_ACCESS_RESOLUTION,
+            ),
+            (_aurora_iam_authentication(cluster), AURORA_IAM_AUTH_RESOLUTION),
+        )
+        statuses = [leg["status"] for leg, _ in legs]
         return _store_with_access(
             status,
             f"uses {located}, encrypted with {observed}.",
-            _aurora_member_access(rds_client, cluster, store_region),
-            AURORA_ACCESS_RESOLUTION,
+            {
+                "status": "Failed"
+                if "Failed" in statuses
+                else "N/A"
+                if "N/A" in statuses
+                else "Passed",
+                "detail": " ".join(leg["detail"] for leg, _ in legs),
+            },
+            " ".join(fix for leg, fix in legs if leg["status"] == "Failed"),
         )
 
     if storage_type == "OPENSEARCH_MANAGED_CLUSTER":

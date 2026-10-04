@@ -1168,6 +1168,27 @@ MUTATIONS = [
         "replace": '"Pipelines",',
     },
     {
+        "name": "BR-20 credits an Aurora store with password logins only",
+        "file": BEDROCK,
+        "defect": "BR-20 drops the IAM database authentication leg, so an Aurora cluster with IAMDatabaseAuthenticationEnabled false passes",
+        "find": "            (_aurora_iam_authentication(cluster), AURORA_IAM_AUTH_RESOLUTION),\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-20 reads an absent IAM authentication value as off",
+        "file": BEDROCK,
+        "defect": "BR-20 fails an Aurora cluster whose IAMDatabaseAuthenticationEnabled was not returned",
+        "find": "    if enabled is False:\n",
+        "replace": "    if enabled is not True:\n",
+    },
+    {
+        "name": "BR-20 names only one Aurora fix",
+        "file": BEDROCK,
+        "defect": "BR-20 joins only the first failed Aurora leg's fix, so a public, password-only cluster is told one of two changes",
+        "find": '" ".join(fix for leg, fix in legs if leg["status"] == "Failed")',
+        "replace": 'next((fix for leg, fix in legs if leg["status"] == "Failed"), "")',
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -3000,6 +3021,13 @@ GROUPS: dict[str, str] = {
         "in the Bedrock owner tag sweep"
     ),
     "BR-53 drops never-tagged pipelines": ("in the Bedrock owner tag sweep"),
+    "BR-20 credits an Aurora store with password logins only": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 reads an absent IAM authentication value as off": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 names only one Aurora fix": ("in the Bedrock knowledge base stores"),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

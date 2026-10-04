@@ -37012,12 +37012,66 @@ class TestBR20ValueDepth:
         client.describe_db_instances.side_effect = describe_db_instances
         return client
 
-    def _aurora_cluster(self, *members):
-        return {
+    def _aurora_cluster(self, *members, iam_auth=True):
+        cluster = {
             "StorageEncrypted": True,
             "KmsKeyId": self.CMK,
             "DBClusterMembers": [{"DBInstanceIdentifier": m} for m in members],
         }
+        if iam_auth is not None:
+            cluster["IAMDatabaseAuthenticationEnabled"] = iam_auth
+        return cluster
+
+    def test_aurora_with_iam_database_authentication_off_fails(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", "kb-db-2", iam_auth=False)],
+                    instances={"kb-db-1": False, "kb-db-2": False},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "No member instance of the cluster is PubliclyAccessible" in details
+        assert (
+            "IAM database authentication is off (IAMDatabaseAuthenticationEnabled "
+            "false), so database users authenticate only with passwords" in details
+        )
+        assert rows[0]["Resolution"].startswith(
+            "Enable IAM database authentication on the Aurora cluster"
+        )
+        assert "PubliclyAccessible to false" not in rows[0]["Resolution"]
+
+    def test_aurora_public_and_password_only_names_both_fixes(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", iam_auth=False)],
+                    instances={"kb-db-1": True},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Set PubliclyAccessible to false" in rows[0]["Resolution"]
+        assert "Enable IAM database authentication" in rows[0]["Resolution"]
+
+    def test_aurora_with_no_iam_authentication_value_is_na(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", iam_auth=None)],
+                    instances={"kb-db-1": False},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "returned no IAMDatabaseAuthenticationEnabled" in rows[0]["Finding_Details"]
+        )
 
     def test_aurora_with_a_public_member_instance_fails(self):
         rows = self._run(
@@ -37048,6 +37102,11 @@ class TestBR20ValueDepth:
         assert (
             "No member instance of the cluster is PubliclyAccessible (kb-db-1, "
             "kb-db-2)" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "IAM database authentication is enabled (IAMDatabaseAuthenticationEnabled "
+            "true); whether password logins also remain is not read"
+            in rows[0]["Finding_Details"]
         )
 
     def test_aurora_with_an_unread_member_instance_is_na(self):
