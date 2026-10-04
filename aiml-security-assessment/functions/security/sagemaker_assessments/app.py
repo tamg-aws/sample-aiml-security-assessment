@@ -6052,6 +6052,36 @@ def check_sagemaker_runtime_endpoint_policy(region: str = "") -> Dict[str, Any]:
     return {"csv_data": rows}
 
 
+def _vpc_dns_attribute_reads(
+    ec2_client, vpc_ids: List[str]
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """(attributes set to false, attributes not read) of each VPC, for the
+    enableDnsSupport and enableDnsHostnames attributes private DNS needs."""
+    dns_off, dns_unread = {}, {}
+    for vpc_id in vpc_ids:
+        for attribute in ("enableDnsSupport", "enableDnsHostnames"):
+            try:
+                value = (
+                    ec2_client.describe_vpc_attribute(VpcId=vpc_id, Attribute=attribute)
+                    .get(attribute[0].upper() + attribute[1:], {})
+                    .get("Value")
+                )
+            except Exception as error:
+                dns_unread.setdefault(vpc_id, []).append(
+                    f"{attribute} of {vpc_id} (ec2:DescribeVpcAttribute: "
+                    f"{get_assessment_error_label(error)})"
+                )
+                continue
+            if value is False:
+                dns_off.setdefault(vpc_id, []).append(attribute)
+            elif value is not True:
+                dns_unread.setdefault(vpc_id, []).append(
+                    f"{attribute} of {vpc_id} (not returned by "
+                    "ec2:DescribeVpcAttribute)"
+                )
+    return dns_off, dns_unread
+
+
 def _runtime_private_path_findings(
     inventory: Dict[str, Any], region: str
 ) -> List[Dict[str, Any]]:
@@ -6061,26 +6091,39 @@ def _runtime_private_path_findings(
 
     Only asked when the region hosts an endpoint. The scan cannot see where
     callers run, so a Passed row states which VPCs have the path and no more.
+    Private DNS maps the runtime hostname only in a VPC with enableDnsSupport
+    and enableDnsHostnames true, so either attribute false fails and an unread
+    one leaves the row N/A. A VPC a gateway endpoint serves is not read.
     """
     if not inventory["endpoints"]:
         return []
     private = []
     other = []
+    gateway_vpcs = set()
     try:
         for vpce in _read_runtime_vpc_endpoints(region):
             label = f"{vpce.get('VpcEndpointId')} in {vpce.get('VpcId')}"
+            if (
+                vpce.get("VpcEndpointType") == "Gateway"
+                and str(vpce.get("State", "")).lower() == "available"
+            ):
+                gateway_vpcs.add(vpce.get("VpcId"))
             if (
                 vpce.get("VpcEndpointType") == "Interface"
                 and str(vpce.get("State", "")).lower() == "available"
                 and vpce.get("PrivateDnsEnabled") is True
             ):
-                private.append(label)
+                private.append((label, vpce.get("VpcId")))
             else:
                 other.append(
                     f"{label} (type {vpce.get('VpcEndpointType')}, state "
                     f"{vpce.get('State')}, private DNS "
                     f"{vpce.get('PrivateDnsEnabled')})"
                 )
+        dns_off, dns_unread = _vpc_dns_attribute_reads(
+            boto3.client("ec2", config=boto3_config, region_name=region),
+            sorted({vpc for _, vpc in private if vpc not in gateway_vpcs}),
+        )
     except Exception as e:
         return [
             create_finding(
@@ -6124,16 +6167,61 @@ def _runtime_private_path_findings(
                 region=region,
             )
         ]
+    if dns_off:
+        off = [
+            f"{label} ({' and '.join(dns_off[vpc])} false)"
+            for label, vpc in private
+            if vpc in dns_off
+        ]
+        return [
+            create_finding(
+                check_id="SM-11",
+                finding_name=RUNTIME_PRIVATE_PATH_FINDING,
+                finding_details=(
+                    f"The region hosts endpoint(s) {endpoint_names}. The "
+                    "sagemaker.runtime interface VPC endpoint(s) "
+                    f"{'; '.join(off[:5])} have private DNS enabled in a VPC "
+                    "whose DNS attribute is set to false (ec2:DescribeVpcAttribute), "
+                    "so no record maps the runtime hostname to them and "
+                    "InvokeEndpoint calls from that VPC resolve to the public "
+                    "runtime endpoint."
+                ),
+                resolution=(
+                    "Set enableDnsSupport and enableDnsHostnames to true on the "
+                    "VPC (aws ec2 modify-vpc-attribute)."
+                ),
+                reference=RUNTIME_PRIVATE_PATH_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        ]
+    labels = [label for label, _ in private]
+    read_details = (
+        "An available sagemaker.runtime interface VPC endpoint with private "
+        f"DNS exists: {'; '.join(labels[:5])}. Each VPC it is in has "
+        "enableDnsSupport and enableDnsHostnames true, so calls from those VPCs "
+        "resolve the runtime hostname to it."
+    )
+    if dns_unread:
+        return [
+            _unread_resources_finding(
+                "SM-11",
+                RUNTIME_PRIVATE_PATH_FINDING,
+                [item for vpc in sorted(dns_unread) for item in dns_unread[vpc]],
+                read_details,
+                RUNTIME_PRIVATE_PATH_REFERENCE,
+                region,
+            )
+        ]
     return [
         create_finding(
             check_id="SM-11",
             finding_name=RUNTIME_PRIVATE_PATH_FINDING,
             finding_details=(
-                "An available sagemaker.runtime interface VPC endpoint with private "
-                f"DNS exists: {'; '.join(private[:5])}. Calls from those VPCs "
-                "resolve the runtime hostname to it. The scan does not record where "
-                "callers run, so calls from other networks can still use the public "
-                "runtime endpoint."
+                f"{read_details} The scan does not record where callers run, so "
+                "calls from other networks can still use the public runtime "
+                "endpoint."
             ),
             resolution="No action required",
             reference=RUNTIME_PRIVATE_PATH_REFERENCE,
@@ -12774,30 +12862,9 @@ def _training_vpc_endpoint_findings(
             if vpce.get("VpcEndpointType") == "Interface"
         )
 
-    dns_off, dns_unread = {}, {}
-    for vpc_id in sorted(present):
-        if not dns_served(vpc_id):
-            continue
-        for attribute in ("enableDnsSupport", "enableDnsHostnames"):
-            try:
-                value = (
-                    ec2_client.describe_vpc_attribute(VpcId=vpc_id, Attribute=attribute)
-                    .get(attribute[0].upper() + attribute[1:], {})
-                    .get("Value")
-                )
-            except Exception as error:
-                dns_unread.setdefault(vpc_id, []).append(
-                    f"{attribute} of {vpc_id} (ec2:DescribeVpcAttribute: "
-                    f"{get_assessment_error_label(error)})"
-                )
-                continue
-            if value is False:
-                dns_off.setdefault(vpc_id, []).append(attribute)
-            elif value is not True:
-                dns_unread.setdefault(vpc_id, []).append(
-                    f"{attribute} of {vpc_id} (not returned by "
-                    "ec2:DescribeVpcAttribute)"
-                )
+    dns_off, dns_unread = _vpc_dns_attribute_reads(
+        ec2_client, [vpc_id for vpc_id in sorted(present) if dns_served(vpc_id)]
+    )
 
     emitted = []
     complete = []
@@ -20887,9 +20954,7 @@ def _microvm_image_versions(
         images = []
         for page in client.get_paginator("list_microvm_images").paginate():
             images.extend(
-                i
-                for i in page.get("items", [])
-                if i.get("state") not in ("DELETING", "DELETED")
+                i for i in page.get("items", []) if i.get("state") != "DELETED"
             )
     except Exception as error:
         return [], [f"lambda:ListMicrovmImages ({get_assessment_error_label(error)})"]
@@ -21133,8 +21198,9 @@ def _propagation_and_plaintext_findings(
                 finding_details=(
                     "No ECS task injects a rotating secret, and none injects from "
                     "Parameter Store. Lambda functions "
-                    "are not graded: no API shows whether a function re-fetches per "
-                    "invocation or caches at init; "
+                    "are not graded: function code is not read by this check, so "
+                    "whether a function re-fetches per invocation or caches at "
+                    "init is not judged; "
                     f"{extension_users} of {len(functions)} use the Parameters and "
                     "Secrets extension. Each of the "
                     f"{len(microvm_versions)} ACTIVE Lambda MicroVM image "

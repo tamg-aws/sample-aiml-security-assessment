@@ -2322,8 +2322,8 @@ FOUNDATION_ROWS = [
         "a Lambda MicroVM image version. It fails an ACTIVE Lambda MicroVM image "
         "version whose hooks.microvmHooks.resume is not ENABLED; the image's "
         "code artifact is not read, so what the hook runs is not judged. "
-        "A Lambda function is not graded on propagation, because no API shows "
-        "whether it re-fetches a secret per invocation",
+        "A Lambda function is not graded on propagation: its code is not read, "
+        "so whether it re-fetches a secret per invocation is not judged",
         [],
         6,
     ),

@@ -14666,6 +14666,8 @@ def _sm11_rows(
     key_managers=None,
     components=None,
     subnet_fixtures=(PRIVATE_SUBNET_FIXTURE,),
+    dns_attributes=None,
+    dns_calls=None,
 ):
     """Run SM-11 against models {name: DescribeModel}, endpoints {name: config}.
 
@@ -14741,7 +14743,11 @@ def _sm11_rows(
         else [{"VpcEndpoints": vpces or []}],
     }
     ec2_calls = {}
-    ec2 = _pages_client(ec2_pages, calls=ec2_calls)
+    ec2 = _pages_client(
+        ec2_pages,
+        calls=ec2_calls,
+        describe_vpc_attribute=_vpc_dns_attributes(dns_attributes, dns_calls),
+    )
 
     def describe_key(KeyId):
         value = key_managers.get(KeyId, "CUSTOMER")
@@ -15259,6 +15265,80 @@ class TestSM11RuntimePrivatePath:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "vpce-good" in rows[0]["Finding_Details"]
         assert "public" in rows[0]["Finding_Details"]
+
+    def _dns(self, dns_attributes=None, calls=None, vpces=None):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints=self._ENDPOINTS,
+            configs=self._CONFIGS,
+            vpces=vpces
+            or [
+                _PRIVATE_RUNTIME_VPCE,
+                dict(_PRIVATE_RUNTIME_VPCE, VpcEndpointId="vpce-two", VpcId="vpc-2"),
+            ],
+            dns_attributes=dns_attributes,
+            dns_calls=calls,
+        )
+        return _by_finding(rows, sagemaker_app.RUNTIME_PRIVATE_PATH_FINDING)
+
+    def test_two_vpcs_with_dns_on_pass_and_each_is_read(self):
+        calls = []
+        rows = self._dns(calls=calls)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Each VPC it is in has enableDnsSupport and enableDnsHostnames true"
+            in rows[0]["Finding_Details"]
+        )
+        assert sorted(calls) == [
+            ("vpc-1", "enableDnsHostnames"),
+            ("vpc-1", "enableDnsSupport"),
+            ("vpc-2", "enableDnsHostnames"),
+            ("vpc-2", "enableDnsSupport"),
+        ]
+
+    @pytest.mark.parametrize("attribute", ["enableDnsSupport", "enableDnsHostnames"])
+    def test_only_the_endpoint_in_the_vpc_with_dns_off_fails(self, attribute):
+        rows = self._dns({("vpc-2", attribute): False})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert f"vpce-two in vpc-2 ({attribute} false)" in details
+        assert "vpce-good" not in details
+        assert "modify-vpc-attribute" in rows[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "value, text",
+        [
+            (
+                _make_client_error("UnauthorizedOperation"),
+                "enableDnsSupport of vpc-2 (ec2:DescribeVpcAttribute: "
+                "UnauthorizedOperation)",
+            ),
+            (None, "enableDnsSupport of vpc-2 (not returned by"),
+        ],
+    )
+    def test_an_unread_attribute_is_not_passed(self, value, text):
+        rows = self._dns({("vpc-2", "enableDnsSupport"): value})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Finding"].endswith(" Incomplete")
+        assert text in rows[0]["Finding_Details"]
+
+    def test_a_vpc_a_gateway_endpoint_serves_is_not_read(self):
+        calls = []
+        rows = self._dns(
+            {("vpc-2", "enableDnsSupport"): False},
+            calls,
+            vpces=[
+                dict(_PRIVATE_RUNTIME_VPCE, VpcEndpointId="vpce-two", VpcId="vpc-2"),
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-gw",
+                    VpcId="vpc-2",
+                    VpcEndpointType="Gateway",
+                ),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert calls == []
 
     def test_access_denied_is_not_read_not_failed_or_passed(self):
         rows, _ = self._run(_make_client_error("UnauthorizedOperation"))
@@ -23849,19 +23929,36 @@ class TestSM40MicrovmResumeHook:
         ) in details
         assert "not returned by any API" not in details
 
-    @pytest.mark.parametrize("state", ["DELETING", "DELETED"])
-    def test_a_deleting_or_deleted_image_is_not_judged(self, state):
+    def test_the_passed_text_says_lambda_function_code_is_not_read(self):
+        rows = self._propagation(microvms={"agent": [_sm40_microvm_version()]})
+        details = rows[0]["Finding_Details"]
+        assert (
+            "Lambda functions are not graded: function code is not read by this "
+            "check, so whether a function re-fetches per invocation or caches at "
+            "init is not judged;"
+        ) in details
+        assert "no API shows" not in details
+
+    def test_a_deleted_image_is_not_judged(self):
         microvms = {
             "gone": [_sm40_microvm_version(resume="DISABLED")],
             "kept": [_sm40_microvm_version()],
         }
-        rows = self._propagation(microvms=microvms, microvm_states={"gone": state})
+        rows = self._propagation(microvms=microvms, microvm_states={"gone": "DELETED"})
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "Each of the 1 ACTIVE" in rows[0]["Finding_Details"]
         assert "image gone" not in rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
-        "state", ["CREATED", "UPDATING", "UPDATED", "UPDATE_FAILED", "DELETE_FAILED"]
+        "state",
+        [
+            "CREATED",
+            "UPDATING",
+            "UPDATED",
+            "UPDATE_FAILED",
+            "DELETING",
+            "DELETE_FAILED",
+        ],
     )
     def test_an_image_in_any_other_state_is_judged(self, state):
         microvms = {"gone": [_sm40_microvm_version(resume="DISABLED")]}

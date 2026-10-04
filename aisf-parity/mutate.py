@@ -1016,7 +1016,7 @@ MUTATIONS = [
         ),
     },
     {
-        "name": "SM-33 credits private DNS in a VPC with DNS off",
+        "name": "SM-33 and SM-11 credit private DNS in a VPC with DNS off",
         "file": SAGEMAKER,
         "defect": "private DNS creates no record for the default hostname in a "
         "VPC with enableDnsSupport or enableDnsHostnames false, so the job "
@@ -1040,10 +1040,8 @@ MUTATIONS = [
         "file": SAGEMAKER,
         "defect": "only the first VPC holding an interface endpoint is read, so "
         "a second VPC with DNS off passes",
-        "find": "    for vpc_id in sorted(present):\n        if not dns_served(vpc_id):",
-        "replace": (
-            "    for vpc_id in sorted(present)[:1]:\n        if not dns_served(vpc_id):"
-        ),
+        "find": "[vpc_id for vpc_id in sorted(present) if dns_served(vpc_id)]",
+        "replace": "[vpc_id for vpc_id in sorted(present) if dns_served(vpc_id)][:1]",
     },
     {
         "name": "SM-18 holds a gateway-served S3 to the DNS attributes",
@@ -1058,12 +1056,50 @@ MUTATIONS = [
         "replace": "            if True\n",
     },
     {
-        "name": "SM-40 judges a deleted MicroVM image",
+        "name": "SM-40 judges a DELETED MicroVM image",
         "file": SAGEMAKER,
-        "defect": "an image in DELETING or DELETED state is judged, so its "
-        "versions fail a workload that is being removed",
-        "find": 'if i.get("state") not in ("DELETING", "DELETED")',
+        "defect": "an image in DELETED state is judged, so its versions fail a "
+        "workload that was removed",
+        "find": 'if i.get("state") != "DELETED"',
         "replace": "if True",
+    },
+    {
+        "name": "SM-40 skips a DELETING MicroVM image",
+        "file": SAGEMAKER,
+        "defect": "an image still DELETING may hold ACTIVE versions RunMicrovm "
+        "launches, so skipping it narrows the population",
+        "find": 'i.get("state") != "DELETED"\n',
+        "replace": 'i.get("state") not in ("DELETING", "DELETED")\n',
+    },
+    {
+        "name": "SM-11 passes a runtime endpoint in a VPC with DNS off",
+        "file": SAGEMAKER,
+        "defect": "a sagemaker.runtime interface endpoint in a VPC with a DNS "
+        "attribute false is credited, though no record maps the runtime "
+        "hostname to it",
+        "find": "    if dns_off:\n        off = [",
+        "replace": "    if False:\n        off = [",
+    },
+    {
+        "name": "SM-11 passes when a DNS attribute was not read",
+        "file": SAGEMAKER,
+        "defect": "a failed DescribeVpcAttribute read yields Passed",
+        "find": (
+            "    if dns_unread:\n        return [\n            "
+            '_unread_resources_finding(\n                "SM-11"'
+        ),
+        "replace": (
+            "    if False:\n        return [\n            "
+            '_unread_resources_finding(\n                "SM-11"'
+        ),
+    },
+    {
+        "name": "SM-11 reads only the first VPC's DNS attributes",
+        "file": SAGEMAKER,
+        "defect": "only the first VPC holding a runtime endpoint is read, so a "
+        "second VPC with DNS off passes",
+        "find": "sorted({vpc for _, vpc in private if vpc not in gateway_vpcs}),",
+        "replace": "sorted({vpc for _, vpc in private if vpc not in gateway_vpcs})[:1],",
     },
     # ------------------------------------------ the AgentCore verdict legs
     # Each entry reverts one round-6 verdict leg in agentcore_assessments to the
@@ -2586,11 +2622,15 @@ GROUPS: dict[str, str] = {
     "SM-39 does not count an agent Lambda outside a VPC": "in the SageMaker verdict legs",
     "SM-39 drops EKS cluster subnets": "in the SageMaker verdict legs",
     "SM-26 passes active prompt-injection findings": "in the SageMaker verdict legs",
-    "SM-33 credits private DNS in a VPC with DNS off": "in the SageMaker verdict legs",
+    "SM-33 and SM-11 credit private DNS in a VPC with DNS off": "in the SageMaker verdict legs",
     "SM-33 passes a VPC whose DNS attributes were not read": "in the SageMaker verdict legs",
     "SM-33 reads only the first VPC's DNS attributes": "in the SageMaker verdict legs",
     "SM-18 holds a gateway-served S3 to the DNS attributes": "in the SageMaker verdict legs",
-    "SM-40 judges a deleted MicroVM image": "in the SageMaker verdict legs",
+    "SM-40 judges a DELETED MicroVM image": "in the SageMaker verdict legs",
+    "SM-40 skips a DELETING MicroVM image": "in the SageMaker verdict legs",
+    "SM-11 passes a runtime endpoint in a VPC with DNS off": "in the SageMaker verdict legs",
+    "SM-11 passes when a DNS attribute was not read": "in the SageMaker verdict legs",
+    "SM-11 reads only the first VPC's DNS attributes": "in the SageMaker verdict legs",
     "AC-37 reads an allow-list SCP's omission as an Allow": "in the AgentCore verdict legs",
     "AC-37 passes when the organization's SCPs could not be listed": "in the AgentCore verdict legs",
     "AC-42 passes the population beside an unread configuration": "in the AgentCore verdict legs",
