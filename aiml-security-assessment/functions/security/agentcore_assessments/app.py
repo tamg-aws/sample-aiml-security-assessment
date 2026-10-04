@@ -24518,16 +24518,26 @@ AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
 # is scanned, whatever its size, in chunks of AC34_SCAN_CHUNK_BYTES, each
 # matched together with the last AC34_SCAN_OVERLAP_CHARS characters of the
 # chunk before, so a credential that straddles two chunks is still found and
-# memory holds one chunk. Measured live on 2026-10-04 in account 178113193057,
-# us-east-1, on two runtime code archives there (39.8 and 34.4 MiB, unpacking
-# to 92.7 and 76.6 MiB): s3:GetObject ran at 17.8 to 27.9 MiB/s, and the scan
-# at 26.5 MiB/s or more of unpacked bytes with assignment matching on every
-# file, the slowest case. The calls ran from a workstation, not from the
-# function. At the slowest rates an archive at both bounds takes 3.6 s to
-# fetch and 9.7 s to scan, 13.3 s in all, so 45 such archives fit in the
-# 600 s Lambda timeout; 15 of that account's 19 runtimes run a code archive,
-# 12 distinct ones. An archive past either bound is named in the row, which
-# is then N/A, never Passed.
+# memory holds one chunk.
+#
+# The bounds are set from measurement on 2026-10-04. Download: s3:GetObject in
+# account 178113193057, us-east-1, of two runtime code archives there (39.8
+# MiB unpacking to 92.7 MiB, and 34.4 MiB unpacking to 76.6 MiB) ran at 17.8
+# to 27.9 MiB/s, from a workstation and not from the function. Scan:
+# _code_archive_credentials over synthetic archives on Python 3.12 ran at
+# 19.4 MiB/s of unpacked bytes on a 65.5 MiB archive of base64 text (85 MiB
+# unpacked), 19.7 MiB/s on 250 MiB of base64 and 23.3 MiB/s on 250 MiB of
+# assignment-dense code, the slowest being incompressible text. At the slowest
+# rates an archive at both bounds takes 3.6 s to fetch (64 MiB) and 13.2 s to
+# scan (256 MiB), 16.8 s in all, so 35 such archives fit in the 600 s Lambda
+# timeout; 15 of that account's 19 runtimes run a code archive, 12 distinct,
+# the largest 39.8 MiB. The service's own maxima for a direct code deployment
+# package, 250 MB compressed and 750 MB uncompressed (bedrock-agentcore-limits
+# .html), would cost 13.4 s and 36.9 s, 50.3 s per archive, leaving room for 11
+# in a run that also holds every other AgentCore check, and would hold up to
+# twice the archive in the function's 1024 MB while the body is read; so the
+# bounds stay. An archive past either bound is named in the row, which is then
+# N/A, never Passed.
 AC34_CODE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
 AC34_CODE_UNPACKED_MAX_BYTES = 256 * 1024 * 1024
 AC34_SCAN_CHUNK_BYTES = 1024 * 1024

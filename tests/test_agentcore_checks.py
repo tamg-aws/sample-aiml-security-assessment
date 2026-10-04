@@ -20330,6 +20330,7 @@ class TestAC34RuntimeCode:
             )
         assert [r["Status"] for r in rows] == ["Passed", "N/A"]
         assert reason in rows[1]["Finding_Details"]
+        assert "s3://code-bucket/b.zip" in rows[1]["Finding_Details"]
         assert "s3:GetObject" in rows[1]["Resolution"]
 
     def test_an_older_served_version_runs_its_own_code(self):
