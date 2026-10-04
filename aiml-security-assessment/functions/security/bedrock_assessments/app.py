@@ -16237,8 +16237,10 @@ def _source_bucket_read_restrictions(document: Any, bucket: str) -> Dict[str, An
     allow_only: List[List[str]] = []
     excluded: List[str] = []
     held: List[str] = []
+    allows = False
     for index, statement in enumerate(_policy_statements(document)):
         if str(statement.get("Effect", "")).upper() != "DENY":
+            allows = allows or _statement_matches_action(statement, "s3:getobject")
             continue
         if not _statement_matches_action(statement, "s3:getobject"):
             continue
@@ -16292,7 +16294,140 @@ def _source_bucket_read_restrictions(document: Any, bucket: str) -> Dict[str, An
             allow_only.append([str(v) for v in _as_list(keys[0][2])])
             continue
         held.append(f"{label} carries a Condition whose effect is not computed")
-    return {"allow_only": allow_only, "excluded": excluded, "held": held}
+    return {
+        "allow_only": allow_only,
+        "excluded": excluded,
+        "held": held,
+        "allows": allows,
+    }
+
+
+def _source_identity_read(
+    principal: str,
+    bucket: str,
+    permission_cache: Optional[Dict[str, Any]],
+    bucket_allows: bool,
+) -> Tuple[str, str]:
+    """
+    Judge whether a principal's own IAM policies let it read the objects of a
+    knowledge base source bucket, for BR-20. Returns ("denied", why), ("held",
+    why) or ("reads", "").
+
+    A Resource covers every object of the bucket when it ends in * and matches
+    "arn:<partition>:s3:::<bucket>/", and reaches the bucket when it can match
+    some object of it. An unconditioned Deny of s3:GetObject that covers every
+    object, in an identity policy or the permissions boundary, denies. So does
+    a boundary that allows s3:GetObject on no resource reaching the bucket, and
+    identity policies that allow it nowhere there while the bucket policy has
+    no Allow of s3:GetObject either, since the read then has no grant. A
+    principal reads only when an identity Allow covers every object and so
+    does the boundary, if one is set. A Deny with a Condition, with NotResource
+    or on part of the bucket, an Allow on part of the bucket only, or no
+    identity Allow beside a bucket policy Allow, is held, as is a principal the
+    cache does not hold. An Allow is credited without judging its Condition.
+    """
+    match = re.match(
+        r"^arn:(aws[a-z-]*):iam::\d{12}:(role|user)/(?:.*/)?([^/]+)$", principal
+    )
+    if not match:
+        return "held", "it is not an IAM role or user ARN"
+    partition, kind, name = match.groups()
+    if permission_cache is None:
+        return "held", "the IAM permissions cache was not available"
+    permissions = (permission_cache.get(f"{kind}_permissions") or {}).get(name)
+    if not isinstance(permissions, dict):
+        return "held", f"the {kind} is not in the IAM permissions cache"
+    if any(
+        isinstance(error, dict)
+        and (str(error.get("type")), str(error.get("name"))) == (kind, name)
+        for error in permission_cache.get("principal_errors") or []
+    ):
+        return "held", f"the {kind} had a policy read fail in the IAM permissions cache"
+    target = f"arn:{partition}:s3:::{bucket}/"
+
+    def reaches(resource: str) -> bool:
+        literal = re.split(r"[*?]", resource, maxsplit=1)[0]
+        if literal != resource:
+            return target.startswith(literal) or literal.startswith(target)
+        return resource.startswith(target) and len(resource) > len(target)
+
+    def covers(resource: str) -> bool:
+        return resource.endswith("*") and _wildcard_matches(resource, target)
+
+    def coverage(statement: Dict[str, Any]) -> int:
+        # 2 covers every object, 1 reaches some, 0 reaches none.
+        if "NotResource" in statement:
+            excluded = [str(r) for r in _as_list(statement.get("NotResource"))]
+            if any(map(covers, excluded)):
+                return 0
+            return 1 if any(map(reaches, excluded)) else 2
+        resources = [str(r) for r in _as_list(statement.get("Resource"))]
+        if any(map(covers, resources)):
+            return 2
+        return 1 if any(map(reaches, resources)) else 0
+
+    policies = list(_cached_identity_policies(permissions))
+    boundary = _boundary_document(permissions)
+    if boundary is not None:
+        policies.append(("permissions boundary", {"document": boundary}))
+    granted, bounded, held = 0, 0, []
+    for source, policy in policies:
+        label = (
+            f"{source} '{policy.get('policy_name') or policy.get('name') or 'unnamed'}'"
+        )
+        try:
+            statements = _policy_statements(policy.get("document"))
+        except (ValueError, TypeError) as error:
+            held.append(
+                f"{label} could not be parsed ({get_assessment_error_label(error)})"
+            )
+            continue
+        for statement in statements:
+            if not _statement_matches_action(statement, "s3:getobject"):
+                continue
+            if str(statement.get("Effect", "")).upper() == "ALLOW":
+                if source == "permissions boundary":
+                    bounded = max(bounded, coverage(statement))
+                else:
+                    granted = max(granted, coverage(statement))
+                continue
+            if "NotResource" in statement:
+                held.append(f"{label} denies s3:GetObject with NotResource")
+                continue
+            resources = [str(r) for r in _as_list(statement.get("Resource"))]
+            if not any(map(reaches, resources)):
+                continue
+            if statement.get("Condition"):
+                held.append(f"{label} denies s3:GetObject under a Condition")
+            elif any(map(covers, resources)):
+                return "denied", f"{label} denies s3:GetObject on every object"
+            else:
+                held.append(f"{label} denies s3:GetObject on part of the bucket")
+    if boundary is not None and bounded == 0:
+        return "denied", (
+            "its permissions boundary allows s3:GetObject on no object of the bucket"
+        )
+    if boundary is not None and bounded == 1:
+        held.append(
+            "its permissions boundary allows s3:GetObject on part of the bucket only"
+        )
+    if granted == 1:
+        held.append(
+            "its identity policies allow s3:GetObject on part of the bucket only"
+        )
+    if held:
+        return "held", "; ".join(held)
+    if granted == 0:
+        if bucket_allows:
+            return "held", (
+                "no identity policy allows s3:GetObject on the bucket, and the "
+                "bucket policy's Allow statements are not compared per principal"
+            )
+        return "denied", (
+            "no identity policy allows s3:GetObject on the bucket and the bucket "
+            "policy allows it to no one"
+        )
+    return "reads", ""
 
 
 def _knowledge_base_source_access_findings(
@@ -16300,18 +16435,19 @@ def _knowledge_base_source_access_findings(
     bucket_kbs: Dict[str, set],
     vector_principals: Dict[str, Dict[str, Any]],
     region: str,
+    permission_cache: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Compare who a vector store admits with who the source bucket policy lets
-    read the documents, for BR-20.
+    Compare who a vector store admits with who the source bucket policy and
+    their own IAM policies let read the documents, for BR-20.
 
     The admitted principals are those an OpenSearch Serverless data access
     policy names on the index, or those a restricting S3 Vectors bucket policy
     Deny exempts by aws:PrincipalArn or NotPrincipal. One that a Deny in the
     policy of a bucket the knowledge base ingests from keeps from s3:GetObject
-    on every object fails. IAM grants on the source
-    objects are not compared, because the bucket policy is the only resource
-    side read here.
+    on every object fails, and so does one _source_identity_read finds denied
+    by its identity policies or permissions boundary. Service control policies
+    are not evaluated.
     """
     rows = []
     s3_client = None
@@ -16345,7 +16481,12 @@ def _knowledge_base_source_access_findings(
                     )
                 )
                 continue
-            restrictions = {"allow_only": [], "excluded": [], "held": []}
+            restrictions = {
+                "allow_only": [],
+                "excluded": [],
+                "held": [],
+                "allows": False,
+            }
         except (ValueError, TypeError) as error:
             rows.append(
                 (
@@ -16365,24 +16506,51 @@ def _knowledge_base_source_access_findings(
                 for patterns in restrictions["allow_only"]
             )
         ]
+        identity_denied, identity_held = [], []
+        for principal in principals:
+            if principal in denied:
+                continue
+            verdict, why = _source_identity_read(
+                principal, bucket, permission_cache, restrictions["allows"]
+            )
+            if verdict == "denied":
+                identity_denied.append(f"{principal} ({why})")
+            elif verdict == "held":
+                identity_held.append(f"{principal}: {why}")
         served = "; ".join(labels)
         indexes = ", ".join(f"'{entry['name']}'" for _, entry in reaching)
-        if denied:
+        if denied or identity_denied:
             status = "Failed"
-            detail = (
-                f"{len(denied)} of the {len(principals)} principal(s) admitted to "
-                f"the vector index of knowledge base(s) {indexes} are denied "
-                f"s3:GetObject on the documents of source bucket '{bucket}' by its "
-                f"bucket policy, so they read through the index content the bucket "
-                f"keeps from them: {', '.join(denied[:5])}. The bucket is ingested "
-                f"by {served}."
-            )
-        elif restrictions["held"] or unread:
+            parts = []
+            if denied:
+                parts.append(
+                    f"{len(denied)} of the {len(principals)} principal(s) admitted "
+                    f"to the vector index of knowledge base(s) {indexes} are denied "
+                    f"s3:GetObject on the documents of source bucket '{bucket}' by "
+                    "its bucket policy, so they read through the index content the "
+                    f"bucket keeps from them: {', '.join(denied[:5])}."
+                )
+            if identity_denied:
+                parts.append(
+                    f"{len(identity_denied)} of the {len(principals)} principal(s) "
+                    f"admitted to the vector index of knowledge base(s) {indexes} "
+                    "cannot read the documents of source bucket "
+                    f"'{bucket}' under their own IAM policies, so they read through "
+                    "the index content their grants keep from them: "
+                    f"{'; '.join(identity_denied[:5])}."
+                )
+            detail = " ".join(parts) + f" The bucket is ingested by {served}."
+        elif restrictions["held"] or unread or identity_held:
             status = "N/A"
-            reasons = list(restrictions["held"]) + [
-                f"the principals admitted to the index of '{name}' were not all read"
-                for name in unread
-            ]
+            reasons = (
+                list(restrictions["held"])
+                + [
+                    f"the principals admitted to the index of '{name}' were not "
+                    "all read"
+                    for name in unread
+                ]
+                + identity_held
+            )
             detail = (
                 f"Who reads the documents of source bucket '{bucket}' was not fully "
                 f"compared with who reads the vector index of {indexes}: "
@@ -16395,7 +16563,12 @@ def _knowledge_base_source_access_findings(
                 f"index of {indexes} is denied s3:GetObject by the policy of "
                 f"source bucket '{bucket}'"
                 + ("" if restricted else ", which has no Deny on those reads")
-                + ". IAM grants on the source objects are not compared."
+                + ", and each holds an identity-policy Allow of s3:GetObject whose "
+                "Resource covers every object of the bucket, within a permissions "
+                "boundary that does too if one is set, with no identity-policy or "
+                "permissions-boundary Deny of it. Conditions on those Allow "
+                "statements are not evaluated, and neither service control policies "
+                "nor the KMS key policy of the bucket's key is read."
             )
         rows.append((status, detail))
     return [
@@ -16555,7 +16728,9 @@ def _knowledge_base_transient_key_findings(
 
 
 def _knowledge_base_source_encryption_findings(
-    region: str, vector_principals: Optional[Dict[str, Dict[str, Any]]] = None
+    region: str,
+    vector_principals: Optional[Dict[str, Dict[str, Any]]] = None,
+    permission_cache: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Assess encryption at rest on every S3 bucket a knowledge base ingests from.
 
@@ -16734,7 +16909,7 @@ def _knowledge_base_source_encryption_findings(
     )
     source_findings.extend(
         _knowledge_base_source_access_findings(
-            buckets, bucket_kbs, vector_principals or {}, region
+            buckets, bucket_kbs, vector_principals or {}, region, permission_cache
         )
     )
 
@@ -17104,6 +17279,7 @@ def check_bedrock_knowledge_base_kms_encryption(
                     for kb in kbs_store_assessments
                     if "principals" in kb
                 },
+                permission_cache,
             )
             if any(row["Status"] == "Failed" for row in source_encryption):
                 findings["status"] = "WARN"

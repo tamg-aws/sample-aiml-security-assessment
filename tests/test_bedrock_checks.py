@@ -39297,7 +39297,8 @@ class TestBR20ValueDepth:
     @classmethod
     def _cache(cls, resource=None, condition=None, roles=None):
         """An IAM permissions cache where kb-role allows aoss:APIAccessAll on
-        `resource` (collection c1 by default)."""
+        `resource` (collection c1 by default) and s3:GetObject on the objects
+        of the corpus and open source buckets."""
         statement = {
             "Effect": "Allow",
             "Action": "aoss:APIAccessAll",
@@ -39311,7 +39312,23 @@ class TestBR20ValueDepth:
                 {
                     "policy_name": "kb-aoss",
                     "document": {"Version": "2012-10-17", "Statement": [statement]},
-                }
+                },
+                {
+                    "policy_name": "kb-sources",
+                    "document": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "s3:GetObject",
+                                "Resource": [
+                                    "arn:aws:s3:::corpus/*",
+                                    "arn:aws:s3:::open/*",
+                                ],
+                            }
+                        ],
+                    },
+                },
             ]
         }
         return {
@@ -40137,6 +40154,251 @@ class TestBR20ValueDepth:
         rows = self._source_access(self._source_run({"corpus": policy}))
         assert [r["Status"] for r in rows] == ["N/A", "Passed"]
         assert expected in rows[0]["Finding_Details"]
+
+    def _identity_run(self, statements, boundary=None, bucket_policies=None):
+        # kb-role keeps its aoss grant; only its s3 statements vary.
+        cache = self._cache()
+        policies = cache["role_permissions"]["kb-role"]["attached_policies"]
+        policies[1]["document"]["Statement"] = statements
+        if boundary is not None:
+            cache["role_permissions"]["kb-role"]["permissions_boundary"] = {
+                "document": {"Statement": boundary}
+            }
+        return self._source_access(
+            self._run(
+                {"kb1": self._aoss_body()},
+                clients={"opensearchserverless": self._aoss(self.CMK)},
+                sources={
+                    "kb1": [("ds1", "corpus", self.CMK), ("ds2", "open", self.CMK)]
+                },
+                bucket_encryption={
+                    "corpus": self._sse(self.CMK),
+                    "open": self._sse(self.CMK),
+                },
+                bucket_policies=bucket_policies,
+                permission_cache=cache,
+            )
+        )
+
+    @staticmethod
+    def _s3_statement(effect, resource, **extra):
+        return {
+            "Effect": effect,
+            "Action": "s3:GetObject",
+            "Resource": resource,
+            **extra,
+        }
+
+    def test_a_vector_principal_its_own_policy_denies_fails(self):
+        rows = self._identity_run(
+            [
+                self._s3_statement("Allow", "*"),
+                self._s3_statement("Deny", "arn:aws:s3:::corpus/*"),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "1 of the 1 principal(s) admitted to the vector index of knowledge "
+            "base(s) 'KB-kb1' cannot read the documents of source bucket 'corpus' "
+            "under their own IAM policies, so they read through the index content "
+            f"their grants keep from them: {self.ROLE} (attached policy "
+            "'kb-sources' denies s3:GetObject on every object)."
+        ) in rows[0]["Finding_Details"]
+        assert "by its bucket policy" not in rows[0]["Finding_Details"]
+        assert rows[0]["Resolution"] == bedrock_app.KB_SOURCE_ACCESS_RESOLUTION
+
+    @pytest.mark.parametrize(
+        "resource, status",
+        [
+            ("arn:aws:s3:::open/*", "Failed"),
+            ("arn:aws:s3:::corpus", "Failed"),
+            ("arn:aws:s3:::corp*", "Passed"),
+            ("arn:*:s3:::corpus/*", "Passed"),
+            ("arn:aws:s3:::corpus/docs/a.pdf", "N/A"),
+            ("arn:aws:s3:::corpus/docs/*", "N/A"),
+            ("arn:aws:s3:::corpus*/", "N/A"),
+        ],
+    )
+    def test_a_vector_principal_with_no_source_grant_fails(self, resource, status):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", [resource, "arn:aws:s3:::open/*"])]
+        )
+        assert [r["Status"] for r in rows] == [status, "Passed"]
+        if status == "Failed":
+            assert (
+                f"{self.ROLE} (no identity policy allows s3:GetObject on the bucket "
+                "and the bucket policy allows it to no one)"
+            ) in rows[0]["Finding_Details"]
+        if status == "N/A":
+            assert (
+                f"{self.ROLE}: its identity policies allow s3:GetObject on part of "
+                "the bucket only"
+            ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "excluded, status",
+        [
+            ("arn:aws:s3:::other/*", "Passed"),
+            ("arn:aws:s3:::corpus/secret/*", "N/A"),
+            ("arn:aws:s3:::corpus/*", "Failed"),
+        ],
+    )
+    def test_a_not_resource_allow_grants_what_it_does_not_exclude(
+        self, excluded, status
+    ):
+        rows = self._identity_run(
+            [
+                self._s3_statement("Allow", "arn:aws:s3:::open/*"),
+                {"Effect": "Allow", "Action": "s3:GetObject", "NotResource": excluded},
+            ]
+        )
+        assert [r["Status"] for r in rows] == [status, "Passed"]
+
+    def test_a_boundary_on_part_of_the_source_is_not_passed(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "*")],
+            boundary=[
+                {"Effect": "Allow", "Action": "aoss:*", "Resource": "*"},
+                self._s3_statement("Allow", "arn:aws:s3:::corpus/docs/*"),
+                self._s3_statement("Allow", "arn:aws:s3:::open/*"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert (
+            f"{self.ROLE}: its permissions boundary allows s3:GetObject on part of "
+            "the bucket only"
+        ) in rows[0]["Finding_Details"]
+
+    def test_no_identity_grant_beside_a_bucket_allow_is_not_compared(self):
+        allow = self._policy(
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{self.ACCOUNT}:root"},
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::corpus/*",
+            }
+        )
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "arn:aws:s3:::open/*")],
+            bucket_policies={"corpus": allow},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert (
+            f"{self.ROLE}: no identity policy allows s3:GetObject on the bucket, "
+            "and the bucket policy's Allow statements are not compared per principal"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_boundary_without_the_source_fails(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "*")],
+            boundary=[
+                {"Effect": "Allow", "Action": "aoss:*", "Resource": "*"},
+                self._s3_statement("Allow", "arn:aws:s3:::open/*"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "its permissions boundary allows s3:GetObject on no object of the bucket"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_a_boundary_allow_is_not_a_grant(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "arn:aws:s3:::open/*")],
+            boundary=[{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "no identity policy allows s3:GetObject on the bucket and the bucket "
+            "policy allows it to no one" in rows[0]["Finding_Details"]
+        )
+
+    def test_a_boundary_deny_on_the_source_fails(self):
+        rows = self._identity_run(
+            [self._s3_statement("Allow", "*")],
+            boundary=[
+                {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                self._s3_statement("Deny", "arn:aws:s3:::corpus/*"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "permissions boundary 'unnamed' denies s3:GetObject on every object"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "deny, expected",
+        [
+            (
+                {
+                    "Resource": "arn:aws:s3:::corpus/*",
+                    "Condition": {"Bool": {"aws:x": "1"}},
+                },
+                "attached policy 'kb-sources' denies s3:GetObject under a Condition",
+            ),
+            (
+                {"Resource": "arn:aws:s3:::corpus/secret/*"},
+                "attached policy 'kb-sources' denies s3:GetObject on part of the bucket",
+            ),
+            (
+                {"Resource": "arn:aws:s3:::corpus*/"},
+                "attached policy 'kb-sources' denies s3:GetObject on part of the bucket",
+            ),
+            (
+                {"NotResource": "arn:aws:s3:::open/*"},
+                "attached policy 'kb-sources' denies s3:GetObject with NotResource",
+            ),
+        ],
+    )
+    def test_an_uncomputed_identity_deny_is_not_passed(self, deny, expected):
+        statement = {"Effect": "Deny", "Action": "s3:GetObject", **deny}
+        rows = self._identity_run([self._s3_statement("Allow", "*"), statement])
+        assert rows[0]["Status"] == "N/A"
+        assert f"{self.ROLE}: {expected}" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "cache, expected",
+        [
+            ("missing", "the role is not in the IAM permissions cache"),
+            ("errored", "the role had a policy read fail in the IAM permissions cache"),
+            (False, "the IAM permissions cache was not available"),
+        ],
+    )
+    def test_an_unread_identity_is_not_passed(self, cache, expected):
+        if cache == "missing":
+            cache = self._cache()
+            cache["role_permissions"] = {}
+        elif cache == "errored":
+            cache = self._cache()
+            cache["principal_errors"] = [{"type": "role", "name": "kb-role"}]
+        rows = self._source_access(self._source_run_with_cache(cache))
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert f"{self.ROLE}: {expected}" in rows[0]["Finding_Details"]
+
+    def _source_run_with_cache(self, cache):
+        return self._run(
+            {"kb1": self._aoss_body()},
+            clients={"opensearchserverless": self._aoss(self.CMK)},
+            sources={"kb1": [("ds1", "corpus", self.CMK), ("ds2", "open", self.CMK)]},
+            bucket_encryption={
+                "corpus": self._sse(self.CMK),
+                "open": self._sse(self.CMK),
+            },
+            permission_cache=cache,
+        )
+
+    def test_a_passed_source_comparison_names_the_identity_leg(self):
+        rows = self._identity_run([self._s3_statement("Allow", "*")])
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+        assert rows[0]["Finding_Details"].endswith(
+            "which has no Deny on those reads, and each holds an identity-policy "
+            "Allow of s3:GetObject whose Resource covers every object of the "
+            "bucket, within a permissions boundary that does too if one is set, "
+            "with no identity-policy or permissions-boundary Deny of it. Conditions "
+            "on those Allow statements are not evaluated, and neither service "
+            "control policies nor the KMS key policy of the bucket's key is read."
+        )
 
     def _s3v_source_run(self, deny, bucket_policies):
         return self._run(

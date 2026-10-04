@@ -732,6 +732,83 @@ MUTATIONS = [
         "replace": "    missing = []\n",
     },
     {
+        "name": "BR-20 source: an identity Deny is ignored",
+        "file": BEDROCK,
+        "defect": "BR-20 skips an unconditioned identity-policy Deny of s3:GetObject on the source bucket, so a principal its own policy keeps from the documents passes",
+        "find": '                return "denied", f"{label} denies s3:GetObject on every object"\n',
+        "replace": "                pass\n",
+    },
+    {
+        "name": "BR-20 source: a missing identity grant reads as a read",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a principal no identity policy lets read the source bucket, beside a bucket policy that allows no one",
+        "find": "    if granted == 0:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: a boundary Allow counts as a grant",
+        "file": BEDROCK,
+        "defect": "BR-20 reads a permissions boundary Allow as a grant, though a boundary only limits one",
+        "find": '                if source == "permissions boundary":\n',
+        "replace": "                if False:\n",
+    },
+    {
+        "name": "BR-20 source: a boundary scoped elsewhere is not read",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a principal whose permissions boundary allows s3:GetObject only on other buckets",
+        "find": "    if boundary is not None and bounded == 0:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: a boundary on part of the bucket is credited",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a principal whose permissions boundary allows s3:GetObject on one prefix of the source bucket only",
+        "find": "    if boundary is not None and bounded == 1:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: any wildcard grant reaches the bucket",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a wildcard s3:GetObject Allow on another bucket as a grant on the source",
+        "find": "            return target.startswith(literal) or literal.startswith(target)\n",
+        "replace": "            return True\n",
+    },
+    {
+        "name": "BR-20 source: a pattern ending past the bucket covers it",
+        "file": BEDROCK,
+        "defect": "BR-20 reads a Resource that matches the bucket prefix but does not end in a wildcard as covering every object",
+        "find": '        return resource.endswith("*") and _wildcard_matches(resource, target)\n',
+        "replace": "        return _wildcard_matches(resource, target)\n",
+    },
+    {
+        "name": "BR-20 source: a grant on part of the bucket is credited",
+        "file": BEDROCK,
+        "defect": "BR-20 credits an identity Allow of s3:GetObject on one prefix of the source bucket as a read of every document",
+        "find": "    if granted == 1:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-20 source: a NotResource Allow excluding a prefix covers the bucket",
+        "file": BEDROCK,
+        "defect": "BR-20 credits a NotResource Allow that excludes a prefix of the source bucket as a read of every document",
+        "find": "            return 1 if any(map(reaches, excluded)) else 2\n",
+        "replace": "            return 2\n",
+    },
+    {
+        "name": "BR-20 source: the identity verdict is not read",
+        "file": BEDROCK,
+        "defect": "BR-20 computes the identity-policy verdict and never fails on it",
+        "find": '            if verdict == "denied":\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-20 source: an unjudged identity reads as passed",
+        "file": BEDROCK,
+        "defect": "BR-20 passes a principal whose identity policies were not read or not computed",
+        "find": '            elif verdict == "held":\n',
+        "replace": "            elif False:\n",
+    },
+    {
         "name": "BR-46 sidecar budget resets for each source",
         "file": BEDROCK,
         "defect": "BR-46 gives every source the whole sidecar read budget, so "
@@ -4933,6 +5010,39 @@ GROUPS: dict[str, str] = {
     ),
     "BR-46 credits a document with no metadata sidecar": (
         "in the Bedrock knowledge base classification"
+    ),
+    "BR-20 source: an identity Deny is ignored": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a missing identity grant reads as a read": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a boundary Allow counts as a grant": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a boundary scoped elsewhere is not read": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a boundary on part of the bucket is credited": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: any wildcard grant reaches the bucket": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a pattern ending past the bucket covers it": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a grant on part of the bucket is credited": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: a NotResource Allow excluding a prefix covers the bucket": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: the identity verdict is not read": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 source: an unjudged identity reads as passed": (
+        "in the Bedrock knowledge base stores"
     ),
     "BR-46 sidecar budget resets for each source": (
         "in the Bedrock knowledge base classification"
