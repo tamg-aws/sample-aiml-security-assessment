@@ -46804,6 +46804,8 @@ class TestBR57AgentRoleScope:
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-*",
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-?????",
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/*-??????",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/d?-??????",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:*",
         ],
     )
     def test_a_wildcard_in_any_arn_segment_fails(self, resource):
