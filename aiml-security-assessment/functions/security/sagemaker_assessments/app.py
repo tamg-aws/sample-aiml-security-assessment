@@ -1339,104 +1339,10 @@ def _guardduty_org_auto_enable_finding(region: str, detector_id: str) -> Dict[st
     )
 
 
-GUARDDUTY_PROMPT_INJECTION_FINDING = "GuardDuty Prompt Injection Findings"
-# The type was read live from GetFindings in us-east-1 on 2026-10-03.
-GUARDDUTY_PROMPT_INJECTION_TYPE = "Impact:IAMUser/PromptInjection.Direct"
-
-
-def _guardduty_prompt_injection_finding(
-    region: str, detector_id: str, protected: bool
-) -> Dict[str, Any]:
-    """AIR-FND-DET-04: a GuardDuty prompt-injection finding is the flagged event
-    the control asks for, so findings, archived or not, are evidence of
-    detection; with none, AI Protection is the detection rule on its own."""
-    reference = "https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html"
-
-    def _row(details, resolution, severity, status):
-        return create_finding(
-            check_id="SM-26",
-            finding_name=GUARDDUTY_PROMPT_INJECTION_FINDING,
-            finding_details=details,
-            resolution=resolution,
-            reference=reference,
-            severity=severity,
-            status=status,
-            region=region,
-        )
-
-    if not protected:
-        return _row(
-            "AI Protection is not enabled on this detector, so GuardDuty runs no "
-            f"rule that raises an {GUARDDUTY_PROMPT_INJECTION_TYPE} finding and no "
-            "prompt-injection attempt is detected or logged.",
-            "Enable the GuardDuty AI_PROTECTION detector feature for this region.",
-            "Medium",
-            "Failed",
-        )
-    try:
-        client = boto3.client("guardduty", config=boto3_config, region_name=region)
-        ids = []
-        for page in client.get_paginator("list_findings").paginate(
-            DetectorId=detector_id,
-            FindingCriteria={
-                "Criterion": {"type": {"Equals": [GUARDDUTY_PROMPT_INJECTION_TYPE]}}
-            },
-            SortCriteria={"AttributeName": "updatedAt", "OrderBy": "DESC"},
-        ):
-            ids.extend(page.get("FindingIds") or [])
-    except Exception as error:
-        return _row(
-            f"guardduty:ListFindings failed ({get_assessment_error_label(error)}), "
-            f"so whether any {GUARDDUTY_PROMPT_INJECTION_TYPE} finding was raised "
-            "was not read.",
-            COULD_NOT_ASSESS_RESOLUTION,
-            "Informational",
-            "N/A",
-        )
-    if not ids:
-        return _row(
-            f"AI Protection is enabled on detector {detector_id}, the rule that "
-            f"raises {GUARDDUTY_PROMPT_INJECTION_TYPE} findings. No such finding, "
-            "archived or not, exists on the detector, so no example flagged event "
-            "exists yet.",
-            "No action required",
-            "Medium",
-            "Passed",
-        )
-    try:
-        latest = (
-            client.get_findings(DetectorId=detector_id, FindingIds=ids[:1]).get(
-                "Findings"
-            )
-            or [{}]
-        )[0]
-        example = (
-            f" The latest, {ids[0]}, was last updated {latest.get('UpdatedAt')} "
-            f"and counts {(latest.get('Service') or {}).get('Count')} event(s) "
-            f"against a {(latest.get('Resource') or {}).get('ResourceType')} "
-            "resource."
-        )
-    except Exception as error:
-        example = (
-            f" The latest is {ids[0]}; guardduty:GetFindings failed "
-            f"({get_assessment_error_label(error)}), so its detail was not read."
-        )
-    return _row(
-        f"AI Protection is enabled on detector {detector_id} and has raised "
-        f"{len(ids)} {GUARDDUTY_PROMPT_INJECTION_TYPE} finding(s), archived "
-        "included, each a prompt-injection attempt detected and logged as a "
-        f"security finding.{example}",
-        "No action required",
-        "Medium",
-        "Passed",
-    )
-
-
 def check_guardduty_ai_protection(
     region: str = "", detector_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
-    """SM-26: Verify GuardDuty AI Protection is enabled, and name an example
-    prompt-injection finding it raised."""
+    """SM-26: Verify GuardDuty AI Protection is enabled."""
     findings = {"csv_data": []}
     try:
         inventory = detector_inventory or get_guardduty_detector_inventory(region)
@@ -1501,11 +1407,6 @@ def check_guardduty_ai_protection(
                 severity="High",
                 status="Passed" if enabled else "Failed",
                 region=region,
-            )
-        )
-        findings["csv_data"].append(
-            _guardduty_prompt_injection_finding(
-                region, inventory["detector_id"], enabled
             )
         )
         findings["csv_data"].append(

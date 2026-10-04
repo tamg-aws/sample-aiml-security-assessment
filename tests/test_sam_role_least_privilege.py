@@ -336,8 +336,6 @@ _EXPECTED_ACTIONS = {
         "iam:GetInstanceProfile",
         "lambda:ListMicrovmImages",
         "lambda:ListMicrovmImageVersions",
-        "guardduty:ListFindings",
-        "guardduty:GetFindings",
         "ec2:DescribeVpcAttribute",
         "organizations:ListAWSServiceAccessForOrganization",
         "sagemaker:DescribeModelBiasJobDefinition",
@@ -1170,8 +1168,6 @@ _SAGEMAKER_MANAGED_GRANTS = [
         ),
     ),
     ("Allow", "lambda:ListMicrovmImages", '"*"'),
-    ("Allow", "guardduty:ListFindings", '"*"'),
-    ("Allow", "guardduty:GetFindings", '"*"'),
     (
         "Allow",
         "lambda:ListMicrovmImageVersions",

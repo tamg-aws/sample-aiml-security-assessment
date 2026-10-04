@@ -1003,47 +1003,6 @@ MUTATIONS = [
         "replace": "            pass\n",
     },
     {
-        "name": "SM-26 credits a detector without AI Protection",
-        "file": SAGEMAKER,
-        "defect": "with AI_PROTECTION off GuardDuty runs no prompt-injection "
-        "rule, so reading its findings and passing hides that nothing is detected",
-        "find": "    if not protected:\n        return _row(",
-        "replace": "    if False:\n        return _row(",
-    },
-    {
-        "name": "SM-26 fails a detector that raised a prompt-injection finding",
-        "file": SAGEMAKER,
-        "defect": "a raised finding is the example flagged event DET-04 asks "
-        "for, so failing on it inverts the verdict where detection works",
-        "find": (
-            '        f"security finding.{example}",\n'
-            '        "No action required",\n'
-            '        "Medium",\n'
-            '        "Passed",\n'
-        ),
-        "replace": (
-            '        f"security finding.{example}",\n'
-            '        "No action required",\n'
-            '        "Medium",\n'
-            '        "Failed",\n'
-        ),
-    },
-    {
-        "name": "SM-26 reads only unarchived prompt-injection findings",
-        "file": SAGEMAKER,
-        "defect": "an archived finding is still a flagged event, so filtering it "
-        "out reports no example where one exists",
-        "find": (
-            '                "Criterion": {"type": {"Equals": '
-            "[GUARDDUTY_PROMPT_INJECTION_TYPE]}}\n"
-        ),
-        "replace": (
-            '                "Criterion": {"type": {"Equals": '
-            '[GUARDDUTY_PROMPT_INJECTION_TYPE]}, "service.archived": '
-            '{"Equals": ["false"]}}\n'
-        ),
-    },
-    {
         "name": "SM-33 and SM-11 credit private DNS in a VPC with DNS off",
         "file": SAGEMAKER,
         "defect": "private DNS creates no record for the default hostname in a "
@@ -2649,9 +2608,6 @@ GROUPS: dict[str, str] = {
     "SM-02 lets a stage span a slash": "in the SageMaker verdict legs",
     "SM-39 does not count an agent Lambda outside a VPC": "in the SageMaker verdict legs",
     "SM-39 drops EKS cluster subnets": "in the SageMaker verdict legs",
-    "SM-26 credits a detector without AI Protection": "in the SageMaker verdict legs",
-    "SM-26 fails a detector that raised a prompt-injection finding": "in the SageMaker verdict legs",
-    "SM-26 reads only unarchived prompt-injection findings": "in the SageMaker verdict legs",
     "SM-33 and SM-11 credit private DNS in a VPC with DNS off": "in the SageMaker verdict legs",
     "SM-33 passes a VPC whose DNS attributes were not read": "in the SageMaker verdict legs",
     "SM-33 reads only the first VPC's DNS attributes": "in the SageMaker verdict legs",
