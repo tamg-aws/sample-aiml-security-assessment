@@ -52546,6 +52546,141 @@ class TestAC49EgressAllowListSync:
     @patch("agentcore_app.network_firewall_client")
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
+    def test_a_name_an_earlier_block_refuses_inside_an_allowed_wildcard_fails(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        # The ALLOW over *.example.com answers every subdomain except those the
+        # earlier BLOCK refuses, so a firewall target admitting a refused name
+        # is held by one layer only.
+        allowed = ("ALLOW", ["example.com.", "*.example.com."])
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {
+                "vpc-a": [("BLOCK", ["a.example.com."]), allowed, ("BLOCK", ["*."])],
+                "vpc-b": [("BLOCK", ["*.x.example.com."]), allowed, ("BLOCK", ["*."])],
+            },
+            {
+                "fw1": [".example.com", "a.example.com", "b.example.com"],
+                "fw2": [".example.com", "x.example.com"],
+            },
+        )
+
+        assert rows["vpc-a"]["Status"] == "Failed"
+        assert (
+            "firewall fw1's ALLOWLIST admits .example.com, a.example.com, which the "
+            "DNS Firewall allow-list does not" in rows["vpc-a"]["Finding_Details"]
+        )
+        assert rows["vpc-b"]["Status"] == "Failed"
+        assert (
+            "firewall fw2's ALLOWLIST admits .example.com, which the DNS Firewall "
+            "allow-list does not" in rows["vpc-b"]["Finding_Details"]
+        )
+        for row in rows.values():
+            assert "the DNS Firewall allow-list admits" not in row["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    def test_the_comparison_matches_first_match_evaluation(self, mock_r53):
+        # The oracle walks the rules in order for every name of a finite
+        # universe; the label "z" appears in no rule, so it stands for every
+        # subdomain the rules do not name, and depth 4 is one past the deepest
+        # rule.
+        import itertools
+        import random
+
+        rng = random.Random(20261004)
+        labels = ["a", "b"]
+        names = ["example.com"] + [
+            ".".join(parts) + ".example.com"
+            for depth in (1, 2)
+            for parts in itertools.product(labels, repeat=depth)
+        ]
+        universe = ["example.com"] + [
+            ".".join(parts) + ".example.com"
+            for depth in (1, 2, 3, 4)
+            for parts in itertools.product(labels + ["z"], repeat=depth)
+        ]
+
+        def matches(entry, name):
+            if entry.startswith("*."):
+                return name.endswith("." + entry[2:])
+            return name == entry
+
+        for _ in range(400):
+            rules = [
+                (
+                    rng.choice(["ALLOW", "BLOCK"]),
+                    [
+                        rng.choice(["", "*."]) + rng.choice(names)
+                        for _ in range(rng.randint(1, 3))
+                    ],
+                )
+                for _ in range(rng.randint(1, 5))
+            ] + [("BLOCK", ["*."])]
+            self._dns(
+                mock_r53, {"vpc-a": [(a, [d + "." for d in ds]) for a, ds in rules]}
+            )
+            allowed, _, _ = agentcore_app._dns_firewall_allowed_names("vpc-a")
+
+            def answered(name):
+                for action, entries in rules[:-1]:
+                    if any(matches(entry, name) for entry in entries):
+                        return action == "ALLOW"
+                return False
+
+            for target in names + ["." + name for name in names]:
+                pattern = agentcore_app._domain_pattern(target, True)
+                expected = all(
+                    answered(name)
+                    for name in universe
+                    if name == pattern[0]
+                    or (pattern[2] and name.endswith("." + pattern[0]))
+                )
+                assert (
+                    agentcore_app._dns_allow_list_covers(allowed, pattern) is expected
+                ), (rules, target)
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_refused_part_an_earlier_allow_answers_stays_in_sync(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        # An ALLOW ahead of the BLOCK answers the part the BLOCK would refuse,
+        # so every name the firewall admits is still answered.
+        allowed = ("ALLOW", ["example.com.", "*.example.com."])
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {
+                "vpc-a": [
+                    ("ALLOW", ["a.example.com."]),
+                    ("BLOCK", ["a.example.com."]),
+                    allowed,
+                    ("BLOCK", ["*."]),
+                ],
+                "vpc-b": [
+                    ("ALLOW", ["*.x.example.com."]),
+                    ("BLOCK", ["*.x.example.com.", "y.x.example.com."]),
+                    allowed,
+                    ("BLOCK", ["*."]),
+                ],
+            },
+            {"fw1": [".example.com"], "fw2": [".example.com", "y.x.example.com"]},
+        )
+
+        assert rows["vpc-a"]["Status"] == "Passed"
+        assert rows["vpc-b"]["Status"] == "Passed"
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
     def test_an_earlier_wildcard_block_removes_the_names_it_covers(
         self, mock_ac, mock_ec2, mock_nfw, mock_r53
     ):
