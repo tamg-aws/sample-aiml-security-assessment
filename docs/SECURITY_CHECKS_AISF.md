@@ -248,7 +248,7 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 178 check-control pairs over 113 tagged checks in 4 modules, naming 103
+every run: 179 check-control pairs over 113 tagged checks in 4 modules, naming 103
 distinct controls. Tagged checks per module are bedrock 33, sagemaker 26,
 agentcore 50, agent_registry 4.
 
@@ -266,8 +266,8 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 56 bare, 0 `(partial)`, 122
-joint. The 56 bare tags plus the 47 jointly covered controls account for the 103
+Census at the current head, also printed by gate 14: 55 bare, 0 `(partial)`, 124
+joint. The 55 bare tags plus the 48 jointly covered controls account for the 103
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
 incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
 dropped `(1 of N)`, fails gate 14 with the row's verdict and incumbent count
@@ -467,10 +467,10 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 250/250 find-strings validated`, aborting and naming each entry whose
+   `entries 260/260 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 250 ways and requires a ledger gate or a test to go red for
+   breaks the code 260 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
    in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names
    the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown
@@ -481,7 +481,7 @@ timestamp and `--csv-dir` says it cannot.
    the Bedrock condition parsers, 1 in the Bedrock endpoint collector, 1 in
    the Bedrock cross-Region agent roles, 1 in the Bedrock CloudTrail Lake
    reader, 1 in the Bedrock training bucket policies, 1 in the Bedrock
-   AI user population, 2 in the Bedrock knowledge base stores, 1 in the Bedrock data path TLS exemptions, 1 in the Bedrock AgentCore memory retention, 2 in the Bedrock knowledge base redaction, 1 in the Bedrock guardrail output probe, 1 in the Bedrock Identity Center attributes, 1 in the Bedrock invocation log entries, 1 in the Bedrock owner tag sweep, 1 in the Bedrock profiles in use, 2 in the Bedrock agent workload identity, 2 in the Bedrock container image scanning and 3 in the Bedrock invocation log guardrail evidence and 187 in the AgentCore verdict legs. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
+   AI user population, 2 in the Bedrock knowledge base stores, 1 in the Bedrock data path TLS exemptions, 1 in the Bedrock AgentCore memory retention, 2 in the Bedrock knowledge base redaction, 1 in the Bedrock guardrail output probe, 1 in the Bedrock Identity Center attributes, 1 in the Bedrock invocation log entries, 1 in the Bedrock owner tag sweep, 1 in the Bedrock profiles in use, 2 in the Bedrock agent workload identity, 2 in the Bedrock container image scanning and 3 in the Bedrock invocation log guardrail evidence and 197 in the AgentCore verdict legs. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
    fails if this paragraph disagrees with it, because the earlier copy of this
    sentence went stale at 17 while the battery grew to 22 and nothing read the
    two together. The last of those entries is what keeps gate 20 itself honest:

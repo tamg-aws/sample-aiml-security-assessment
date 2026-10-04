@@ -33,6 +33,18 @@ NON_PAGEABLE_CALLS = {
         "check_model_inventory_tagging",
         "list_tags_for_resource",
     ),
+    # AC-41: bedrock-agentcore-control and logs ListTagsForResource take only
+    # resourceArn and return only tags.
+    (
+        "agentcore_assessments/app.py",
+        "read_tags",
+        "list_tags_for_resource",
+    ),
+    (
+        "agentcore_assessments/app.py",
+        "check_agentcore_evaluation_personal_data",
+        "list_tags_for_resource",
+    ),
     (
         "responsible_ai_grc_assessments/app.py",
         "check_model_inventory_tagging",

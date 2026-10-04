@@ -548,7 +548,14 @@ AI_SUBJECT_ROWS = [
         "more than one AgentCore resource names. The shell-connection alarm leg of "
         "AC-45 runs in every assessed Region that holds a runtime, because metric "
         "filters and alarms are regional, and fails a Region with no acting alarm "
-        "counting shell connections",
+        "counting shell connections. AC-48's Execution Role Access Analyzer row, on "
+        "the primary Region, lists the IAM Access Analyzer analyzers of every "
+        "assessed Region and passes when an ACTIVE ACCOUNT_UNUSED_ACCESS or "
+        "ORGANIZATION_UNUSED_ACCESS analyzer excludes neither the account nor a "
+        "resource tag. An account outside any organization with none fails; in an "
+        "organization, whose analyzer the member account cannot list, it is N/A, as "
+        "is a tag exclusion or an unlisted Region. Whether each role holds equal or "
+        "fewer privileges than the principals that invoke it is not judged",
         [],
         4,
     ),
@@ -712,9 +719,14 @@ AI_SUBJECT_ROWS = [
         "system prompt, model parameters). A value holding a slash reads as a secret name "
         "unless it is a base64 string of 40 or more characters. No API reads the rest: there "
         "is no ListTokenVaults, so a vault no provider names and that is not configured is not "
-        "read. The agent's code and container image are not scanned: GetAgentRuntime "
-        "names them in agentRuntimeArtifact, but the role is not granted s3:GetObject or "
-        "the ECR image reads that fetch them. The vault key policy's trust is not graded, "
+        "read. AC-34 also reads the configuration of the container image each read "
+        "runtime version names, every platform of an image index, from this account's ECR "
+        "registry: an Env variable holding a credential, or an AWS access key ID or private "
+        "key block in Entrypoint or Cmd, fails, and an image in another account's registry "
+        "or one whose configuration cannot be fetched is N/A. The image's file system "
+        "layers are not scanned. The agent's code in S3 is not scanned: GetAgentRuntime "
+        "names it in agentRuntimeArtifact, but the role is not granted the s3:GetObject "
+        "that fetches it. The vault key policy's trust is not graded, "
         "and a denied bedrock-agentcore:ListHarnesses makes the harness leg N/A",
         [],
         4,
@@ -869,7 +881,10 @@ AI_SUBJECT_ROWS = [
         "runtime, code interpreter or browser and fails a resource whose groups "
         "together permit 0.0.0.0/0 or ::/0 egress, so 0.0.0.0/1 plus 128.0.0.0/1 fails "
         "as 0.0.0.0/0 does, and fails a rule naming a public range of /16 (IPv6 /48) "
-        "or wider, so 0.0.0.0/1 alone fails; ports are not judged. A tool in PUBLIC network mode fails without a describe "
+        "or wider, so 0.0.0.0/1 alone fails. A rule naming an IP range or prefix "
+        "list that allows every protocol, or TCP or UDP ports 1 (or lower) through "
+        "65535, fails as Egress Ports Unrestricted, and a passing row lists the ports "
+        "it read. A tool in PUBLIC network mode fails without a describe "
         "call, because the service grants it open internet egress by configuration, "
         "and a tool in SANDBOX fails at Medium, because no customer security group "
         "names what it reaches. A group the describe did not return and a denied "
@@ -975,9 +990,16 @@ AI_SUBJECT_ROWS = [
         "unreadable key policy is N/A. A configuration writing to SOURCE_LOG_GROUP "
         "names no results group and is N/A, with AC-20 and AC-26 named as the checks "
         "that judge the input groups. Retention length is reported and not judged, "
-        "because no API field states the workload's schedule. Tag values and the "
-        "configuration's own description are free-form text AC-41 discloses without "
-        "judging. The keys of custom evaluators and batch evaluations are credited "
+        "because no API field states the workload's schedule. AC-41's Evaluation "
+        "Personal Data row reads the tags of every evaluator the account defines, "
+        "every online evaluation configuration and every log group under "
+        "/aws/bedrock-agentcore/evaluations/ or named by an outputConfig, and the "
+        "name and description of those and of every batch evaluation plus each "
+        "evaluator's evaluatorConfig, and fails one that holds an email address, a "
+        "phone number, a US social security number in NNN-NN-NNNN form or a "
+        "Luhn-valid 13 to 19 digit number, naming the field and never the value. "
+        "Personal data in other forms is not detected, and an unread tag or field "
+        "makes the row N/A. The keys of custom evaluators and batch evaluations are credited "
         "only when DescribeKey reports them customer managed and enabled and the key "
         "policy allows kms:Decrypt with an encryption context naming that evaluator "
         "or batch evaluation in one account, with kms:ViaService for an evaluator, "
@@ -1674,8 +1696,11 @@ AI_SUBJECT_ROWS = [
         "AC-49's AgentCore Network Firewall Threat Inspection row is the egress IPS leg: "
         "each AWS Network Firewall a VPC hosting AgentCore reaches by its default route "
         "must run the AWS managed ThreatSignatures rule group and a malware or botnet "
-        "domain group, neither overridden to DROP_TO_ALERT. VPCs hosting no AgentCore "
-        "resource are not read, and no check reads recent detections",
+        "domain group, neither overridden to DROP_TO_ALERT, and must send its ALERT "
+        "log, which records each detection, to a destination; a firewall whose "
+        "logging configuration is not read makes the row Not Applicable. The "
+        "detections in that log are not read, and VPCs hosting no AgentCore "
+        "resource are not read",
         [],
         5,
     ),
@@ -1785,7 +1810,16 @@ FOUNDATION_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-49"],
+        ["AC-49", "AC-01"],
+        "AC-01 is the security-group port leg: on each VPC-mode AgentCore runtime, "
+        "code interpreter and browser it fails an outbound rule naming an IP range or "
+        "prefix list that allows every protocol, or TCP or UDP ports 1 (or lower) "
+        "through 65535, and a passing row lists the protocol and ports each such rule "
+        "allows. The control names no port list, so a named port is reported and not "
+        "graded. A rule naming only a security group is not judged on ports. "
+        "The population of both checks is AgentCore's hosting VPCs. ECS services "
+        "and VPC Lambda functions are judged by the SageMaker module's SM-39 under "
+        "AIR-SLF-RT-02, not in this row, and other AI workloads are not read here. "
         "AC-49 asserts an egress allow-list by destination name on each VPC that "
         "hosts an AgentCore runtime, at any version ListAgentRuntimeVersions "
         "returns, browser or code interpreter. It passes only "
@@ -2304,7 +2338,14 @@ FOUNDATION_ROWS = [
         "Medium; with no active subscription the row is Not Applicable, because "
         "the control asks for Shield Advanced where availability is "
         "business-critical. A distribution fronting no gateway gives no row. "
-        "AG-39 is the request-rate leg: it fails "
+        "AC-51's Gateway Firewall Manager Enrollment row fails a gateway with no "
+        "web ACL, or whose web ACL GetWebACL reports with neither "
+        "ManagedByFirewallManager nor RetrofittedByFirewallManager true; the "
+        "Firewall Manager policy is readable only from its administrator account "
+        "and its scope is not judged. AC-51's Shield Proactive Engagement row, in a "
+        "Region that holds a gateway, fails an ACTIVE Shield Advanced subscription "
+        "whose ProactiveEngagementStatus is not ENABLED and is Not Applicable with "
+        "no active subscription. AG-39 is the request-rate leg: it fails "
         "a gateway web ACL with no rate-based rule whose action is Block",
         [],
         6,

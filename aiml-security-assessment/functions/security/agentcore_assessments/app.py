@@ -17,6 +17,7 @@ import time
 from fnmatch import fnmatchcase
 from io import StringIO
 from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.request import urlopen
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from botocore.config import Config
@@ -304,6 +305,13 @@ WAF_ANTI_DDOS_REFERENCE_URL = (
 )
 SHIELD_PROTECTED_RESOURCES_REFERENCE_URL = (
     "https://docs.aws.amazon.com/waf/latest/developerguide/ddos-choose-resources.html"
+)
+FIREWALL_MANAGER_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/waf/latest/developerguide/fms-chapter.html"
+)
+SRT_PROACTIVE_ENGAGEMENT_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/waf/latest/developerguide/"
+    "ddos-srt-proactive-engagement.html"
 )
 ECR_ENHANCED_SCANNING_REFERENCE_URL = (
     "https://docs.aws.amazon.com/AmazonECR/latest/userguide/"
@@ -2382,6 +2390,7 @@ def _agentcore_egress_findings(
         broad_ranges = _security_groups_broad_public_ranges(
             read_groups, "IpPermissionsEgress"
         )
+        unbounded_ports, egress_ports = _security_groups_egress_ports(read_groups)
 
         if open_ranges:
             findings.append(
@@ -2428,6 +2437,26 @@ def _agentcore_egress_findings(
                     status=StatusEnum.FAILED,
                 )
             )
+        elif unbounded_ports:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name="AgentCore Egress Ports Unrestricted",
+                    finding_details=(
+                        f"{label} has outbound rules that name an IP range or "
+                        f"prefix list and allow {'; '.join(unbounded_ports)}, so "
+                        "code running there reaches those destinations on any "
+                        f"port. {AGENTCORE_EGRESS_PORT_RULE}"
+                    ),
+                    resolution=(
+                        "Limit each outbound rule to the protocol and ports this "
+                        "workload needs, for example TCP 443."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
         elif unreadable:
             findings.append(
                 create_finding(
@@ -2471,8 +2500,10 @@ def _agentcore_egress_findings(
                         "entries included, together cover neither 0.0.0.0/0 nor "
                         "::/0, and no rule names a public range of "
                         f"/{AGENTCORE_BROAD_EGRESS_PREFIX[4]} (IPv6 "
-                        f"/{AGENTCORE_BROAD_EGRESS_PREFIX[6]}) or wider. Ports are "
-                        "not judged."
+                        f"/{AGENTCORE_BROAD_EGRESS_PREFIX[6]}) or wider. "
+                        f"{AGENTCORE_EGRESS_PORT_RULE} The rules naming one allow "
+                        f"{', '.join(egress_ports) if egress_ports else 'no port'}; "
+                        "rules naming only a security group are not judged on ports."
                     ),
                     resolution=(
                         "No action required. Confirm the outbound rules name only "
@@ -10394,6 +10425,70 @@ def _security_groups_broad_public_ranges(
                 if label not in broad:
                     broad.append(label)
     return broad
+
+
+SECURITY_GROUP_PROTOCOL_NAMES = {"6": "tcp", "17": "udp", "1": "icmp", "58": "icmpv6"}
+AGENTCORE_EGRESS_PORT_RULE = (
+    "An outbound rule naming an IP range or prefix list fails when it allows "
+    "every protocol or every TCP or UDP port."
+)
+
+
+def _security_groups_egress_ports(
+    security_groups: List[Dict[str, Any]],
+) -> Tuple[List[str], List[str]]:
+    """Return the outbound rules that allow every port, and every port allowed.
+
+    Only rules naming an IP range or prefix list are read; a rule naming only a
+    security group is bounded by that group's members. A rule is unbounded on
+    ports when its IpProtocol is -1, or it is TCP or UDP with a port range from
+    1 or below to 65535, since port 0 is reserved and carries no connection. A TCP or UDP rule that reports no port range is listed
+    as such and not failed.
+    """
+    unbounded: List[str] = []
+    ports: List[str] = []
+    for security_group in security_groups:
+        group_id = security_group.get("GroupId", "unknown")
+        for permission in security_group.get("IpPermissionsEgress") or []:
+            if not isinstance(permission, dict) or not any(
+                permission.get(key)
+                for key in ("IpRanges", "Ipv6Ranges", "PrefixListIds")
+            ):
+                continue
+            raw = str(permission.get("IpProtocol", "-1")).lower()
+            protocol = SECURITY_GROUP_PROTOCOL_NAMES.get(raw, raw)
+            from_port, to_port = permission.get("FromPort"), permission.get("ToPort")
+            if protocol in ("-1", "all"):
+                label = "every protocol"
+            elif (
+                protocol in ("tcp", "udp")
+                and from_port is not None
+                and to_port is not None
+                and int(from_port) <= 1
+                and int(to_port) >= 65535
+            ):
+                label = f"every {protocol} port"
+            else:
+                if protocol in ("tcp", "udp") and (
+                    from_port is None or to_port is None
+                ):
+                    label = f"{protocol} (no port range reported)"
+                elif protocol in ("tcp", "udp"):
+                    port = (
+                        str(from_port)
+                        if from_port == to_port
+                        else f"{from_port}-{to_port}"
+                    )
+                    label = f"{protocol} {port}"
+                else:
+                    label = protocol
+                if label not in ports:
+                    ports.append(label)
+                continue
+            entry = f"{label} in {group_id}"
+            if entry not in unbounded:
+                unbounded.append(entry)
+    return unbounded, ports
 
 
 def _security_groups_inbound_permissions(
@@ -23779,12 +23874,26 @@ CREDENTIAL_TEXT_PATTERN = re.compile(
 
 # What every passing AC-34 finding states it could not read.
 AC34_CODE_CEILING = (
-    "The agent's code and container image were not scanned: GetAgentRuntime "
-    "names them in agentRuntimeArtifact (codeConfiguration.code.s3 and "
-    "containerConfiguration.containerUri), but the assessment role is not "
-    "granted s3:GetObject, ecr:BatchGetImage or ecr:GetDownloadUrlForLayer to "
-    "fetch them."
+    "The agent's code was not scanned: GetAgentRuntime names it in "
+    "agentRuntimeArtifact.codeConfiguration.code.s3, but the assessment role is "
+    "not granted s3:GetObject to fetch it. A container image's configuration is "
+    "judged in the AgentCore Runtime Image Inline Credentials row, and its file "
+    "system layers are not scanned."
 )
+AC34_IMAGE_FINDING = "AgentCore Runtime Image Inline Credentials"
+# The manifest media types BatchGetImage is asked to return. An image index or
+# manifest list names one manifest per platform, and each is read.
+ECR_IMAGE_MANIFEST_TYPES = (
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+)
+ECR_IMAGE_INDEX_TYPES = (
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+)
+ECR_IMAGE_MAX_PLATFORMS = 8
+ECR_IMAGE_CONFIG_MAX_BYTES = 1024 * 1024
+ECR_IMAGE_CONFIG_TIMEOUT_SECONDS = 10
 
 
 def _value_is_a_credential_literal(value: str) -> bool:
@@ -24045,15 +24154,32 @@ def _harness_inline_credentials(harness: Dict[str, Any]) -> Tuple[List[str], int
     return found, scanned
 
 
-def _agentcore_runtime_credential_findings() -> List[Dict[str, Any]]:
+def _agentcore_runtime_credential_findings(
+    images: Optional[Dict[str, Tuple[str, Set[str]]]] = None,
+) -> List[Dict[str, Any]]:
     """AC-34's runtime leg: one finding per runtime version's environment variables.
 
     GetAgentRuntime with no agentRuntimeVersion returns one version. An endpoint
     can serve an older version, or roll toward a newer one, whose environment
     variables differ, so each liveVersion and targetVersion that
     ListAgentRuntimeEndpoints reports is read and judged on its own row, as
-    AC-30 does for the inbound authorizer.
+    AC-30 does for the inbound authorizer. When images is given, the container
+    image URI of each version read is recorded in it, keyed by runtime label,
+    for the image leg.
     """
+    images = {} if images is None else images
+
+    def record_image(label: str, details: Dict[str, Any]) -> None:
+        uri = (
+            (details.get("agentRuntimeArtifact") or {}).get("containerConfiguration")
+            or {}
+        ).get("containerUri")
+        if isinstance(uri, str) and uri:
+            account, uris = images.setdefault(
+                label, (_arn_account(details.get("agentRuntimeArn")) or "", set())
+            )
+            uris.add(uri)
+
     try:
         runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
     except Exception as error:
@@ -24158,6 +24284,7 @@ def _agentcore_runtime_credential_findings() -> List[Dict[str, Any]]:
             continue
 
         finding = judge(label, details)
+        record_image(label, details)
         try:
             endpoints = _agentcore_list_all(
                 "list_agent_runtime_endpoints",
@@ -24214,7 +24341,220 @@ def _agentcore_runtime_credential_findings() -> List[Dict[str, Any]]:
                 findings.append(unread_finding(version_label, error))
                 continue
             findings.append(judge(version_label, version_details))
+            record_image(label, version_details)
 
+    return findings
+
+
+def _ecr_client_for(region_name: str) -> Any:
+    """Return an ECR client for the Region an image URI names."""
+    if ecr_client is not None and ecr_client.meta.region_name == region_name:
+        return ecr_client
+    return boto3.client("ecr", config=boto3_config, region_name=region_name)
+
+
+def _fetch_image_config(download_url: str) -> Dict[str, Any]:
+    """Read one image configuration blob from its pre-signed ECR layer URL."""
+    if urlsplit(download_url).scheme != "https":
+        raise ValueError("the layer URL is not HTTPS")
+    with urlopen(download_url, timeout=ECR_IMAGE_CONFIG_TIMEOUT_SECONDS) as response:
+        body = response.read(ECR_IMAGE_CONFIG_MAX_BYTES + 1)
+    if len(body) > ECR_IMAGE_CONFIG_MAX_BYTES:
+        raise ValueError("the image configuration is larger than 1 MiB")
+    document = json.loads(body)
+    if not isinstance(document, dict):
+        raise ValueError("the image configuration is not a JSON object")
+    return document
+
+
+def _image_config_credentials(
+    registry: str, region_name: str, repository: str, reference: str
+) -> Tuple[List[str], int, int]:
+    """Scan the configuration of every platform an ECR image reference names.
+
+    Returns the inline credentials found (named by variable or field, never
+    by value), the environment variables read, and the platforms read.
+    Raises ClientError, BotoCoreError, OSError or ValueError on a read that
+    fails, so the caller never reports an unread image as clean.
+    """
+    client = _ecr_client_for(region_name)
+    image_id = (
+        {"imageDigest": reference[1:]}
+        if reference.startswith("@")
+        else {"imageTag": reference[1:] if reference.startswith(":") else "latest"}
+    )
+
+    def manifest(image: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+        images = (
+            client.batch_get_image(
+                registryId=registry,
+                repositoryName=repository,
+                imageIds=[image],
+                acceptedMediaTypes=list(
+                    ECR_IMAGE_MANIFEST_TYPES + ECR_IMAGE_INDEX_TYPES
+                ),
+            ).get("images")
+            or []
+        )
+        if not images:
+            raise ValueError(f"BatchGetImage returned no image for {image}")
+        document = json.loads(images[0].get("imageManifest") or "{}")
+        media_type = str(
+            images[0].get("imageManifestMediaType") or document.get("mediaType") or ""
+        )
+        return media_type, document
+
+    media_type, document = manifest(image_id)
+    if media_type in ECR_IMAGE_INDEX_TYPES:
+        children = [
+            str(entry.get("digest"))
+            for entry in document.get("manifests") or []
+            if entry.get("digest")
+            and (entry.get("platform") or {}).get("os") != "unknown"
+        ]
+        if len(children) > ECR_IMAGE_MAX_PLATFORMS:
+            raise ValueError(
+                f"the image index names {len(children)} platforms, more than "
+                f"{ECR_IMAGE_MAX_PLATFORMS}"
+            )
+        manifests = [manifest({"imageDigest": digest})[1] for digest in children]
+    else:
+        manifests = [document]
+
+    found: List[str] = []
+    variables = 0
+    for platform in manifests:
+        digest = (platform.get("config") or {}).get("digest")
+        if not digest:
+            raise ValueError("a manifest names no configuration digest")
+        url = client.get_download_url_for_layer(
+            registryId=registry, repositoryName=repository, layerDigest=digest
+        ).get("downloadUrl")
+        config = (_fetch_image_config(str(url or "")).get("config")) or {}
+        environment = {}
+        for entry in config.get("Env") or []:
+            name, _, value = str(entry).partition("=")
+            environment[name] = value
+        variables += len(environment)
+        literals, _ = _credential_entries(environment)
+        found.extend(f"Env {name}" for name in literals if f"Env {name}" not in found)
+        for field in ("Entrypoint", "Cmd"):
+            text = " ".join(str(part) for part in config.get(field) or [])
+            if _text_holds_a_credential(text) and field not in found:
+                found.append(field)
+    return found, variables, len(manifests)
+
+
+def _agentcore_runtime_image_credential_findings(
+    images: Dict[str, Tuple[str, Set[str]]],
+) -> List[Dict[str, Any]]:
+    """AC-34's image leg: scan each runtime's container image configuration.
+
+    A container runtime names its image in
+    agentRuntimeArtifact.containerConfiguration.containerUri, and the image's
+    configuration carries the Env, Entrypoint and Cmd every process in the
+    microVM starts with. images holds the URIs of every version the runtime
+    leg read, keyed by runtime label; a version whose definition could not be
+    read is already reported N/A on the runtime leg's row. An image in another
+    account's registry is not read, because the role's ECR reads are scoped
+    to this account. The image's file system layers are not scanned.
+    """
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-34",
+            finding_name=AC34_IMAGE_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    findings: List[Dict[str, Any]] = []
+    for label, (account, uris) in images.items():
+        found: List[str] = []
+        unread: List[str] = []
+        scanned: List[str] = []
+        for uri in sorted(uris):
+            match = ECR_IMAGE_URI_PATTERN.match(uri)
+            if not match:
+                unread.append(f"{uri} is not an Amazon ECR image URI")
+                continue
+            registry, image_region, repository = match.groups()
+            if account and registry != account:
+                unread.append(
+                    f"{uri} is in registry {registry}, another account's, which "
+                    "the assessment role does not read"
+                )
+                continue
+            try:
+                credentials, variables, platforms = _image_config_credentials(
+                    registry, image_region, repository, uri[match.end() :]
+                )
+            except (BotoCoreError, ClientError, OSError, ValueError) as error:
+                # A ValueError is raised by this scan with a message naming
+                # only a count, a size or a shape, never image content.
+                reason = (
+                    str(error)
+                    if type(error) is ValueError
+                    else _assessment_error_label(error)
+                )
+                unread.append(
+                    f"the configuration of {uri} could not be read ({reason})"
+                )
+                continue
+            found.extend(f"{name} of {uri}" for name in credentials)
+            scanned.append(
+                f"{uri} ({platforms} platform(s), {variables} Env variable(s))"
+            )
+        if found:
+            findings.append(
+                finding(
+                    f"{label} runs a container image whose configuration holds "
+                    f"credential material inline: {', '.join(found)}. Every "
+                    "process in the microVM starts with it. The values are "
+                    "withheld from this report."
+                    + (f" Not read: {'; '.join(unread)}." if unread else ""),
+                    "Rebuild the image without the credential, pass a reference "
+                    "to the AgentCore Identity token vault or AWS Secrets Manager "
+                    "instead, and rotate the exposed credential.",
+                    SeverityEnum.HIGH,
+                    StatusEnum.FAILED,
+                )
+            )
+        elif unread:
+            findings.append(
+                finding(
+                    f"{label}: whether its container image configuration holds "
+                    f"an inline credential was not judged: {'; '.join(unread)}."
+                    + (
+                        f" Scanned with none found: {'; '.join(scanned)}."
+                        if scanned
+                        else ""
+                    ),
+                    "Grant ecr:BatchGetImage and ecr:GetDownloadUrlForLayer on "
+                    "the repository, and let the function reach the ECR layer "
+                    "URL over HTTPS, then retry.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    f"{label} runs image(s) {'; '.join(scanned)}. No Env variable "
+                    "holds credential material inline, and neither Entrypoint "
+                    "nor Cmd holds an AWS access key ID or a private key block. "
+                    "The image's file system layers are not scanned.",
+                    "No action required. The Env scan reads variable names and "
+                    "value shapes, as the environment variable row does; "
+                    "Entrypoint and Cmd are matched only for those two "
+                    "credential forms.",
+                    SeverityEnum.HIGH,
+                    StatusEnum.PASSED,
+                )
+            )
     return findings
 
 
@@ -24438,9 +24778,9 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
     definitions are read: each runtime's environment variables, each gateway
     target's sensitive fields, and each harness's sensitive fields. Only names
     and field paths are reported, never values, because the APIs model these
-    fields as sensitive. The agent's code and container image are named by
-    agentRuntimeArtifact but not fetched, because the role holds no S3 or ECR
-    image read.
+    fields as sensitive. A container image's Env, Entrypoint and Cmd are read
+    from its ECR configuration blob. The agent's code in S3 is named by
+    agentRuntimeArtifact but not fetched, because the role holds no read of it.
     """
     if agentcore_client is None:
         return [
@@ -24455,8 +24795,10 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
             )
         ]
 
+    images: Dict[str, Tuple[str, Set[str]]] = {}
     findings = (
-        _agentcore_runtime_credential_findings()
+        _agentcore_runtime_credential_findings(images)
+        + _agentcore_runtime_image_credential_findings(images)
         + _agentcore_gateway_target_credential_findings()
         + _agentcore_harness_credential_findings()
     )
@@ -29421,11 +29763,10 @@ def _evaluation_results_group_findings(
                     f"{' and '.join(confirmations)}."
                 ),
                 resolution=(
-                    "No action required for this check. Tag values and the "
-                    "configuration's own description are free-form text this "
-                    "check cannot judge, so confirm neither carries personal "
-                    "data. Confirm the retention period matches the workload's "
-                    "schedule, which no API field states."
+                    "No action required for this check. The AgentCore Evaluation "
+                    "Personal Data row judges tag values and the configuration's "
+                    "own description. Confirm the retention period matches the "
+                    "workload's schedule, which no API field states."
                 ),
                 reference=LOGS_RETENTION_REFERENCE_URL,
                 severity=SeverityEnum.MEDIUM,
@@ -29722,6 +30063,344 @@ def _evaluation_key_verdict(
             f"{metadata.get('KeyState') or 'in an unknown state'}"
         )
     return StatusEnum.PASSED, f"is encrypted with customer managed key {key_arn}"
+
+
+EVALUATION_PERSONAL_DATA_FINDING = "AgentCore Evaluation Personal Data"
+EVALUATION_RESULTS_LOG_GROUP_PREFIX = "/aws/bedrock-agentcore/evaluations/"
+# Patterns for personal data that a tag or a description should never hold.
+# A match names the pattern and the field; the matched value is never written
+# to a finding or a log. Every pattern is bounded or anchored on a maximal run,
+# so a long instruction text is scanned in linear time.
+PERSONAL_DATA_PATTERNS = (
+    ("a US social security number", re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")),
+    (
+        "a phone number",
+        re.compile(r"(?<![\w+])(?:\+\d{10,15}|\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4})(?!\d)"),
+    ),
+)
+EMAIL_CANDIDATE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)")
+EMAIL_DOMAIN = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+DIGIT_RUN = re.compile(r"\d(?:[ -]?\d)*")
+PERSONAL_DATA_RULE = (
+    "A tag key or value, or a name, description or evaluator instruction, fails "
+    "when it holds an email address, a phone number in +E.164 form or as NNN "
+    "NNN NNNN separated by spaces, dots or dashes, a US social security number "
+    "in NNN-NN-NNNN form, or a run of 13 to 19 digits, spaces and dashes allowed "
+    "between them, that passes the Luhn check. Personal data in any "
+    "other form is not detected."
+)
+
+
+def _luhn_valid(digits: str) -> bool:
+    """Return whether a digit string passes the Luhn checksum."""
+    total = 0
+    for index, digit in enumerate(reversed(digits)):
+        value = int(digit) * (2 if index % 2 else 1)
+        total += value - 9 if value > 9 else value
+    return total % 10 == 0
+
+
+def _personal_data_kinds(text: str) -> List[str]:
+    """Return the PERSONAL_DATA_RULE patterns one string matches."""
+    kinds = []
+    if any(
+        EMAIL_DOMAIN.fullmatch(match.group(1).rstrip(".-"))
+        for match in EMAIL_CANDIDATE.finditer(text)
+    ):
+        kinds.append("an email address")
+    kinds += [kind for kind, pattern in PERSONAL_DATA_PATTERNS if pattern.search(text)]
+    if any(
+        13 <= len(digits) <= 19 and _luhn_valid(digits)
+        for digits in (
+            re.sub(r"[ -]", "", match.group(0)) for match in DIGIT_RUN.finditer(text)
+        )
+    ):
+        kinds.append("a payment card number")
+    return kinds
+
+
+def _string_leaves(value: Any, path: str) -> List[Tuple[str, str]]:
+    """Return (path, string) for every string inside a JSON-shaped value."""
+    if isinstance(value, str):
+        return [(path, value)]
+    if isinstance(value, dict):
+        return [
+            leaf
+            for key, item in value.items()
+            for leaf in _string_leaves(item, f"{path}.{key}")
+        ]
+    if isinstance(value, list):
+        return [
+            leaf
+            for index, item in enumerate(value)
+            for leaf in _string_leaves(item, f"{path}[{index}]")
+        ]
+    return []
+
+
+def check_agentcore_evaluation_personal_data() -> List[Dict[str, Any]]:
+    """AC-41: Fail personal data in the tags and free-form fields of evaluation.
+
+    AIR-ACR-EVAL-07 asks that evaluator tags and free-form fields hold no PII.
+    The population is every evaluator this account defines (Builtin evaluators
+    are AWS's own), every online evaluation configuration, every batch
+    evaluation, and every log group under /aws/bedrock-agentcore/evaluations/
+    or named by a configuration's outputConfig. Evaluators, configurations and
+    log groups are read for tags; each resource's name and description, and an
+    evaluator's evaluatorConfig, are read as free-form text. A batch
+    evaluation has no tag API. The rule is PERSONAL_DATA_RULE, and a finding
+    names the field and the pattern, never the value.
+    """
+    if agentcore_client is None:
+        return []
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-41",
+            finding_name=EVALUATION_PERSONAL_DATA_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    matches: List[str] = []
+    unread: List[str] = []
+    counts: Dict[str, int] = {}
+
+    def named(kind: str, name: Any, fallback: Any) -> str:
+        # A name that holds personal data is replaced by the resource's id.
+        name = str(name or fallback)
+        return (
+            f"{kind} '{name}'"
+            if not _personal_data_kinds(name)
+            else f"{kind} {fallback} (whose name is withheld)"
+        )
+
+    def scan(label: str, fields: List[Tuple[str, str]]) -> None:
+        for path, text in fields:
+            kinds = _personal_data_kinds(text)
+            if kinds:
+                matches.append(f"{label} {path} holds {' and '.join(kinds)}")
+
+    def scan_tags(label: str, tags: Dict[str, Any]) -> None:
+        # A key that holds personal data is named by its position, so the
+        # finding never repeats it.
+        for position, (key, value) in enumerate(sorted((tags or {}).items()), 1):
+            name = (
+                f"'{key}'"
+                if not _personal_data_kinds(str(key))
+                else f"number {position}"
+            )
+            scan(label, [(f"tag key {name}", str(key))])
+            scan(label, [(f"tag {name} value", str(value))])
+
+    def read_tags(label: str, arn: str) -> None:
+        try:
+            scan_tags(
+                label,
+                agentcore_client.list_tags_for_resource(resourceArn=arn).get("tags")
+                or {},
+            )
+        except (BotoCoreError, ClientError) as error:
+            unread.append(
+                f"the tags of {label} (bedrock-agentcore:ListTagsForResource "
+                f"{_assessment_error_label(error)})"
+            )
+
+    try:
+        evaluators = [
+            e
+            for e in _agentcore_list_all("list_evaluators", ["evaluators"])
+            if e.get("evaluatorType") != "Builtin"
+        ]
+    except (AttributeError, BotoCoreError, ClientError) as error:
+        evaluators = []
+        unread.append(
+            "the evaluators (bedrock-agentcore:ListEvaluators "
+            f"{_assessment_error_label(error)})"
+        )
+    for summary in evaluators:
+        evaluator_id = summary.get("evaluatorId")
+        label = named("evaluator", summary.get("evaluatorName"), evaluator_id)
+        counts["evaluator"] = counts.get("evaluator", 0) + 1
+        try:
+            detail = agentcore_client.get_evaluator(evaluatorId=evaluator_id)
+        except (BotoCoreError, ClientError) as error:
+            unread.append(
+                f"{label} (bedrock-agentcore:GetEvaluator "
+                f"{_assessment_error_label(error)})"
+            )
+        else:
+            scan(
+                label,
+                _string_leaves(detail.get("evaluatorName"), "name")
+                + _string_leaves(detail.get("description"), "description")
+                + _string_leaves(detail.get("evaluatorConfig"), "evaluatorConfig"),
+            )
+        if summary.get("evaluatorArn"):
+            read_tags(label, summary["evaluatorArn"])
+
+    group_names: Set[str] = set()
+    try:
+        configs = _agentcore_list_all(
+            "list_online_evaluation_configs", ["onlineEvaluationConfigs"]
+        )
+    except (AttributeError, BotoCoreError, ClientError) as error:
+        configs = []
+        unread.append(
+            "the online evaluation configurations "
+            "(bedrock-agentcore:ListOnlineEvaluationConfigs "
+            f"{_assessment_error_label(error)})"
+        )
+    for summary in configs:
+        config_id = summary.get("onlineEvaluationConfigId")
+        label = named(
+            "online evaluation configuration",
+            summary.get("onlineEvaluationConfigName"),
+            config_id,
+        )
+        counts["online evaluation configuration"] = (
+            counts.get("online evaluation configuration", 0) + 1
+        )
+        try:
+            detail = agentcore_client.get_online_evaluation_config(
+                onlineEvaluationConfigId=config_id
+            )
+        except (BotoCoreError, ClientError) as error:
+            unread.append(
+                f"{label} (bedrock-agentcore:GetOnlineEvaluationConfig "
+                f"{_assessment_error_label(error)})"
+            )
+        else:
+            scan(
+                label,
+                _string_leaves(detail.get("onlineEvaluationConfigName"), "name")
+                + _string_leaves(detail.get("description"), "description"),
+            )
+            group = (
+                (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
+            ).get("logGroupName")
+            if group:
+                group_names.add(str(group))
+        arn = summary.get("onlineEvaluationConfigArn")
+        if arn:
+            read_tags(label, arn)
+
+    if agentcore_data_client is None:
+        unread.append("the batch evaluations (no bedrock-agentcore client)")
+    else:
+        try:
+            batches = _paginate_aws_list(
+                agentcore_data_client,
+                "list_batch_evaluations",
+                "batchEvaluations",
+                "nextToken",
+                "nextToken",
+            )
+        except (BotoCoreError, ClientError) as error:
+            batches = []
+            unread.append(
+                "the batch evaluations (bedrock-agentcore:ListBatchEvaluations "
+                f"{_assessment_error_label(error)})"
+            )
+        for batch in batches:
+            batch_id = batch.get("batchEvaluationId")
+            label = named(
+                "batch evaluation", batch.get("batchEvaluationName"), batch_id
+            )
+            counts["batch evaluation"] = counts.get("batch evaluation", 0) + 1
+            try:
+                detail = agentcore_data_client.get_batch_evaluation(
+                    batchEvaluationId=batch_id
+                )
+            except (BotoCoreError, ClientError) as error:
+                unread.append(
+                    f"{label} (bedrock-agentcore:GetBatchEvaluation "
+                    f"{_assessment_error_label(error)})"
+                )
+                continue
+            scan(
+                label,
+                _string_leaves(detail.get("batchEvaluationName"), "name")
+                + _string_leaves(detail.get("description"), "description"),
+            )
+
+    if logs_client is None:
+        unread.append("the evaluation results log groups (no CloudWatch Logs client)")
+    else:
+        groups: Dict[str, str] = {}
+        for prefix in sorted({EVALUATION_RESULTS_LOG_GROUP_PREFIX} | group_names):
+            try:
+                for group in _paginate_aws_list(
+                    logs_client,
+                    "describe_log_groups",
+                    "logGroups",
+                    logGroupNamePrefix=prefix,
+                ):
+                    name = str(group.get("logGroupName") or "")
+                    if name.startswith(EVALUATION_RESULTS_LOG_GROUP_PREFIX) or (
+                        name in group_names
+                    ):
+                        groups[name] = str(
+                            group.get("logGroupArn") or group.get("arn") or ""
+                        )
+            except (BotoCoreError, ClientError) as error:
+                unread.append(
+                    f"the {named('log groups named', prefix, 'of a configuration')} "
+                    f"(logs:DescribeLogGroups {_assessment_error_label(error)})"
+                )
+        for position, (name, arn) in enumerate(sorted(groups.items()), 1):
+            label = named("log group", name, f"number {position}")
+            counts["results log group"] = counts.get("results log group", 0) + 1
+            try:
+                scan_tags(
+                    label,
+                    logs_client.list_tags_for_resource(
+                        resourceArn=arn.removesuffix(":*")
+                    ).get("tags")
+                    or {},
+                )
+            except (BotoCoreError, ClientError) as error:
+                unread.append(
+                    f"the tags of {label} (logs:ListTagsForResource "
+                    f"{_assessment_error_label(error)})"
+                )
+
+    population = ", ".join(f"{n} {kind}(s)" for kind, n in sorted(counts.items()))
+    if matches:
+        return [
+            finding(
+                f"{'; '.join(matches)}. {PERSONAL_DATA_RULE}"
+                + (f" Not read: {'; '.join(unread)}." if unread else ""),
+                "Remove the personal data from these tags and fields, and keep "
+                "identifiers of people out of evaluation metadata.",
+                SeverityEnum.MEDIUM,
+                StatusEnum.FAILED,
+            )
+        ]
+    if unread:
+        return [
+            finding(
+                "Whether evaluation tags and free-form fields hold personal data "
+                f"was not judged: not read were {'; '.join(unread)}."
+                + (f" Read with no match: {population}." if population else ""),
+                "Grant the actions named and retry.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    if not counts:
+        return []
+    return [
+        finding(
+            f"No tag or free-form field of {population} matched. {PERSONAL_DATA_RULE}",
+            "No action required.",
+            SeverityEnum.MEDIUM,
+            StatusEnum.PASSED,
+        )
+    ]
 
 
 def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
@@ -33898,6 +34577,233 @@ def _agentcore_other_region_role_references(
     return references, errors
 
 
+ACCESS_ANALYZER_UNUSED_ACCESS_TYPES = (
+    "ACCOUNT_UNUSED_ACCESS",
+    "ORGANIZATION_UNUSED_ACCESS",
+)
+ACCESS_ANALYZER_UNUSED_ACCESS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/"
+    "access-analyzer-create-unused.html"
+)
+AGENTCORE_ROLE_ANALYZER_FINDING = "AgentCore Execution Role Access Analyzer"
+
+
+def _access_analyzer_client(region_name: str) -> Any:
+    """Return an IAM Access Analyzer client for one Region."""
+    return boto3.client("accessanalyzer", config=boto3_config, region_name=region_name)
+
+
+def check_agentcore_execution_role_access_analyzer(
+    browser_inventory: Dict[str, Any] = None,
+    target_regions: Optional[List[str]] = None,
+    is_primary_region: bool = True,
+) -> List[Dict[str, Any]]:
+    """AC-48: Require an unused access analyzer over the AgentCore execution roles.
+
+    AIR-ACR-RT-03 asks to audit tool execution roles continuously with IAM
+    Access Analyzer. An unused access analyzer reports the permissions an IAM
+    role holds and does not use, which is the least-privilege audit the
+    control names. IAM roles are global, so one ACTIVE analyzer of type
+    ACCOUNT_UNUSED_ACCESS or ORGANIZATION_UNUSED_ACCESS in any assessed Region
+    covers them, unless its analysis rule excludes the account. An exclusion
+    by resource tag is not judged, because the roles' tags are not read.
+
+    The primary Region reads every assessed Region; the others give no row.
+    An organization analyzer lives in the delegated administrator account and
+    is not listed in a member account, so an account in an organization with
+    no analyzer of its own is Not Applicable, and only an account outside any
+    organization fails.
+    """
+    if agentcore_client is None or (
+        target_regions is not None and not is_primary_region
+    ):
+        return []
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-48",
+            finding_name=AGENTCORE_ROLE_ANALYZER_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=ACCESS_ANALYZER_UNUSED_ACCESS_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    region = agentcore_client.meta.region_name
+    regions = [region] + [r for r in target_regions or [] if r and r != region]
+    try:
+        references, errors = _agentcore_execution_role_references(browser_inventory)
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-48",
+                finding_name=AGENTCORE_ROLE_ANALYZER_FINDING,
+                error=error,
+                reference=ACCESS_ANALYZER_UNUSED_ACCESS_REFERENCE_URL,
+            )
+        ]
+    remote, remote_errors = _agentcore_other_region_role_references(regions[1:])
+    roles = sorted({arn for _, _, arn in references + remote if arn})
+    if not roles:
+        if errors or remote_errors:
+            return [
+                finding(
+                    "Which AgentCore execution roles exist was not read: "
+                    + "; ".join(
+                        f"{label} ({_assessment_error_label(error)})"
+                        for label, error, _ in errors + remote_errors
+                    )
+                    + ".",
+                    "Grant the bedrock-agentcore list and get actions named, then "
+                    "retry.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            ]
+        return []
+    accounts = {_arn_account(arn) for arn in roles} - {""}
+    subject = (
+        f"{len(roles)} AgentCore execution role(s), "
+        f"{', '.join(arn.rsplit('/', 1)[-1] for arn in roles)},"
+    )
+
+    covering: List[str] = []
+    tag_scoped: List[str] = []
+    excluded: List[str] = []
+    unread: List[str] = []
+    for analyzer_region in regions:
+        try:
+            analyzers = _paginate_aws_list(
+                _access_analyzer_client(analyzer_region),
+                "list_analyzers",
+                "analyzers",
+                token_request_key="nextToken",
+                token_response_key="nextToken",
+            )
+        except (BotoCoreError, ClientError) as error:
+            unread.append(f"{analyzer_region} ({_assessment_error_label(error)})")
+            continue
+        for analyzer in analyzers:
+            if (
+                analyzer.get("type") not in ACCESS_ANALYZER_UNUSED_ACCESS_TYPES
+                or analyzer.get("status") != "ACTIVE"
+            ):
+                continue
+            name = f"{analyzer.get('name') or analyzer.get('arn')} in {analyzer_region}"
+            exclusions = (
+                ((analyzer.get("configuration") or {}).get("unusedAccess") or {}).get(
+                    "analysisRule"
+                )
+                or {}
+            ).get("exclusions") or []
+            if any(
+                accounts & {str(a) for a in exclusion.get("accountIds") or []}
+                for exclusion in exclusions
+            ):
+                excluded.append(name)
+            elif any(exclusion.get("resourceTags") for exclusion in exclusions):
+                tag_scoped.append(name)
+            else:
+                covering.append(name)
+
+    if covering:
+        return [
+            finding(
+                f"{subject} are covered by ACTIVE unused access analyzer(s) "
+                f"{', '.join(covering)}, whose analysis rule excludes neither "
+                "the account nor any resource tag. The analyzer's findings are "
+                "not read.",
+                "No action required.",
+                SeverityEnum.MEDIUM,
+                StatusEnum.PASSED,
+            )
+        ]
+    notes = []
+    if excluded:
+        notes.append(
+            f"unused access analyzer(s) {', '.join(excluded)} exclude the account"
+        )
+    if tag_scoped:
+        notes.append(
+            f"unused access analyzer(s) {', '.join(tag_scoped)} exclude resources "
+            "by tag, and the roles' tags are not read"
+        )
+    if unread:
+        notes.append(
+            "the analyzers of Region(s) " + ", ".join(unread) + " could not be listed"
+        )
+    if tag_scoped or unread:
+        return [
+            finding(
+                f"{subject} have no unused access analyzer known to cover them: "
+                f"{'; '.join(notes)}.",
+                "Grant access-analyzer:ListAnalyzers and retry, or confirm the tag "
+                "exclusions match none of these roles.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    read = ", ".join(regions)
+    try:
+        organizations_client.describe_organization()
+    except ClientError as error:
+        if (
+            error.response.get("Error", {}).get("Code")
+            != "AWSOrganizationsNotInUseException"
+        ):
+            return [
+                finding(
+                    f"{subject} have no ACTIVE unused access analyzer in Region(s) "
+                    f"{read}, and whether the account is in an organization, whose "
+                    "analyzer this account cannot list, was not read: "
+                    f"{_assessment_error_label(error)}.",
+                    "Grant organizations:DescribeOrganization and retry.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            ]
+    except (AttributeError, BotoCoreError) as error:
+        return [
+            finding(
+                f"{subject} have no ACTIVE unused access analyzer in Region(s) "
+                f"{read}, and whether the account is in an organization was not "
+                f"read: {_assessment_error_label(error)}.",
+                "Rerun the assessment where the Organizations client can be created.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    else:
+        return [
+            finding(
+                f"{subject} have no ACTIVE unused access analyzer of this account "
+                f"in Region(s) {read}"
+                + (f" ({'; '.join(notes)})" if notes else "")
+                + ". The account is in an organization, and an "
+                "ORGANIZATION_UNUSED_ACCESS analyzer in its delegated "
+                "administrator account is not listed here, so coverage was not "
+                "judged.",
+                "Confirm an organization unused access analyzer covers this "
+                "account, or create an ACCOUNT_UNUSED_ACCESS analyzer.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    return [
+        finding(
+            f"{subject} have no ACTIVE unused access analyzer in Region(s) {read}"
+            + (f" ({'; '.join(notes)})" if notes else "")
+            + ", and the account is in no organization, so no analyzer reports "
+            "the permissions these roles hold and do not use.",
+            "Create an IAM Access Analyzer unused access analyzer "
+            "(ACCOUNT_UNUSED_ACCESS) and review its findings for these roles.",
+            SeverityEnum.MEDIUM,
+            StatusEnum.FAILED,
+        )
+    ]
+
+
 def check_agentcore_execution_role_trust_and_sharing(
     browser_inventory: Dict[str, Any] = None,
     target_regions: Optional[List[str]] = None,
@@ -35596,6 +36502,11 @@ def _network_firewall_policy_gaps(
     return allow_gaps, threat_gaps, unread
 
 
+# The Network Firewall log type that records each stateful rule match whose
+# action is alert, drop or reject.
+NETWORK_FIREWALL_ALERT_LOG_TYPE = "ALERT"
+
+
 def check_agentcore_network_firewall_egress(
     browser_inventory: Dict[str, Any] = None,
 ) -> List[Dict[str, Any]]:
@@ -35620,7 +36531,9 @@ def check_agentcore_network_firewall_egress(
     HTTP_HOST, no REJECTLIST or ALERTLIST domain group beside it under
     DEFAULT_ACTION_ORDER, and a HOME_NET that holds the hosting subnets where one
     is set. The threat row requires an AWS managed ThreatSignatures group and a
-    domain reputation group that are not overridden to DROP_TO_ALERT. Both rows
+    domain reputation group that are not overridden to DROP_TO_ALERT, and an
+    ALERT log destination on each reached firewall, which records the
+    detections; the log's content is not read. Both rows
     fail a stateless default action of aws:pass, a customer stateless aws:pass
     rule from the hosting subnets to internet addresses, and a customer stateful
     pass rule that is not scoped to a TLS SNI or HTTP Host name and acts before
@@ -35891,10 +36804,35 @@ def check_agentcore_network_firewall_egress(
         allow_gaps: List[str] = []
         threat_gaps: List[str] = []
         unread: List[str] = []
+        log_unread: List[str] = []
         policy_action = None
         for arn in sorted(reached):
             firewall = reached[arn]
             name = firewall.get("FirewallName") or arn
+            try:
+                log_types = {
+                    str(config.get("LogType") or "")
+                    for config in (
+                        network_firewall_client.describe_logging_configuration(
+                            FirewallArn=arn
+                        ).get("LoggingConfiguration")
+                        or {}
+                    ).get("LogDestinationConfigs")
+                    or []
+                    if config.get("LogDestination")
+                }
+            except (BotoCoreError, ClientError) as error:
+                log_unread.append(
+                    f"the logging configuration of firewall {name} could not be "
+                    f"read ({_assessment_error_label(error)})"
+                )
+            else:
+                if NETWORK_FIREWALL_ALERT_LOG_TYPE not in log_types:
+                    threat_gaps.append(
+                        f"firewall {name} sends no {NETWORK_FIREWALL_ALERT_LOG_TYPE} "
+                        "log to a destination, so the detections its stateful "
+                        "rules make are not kept"
+                    )
             try:
                 policy = (
                     network_firewall_client.describe_firewall_policy(
@@ -35961,6 +36899,7 @@ def check_agentcore_network_firewall_egress(
             (threat_name, threat_gaps, NETWORK_FIREWALL_THREAT_SIGNATURE_REFERENCE_URL),
         ):
             problems = list(gaps)
+            row_unread = unread + (log_unread if row_name == threat_name else [])
             if bypassing:
                 problems.insert(
                     0,
@@ -35980,15 +36919,18 @@ def check_agentcore_network_firewall_egress(
                     "ThreatSignatures rule group and a domain reputation group, "
                     "neither overridden to DROP_TO_ALERT"
                 ) + "."
-            elif unread:
+            elif row_unread:
                 status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
                 details = (
                     f"{subject} reaches firewall(s) {reached_text}, but "
-                    f"{'; '.join(unread)}.{route_text}"
+                    f"{'; '.join(row_unread)}.{route_text}"
                 )
                 resolution = (
                     f"Grant {policy_action} and retry."
                     if policy_action
+                    else "Grant network-firewall:DescribeLoggingConfiguration and "
+                    "retry."
+                    if not unread
                     else "Set HOME_NET in one place that holds every hosting subnet."
                 )
             elif not reached:
@@ -36022,7 +36964,9 @@ def check_agentcore_network_firewall_egress(
                         "HTTP_HOST. IP and CIDR rules beside it are not judged."
                         if row_name == egress_name
                         else "whose policy drops on an AWS managed ThreatSignatures "
-                        "group and a domain reputation group."
+                        "group and a domain reputation group, and which send their "
+                        f"{NETWORK_FIREWALL_ALERT_LOG_TYPE} log to a destination. "
+                        "The detections in that log are not read."
                     )
                     + route_text
                 )
@@ -37206,6 +38150,254 @@ def check_agentcore_front_door_shield() -> List[Dict[str, Any]]:
                 )
             )
     return findings
+
+
+AGENTCORE_FIREWALL_MANAGER_FINDING = "AgentCore Gateway Firewall Manager Enrollment"
+AGENTCORE_SRT_ENGAGEMENT_FINDING = "AgentCore Shield Proactive Engagement"
+
+
+def check_agentcore_gateway_firewall_manager() -> List[Dict[str, Any]]:
+    """AC-51: Require each gateway's web ACL to be managed by Firewall Manager.
+
+    AIR-FND-NET-08 asks to enroll entry points org-wide with AWS Firewall
+    Manager. GetWebACL reports ManagedByFirewallManager for a web ACL a
+    Firewall Manager policy created and RetrofittedByFirewallManager for one a
+    policy took over, and either is credited. A gateway with no web ACL is not
+    enrolled. The Firewall Manager policy itself is readable only from the
+    administrator account, so its scope and rules are not judged here.
+    """
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-51",
+            finding_name=AGENTCORE_FIREWALL_MANAGER_FINDING,
+            finding_details=f"{details} {AC51_OUT_OF_SCOPE_FRONT_DOORS}",
+            resolution=resolution,
+            reference=FIREWALL_MANAGER_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    if agentcore_client is None:
+        return []
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except (AttributeError, BotoCoreError, ClientError) as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-51",
+                finding_name=AGENTCORE_FIREWALL_MANAGER_FINDING,
+                error=error,
+                reference=FIREWALL_MANAGER_REFERENCE_URL,
+            )
+        ]
+    findings: List[Dict[str, Any]] = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        label = f"Gateway '{gateway.get('name', gateway_id)}' ({gateway_id})"
+        try:
+            web_acl_arn = agentcore_client.get_gateway(
+                gatewayIdentifier=gateway_id
+            ).get("webAclArn")
+        except (BotoCoreError, ClientError) as error:
+            findings.append(
+                finding(
+                    f"Could not read which web ACL {label} is associated with, so "
+                    "its Firewall Manager enrollment was not read: "
+                    f"{_assessment_error_label(error)}.",
+                    "Grant bedrock-agentcore:GetGateway, then rerun the assessment.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        if not web_acl_arn:
+            findings.append(
+                finding(
+                    f"{label} has no web ACL associated, so no Firewall Manager "
+                    "policy protects it.",
+                    "Enroll the gateway in a Firewall Manager AWS WAF policy from "
+                    "the organization's Firewall Manager administrator account.",
+                    SeverityEnum.LOW,
+                    StatusEnum.FAILED,
+                )
+            )
+            continue
+        if wafv2_client is None:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {web_acl_arn}, but the AWS "
+                    "WAF client is not available in this region, so its Firewall "
+                    "Manager enrollment was not read.",
+                    "Rerun the assessment where the AWS WAF client can be created.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        try:
+            web_acl = (wafv2_client.get_web_acl(ARN=web_acl_arn) or {}).get(
+                "WebACL"
+            ) or {}
+        except (BotoCoreError, ClientError) as error:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {web_acl_arn}, which could "
+                    "not be read, so its Firewall Manager enrollment was not read: "
+                    f"{_assessment_error_label(error)}.",
+                    "Grant wafv2:GetWebACL on the web ACL, then rerun the assessment.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        acl_name = web_acl.get("Name") or web_acl_arn
+        managed = [
+            field
+            for field in ("ManagedByFirewallManager", "RetrofittedByFirewallManager")
+            if web_acl.get(field) is True
+        ]
+        if managed:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {acl_name}, which reports "
+                    f"{managed[0]} true. The Firewall Manager policy's scope and "
+                    "rules are not judged.",
+                    "No action required.",
+                    SeverityEnum.LOW,
+                    StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {acl_name}, which reports "
+                    "neither ManagedByFirewallManager nor "
+                    "RetrofittedByFirewallManager true, so the account manages the "
+                    "gateway's protection outside any org-wide Firewall Manager "
+                    "policy.",
+                    "Enroll the gateway in a Firewall Manager AWS WAF policy from "
+                    "the organization's Firewall Manager administrator account.",
+                    SeverityEnum.LOW,
+                    StatusEnum.FAILED,
+                )
+            )
+    return findings
+
+
+def check_agentcore_shield_proactive_engagement() -> List[Dict[str, Any]]:
+    """AC-51: Require SRT proactive engagement where Shield Advanced is active.
+
+    AIR-FND-NET-08 asks to register for Shield Response Team proactive
+    engagement. It is a setting of a Shield Advanced subscription, so an
+    account whose subscription is not ACTIVE is informational N/A, as in the
+    AgentCore Front Door Shield Protection row. The row is emitted only in a
+    Region that holds an AgentCore gateway. With the subscription ACTIVE,
+    DescribeSubscription's ProactiveEngagementStatus must be ENABLED; PENDING
+    and DISABLED fail.
+    """
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-51",
+            finding_name=AGENTCORE_SRT_ENGAGEMENT_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=SRT_PROACTIVE_ENGAGEMENT_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    if agentcore_client is None:
+        return []
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except (AttributeError, BotoCoreError, ClientError) as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-51",
+                finding_name=AGENTCORE_SRT_ENGAGEMENT_FINDING,
+                error=error,
+                reference=SRT_PROACTIVE_ENGAGEMENT_REFERENCE_URL,
+            )
+        ]
+    if not gateways:
+        return []
+    scope = (
+        f"This account holds {len(gateways)} AgentCore gateway(s) in Region "
+        f"'{agentcore_client.meta.region_name}'."
+    )
+    if shield_client is None:
+        return [
+            finding(
+                f"{scope} The Shield client is not available, so SRT proactive "
+                "engagement was not read.",
+                "Rerun the assessment where the Shield client can be created.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    try:
+        state = shield_client.get_subscription_state().get("SubscriptionState")
+    except (BotoCoreError, ClientError) as error:
+        return [
+            finding(
+                f"{scope} The Shield Advanced subscription state could not be "
+                f"read: {_assessment_error_label(error)}.",
+                "Grant shield:GetSubscriptionState, then rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    if state != "ACTIVE":
+        return [
+            finding(
+                f"{scope} Shield Advanced is not active in this account "
+                f"(subscription state {state or 'not reported'}), and SRT "
+                "proactive engagement is a setting of that subscription, so it "
+                "was not judged.",
+                "If the gateways' availability is business-critical, subscribe to "
+                "Shield Advanced and enable SRT proactive engagement.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    try:
+        status = (shield_client.describe_subscription().get("Subscription") or {}).get(
+            "ProactiveEngagementStatus"
+        )
+    except (BotoCoreError, ClientError) as error:
+        return [
+            finding(
+                f"{scope} Shield Advanced is active, but the subscription could "
+                f"not be read: {_assessment_error_label(error)}.",
+                "Grant shield:DescribeSubscription, then rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+    if status == "ENABLED":
+        return [
+            finding(
+                f"{scope} Shield Advanced is active with SRT proactive engagement "
+                "ENABLED. The emergency contacts are not judged.",
+                "No action required.",
+                SeverityEnum.MEDIUM,
+                StatusEnum.PASSED,
+            )
+        ]
+    return [
+        finding(
+            f"{scope} Shield Advanced is active, but SRT proactive engagement is "
+            f"{status or 'not reported'}, so the Shield Response Team does not "
+            "contact the account when it detects an event against a protected "
+            "resource.",
+            "Add emergency contacts and enable SRT proactive engagement on the "
+            "Shield Advanced subscription.",
+            SeverityEnum.MEDIUM,
+            StatusEnum.FAILED,
+        )
+    ]
 
 
 COGNITO_USER_POOL_SECURITY_REFERENCE_URL = (
@@ -39351,6 +40543,11 @@ def lambda_handler(event, context):
                 check_agentcore_evaluation_key_protection,
             ),
             (
+                ["AC-41"],
+                "Evaluation Personal Data",
+                check_agentcore_evaluation_personal_data,
+            ),
+            (
                 ["AC-47"],
                 "Runtime Invocation Path",
                 lambda: check_agentcore_runtime_invocation_path(
@@ -39361,6 +40558,13 @@ def lambda_handler(event, context):
                 ["AC-48"],
                 "Execution Role Trust And Sharing",
                 lambda: check_agentcore_execution_role_trust_and_sharing(
+                    browser_inventory, target_regions, is_primary_region
+                ),
+            ),
+            (
+                ["AC-48"],
+                "Execution Role Access Analyzer",
+                lambda: check_agentcore_execution_role_access_analyzer(
                     browser_inventory, target_regions, is_primary_region
                 ),
             ),
@@ -39398,6 +40602,16 @@ def lambda_handler(event, context):
                 ["AC-51"],
                 "Front Door Shield Protection",
                 check_agentcore_front_door_shield,
+            ),
+            (
+                ["AC-51"],
+                "Gateway Firewall Manager Enrollment",
+                check_agentcore_gateway_firewall_manager,
+            ),
+            (
+                ["AC-51"],
+                "Shield Proactive Engagement",
+                check_agentcore_shield_proactive_engagement,
             ),
             (
                 ["AC-52"],

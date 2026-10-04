@@ -19187,8 +19187,9 @@ class TestAC34RuntimeInlineCredentials:
 
     @patch("agentcore_app.agentcore_client")
     def test_the_passing_row_names_why_code_was_not_scanned(self, mock_ac):
-        # GetAgentRuntime returns where the code and the image live, so they are
-        # readable; the role is not granted the S3 and ECR reads that fetch them.
+        # GetAgentRuntime returns where the code and the image live. The role
+        # is not granted the S3 read that fetches the code; the image is judged
+        # on its own row.
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [self._RUNTIMES[0]]
         }
@@ -19201,7 +19202,8 @@ class TestAC34RuntimeInlineCredentials:
         assert "not readable through any" not in resolution
         assert "agentRuntimeArtifact" in resolution
         assert "s3:GetObject" in resolution
-        assert "ecr:GetDownloadUrlForLayer" in resolution
+        assert "AgentCore Runtime Image Inline Credentials row" in resolution
+        assert "file system layers are not scanned" in resolution
 
     @patch("agentcore_app.agentcore_client")
     def test_one_unreadable_runtime_does_not_hide_the_others(self, mock_ac):
@@ -19924,6 +19926,440 @@ class TestAC34Harnesses:
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
         assert "GetHarness" in findings[0]["Resolution"]
+
+
+class TestAC34RuntimeImages:
+    """AC-34: a credential baked into a runtime's container image configuration."""
+
+    _ACCOUNT = "111122223333"
+    _URI = f"{_ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/agents/rt"
+    _ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret - AWS doc example
+
+    @classmethod
+    def _detail(cls, runtime_id, uri, version="1"):
+        return {
+            "agentRuntimeArn": (
+                f"arn:aws:bedrock-agentcore:us-east-1:{cls._ACCOUNT}:"
+                f"runtime/{runtime_id}"
+            ),
+            "agentRuntimeVersion": version,
+            "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": uri}},
+        }
+
+    @staticmethod
+    def _config(env=(), cmd=()):
+        body = json.dumps({"config": {"Env": list(env), "Cmd": list(cmd)}}).encode()
+        response = MagicMock()
+        response.read.side_effect = lambda size=-1: body[:size] if size >= 0 else body
+        response.__enter__.return_value = response
+        return response
+
+    def _wire(self, mock_ac, mock_ecr, mock_open, runtimes, configs, index=None):
+        """runtimes: {id: uri}. configs: {config digest: response}.
+
+        A URI's tag (or digest) names its manifest; index maps a tag to the
+        child manifest digests of an image index.
+        """
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": rid, "agentRuntimeName": rid} for rid in runtimes
+            ]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId, **kw: (
+            self._detail(agentRuntimeId, runtimes[agentRuntimeId])
+        )
+        mock_ac.list_agent_runtime_endpoints.return_value = {"runtimeEndpoints": []}
+        mock_ecr.meta.region_name = "us-east-1"
+        index = index or {}
+
+        def batch_get_image(imageIds, **kwargs):
+            ref = imageIds[0].get("imageTag") or imageIds[0]["imageDigest"]
+            if ref in index:
+                return {
+                    "images": [
+                        {
+                            "imageManifestMediaType": (
+                                "application/vnd.oci.image.index.v1+json"
+                            ),
+                            "imageManifest": json.dumps(
+                                {
+                                    "manifests": [
+                                        {"digest": d, "platform": {"os": "linux"}}
+                                        for d in index[ref]
+                                    ]
+                                }
+                            ),
+                        }
+                    ]
+                }
+            return {
+                "images": [
+                    {
+                        "imageManifestMediaType": (
+                            "application/vnd.oci.image.manifest.v1+json"
+                        ),
+                        "imageManifest": json.dumps(
+                            {"config": {"digest": f"cfg-{ref}"}}
+                        ),
+                    }
+                ]
+            }
+
+        mock_ecr.batch_get_image.side_effect = batch_get_image
+        mock_ecr.get_download_url_for_layer.side_effect = lambda layerDigest, **kw: {
+            "downloadUrl": f"https://layer.example/{layerDigest}"
+        }
+        mock_open.side_effect = lambda url, timeout: configs[url.rsplit("/", 1)[1]]
+
+    @staticmethod
+    def _image_rows(findings):
+        return [f for f in findings if f["Finding"] == agentcore_app.AC34_IMAGE_FINDING]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_image_holding_a_credential_fails_and_the_clean_one_passes(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean", "rt-b": f"{self._URI}:bad"},
+            {
+                "cfg-clean": self._config(env=["LOG_LEVEL=INFO"]),
+                "cfg-bad": self._config(env=["PATH=/bin", f"API_KEY={_SECRET_VALUE}"]),
+            },
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        assert "(rt-a)" in rows[0]["Finding_Details"]
+        assert "1 Env variable(s)" in rows[0]["Finding_Details"]
+        assert "file system layers are not scanned" in rows[0]["Finding_Details"]
+        assert "(rt-b)" in rows[1]["Finding_Details"]
+        assert f"Env API_KEY of {self._URI}:bad" in rows[1]["Finding_Details"]
+        assert rows[1]["Severity"] == "High"
+        for row in rows:
+            assert _SECRET_VALUE not in json.dumps(row)
+            assert row["Check_ID"] == "AC-34"
+            assert_finding_schema(row)
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_platform_of_an_image_index_is_read(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        # The second platform carries the credential; reading only the first
+        # manifest would pass the image.
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:multi"},
+            {
+                "cfg-sha256:amd": self._config(env=["LOG_LEVEL=INFO"]),
+                "cfg-sha256:arm": self._config(env=[f"API_KEY={_SECRET_VALUE}"]),
+            },
+            index={"multi": ["sha256:amd", "sha256:arm"]},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Env API_KEY" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_clean_image_index_names_each_platform_read(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:multi"},
+            {
+                "cfg-sha256:amd": self._config(env=["A=1"]),
+                "cfg-sha256:arm": self._config(env=["B=2"]),
+            },
+            index={"multi": ["sha256:amd", "sha256:arm"]},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 platform(s), 2 Env variable(s)" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_access_key_in_cmd_fails(self, mock_ac, mock_ecr, mock_open):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean", "rt-b": f"{self._URI}:cmd"},
+            {
+                "cfg-clean": self._config(cmd=["python", "app.py"]),
+                "cfg-cmd": self._config(
+                    cmd=["python", "app.py", f"--key={self._ACCESS_KEY}"]
+                ),
+            },
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        assert f"Cmd of {self._URI}:cmd" in rows[1]["Finding_Details"]
+        assert self._ACCESS_KEY not in json.dumps(rows[1])
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_in_another_accounts_registry_is_not_read(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        other = "444455556666.dkr.ecr.us-east-1.amazonaws.com/shared/rt:v1"
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean", "rt-b": other},
+            {"cfg-clean": self._config(env=["A=1"])},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "registry 444455556666" in rows[1]["Finding_Details"]
+        assert all(
+            c.kwargs["registryId"] == self._ACCOUNT
+            for c in mock_ecr.batch_get_image.call_args_list
+        )
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["batch_get_image", "get_download_url_for_layer", "urlopen"],
+    )
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_failed_read_is_not_reported_clean(
+        self, mock_ac, mock_ecr, mock_open, failure
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean", "rt-b": f"{self._URI}:other"},
+            {
+                "cfg-clean": self._config(env=["A=1"]),
+                "cfg-other": self._config(env=["A=1"]),
+            },
+        )
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "Op"
+        )
+        if failure == "urlopen":
+            original = mock_open.side_effect
+            mock_open.side_effect = lambda url, timeout: (
+                (_ for _ in ()).throw(OSError("timed out"))
+                if url.endswith("cfg-other")
+                else original(url, timeout)
+            )
+        else:
+            method = getattr(mock_ecr, failure)
+            original = method.side_effect
+
+            def fail_other(**kwargs):
+                if "other" in json.dumps(kwargs):
+                    raise denied
+                return original(**kwargs)
+
+            method.side_effect = fail_other
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "could not be read" in rows[1]["Finding_Details"]
+        assert "ecr:BatchGetImage" in rows[1]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "url, size",
+        [("http://layer.example/cfg-clean", 10), ("https://layer.example/x", 2)],
+    )
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_plain_http_url_or_an_oversized_blob_is_not_read(
+        self, mock_ac, mock_ecr, mock_open, url, size
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean"},
+            {"cfg-clean": self._config(env=["A=1"])},
+        )
+        mock_ecr.get_download_url_for_layer.side_effect = None
+        mock_ecr.get_download_url_for_layer.return_value = {"downloadUrl": url}
+        big = MagicMock()
+        big.read.return_value = b" " * (
+            agentcore_app.ECR_IMAGE_CONFIG_MAX_BYTES * size // 2 + 1
+        )
+        big.__enter__.return_value = big
+        mock_open.side_effect = None
+        mock_open.return_value = big
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["N/A"]
+        if url.startswith("http:"):
+            assert "not HTTPS" in rows[0]["Finding_Details"]
+            mock_open.assert_not_called()
+        else:
+            assert "larger than 1 MiB" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_index_naming_too_many_platforms_is_not_read(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        digests = [
+            f"sha256:p{n}" for n in range(agentcore_app.ECR_IMAGE_MAX_PLATFORMS + 1)
+        ]
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:multi"},
+            {f"cfg-{d}": self._config(env=["A=1"]) for d in digests},
+            index={"multi": digests},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "9 platforms" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_older_served_version_runs_its_own_image(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean"},
+            {
+                "cfg-clean": self._config(env=["A=1"]),
+                "cfg-old": self._config(env=[f"API_KEY={_SECRET_VALUE}"]),
+            },
+        )
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId, **kw: (
+            self._detail(agentRuntimeId, f"{self._URI}:old", "1")
+            if kw.get("agentRuntimeVersion") == "1"
+            else self._detail(agentRuntimeId, f"{self._URI}:clean", "2")
+        )
+        mock_ac.list_agent_runtime_endpoints.return_value = {
+            "runtimeEndpoints": [{"name": "prod", "liveVersion": "1"}]
+        }
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"Env API_KEY of {self._URI}:old" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.boto3")
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_in_another_region_is_read_there(
+        self, mock_ac, mock_ecr, mock_open, mock_boto3
+    ):
+        uri = f"{self._ACCOUNT}.dkr.ecr.eu-west-1.amazonaws.com/agents/rt:clean"
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": uri},
+            {"cfg-clean": self._config(env=["A=1"])},
+        )
+        regional = MagicMock()
+        regional.batch_get_image.side_effect = mock_ecr.batch_get_image.side_effect
+        regional.get_download_url_for_layer.side_effect = (
+            mock_ecr.get_download_url_for_layer.side_effect
+        )
+        mock_boto3.client.return_value = regional
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed"]
+        mock_boto3.client.assert_called_once()
+        assert mock_boto3.client.call_args.kwargs["region_name"] == "eu-west-1"
+        mock_ecr.batch_get_image.assert_not_called()
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_code_runtime_gets_no_image_row(self, mock_ac, mock_ecr, mock_open):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean"},
+            {"cfg-clean": self._config(env=["A=1"])},
+        )
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": "rt-a", "agentRuntimeName": "a"},
+                {"agentRuntimeId": "rt-code", "agentRuntimeName": "code"},
+            ]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId, **kw: (
+            {
+                "agentRuntimeVersion": "1",
+                "agentRuntimeArtifact": {
+                    "codeConfiguration": {"code": {"s3": {"bucket": "b"}}}
+                },
+            }
+            if agentRuntimeId == "rt-code"
+            else self._detail(agentRuntimeId, f"{self._URI}:clean")
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert len(rows) == 1
+        assert "(rt-a)" in rows[0]["Finding_Details"]
 
 
 class TestAC34CheckRegistration:
@@ -26115,7 +26551,10 @@ class TestAC41EvaluationResultProtection:
         assert findings[0]["Status"] == "Passed"
         assert "expires results after 365 day(s)" in findings[0]["Finding_Details"]
         assert "AC-20 judges its masking policy" in findings[0]["Finding_Details"]
-        assert "Tag values" in findings[0]["Resolution"]
+        assert (
+            "AgentCore Evaluation Personal Data row judges tag values"
+            in findings[0]["Resolution"]
+        )
         assert_finding_schema(findings[0])
 
     @pytest.mark.parametrize(
@@ -47790,12 +48229,14 @@ class TestAC49NetworkFirewallEgress:
         policies=None,
         groups=None,
         nat_subnets=None,
+        log_types=None,
     ):
         """Stub VPC-mode runtimes, their subnets' routes and the firewalls.
 
         subnets maps subnet id to (vpc id, cidr); routes maps subnet id to its
         0.0.0.0/0 target; firewalls maps firewall name to (vpc id, endpoint ids,
-        policy name).
+        policy name); log_types maps firewall name to the log types it sends to
+        a destination, ALERT and FLOW when absent, or to an exception.
         """
         subnets = subnets or {"subnet-a": ("vpc-a", "10.0.1.0/24")}
         runtime_subnets = [s for s in subnets if not s.startswith("subnet-pub")]
@@ -47888,6 +48329,29 @@ class TestAC49NetworkFirewallEgress:
         mock_nfw.describe_rule_group.side_effect = lambda RuleGroupArn: {
             "RuleGroup": groups[RuleGroupArn]
         }
+
+        def describe_logging_configuration(FirewallArn):
+            types = (log_types or {}).get(
+                FirewallArn.rsplit("/", 1)[-1], ("ALERT", "FLOW")
+            )
+            if isinstance(types, Exception):
+                raise types
+            return {
+                "LoggingConfiguration": {
+                    "LogDestinationConfigs": [
+                        {
+                            "LogType": log_type,
+                            "LogDestinationType": "CloudWatchLogs",
+                            "LogDestination": {"logGroup": f"/nfw/{log_type}"},
+                        }
+                        for log_type in types
+                    ]
+                }
+            }
+
+        mock_nfw.describe_logging_configuration.side_effect = (
+            describe_logging_configuration
+        )
         return None
 
     @staticmethod
@@ -53202,3 +53666,762 @@ class TestAC38TemporalPrerequisitePermits:
         request = ("verifyPayee", "request", "eventResource: resource")
         rows = self._run(mock_ac, {"gw-1": [_temporal_statement(request)]})
         assert rows == {}
+
+
+class TestAC51FirewallManagerAndSrt:
+    """AIR-FND-NET-08: each gateway's web ACL is enrolled through Firewall
+    Manager, and an active Shield Advanced subscription has SRT proactive
+    engagement enabled."""
+
+    def _fms(self, acls, gateway_error=None, acl_error=None):
+        mock_ac = MagicMock()
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": gw, "name": gw.upper()} for gw in acls]
+        }
+
+        def get_gateway(gatewayIdentifier):
+            if gateway_error is not None and gatewayIdentifier == "gw-err":
+                raise gateway_error
+            arn = acls[gatewayIdentifier]
+            return {"webAclArn": arn} if arn else {}
+
+        mock_ac.get_gateway.side_effect = get_gateway
+        mock_waf = MagicMock()
+        fields = {
+            "arn:acl/fms": {"ManagedByFirewallManager": True},
+            "arn:acl/retro": {
+                "ManagedByFirewallManager": False,
+                "RetrofittedByFirewallManager": True,
+            },
+            "arn:acl/own": {"ManagedByFirewallManager": False},
+            "arn:acl/absent": {},
+        }
+
+        def get_web_acl(ARN):
+            if ARN == "arn:acl/err":
+                raise acl_error
+            return {"WebACL": {"Name": ARN.rsplit("/", 1)[1], **fields[ARN]}}
+
+        mock_waf.get_web_acl.side_effect = get_web_acl
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.wafv2_client", mock_waf),
+        ):
+            findings = agentcore_app.check_agentcore_gateway_firewall_manager()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-51"
+            assert finding["Finding"] == "AgentCore Gateway Firewall Manager Enrollment"
+        return {
+            f["Finding_Details"].split("(", 1)[1].split(")")[0]: f for f in findings
+        }
+
+    def test_each_gateway_is_judged_on_its_own_web_acl(self):
+        rows = self._fms(
+            {
+                "gw-fms": "arn:acl/fms",
+                "gw-retro": "arn:acl/retro",
+                "gw-own": "arn:acl/own",
+                "gw-absent": "arn:acl/absent",
+                "gw-none": None,
+            }
+        )
+        assert rows["gw-fms"]["Status"] == "Passed"
+        assert "ManagedByFirewallManager true" in rows["gw-fms"]["Finding_Details"]
+        assert rows["gw-retro"]["Status"] == "Passed"
+        assert (
+            "RetrofittedByFirewallManager true" in (rows["gw-retro"]["Finding_Details"])
+        )
+        assert rows["gw-own"]["Status"] == "Failed"
+        assert rows["gw-absent"]["Status"] == "Failed"
+        assert rows["gw-none"]["Status"] == "Failed"
+        assert "no web ACL" in rows["gw-none"]["Finding_Details"]
+        for row in rows.values():
+            assert "wafv2:ListResourcesForWebACL" in row["Finding_Details"]
+
+    def test_an_unread_gateway_or_web_acl_is_na(self):
+        denied = _make_client_error("AccessDeniedException", "no")
+        rows = self._fms(
+            {"gw-err": "arn:acl/fms", "gw-acl": "arn:acl/err", "gw-fms": "arn:acl/fms"},
+            gateway_error=denied,
+            acl_error=denied,
+        )
+        assert rows["gw-err"]["Status"] == "N/A"
+        assert rows["gw-acl"]["Status"] == "N/A"
+        assert (
+            "Firewall Manager enrollment was not read"
+            in (rows["gw-acl"]["Finding_Details"])
+        )
+        assert rows["gw-fms"]["Status"] == "Passed"
+
+    def _srt(self, gateways=1, state="ACTIVE", status="ENABLED", errors=None):
+        errors = errors or {}
+        mock_ac = MagicMock()
+        mock_ac.meta.region_name = "us-east-1"
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": f"gw-{n}"} for n in range(gateways)]
+        }
+        mock_sh = MagicMock()
+        if "state" in errors:
+            mock_sh.get_subscription_state.side_effect = errors["state"]
+        mock_sh.get_subscription_state.return_value = {"SubscriptionState": state}
+        if "describe" in errors:
+            mock_sh.describe_subscription.side_effect = errors["describe"]
+        mock_sh.describe_subscription.return_value = {
+            "Subscription": {"ProactiveEngagementStatus": status} if status else {}
+        }
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.shield_client", mock_sh),
+        ):
+            findings = agentcore_app.check_agentcore_shield_proactive_engagement()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-51"
+            assert finding["Finding"] == "AgentCore Shield Proactive Engagement"
+        return findings, mock_sh
+
+    @pytest.mark.parametrize(
+        "status, verdict",
+        [
+            ("ENABLED", "Passed"),
+            ("PENDING", "Failed"),
+            ("DISABLED", "Failed"),
+            (None, "Failed"),
+        ],
+    )
+    def test_an_active_subscription_is_judged_on_proactive_engagement(
+        self, status, verdict
+    ):
+        findings, _ = self._srt(gateways=2, status=status)
+        assert [f["Status"] for f in findings] == [verdict]
+        assert (
+            "2 AgentCore gateway(s) in Region 'us-east-1'"
+            in (findings[0]["Finding_Details"])
+        )
+        if verdict == "Failed":
+            assert (
+                f"proactive engagement is {status or 'not reported'}"
+                in (findings[0]["Finding_Details"])
+            )
+
+    def test_an_inactive_subscription_is_na_and_reads_no_subscription(self):
+        findings, mock_sh = self._srt(state="INACTIVE", status="DISABLED")
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "subscription state INACTIVE" in findings[0]["Finding_Details"]
+        mock_sh.describe_subscription.assert_not_called()
+
+    @pytest.mark.parametrize("leg", ["state", "describe"])
+    def test_an_unread_subscription_is_na(self, leg):
+        findings, _ = self._srt(
+            errors={leg: _make_client_error("AccessDeniedException", "no")}
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "AccessDenied" in findings[0]["Finding_Details"]
+
+    def test_a_region_without_a_gateway_gives_no_row(self):
+        findings, mock_sh = self._srt(gateways=0)
+        assert findings == []
+        mock_sh.get_subscription_state.assert_not_called()
+
+
+class TestAC49FirewallAlertLogging:
+    """AIR-FND-NET-04: the threat row requires each reached firewall to send
+    its ALERT log, which records the detections, to a destination."""
+
+    _base = TestAC49NetworkFirewallEgress()
+
+    def _rows(self, log_types):
+        mock_ac, mock_ec2, mock_nfw = MagicMock(), MagicMock(), MagicMock()
+        inventory = self._base._wire(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            subnets={
+                "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                "subnet-b": ("vpc-a", "10.0.2.0/24"),
+            },
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-b": ("VpcEndpointId", "vpce-fw2"),
+            },
+            firewalls={
+                "fw1": ("vpc-a", ["vpce-fw1"], "p1"),
+                "fw2": ("vpc-a", ["vpce-fw2"], "p1"),
+            },
+            log_types=log_types,
+        )
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.ec2_client", mock_ec2),
+            patch("agentcore_app.network_firewall_client", mock_nfw),
+        ):
+            findings = agentcore_app.check_agentcore_network_firewall_egress(inventory)
+        assert len(findings) == 2
+        return self._base._rows(findings)
+
+    def test_both_firewalls_logging_alerts_pass(self):
+        rows = self._rows({})
+        assert rows["threat"]["Status"] == "Passed"
+        assert (
+            "send their ALERT log to a destination"
+            in (rows["threat"]["Finding_Details"])
+        )
+        assert (
+            "detections in that log are not read" in (rows["threat"]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize("types", [("FLOW",), ("TLS", "FLOW"), ()])
+    def test_one_firewall_without_an_alert_log_fails_the_threat_row(self, types):
+        rows = self._rows({"fw2": types})
+        assert rows["threat"]["Status"] == "Failed"
+        assert "firewall fw2 sends no ALERT log" in rows["threat"]["Finding_Details"]
+        assert "firewall fw1 sends no" not in rows["threat"]["Finding_Details"]
+        assert rows["egress"]["Status"] == "Passed"
+
+    def test_an_alert_config_without_a_destination_is_not_credited(self):
+        rows = self._rows({})
+        # Re-run with fw1's ALERT entry stripped of its destination.
+        mock_ac, mock_ec2, mock_nfw = MagicMock(), MagicMock(), MagicMock()
+        inventory = self._base._wire(mock_ac, mock_ec2, mock_nfw)
+        mock_nfw.describe_logging_configuration.side_effect = lambda FirewallArn: {
+            "LoggingConfiguration": {
+                "LogDestinationConfigs": [
+                    {"LogType": "ALERT", "LogDestinationType": "S3"}
+                ]
+            }
+        }
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.ec2_client", mock_ec2),
+            patch("agentcore_app.network_firewall_client", mock_nfw),
+        ):
+            findings = agentcore_app.check_agentcore_network_firewall_egress(inventory)
+        threat = self._base._rows(findings)["threat"]
+        assert rows["threat"]["Status"] == "Passed"
+        assert threat["Status"] == "Failed"
+
+    def test_an_unread_logging_configuration_is_na_on_the_threat_row_only(self):
+        rows = self._rows({"fw1": _make_client_error("AccessDeniedException", "no")})
+        assert rows["threat"]["Status"] == "N/A"
+        assert (
+            "logging configuration of firewall fw1 could not be read"
+            in (rows["threat"]["Finding_Details"])
+        )
+        assert (
+            "network-firewall:DescribeLoggingConfiguration"
+            in (rows["threat"]["Resolution"])
+        )
+        assert rows["egress"]["Status"] == "Passed"
+
+
+class TestAC01EgressPorts:
+    """AIR-FND-NET-03: security-group egress is restricted to named ports, so
+    an outbound rule naming an IP range or prefix list fails when it allows
+    every protocol or every TCP or UDP port."""
+
+    _NARROW = [{"CidrIp": "52.94.0.0/22"}]
+
+    def _rows(self, mock_ac, mock_ec2, rules):
+        runtimes = [
+            _vpc_runtime("rt-good", security_groups=["sg-good"]),
+            _vpc_runtime("rt-bad", security_groups=["sg-bad"]),
+        ]
+        _wire_runtimes(mock_ac, runtimes)
+        _wire_tools(mock_ac)
+        good = [
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 443,
+                "ToPort": 443,
+                "IpRanges": self._NARROW,
+            },
+            {
+                "IpProtocol": "udp",
+                "FromPort": 1024,
+                "ToPort": 2048,
+                "IpRanges": [{"CidrIp": "10.0.0.0/16"}],
+            },
+            # A rule naming only a security group is not judged on ports.
+            {"IpProtocol": "-1", "UserIdGroupPairs": [{"GroupId": "sg-peer"}]},
+        ]
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                _security_group("sg-good", good),
+                _security_group("sg-bad", good + [rules]),
+            ]
+        }
+        egress = [
+            f
+            for f in extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+            if f["Finding"].startswith("AgentCore Egress")
+        ]
+        return {
+            ("rt-good" if "rt-good" in f["Finding_Details"] else "rt-bad"): f
+            for f in egress
+        }
+
+    @pytest.mark.parametrize(
+        "rule, named",
+        [
+            (
+                {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "10.0.0.0/16"}]},
+                "every protocol in sg-bad",
+            ),
+            (
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 0,
+                    "ToPort": 65535,
+                    "IpRanges": [{"CidrIp": "10.0.0.0/16"}],
+                },
+                "every tcp port in sg-bad",
+            ),
+            # Port 0 is reserved, so 1-65535 is every port a connection uses.
+            (
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 1,
+                    "ToPort": 65535,
+                    "IpRanges": [{"CidrIp": "52.94.0.0/22"}],
+                },
+                "every tcp port in sg-bad",
+            ),
+            (
+                {
+                    "IpProtocol": "17",
+                    "FromPort": 0,
+                    "ToPort": 65535,
+                    "Ipv6Ranges": [{"CidrIpv6": "fd00::/8"}],
+                },
+                "every udp port in sg-bad",
+            ),
+            (
+                {"IpProtocol": "-1", "PrefixListIds": [{"PrefixListId": "pl-s3"}]},
+                "every protocol in sg-bad",
+            ),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_all_port_rule_fails_only_its_runtime(
+        self, mock_ac, mock_ec2, rule, named
+    ):
+        mock_ec2.get_managed_prefix_list_entries.return_value = {
+            "Entries": [{"Cidr": "52.216.0.0/24"}]
+        }
+        rows = self._rows(mock_ac, mock_ec2, rule)
+        assert rows["rt-bad"]["Status"] == "Failed"
+        assert rows["rt-bad"]["Finding"] == "AgentCore Egress Ports Unrestricted"
+        assert named in rows["rt-bad"]["Finding_Details"]
+        assert (
+            "fails when it allows every protocol" in rows["rt-bad"]["Finding_Details"]
+        )
+        assert rows["rt-good"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_passing_row_reports_the_ports_it_read(self, mock_ac, mock_ec2):
+        rows = self._rows(
+            mock_ac,
+            mock_ec2,
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 2,
+                "ToPort": 65535,
+                "IpRanges": self._NARROW,
+            },
+        )
+        # 2-65535 leaves port 1 out, so it is a named range and is reported.
+        assert rows["rt-bad"]["Status"] == "Passed"
+        assert "tcp 2-65535" in rows["rt-bad"]["Finding_Details"]
+        assert "allow tcp 443, udp 1024-2048;" in rows["rt-good"]["Finding_Details"]
+        assert "not judged on ports" in rows["rt-good"]["Finding_Details"]
+
+
+class TestAC48AccessAnalyzer:
+    """AIR-ACR-RT-03: the AgentCore execution roles are audited by an ACTIVE
+    IAM Access Analyzer unused access analyzer in some assessed Region."""
+
+    _ROLES = [
+        ("runtime", "Runtime 'a'", "arn:aws:iam::123456789012:role/agent-a"),
+        ("browser", "Browser 'b'", "arn:aws:iam::123456789012:role/agent-b"),
+    ]
+
+    def _run(
+        self,
+        analyzers,
+        org_error=None,
+        references=None,
+        remote=(),
+        target_regions=("us-east-1", "us-west-2"),
+        primary=True,
+    ):
+        mock_ac = MagicMock()
+        mock_ac.meta.region_name = "us-east-1"
+        mock_org = MagicMock()
+        if org_error is not None:
+            mock_org.describe_organization.side_effect = org_error
+
+        def client(region_name):
+            listed = analyzers.get(region_name, [])
+            fake = MagicMock()
+            if isinstance(listed, Exception):
+                fake.list_analyzers.side_effect = listed
+            else:
+                fake.list_analyzers.return_value = {"analyzers": listed}
+            return fake
+
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.organizations_client", mock_org),
+            patch("agentcore_app._access_analyzer_client", side_effect=client),
+            patch(
+                "agentcore_app._agentcore_execution_role_references",
+                return_value=(self._ROLES if references is None else references, []),
+            ),
+            patch(
+                "agentcore_app._agentcore_other_region_role_references",
+                return_value=(list(remote), []),
+            ),
+        ):
+            findings = agentcore_app.check_agentcore_execution_role_access_analyzer(
+                None, list(target_regions) if target_regions else None, primary
+            )
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-48"
+            assert finding["Finding"] == "AgentCore Execution Role Access Analyzer"
+        return findings
+
+    @staticmethod
+    def _analyzer(name, kind="ACCOUNT_UNUSED_ACCESS", status="ACTIVE", exclusions=None):
+        analyzer = {"name": name, "type": kind, "status": status}
+        if exclusions is not None:
+            analyzer["configuration"] = {
+                "unusedAccess": {"analysisRule": {"exclusions": exclusions}}
+            }
+        return analyzer
+
+    _NOT_IN_ORG = _make_client_error("AWSOrganizationsNotInUseException", "none")
+
+    def test_an_analyzer_in_another_region_covers_the_roles(self):
+        findings = self._run(
+            {
+                "us-east-1": [self._analyzer("ext", kind="ACCOUNT")],
+                "us-west-2": [self._analyzer("unused")],
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "unused in us-west-2" in findings[0]["Finding_Details"]
+        assert "agent-a, agent-b" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "analyzers",
+        [
+            {},
+            {"us-east-1": [{"name": "ext", "type": "ACCOUNT", "status": "ACTIVE"}]},
+            {
+                "us-west-2": [
+                    {"name": "u", "type": "ACCOUNT_UNUSED_ACCESS", "status": "DISABLED"}
+                ]
+            },
+            {
+                "us-west-2": [
+                    {"name": "u", "type": "ACCOUNT_UNUSED_ACCESS", "status": "CREATING"}
+                ]
+            },
+        ],
+    )
+    def test_no_active_unused_access_analyzer_fails_outside_an_organization(
+        self, analyzers
+    ):
+        findings = self._run(analyzers, org_error=self._NOT_IN_ORG)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Region(s) us-east-1, us-west-2" in findings[0]["Finding_Details"]
+        assert "in no organization" in findings[0]["Finding_Details"]
+
+    def test_an_account_exclusion_does_not_cover(self):
+        findings = self._run(
+            {
+                "us-east-1": [
+                    self._analyzer(
+                        "other", exclusions=[{"accountIds": ["999999999999"]}]
+                    )
+                ],
+                "us-west-2": [
+                    self._analyzer(
+                        "skip", exclusions=[{"accountIds": ["123456789012"]}]
+                    )
+                ],
+            },
+        )
+        # "other" excludes a different account, so it still covers these roles.
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "other in us-east-1" in findings[0]["Finding_Details"]
+        findings = self._run(
+            {
+                "us-west-2": [
+                    self._analyzer(
+                        "skip", exclusions=[{"accountIds": ["123456789012"]}]
+                    )
+                ]
+            },
+            org_error=self._NOT_IN_ORG,
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "skip in us-west-2 exclude the account" in findings[0]["Finding_Details"]
+
+    def test_a_tag_exclusion_is_na(self):
+        findings = self._run(
+            {
+                "us-east-1": [
+                    self._analyzer(
+                        "tags", exclusions=[{"resourceTags": [{"env": "dev"}]}]
+                    )
+                ]
+            },
+            org_error=self._NOT_IN_ORG,
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "exclude resources by tag" in findings[0]["Finding_Details"]
+
+    def test_an_unlisted_region_is_na_not_failed(self):
+        findings = self._run(
+            {"us-west-2": _make_client_error("AccessDeniedException", "no")},
+            org_error=self._NOT_IN_ORG,
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "us-west-2 (" in findings[0]["Finding_Details"]
+        assert "access-analyzer:ListAnalyzers" in findings[0]["Resolution"]
+
+    def test_an_organization_member_without_its_own_analyzer_is_na(self):
+        findings = self._run({})
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "ORGANIZATION_UNUSED_ACCESS analyzer in its delegated"
+            in (findings[0]["Finding_Details"])
+        )
+
+    def test_a_remote_role_alone_is_judged_and_other_regions_give_no_row(self):
+        findings = self._run(
+            {},
+            org_error=self._NOT_IN_ORG,
+            references=[],
+            remote=[("runtime", "x", "arn:aws:iam::123456789012:role/remote")],
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "remote" in findings[0]["Finding_Details"]
+        assert self._run({}, primary=False) == []
+        assert self._run({}, references=[], org_error=self._NOT_IN_ORG) == []
+
+
+class TestAC41EvaluationPersonalData:
+    """AIR-ACR-EVAL-07: no personal data in evaluator tags or the free-form
+    fields of evaluation resources."""
+
+    def _run(
+        self,
+        evaluator_tags=None,
+        config_desc="scores tone",
+        errors=None,
+        safety_name="safety",
+    ):
+        errors = errors or {}
+        mock_ac = MagicMock()
+        mock_ac.list_evaluators.return_value = {
+            "evaluators": [
+                {
+                    "evaluatorId": "Builtin.Helpfulness",
+                    "evaluatorName": "Builtin.Helpfulness",
+                    "evaluatorType": "Builtin",
+                    "evaluatorArn": "arn:aws:bedrock-agentcore:::evaluator/Builtin.Helpfulness",
+                },
+                {
+                    "evaluatorId": "ev-1",
+                    "evaluatorName": "tone",
+                    "evaluatorType": "Custom",
+                    "evaluatorArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:evaluator/ev-1",
+                },
+                {
+                    "evaluatorId": "ev-2",
+                    "evaluatorName": safety_name,
+                    "evaluatorType": "Custom",
+                    "evaluatorArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:evaluator/ev-2",
+                },
+            ]
+        }
+        details = {
+            "ev-1": {
+                "evaluatorName": "tone",
+                "description": "Rates tone",
+                "evaluatorConfig": {
+                    "llmAsAJudge": {"instructions": "Score 1 to 5 for politeness."}
+                },
+            },
+            "ev-2": {
+                "evaluatorName": safety_name,
+                "description": "Rates safety",
+                "evaluatorConfig": {
+                    "llmAsAJudge": {"instructions": "Escalate to ops on low scores."}
+                },
+            },
+        }
+        if "get_evaluator" in errors:
+            mock_ac.get_evaluator.side_effect = errors["get_evaluator"]
+        else:
+            mock_ac.get_evaluator.side_effect = lambda evaluatorId: details[evaluatorId]
+        tags = {"...ev-1": {"team": "eval"}, "...ev-2": {"team": "eval"}}
+        tags.update(evaluator_tags or {})
+
+        def list_tags(resourceArn):
+            if "tags" in errors:
+                raise errors["tags"]
+            return {"tags": tags.get("..." + resourceArn.rsplit("/", 1)[1], {})}
+
+        mock_ac.list_tags_for_resource.side_effect = list_tags
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": [
+                {
+                    "onlineEvaluationConfigId": "oc-1",
+                    "onlineEvaluationConfigName": "prod",
+                    "onlineEvaluationConfigArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:online-evaluation-config/oc-1",
+                }
+            ]
+        }
+        mock_ac.get_online_evaluation_config.return_value = {
+            "onlineEvaluationConfigName": "prod",
+            "description": config_desc,
+            "outputConfig": {"cloudWatchConfig": {"logGroupName": "/custom/results"}},
+        }
+        mock_data = MagicMock()
+        mock_data.list_batch_evaluations.return_value = {
+            "batchEvaluations": [{"batchEvaluationId": "b-1"}]
+        }
+        mock_data.get_batch_evaluation.return_value = {
+            "batchEvaluationName": "nightly",
+            "description": "nightly run",
+        }
+        mock_logs = MagicMock()
+        mock_logs.describe_log_groups.side_effect = lambda logGroupNamePrefix, **_: {
+            "logGroups": [
+                {
+                    "logGroupName": name,
+                    "logGroupArn": f"arn:aws:logs:us-east-1:123456789012:log-group:{name}",
+                }
+                for name in (
+                    "/aws/bedrock-agentcore/evaluations/batch",
+                    "/custom/results",
+                    "/custom/resultsother",
+                )
+                if name.startswith(logGroupNamePrefix)
+            ]
+        }
+        group_tags = (evaluator_tags or {}).get("groups", {})
+        mock_logs.list_tags_for_resource.side_effect = lambda resourceArn: {
+            "tags": group_tags.get(resourceArn.split("log-group:")[1], {})
+        }
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.agentcore_data_client", mock_data),
+            patch("agentcore_app.logs_client", mock_logs),
+        ):
+            findings = agentcore_app.check_agentcore_evaluation_personal_data()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-41"
+            assert finding["Finding"] == "AgentCore Evaluation Personal Data"
+        return findings, mock_ac, mock_logs
+
+    def test_clean_metadata_passes_and_counts_the_population(self):
+        findings, mock_ac, mock_logs = self._run()
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "2 evaluator(s)" in details
+        assert "1 online evaluation configuration(s)" in details
+        assert "1 batch evaluation(s)" in details
+        # The batch group by prefix and the configuration's own group, not the
+        # sibling that only shares its prefix.
+        assert "2 results log group(s)" in details
+        assert "Personal data in any other form is not detected" in details
+        assert all(
+            "Builtin" not in str(c) for c in mock_ac.get_evaluator.call_args_list
+        )
+        assert {
+            c.kwargs["resourceArn"]
+            for c in mock_logs.list_tags_for_resource.call_args_list
+        } == {
+            "arn:aws:logs:us-east-1:123456789012:log-group:/aws/bedrock-agentcore/evaluations/batch",
+            "arn:aws:logs:us-east-1:123456789012:log-group:/custom/results",
+        }
+
+    @pytest.mark.parametrize(
+        "tags, field, kind",
+        [
+            (
+                {"...ev-2": {"owner": "jane.doe@example.com"}},
+                "evaluator 'safety' tag 'owner' value",
+                "an email address",
+            ),
+            ({"...ev-2": {"jane.doe@example.com": "x"}}, "tag key", "an email address"),
+            (
+                {"...ev-1": {"oncall": "+14155550123"}},
+                "evaluator 'tone' tag 'oncall' value",
+                "a phone number",
+            ),
+            (
+                {"...oc-1": {"ssn": "123-45-6789"}},
+                "online evaluation configuration 'prod' tag",
+                "a US social security number",
+            ),
+            (
+                {"groups": {"/custom/results": {"card": "4111 1111 1111 1111"}}},
+                "log group '/custom/results' tag 'card' value",
+                "a payment card number",
+            ),
+        ],
+    )
+    def test_personal_data_in_one_tag_fails_and_names_no_value(self, tags, field, kind):
+        findings, _, _ = self._run(evaluator_tags=tags)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert field in details
+        assert kind in details
+        for value in ("jane.doe", "4155550123", "6789", "4111"):
+            assert value not in details
+        assert "tone' tag 'team'" not in details
+
+    def test_personal_data_in_a_description_fails(self):
+        findings, _, _ = self._run(config_desc="ask (415) 555-0123 for access")
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "online evaluation configuration 'prod' description holds a phone number"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "desc",
+        ["card 4111111111111112 fails Luhn", "account 123456789012", "date 2026-10-03"],
+    )
+    def test_near_miss_numbers_pass(self, desc):
+        findings, _, _ = self._run(config_desc=desc)
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize("leg", ["tags", "get_evaluator"])
+    def test_an_unread_leg_is_na_never_passed(self, leg):
+        findings, _, _ = self._run(
+            errors={leg: _make_client_error("AccessDeniedException", "no")}
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "not judged" in findings[0]["Finding_Details"]
+
+    def test_a_match_beside_an_unread_leg_still_fails(self):
+        findings, _, _ = self._run(
+            config_desc="mail ops@example.com",
+            errors={"tags": _make_client_error("AccessDeniedException", "no")},
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Not read:" in findings[0]["Finding_Details"]
+
+    def test_a_name_holding_personal_data_fails_by_id_and_is_withheld(self):
+        findings, _, _ = self._run(safety_name="jane.doe@example.com")
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "evaluator ev-2 (whose name is withheld) name holds an email" in details
+        assert "jane.doe" not in details

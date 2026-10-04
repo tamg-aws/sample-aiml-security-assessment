@@ -314,13 +314,20 @@ _EXPECTED_ACTIONS = {
         "tag:GetResources",
     },
     "AgentCoreAssessmentReadsPolicy": {
+        "access-analyzer:ListAnalyzers",
+        "bedrock-agentcore:ListTagsForResource",
         "cloudfront:ListDistributions",
+        "ecr:BatchGetImage",
         "ecr:DescribeImages",
+        "ecr:GetDownloadUrlForLayer",
         "firehose:DescribeDeliveryStream",
         "logs:DescribeDestinations",
         "logs:DescribeSubscriptionFilters",
+        "logs:ListTagsForResource",
+        "network-firewall:DescribeLoggingConfiguration",
         "s3:GetBucketObjectLockConfiguration",
         "s3:GetBucketOwnershipControls",
+        "shield:DescribeSubscription",
         "shield:GetSubscriptionState",
         "shield:ListProtections",
     },
@@ -1365,6 +1372,7 @@ _AGENTCORE_MANAGED_GRANTS = [
     ),
     # No resource type in the service authorization reference (2026-10-03).
     ("Allow", "cloudfront:ListDistributions", json.dumps("*")),
+    ("Allow", "shield:DescribeSubscription", json.dumps("*")),
     ("Allow", "shield:GetSubscriptionState", json.dumps("*")),
     ("Allow", "shield:ListProtections", json.dumps("*")),
     (
@@ -1376,6 +1384,61 @@ _AGENTCORE_MANAGED_GRANTS = [
     ),
     # No resource type in the service authorization reference (2026-10-03).
     ("Allow", "logs:DescribeDestinations", json.dumps("*")),
+    (
+        "Allow",
+        "network-firewall:DescribeLoggingConfiguration",
+        json.dumps(
+            {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:"
+                    "firewall/*"
+                )
+            }
+        ),
+    ),
+    # No resource type in the service authorization reference (2026-10-03).
+    ("Allow", "access-analyzer:ListAnalyzers", json.dumps("*")),
+    (
+        "Allow",
+        "bedrock-agentcore:ListTagsForResource",
+        json.dumps(
+            [
+                {
+                    "Fn::Sub": (
+                        "arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:"
+                        "evaluator/*"
+                    )
+                },
+                {
+                    "Fn::Sub": (
+                        "arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:"
+                        "online-evaluation-config/*"
+                    )
+                },
+            ]
+        ),
+    ),
+    (
+        "Allow",
+        "logs:ListTagsForResource",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*"}
+        ),
+    ),
+    (
+        "Allow",
+        "ecr:BatchGetImage",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "ecr:GetDownloadUrlForLayer",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
+        ),
+    ),
 ]
 
 

@@ -1544,12 +1544,14 @@ Resources:
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
           - Sid: FrontDoorShieldRead
             # AC-51 lists the CloudFront distributions whose origin is an
-            # AgentCore gateway and reads their Shield Advanced enrollment.
-            # None of the three actions has a resource type in the service
-            # authorization reference, so each takes '*'.
+            # AgentCore gateway, reads their Shield Advanced enrollment, and
+            # reads the subscription's SRT proactive engagement status. None of
+            # the four actions has a resource type in the service authorization
+            # reference, so each takes '*'.
             Effect: Allow
             Action:
               - cloudfront:ListDistributions # AC-51
+              - shield:DescribeSubscription # AC-51
               - shield:GetSubscriptionState # AC-51
               - shield:ListProtections # AC-51
             Resource: '*'
@@ -1570,6 +1572,44 @@ Resources:
             Action:
               - logs:DescribeDestinations # AC-26
             Resource: '*'
+          - Sid: FirewallAlertLoggingRead
+            # AC-49 reads where each firewall a hosting subnet routes to sends
+            # its ALERT log, in this account.
+            Effect: Allow
+            Action:
+              - network-firewall:DescribeLoggingConfiguration # AC-49
+            Resource: !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall/*'
+          - Sid: ExecutionRoleAnalyzerRead
+            # AC-48 lists the IAM Access Analyzer analyzers of each assessed
+            # Region for an unused access analyzer. ListAnalyzers has no
+            # resource type in the service authorization reference, so it
+            # takes '*'.
+            Effect: Allow
+            Action:
+              - access-analyzer:ListAnalyzers # AC-48
+            Resource: '*'
+          - Sid: EvaluationTagRead
+            # AC-41 reads the tags of each evaluator, online evaluation
+            # configuration and evaluation results log group in this account.
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:ListTagsForResource # AC-41
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:evaluator/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:online-evaluation-config/*'
+          - Sid: EvaluationLogGroupTagRead
+            Effect: Allow
+            Action:
+              - logs:ListTagsForResource # AC-41
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+          - Sid: RuntimeImageConfigRead
+            # AC-34 reads each runtime image's manifest and the URL of its
+            # configuration blob, in this account's registry.
+            Effect: Allow
+            Action:
+              - ecr:BatchGetImage # AC-34
+              - ecr:GetDownloadUrlForLayer # AC-34
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
