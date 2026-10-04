@@ -65,24 +65,47 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-20"],
-        "BR-20 judges the vector store key of every knowledge base by DescribeKey. For "
-        "an OpenSearch Serverless collection it also reads every data access policy "
-        "(aoss:ListAccessPolicies, aoss:GetAccessPolicy) and fails an index rule "
-        "reaching the knowledge base's index whose collection segment or principal is "
-        "a wildcard, since OpenSearch Serverless does not check a caller's KMS "
-        "permission; an unread policy is N/A. For S3 Vectors it judges the bucket "
-        "policy. For an OpenSearch Service domain it fails an Allow admitting an "
-        "unbounded principal unless fine-grained access control is on with anonymous "
+        "BR-20 judges the vector store key of every knowledge base by DescribeKey. "
+        "For an OpenSearch Serverless collection it also reads every data access "
+        "policy (aoss:ListAccessPolicies, aoss:GetAccessPolicy) and fails an index "
+        "rule reaching the knowledge base's index whose collection segment or "
+        "principal is a wildcard, since OpenSearch Serverless does not check a "
+        "caller's KMS permission. It reads every network policy "
+        "(aoss:ListSecurityPolicies, aoss:GetSecurityPolicy) and fails a collection"
+        " or dashboard rule naming the collection with AllowFromPublic true, and "
+        "reads from the IAM permissions cache the aoss:APIAccessAll grant of each "
+        "role or user a reaching index rule admits, failing an unconditioned Allow "
+        "whose Resource has a wildcard in any segment or that uses NotResource "
+        "unless the permissions boundary scopes it. An unread policy, a collection "
+        "no network rule names, a conditioned grant and a principal missing from "
+        "the cache are N/A. For S3 Vectors it judges the bucket policy. For an "
+        "OpenSearch Service domain it fails an Allow admitting an unbounded "
+        "principal unless fine-grained access control is on with anonymous "
         "authentication off, and for Neptune Analytics it fails a graph with "
         "publicConnectivity true; an absent field is N/A. For Aurora it fails a "
-        "cluster with a PubliclyAccessible member instance (rds:DescribeDBInstances "
-        "per DBClusterMembers entry) or with IAMDatabaseAuthenticationEnabled false, "
-        "and an unread instance or absent value is N/A; whether password logins "
-        "remain beside IAM authentication is not read. For a SQL knowledge base it fails a "
-        "Redshift cluster with PubliclyAccessible true or a Serverless workgroup with "
-        "publiclyAccessible true, and holds an AWS_DATA_CATALOG store at N/A. A "
-        "MANAGED store is judged on its key "
-        "alone, and whether access matches the source data's is not compared",
+        "cluster with a PubliclyAccessible member instance (rds:DescribeDBInstances"
+        " per DBClusterMembers entry) or with IAMDatabaseAuthenticationEnabled "
+        "false, and an unread instance or absent value is N/A; whether password "
+        "logins remain beside IAM authentication is not read. For a SQL knowledge "
+        "base it fails a Redshift cluster with PubliclyAccessible true or a "
+        "Serverless workgroup with publiclyAccessible true, and holds an "
+        "AWS_DATA_CATALOG store at N/A. For each S3 source bucket of an OpenSearch "
+        "Serverless or S3 Vectors knowledge base it reads the bucket policy "
+        "(s3:GetBucketPolicy) and fails a principal the vector store admits that a "
+        "Deny of s3:GetObject on every object keeps out, by one negated "
+        "aws:PrincipalArn condition or by name; a Deny with another condition or on"
+        " part of the bucket, or an unread policy or principal list, is N/A, and "
+        "IAM grants on the source objects are not compared. A MANAGED store is "
+        "judged on its key and on the default encryption of each S3 bucket its "
+        "supplementalDataStorageConfiguration names. Partial, ceiling reached: "
+        "ManagedKnowledgeBaseConfiguration has no access member "
+        "(embeddingModelType, embeddingModelArn, embeddingModelConfiguration, "
+        "serverSideEncryptionConfiguration and supplementalDataStorageConfiguration"
+        " only), so who can read a MANAGED store is not compared with who reads its"
+        " source data. The Aurora, OpenSearch domain, Neptune Analytics, Kendra and"
+        " Redshift stores are not compared with the source bucket either, because "
+        "their readers are database users, fine-grained access control users or IAM"
+        " grants, not principals a resource policy names",
         [],
         3,
     ),
@@ -108,21 +131,51 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-34"],
-        "BR-34 requires a PROMPT_ATTACK filter with inputEnabled, BLOCK and HIGH "
-        "on the STANDARD tier for every reached guardrail version. Its 'Guardrail "
-        "Prompt Attack Invocation Evidence' row reads the last 24 hours of "
-        "invocation log records, from CloudWatch Logs with logs:FilterLogEvents or "
-        "from an S3-only destination with s3:GetObject, fails a guarded InvokeModel "
-        "call whose input is not wrapped in the guardContent tag its "
+        "BR-34 requires a PROMPT_ATTACK filter with inputEnabled, BLOCK and a LOW, "
+        "MEDIUM or HIGH inputStrength on the STANDARD tier for every reached "
+        "guardrail version, and names the strength, because no API records whether "
+        "it was tuned against production traffic. Its 'Guardrail Prompt Attack "
+        "Invocation Evidence' row reads the last 24 hours of invocation log "
+        "records, from CloudWatch Logs with logs:FilterLogEvents or from an S3-only"
+        " destination with s3:GetObject, fails a guarded InvokeModel call whose "
+        "input is not wrapped in the guardContent tag its "
         "amazon-bedrock-guardrailConfig tagSuffix names, fails a guarded Converse "
-        "call whose latest user turn has no guardContent block, and passes on a "
-        "logged PROMPT_ATTACK block with every guarded call marked. A Converse call "
-        "counts as guarded only when its logged request names guardrailConfig or "
-        "its response carries a guardrail trace or intervention",
+        "call whose latest user turn has no guardContent block or that leaves an "
+        "earlier text-bearing user turn untagged, and passes on a logged "
+        "PROMPT_ATTACK block with every guarded call marked. A Converse call counts"
+        " as guarded only when its logged request names guardrailConfig or its "
+        "response carries a guardrail trace or intervention. No row reads whether "
+        "an agent calls InvokeGuardrailChecks each turn, a runtime call that takes "
+        "its checks inline and leaves no stored configuration, and whether an "
+        "application screens toolUse input and toolResult content, which the filter"
+        " never evaluates, is runtime behaviour no API reports",
         [],
         3,
     ),
-    ("AIR-BDR-GRD-04", COVERED, None, "bedrock_assessments", ["BR-32"], "", [], 3),
+    (
+        "AIR-BDR-GRD-04",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-32"],
+        "BR-32 credits an alarm on the guardrail intervention metric, or on a "
+        "metric filter over the invocation log group, only when it enters ALARM on "
+        "a spike: a Sum, SampleCount or Maximum statistic with GreaterThanThreshold"
+        " or GreaterThanOrEqualToThreshold, or an anomaly detection band on such a "
+        "statistic with GreaterThanUpperThreshold or "
+        "LessThanLowerOrGreaterThanUpperThreshold. Each credited alarm's bound is "
+        "named, and whether it fits the Region's intervention volume is not judged;"
+        " a metric math alarm other than a band is N/A. An acting alarm passes only"
+        " beside a subscription-filter forward of the invocation log group and a "
+        "trail or event data store recording AWS::Bedrock::Guardrail data events. "
+        "For an S3-only invocation log destination it reads the bucket's event "
+        "notifications (s3:GetBucketNotification): a queue, topic or Lambda "
+        "configuration sending s3:ObjectCreated:* for every object under the "
+        "Region's BedrockModelInvocationLogs root counts as the forward, and "
+        "whether that destination reaches a SIEM is not read",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-GRD-09",
         COVERED,
@@ -131,11 +184,17 @@ AI_SUBJECT_ROWS = [
         ["BR-27"],
         "BR-27 requires active GROUNDING and RELEVANCE filters with BLOCK and a "
         "threshold above 0 and at most 0.99. Its 'Guardrail Contextual Grounding "
-        "Score Evidence' row fails when invocation logging delivers no text, so "
-        "no score is logged, and passes on a scored GROUNDING or RELEVANCE entry "
-        "read from the last 24 hours of invocation log records, from CloudWatch "
-        "Logs or from an S3-only destination with s3:GetObject. Whether callers "
-        "supply the grounding qualifiers is not recorded by any API",
+        "Score Evidence' row fails when invocation logging delivers no text, so no "
+        "score is logged, and passes on a scored GROUNDING or RELEVANCE entry read "
+        "from the last 24 hours of invocation log records, from CloudWatch Logs or "
+        "from an S3-only destination with s3:GetObject. It also reads the logged "
+        "inputBodyJson of each guarded Converse call through a guardrail version "
+        "with contextual grounding filters (bedrock:GetGuardrail on the version the"
+        " call names) and fails one that does not qualify both a grounding_source "
+        "and a query guardContent block; an unread version, a call naming no "
+        "guardrailConfig or a capped read is N/A. The grounding_source and query "
+        "tags of InvokeModel calls are not read, and Automated Reasoning checks are"
+        " reported, not judged",
         [],
         3,
     ),
@@ -163,26 +222,32 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-06"],
-        "BR-06 credits Bedrock management and data events from multi-region trails, "
-        "from single-Region trails homed in the assessed Region, and from each ENABLED "
-        "CloudTrail Lake event data store homed there or, with MultiRegionEnabled, "
-        "in another assessed Region or any Region enabled for the account "
-        "(account:ListRegions). Each store's advanced selectors are read with "
-        "cloudtrail:GetEventDataStore and judged as a trail's. A management "
-        "selector must admit both bedrock.amazonaws.com and bedrock-mantle.amazonaws.com, "
-        "and a data-event row needs all six AWS::BedrockMantle:: resource types. "
-        "An unread "
-        "trail or store keeps a gap N/A. The end-to-end trace row reads the 10 "
-        "newest successful InvokeModel, InvokeModelWithResponseStream, Converse and "
-        "ConverseStream events of the last 24 hours (LookupEvents) and joins each to "
-        "its invocation log record by request ID (FilterLogEvents, or the S3 "
-        "records); a joined call is the Passed trace example naming caller, source "
-        "IP, model, inference Region and whether bodies were logged, no join fails, "
-        "and text delivery off fails. The centralization row passes on a Lake store "
-        "recording Bedrock management events, or a Glue table in any enabled Region "
-        "over a CloudTrail log path or a Security Lake CLOUD_TRAIL_MGMT source, and "
-        "fails with neither; whether the invocation log records are centralized too "
-        "is not judged",
+        "BR-06 credits Bedrock management and data events from multi-region trails,"
+        " from single-Region trails homed in the assessed Region, and from each "
+        "ENABLED CloudTrail Lake event data store homed there or, with "
+        "MultiRegionEnabled, in another assessed Region or any Region enabled for "
+        "the account (account:ListRegions). Each store's advanced selectors are "
+        "read with cloudtrail:GetEventDataStore and judged as a trail's. A "
+        "management selector must admit both bedrock.amazonaws.com and "
+        "bedrock-mantle.amazonaws.com, and a data-event row needs all six "
+        "AWS::BedrockMantle:: resource types. An unread trail or store keeps a gap "
+        "N/A. The end-to-end trace row reads the 10 newest successful InvokeModel, "
+        "InvokeModelWithResponseStream, Converse and ConverseStream events of the "
+        "last 24 hours (LookupEvents) and joins each to its invocation log record "
+        "by request ID (FilterLogEvents, or the S3 records); a joined call is the "
+        "Passed trace example naming caller, source IP, model, inference Region and"
+        " whether bodies were logged, no join fails, and text delivery off fails. "
+        "The centralization row needs both halves of a trace in a central store: "
+        "the CloudTrail events, from a Lake store recording Bedrock management "
+        "events or a Glue table in any enabled Region under the S3 log root of a "
+        "logging trail that records every Bedrock management event in this Region, "
+        "where a Security Lake CLOUD_TRAIL_MGMT table or a table under no such root"
+        " is not credited; and the invocation log records, from a Glue table whose "
+        "location holds BedrockModelInvocationLogs/ and is a prefix of this "
+        "Region's S3 invocation log root. A missing half fails. Invocation logs "
+        "delivered only to CloudWatch Logs are N/A, since whether a subscription "
+        "carries them to a central store is not read, and whether each table's "
+        "schema parses the records is not judged",
         [],
         3,
     ),
@@ -214,7 +279,21 @@ AI_SUBJECT_ROWS = [
         [],
         3,
     ),
-    ("AIR-BDR-MDL-01", COVERED, None, "bedrock_assessments", ["BR-42"], "", [], 3),
+    (
+        "AIR-BDR-MDL-01",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-42"],
+        "BR-42 fails each cached role or user whose bedrock:InvokeModel, "
+        "bedrock:InvokeModelWithResponseStream or bedrock-mantle:CreateInference "
+        "grant reaches every model, judges the service control policy leg, and "
+        "fails the management account, which service control policies never "
+        "restrict. An identity policy document that cannot be parsed is named on an"
+        " N/A row and holds the would-be Passed row at N/A",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-MDL-03",
         COVERED,
@@ -252,21 +331,22 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-34"],
-        "partial, ceiling reached. BR-34 reads every data source with GetDataSource "
-        "for a POST_CHUNKING transformation Lambda, and every agent version and flow "
-        "node that retrieves from the knowledge base, at DRAFT and at each "
-        "alias-routed version, with ListAgentKnowledgeBases and the flow definition. "
-        "It fails a knowledge base that ingests a source with no transformation step "
-        "and is reached through any agent version or flow node, because managed "
-        "retrieval cannot wrap retrieved chunks in guardContent tags, so an agent or "
-        "flow guardrail's PROMPT_ATTACK filter does not evaluate them. It never passes "
-        "one. An account-enforced configuration whose PROMPT_ATTACK input filter "
-        "blocks at HIGH strength is credited only when it applies to every model and "
-        "every message, without SELECTIVE guarding or inputTags HONOR. The ceiling: a "
-        "transformation Lambda's logic is opaque, the bedrock-agent KnowledgeBase "
-        "shape has no guardrail member, and guardrailConfiguration is a "
-        "GenerationConfiguration request member of RetrieveAndGenerate, so no read "
-        "can show that retrieved chunks are screened",
+        "partial, ceiling reached. BR-34 reads every data source with GetDataSource"
+        " for a POST_CHUNKING transformation Lambda, and every agent version and "
+        "flow node that retrieves from the knowledge base, at DRAFT and at each "
+        "alias-routed version, with ListAgentKnowledgeBases and the flow "
+        "definition. It fails a knowledge base that ingests a source with no "
+        "transformation step and is reached through any agent version or flow node,"
+        " because managed retrieval cannot wrap retrieved chunks in guardContent "
+        "tags, so an agent or flow guardrail's PROMPT_ATTACK filter does not "
+        "evaluate them. It never passes one. An account-enforced configuration "
+        "whose PROMPT_ATTACK input filter blocks at LOW, MEDIUM or HIGH strength is"
+        " credited only when it applies to every model and every message, without "
+        "SELECTIVE guarding or inputTags HONOR. The ceiling: a transformation "
+        "Lambda's logic is opaque, the bedrock-agent KnowledgeBase shape has no "
+        "guardrail member, and guardrailConfiguration is a GenerationConfiguration "
+        "request member of RetrieveAndGenerate, so no read can show that retrieved "
+        "chunks are screened",
         [],
         3,
     ),
@@ -276,29 +356,36 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-26"],
-        "partial, ceiling reached. BR-26 fails a knowledge base that ingests a source "
-        "with no POST_CHUNKING transformation step and no completed Comprehend "
-        "ONLY_REDACTION job whose output location holds everything the source "
-        "ingests, whose PiiEntityTypes names ALL, and that ended before the source's "
-        "latest ingestion job started, and no AWS Glue visual job (glue:GetJobs "
-        "CodeGenConfigurationNodes) whose every path into an S3 target the source "
-        "ingests passes a PIIDetection node with a masking or hashing PiiType, and "
-        "whose newest SUCCEEDED run (glue:GetJobRuns) ended before that ingestion "
-        "job; a catalog target resolves through glue:GetTable, and whether the "
-        "node's EntityTypesToDetect cover the source's PII is not judged. An agent version or flow node guardrail is not "
-        "credited as screening the retrieved chunks, because the agent guardrail guide "
-        "describes it evaluating user messages and model responses only. Each object "
-        "the source ingests is listed with s3:ListBucket, and one last modified after "
-        "the job's EndTime fails the source; an unread or capped listing is N/A. It "
-        "never passes one, because no API records that the job wrote each object. An account-enforced configuration is "
-        "credited only when it applies to every model and every message, without "
-        "SELECTIVE guarding or inputTags HONOR. comprehend:ListPiiEntitiesDetectionJobs has "
-        "no resource type and is granted on *, and a failed read leaves an S3 "
-        "source not judged, as does an unread Glue job, run or target table. The "
-        "ceiling: a transformation Lambda's logic and a Glue script job's code "
-        "are not recorded (only a visual job carries CodeGenConfigurationNodes), and guardrailConfiguration is a "
-        "GenerationConfiguration request member of RetrieveAndGenerate, absent from "
-        "the bedrock-agent KnowledgeBase shape",
+        "partial, ceiling reached. BR-26 fails a knowledge base that ingests a "
+        "source with no POST_CHUNKING transformation step and no completed "
+        "Comprehend ONLY_REDACTION job whose output location holds everything the "
+        "source ingests, whose PiiEntityTypes names ALL, and that ended before the "
+        "source's latest ingestion job started, and no AWS Glue visual job "
+        "(glue:GetJobs CodeGenConfigurationNodes) whose every path into an S3 "
+        "target the source ingests passes a PIIDetection node with a masking or "
+        "hashing PiiType, and whose newest SUCCEEDED run (glue:GetJobRuns) ended "
+        "before that ingestion job; a catalog target resolves through "
+        "glue:GetTable, and whether the node's EntityTypesToDetect cover the "
+        "source's PII is not judged. An agent version or flow node guardrail is not"
+        " credited as screening the retrieved chunks, because the agent guardrail "
+        "guide describes it evaluating user messages and model responses only. A "
+        "knowledge base whose every source is credited is then judged on that "
+        "defense-in-depth layer: an agent version or flow node that generates from "
+        "it with no guardrail that blocks or masks AWS_ACCESS_KEY, AWS_SECRET_KEY "
+        "and PASSWORD on the input and the output and a custom regex on the output "
+        "fails, and an unread guardrail is N/A. Each object the source ingests is "
+        "listed with s3:ListBucket, and one last modified after the job's EndTime "
+        "fails the source; an unread or capped listing is N/A. It never passes one,"
+        " because no API records that the job wrote each object. An "
+        "account-enforced configuration is credited only when it applies to every "
+        "model and every message, without SELECTIVE guarding or inputTags HONOR. "
+        "comprehend:ListPiiEntitiesDetectionJobs has no resource type and is "
+        "granted on *, and a failed read leaves an S3 source not judged, as does an"
+        " unread Glue job, run or target table. The ceiling: a transformation "
+        "Lambda's logic and a Glue script job's code are not recorded (only a "
+        "visual job carries CodeGenConfigurationNodes), and guardrailConfiguration "
+        "is a GenerationConfiguration request member of RetrieveAndGenerate, absent"
+        " from the bedrock-agent KnowledgeBase shape",
         [],
         3,
     ),
@@ -308,27 +395,34 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-07"],
-        "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts"
-        " is Not Applicable) and now the production-version leg as well. For each prompt it"
-        " calls ListPrompts(promptIdentifier=...) for the numbered versions, fails a prompt"
-        " that has only its DRAFT, and reads GetPrompt(promptVersion=N) on every "
-        "numbered version for customerEncryptionKeyArn, which PromptSummary does not carry, and "
-        "judges that key by DescribeKey as customer managed and Enabled. For flows it reads "
-        "the prompt node's resource.promptArn in the working draft and in every flow "
-        "version an alias routes to (ListFlowAliases, GetFlowVersion), and fails a node that pins no version suffix,"
-        " since an unversioned ARN resolves to the working draft, and a node that defines "
-        "its prompt inline, which no version pins. The flow leg runs even with no prompt "
-        "in the Region. A role or user allowed bedrock:UpdatePrompt, "
-        "bedrock:CreatePromptVersion or bedrock:DeletePrompt on a Resource with a wildcard "
-        "fails, and so does one that holds one of them beside bedrock:RenderPrompt. "
-        "bedrock:CreatePrompt has no resource type, so every holder is named in the row, "
-        "and one that also holds bedrock:RenderPrompt fails. Whether a Converse call "
-        "names a prompt ARN as its modelId is not read from CloudTrail. A version != DRAFT test "
-        "on bare ListPrompts or on a GetPrompt with no promptVersion would have failed "
-        "every prompt in every account, because both return the draft. Partial, ceiling "
-        "reached: a prompt held in application code has no AWS record, and no AWS field "
-        "names the role approved to release a version, so which of the scoped roles "
-        "should release a version, beside the RenderPrompt roles, is not judged",
+        "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero"
+        " prompts is Not Applicable) and now the production-version leg as well. "
+        "For each prompt it calls ListPrompts(promptIdentifier=...) for the "
+        "numbered versions, fails a prompt that has only its DRAFT, and reads "
+        "GetPrompt(promptVersion=N) on every numbered version for "
+        "customerEncryptionKeyArn, which PromptSummary does not carry, and judges "
+        "that key by DescribeKey as customer managed and Enabled. For flows it "
+        "reads the prompt node's resource.promptArn in the working draft and in "
+        "every flow version an alias routes to (ListFlowAliases, GetFlowVersion), "
+        "and fails a node that pins no version suffix, since an unversioned ARN "
+        "resolves to the working draft, and a node that defines its prompt inline, "
+        "which no version pins. The flow leg runs even with no prompt in the "
+        "Region. A role or user allowed bedrock:UpdatePrompt, "
+        "bedrock:CreatePromptVersion or bedrock:DeletePrompt on a Resource with a "
+        "wildcard fails, and so does one that holds one of them beside "
+        "bedrock:RenderPrompt. bedrock:CreatePrompt has no resource type, so every "
+        "holder is named in the row, and one that also holds bedrock:RenderPrompt "
+        "fails. Its 'Bedrock Runtime Prompt Version Reference' row reads up to 10 "
+        "LookupEvents pages for each of InvokeModel, InvokeModelWithResponseStream,"
+        " Converse and ConverseStream over the last 24 hours and fails a call whose"
+        " requestParameters.modelId is a prompt ARN with no version suffix, which "
+        "runs the working draft; a capped or failed read, or no call naming a "
+        "prompt ARN, is N/A. A version != DRAFT test on bare ListPrompts or on a "
+        "GetPrompt with no promptVersion would have failed every prompt in every "
+        "account, because both return the draft. Partial, ceiling reached: a prompt"
+        " held in application code has no AWS record, and no AWS field names the "
+        "role approved to release a version, so which of the scoped roles should "
+        "release a version, beside the RenderPrompt roles, is not judged",
         [],
         4,
     ),
@@ -1588,37 +1682,43 @@ AI_SUBJECT_ROWS = [
         None,
         ["bedrock_assessments", "sagemaker_assessments"],
         ["BR-34", "BR-41", "BR-49", "SM-26"],
-        "three Bedrock checks, one per enforcement surface, and one detection check. "
-        "BR-34 asserts a guardrail carries a "
-        "PROMPT_ATTACK filter with inputEnabled true, inputAction BLOCK and inputStrength "
-        "HIGH on the STANDARD content-filter tier, and fails a CLASSIC tier, which has no "
-        "prompt-leakage detection. BR-34 also fails a Region whose model invocation "
-        "logging is off or has textDataDeliveryEnabled not true, since the text output "
-        "body is the record of a guardrail intervention, and reports an unread or absent "
-        "flag as Not Applicable. SM-26 reads each GuardDuty detector's AI_PROTECTION "
-        "feature, which raises the prompt-injection finding. BR-34 fails a Region with "
-        "no GuardDuty detector, or whose detector is not ENABLED or does not list "
-        "AI_PROTECTION ENABLED, and on a Passed row names, as the example flagged "
-        "events, the newest unarchived Impact:IAMUser/PromptInjection.Direct findings "
-        "on bedrock.amazonaws.com calls from every ListFindings page (GetFindings in "
-        "batches of 50); an unread detector or finding list is Not Applicable. "
-        "BR-41 reads ListEnforcedGuardrailsConfiguration, including "
-        "modelEnforcement.includedModels and excludedModels, where ALL with an empty "
-        "excludedModels is every model and a non-empty excludedModels leaves holes, and "
-        "selectiveContentGuarding, where SELECTIVE on either the system or the messages "
-        "field leaves content the caller does not tag unguarded, and inputTags HONOR "
-        "fails because the caller then picks what is evaluated. It reads each "
-        "bedrock.guardrail_inference.<region> configuration of the effective "
-        "Organizations Bedrock policy with the same model and content tests, credited "
-        "only in its own Region, and credits a service control policy only when its "
-        "Deny Resource covers every invoke resource type. "
-        "BR-49 asserts the identity-policy fallback: each identity allowed to invoke a "
-        "model is denied bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream "
-        "without an approved bedrock:GuardrailIdentifier. Those two actions authorize "
-        "Converse and ConverseStream as well; the Converse operations have no IAM action of"
-        " their own. Ceiling: whether an application runs ApplyGuardrail over retrieved "
-        "and tool-returned content is runtime behaviour that no configuration API "
-        "reports",
+        "three Bedrock checks, one per enforcement surface, and one detection "
+        "check. BR-34 asserts a guardrail carries a PROMPT_ATTACK filter with "
+        "inputEnabled true, inputAction BLOCK and a LOW, MEDIUM or HIGH "
+        "inputStrength, which the row names, on the STANDARD content-filter tier, "
+        "and fails a CLASSIC tier, which has no prompt-leakage detection. BR-34 "
+        "also fails a Region whose model invocation logging is off or has "
+        "textDataDeliveryEnabled not true, since the text output body is the record"
+        " of a guardrail intervention, and reports an unread or absent flag as Not "
+        "Applicable. Its invocation evidence row fails a guarded Converse call that"
+        " marks its latest user turn with guardContent but leaves an earlier user "
+        "turn with text and no guardContent block, since the guardrail then "
+        "evaluates only the marked blocks. SM-26 reads each GuardDuty detector's "
+        "AI_PROTECTION feature, which raises the prompt-injection finding. BR-34 "
+        "fails a Region with no GuardDuty detector, or whose detector is not "
+        "ENABLED or does not list AI_PROTECTION ENABLED, and on a Passed row names,"
+        " as the example flagged events, the newest unarchived "
+        "Impact:IAMUser/PromptInjection.Direct findings on bedrock.amazonaws.com "
+        "calls from every ListFindings page (GetFindings in batches of 50); an "
+        "unread detector or finding list is Not Applicable. BR-41 reads "
+        "ListEnforcedGuardrailsConfiguration, including "
+        "modelEnforcement.includedModels and excludedModels, where ALL with an "
+        "empty excludedModels is every model and a non-empty excludedModels leaves "
+        "holes, and selectiveContentGuarding, where SELECTIVE on either the system "
+        "or the messages field leaves content the caller does not tag unguarded, "
+        "and inputTags HONOR fails because the caller then picks what is evaluated."
+        " It reads each bedrock.guardrail_inference.<region> configuration of the "
+        "effective Organizations Bedrock policy with the same model and content "
+        "tests, credited only in its own Region, and credits a service control "
+        "policy only when its Deny Resource covers every invoke resource type. "
+        "BR-49 asserts the identity-policy fallback: each identity allowed to "
+        "invoke a model is denied bedrock:InvokeModel and "
+        "bedrock:InvokeModelWithResponseStream without an approved "
+        "bedrock:GuardrailIdentifier. Those two actions authorize Converse and "
+        "ConverseStream as well; the Converse operations have no IAM action of "
+        "their own. Ceiling: whether an application runs ApplyGuardrail over "
+        "retrieved and tool-returned content is runtime behaviour that no "
+        "configuration API reports",
         [],
         5,
     ),
@@ -1629,47 +1729,47 @@ AI_SUBJECT_ROWS = [
         ["agentcore_assessments", "bedrock_assessments"],
         ["AC-43", "AC-45", "AC-02", "AC-48", "BR-57"],
         "AC-45 scopes what each tool, runtime, memory, harness and payment manager "
-        "execution role may do, failing a grant of every resource or every action of "
-        "a service, so AWS's managed memory inference policy fails on its every-model "
-        "grant, and the row names "
-        "AmazonBedrockAgentCoreMemoryBedrockModelInferenceExecutionRolePolicy as the "
-        "AWS managed policy that holds it. AC-02 flags wildcard or "
-        "allow-except AgentCore grants on all resources across every cached role and "
-        "user. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 "
-        "reads the trust policy of every runtime, gateway, browser, code interpreter, "
+        "execution role may do, failing a grant of every resource or every action "
+        "of a service, so AWS's managed memory inference policy fails on its "
+        "every-model grant, and the row names "
+        "AmazonBedrockAgentCoreMemoryBedrockModelInferenceExecutionRolePolicy as "
+        "the AWS managed policy that holds it. AC-02 flags wildcard or allow-except"
+        " AgentCore grants on all resources across every cached role and user. "
+        "AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 reads "
+        "the trust policy of every runtime, gateway, browser, code interpreter, "
         "memory, payment manager and harness execution role: it fails a service "
-        "principal or * unless an aws:SourceAccount or aws:SourceArn condition names "
-        "the assessed account in every value, and fails at Medium a statement guarded "
-        "by aws:SourceAccount alone, since any AgentCore resource in the account can "
-        "then have the service assume the role; the AgentCore devguide's confused "
-        "deputy page recommends both keys. IfExists and ForAllValues: forms, and an "
-        "aws:SourceArn whose account segment holds a wildcard or another account, are "
-        "not credited. It fails an account-root or bare account-id "
-        "principal unless its condition names the calling principal, and fails a role "
-        "that more than one AgentCore resource names, since the shared role carries "
-        "the union of what each needs. The sharing leg runs at the primary Region and "
-        "compares the roles of every assessed Region, and an unread Region is N/A. "
-        "The sharing Passed is withheld while any family "
-        "could not be listed, so it reads N/A until "
-        "bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are "
-        "granted. AC-27 also reads the gateway roles. BR-57 carries the Bedrock "
-        "Agents leg: it reads the trust policy of every agent role (the "
+        "principal or * unless an aws:SourceAccount or aws:SourceArn condition "
+        "names the assessed account in every value, and fails at Medium a statement"
+        " guarded by aws:SourceAccount alone, since any AgentCore resource in the "
+        "account can then have the service assume the role; the AgentCore "
+        "devguide's confused deputy page recommends both keys. IfExists and "
+        "ForAllValues: forms, and an aws:SourceArn whose account segment holds a "
+        "wildcard or another account, are not credited. It fails an account-root or"
+        " bare account-id principal unless its condition names the calling "
+        "principal, and fails a role that more than one AgentCore resource names, "
+        "since the shared role carries the union of what each needs. The sharing "
+        "leg runs at the primary Region and compares the roles of every assessed "
+        "Region, and an unread Region is N/A. The sharing Passed is withheld while "
+        "any family could not be listed, so it reads N/A until "
+        "bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses "
+        "are granted. AC-27 also reads the gateway roles. BR-57 carries the Bedrock"
+        " Agents leg: it reads the trust policy of every agent role (the "
         "agentResourceRoleArn of each DRAFT and alias-routed version) and fails a "
         "bedrock.amazonaws.com statement without both a positive aws:SourceAccount "
         "and aws:SourceArn test naming the role's own account, fails a role two "
         "agents share, and fails an execution role that two action group Lambda "
-        "functions of those versions run as, or that a Lambda function outside every "
-        "action group runs as (ListFunctions with FunctionVersion ALL). It scopes "
-        "each agent and action group role from the IAM permissions cache: an "
-        "unconditioned Allow of bedrock:InvokeModel, "
-        "bedrock:InvokeModelWithResponseStream, bedrock:Retrieve, "
-        "bedrock:InvokeAgent, s3:GetObject, s3:PutObject, dynamodb:GetItem, "
-        "dynamodb:PutItem, secretsmanager:GetSecretValue, lambda:InvokeFunction or "
-        "execute-api:Invoke on every resource of its type, or through NotResource, "
-        "fails unless the permissions boundary denies or scopes it; a conditioned "
-        "one, a role missing from the cache or with a policy read error, or an unread "
-        "agent or function is Not Applicable. Actions outside that probe set, Deny "
-        "statements and service control policies are not judged",
+        "functions of those versions run as, or that a Lambda function outside "
+        "every action group runs as (ListFunctions with FunctionVersion ALL). It "
+        "scopes each agent and action group role from the IAM permissions cache: an"
+        " unconditioned Allow of any action on every resource of its type, or "
+        "through NotResource, fails unless the permissions boundary denies or "
+        "scopes it, and 18 actions the service reference lists with no resource "
+        "type are named and not judged. A NotAction Allow fails outright with no "
+        "boundary and is judged on an 11-action probe set under one, and a wildcard"
+        " action pattern under a narrower boundary is Not Applicable because their "
+        "overlap is not computed, as is a conditioned grant, a role missing from "
+        "the cache or with a policy read error, or an unread agent or function. "
+        "Deny statements and service control policies are not judged",
         [],
         5,
     ),
@@ -1878,22 +1978,24 @@ FOUNDATION_ROWS = [
             "sagemaker_assessments",
         ],
         ["BR-42", "SM-02"],
-        "BR-42 fails each cached role or user whose Bedrock invocation grant reaches "
-        "every model instead of naming foundation-model or inference-profile ARNs. "
-        "On the training data buckets of customization and SageMaker training jobs "
-        "it fails an identity s3:GetObject grant that reaches the bucket through a "
-        "wildcard, and reads each bucket policy with s3:GetBucketPolicy: an Allow "
-        "of s3:GetObject to every principal with no condition fails, a conditioned "
-        "one passes only when a positive account, organization or principal ARN "
-        "test names this account or its organization and nothing else, a grant to "
-        "another account's principals fails, and an unread policy or account ID "
-        "withholds Passed. "
-        "SM-02 fails each cached role or user whose sagemaker:InvokeEndpoint grant "
-        "reaches every endpoint with no aws:ResourceTag condition that narrows "
-        "it; a Like value made only of wildcards narrows nothing. Together they "
-        "cover the model and the inference endpoint; which identities should hold "
-        "those grants is a workload decision, so a grant that names its resources "
-        "is not judged further",
+        "BR-42 fails each cached role or user whose Bedrock invocation grant "
+        "reaches every model instead of naming foundation-model or "
+        "inference-profile ARNs. On the training data buckets of customization and "
+        "SageMaker training jobs it fails an identity s3:GetObject grant that "
+        "reaches the bucket through a wildcard, and reads each bucket policy with "
+        "s3:GetBucketPolicy: an Allow of s3:GetObject to every principal with no "
+        "condition fails, a conditioned one passes only when a positive account, "
+        "organization or principal ARN test names this account or its organization "
+        "and nothing else, a grant to another account's principals fails, and an "
+        "unread policy or account ID withholds Passed. Training jobs are read "
+        "through every sagemaker:Search page (Resource TrainingJob), so only a "
+        "listed job Search does not return takes a DescribeTrainingJob call, and "
+        "those past 200 are named as unread. SM-02 fails each cached role or user "
+        "whose sagemaker:InvokeEndpoint grant reaches every endpoint with no "
+        "aws:ResourceTag condition that narrows it; a Like value made only of "
+        "wildcards narrows nothing. Together they cover the model and the inference"
+        " endpoint; which identities should hold those grants is a workload "
+        "decision, so a grant that names its resources is not judged further",
         [],
         6,
     ),

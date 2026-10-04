@@ -144,7 +144,9 @@ _EXPECTED_ACTIONS = {
     "BedrockAssessmentReadsPolicy": {
         "account:ListRegions",
         "aoss:GetAccessPolicy",
+        "aoss:GetSecurityPolicy",
         "aoss:ListAccessPolicies",
+        "aoss:ListSecurityPolicies",
         "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:GetMemory",
         "bedrock-agentcore:GetResourcePolicy",
@@ -186,6 +188,7 @@ _EXPECTED_ACTIONS = {
         "redshift-serverless:GetNamespace",
         "redshift-serverless:ListWorkgroups",
         "redshift:DescribeClusters",
+        "s3:GetBucketNotification",
         "s3:GetObject",
         "s3:ListBucket",
         "sagemaker:DescribeEndpoint",
@@ -201,6 +204,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListProcessingJobs",
         "sagemaker:ListTrainingJobs",
         "sagemaker:ListTransformJobs",
+        "sagemaker:Search",
         "sso:DescribeInstanceAccessControlAttributeConfiguration",
         "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
         "sso:ListManagedPoliciesInPermissionSet",
@@ -879,6 +883,9 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
         [
             ("Allow", "aoss:ListAccessPolicies", '"*"'),
             ("Allow", "aoss:GetAccessPolicy", '"*"'),
+            ("Allow", "aoss:ListSecurityPolicies", '"*"'),
+            ("Allow", "aoss:GetSecurityPolicy", '"*"'),
+            ("Allow", "sagemaker:Search", '"*"'),
             ("Allow", "sagemaker:ListTrainingJobs", '"*"'),
             ("Allow", "sagemaker:ListTransformJobs", '"*"'),
             ("Allow", "sagemaker:ListProcessingJobs", '"*"'),
@@ -954,6 +961,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             scoped("logs:FilterLogEvents", "logs:*:${AWS::AccountId}:log-group:*"),
             ("Allow", "redshift-serverless:ListWorkgroups", '"*"'),
             scoped("s3:ListBucket", "s3:::*"),
+            scoped("s3:GetBucketNotification", "s3:::*"),
             *(
                 (
                     "Allow",
@@ -1043,6 +1051,14 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                                 "Fn::Sub": "arn:${AWS::Partition}:guardduty:*:"
                                 "${AWS::AccountId}:detector/*"
                             },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                                "${AWS::AccountId}:knowledge-base/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock-mantle:*:"
+                                "${AWS::AccountId}:project/*"
+                            },
                         ]
                     ),
                 )
@@ -1052,17 +1068,9 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "account:ListRegions",
                     "events:ListTargetsByRule",
                     "guardduty:GetDetector",
+                    "bedrock:ListIngestionJobs",
+                    "bedrock-mantle:ListProjects",
                 )
-            ),
-            (
-                "Allow",
-                "bedrock:ListIngestionJobs",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
-                        "${AWS::AccountId}:knowledge-base/*"
-                    }
-                ),
             ),
             *(
                 (
@@ -1165,10 +1173,6 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
             ("Allow", "bedrock-mantle:GetAccountDataRetention", '"*"'),
             ("Allow", "iam:GetAccountSummary", '"*"'),
-            scoped(
-                "bedrock-mantle:ListProjects",
-                "bedrock-mantle:*:${AWS::AccountId}:project/*",
-            ),
             (
                 "Allow",
                 "s3:GetObject",

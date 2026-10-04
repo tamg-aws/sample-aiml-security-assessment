@@ -576,6 +576,9 @@ def test_runtime_guidance_does_not_use_invalid_iam_identifiers():
 # for permissions. A new IAM-shaped token in remediation text must be reviewed
 # and added deliberately.
 _VERIFIED_REMEDIATION_IAM_ACTIONS = {
+    # aoss:APIAccessAll (resource type Collection) was read from the aoss
+    # service reference JSON on 2026-10-04.
+    "aoss:APIAccessAll",
     "aoss:ListCollections",
     "agent-registry:GetRegistry",
     "agent-registry:ListRegistries",
