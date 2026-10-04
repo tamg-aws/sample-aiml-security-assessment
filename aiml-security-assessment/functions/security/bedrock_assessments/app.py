@@ -44,6 +44,35 @@ logger.setLevel(logging.ERROR)
 # duplicate findings when scanning multiple regions.
 GLOBAL_REGION_LABEL = "Global"
 
+# The Bedrock function's Timeout in template.yaml and template-multi-account.yaml,
+# the deadline's base when lambda_handler is called with no Lambda context.
+LAMBDA_TIMEOUT_SECONDS = 600
+
+# Every capped or budgeted read loop also stops once less than this many seconds
+# of the invocation remain. Each cap was measured alone against the deployed
+# function's slowest run, 420 s of its 600 s timeout, but the caps one region
+# run reaches can together pass 600 s, and an invocation that times out writes
+# no report at all. 60 s is botocore's default read timeout, so it covers one
+# call left stalled in flight when the deadline passes, then the CSV build and
+# the one S3 PutObject of the report. Calls outside these loops are not stopped.
+# A read the deadline stops is reported as a read past its cap is: named or
+# counted, and the row held at N/A.
+DEADLINE_MARGIN_SECONDS = 60
+
+# Where a read the deadline stopped says it stopped.
+DEADLINE_STOP = (
+    f"at the invocation deadline, {DEADLINE_MARGIN_SECONDS} s before the Lambda timeout"
+)
+
+# time.monotonic() past which the capped reads stop. lambda_handler sets it at
+# entry, because a warm container keeps module state between invocations.
+_DEADLINE: Optional[float] = None
+
+
+def _deadline_reached() -> bool:
+    """True once less than DEADLINE_MARGIN_SECONDS of the invocation remain."""
+    return _DEADLINE is not None and time.monotonic() >= _DEADLINE
+
 
 def _caller_identity_partition(caller_identity: Dict[str, Any]) -> str:
     """Return the STS ARN partition, defaulting safely for incomplete identities."""
@@ -4817,6 +4846,15 @@ def _log_group_deletion_evidence(
     try:
         logs_client = boto3.client("logs", config=boto3_config, region_name=region)
         for _ in range(LOG_DELETION_MAX_PAGES):
+            if _deadline_reached():
+                return {
+                    "overdue": None,
+                    "evidence": "",
+                    "error": (
+                        "FilterLogEvents had not finished searching for an event "
+                        f"older than {allowance}: the search stopped {DEADLINE_STOP}"
+                    ),
+                }
             response = logs_client.filter_log_events(**request)
             events = response.get("events") or []
             if events:
@@ -5092,14 +5130,19 @@ def _replication_held_log_objects(
             Bucket=bucket_name, Prefix=root
         ):
             for item in page.get("Contents") or []:
-                if read >= REPLICATION_STATUS_HEAD_CAP:
+                if read >= REPLICATION_STATUS_HEAD_CAP or _deadline_reached():
                     return {
                         "failed": failed,
                         "read": read,
                         "capped": True,
                         "error": (
                             f"objects under s3://{bucket_name}/{root} past the first "
-                            f"{REPLICATION_STATUS_HEAD_CAP} were not read"
+                            f"{read} were not read"
+                            + (
+                                ""
+                                if read >= REPLICATION_STATUS_HEAD_CAP
+                                else f": HeadObject stopped {DEADLINE_STOP}"
+                            )
                         ),
                     }
                 action = "s3:GetObject"
@@ -5155,12 +5198,17 @@ def _oldest_object_under(s3_client: Any, bucket_name: str, root: str) -> Dict[st
         folders: List[str] = []
         token = None
         while True:
-            if calls >= OLDEST_OBJECT_LIST_CAP:
+            if calls >= OLDEST_OBJECT_LIST_CAP or _deadline_reached():
                 return {
                     "oldest": oldest,
                     "error": (
                         f"the listing under s3://{bucket_name}/{root} stopped "
-                        f"after {OLDEST_OBJECT_LIST_CAP} ListObjectsV2 calls"
+                        f"after {calls} ListObjectsV2 calls"
+                        + (
+                            ""
+                            if calls >= OLDEST_OBJECT_LIST_CAP
+                            else f" {DEADLINE_STOP}"
+                        )
                     ),
                 }
             request = {"Bucket": bucket_name, "Prefix": prefix, "Delimiter": "/"}
@@ -5214,6 +5262,11 @@ def _oldest_noncurrent_version_under(
         while True:
             if calls >= OLDEST_OBJECT_LIST_CAP:
                 return None, capped
+            if _deadline_reached():
+                return None, (
+                    f"the version listing under s3://{bucket_name}/{root} stopped "
+                    f"after {calls} ListObjectVersions calls {DEADLINE_STOP}"
+                )
             page = s3_client.list_object_versions(**request)
             calls += 1
             entries.extend((item, True) for item in page.get("Versions") or [])
@@ -8027,7 +8080,7 @@ def _inference_trace_findings(region: str) -> Dict[str, Any]:
                     source["where"],
                     f"failed ({scan.get('action')}: {scan['error']})"
                     if scan["error"]
-                    else "reached its cap",
+                    else f"reached its {scan.get('cap') or 'cap'}",
                 ),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
@@ -8965,7 +9018,14 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
     """
     client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
     now = datetime.now(timezone.utc)
-    found = {"versioned": [], "draft": [], "read": 0, "capped": [], "error": None}
+    found = {
+        "versioned": [],
+        "draft": [],
+        "read": 0,
+        "capped": [],
+        "error": None,
+        "deadline": False,
+    }
     for operation in INFERENCE_TRACE_OPERATIONS:
         oldest = None
         request = {
@@ -8976,7 +9036,11 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
             "EndTime": now,
             "MaxResults": 50,
         }
+        stopped = True
         for _ in range(RUNTIME_PROMPT_LOOKUP_PAGES):
+            if _deadline_reached():
+                found["deadline"] = True
+                break
             try:
                 response = client.lookup_events(**request)
                 if not isinstance(response, dict):
@@ -9012,9 +9076,10 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
                 )
                 found["versioned" if match.group(1) else "draft"].append(label)
             if not response.get("NextToken"):
+                stopped = False
                 break
             request["NextToken"] = response["NextToken"]
-        else:
+        if stopped:
             found["capped"].append(
                 f"{operation} calls before {oldest}"
                 if oldest
@@ -9076,12 +9141,15 @@ def _runtime_prompt_version_findings(
         return [
             row(
                 "{} of the {} event(s) read passed a prompt ARN, each with a "
-                "numbered version, but event history holds more than the {} "
+                "numbered version, but {}event history holds more than the {} "
                 "event(s) read per operation, newest first, so these were not "
                 "read, and one that runs a prompt DRAFT may be among them: "
                 "{}.".format(
                     total,
                     references["read"],
+                    f"the lookup stopped {DEADLINE_STOP} or "
+                    if references.get("deadline")
+                    else "",
                     RUNTIME_PROMPT_LOOKUP_PAGES * 50,
                     "; ".join(references["capped"]),
                 ),
@@ -10054,6 +10122,12 @@ def _read_guardrail_directions(
             )
             return result
         for version in versions:
+            if _deadline_reached():
+                result["unread"] = (
+                    f"the read of its versions from {version} on stopped "
+                    f"{DEADLINE_STOP}"
+                )
+                return result
             detail = client.get_guardrail(
                 guardrailIdentifier=reference["identifier"],
                 guardrailVersion=version,
@@ -16482,6 +16556,11 @@ def _data_catalog_table_buckets(
                             f"more than {DATA_CATALOG_PARTITION_PAGES} pages of "
                             "partitions"
                         )
+                    if _deadline_reached():
+                        raise ValueError(
+                            f"partitions from page {count} on, whose read stopped "
+                            f"{DEADLINE_STOP}"
+                        )
                     locations.extend(
                         (partition.get("StorageDescriptor") or {}).get("Location")
                         for partition in page.get("Partitions") or []
@@ -20841,6 +20920,16 @@ def _objects_written_after(
                             "lists, so not every object was read"
                         ),
                     }
+                if _deadline_reached():
+                    return {
+                        "listed": listed,
+                        "later": later,
+                        "error": (
+                            f"the listing of s3://{bucket} stopped after "
+                            f"{listed:,} object(s) {DEADLINE_STOP}, so not every "
+                            "object was read"
+                        ),
+                    }
                 for item in page.get("Contents") or []:
                     listed += 1
                     gap = _days_between(after, item.get("LastModified"))
@@ -21548,8 +21637,12 @@ def _scan_invocation_log(
     }
     read = 0
     last = start
+    cap = "page cap"
     try:
         for _ in range(INVOCATION_LOG_SCAN_MAX_PAGES):
+            if _deadline_reached():
+                cap = "invocation deadline"
+                break
             response = client.filter_log_events(**request)
             for event in response.get("events") or []:
                 if isinstance(event.get("timestamp"), int):
@@ -21574,6 +21667,7 @@ def _scan_invocation_log(
     return {
         "read": read,
         "capped": True,
+        "cap": cap,
         "error": None,
         "unread_from": datetime.fromtimestamp(last / 1000, timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
@@ -21637,9 +21731,12 @@ def _scan_invocation_log_s3(
                     key = item.get("Key") or ""
                     if "/data/" in key[len(request["Prefix"]) - 1 :]:
                         continue
-                    if objects >= INVOCATION_LOG_S3_MAX_OBJECTS:
+                    if objects >= INVOCATION_LOG_S3_MAX_OBJECTS or _deadline_reached():
                         return summaries(
                             capped=True,
+                            cap="object cap"
+                            if objects >= INVOCATION_LOG_S3_MAX_OBJECTS
+                            else "invocation deadline",
                             error=None,
                             unread_from=folder.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         )
@@ -21862,6 +21959,7 @@ def _invoke_call_guardrails(
             "missing": True,
         }
         try:
+            stopped = True
             for _ in range(
                 max(
                     0,
@@ -21871,6 +21969,8 @@ def _invoke_call_guardrails(
                     ),
                 )
             ):
+                if _deadline_reached():
+                    break
                 joins["pages"] += 1
                 response = client.lookup_events(**request)
                 if not isinstance(response, dict):
@@ -21908,9 +22008,10 @@ def _invoke_call_guardrails(
                     )
                 next_token = response.get("NextToken")
                 if not pending or not isinstance(next_token, str) or not next_token:
+                    stopped = False
                     break
                 request["NextToken"] = next_token
-            else:
+            if stopped:
                 for _, call in timed:
                     if call["request_id"] in pending:
                         capped.append(call["label"])
@@ -22008,8 +22109,8 @@ def _converse_join_notes(
         unread.insert(
             0,
             "{} Converse call(s) not matched to CloudTrail within the LookupEvents "
-            "page cap ({} pages per operation, {} per region run), so {} is not "
-            "known: {}".format(
+            "page cap ({} pages per operation, {} per region run) or before the "
+            "invocation deadline, so {} is not known: {}".format(
                 len(sorted_calls["capped"]),
                 GROUNDING_JOIN_MAX_PAGES,
                 GROUNDING_JOIN_BUDGET_PAGES,
@@ -22553,7 +22654,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
             elif scan["capped"]:
                 unread.append(
                     f"records matching {what} in {where} past the first "
-                    f"{scan['read']} ({cap}; those logged from "
+                    f"{scan['read']} ({scan.get('cap') or cap}; those logged from "
                     f"{scan['unread_from']} on were not all read)"
                 )
         unread_note = " Not read: {}.".format("; ".join(unread[:5])) if unread else ""
@@ -22925,7 +23026,8 @@ def check_guardrail_grounding_score_evidence(
             elif leg_scan["capped"]:
                 unjudged.append(
                     f"records {what} in {log_group} past the first "
-                    f"{leg_scan['read']} ({cap}; those logged from "
+                    f"{leg_scan['read']} ({leg_scan.get('cap') or cap}; those "
+                    "logged from "
                     f"{leg_scan['unread_from']} on were not all read)"
                 )
         joined = _converse_call_guardrails(
@@ -22982,8 +23084,8 @@ def check_guardrail_grounding_score_evidence(
                 0,
                 "{} untagged guarded InvokeModel call(s) were not matched to "
                 "CloudTrail within the LookupEvents page cap ({} pages per "
-                "operation, {} per region run), so their guardrail is not "
-                "known: {}".format(
+                "operation, {} per region run) or before the invocation "
+                "deadline, so their guardrail is not known: {}".format(
                     len(invoke_joins["capped"]),
                     GROUNDING_JOIN_MAX_PAGES,
                     GROUNDING_JOIN_BUDGET_PAGES,
@@ -23092,10 +23194,9 @@ def check_guardrail_grounding_score_evidence(
                 "the caller enables the guardrail trace.".format(
                     log_group,
                     scan["read"],
-                    (
-                        " (page cap reached)"
-                        if source["log_group"]
-                        else " (object cap reached)"
+                    " ({} reached)".format(
+                        scan.get("cap")
+                        or ("page cap" if source["log_group"] else "object cap")
                     )
                     if scan["capped"]
                     else "",
@@ -30048,7 +30149,10 @@ def _inference_profiles_called(api_region: str = "") -> Dict[str, Any]:
                 continue
             if result["truncated"]:
                 gaps.append(
-                    f"{event_name} in {source_region} past the "
+                    f"{event_name} in {source_region}, whose lookup stopped "
+                    f"{DEADLINE_STOP}"
+                    if result.get("deadline")
+                    else f"{event_name} in {source_region} past the "
                     f"{LLM_JACKING_MAX_PAGES_PER_ACTION}-page cap"
                 )
             for event in result["events"]:
@@ -30840,7 +30944,10 @@ def check_bedrock_inference_region_evidence(
                     continue
                 if result["truncated"]:
                     read_gaps.append(
-                        f"{event_name} in {source_region} was read to the "
+                        f"{event_name} in {source_region} was read only until "
+                        f"its lookup stopped {DEADLINE_STOP}"
+                        if result.get("deadline")
+                        else f"{event_name} in {source_region} was read to the "
                         f"{LLM_JACKING_MAX_PAGES_PER_ACTION}-page cap only"
                     )
                 for event in result["events"]:
@@ -31253,7 +31360,11 @@ def check_bedrock_custom_model_sharing(region: str = "") -> Dict[str, Any]:
         unbounded_models = set()
         shared = []
         unread = []
+        policies_read = 0
         for model in owned[:MAX_CUSTOM_MODEL_POLICY_READS]:
+            if _deadline_reached():
+                break
+            policies_read += 1
             name = model.get("modelName") or model.get("modelArn")
             try:
                 response = bedrock_client.get_resource_policy(
@@ -31276,6 +31387,15 @@ def check_bedrock_custom_model_sharing(region: str = "") -> Dict[str, Any]:
                 unbounded_models.add(name)
             unbounded.extend(f"{name}: {text}" for text in observed["unbounded"])
             shared.extend(f"{name}: {text}" for text in observed["shared"])
+        if policies_read < len(owned[:MAX_CUSTOM_MODEL_POLICY_READS]):
+            unread.append(
+                "{} model(s) from {} on, whose reads stopped {}".format(
+                    len(owned[:MAX_CUSTOM_MODEL_POLICY_READS]) - policies_read,
+                    owned[policies_read].get("modelName")
+                    or owned[policies_read].get("modelArn"),
+                    DEADLINE_STOP,
+                )
+            )
         if len(owned) > MAX_CUSTOM_MODEL_POLICY_READS:
             unread.append(
                 "{} model(s) past the {}-policy cap".format(
@@ -35730,19 +35850,24 @@ def _source_object_listing(
                 Bucket=bucket, Prefix=prefix
             ):
                 pages += 1
-                if (
+                capped = (
                     pages > REDACTION_SOURCE_LIST_PAGE_CAP
                     or budget["pages"] >= SOURCE_LISTING_BUDGET_PAGES
-                ):
+                )
+                if capped or _deadline_reached():
                     stopped = f"after key {items[-1][0]}" if items else "before any key"
+                    limit = (
+                        f"at the cap of {REDACTION_SOURCE_LIST_PAGE_CAP} "
+                        "ListObjectsV2 pages per source and "
+                        f"{SOURCE_LISTING_BUDGET_PAGES} per region run"
+                        if capped
+                        else DEADLINE_STOP
+                    )
                     return {
                         "items": items,
                         "error": (
-                            f"the listing of s3://{bucket} stopped {stopped}, at "
-                            f"the cap of {REDACTION_SOURCE_LIST_PAGE_CAP} "
-                            "ListObjectsV2 pages per source and "
-                            f"{SOURCE_LISTING_BUDGET_PAGES} per region run, so the "
-                            "objects past it were not read"
+                            f"the listing of s3://{bucket} stopped {stopped}, "
+                            f"{limit}, so the objects past it were not read"
                         ),
                     }
                 budget["pages"] += 1
@@ -35779,7 +35904,11 @@ def _metadata_sidecar_gaps(
     empty, unread = [], []
     room = max(0, METADATA_SIDECAR_READ_CAP - budget["sidecars"])
     budget["sidecars"] += min(room, len(present))
+    sidecars_read = 0
     for key in present[:room]:
+        if _deadline_reached():
+            break
+        sidecars_read += 1
         sidecar = key + METADATA_SIDECAR_SUFFIX
         try:
             body = client.get_object(Bucket=bucket, Key=sidecar)["Body"].read()
@@ -35793,6 +35922,12 @@ def _metadata_sidecar_gaps(
             attributes = None
         if not isinstance(attributes, dict) or not attributes:
             empty.append(sidecar)
+    if sidecars_read < len(present[:room]):
+        unread.append(
+            f"{len(present[:room]) - sidecars_read} sidecar(s) from "
+            f"{present[sidecars_read]}{METADATA_SIDECAR_SUFFIX} on, whose reads "
+            f"stopped {DEADLINE_STOP}"
+        )
     if len(present) > room:
         unread.append(
             f"{len(present) - room} sidecar(s) from "
@@ -37010,10 +37145,14 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
             )
         )
     described = set(unsearched[:MAX_SAGEMAKER_TRAINING_JOB_READS])
+    stopped = []
     for name in names:
         if name in searched:
             detail = searched[name]
         elif name not in described:
+            continue
+        elif _deadline_reached():
+            stopped.append(name)
             continue
         else:
             try:
@@ -37050,6 +37189,12 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
                         "started": detail.get("CreationTime"),
                     }
                 )
+    if stopped:
+        errors.append(
+            f"{len(stopped)} SageMaker training job(s) from '{stopped[0]}' on were "
+            "not read with sagemaker:DescribeTrainingJob, whose reads stopped "
+            f"{DEADLINE_STOP}"
+        )
     return {"locations": locations, "errors": errors}
 
 
@@ -37157,8 +37302,12 @@ def _sagemaker_batch_job_locations(region: str = "") -> Dict[str, Any]:
                 )
             )
         read = undescribed[:MAX_SAGEMAKER_TRAINING_JOB_READS]
+        stopped = []
         for job in [job for job in jobs if job.get(name_key) in held] + read:
             name = job.get(name_key) or "unnamed"
+            if not held.get(name) and _deadline_reached():
+                stopped.append(name)
+                continue
             try:
                 detail = held.get(name) or getattr(client, describe)(**{name_key: name})
             except (ClientError, BotoCoreError) as error:
@@ -37209,6 +37358,11 @@ def _sagemaker_batch_job_locations(region: str = "") -> Dict[str, Any]:
                             f"the {role} of SageMaker {kind} job '{name}'",
                         )
                     )
+        if stopped:
+            errors.append(
+                f"{len(stopped)} {kind} job(s) from '{stopped[0]}' on were not read "
+                f"with sagemaker:{actions[1]}, whose reads stopped {DEADLINE_STOP}"
+            )
     return {"locations": locations, "errors": errors}
 
 
@@ -37331,8 +37485,12 @@ def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
                 f", and {rest} more" if rest > 0 else "",
             )
         )
+    stopped = []
     for job in jobs[:MAX_EVALUATION_JOB_READS]:
         name = job.get("jobName") or job.get("jobArn") or "unnamed"
+        if _deadline_reached():
+            stopped.append(name)
+            continue
         try:
             detail = client.get_evaluation_job(jobIdentifier=job.get("jobArn"))
         except (ClientError, BotoCoreError) as error:
@@ -37357,6 +37515,17 @@ def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
                 locations.append(
                     (_s3_uri_bucket(uri), f"the {role} of evaluation job '{name}'")
                 )
+    if stopped:
+        rest = len(stopped) - EVALUATION_JOBS_NAMED_PAST_CAP
+        errors.append(
+            "{} evaluation job(s) were not read with bedrock:GetEvaluationJob, "
+            "whose reads stopped {}: {}{}".format(
+                len(stopped),
+                DEADLINE_STOP,
+                ", ".join(stopped[:EVALUATION_JOBS_NAMED_PAST_CAP]),
+                f", and {rest} more" if rest > 0 else "",
+            )
+        )
     return {"locations": locations, "errors": errors}
 
 
@@ -40143,6 +40312,12 @@ def _enclave_attestation_events(cloudtrail_client: Any, key_arn: str) -> Dict[st
     error = f"events past the first {ENCLAVE_EVENT_MAX_PAGES} page(s) were not read"
     try:
         for _ in range(ENCLAVE_EVENT_MAX_PAGES):
+            if _deadline_reached():
+                error = (
+                    f"events past the first {read} were not read: the lookup "
+                    f"stopped {DEADLINE_STOP}"
+                )
+                break
             response = cloudtrail_client.lookup_events(**request)
             for event in response.get("Events") or []:
                 read += 1
@@ -40500,6 +40675,8 @@ def _llm_jacking_lookup(cloudtrail_client, event_name: str, start_time) -> Dict:
         "MaxResults": LOOKUP_EVENTS_PAGE_SIZE,
     }
     for _ in range(LLM_JACKING_MAX_PAGES_PER_ACTION):
+        if _deadline_reached():
+            return {"events": events, "truncated": True, "deadline": True}
         response = cloudtrail_client.lookup_events(**request)
         events.extend(response.get("Events", []))
         next_token = response.get("NextToken")
@@ -40567,7 +40744,9 @@ def check_bedrock_llm_jacking_activity(region: str = "") -> Dict[str, Any]:
                 continue
             if result["truncated"]:
                 unseen[event_name] = (
-                    f"more than {LLM_JACKING_MAX_PAGES_PER_ACTION} pages"
+                    f"lookup stopped {DEADLINE_STOP}"
+                    if result.get("deadline")
+                    else f"more than {LLM_JACKING_MAX_PAGES_PER_ACTION} pages"
                 )
             for event in result["events"]:
                 try:
@@ -43796,6 +43975,13 @@ def lambda_handler(event, context):
     """
     Main Lambda handler
     """
+    global _DEADLINE
+    remaining = (
+        context.get_remaining_time_in_millis() / 1000
+        if context is not None
+        else LAMBDA_TIMEOUT_SECONDS
+    )
+    _DEADLINE = time.monotonic() + remaining - DEADLINE_MARGIN_SECONDS
     logger.info("Starting Bedrock security assessment")
     all_findings = []
     _AI_DATA_PATH_BUCKETS_BY_REGION.clear()

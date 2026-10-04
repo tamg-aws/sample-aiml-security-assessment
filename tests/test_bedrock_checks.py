@@ -13,6 +13,7 @@ import contextlib
 import gzip
 import io
 import json
+import re
 import time
 import sys
 import os
@@ -54,6 +55,15 @@ def _fresh_data_path_buckets():
     bedrock_app._AI_DATA_PATH_BUCKETS_BY_REGION.clear()
     yield
     bedrock_app._AI_DATA_PATH_BUCKETS_BY_REGION.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_invocation_deadline():
+    """A test calls a check with no handler before it, so no deadline is set,
+    and one a handler test set does not carry into the next test."""
+    bedrock_app._DEADLINE = None
+    yield
+    bedrock_app._DEADLINE = None
 
 
 @pytest.fixture(autouse=True)
@@ -46930,8 +46940,8 @@ class TestInvocationLogGuardrailEvidence:
         assert (
             "10 untagged guarded InvokeModel call(s) were not matched to CloudTrail "
             "within the LookupEvents page cap (2 pages per operation, 100 per "
-            "region run), so their guardrail is not known: req-20 (InvokeModel "
-            "anthropic.test)"
+            "region run) or before the invocation deadline, so their guardrail "
+            "is not known: req-20 (InvokeModel anthropic.test)"
         ) in detail
         assert len(self.trail_requests) == 2
 
@@ -47131,8 +47141,9 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["N/A"]
         assert (
             "2 Converse call(s) not matched to CloudTrail within the LookupEvents "
-            "page cap (50 pages per operation, 100 per region run), so whether a "
-            "guardrail ran is not known: req-c-a (Converse anthropic.test), "
+            "page cap (50 pages per operation, 100 per region run) or before the "
+            "invocation deadline, so whether a guardrail ran is not known: req-c-a "
+            "(Converse anthropic.test), "
             "req-c-b (Converse anthropic.test)"
         ) in rows[0]["Finding_Details"]
         assert self.trail_requests == []
@@ -49262,3 +49273,502 @@ def test_handler_does_not_reuse_a_previous_invocations_data_path():
         )
     held = bedrock_app._AI_DATA_PATH_BUCKETS_BY_REGION
     assert all("stale" not in entry["buckets"] for entry in held.values())
+
+
+class TestInvocationDeadline:
+    """Every capped read loop also stops DEADLINE_MARGIN_SECONDS before the
+    Lambda timeout, and a read it stops is held at N/A like a read past its cap."""
+
+    @staticmethod
+    def _expire():
+        bedrock_app._DEADLINE = time.monotonic() - 1
+
+    @staticmethod
+    def _run_handler(context):
+        test_client = MagicMock()
+        test_client.get_model_invocation_logging_configuration.side_effect = (
+            _make_client_error("AccessDeniedException")
+        )
+        with (
+            patch.object(bedrock_app.boto3, "client", return_value=test_client),
+            patch.object(bedrock_app, "get_permissions_cache", return_value=None),
+            patch.object(bedrock_app, "generate_csv_report", return_value="csv"),
+            patch.object(bedrock_app, "write_to_s3", return_value="s3://b/r.csv"),
+            patch.object(
+                bedrock_app,
+                "_read_ai_data_path_buckets",
+                return_value={"buckets": {}, "errors": []},
+            ),
+        ):
+            bedrock_app.lambda_handler(
+                _bedrock_event(region="us-east-1", region_index=0), context
+            )
+
+    def test_no_deadline_is_never_reached_and_a_past_one_is(self):
+        assert bedrock_app._deadline_reached() is False
+        bedrock_app._DEADLINE = time.monotonic() + 100
+        assert bedrock_app._deadline_reached() is False
+        self._expire()
+        assert bedrock_app._deadline_reached() is True
+
+    def test_the_handler_sets_the_deadline_from_the_remaining_time(self):
+        context = MagicMock()
+        context.get_remaining_time_in_millis.return_value = 300_000
+        before = time.monotonic()
+        self._run_handler(context)
+        after = time.monotonic()
+        margin = bedrock_app.DEADLINE_MARGIN_SECONDS
+        assert before + 300 - margin <= bedrock_app._DEADLINE <= after + 300 - margin
+
+    def test_with_no_context_the_deadline_is_the_configured_timeout(self):
+        before = time.monotonic()
+        self._run_handler(None)
+        after = time.monotonic()
+        budget = (
+            bedrock_app.LAMBDA_TIMEOUT_SECONDS - bedrock_app.DEADLINE_MARGIN_SECONDS
+        )
+        assert before + budget <= bedrock_app._DEADLINE <= after + budget
+
+    def test_a_fresh_invocation_resets_a_spent_deadline(self):
+        self._expire()
+        context = MagicMock()
+        context.get_remaining_time_in_millis.return_value = 600_000
+        self._run_handler(context)
+        assert bedrock_app._deadline_reached() is False
+
+    def test_an_invocation_with_less_than_the_margin_left_starts_spent(self):
+        bedrock_app._DEADLINE = time.monotonic() + 1000
+        context = MagicMock()
+        context.get_remaining_time_in_millis.return_value = (
+            bedrock_app.DEADLINE_MARGIN_SECONDS * 1000 - 1
+        )
+        self._run_handler(context)
+        assert bedrock_app._deadline_reached() is True
+
+    @pytest.mark.parametrize(
+        "template", ["template.yaml", "template-multi-account.yaml"]
+    )
+    def test_the_configured_timeout_is_the_functions_timeout(self, template):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "aiml-security-assessment", template
+        )
+        with open(path) as handle:
+            text = handle.read()
+        block = text[text.index("\n  BedrockSecurityAssessmentFunction:\n") :]
+        timeout = re.search(r"\n      Timeout: (\d+)", block)
+        assert int(timeout.group(1)) == bedrock_app.LAMBDA_TIMEOUT_SECONDS
+
+    def _llm_jacking(self, deadline_after_calls=None, truncated=False):
+        calls = []
+
+        def lookup_events(**kwargs):
+            calls.append(kwargs["LookupAttributes"][0]["AttributeValue"])
+            if deadline_after_calls is not None and len(calls) >= deadline_after_calls:
+                self._expire()
+            response = {"Events": []}
+            if truncated:
+                response["NextToken"] = "more"
+            return response
+
+        cloudtrail = MagicMock()
+        cloudtrail.lookup_events.side_effect = lookup_events
+        with patch("boto3.client", return_value=cloudtrail):
+            result = bedrock_app.check_bedrock_llm_jacking_activity(region="us-east-1")
+        return extract_csv_data(result), calls
+
+    def test_br56_stops_at_the_deadline_and_holds_na_naming_each_action(self):
+        rows, calls = self._llm_jacking(deadline_after_calls=1)
+        assert len(calls) == 1
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        second = bedrock_app.LLM_JACKING_ACTIONS[1]
+        assert f"{second} (lookup stopped {bedrock_app.DEADLINE_STOP})" in detail
+        assert "pages)" not in detail
+
+    def test_br56_page_cap_still_applies_when_time_remains(self):
+        bedrock_app._DEADLINE = time.monotonic() + 1000
+        rows, calls = self._llm_jacking(truncated=True)
+        actions = bedrock_app.LLM_JACKING_ACTIONS
+        assert len(calls) == len(actions) * bedrock_app.LLM_JACKING_MAX_PAGES_PER_ACTION
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert f"{actions[0]} (more than 5 pages)" in detail
+        assert "invocation deadline" not in detail
+
+    def test_the_log_deletion_search_stops_at_the_deadline(self):
+        logs = MagicMock()
+        self._expire()
+        with patch.object(bedrock_app.boto3, "client", return_value=logs):
+            result = bedrock_app._log_group_deletion_evidence("g", 30, "us-east-1")
+        logs.filter_log_events.assert_not_called()
+        assert result["overdue"] is None and result["evidence"] == ""
+        assert result["error"].endswith(
+            f"the search stopped {bedrock_app.DEADLINE_STOP}"
+        )
+
+    def test_the_log_deletion_search_keeps_its_page_cap_when_time_remains(self):
+        bedrock_app._DEADLINE = time.monotonic() + 1000
+        logs = MagicMock()
+        logs.filter_log_events.return_value = {"events": [], "nextToken": "t"}
+        with patch.object(bedrock_app.boto3, "client", return_value=logs):
+            result = bedrock_app._log_group_deletion_evidence("g", 30, "us-east-1")
+        assert logs.filter_log_events.call_count == bedrock_app.LOG_DELETION_MAX_PAGES
+        assert result["error"].endswith(
+            f"after {bedrock_app.LOG_DELETION_MAX_PAGES} pages"
+        )
+
+    def test_the_oldest_object_listing_stops_mid_walk_at_the_deadline(self):
+        s3 = MagicMock()
+
+        def list_objects_v2(**kwargs):
+            self._expire()
+            return {
+                "Contents": [],
+                "CommonPrefixes": [{"Prefix": "AWSLogs/a/"}, {"Prefix": "AWSLogs/b/"}],
+                "IsTruncated": False,
+            }
+
+        s3.list_objects_v2.side_effect = list_objects_v2
+        result = bedrock_app._oldest_object_under(s3, "bucket", "AWSLogs/")
+        assert s3.list_objects_v2.call_count == 1
+        assert result["error"] == (
+            "the listing under s3://bucket/AWSLogs/ stopped after 1 ListObjectsV2 "
+            f"calls {bedrock_app.DEADLINE_STOP}"
+        )
+
+    def test_the_cloudwatch_invocation_scan_reports_the_deadline_as_its_cap(self):
+        logs = MagicMock()
+
+        def filter_log_events(**kwargs):
+            self._expire()
+            return {"events": [], "nextToken": "t"}
+
+        logs.filter_log_events.side_effect = filter_log_events
+        with patch.object(bedrock_app.boto3, "client", return_value=logs):
+            scan = bedrock_app._scan_invocation_log(
+                "us-east-1", "group", "pattern", lambda record: None
+            )
+        assert logs.filter_log_events.call_count == 1
+        assert scan["capped"] is True
+        assert scan["cap"] == "invocation deadline"
+
+    def test_the_cloudwatch_invocation_scan_names_its_page_cap(self):
+        bedrock_app._DEADLINE = time.monotonic() + 1000
+        logs = MagicMock()
+        logs.filter_log_events.return_value = {"events": [], "nextToken": "t"}
+        with patch.object(bedrock_app.boto3, "client", return_value=logs):
+            scan = bedrock_app._scan_invocation_log(
+                "us-east-1", "group", "pattern", lambda record: None
+            )
+        assert logs.filter_log_events.call_count == (
+            bedrock_app.INVOCATION_LOG_SCAN_MAX_PAGES
+        )
+        assert (scan["capped"], scan["cap"]) == (True, "page cap")
+
+    def test_a_join_the_deadline_stops_holds_its_calls_as_capped(self):
+        trail = MagicMock()
+        self._expire()
+        joins = {"resolved": {}, "pages": 0}
+        call = {
+            "label": "req-1 (InvokeModel m)",
+            "request_id": "req-1",
+            "operation": "InvokeModel",
+            "time": "2026-10-04T13:00:00Z",
+        }
+        with patch.object(bedrock_app.boto3, "client", return_value=trail):
+            joined = bedrock_app._invoke_call_guardrails("us-east-1", [call], joins)
+        trail.lookup_events.assert_not_called()
+        assert joined == {"resolved": {}, "capped": ["req-1 (InvokeModel m)"]}
+        assert joins["pages"] == 0
+
+    def test_br07_stops_at_the_deadline_and_holds_na(self):
+        trail = MagicMock()
+        self._expire()
+        with patch.object(bedrock_app.boto3, "client", return_value=trail):
+            references = bedrock_app._runtime_prompt_references("us-east-1")
+        trail.lookup_events.assert_not_called()
+        assert references["deadline"] is True
+        assert len(references["capped"]) == len(bedrock_app.INFERENCE_TRACE_OPERATIONS)
+        (row,) = bedrock_app._runtime_prompt_version_findings(references, "us-east-1")
+        assert row["Status"] == "N/A"
+        assert (
+            f"the lookup stopped {bedrock_app.DEADLINE_STOP} or"
+            in (row["Finding_Details"])
+        )
+
+    def test_evaluation_jobs_past_the_deadline_are_named(self):
+        bedrock = MagicMock()
+        bedrock.list_evaluation_jobs.return_value = {
+            "jobSummaries": [
+                {"jobName": "new", "jobArn": "arn:new"},
+                {"jobName": "old", "jobArn": "arn:old"},
+            ]
+        }
+
+        def get_evaluation_job(**kwargs):
+            self._expire()
+            return {}
+
+        bedrock.get_evaluation_job.side_effect = get_evaluation_job
+        with patch.object(bedrock_app.boto3, "client", return_value=bedrock):
+            found = bedrock_app._evaluation_job_locations("us-east-1")
+        assert bedrock.get_evaluation_job.call_count == 1
+        assert found["errors"] == [
+            "1 evaluation job(s) were not read with bedrock:GetEvaluationJob, whose "
+            f"reads stopped {bedrock_app.DEADLINE_STOP}: old"
+        ]
+
+    def test_metadata_sidecars_past_the_deadline_are_counted(self):
+        s3 = MagicMock()
+
+        def get_object(**kwargs):
+            self._expire()
+            return {"Body": io.BytesIO(b'{"metadataAttributes": {"a": 1}}')}
+
+        s3.get_object.side_effect = get_object
+        items = [
+            (key, None)
+            for key in ("a.txt", "a.txt.metadata.json", "b.txt", "b.txt.metadata.json")
+        ]
+        budget = {"pages": 0, "sidecars": 0}
+        with patch.object(bedrock_app.boto3, "client", return_value=s3):
+            gaps = bedrock_app._metadata_sidecar_gaps("us-east-1", "kb", items, budget)
+        assert s3.get_object.call_count == 1
+        assert gaps["unread"] == [
+            "1 sidecar(s) from b.txt.metadata.json on, whose reads stopped "
+            f"{bedrock_app.DEADLINE_STOP}"
+        ]
+
+    def test_replication_head_reads_stop_at_the_deadline_as_capped(self):
+        s3 = MagicMock()
+        s3.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": "k1"}, {"Key": "k2"}]}
+        ]
+
+        def head_object(**kwargs):
+            self._expire()
+            return {}
+
+        s3.head_object.side_effect = head_object
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        with patch.object(bedrock_app.boto3, "client", return_value=sts):
+            held = bedrock_app._replication_held_log_objects(s3, "logs", None)
+        assert s3.head_object.call_count == 1
+        assert (held["read"], held["capped"]) == (1, True)
+        assert held["error"] == (
+            "objects under s3://logs/AWSLogs/123456789012/BedrockModelInvocationLogs/ "
+            f"past the first 1 were not read: HeadObject stopped "
+            f"{bedrock_app.DEADLINE_STOP}"
+        )
+
+    def test_the_noncurrent_version_walk_stops_at_the_deadline(self):
+        s3 = MagicMock()
+        self._expire()
+        found = bedrock_app._oldest_noncurrent_version_under(s3, "b", "AWSLogs/")
+        s3.list_object_versions.assert_not_called()
+        assert found == {
+            "oldest": None,
+            "error": "the version listing under s3://b/AWSLogs/ stopped after 0 "
+            f"ListObjectVersions calls {bedrock_app.DEADLINE_STOP}",
+        }
+
+    def test_br10_guardrail_versions_past_the_deadline_hold_the_value_unread(self):
+        bedrock = MagicMock()
+        bedrock.list_guardrails.return_value = {
+            "guardrails": [{"version": "1"}, {"version": "2"}]
+        }
+
+        def get_guardrail(**kwargs):
+            self._expire()
+            return {}
+
+        bedrock.get_guardrail.side_effect = get_guardrail
+        reading = bedrock_app._read_guardrail_directions(
+            "gr-1", "us-east-1", {"us-east-1": bedrock}
+        )
+        assert bedrock.get_guardrail.call_count == 1
+        assert reading["unread"] == (
+            f"the read of its versions from 2 on stopped {bedrock_app.DEADLINE_STOP}"
+        )
+
+    def test_the_redaction_source_listing_stops_at_the_deadline(self):
+        s3 = MagicMock()
+        s3.get_paginator.return_value.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": "a", "LastModified": _dt(2026, 1, 1, tzinfo=_tz.utc)}
+                ]
+            }
+        ]
+        self._expire()
+        with patch.object(bedrock_app.boto3, "client", return_value=s3):
+            listing = bedrock_app._objects_written_after(
+                "us-east-1", "src", [""], _dt(2026, 1, 2, tzinfo=_tz.utc)
+            )
+        assert listing["listed"] == 0
+        assert listing["error"] == (
+            f"the listing of s3://src stopped after 0 object(s) "
+            f"{bedrock_app.DEADLINE_STOP}, so not every object was read"
+        )
+
+    def test_the_s3_invocation_scan_reports_the_deadline_as_its_cap(self):
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {
+            "Contents": [{"Key": "root/2026/10/04/12/a.json.gz"}],
+            "IsTruncated": False,
+        }
+        self._expire()
+        with patch.object(bedrock_app.boto3, "client", return_value=s3):
+            (scan,) = bedrock_app._scan_invocation_log_s3(
+                "us-east-1",
+                {"bucket": "b", "root": "root/"},
+                [(lambda line, record: True, lambda record: None)],
+            )
+        s3.get_object.assert_not_called()
+        assert (scan["capped"], scan["cap"]) == (True, "invocation deadline")
+
+    def test_the_br46_listing_names_the_deadline_and_not_its_budget(self):
+        s3 = MagicMock()
+        s3.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": "a"}]},
+            {"Contents": [{"Key": "b"}]},
+        ]
+        budget = {"pages": 0, "sidecars": 0}
+
+        def pages(**kwargs):
+            yield {"Contents": [{"Key": "a"}]}
+            self._expire()
+            yield {"Contents": [{"Key": "b"}]}
+
+        s3.get_paginator.return_value.paginate.side_effect = pages
+        with patch.object(bedrock_app.boto3, "client", return_value=s3):
+            listing = bedrock_app._source_object_listing(
+                "us-east-1", "kb", [""], budget
+            )
+        assert [key for key, _ in listing["items"]] == ["a"]
+        assert listing["error"] == (
+            f"the listing of s3://kb stopped after key a, {bedrock_app.DEADLINE_STOP}, "
+            "so the objects past it were not read"
+        )
+
+    def test_training_jobs_the_deadline_stops_are_named(self):
+        sagemaker = MagicMock()
+        sagemaker.search.return_value = {"Results": []}
+        sagemaker.list_training_jobs.return_value = {
+            "TrainingJobSummaries": [
+                {"TrainingJobName": "new"},
+                {"TrainingJobName": "old"},
+            ]
+        }
+
+        def describe(**kwargs):
+            self._expire()
+            return {}
+
+        sagemaker.describe_training_job.side_effect = describe
+        with patch.object(bedrock_app.boto3, "client", return_value=sagemaker):
+            found = bedrock_app._sagemaker_training_locations("us-east-1")
+        assert sagemaker.describe_training_job.call_count == 1
+        assert found["errors"] == [
+            "1 SageMaker training job(s) from 'old' on were not read with "
+            "sagemaker:DescribeTrainingJob, whose reads stopped "
+            f"{bedrock_app.DEADLINE_STOP}"
+        ]
+
+    def test_transform_and_processing_jobs_the_deadline_stops_are_named(self):
+        sagemaker = MagicMock()
+        sagemaker.search.return_value = {"Results": []}
+        sagemaker.list_transform_jobs.return_value = {
+            "TransformJobSummaries": [{"TransformJobName": "t1"}]
+        }
+        sagemaker.list_processing_jobs.return_value = {
+            "ProcessingJobSummaries": [{"ProcessingJobName": "p1"}]
+        }
+        self._expire()
+        with patch.object(bedrock_app.boto3, "client", return_value=sagemaker):
+            found = bedrock_app._sagemaker_batch_job_locations("us-east-1")
+        sagemaker.describe_transform_job.assert_not_called()
+        sagemaker.describe_processing_job.assert_not_called()
+        assert found["errors"] == [
+            "1 transform job(s) from 't1' on were not read with "
+            f"sagemaker:DescribeTransformJob, whose reads stopped "
+            f"{bedrock_app.DEADLINE_STOP}",
+            "1 processing job(s) from 'p1' on were not read with "
+            f"sagemaker:DescribeProcessingJob, whose reads stopped "
+            f"{bedrock_app.DEADLINE_STOP}",
+        ]
+
+    def test_custom_model_policies_past_the_deadline_hold_na(self):
+        bedrock = MagicMock()
+        bedrock.get_paginator.return_value.paginate.return_value = [
+            {
+                "modelSummaries": [
+                    {"modelName": "m1", "modelArn": "arn:m1"},
+                    {"modelName": "m2", "modelArn": "arn:m2"},
+                ]
+            }
+        ]
+
+        def get_resource_policy(**kwargs):
+            self._expire()
+            return {"resourcePolicy": "{}"}
+
+        bedrock.get_resource_policy.side_effect = get_resource_policy
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {"bedrock": bedrock, "sts": sts}[
+                service
+            ],
+        ):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_custom_model_sharing(region="us-east-1")
+            )
+        assert bedrock.get_resource_policy.call_count == 1
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            f"1 model(s) from m2 on, whose reads stopped {bedrock_app.DEADLINE_STOP}"
+        ) in rows[0]["Finding_Details"]
+
+    def test_enclave_event_lookup_stops_at_the_deadline(self):
+        trail = MagicMock()
+
+        def lookup_events(**kwargs):
+            self._expire()
+            return {"Events": [{"CloudTrailEvent": "{}"}], "NextToken": "t"}
+
+        trail.lookup_events.side_effect = lookup_events
+        events = bedrock_app._enclave_attestation_events(trail, "arn:key")
+        assert trail.lookup_events.call_count == 1
+        assert events["error"] == (
+            "events past the first 1 were not read: the lookup stopped "
+            f"{bedrock_app.DEADLINE_STOP}"
+        )
+
+    def test_data_catalog_partitions_past_the_deadline_are_named(self):
+        glue = MagicMock()
+        glue.get_table.return_value = {
+            "Table": {
+                "DatabaseName": "db",
+                "Name": "t",
+                "PartitionKeys": [{"Name": "dt"}],
+                "StorageDescriptor": {"Location": "s3://b/t/"},
+            }
+        }
+
+        def pages(**kwargs):
+            self._expire()
+            yield {"Partitions": []}
+
+        glue.get_paginator.return_value.paginate.side_effect = pages
+        with patch.object(bedrock_app.boto3, "client", return_value=glue):
+            buckets, unread = bedrock_app._data_catalog_table_buckets(
+                ["db.t"], "us-east-1"
+            )
+        assert buckets == {}
+        assert unread == [
+            f"table 'db.t' has partitions from page 1 on, whose read stopped "
+            f"{bedrock_app.DEADLINE_STOP}, which were not all read"
+        ]

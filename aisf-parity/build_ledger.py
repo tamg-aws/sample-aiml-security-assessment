@@ -318,8 +318,9 @@ AI_SUBJECT_ROWS = [
         "is not ordered against each earlier ingestion, because Macie returns only "
         "lastRunTime, and which attribute names the classification is not judged. "
         "A region run reads at most 300 sidecars and 150 ListObjectsV2 pages, "
-        "budgets measured against the Lambda timeout, and a source past either is "
-        "N/A with a count",
+        "budgets measured against the Lambda timeout, and a source past either, "
+        "or one whose read stopped at the invocation deadline a fixed margin "
+        "before that timeout, is N/A with a count",
         [],
         3,
     ),
@@ -1664,7 +1665,9 @@ AI_SUBJECT_ROWS = [
         "location, so each is read with GetEvaluationJob to the newest 600: a live "
         "call took 0.079 s at the median and 0.188 s at the slowest, and the 5,000 "
         "job quota would take 940 s against the function's 600 s timeout. The jobs "
-        "past that cap are named. An unread job past any cap withholds "
+        "past that cap are named, as are the jobs whose reads stopped at the "
+        "invocation deadline a fixed margin before that timeout. An unread job past "
+        "any cap or the deadline withholds "
         "the Passed row, as does a failed read, since an unread bucket may accept "
         "plaintext",
         [],
