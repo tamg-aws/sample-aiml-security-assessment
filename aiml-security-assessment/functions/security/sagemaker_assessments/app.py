@@ -6,7 +6,7 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 import time
-from typing import Dict, List, Any, Optional, Iterator, Tuple
+from typing import Callable, Dict, List, Any, Optional, Iterator, Tuple
 from io import StringIO
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -4443,8 +4443,11 @@ def _environment_role_findings(
     return rows
 
 
-def _advanced_selector_management_coverage(selector: Dict[str, Any]) -> set:
-    """Return which of {"read", "write"} management events a selector records."""
+def _advanced_selector_management_coverage(
+    selector: Dict[str, Any], source: str = SAGEMAKER_EVENT_SOURCE
+) -> set:
+    """Return which of {"read", "write"} management events of source a selector
+    records."""
     fields = {
         str(field.get("Field")): field for field in selector.get("FieldSelectors") or []
     }
@@ -4461,9 +4464,9 @@ def _advanced_selector_management_coverage(selector: Dict[str, Any]) -> set:
         allowed = set(field) - {"Field"}
         if allowed - {"Equals", "NotEquals"}:
             return set()
-        if "Equals" in field and SAGEMAKER_EVENT_SOURCE not in field["Equals"]:
+        if "Equals" in field and source not in field["Equals"]:
             return set()
-        if SAGEMAKER_EVENT_SOURCE in (field.get("NotEquals") or []):
+        if source in (field.get("NotEquals") or []):
             return set()
     read_only = fields.get("readOnly")
     if read_only is None:
@@ -4476,15 +4479,16 @@ def _advanced_selector_management_coverage(selector: Dict[str, Any]) -> set:
     )
 
 
-def _selectors_record_sagemaker_management(selectors: Dict[str, Any]) -> bool:
-    """Return whether a trail's selectors record read and write SageMaker calls."""
+def _selectors_record_sagemaker_management(
+    selectors: Dict[str, Any], source: str = SAGEMAKER_EVENT_SOURCE
+) -> bool:
+    """Return whether a trail's selectors record read and write management
+    calls of source, SageMaker's by default."""
     covered = set()
     for selector in selectors.get("EventSelectors") or []:
         if selector.get("IncludeManagementEvents") is not True:
             continue
-        if SAGEMAKER_EVENT_SOURCE in (
-            selector.get("ExcludeManagementEventSources") or []
-        ):
+        if source in (selector.get("ExcludeManagementEventSources") or []):
             continue
         read_write = selector.get("ReadWriteType")
         if read_write == "All":
@@ -4494,7 +4498,7 @@ def _selectors_record_sagemaker_management(selectors: Dict[str, Any]) -> bool:
         elif read_write == "WriteOnly":
             covered.add("write")
     for selector in selectors.get("AdvancedEventSelectors") or []:
-        covered |= _advanced_selector_management_coverage(selector)
+        covered |= _advanced_selector_management_coverage(selector, source)
     return covered == {"read", "write"}
 
 
@@ -18697,8 +18701,287 @@ LAMBDA_RUNTIME_TIER_REFERENCE = (
 )
 RUNTIME_UNSUPPORTED_NOTE = (
     "EKS on Fargate, EKS Hybrid Nodes and ECS Managed Instances are not "
-    "supported by Runtime Monitoring and fall to task- and network-level telemetry"
+    "supported by Runtime Monitoring and fall to task- and network-level "
+    "telemetry; tasks on ECS Managed Instances are judged on that tier under "
+    "'ECS Managed Instances Runtime Detection Tier'"
 )
+ECS_MANAGED_INSTANCES_TIER_FINDING = "ECS Managed Instances Runtime Detection Tier"
+ECS_MANAGED_INSTANCES_TIER_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ManagedInstances.html"
+)
+ECS_EVENT_SOURCE = "ecs.amazonaws.com"
+ECS_MANAGED_INSTANCES_TYPE = "MANAGED_INSTANCES"
+ECS_MANAGED_INSTANCES_NOTE = (
+    "Runtime Monitoring does not support ECS Managed Instances, so managed "
+    "process- and file-level behavioral detection does not exist for these "
+    "tasks; a self-managed sensor under the capacity provider's privileged "
+    "Linux capabilities is not read."
+)
+
+
+def _ecs_managed_instance_tasks(region: str) -> Dict[str, Any]:
+    """
+    Each ECS cluster with an ECS Managed Instances capacity provider
+    (DescribeCapacityProviders type MANAGED_INSTANCES): its provider names,
+    its running tasks placed on them, and how many running tasks it places
+    elsewhere. Clusters whose providers or tasks were not read are named in
+    "unread_clusters" and their reads in "unread".
+    """
+    managed: Dict[str, Any] = {"clusters": {}, "unread": [], "unread_clusters": []}
+    try:
+        ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
+        clusters = []
+        for page in ecs_client.get_paginator("list_clusters").paginate():
+            clusters.extend(page.get("clusterArns", []))
+    except Exception as error:
+        managed["unread"].append(
+            f"ecs:ListClusters ({get_assessment_error_label(error)})"
+        )
+        return managed
+    for cluster in clusters:
+        cluster_name = str(cluster).rsplit("/", 1)[-1]
+        try:
+            providers, token, seen = [], None, set()
+            while True:
+                response = ecs_client.describe_capacity_providers(
+                    cluster=cluster, **({"nextToken": token} if token else {})
+                )
+                providers.extend(response.get("capacityProviders") or [])
+                token = response.get("nextToken")
+                if not token:
+                    break
+                if token in seen:
+                    raise RuntimeError("DescribeCapacityProviders repeated a nextToken")
+                seen.add(token)
+            names = {
+                str(p.get("name"))
+                for p in providers
+                if p.get("type") == ECS_MANAGED_INSTANCES_TYPE
+                or p.get("managedInstancesProvider")
+            }
+            if not names:
+                continue
+            arns = []
+            for page in ecs_client.get_paginator("list_tasks").paginate(
+                cluster=cluster, desiredStatus="RUNNING"
+            ):
+                arns.extend(page.get("taskArns", []))
+            tasks, other = [], 0
+            for start in range(0, len(arns), 100):
+                response = ecs_client.describe_tasks(
+                    cluster=cluster, tasks=arns[start : start + 100]
+                )
+                for failure in response.get("failures") or []:
+                    managed["unread"].append(
+                        f"ECS task {failure.get('arn')} ({failure.get('reason')})"
+                    )
+                for task in response.get("tasks") or []:
+                    if (
+                        task.get("capacityProviderName") in names
+                        or task.get("launchType") == ECS_MANAGED_INSTANCES_TYPE
+                    ):
+                        tasks.append(task)
+                    else:
+                        other += 1
+        except Exception as error:
+            managed["unread"].append(
+                f"ECS cluster {cluster_name} capacity providers or tasks "
+                f"({get_assessment_error_label(error)})"
+            )
+            managed["unread_clusters"].append(cluster_name)
+            continue
+        managed["clusters"][cluster_name] = {
+            "providers": sorted(names),
+            "tasks": tasks,
+            "other_tasks": other,
+        }
+    return managed
+
+
+def _ecs_managed_instances_tier_findings(
+    region: str, managed: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    AIR-SLF-RT-04 for ECS Managed Instances, which Runtime Monitoring does not
+    support: each running task must run in awsvpc mode with an ACTIVE flow log
+    recording ALL traffic on its ENI, subnet or VPC, send every container's
+    logs to CloudWatch Logs through the awslogs driver, and run in a Region
+    whose ECS management events a logging trail or ENABLED event data store
+    records, read and write.
+    """
+    if not managed["clusters"] and not managed["unread"]:
+        return []
+    unread = list(managed["unread"])
+    problems: List[str] = []
+    tasks = [
+        (cluster, task)
+        for cluster, entry in sorted(managed["clusters"].items())
+        for task in entry["tasks"]
+    ]
+    interfaces: Dict[str, List[str]] = {}
+    for cluster, task in tasks:
+        label = _ecs_task_label(cluster, task)
+        task_subnets, task_interfaces = _ecs_task_interfaces(task)
+        if not task_interfaces:
+            problems.append(
+                f"{label} on capacity provider "
+                f"{task.get('capacityProviderName') or 'not reported'} has no "
+                "awsvpc network interface, so no task ENI flow log can record its "
+                "network calls"
+            )
+            continue
+        interfaces[label] = task_interfaces + task_subnets
+    if interfaces:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        subnet_ids = sorted(
+            {r for refs in interfaces.values() for r in refs if r.startswith("subnet-")}
+        )
+        subnet_vpc: Dict[str, str] = {}
+        flow_logs = []
+        try:
+            for batch in _chunked(subnet_ids, SUBNET_LOOKUP_BATCH_SIZE):
+                for page in ec2_client.get_paginator("describe_subnets").paginate(
+                    Filters=[{"Name": "subnet-id", "Values": batch}]
+                ):
+                    for subnet in page.get("Subnets", []):
+                        if subnet.get("SubnetId") and subnet.get("VpcId"):
+                            subnet_vpc[subnet["SubnetId"]] = subnet["VpcId"]
+            resource_ids = sorted(
+                {r for refs in interfaces.values() for r in refs}
+                | set(subnet_vpc.values())
+            )
+            for batch in _chunked(resource_ids, SUBNET_LOOKUP_BATCH_SIZE):
+                for page in ec2_client.get_paginator("describe_flow_logs").paginate(
+                    Filter=[{"Name": "resource-id", "Values": batch}]
+                ):
+                    flow_logs.extend(page.get("FlowLogs", []))
+        except Exception as error:
+            unread.append(
+                "the ECS Managed Instances task ENI flow logs "
+                f"({get_assessment_error_label(error)})"
+            )
+            interfaces = {}
+        recording = {
+            flow_log.get("ResourceId")
+            for flow_log in flow_logs
+            if flow_log.get("FlowLogStatus") == "ACTIVE"
+            and flow_log.get("TrafficType") == "ALL"
+        }
+        for label, refs in interfaces.items():
+            vpcs = {subnet_vpc[r] for r in refs if r in subnet_vpc}
+            if not any(r in recording for r in refs) and not vpcs & recording:
+                problems.append(
+                    f"{label} has no ACTIVE flow log recording ALL traffic on its "
+                    f"network interface {refs[0]}, its subnet or its VPC"
+                )
+    definitions: Dict[str, Optional[List[Dict[str, Any]]]] = {}
+    if tasks:
+        ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
+    for cluster, task in tasks:
+        arn = task.get("taskDefinitionArn")
+        if not arn:
+            unread.append(f"{_ecs_task_label(cluster, task)} (no taskDefinitionArn)")
+            continue
+        if arn not in definitions:
+            try:
+                definitions[arn] = (
+                    ecs_client.describe_task_definition(taskDefinition=arn).get(
+                        "taskDefinition"
+                    )
+                    or {}
+                ).get("containerDefinitions") or []
+            except Exception as error:
+                definitions[arn] = None
+                unread.append(
+                    f"task definition {arn} ({get_assessment_error_label(error)})"
+                )
+        if definitions[arn] is None:
+            continue
+        unlogged = [
+            str(container.get("name"))
+            for container in definitions[arn]
+            if (container.get("logConfiguration") or {}).get("logDriver") != "awslogs"
+        ]
+        if unlogged:
+            problems.append(
+                f"{_ecs_task_label(cluster, task)} runs container(s) "
+                f"{', '.join(unlogged[:5])} of {arn.rsplit('/', 1)[-1]} without the "
+                "awslogs log driver, so their output does not reach CloudWatch Logs"
+            )
+    events = {"credited": [], "gaps": [], "unread": []}
+    if tasks:
+        events = _event_coverage(
+            region,
+            lambda selectors: (
+                _selectors_record_sagemaker_management(selectors, ECS_EVENT_SOURCE),
+                [],
+            ),
+            "ECS management event",
+        )
+        unread.extend(events["unread"])
+        if not events["credited"] and not events["unread"]:
+            problems.append(
+                "no logging trail covering this Region, and no ENABLED event data "
+                "store read in any Region enabled for the account, records read "
+                "and write ECS management events"
+                + (f" ({'; '.join(events['gaps'][:5])})" if events["gaps"] else "")
+            )
+    rows = _capped_problem_rows(
+        "SM-38",
+        ECS_MANAGED_INSTANCES_TIER_FINDING,
+        [
+            f"ECS Managed Instances runtime tier: {problem}. "
+            + ECS_MANAGED_INSTANCES_NOTE
+            for problem in problems
+        ],
+        "Run tasks on ECS Managed Instances in awsvpc mode with an ACTIVE VPC Flow "
+        "Log recording ALL traffic on the task ENI's subnet or VPC, give every "
+        "container the awslogs log driver, and record read and write ECS "
+        "management events on a logging trail or event data store.",
+        ECS_MANAGED_INSTANCES_TIER_REFERENCE,
+        "Medium",
+        region,
+        "ECS Managed Instances runtime tier gaps",
+    )
+    clusters = ", ".join(sorted(managed["clusters"])[:5])
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-38",
+                ECS_MANAGED_INSTANCES_TIER_FINDING,
+                unread,
+                f"{len(tasks)} running task(s) on ECS Managed Instances were read.",
+                ECS_MANAGED_INSTANCES_TIER_REFERENCE,
+                region,
+            )
+        )
+    elif not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=ECS_MANAGED_INSTANCES_TIER_FINDING,
+                finding_details=(
+                    f"All {len(tasks)} running task(s) on the ECS Managed Instances "
+                    f"capacity of cluster(s) {clusters} run in awsvpc mode with an "
+                    "ACTIVE flow log recording ALL traffic on the task ENI, its "
+                    "subnet or its VPC, every container logs to CloudWatch Logs "
+                    "through the awslogs driver, and "
+                    f"{', '.join(events['credited'])} record(s) read and write ECS "
+                    f"management events. {ECS_MANAGED_INSTANCES_NOTE}"
+                    if tasks
+                    else f"ECS cluster(s) {clusters} have ECS Managed Instances "
+                    "capacity but no task runs on it."
+                ),
+                resolution="No action required",
+                reference=ECS_MANAGED_INSTANCES_TIER_REFERENCE,
+                severity="Medium" if tasks else "Informational",
+                status="Passed" if tasks else "N/A",
+                region=region,
+            )
+        )
+    return rows
+
+
 MICROVM_RUNTIME_TIER_FINDING = "Lambda MicroVM Runtime Detection Tier"
 MICROVM_RUNTIME_TIER_REFERENCE = (
     "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/"
@@ -18707,12 +18990,24 @@ MICROVM_RUNTIME_TIER_REFERENCE = (
 # The CloudTrail data-event table lists "API activity on
 # AWS::Lambda::MicrovmImage resources". Data events are not logged by default.
 MICROVM_DATA_EVENT_TYPE = "AWS::Lambda::MicrovmImage"
+# AIR-SLF-RT-04 pairs the Lambda tier with CloudTrail Invoke data events, which
+# CloudTrail records on the AWS::Lambda::Function resource type. A basic event
+# selector names every function with the value arn:<partition>:lambda.
+LAMBDA_DATA_EVENT_TYPE = "AWS::Lambda::Function"
+LAMBDA_EVERY_FUNCTION = re.compile(r"^arn:aws[a-z-]*:lambda$")
 
 
 def _runtime_coverage_findings(
-    region: str, detector_id: str, runtime: Dict[str, Any]
+    region: str,
+    detector_id: str,
+    runtime: Dict[str, Any],
+    managed: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Every covered resource HEALTHY, and every EKS and ECS cluster covered."""
+    """Every covered resource HEALTHY, and every EKS and ECS cluster covered.
+    An uncovered ECS cluster whose running tasks all run on ECS Managed
+    Instances capacity, which Runtime Monitoring does not support, is judged
+    on that tier's own row instead."""
+    managed = managed or {"clusters": {}, "unread_clusters": []}
     unread = []
     try:
         client = boto3.client("guardduty", config=boto3_config, region_name=region)
@@ -18904,8 +19199,21 @@ def _runtime_coverage_findings(
                 "Nodes, which Runtime Monitoring does not support"
             )
     for cluster in ecs_clusters:
-        if cluster not in covered["ECS"]:
+        if cluster in covered["ECS"]:
+            continue
+        if cluster in managed["unread_clusters"]:
+            unread.append(
+                f"ECS cluster {cluster}, whose ECS Managed Instances capacity was "
+                "not read"
+            )
+        elif cluster not in managed["clusters"]:
             problems.append(f"ECS cluster {cluster} has no Runtime Monitoring coverage")
+        elif managed["clusters"][cluster]["other_tasks"]:
+            problems.append(
+                f"ECS cluster {cluster} has no Runtime Monitoring coverage for its "
+                f"{managed['clusters'][cluster]['other_tasks']} running task(s) "
+                "outside its ECS Managed Instances capacity"
+            )
     for instance_id in instances:
         if instance_id not in covered["EC2"]:
             problems.append(
@@ -19101,8 +19409,10 @@ def _lambda_runtime_tier_findings(
     region: str, detail: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
     """
-    Lambda has no runtime agent, so the tier is GuardDuty Lambda Protection plus
-    Inspector Lambda standard and code scanning, read per function.
+    Lambda has no runtime agent, so the tier is GuardDuty Lambda Protection,
+    Inspector Lambda standard and code scanning, read per function, and,
+    where functions exist, CloudTrail data events on AWS::Lambda::Function,
+    which record each Invoke.
     """
     problems = []
     unread = []
@@ -19173,6 +19483,20 @@ def _lambda_runtime_tier_findings(
                         f"{status.get('statusCode') or 'not reported'} "
                         f"({status.get('reason') or 'no reason'})".replace("  ", " ")
                     )
+    events = {"credited": [], "gaps": [], "unread": []}
+    if functions:
+        events = _event_coverage(
+            region, _lambda_invoke_selectors, LAMBDA_DATA_EVENT_TYPE
+        )
+        unread.extend(events["unread"])
+        if not events["credited"] and not events["unread"]:
+            problems.append(
+                "no logging trail covering this Region, and no ENABLED event data "
+                "store read in any Region enabled for the account, records every "
+                f"{LAMBDA_DATA_EVENT_TYPE} data event, so no function's Invoke "
+                "calls are recorded"
+                + (f" ({'; '.join(events['gaps'][:5])})" if events["gaps"] else "")
+            )
     rows = []
     for problem in problems[:20]:
         rows.append(
@@ -19187,7 +19511,12 @@ def _lambda_runtime_tier_findings(
                     "Enable GuardDuty Lambda Protection and Inspector Lambda standard "
                     "and code scanning, and keep each function eligible (no "
                     "InspectorExclusion tag, invoked or updated within 90 days, no "
-                    "customer-managed KmsKeyArn unless the artifact is scanned in CI)."
+                    "customer-managed KmsKeyArn unless the artifact is scanned in CI). "
+                    "Record Lambda Invoke data events with an advanced event "
+                    f"selector of eventCategory Equals Data and resources.type "
+                    f"Equals {LAMBDA_DATA_EVENT_TYPE} and no other field, or a basic "
+                    "selector over arn:aws:lambda with ReadWriteType All, on a "
+                    "logging trail or event data store."
                 ),
                 reference=LAMBDA_RUNTIME_TIER_REFERENCE,
                 severity="Medium",
@@ -19231,6 +19560,13 @@ def _lambda_runtime_tier_findings(
                     "GuardDuty Lambda Protection and Inspector Lambda standard and "
                     f"code scanning are enabled, and all {len(functions)} function(s) "
                     "are ACTIVE in Inspector coverage."
+                    + (
+                        f" {', '.join(events['credited'])} record(s) every "
+                        f"{LAMBDA_DATA_EVENT_TYPE} data event, so each function's "
+                        "Invoke calls are recorded."
+                        if functions
+                        else ""
+                    )
                 ),
                 resolution="No action required",
                 reference=LAMBDA_RUNTIME_TIER_REFERENCE,
@@ -19242,10 +19578,12 @@ def _lambda_runtime_tier_findings(
     return rows
 
 
-def _microvm_data_event_selectors(selectors: Any) -> Tuple[bool, List[str]]:
+def _data_event_selectors(
+    selectors: Any, resource_type: str = MICROVM_DATA_EVENT_TYPE
+) -> Tuple[bool, List[str]]:
     """
-    Whether advanced event selectors record every AWS::Lambda::MicrovmImage data
-    event, and the fields that narrow any selector naming the type.
+    Whether advanced event selectors record every data event on resource_type,
+    and the fields that narrow any selector naming the type.
 
     A selector is credited only with eventCategory Equals Data, resources.type
     Equals the type and no other field: eventName, readOnly, resources.ARN and
@@ -19263,7 +19601,7 @@ def _microvm_data_event_selectors(selectors: Any) -> Tuple[bool, List[str]]:
         if "Data" not in ((fields.get("eventCategory") or {}).get("Equals") or []):
             continue
         types = (fields.get("resources.type") or {}).get("Equals") or []
-        if MICROVM_DATA_EVENT_TYPE not in types:
+        if resource_type not in types:
             continue
         extra = set(fields) - {"eventCategory", "resources.type"}
         if not extra:
@@ -19272,13 +19610,53 @@ def _microvm_data_event_selectors(selectors: Any) -> Tuple[bool, List[str]]:
     return False, sorted(narrowed)
 
 
-def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
+def _lambda_invoke_selectors(selectors: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Whether a trail's or event data store's selectors record every
+    AWS::Lambda::Function data event, Invoke among them, and what narrows the
+    ones that name the type. A basic selector is credited only with
+    ReadWriteType All and a DataResources value of arn:<partition>:lambda,
+    which CloudTrail documents as every function.
+    """
+    credited, narrowed = _data_event_selectors(
+        selectors.get("AdvancedEventSelectors"), LAMBDA_DATA_EVENT_TYPE
+    )
+    if credited:
+        return True, []
+    for selector in selectors.get("EventSelectors") or []:
+        if not isinstance(selector, dict):
+            continue
+        values = [
+            str(value)
+            for resource in selector.get("DataResources") or []
+            if isinstance(resource, dict)
+            and resource.get("Type") == LAMBDA_DATA_EVENT_TYPE
+            for value in resource.get("Values") or []
+        ]
+        if not values:
+            continue
+        every_function = any(LAMBDA_EVERY_FUNCTION.match(v) for v in values)
+        if every_function and selector.get("ReadWriteType", "All") == "All":
+            return True, []
+        if not every_function:
+            narrowed.append(f"DataResources values ({len(values)} named function(s))")
+        else:
+            narrowed.append(f"ReadWriteType {selector.get('ReadWriteType')}")
+    return False, sorted(set(narrowed))
+
+
+def _event_coverage(
+    region: str,
+    credit: Callable[[Dict[str, Any]], Tuple[bool, List[str]]],
+    subject: str,
+) -> Dict[str, List[str]]:
     """
     The logging trails covering this Region, then the ENABLED CloudTrail Lake
     event data stores (this Region's, and multi-Region stores homed in every
-    other Region enabled for the account), that record every
-    AWS::Lambda::MicrovmImage data event. Stores are read only when no trail
-    is credited.
+    other Region enabled for the account), whose selectors credit() accepts.
+    credit() takes a GetEventSelectors response or a GetEventDataStore detail
+    and returns whether it records the events, and the fields that narrow it.
+    Stores are read only when no trail is credited.
     """
     coverage: Dict[str, List[str]] = {"credited": [], "gaps": [], "unread": []}
     try:
@@ -19310,9 +19688,7 @@ def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
                 f"trail '{name}' ({get_assessment_error_label(error)})"
             )
             continue
-        credited, narrowed = _microvm_data_event_selectors(
-            selectors.get("AdvancedEventSelectors")
-        )
+        credited, narrowed = credit(selectors)
         if status.get("IsLogging") is not True:
             if credited:
                 coverage["gaps"].append(f"trail '{name}' is not logging")
@@ -19320,7 +19696,7 @@ def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
             coverage["credited"].append(f"trail '{name}'")
         elif narrowed:
             coverage["gaps"].append(
-                f"trail '{name}' narrows its {MICROVM_DATA_EVENT_TYPE} selector by "
+                f"trail '{name}' narrows its {subject} selector by "
                 f"{', '.join(narrowed)}"
             )
     if coverage["credited"]:
@@ -19378,9 +19754,7 @@ def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
                 continue
             if store_region != region and detail.get("MultiRegionEnabled") is not True:
                 continue
-            credited, narrowed = _microvm_data_event_selectors(
-                detail.get("AdvancedEventSelectors")
-            )
+            credited, narrowed = credit(detail)
             if detail.get("Status") != "ENABLED":
                 if credited:
                     coverage["gaps"].append(
@@ -19390,8 +19764,7 @@ def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
                 coverage["credited"].append(name)
             elif narrowed:
                 coverage["gaps"].append(
-                    f"{name} narrows its {MICROVM_DATA_EVENT_TYPE} selector by "
-                    f"{', '.join(narrowed)}"
+                    f"{name} narrows its {subject} selector by {', '.join(narrowed)}"
                 )
     return coverage
 
@@ -19552,7 +19925,13 @@ def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
     )
     problems.extend(logging_problems)
     unread.extend(logging_unread)
-    events = _microvm_data_event_coverage(region)
+    events = _event_coverage(
+        region,
+        lambda selectors: _data_event_selectors(
+            selectors.get("AdvancedEventSelectors")
+        ),
+        MICROVM_DATA_EVENT_TYPE,
+    )
     unread.extend(events["unread"])
     if not events["credited"] and not events["unread"]:
         problems.append(
@@ -19647,6 +20026,7 @@ def check_guardduty_runtime_monitoring_coverage(
             raise inventory["error"]
         detail = inventory.get("detail") or {}
         runtime = _guardduty_feature(detail, "RUNTIME_MONITORING")
+        managed = _ecs_managed_instance_tasks(region)
         if (
             inventory.get("detector_id")
             and detail.get("Status") == "ENABLED"
@@ -19654,11 +20034,16 @@ def check_guardduty_runtime_monitoring_coverage(
             and runtime.get("Status") == "ENABLED"
         ):
             findings["csv_data"].extend(
-                _runtime_coverage_findings(region, inventory["detector_id"], runtime)
+                _runtime_coverage_findings(
+                    region, inventory["detector_id"], runtime, managed
+                )
             )
         findings["csv_data"].extend(_eks_audit_log_findings(region, detail))
         findings["csv_data"].extend(_lambda_runtime_tier_findings(region, detail))
         findings["csv_data"].extend(_microvm_runtime_tier_findings(region))
+        findings["csv_data"].extend(
+            _ecs_managed_instances_tier_findings(region, managed)
+        )
     except Exception as error:
         findings["csv_data"].append(
             create_finding(
@@ -20926,11 +21311,20 @@ SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
 
 def _egress_workload_subnets(
     region: str,
-) -> Tuple[List[Tuple[str, str]], List[str], List[Dict[str, Any]]]:
+) -> Tuple[
+    List[Tuple[str, str]],
+    List[str],
+    List[Dict[str, Any]],
+    List[Tuple[str, List[str]]],
+    List[str],
+]:
     """(workload label, subnet id) for each ECS awsvpc service and standalone
     task, VPC Lambda, EKS cluster and Fargate profile and EC2 instance, the
-    unread lists, and every Lambda function version."""
+    unread lists, every Lambda function version, (label, security group ids)
+    for each EKS cluster, and the EKS reads that failed."""
     references = []
+    groups: List[Tuple[str, List[str]]] = []
+    eks_unread: List[str] = []
     services, unread = _ecs_services(region)
     for cluster_name, service in services:
         awsvpc = (service.get("networkConfiguration") or {}).get(
@@ -20968,19 +21362,25 @@ def _egress_workload_subnets(
             clusters.extend(page.get("clusters", []))
     except Exception as error:
         clusters = []
-        unread.append(f"eks:ListClusters ({get_assessment_error_label(error)})")
+        eks_unread.append(f"eks:ListClusters ({get_assessment_error_label(error)})")
     for cluster in clusters:
         try:
             detail = eks_client.describe_cluster(name=cluster).get("cluster") or {}
         except Exception as error:
-            unread.append(
+            eks_unread.append(
                 f"eks:DescribeCluster {cluster} ({get_assessment_error_label(error)})"
             )
             continue
-        for subnet_id in (detail.get("resourcesVpcConfig") or {}).get(
-            "subnetIds"
-        ) or []:
+        vpc_config = detail.get("resourcesVpcConfig") or {}
+        for subnet_id in vpc_config.get("subnetIds") or []:
             references.append((f"EKS cluster {cluster}", subnet_id))
+        # The cluster security group is on the control-plane ENIs and on every
+        # Fargate pod and managed node that names no group of its own.
+        cluster_groups = list(vpc_config.get("securityGroupIds") or [])
+        if vpc_config.get("clusterSecurityGroupId"):
+            cluster_groups.append(vpc_config["clusterSecurityGroupId"])
+        if cluster_groups:
+            groups.append((f"EKS cluster {cluster}", cluster_groups))
         try:
             profiles = []
             for page in eks_client.get_paginator("list_fargate_profiles").paginate(
@@ -21036,21 +21436,24 @@ def _egress_workload_subnets(
                         references.append((label, subnet_id))
     except Exception as error:
         unread.append(f"ec2:DescribeInstances ({get_assessment_error_label(error)})")
-    return references, unread, functions
+    unread.extend(eks_unread)
+    return references, unread, functions, groups, eks_unread
 
 
-# A training or processing job in any other status has no running instance, so
-# it has no egress to filter.
+# A training, processing or transform job in any other status has no running
+# instance, so it has no egress to filter.
 RUNNING_JOB_STATUSES = ("InProgress", "Stopping")
 
 
 def _sagemaker_egress_workloads(
     region: str,
-) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+) -> Tuple[List[Tuple[str, str]], List[str], List[str], List[Tuple[str, List[str]]]]:
     """
-    (workload label, subnet id) for each SageMaker endpoint, running training
-    and processing job, notebook instance and Studio domain in a VPC; the ones
-    with an internet path outside the customer VPC; and the unread lists.
+    (workload label, subnet id) for each SageMaker endpoint, running training,
+    processing and transform job, notebook instance and Studio domain in a
+    VPC; the ones with an internet path outside the customer VPC; the unread
+    lists; and (label, security group ids) for each endpoint, running job,
+    notebook instance and HyperPod instance group or cluster.
 
     A notebook with DirectInternetAccess other than Disabled, a domain whose
     AppNetworkAccessType is not VpcOnly, and an endpoint or job with no VPC
@@ -21060,6 +21463,7 @@ def _sagemaker_egress_workloads(
     references: List[Tuple[str, str]] = []
     open_paths: List[str] = []
     unread: List[str] = []
+    groups: List[Tuple[str, List[str]]] = []
     outside = (
         "reaches the internet through SageMaker's network, so no DNS Firewall "
         "rule group or Network Firewall route applies to that egress."
@@ -21076,6 +21480,9 @@ def _sagemaker_egress_workloads(
         label = f"SageMaker endpoint '{endpoint['name']}'"
         config = endpoint["config"]
         subnets = set((config.get("VpcConfig") or {}).get("Subnets") or [])
+        endpoint_groups = list(
+            (config.get("VpcConfig") or {}).get("SecurityGroupIds") or []
+        )
         isolated = [config.get("EnableNetworkIsolation") is True] * bool(
             endpoint["component_variants"]
         )
@@ -21095,8 +21502,15 @@ def _sagemaker_egress_workloads(
                 complete = False
                 continue
             subnets.update((model.get("VpcConfig") or {}).get("Subnets") or [])
+            endpoint_groups.extend(
+                g
+                for g in (model.get("VpcConfig") or {}).get("SecurityGroupIds") or []
+                if g not in endpoint_groups
+            )
             isolated.append(model.get("EnableNetworkIsolation") is True)
         references.extend((label, subnet) for subnet in sorted(subnets))
+        if endpoint_groups:
+            groups.append((label, endpoint_groups))
         if complete and not subnets and not all(isolated):
             open_paths.append(
                 f"{label} runs outside a VPC without network isolation and {outside}"
@@ -21140,10 +21554,67 @@ def _sagemaker_egress_workloads(
                     continue
                 subnets = (network.get("VpcConfig") or {}).get("Subnets") or []
                 references.extend((label, subnet) for subnet in subnets)
+                job_groups = (network.get("VpcConfig") or {}).get("SecurityGroupIds")
+                if job_groups:
+                    groups.append((label, list(job_groups)))
                 if not subnets and network.get("EnableNetworkIsolation") is not True:
                     open_paths.append(
                         f"{label} runs outside a VPC without network isolation and {outside}"
                     )
+    # A transform job runs in the VpcConfig of the model it names, with that
+    # model's network isolation (DescribeTransformJob returns no VpcConfig).
+    for status in RUNNING_JOB_STATUSES:
+        try:
+            names = [
+                summary["TransformJobName"]
+                for summary in _paged(
+                    client,
+                    "list_transform_jobs",
+                    "TransformJobSummaries",
+                    StatusEquals=status,
+                )
+                if summary.get("TransformJobName")
+            ]
+        except Exception as error:
+            unread.append(
+                f"{status} SageMaker transform jobs "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for job_name in names:
+            label = f"SageMaker transform job '{job_name}'"
+            try:
+                model_name = client.describe_transform_job(
+                    TransformJobName=job_name
+                ).get("ModelName")
+            except Exception as error:
+                unread.append(f"{label} ({get_assessment_error_label(error)})")
+                continue
+            if not model_name:
+                unread.append(f"{label} (DescribeTransformJob returned no ModelName)")
+                continue
+            if model_name not in models:
+                try:
+                    models[model_name] = client.describe_model(ModelName=model_name)
+                except Exception as error:
+                    models[model_name] = None
+                    unread.append(
+                        f"model '{model_name}' of {label} "
+                        f"({get_assessment_error_label(error)})"
+                    )
+            model = models[model_name]
+            if model is None:
+                continue
+            vpc_config = model.get("VpcConfig") or {}
+            subnets = vpc_config.get("Subnets") or []
+            references.extend((label, subnet) for subnet in subnets)
+            if vpc_config.get("SecurityGroupIds"):
+                groups.append((label, list(vpc_config["SecurityGroupIds"])))
+            if not subnets and model.get("EnableNetworkIsolation") is not True:
+                open_paths.append(
+                    f"{label} runs model '{model_name}' outside a VPC without "
+                    f"network isolation and {outside}"
+                )
     try:
         notebooks = [
             notebook["NotebookInstanceName"]
@@ -21168,6 +21639,8 @@ def _sagemaker_egress_workloads(
             continue
         if detail.get("SubnetId"):
             references.append((label, detail["SubnetId"]))
+        if detail.get("SecurityGroups"):
+            groups.append((label, list(detail["SecurityGroups"])))
         if detail.get("DirectInternetAccess") != "Disabled":
             open_paths.append(
                 f"{label} has DirectInternetAccess "
@@ -21221,12 +21694,12 @@ def _sagemaker_egress_workloads(
             unread.append(f"{label} ({get_assessment_error_label(error)})")
             continue
         cluster_subnets = (detail.get("VpcConfig") or {}).get("Subnets") or []
-        groups = [
+        instance_groups = [
             *(detail.get("InstanceGroups") or []),
             *(detail.get("RestrictedInstanceGroups") or []),
         ]
-        inherit = not groups
-        for group in groups:
+        inherit = not instance_groups
+        for group in instance_groups:
             override = (group.get("OverrideVpcConfig") or {}).get("Subnets") or []
             if not override:
                 inherit = True
@@ -21235,9 +21708,17 @@ def _sagemaker_egress_workloads(
                 f"instance group '{group.get('InstanceGroupName')}' of {label}"
             )
             references.extend((group_label, subnet) for subnet in override)
+            override_groups = (group.get("OverrideVpcConfig") or {}).get(
+                "SecurityGroupIds"
+            )
+            if override_groups:
+                groups.append((group_label, list(override_groups)))
         if not inherit:
             continue
         references.extend((label, subnet) for subnet in cluster_subnets)
+        cluster_groups = (detail.get("VpcConfig") or {}).get("SecurityGroupIds")
+        if cluster_groups:
+            groups.append((label, list(cluster_groups)))
         if not cluster_subnets:
             open_paths.append(
                 f"{label} has no VpcConfig, so HyperPod runs its instance groups "
@@ -21245,7 +21726,7 @@ def _sagemaker_egress_workloads(
                 "platform VPC, where no DNS Firewall rule group or Network "
                 "Firewall route of this account applies to their egress."
             )
-    return references, open_paths, unread
+    return references, open_paths, unread, groups
 
 
 # Bedrock jobs that are running or queued to run, so their vpcConfig is the
@@ -21262,16 +21743,18 @@ BEDROCK_INVOCATION_ACTIVE_STATUSES = (
 
 def _bedrock_job_egress_workloads(
     region: str,
-) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+) -> Tuple[List[Tuple[str, str]], List[str], List[str], List[Tuple[str, List[str]]]]:
     """
     (workload label, subnet id) for each active Bedrock model customization
-    and batch inference job with a vpcConfig, the jobs without one, and the
-    unread lists. A batch inference job summary carries its vpcConfig, so only
-    a customization job is read with GetModelCustomizationJob.
+    and batch inference job with a vpcConfig, the jobs without one, the
+    unread lists, and (label, security group ids) for each job. A batch
+    inference job summary carries its vpcConfig, so only a customization job
+    is read with GetModelCustomizationJob.
     """
     references: List[Tuple[str, str]] = []
     open_paths: List[str] = []
     unread: List[str] = []
+    groups: List[Tuple[str, List[str]]] = []
     outside = (
         "has no vpcConfig, so Bedrock reaches its S3 data over the service's own "
         "network, where no DNS Firewall rule group or Network Firewall route of "
@@ -21306,6 +21789,8 @@ def _bedrock_job_egress_workloads(
                 continue
             subnets = (detail.get("vpcConfig") or {}).get("subnetIds") or []
             references.extend((label, subnet) for subnet in subnets)
+            if (detail.get("vpcConfig") or {}).get("securityGroupIds"):
+                groups.append((label, list(detail["vpcConfig"]["securityGroupIds"])))
             if not subnets:
                 open_paths.append(f"{label} {outside}")
     for status in BEDROCK_INVOCATION_ACTIVE_STATUSES:
@@ -21329,9 +21814,11 @@ def _bedrock_job_egress_workloads(
             label = f"Bedrock batch inference job '{name}'"
             subnets = (summary.get("vpcConfig") or {}).get("subnetIds") or []
             references.extend((label, subnet) for subnet in subnets)
+            if (summary.get("vpcConfig") or {}).get("securityGroupIds"):
+                groups.append((label, list(summary["vpcConfig"]["securityGroupIds"])))
             if not subnets:
                 open_paths.append(f"{label} {outside}")
-    return references, open_paths, unread
+    return references, open_paths, unread, groups
 
 
 def _describe_workload_subnets(
@@ -22973,13 +23460,179 @@ def _workload_firewall_vpc_finding(
     return [row, sync]
 
 
+WORKLOAD_GROUP_EGRESS_FINDING = "Agent Workload Security Group Egress"
+WORKLOAD_GROUP_EGRESS_REFERENCE = (
+    "https://docs.aws.amazon.com/vpc/latest/userguide/security-group-rules.html"
+)
+WORKLOAD_GROUP_EGRESS_RULE = (
+    "AIR-FND-NET-03 asks that security-group egress be restricted to the "
+    "required ports and names no port list, so this row fails a workload whose "
+    "security groups' all-protocol outbound rules (IpProtocol -1), named "
+    "directly or as entries of a customer-managed prefix list, together reach "
+    "every IPv4 address (0.0.0.0/0) or every IPv6 address (::/0), and does not "
+    "judge a rule over a named protocol and port range."
+)
+
+
+def _workload_group_egress_findings(
+    region: str,
+    ec2_client: Any,
+    workloads: List[Tuple[str, List[str]]],
+    unread: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    AIR-FND-NET-03 security-group leg for the SageMaker, EKS and Bedrock
+    workloads: fail a workload whose groups' all-protocol egress reaches any
+    destination. EC2 instances, ECS services and tasks and Lambda functions
+    are judged under WORKLOAD_SEGMENTATION_FINDING, which fails any egress
+    rule to a /16 (IPv6 /48) or wider, a stricter bound than this one.
+    """
+    if not workloads and not unread:
+        return []
+    unread = list(unread)
+    group_ids = sorted({g for _, ids in workloads for g in ids})
+    described: Dict[str, Dict[str, Any]] = {}
+    try:
+        for chunk in _chunked(group_ids, SUBNET_LOOKUP_BATCH_SIZE):
+            # Filters tolerate an id that no longer exists; GroupIds= raises
+            # InvalidGroup.NotFound and loses the whole batch with it.
+            for page in ec2_client.get_paginator("describe_security_groups").paginate(
+                Filters=[{"Name": "group-id", "Values": chunk}]
+            ):
+                for group in page.get("SecurityGroups", []):
+                    described[group.get("GroupId")] = group
+    except Exception as error:
+        unread.append(
+            f"ec2:DescribeSecurityGroups ({get_assessment_error_label(error)})"
+        )
+        described = None
+    prefix_lists: Dict[str, Optional[List[str]]] = {}
+    if described:
+        users: Dict[str, List[str]] = {}
+        for group_id, group in described.items():
+            for permission in group.get("IpPermissionsEgress") or []:
+                if str(permission.get("IpProtocol")) != "-1":
+                    continue
+                for entry in permission.get("PrefixListIds") or []:
+                    named_by = users.setdefault(
+                        entry.get("PrefixListId") or "(no id)", []
+                    )
+                    if group_id not in named_by:
+                        named_by.append(group_id)
+        prefix_lists, prefix_unread = _prefix_list_cidrs(ec2_client, users)
+        unread.extend(prefix_unread)
+    problems = []
+    judged = 0
+    for label, ids in workloads if described is not None else []:
+        missing = [g for g in ids if g not in described]
+        if missing:
+            unread.append(
+                f"security group(s) {', '.join(missing)} of {label} (not returned "
+                "by ec2:DescribeSecurityGroups)"
+            )
+            continue
+        networks = {4: [], 6: []}
+        rules = []
+        for group_id in ids:
+            for permission in described[group_id].get("IpPermissionsEgress") or []:
+                if str(permission.get("IpProtocol")) != "-1":
+                    continue
+                cidrs = [
+                    (entry.get(field) or "", "")
+                    for key, field in (
+                        ("IpRanges", "CidrIp"),
+                        ("Ipv6Ranges", "CidrIpv6"),
+                    )
+                    for entry in permission.get(key) or []
+                ]
+                for entry in permission.get("PrefixListIds") or []:
+                    prefix_list_id = entry.get("PrefixListId")
+                    cidrs.extend(
+                        (cidr, f" in {prefix_list_id}")
+                        for cidr in prefix_lists.get(prefix_list_id) or []
+                    )
+                for cidr, where in cidrs:
+                    try:
+                        network = ipaddress.ip_network(cidr, strict=False)
+                    except ValueError:
+                        continue
+                    networks[network.version].append(network)
+                    rules.append(f"{group_id} all traffic to {cidr}{where}")
+        open_families = [
+            "every IPv4 address" if version == 4 else "every IPv6 address"
+            for version, found in networks.items()
+            if found
+            and [str(n) for n in ipaddress.collapse_addresses(found)]
+            == [("0.0.0.0/0" if version == 4 else "::/0")]
+        ]
+        judged += 1
+        if open_families:
+            problems.append(
+                f"{label} runs in security group(s) {', '.join(ids)} whose "
+                f"all-protocol outbound rules together reach "
+                f"{' and '.join(open_families)} ({'; '.join(rules[:4])}"
+                + (f"; and {len(rules) - 4} more" if len(rules) > 4 else "")
+                + "), so its egress is not restricted to any port or destination. "
+                + WORKLOAD_GROUP_EGRESS_RULE
+            )
+    resolution = (
+        "Replace each all-traffic outbound rule to 0.0.0.0/0 or ::/0 with rules "
+        "for the ports the workload needs, to the firewall or VPC endpoint "
+        "security group or prefix list it must reach."
+    )
+    rows = _capped_problem_rows(
+        "SM-39",
+        WORKLOAD_GROUP_EGRESS_FINDING,
+        problems,
+        resolution,
+        WORKLOAD_GROUP_EGRESS_REFERENCE,
+        "Medium",
+        region,
+        "workloads with all-protocol egress to any destination",
+    )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-39",
+                WORKLOAD_GROUP_EGRESS_FINDING,
+                list(dict.fromkeys(unread)),
+                f"{judged} SageMaker, EKS or Bedrock workload(s) had their security "
+                "groups read.",
+                WORKLOAD_GROUP_EGRESS_REFERENCE,
+                region,
+            )
+        )
+    elif not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=WORKLOAD_GROUP_EGRESS_FINDING,
+                finding_details=(
+                    f"None of the {judged} SageMaker endpoint, running job, "
+                    "notebook instance or HyperPod instance group or cluster, EKS "
+                    "cluster or active Bedrock job security group set has "
+                    "all-protocol outbound rules that together reach every IPv4 or "
+                    "every IPv6 address. " + WORKLOAD_GROUP_EGRESS_RULE
+                ),
+                resolution="No action required",
+                reference=WORKLOAD_GROUP_EGRESS_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     """
     SM-39 (AIR-SLF-RT-02): judge DNS Firewall and Network Firewall egress for
     every VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS
-    cluster, an EC2 instance, a SageMaker endpoint, running training or
-    processing job, HyperPod cluster, notebook instance or Studio domain, or an
-    active Bedrock model customization or batch inference job runs in.
+    cluster, an EC2 instance, a SageMaker endpoint, running training,
+    processing or transform job, HyperPod cluster, notebook instance or Studio
+    domain, or an active Bedrock model customization or batch inference job
+    runs in, and the all-protocol security-group egress of the SageMaker, EKS
+    and Bedrock workloads among them.
 
     One DNS row and one Network Firewall row per VPC. An unread workload list
     or subnet description is reported N/A by name, never Passed. A Lambda
@@ -23006,17 +23659,26 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
         (WORKLOAD_FIREWALL_EGRESS_FINDING, NETWORK_FIREWALL_DOMAIN_LIST_REFERENCE),
     )
     try:
-        references, unread, functions = _egress_workload_subnets(region)
-        sagemaker_references, open_sagemaker, sagemaker_unread = (
-            _sagemaker_egress_workloads(region)
+        references, unread, functions, group_workloads, group_unread = (
+            _egress_workload_subnets(region)
         )
+        (
+            sagemaker_references,
+            open_sagemaker,
+            sagemaker_unread,
+            sagemaker_groups,
+        ) = _sagemaker_egress_workloads(region)
         references.extend(sagemaker_references)
         unread.extend(sagemaker_unread)
-        bedrock_references, open_bedrock, bedrock_unread = (
+        group_workloads.extend(sagemaker_groups)
+        group_unread.extend(sagemaker_unread)
+        bedrock_references, open_bedrock, bedrock_unread, bedrock_groups = (
             _bedrock_job_egress_workloads(region)
         )
         references.extend(bedrock_references)
         unread.extend(bedrock_unread)
+        group_workloads.extend(bedrock_groups)
+        group_unread.extend(bedrock_unread)
         named, named_unread = _ai_lambda_references(region)
         unread.extend(named_unread)
         # A MicroVM egresses through its VPC egress connector's subnets. AWS
@@ -23160,6 +23822,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                     reference,
                 )
             )
+    findings["csv_data"].extend(
+        _workload_group_egress_findings(
+            region, ec2_client, group_workloads, group_unread
+        )
+    )
     if not firewall_references:
         if (
             not unread

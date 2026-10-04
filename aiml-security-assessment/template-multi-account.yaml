@@ -1454,6 +1454,14 @@ Resources:
             Condition:
               ArnLike:
                 ecs:cluster: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/*'
+          - Sid: ECSCapacityProviderRead
+            # SM-38 reads each ECS cluster's capacity providers to find ECS
+            # Managed Instances capacity. DescribeCapacityProviders has the
+            # capacity-provider resource type.
+            Effect: Allow
+            Action:
+              - ecs:DescribeCapacityProviders # SM-38
+            Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:capacity-provider/*'
           - Sid: EKSFargateProfileRead
             # SM-39 reads the subnets of each Fargate profile.
             Effect: Allow
