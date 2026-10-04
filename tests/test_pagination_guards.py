@@ -29,6 +29,11 @@ NON_PAGEABLE_CALLS = {
         "list_tags_for_resource",
     ),
     (
+        "bedrock_assessments/app.py",
+        "check_bedrock_resource_owner_tag",
+        "list_tags_for_resource",
+    ),
+    (
         "responsible_ai_grc_assessments/app.py",
         "check_model_inventory_tagging",
         "list_tags_for_resource",

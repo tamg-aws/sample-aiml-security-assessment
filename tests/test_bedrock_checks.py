@@ -10,11 +10,14 @@ Each check is tested for:
 """
 
 import contextlib
+import gzip
+import io
 import json
 import time
 import sys
 import os
 import importlib.util
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 from unittest.mock import call, patch, MagicMock
 from botocore.exceptions import (
     EndpointConnectionError,
@@ -43,6 +46,18 @@ _spec = importlib.util.spec_from_file_location(
 bedrock_app = importlib.util.module_from_spec(_spec)
 sys.modules["bedrock_app"] = bedrock_app
 _spec.loader.exec_module(bedrock_app)
+
+
+@pytest.fixture(autouse=True)
+def _no_other_enabled_regions():
+    """Most tests mock one Region's clients, so the enabled-Region sweep for
+    event data stores reads no other Region unless a test patches it again."""
+    with patch.object(
+        bedrock_app,
+        "_event_data_store_home_regions",
+        return_value={"regions": [], "error": None},
+    ):
+        yield
 
 
 @pytest.mark.parametrize(
@@ -1002,10 +1017,20 @@ class TestBR02WorkloadConnectivity:
         }
 
     @staticmethod
-    def _function(name, role, vpc_id="vpc-1"):
-        return {"kind": "Lambda function", "name": name, "vpc_id": vpc_id, "role": role}
+    def _function(name, role, vpc_id="vpc-1", subnets=None):
+        workload = {
+            "kind": "Lambda function",
+            "name": name,
+            "vpc_id": vpc_id,
+            "role": role,
+        }
+        if subnets is not None:
+            workload["subnets"] = subnets
+        return workload
 
-    def _run(self, cache, endpoints, workloads, errors=None, agentcore=()):
+    def _run(
+        self, cache, endpoints, workloads, errors=None, agentcore=(), route_tables=None
+    ):
         with (
             patch(
                 "bedrock_app.check_bedrock_vpc_endpoints",
@@ -1014,6 +1039,7 @@ class TestBR02WorkloadConnectivity:
                     "found_endpoints": list(endpoints),
                     "agentcore_endpoints": list(agentcore),
                     "all_vpcs": ["vpc-1", "vpc-2"],
+                    "route_tables": route_tables or {},
                 },
             ),
             patch(
@@ -1213,9 +1239,10 @@ class TestBR02WorkloadConnectivity:
             assert surface in detail
 
     @classmethod
-    def _data_endpoint(cls, surface, endpoint_type, private_dns=False):
+    def _data_endpoint(cls, surface, endpoint_type, private_dns=False, routes=()):
         endpoint = cls._endpoint(surface, private_dns=private_dns)
         endpoint["type"] = endpoint_type
+        endpoint["route_tables"] = list(routes)
         return endpoint
 
     @pytest.mark.parametrize(
@@ -1252,6 +1279,10 @@ class TestBR02WorkloadConnectivity:
         )
         assert [row["Status"] for row in covered] == ["Passed"]
 
+    # The gateway endpoint now covers a workload only through the route table
+    # of each of its subnets, so this fixture names them.
+    ROUTES = {"vpc-1": {"main": "rtb-main", "subnets": {"subnet-a": "rtb-a"}}}
+
     @pytest.mark.parametrize("surface", ["s3", "dynamodb"])
     def test_br02_a_gateway_endpoint_covers_s3_and_dynamodb(self, surface):
         action = "s3:GetObject" if surface == "s3" else "dynamodb:GetItem"
@@ -1259,11 +1290,188 @@ class TestBR02WorkloadConnectivity:
             self._cache({"Role": self._role(["bedrock:InvokeModel", action])}),
             [
                 self._endpoint("bedrock-runtime"),
-                self._data_endpoint(surface, "Gateway"),
+                self._data_endpoint(surface, "Gateway", routes=["rtb-a", "rtb-main"]),
             ],
-            [self._function("app", "Role")],
+            [self._function("app", "Role", subnets=["subnet-a", "subnet-b"])],
+            route_tables=self.ROUTES,
         )
         assert [row["Status"] for row in rows] == ["Passed"]
+
+    # NET-02: a gateway endpoint was credited for its whole VPC, though only
+    # the subnets whose route table it names reach it.
+    @pytest.mark.parametrize(
+        "routes, subnet",
+        [(["rtb-a"], "subnet-b (rtb-main)"), (["rtb-main"], "subnet-a (rtb-a)")],
+    )
+    def test_br02_a_gateway_endpoint_off_a_subnet_route_table_fails(
+        self, routes, subnet
+    ):
+        cache = self._cache(
+            {
+                "Role": self._role(["bedrock:InvokeModel", "s3:GetObject"]),
+                "Other": self._role(["bedrock:InvokeModel", "s3:GetObject"]),
+            }
+        )
+        rows = self._run(
+            cache,
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=routes),
+            ],
+            [
+                self._function("app", "Role", subnets=["subnet-a", "subnet-b"]),
+                self._function(
+                    "inside",
+                    "Other",
+                    subnets=["subnet-a" if routes == ["rtb-a"] else "subnet-b"],
+                ),
+            ],
+            route_tables=self.ROUTES,
+        )
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "1 workload(s) can call" in details
+            and "Lambda function 'app' in vpc-1 (role 'Role') reaches s3 through a "
+            "gateway endpoint its subnets do not route to: s3: the gateway "
+            f"endpoint names no route table of subnet(s) {subnet}"
+            in details
+        )
+        assert "'inside'" not in details
+        assert "Lambda function 'inside' in vpc-1" in rows[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "subnets, route_tables, phrase",
+        [
+            (None, {"vpc-1": {"main": "rtb-main", "subnets": {}}}, "were not read"),
+            (["subnet-a"], {}, "the route tables of vpc-1 were not read"),
+            (
+                ["subnet-a"],
+                {
+                    "vpc-1": {
+                        "error": "the route tables of vpc-1 were not read with "
+                        "ec2:DescribeRouteTables (UnauthorizedOperation)"
+                    }
+                },
+                "ec2:DescribeRouteTables (UnauthorizedOperation)",
+            ),
+            (
+                ["subnet-z"],
+                {"vpc-1": {"main": None, "subnets": {}}},
+                "reports no main route table",
+            ),
+        ],
+    )
+    def test_br02_unread_routes_withhold_the_gateway_pass(
+        self, subnets, route_tables, phrase
+    ):
+        rows = self._run(
+            self._cache({"Role": self._role(["bedrock:InvokeModel", "s3:GetObject"])}),
+            [
+                self._endpoint("bedrock-runtime"),
+                self._data_endpoint("s3", "Gateway", routes=["rtb-main"]),
+            ],
+            [self._function("app", "Role", subnets=subnets)],
+            route_tables=route_tables,
+        )
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any(phrase in row["Finding_Details"] for row in rows)
+
+    def test_br02_the_collector_reads_route_tables_of_gateway_vpcs_only(self):
+        ec2_client = MagicMock()
+        pages = {
+            "describe_vpcs": [{"Vpcs": [{"VpcId": "vpc-1"}, {"VpcId": "vpc-2"}]}],
+            "describe_vpc_endpoints": [
+                {
+                    "VpcEndpoints": [
+                        {
+                            "VpcEndpointId": "vpce-s3",
+                            "VpcId": "vpc-1",
+                            "ServiceName": "com.amazonaws.us-east-1.s3",
+                            "VpcEndpointType": "Gateway",
+                            "State": "available",
+                            "RouteTableIds": ["rtb-a"],
+                        },
+                        {
+                            "VpcEndpointId": "vpce-ddb",
+                            "VpcId": "vpc-2",
+                            "ServiceName": "com.amazonaws.us-east-1.dynamodb",
+                            "VpcEndpointType": "Interface",
+                            "State": "available",
+                        },
+                    ]
+                }
+            ],
+            "describe_route_tables": [
+                {
+                    "RouteTables": [
+                        {
+                            "RouteTableId": "rtb-main",
+                            "Associations": [{"Main": True}],
+                        },
+                        {
+                            "RouteTableId": "rtb-a",
+                            "Associations": [
+                                {"Main": False, "SubnetId": "subnet-a"},
+                                {"Main": False, "SubnetId": "subnet-b"},
+                            ],
+                        },
+                    ]
+                }
+            ],
+        }
+        filters = []
+
+        def paginator(name):
+            pager = MagicMock()
+
+            def paginate(**kwargs):
+                if name == "describe_route_tables":
+                    filters.append(kwargs["Filters"])
+                return pages[name]
+
+            pager.paginate.side_effect = paginate
+            return pager
+
+        ec2_client.get_paginator.side_effect = paginator
+        with patch("bedrock_app.boto3.client", return_value=ec2_client):
+            result = bedrock_app.check_bedrock_vpc_endpoints(region=self.REGION)
+
+        assert filters == [[{"Name": "vpc-id", "Values": ["vpc-1"]}]]
+        assert result["route_tables"] == {
+            "vpc-1": {
+                "main": "rtb-main",
+                "subnets": {"subnet-a": "rtb-a", "subnet-b": "rtb-a"},
+            }
+        }
+        assert result["data_path_endpoints"][0]["route_tables"] == ["rtb-a"]
+
+    # NET-02: an AI workload that calls only SageMaker runtime was never judged.
+    def test_br02_a_sagemaker_runtime_only_workload_is_in_scope(self):
+        cache = self._cache(
+            {
+                "Invoker": self._role(["sagemaker:InvokeEndpoint"]),
+                "Trainer": self._role(["sagemaker:CreateTrainingJob"]),
+            }
+        )
+        workloads = [
+            self._function("invoker", "Invoker"),
+            self._function("trainer", "Trainer"),
+        ]
+        rows = self._run(cache, [], workloads)
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "Lambda function 'invoker' in vpc-1 (role 'Invoker') is granted "
+            "sagemaker.runtime with no private-DNS endpoint"
+        ) in rows[0]["Finding_Details"]
+        assert "'trainer'" not in rows[0]["Finding_Details"]
+
+        covered = self._run(
+            cache,
+            [self._data_endpoint("sagemaker.runtime", "Interface", private_dns=True)],
+            workloads,
+        )
+        assert [row["Status"] for row in covered] == ["Passed"]
 
     def test_br02_a_no_dns_sagemaker_interface_endpoint_is_not_coverage(self):
         rows = self._run(
@@ -1389,7 +1597,7 @@ class TestBR02WorkloadConnectivity:
                     {
                         "FunctionName": "one",
                         "Role": "arn:aws:iam::123456789012:role/service-role/RoleOne",
-                        "VpcConfig": {"VpcId": "vpc-1"},
+                        "VpcConfig": {"VpcId": "vpc-1", "SubnetIds": ["subnet-a"]},
                     }
                 ]
             },
@@ -1424,12 +1632,14 @@ class TestBR02WorkloadConnectivity:
                 "name": "one",
                 "vpc_id": "vpc-1",
                 "role": "RoleOne",
+                "subnets": ["subnet-a"],
             },
             {
                 "kind": "Lambda function",
                 "name": "two",
                 "vpc_id": None,
                 "role": "RoleTwo",
+                "subnets": None,
             },
         ]
         assert len(inventory["errors"]) == 1
@@ -4157,16 +4367,57 @@ class TestBR06SelectorValues:
         assert "eu-west-1" in row["Finding_Details"]
         assert "cloudtrail:ListEventDataStores" in row["Finding_Details"]
 
-    def test_an_unassessed_home_region_is_named_in_the_gap(self):
+    def test_the_gap_says_every_enabled_region_is_read(self):
         rows = self._run({"a": {"advanced": [_management()]}})
         details = rows["Bedrock Knowledge Base Retrieval Data Event Logging"][
             "Finding_Details"
         ]
         assert (
-            "Stores homed in the other assessed Regions are read too; a "
-            "multi-Region event data store homed in a Region this assessment "
-            "does not scan is not read." in details
+            "Multi-Region stores homed in every other Region enabled for the "
+            "account (account:ListRegions) and every other assessed Region are "
+            "read too." in details
         )
+
+    def test_a_multi_region_store_homed_in_an_unassessed_enabled_region_is_coverage(
+        self,
+    ):
+        """MDL-07: TARGET_REGIONS names only this Region, yet a multi-Region store
+        homed in an enabled Region records this Region's calls."""
+        remote = self._remote(
+            detail={
+                "Status": "ENABLED",
+                "MultiRegionEnabled": True,
+                "AdvancedEventSelectors": self.STORE_SELECTORS,
+            }
+        )
+        idle = self._remote(pages=({"EventDataStores": []},))
+        with patch.object(
+            bedrock_app,
+            "_event_data_store_home_regions",
+            return_value={
+                "regions": ["ap-south-1", "eu-west-1", "us-east-1"],
+                "error": None,
+            },
+        ):
+            rows = self._run(
+                {}, remote_clients={"eu-west-1": remote, "ap-south-1": idle}
+            )
+        assert remote.list_event_data_stores.call_count == 1
+        assert idle.list_event_data_stores.call_count == 1
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Passed"
+        assert "org-lake (multi-Region, homed in eu-west-1)" in row["Finding_Details"]
+
+    def test_unlisted_enabled_regions_withhold_failed(self):
+        with patch.object(
+            bedrock_app,
+            "_event_data_store_home_regions",
+            return_value={"regions": [], "error": "account:ListRegions (AccessDenied)"},
+        ):
+            rows = self._run({})
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "N/A"
+        assert "account:ListRegions (AccessDenied)" in row["Finding_Details"]
 
     def test_no_event_data_store_keeps_the_trail_gap_failed(self):
         rows = self._run({"a": {"advanced": [_management()]}})
@@ -5934,6 +6185,84 @@ class TestBR07PromptProductionVersion:
         )
         assert "role 'editor'" not in rows[0]["Finding_Details"]
 
+    # MDL-08: bedrock:CreatePrompt has no resource type, so its holders were
+    # neither read nor reported.
+    def test_br07_prompt_creators_are_named_and_a_denied_one_is_not(self):
+        cache = {
+            "cache_schema_version": 2,
+            "role_permissions": {
+                "release": {
+                    "inline_policies": [self._grant("bedrock:CreatePrompt", "*")]
+                },
+                "builder": {
+                    "attached_policies": [self._grant("bedrock:CreatePromp?", "*")]
+                },
+                "blocked": {
+                    "inline_policies": [
+                        self._grant("bedrock:CreatePrompt", "*"),
+                        self._grant("bedrock:CreatePrompt", "*", effect="Deny"),
+                    ]
+                },
+            },
+        }
+        rows = self._scope_rows(cache)
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "2 role(s) or user(s) may create prompts with bedrock:CreatePrompt, "
+            "which has no resource type, so no Resource ARN bounds it: "
+            "role 'release'; role 'builder'." in details
+        )
+        assert "role 'blocked'" not in details
+        assert "None of them may also call bedrock:RenderPrompt." in details
+
+    def test_br07_no_prompt_creator_is_said_so(self):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "editor": {
+                        "inline_policies": [
+                            self._grant("bedrock:UpdatePrompt", self._PROMPT_ARN)
+                        ]
+                    }
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "No role or user may call bedrock:CreatePrompt."
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize("create", ["bedrock:CreatePrompt", "bedrock:CreatePromp?"])
+    def test_br07_a_role_that_renders_and_creates_prompts_fails(self, create):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "release": {
+                        "inline_policies": [self._grant("bedrock:CreatePrompt", "*")]
+                    },
+                    "runtime": {
+                        "inline_policies": [
+                            self._grant("bedrock:RenderPrompt", self._PROMPT_ARN),
+                            self._grant(create, "*"),
+                        ]
+                    },
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "1 role(s) or user(s) may both render prompts (bedrock:RenderPrompt) "
+            "and create them (bedrock:CreatePrompt): role 'runtime'." in details
+        )
+
 
 # ===================================================================
 # BR-08: check_bedrock_agent_roles
@@ -7278,9 +7607,13 @@ class TestBR12InvocationLogEncryption:
             }
 
         mock_s3.get_bucket_encryption.side_effect = get_bucket_encryption
-        findings = extract_csv_data(
-            bedrock_app.check_bedrock_invocation_log_encryption(region="us-east-1")
-        )
+        findings = [
+            f
+            for f in extract_csv_data(
+                bedrock_app.check_bedrock_invocation_log_encryption(region="us-east-1")
+            )
+            if f["Finding"] != bedrock_app.INVOCATION_LOG_ARCHIVE_FINDING
+        ]
         plain = [f for f in findings if "'plain-bucket'" in f["Finding_Details"]]
         assert [f["Status"] for f in plain] == ["Failed"]
         assert (
@@ -7386,6 +7719,307 @@ class TestBedrockInferenceObserved:
         assert observed is None
 
 
+class TestBR12InvocationLogArchive:
+    """AIR-FND-DET-09: each invocation log destination holds a WORM copy."""
+
+    ACCOUNT = "123456789012"
+    STREAM = "arn:aws:firehose:us-east-1:123456789012:deliverystream/archive"
+
+    @staticmethod
+    def _lock(mode="COMPLIANCE", enabled="Enabled", days=365):
+        config = {"ObjectLockEnabled": enabled}
+        if mode:
+            config["Rule"] = {"DefaultRetention": {"Mode": mode, "Days": days}}
+        return {"ObjectLockConfiguration": config}
+
+    @staticmethod
+    def _stream(bucket="archive-bucket", status="ACTIVE", lambda_processor=False):
+        target = {"BucketARN": f"arn:aws:s3:::{bucket}"}
+        if lambda_processor:
+            target["ProcessingConfiguration"] = {
+                "Enabled": True,
+                "Processors": [{"Type": "Lambda"}],
+            }
+        return {
+            "DeliveryStreamDescription": {
+                "DeliveryStreamStatus": status,
+                "Destinations": [{"ExtendedS3DestinationDescription": target}],
+            }
+        }
+
+    def _run(
+        self, buckets=(), locks=None, log_group=None, filter_pages=None, stream=None
+    ):
+        """
+        ``locks`` maps a bucket to a GetObjectLockConfiguration response or an
+        error; ``filter_pages`` is the DescribeSubscriptionFilters pages or an
+        error.
+        """
+        locks = locks or {}
+        s3 = MagicMock()
+
+        def get_object_lock_configuration(Bucket):
+            value = locks[Bucket]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        s3.get_object_lock_configuration.side_effect = get_object_lock_configuration
+        logs = MagicMock()
+        pages = filter_pages if filter_pages is not None else [[]]
+
+        def describe_subscription_filters(logGroupName, nextToken=None):
+            if isinstance(pages, Exception):
+                raise pages
+            index = int(nextToken or 0)
+            response = {"subscriptionFilters": pages[index]}
+            if index + 1 < len(pages):
+                response["nextToken"] = str(index + 1)
+            return response
+
+        logs.describe_subscription_filters.side_effect = describe_subscription_filters
+        firehose = MagicMock()
+        if isinstance(stream, Exception):
+            firehose.describe_delivery_stream.side_effect = stream
+        else:
+            firehose.describe_delivery_stream.return_value = stream or self._stream()
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": self.ACCOUNT}
+        clients = {"logs": logs, "firehose": firehose, "sts": sts}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: clients[service],
+        ):
+            rows = bedrock_app._invocation_log_archive_findings(
+                log_group, list(buckets), s3, "us-east-1"
+            )
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-12"
+            assert row["Finding"] == "Bedrock Invocation Log WORM Archive"
+        self.firehose = firehose
+        return rows
+
+    def test_each_log_bucket_is_judged_by_its_default_retention(self):
+        rows = self._run(
+            buckets=["locked", "governance", "unlocked", "absent", "denied"],
+            locks={
+                "locked": self._lock(),
+                "governance": self._lock(mode="GOVERNANCE"),
+                "unlocked": self._lock(mode=None, enabled="Disabled"),
+                "absent": _make_client_error("ObjectLockConfigurationNotFoundError"),
+                "denied": _make_client_error("AccessDenied"),
+            },
+        )
+        assert [r["Status"] for r in rows] == [
+            "Passed",
+            "Failed",
+            "Failed",
+            "Failed",
+            "N/A",
+        ]
+        assert (
+            "bucket 'locked', whose default retention is COMPLIANCE mode for 365 day(s)"
+            in rows[0]["Finding_Details"]
+        )
+        assert "separate Log Archive account is not read" in rows[0]["Finding_Details"]
+        assert "GOVERNANCE mode" in rows[1]["Finding_Details"]
+        assert (
+            "bucket 'unlocked', which has Object Lock off" in rows[2]["Finding_Details"]
+        )
+        assert (
+            "bucket 'absent', which has Object Lock off" in rows[3]["Finding_Details"]
+        )
+        assert (
+            "s3:GetBucketObjectLockConfiguration on bucket 'denied'"
+            in rows[4]["Finding_Details"]
+        )
+
+    def test_a_locked_bucket_with_no_default_retention_fails(self):
+        rows = self._run(buckets=["b"], locks={"b": self._lock(mode=None)})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "no default retention" in rows[0]["Finding_Details"]
+
+    def test_a_full_filter_on_a_later_page_passes_beside_a_partial_one(self):
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=[
+                [
+                    {
+                        "filterName": "errors",
+                        "filterPattern": "ERROR",
+                        "destinationArn": self.STREAM,
+                    }
+                ],
+                [
+                    {
+                        "filterName": "all",
+                        "filterPattern": "",
+                        "destinationArn": self.STREAM,
+                    }
+                ],
+            ],
+            locks={"archive-bucket": self._lock()},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Invocation log group '/bedrock/invocations' forwards every event by "
+            "subscription filter 'all' to Firehose stream 'archive', which delivers "
+            "to bucket 'archive-bucket', whose default retention is COMPLIANCE mode"
+            in rows[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "subscription, stream, locks, text",
+        [
+            (
+                {"filterPattern": "ERROR"},
+                None,
+                {"archive-bucket": None},
+                "forwards only the events its filter pattern 'ERROR' matches",
+            ),
+            (
+                {"fieldSelectionCriteria": "$.level = 'error'"},
+                None,
+                {"archive-bucket": None},
+                "field selection criteria",
+            ),
+            (
+                {"applyOnTransformedLogs": True},
+                None,
+                {"archive-bucket": None},
+                "applies to the transformed log events",
+            ),
+            (
+                {},
+                "lambda",
+                {"archive-bucket": None},
+                "runs a Lambda record processor",
+            ),
+            (
+                {},
+                "creating",
+                {"archive-bucket": None},
+                "Firehose stream 'archive' is CREATING",
+            ),
+            (
+                {},
+                None,
+                {"archive-bucket": "GOVERNANCE"},
+                "GOVERNANCE mode, which a principal with s3:BypassGovernanceRetention",
+            ),
+        ],
+        ids=[
+            "pattern",
+            "field-selection",
+            "transformed",
+            "lambda-processor",
+            "inactive-stream",
+            "governance-bucket",
+        ],
+    )
+    def test_a_partial_or_unlocked_forward_fails(
+        self, subscription, stream, locks, text
+    ):
+        stream_response = (
+            self._stream(lambda_processor=True)
+            if stream == "lambda"
+            else self._stream(status="CREATING")
+            if stream == "creating"
+            else self._stream()
+        )
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=[
+                [
+                    dict(
+                        {"filterName": "f", "destinationArn": self.STREAM},
+                        **subscription,
+                    )
+                ]
+            ],
+            stream=stream_response,
+            locks={
+                bucket: self._lock(mode=mode) if mode else self._lock()
+                for bucket, mode in locks.items()
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert text in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "destination, stream, text",
+        [
+            (
+                "arn:aws:firehose:us-east-1:999999999999:deliverystream/archive",
+                None,
+                "in account 999999999999, whose destination this account cannot read",
+            ),
+            (
+                "arn:aws:logs:us-east-1:999999999999:destination:central",
+                None,
+                "which this check does not follow to an archive bucket",
+            ),
+            (
+                "arn:aws:firehose:us-east-1:123456789012:deliverystream/archive",
+                ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                    "DescribeDeliveryStream",
+                ),
+                "firehose:DescribeDeliveryStream on",
+            ),
+        ],
+        ids=["other-account-stream", "logs-destination", "unread-stream"],
+    )
+    def test_an_unfollowed_forward_is_not_failed(self, destination, stream, text):
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=[[{"filterName": "f", "destinationArn": destination}]],
+            stream=stream,
+            locks={"archive-bucket": self._lock()},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert text in rows[0]["Finding_Details"]
+
+    def test_a_log_group_with_no_filter_fails_and_an_unread_list_is_na(self):
+        rows = self._run(log_group="/bedrock/invocations", filter_pages=[[]])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "has no subscription filter" in rows[0]["Finding_Details"]
+        rows = self._run(
+            log_group="/bedrock/invocations",
+            filter_pages=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "were not read" in rows[0]["Finding_Details"]
+
+    def test_the_check_reports_the_archive_rows(self):
+        bedrock = MagicMock()
+        bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": {"s3Config": {"bucketName": "logs-bucket"}}
+        }
+        s3 = MagicMock()
+        s3.get_bucket_encryption.side_effect = _make_client_error("AccessDenied")
+        s3.get_object_lock_configuration.return_value = self._lock(mode="GOVERNANCE")
+        clients = {
+            "bedrock": bedrock,
+            "s3": s3,
+            "logs": MagicMock(),
+            "sts": MagicMock(),
+        }
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: clients[service],
+        ):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_invocation_log_encryption(region="us-east-1")
+            )
+        archive = [
+            r for r in rows if r["Finding"] == "Bedrock Invocation Log WORM Archive"
+        ]
+        assert [r["Status"] for r in archive] == ["Failed"]
+        assert "bucket 'logs-bucket'" in archive[0]["Finding_Details"]
+
+
 class TestBR12DestinationKeys:
     """AIR-BDR-MDL-02 / AIR-FND-DET-01: every log destination needs an enabled CMK."""
 
@@ -7452,7 +8086,11 @@ class TestBR12DestinationKeys:
         encryption = [
             r
             for r in rows
-            if r["Finding"] != "Bedrock Invocation Log Group Deletion Protection"
+            if r["Finding"]
+            not in (
+                "Bedrock Invocation Log Group Deletion Protection",
+                bedrock_app.INVOCATION_LOG_ARCHIVE_FINDING,
+            )
         ]
         return result, encryption, kms_regions
 
@@ -7935,9 +8573,11 @@ class TestBedrockHandlerMultiRegion:
     # invoke once per scanned region, passing region=region.
     NEW_REGIONAL_CHECKS = {
         "check_bedrock_guardrail_pii_filters": "BR-26",
+        "check_bedrock_inference_trace": "BR-06",
         "check_bedrock_guardrail_contextual_grounding": "BR-27",
         "check_guardrail_grounding_score_evidence": "BR-27",
         "check_guardrail_prompt_attack_invocation_evidence": "BR-34",
+        "check_guardduty_prompt_injection_detection": "BR-34",
         "check_bedrock_agent_guardrail_association": "BR-28",
         "check_bedrock_agent_idle_session_ttl": "BR-29",
         "check_bedrock_imported_model_kms_encryption": "BR-30",
@@ -7953,6 +8593,7 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_llm_jacking_activity": "BR-56",
         "check_agent_handoff_source_identity": "BR-57",
         "check_bedrock_agent_workload_identity": "BR-57",
+        "check_bedrock_agent_role_scope": "BR-57",
     }
 
     # Checks that read a global surface (the IAM permissions cache or the
@@ -7976,9 +8617,12 @@ class TestBedrockHandlerMultiRegion:
         Returns {check_function_name: region_passed} plus whether BR-15 ran."""
         recorded = {}
 
+        self.spy_calls = {}
+
         def make_spy(name):
             def spy(*args, region="", **kwargs):
                 recorded[name] = region
+                self.spy_calls.setdefault(name, []).append(kwargs)
                 return {
                     "check_name": name,
                     "status": "PASS",
@@ -8103,6 +8747,24 @@ class TestBedrockHandlerMultiRegion:
             recorded.get("check_bedrock_knowledge_base_source_classification")
             == "us-east-1"
         )
+
+    def test_br44_gets_both_br42_results_and_br42_org_leg_runs_once(self):
+        resp, _ = self._run_handler_with_check_spies(
+            _bedrock_event(region="us-east-1", region_index=0)
+        )
+        assert resp["statusCode"] == 200
+        (br44,) = self.spy_calls["check_bedrock_marketplace_model_control"]
+        assert br44["allow_list_findings"]["check_name"] == (
+            "check_bedrock_model_allow_list"
+        )
+        assert br44["org_allow_list_findings"]["check_name"] == (
+            "check_bedrock_approved_model_control"
+        )
+        legs = [
+            call.get("check_id", "BR-43")
+            for call in self.spy_calls["check_bedrock_approved_model_control"]
+        ]
+        assert sorted(legs) == ["BR-42", "BR-43"]
 
     @pytest.mark.parametrize(
         "targets, index, expected",
@@ -9947,6 +10609,22 @@ class TestBR42ModelAllowList:
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
     )
 
+    def test_br42_lists_the_identities_that_can_invoke_any_model(self):
+        # BR-44 reads invocation_open to judge whether invocation is blocked.
+        result = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "Scoped": [("S", _allow("bedrock:InvokeModel", self.MODEL_ARN))],
+                    "Open": [("O", _allow("bedrock:InvokeModel", "*"))],
+                },
+                users={"Reader": [("R", _allow("bedrock:ListFoundationModels", "*"))]},
+            ),
+            region="Global",
+            training_data={"buckets": {}, "errors": [], "regions": []},
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert result["invocation_open"] == ["role 'Open'"]
+
     NO_TRAINING_DATA = {
         "buckets": {},
         "errors": [],
@@ -10029,10 +10707,43 @@ class TestBR42ModelAllowList:
         ) in failed[0]["Finding_Details"]
         assert [f["Status"] for f in findings].count("Passed") == 1
 
+    ACCOUNT = "123456789012"
+    NONE_OUTSIDE = (
+        "The bucket policies of the 1 training data bucket(s) were read; none "
+        "allows s3:GetObject to every principal with no condition, to every "
+        "principal under a condition that names no account or organization of "
+        "the caller, or to another account's principals."
+    )
+
+    def _bucket_run(self, *statements, training_data=None, account=ACCOUNT):
+        policies = {
+            bucket: json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "Read",
+                            "Effect": "Allow",
+                            "Action": "s3:GetObject",
+                            "Resource": f"arn:aws:s3:::{bucket}/*",
+                            **statement,
+                        }
+                    ],
+                }
+            )
+            for bucket, statement in statements
+        }
+        return self._run(
+            self._scoped_cache(),
+            training_data=training_data or self.ONE_TRAINING_BUCKET,
+            bucket_policies={"policies": policies, "errors": [], "account": account},
+        )
+
     @pytest.mark.parametrize(
         "statement",
         [
             {"Principal": {"AWS": "arn:aws:iam::123456789012:role/Trainer"}},
+            {"Principal": {"AWS": "123456789012"}},
             {"Principal": "*", "Effect": "Deny"},
             {"Principal": "*", "Action": "s3:PutObject"},
             {"Principal": "*", "Resource": "arn:aws:s3:::other-bucket/*"},
@@ -10040,40 +10751,161 @@ class TestBR42ModelAllowList:
         ],
     )
     def test_br42_a_bucket_policy_naming_its_readers_passes(self, statement):
-        findings = self._run(
-            self._scoped_cache(),
-            training_data=self.ONE_TRAINING_BUCKET,
-            bucket_policies={
-                "policies": {"train-a": self._policy(**statement)},
-                "errors": [],
-            },
-        )
+        findings = self._bucket_run(("train-a", statement))
         assert [f["Status"] for f in findings] == ["Passed"]
-        assert (
-            "The bucket policies of the 1 training data bucket(s) were read; "
-            "none allows s3:GetObject to every principal with no condition."
-        ) in findings[0]["Finding_Details"]
+        assert self.NONE_OUTSIDE in findings[0]["Finding_Details"]
 
-    def test_br42_a_conditioned_open_bucket_grant_is_named_not_judged(self):
-        findings = self._run(
-            self._scoped_cache(),
-            training_data=self.ONE_TRAINING_BUCKET,
-            bucket_policies={
-                "policies": {
-                    "train-a": self._policy(
-                        Principal="*",
-                        Condition={"StringEquals": {"aws:SourceVpce": "vpce-1"}},
-                    )
+    # IAM-01: a conditioned every-principal grant was listed as "not evaluated"
+    # and the row passed, and a grant to another account was never judged.
+    @pytest.mark.parametrize(
+        "condition, shown",
+        [
+            (
+                {"StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+                "StringEquals aws:principalaccount 123456789012",
+            ),
+            (
+                {"StringEquals": {"aws:PrincipalOrgID": "o-abcdefghij"}},
+                "StringEquals aws:principalorgid o-abcdefghij",
+            ),
+            (
+                {
+                    "ArnLike": {
+                        "aws:PrincipalArn": "arn:aws:iam::123456789012:role/Train*"
+                    },
+                    "StringEquals": {"aws:SourceVpce": "vpce-1"},
                 },
-                "errors": [],
-            },
+                "ArnLike aws:principalarn arn:aws:iam::123456789012:role/Train*",
+            ),
+        ],
+    )
+    def test_br42_an_open_grant_bounded_to_this_account_passes(self, condition, shown):
+        findings = self._bucket_run(
+            ("train-a", {"Principal": "*", "Condition": condition})
         )
         assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert self.NONE_OUTSIDE in details
         assert (
-            "Statement 'Read' on bucket 'train-a' allows s3:GetObject to every "
-            "principal under a StringEquals aws:SourceVpce condition, which is "
-            "not evaluated."
-        ) in findings[0]["Finding_Details"]
+            f"Statement 'Read' on bucket 'train-a' allows s3:GetObject to every "
+            f"principal only under {shown}, which limits it to this account or its "
+            "organization."
+        ).lower() in details.lower()
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+            {"StringEqualsIfExists": {"aws:PrincipalAccount": "123456789012"}},
+            {"ForAllValues:StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+            {"StringNotEquals": {"aws:PrincipalAccount": "999999999999"}},
+            {"StringLike": {"aws:PrincipalAccount": "12345678901*"}},
+            {"ArnLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Trainer"}},
+            {"StringLike": {"aws:PrincipalOrgID": "o-*"}},
+        ],
+    )
+    def test_br42_an_open_grant_under_a_condition_naming_no_account_fails(
+        self, condition
+    ):
+        findings = self._bucket_run(
+            ("train-a", {"Principal": "*", "Condition": condition})
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "Training data bucket 'train-a' (the training data of customization "
+            "job 'j1') has bucket policy grants that let principals outside this "
+            "account's identity policies read the training data: Statement 'Read' "
+            "on bucket 'train-a' allows s3:GetObject to every principal under a "
+        ) in failed[0]["Finding_Details"]
+        assert (
+            "condition that names no account or organization of the caller"
+            in failed[0]["Finding_Details"]
+        )
+        assert self.NONE_OUTSIDE not in findings[-1]["Finding_Details"]
+        assert (
+            "the Failed rows name the grants on 'train-a' of them"
+            in findings[-1]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "statement, foreign",
+        [
+            (
+                {
+                    "Principal": {
+                        "AWS": [
+                            "arn:aws:iam::123456789012:role/Trainer",
+                            "arn:aws:iam::999999999999:root",
+                        ]
+                    }
+                },
+                "principals of account(s) 999999999999, outside this account",
+            ),
+            (
+                {"Principal": {"AWS": "999999999999"}},
+                "principals of account(s) 999999999999, outside this account",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalAccount": ["123456789012", "999999999999"]
+                        }
+                    },
+                },
+                "admits the principals of account(s) 999999999999 outside this account",
+            ),
+        ],
+    )
+    def test_br42_a_grant_to_another_account_fails(self, statement, foreign):
+        findings = self._bucket_run(("train-a", statement))
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert foreign in failed[0]["Finding_Details"]
+        assert "account(s) 123456789012" not in failed[0]["Finding_Details"]
+
+    def test_br42_only_the_bad_bucket_of_two_is_named(self):
+        two = {
+            "buckets": {
+                "train-a": ["the training data of customization job 'j1'"],
+                "train-b": ["the training data of customization job 'j2'"],
+            },
+            "errors": [],
+            "truncated": [],
+            "regions": ["us-east-1"],
+        }
+        findings = self._bucket_run(
+            ("train-a", {"Principal": {"AWS": "arn:aws:iam::123456789012:root"}}),
+            ("train-b", {"Principal": {"AWS": "arn:aws:iam::999999999999:root"}}),
+            training_data=two,
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "'train-b'" in failed[0]["Finding_Details"]
+        assert "'train-a'" not in failed[0]["Finding_Details"]
+        assert (
+            "the Failed rows name the grants on 'train-b' of them"
+            in findings[-1]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Principal": {"AWS": "arn:aws:iam::123456789012:role/Trainer"}},
+            {
+                "Principal": "*",
+                "Condition": {"StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+            },
+        ],
+    )
+    def test_br42_an_unread_account_id_withholds_the_pass(self, statement):
+        findings = self._bucket_run(("train-a", statement), account=None)
+        assert "Passed" not in [f["Status"] for f in findings]
+        assert "this account's ID was not read" in " ".join(
+            f["Finding_Details"] for f in findings
+        )
 
     def test_br42_an_unread_training_bucket_policy_withholds_passed(self):
         findings = self._run(
@@ -10104,6 +10936,7 @@ class TestBR42ModelAllowList:
             return {"Policy": '{"Statement": []}'}
 
         s3.get_bucket_policy.side_effect = get_policy
+        s3.get_caller_identity.return_value = {"Account": "123456789012"}
         with patch.object(bedrock_app.boto3, "client", return_value=s3):
             result = bedrock_app._training_bucket_policies(
                 {"read": [], "no-policy": [], "denied": []}
@@ -10111,6 +10944,20 @@ class TestBR42ModelAllowList:
         assert result["policies"] == {"read": '{"Statement": []}', "no-policy": None}
         assert result["errors"] == [
             "bucket 'denied' policy was not read with s3:GetBucketPolicy (AccessDenied)"
+        ]
+        assert result["account"] == "123456789012"
+
+    def test_br42_an_unread_caller_identity_is_an_error_not_an_account(self):
+        client = MagicMock()
+        client.get_caller_identity.side_effect = _client_error(
+            "ExpiredToken", operation="GetCallerIdentity"
+        )
+        client.get_bucket_policy.return_value = {"Policy": '{"Statement": []}'}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            result = bedrock_app._training_bucket_policies({"read": []})
+        assert result["account"] is None
+        assert result["errors"] == [
+            "this account's ID was not read with sts:GetCallerIdentity (ExpiredToken)"
         ]
 
     def test_br42_named_arn_passes_while_wildcard_fails(self):
@@ -11063,6 +11910,11 @@ class TestBR43RegionInvocationControl:
         "bedrock:RetrieveAndGenerate",
         "bedrock-agentcore:InvokeAgentRuntime",
         "bedrock-mantle:CreateInference",
+        # ACC-02: a probe per service requires the Deny to cover each whole
+        # prefix, so the named actions alone no longer pass.
+        "bedrock:*",
+        "bedrock-agentcore:*",
+        "bedrock-mantle:*",
     ]
 
     @staticmethod
@@ -11235,6 +12087,35 @@ class TestBR43RegionInvocationControl:
         assert "UnrelatedDeny" not in findings[0]["Finding_Details"]
         assert "includes the literal 'unspecified'" in findings[0]["Finding_Details"]
 
+    # MDL-03: the allow-list that passes above is not credited in the management
+    # account, which service control policies never restrict.
+    @pytest.mark.parametrize(
+        "management, status", [(True, "Failed"), (False, "Passed")]
+    )
+    def test_br43_region_allow_list_is_not_credited_in_the_management_account(
+        self, management, status
+    ):
+        inventory = self._inventory(
+            [
+                (
+                    "ApprovedRegions",
+                    self._region_scp("StringNotEquals", ["us-east-1", "unspecified"]),
+                )
+            ]
+        )
+        inventory["management_account"] = management
+        inventory["account"] = "123456789012"
+        findings = self._run(inventory)
+
+        assert [f["Status"] for f in findings] == [status]
+        if management:
+            assert findings[0]["Severity"] == "Medium"
+            assert (
+                "this is the management account 123456789012, which service "
+                "control policies never restrict" in findings[0]["Finding_Details"]
+            )
+            assert "ApprovedRegions" in findings[0]["Finding_Details"]
+
     def test_br43_allow_list_without_the_global_literal_says_so(self):
         findings = self._run(
             self._inventory(
@@ -11324,10 +12205,18 @@ class TestBR43RegionInvocationControl:
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "222222222222" in findings[0]["Finding_Details"]
 
-    def test_br43_builds_its_own_inventory_when_not_given_one(self):
+    # MDL-03: this test used to pin Passed with the caller as the management
+    # account, which no service control policy restricts. It now pins Failed
+    # there, and a delegated administrator member account still passes.
+    @pytest.mark.parametrize(
+        "master, status",
+        [("123456789012", "Failed"), ("999999999999", "Passed")],
+        ids=["management-account", "delegated-administrator"],
+    )
+    def test_br43_builds_its_own_inventory_when_not_given_one(self, master, status):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
-            "Organization": {"MasterAccountId": "123456789012"}
+            "Organization": {"MasterAccountId": master}
         }
         org_client.list_policies.return_value = {
             "Policies": [{"Id": "p-1", "Name": "ApprovedRegions"}]
@@ -11364,10 +12253,14 @@ class TestBR43RegionInvocationControl:
                 bedrock_app.check_bedrock_region_invocation_control(region="Global")
             )
 
-        org_client.list_policies.assert_called_once_with(
-            MaxResults=20, Filter="SERVICE_CONTROL_POLICY"
+        # A delegated administrator also makes the one-item probe call.
+        assert (
+            org_client.list_policies.call_args_list.count(
+                call(MaxResults=20, Filter="SERVICE_CONTROL_POLICY")
+            )
+            == 1
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == [status]
 
     def test_br43_global_profile_passes_the_region_allow_list_when_unspecified_is_allowed(
         self,
@@ -11714,7 +12607,20 @@ class TestBR43RegionInvocationControl:
             in findings[0]["Finding_Details"]
         )
 
-    def test_br43_three_policies_cover_every_invoking_action_together(self):
+    # ACC-02: this test used to pass three policies that named only the nine
+    # listed actions. Those now fail for want of each whole service prefix,
+    # and the same three policies pass once they cover the prefixes too.
+    @pytest.mark.parametrize(
+        "prefixes, status",
+        [
+            ([], "Failed"),
+            (["bedrock:*", "bedrock-agentcore:*", "bedrock-mantle:*"], "Passed"),
+        ],
+        ids=["named-actions-only", "whole-prefixes"],
+    )
+    def test_br43_three_policies_cover_every_invoking_action_together(
+        self, prefixes, status
+    ):
         findings = self._run(
             self._inventory(
                 [
@@ -11742,14 +12648,58 @@ class TestBR43RegionInvocationControl:
                             action=[
                                 "bedrock-agentcore:InvokeAgentRuntime",
                                 "bedrock-mantle:CreateInference",
-                            ],
+                            ]
+                            + prefixes,
                         ),
                     ),
                 ]
             )
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == [status]
+        if not prefixes:
+            detail = findings[0]["Finding_Details"]
+            assert (
+                "no credited allow-list covers bedrock:*, bedrock-agentcore:*, "
+                "bedrock-mantle:*, so those calls" in detail
+            )
+            assert "bedrock:invokemodel," not in detail.split("covers")[-1]
+
+    # ACC-02: a Deny on bedrock:Invoke* covers every listed bedrock action but
+    # not bedrock:CreateAgent, so it is not a whole-prefix Deny.
+    @pytest.mark.parametrize(
+        "bedrock_actions, status",
+        [
+            (["bedrock:Invoke*", "bedrock:*Job", "bedrock:Retrieve*"], "Failed"),
+            (["bedrock:*"], "Passed"),
+        ],
+        ids=["family-patterns", "whole-prefix"],
+    )
+    def test_br43_family_patterns_are_not_the_whole_bedrock_prefix(
+        self, bedrock_actions, status
+    ):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "Regions",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1", "unspecified"],
+                            action=bedrock_actions
+                            + ["bedrock-agentcore:*", "bedrock-mantle:*"],
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        if status == "Failed":
+            assert (
+                "no credited allow-list covers bedrock:*, so"
+                in findings[0]["Finding_Details"]
+            )
 
     def test_br43_allow_list_missing_agentcore_runtime_fails(self):
         findings = self._run(
@@ -12387,13 +13337,61 @@ class TestBR43AIServiceRegionControl:
 
         assert [f["Status"] for f in findings] == ["Passed"]
 
+    # MDL-03: the Control Tower Region deny that passes above is not credited in
+    # the management account, which service control policies never restrict.
+    @pytest.mark.parametrize(
+        "management, status", [(True, "Failed"), (False, "Passed")]
+    )
+    def test_region_deny_is_not_credited_in_the_management_account(
+        self, management, status
+    ):
+        inventory = TestBR43RegionInvocationControl._inventory(
+            [
+                (
+                    "aws-guardrails-RegionDeny",
+                    {
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "NotAction": ["iam:*", "sts:*"],
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringNotEquals": {
+                                        "aws:RequestedRegion": ["us-east-1"]
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+        inventory["management_account"] = management
+        inventory["account"] = "123456789012"
+        findings = extract_csv_data(
+            bedrock_app.check_ai_service_region_control(
+                region="Global", scp_inventory=inventory
+            )
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        if management:
+            detail = findings[0]["Finding_Details"]
+            assert (
+                "this is the management account 123456789012, which service "
+                "control policies never restrict" in detail
+            )
+            assert "aws-guardrails-RegionDeny" in detail
+
     def test_bedrock_only_allow_list_leaves_sagemaker_open(self):
         findings = self._run(
             [
                 (
                     "BedrockRegions",
                     TestBR43RegionInvocationControl._region_scp(
-                        "StringNotEquals", ["us-east-1"]
+                        "StringNotEquals",
+                        ["us-east-1"],
+                        action=TestBR43RegionInvocationControl.ALL_REGION_ACTIONS[:9],
                     ),
                 ),
                 (
@@ -12415,9 +13413,67 @@ class TestBR43AIServiceRegionControl:
             "sagemaker:invokeendpoint, sagemaker:invokeendpointasync, "
             "bedrock:createknowledgebase, bedrock:createmodelcustomizationjob, "
             "bedrock-agentcore:creatememory, s3:createbucket, "
-            "s3vectors:createvectorbucket, aoss:createcollection outside" in detail
+            "s3vectors:createvectorbucket, aoss:createcollection, sagemaker:*, "
+            "bedrock:*, bedrock-agentcore:*, s3:*, s3vectors:*, aoss:*, es:*, "
+            "rds:*, neptune-graph:*, kendra:* outside" in detail
         )
         assert "sagemaker:createtrainingjob," not in detail
+
+    # DAT-04: a Deny naming all thirteen listed actions used to pass. It now
+    # fails, because es:CreateDomain, rds:CreateDBCluster or
+    # sagemaker:CreateFeatureGroup can still create a store in any Region, and
+    # a Deny over each whole prefix passes.
+    @pytest.mark.parametrize(
+        "extra, status",
+        [
+            ([], "Failed"),
+            (
+                [
+                    "sagemaker:*",
+                    "bedrock:*",
+                    "bedrock-agentcore:*",
+                    "s3:*",
+                    "s3vectors:*",
+                    "aoss:*",
+                    "es:*",
+                    "rds:*",
+                    "neptune-graph:*",
+                    "kendra:*",
+                ],
+                "Passed",
+            ),
+        ],
+        ids=["listed-actions-only", "whole-prefixes"],
+    )
+    def test_listed_actions_alone_leave_each_service_prefix_open(self, extra, status):
+        listed = [
+            action.replace("create", "Create").replace("invoke", "Invoke")
+            for action in bedrock_app.AI_SERVICE_REGION_ACTIONS
+            if not action.endswith(bedrock_app.REGION_SERVICE_PROBE)
+        ]
+        assert len(listed) == 13
+        findings = self._run(
+            [
+                (
+                    "ListedRegions",
+                    TestBR43RegionInvocationControl._region_scp(
+                        "StringNotEquals", ["us-east-1"], action=listed + extra
+                    ),
+                )
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        detail = findings[0]["Finding_Details"]
+        if status == "Failed":
+            assert (
+                "denies sagemaker:*, bedrock:*, bedrock-agentcore:*, s3:*, "
+                "s3vectors:*, aoss:*, es:*, rds:*, neptune-graph:*, kendra:* "
+                "outside" in detail
+            )
+            assert "aoss:createcollection" not in detail.split(" outside")[0]
+        else:
+            assert "es:*, rds:*, neptune-graph:*, kendra:* outside" in detail
 
     def test_a_deny_on_the_first_four_actions_leaves_the_rest_open(self):
         """Endpoints, training, invocation and buckets are pinned, while
@@ -12639,9 +13695,18 @@ class TestBR44MarketplaceModelControl:
 
     PRODUCT_ID = "prod-abcdefghijklm"
 
-    def _run(self, cache):
+    # BR-42 results that block unapproved models at invocation. BR-44 passes
+    # only beside one, so tests of the subscription leg supply both.
+    BLOCKED = {
+        "allow_list_findings": {"invocation_open": [], "csv_data": []},
+        "org_allow_list_findings": {"csv_data": [{"Status": "Passed"}]},
+    }
+
+    def _run(self, cache, **kwargs):
         return extract_csv_data(
-            bedrock_app.check_bedrock_marketplace_model_control(cache, region="Global")
+            bedrock_app.check_bedrock_marketplace_model_control(
+                cache, region="Global", **{**self.BLOCKED, **kwargs}
+            )
         )
 
     def test_br44_product_condition_passes_while_bare_subscribe_fails(self):
@@ -13050,6 +14115,7 @@ class TestBR44MarketplaceModelControl:
             bedrock_app.check_bedrock_marketplace_model_control(
                 cache,
                 region="Global",
+                **self.BLOCKED,
                 scp_inventory=self._scp(self.SCP_ALLOW_LIST, self.SCP_NO_PRODUCT_DENY),
             )
         )
@@ -13067,7 +14133,10 @@ class TestBR44MarketplaceModelControl:
         )
         findings = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_model_control(
-                cache, region="Global", scp_inventory=self._scp(self.SCP_ALLOW_LIST)
+                cache,
+                region="Global",
+                scp_inventory=self._scp(self.SCP_ALLOW_LIST),
+                **self.BLOCKED,
             )
         )
 
@@ -13085,6 +14154,7 @@ class TestBR44MarketplaceModelControl:
                 ),
                 region="Global",
                 scp_inventory=inventory,
+                **self.BLOCKED,
             )
         )
 
@@ -13102,7 +14172,10 @@ class TestBR44MarketplaceModelControl:
         for statement in (deny_list, subscribe_only):
             findings = extract_csv_data(
                 bedrock_app.check_bedrock_marketplace_model_control(
-                    cache, region="Global", scp_inventory=self._scp(statement)
+                    cache,
+                    region="Global",
+                    scp_inventory=self._scp(statement),
+                    **self.BLOCKED,
                 )
             )
             assert [f["Status"] for f in findings] == ["Failed"]
@@ -13160,7 +14233,10 @@ class TestBR44MarketplaceModelControl:
         )
         findings = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_model_control(
-                cache, region="Global", scp_inventory=self._scp(self.OUTRIGHT_DENY)
+                cache,
+                region="Global",
+                scp_inventory=self._scp(self.OUTRIGHT_DENY),
+                **self.BLOCKED,
             )
         )
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -13173,7 +14249,10 @@ class TestBR44MarketplaceModelControl:
         )
         narrowed = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_model_control(
-                cache, region="Global", scp_inventory=self._scp(conditioned)
+                cache,
+                region="Global",
+                scp_inventory=self._scp(conditioned),
+                **self.BLOCKED,
             )
         )
         assert [f["Status"] for f in narrowed] == ["Failed", "Failed"]
@@ -13186,6 +14265,7 @@ class TestBR44MarketplaceModelControl:
                 _identity_cache(roles={"Scoped": [("S", self._scoped())]}),
                 region="Global",
                 scp_inventory=inventory,
+                **self.BLOCKED,
             )
         )
 
@@ -13226,10 +14306,157 @@ class TestBR44MarketplaceModelControl:
         details = findings[0]["Finding_Details"]
         assert "no cached identity can change the account's Marketplace" in details
         assert (
-            "this row does not establish that unapproved models cannot be used"
-            in details
+            "this row passes only when BR-42 also blocks unapproved models at "
+            "invocation" in details
         )
         assert "including the subscription Bedrock makes" not in details
+
+    # MDL-04: the Bedrock user guide says "Denying aws-marketplace:Subscribe
+    # alone will not block the first model invocation", so a Subscribe bound
+    # passes only beside a BR-42 block on invocation.
+    OPEN_BR42 = {
+        "allow_list_findings": {"invocation_open": ["role 'Invoker'"], "csv_data": []},
+        "org_allow_list_findings": {"csv_data": [{"Status": "Failed"}]},
+    }
+
+    def _deny_only_cache(self):
+        return _identity_cache(
+            roles={
+                "Guarded": [
+                    (
+                        "G",
+                        {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "aws-marketplace:*",
+                                    "Resource": "*",
+                                },
+                                dict(self.SCP_ALLOW_LIST),
+                                dict(self.SCP_NO_PRODUCT_DENY),
+                            ],
+                        },
+                    )
+                ]
+            }
+        )
+
+    def test_br44_a_subscribe_deny_alone_fails_without_an_invocation_block(self):
+        findings = self._run(self._deny_only_cache(), **self.OPEN_BR42)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "role 'Guarded'" in details
+        assert bedrock_app.MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE in details
+        assert "role 'Invoker' can invoke any model" in details
+        assert "no attached service control policy denies invoking" in details
+        assert findings[0]["Severity"] == "High"
+        assert "bedrock:InvokeModel" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "leg, blocked",
+        [
+            (
+                "allow_list_findings",
+                {"invocation_open": [], "csv_data": []},
+            ),
+            (
+                "org_allow_list_findings",
+                {"csv_data": [{"Status": "Passed"}, {"Status": "Passed"}]},
+            ),
+        ],
+    )
+    def test_br44_either_br42_leg_blocking_invocation_passes(self, leg, blocked):
+        findings = self._run(
+            self._deny_only_cache(), **{**self.OPEN_BR42, leg: blocked}
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "Unapproved models are also blocked at invocation"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "BR-42 identity allow-list" in findings[0]["Finding_Details"] or (
+            "BR-42 organization allow-list" in findings[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "org_rows",
+        [
+            [{"Status": "Passed"}, {"Status": "Failed"}],
+            [{"Status": "Passed"}, {"Status": "N/A"}],
+        ],
+    )
+    def test_br44_an_org_leg_with_any_non_passed_row_does_not_block(self, org_rows):
+        findings = self._run(
+            self._deny_only_cache(),
+            **{**self.OPEN_BR42, "org_allow_list_findings": {"csv_data": org_rows}},
+        )
+        assert [f["Status"] for f in findings] != ["Passed"]
+
+    def test_br44_an_unread_br42_leg_is_na_not_passed_or_failed(self):
+        for unread in (
+            {"allow_list_findings": None},
+            {"allow_list_findings": {"csv_data": []}},
+            {"org_allow_list_findings": None},
+            {"org_allow_list_findings": {"csv_data": [{"Status": "N/A"}]}},
+        ):
+            findings = self._run(
+                self._deny_only_cache(), **{**self.OPEN_BR42, **unread}
+            )
+            assert [f["Status"] for f in findings] == ["N/A"], unread
+            assert (
+                "blocked at invocation was not read" in (findings[0]["Finding_Details"])
+            )
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                self._deny_only_cache(), region="Global"
+            )
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_br44_the_no_grant_row_is_gated_on_br42_too(self):
+        cache = _identity_cache(
+            roles={"Reader": [("R", _allow("bedrock:ListFoundationModels", "*"))]}
+        )
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = []
+        findings = self._run(cache, **self.OPEN_BR42)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            bedrock_app.MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE
+            in (findings[0]["Finding_Details"])
+        )
+
+    def test_br44_credits_a_product_test_on_subscribe_per_the_user_guide(self):
+        # The service authorization reference lists no condition key on
+        # Subscribe; the Bedrock user guide says aws-marketplace:ProductId
+        # restricts it, and that is followed.
+        for statement, bound in (
+            (dict(self.SCP_ALLOW_LIST, Action="aws-marketplace:Subscribe"), True),
+            (
+                _allow(
+                    "aws-marketplace:Subscribe",
+                    "*",
+                    {
+                        "ForAnyValue:StringEquals": {
+                            "aws-marketplace:ProductId": [self.PRODUCT_ID]
+                        }
+                    },
+                )["Statement"][0],
+                True,
+            ),
+            (_allow("aws-marketplace:Subscribe", "*")["Statement"][0], False),
+        ):
+            binding = bedrock_app._marketplace_statement_binding(statement, True)
+            assert binding["bound"] is bound, statement
+
+    def test_br44_view_subscriptions_text_says_why_it_is_not_judged(self):
+        findings = self._run(_identity_cache(roles={"Scoped": [("S", self._scoped())]}))
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "aws-marketplace:ViewSubscriptions is not judged: it lists "
+            "subscriptions and grants no model" in findings[0]["Finding_Details"]
+        )
 
     def test_br44_schema_valid(self):
         findings = self._run(
@@ -14333,7 +15560,14 @@ class TestBR46KnowledgeBaseSourceClassification:
         pii_jobs_error=None,
         batch_jobs=(),
         batch_error=None,
+        s3_objects=None,
+        s3_list_error=None,
+        s3_get_error=None,
     ):
+        """
+        ``s3_objects`` maps a bucket to {key: (LastModified, body)}; a body of
+        None is an object whose content the test never reads.
+        """
         agent_client = MagicMock()
         ingestion_jobs = ingestion_jobs or {}
         ingestion_pages = ingestion_pages or {}
@@ -14470,6 +15704,36 @@ class TestBR46KnowledgeBaseSourceClassification:
         )
         self.sagemaker_client = sagemaker_client
 
+        s3_client = MagicMock()
+        s3_objects = s3_objects or {}
+        self.s3_gets = []
+
+        def paginate(Bucket, Prefix):
+            if s3_list_error:
+                raise s3_list_error
+            yield {
+                "Contents": [
+                    {"Key": key, "LastModified": modified}
+                    for key, (modified, _) in sorted(
+                        (s3_objects.get(Bucket) or {}).items()
+                    )
+                    if key.startswith(Prefix)
+                ]
+            }
+
+        def get_object(Bucket, Key):
+            self.s3_gets.append(Key)
+            if s3_get_error:
+                raise s3_get_error
+            return {"Body": io.BytesIO(s3_objects[Bucket][Key][1])}
+
+        s3_paginator = MagicMock()
+        s3_paginator.paginate.side_effect = paginate
+        s3_client.get_paginator.side_effect = lambda operation: {
+            "list_objects_v2": s3_paginator
+        }[operation]
+        s3_client.get_object.side_effect = get_object
+
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
@@ -14478,6 +15742,7 @@ class TestBR46KnowledgeBaseSourceClassification:
                 "macie2": macie_client,
                 "sagemaker": sagemaker_client,
                 "comprehend": comprehend_client,
+                "s3": s3_client,
             }[service],
         ):
             return extract_csv_data(
@@ -14549,7 +15814,7 @@ class TestBR46KnowledgeBaseSourceClassification:
         return [f for f in findings if f["Status"] == status]
 
     def test_br46_monitored_and_unmonitored_buckets_discriminate(self):
-        """MONITORED without a job fails; a job over a NOT_MONITORED bucket passes."""
+        """MONITORED without a job fails; a job over a NOT_MONITORED bucket fails too."""
         findings = self._two_bucket_estate(
             macie_buckets=[
                 self._bucket("support-bucket", sensitivityScore=42),
@@ -14559,18 +15824,86 @@ class TestBR46KnowledgeBaseSourceClassification:
         )
 
         failed = self._status(findings, "Failed")
-        passed = self._status(findings, "Passed")
-        assert len(failed) == 1
+        assert len(failed) == 2
         assert failed[0]["Check_ID"] == "BR-46"
         assert "(bucket support-bucket)" in failed[0]["Finding_Details"]
         assert "reports MONITORED" in failed[0]["Finding_Details"]
         assert "samples objects" in failed[0]["Finding_Details"]
+        assert (
+            "data source 'hr-docs' in knowledge base 'hr-kb' (bucket hr-bucket) is "
+            "classified by scheduled Macie job 'nightly-hr'"
+        ) in failed[1]["Finding_Details"]
+        assert (
+            "but automated sensitive data discovery does not monitor the bucket: its "
+            "automatedDiscoveryMonitoringStatus is NOT_MONITORED"
+            in failed[1]["Finding_Details"]
+        )
+        assert "Enable automated sensitive data discovery" in failed[1]["Resolution"]
+        assert not self._status(findings, "Passed")
+
+    def test_br46_a_job_over_a_monitored_bucket_passes(self):
+        findings = self._two_bucket_estate(
+            macie_buckets=[
+                self._bucket("support-bucket", sensitivityScore=42),
+                self._bucket("hr-bucket"),
+            ],
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
+        )
+
+        passed = self._status(findings, "Passed")
         assert len(passed) == 1
         assert (
             "data source 'hr-docs' in knowledge base 'hr-kb' (bucket hr-bucket) is "
             "classified by scheduled Macie job 'nightly-hr'"
         ) in passed[0]["Finding_Details"]
         assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert (
+            "Automated sensitive data discovery is ENABLED and reports each of these "
+            "buckets MONITORED" in passed[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "overrides, text",
+        [
+            (
+                {
+                    "discovery_error": ClientError(
+                        {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                        "GetAutomatedDiscoveryConfiguration",
+                    )
+                },
+                "whether automated sensitive data discovery monitors the bucket was "
+                "not read: the automated sensitive data discovery configuration "
+                "could not be read",
+            ),
+            (
+                {"hr_status": None},
+                "whether automated sensitive data discovery monitors the bucket was "
+                "not read: DescribeBuckets returned no "
+                "automatedDiscoveryMonitoringStatus",
+            ),
+        ],
+    )
+    def test_br46_an_unread_discovery_state_withholds_the_pass(self, overrides, text):
+        hr_status = overrides.pop("hr_status", "MONITORED")
+        hr_bucket = (
+            self._bucket("hr-bucket", hr_status)
+            if hr_status
+            else {"bucketName": "hr-bucket"}
+        )
+        findings = self._two_bucket_estate(
+            macie_buckets=[self._bucket("support-bucket"), hr_bucket],
+            classification_jobs=[self._job("nightly", ["support-bucket", "hr-bucket"])],
+            **overrides,
+        )
+
+        assert not self._status(findings, "Failed")
+        assert not [
+            f
+            for f in self._status(findings, "Passed")
+            if "(bucket hr-bucket)" in f["Finding_Details"]
+        ]
+        assert any(text in f["Finding_Details"] for f in self._status(findings, "N/A"))
 
     def test_br46_monitored_account_bucket_no_knowledge_base_uses_is_not_counted(self):
         """The Macie inventory is wider than the source set on any real account."""
@@ -14711,13 +16044,18 @@ class TestBR46KnowledgeBaseSourceClassification:
         )
 
         failed = self._status(findings, "Failed")
-        assert len(failed) == 1
+        assert len(failed) == 2
         assert "(bucket support-bucket)" in failed[0]["Finding_Details"]
         assert (
             "not in effect: automated sensitive data discovery is DISABLED"
             in failed[0]["Finding_Details"]
         )
-        assert len(self._status(findings, "Passed")) == 1
+        assert "(bucket hr-bucket)" in failed[1]["Finding_Details"]
+        assert (
+            "does not monitor the bucket: automated sensitive data discovery is "
+            "DISABLED" in failed[1]["Finding_Details"]
+        )
+        assert not self._status(findings, "Passed")
 
     def test_br46_bucket_error_code_is_indeterminate_not_failed(self):
         findings = self._two_bucket_estate(
@@ -14868,7 +16206,7 @@ class TestBR46KnowledgeBaseSourceClassification:
         findings = self._two_bucket_estate(
             macie_buckets=[
                 self._bucket("support-bucket"),
-                self._bucket("hr-bucket", "NOT_MONITORED"),
+                self._bucket("hr-bucket"),
             ],
             classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
         )
@@ -14890,7 +16228,7 @@ class TestBR46ClassificationJobCoverage:
         },
         {
             "bucketName": "hr-bucket",
-            "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+            "automatedDiscoveryMonitoringStatus": "MONITORED",
         },
     ]
 
@@ -14938,7 +16276,26 @@ class TestBR46ClassificationJobCoverage:
         assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
         assert "(bucket hr-bucket)" not in passed[0]["Finding_Details"]
 
-    def test_br46_scheduled_job_clears_an_unmonitored_bucket(self):
+    def test_br46_scheduled_job_alone_does_not_clear_an_unmonitored_bucket(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            macie_buckets=[
+                self._BUCKETS[0],
+                dict(
+                    self._BUCKETS[1], automatedDiscoveryMonitoringStatus="NOT_MONITORED"
+                ),
+            ],
+        )
+        self._hr_fails_because(
+            findings,
+            "is classified by scheduled Macie job 'nightly-hr' (IDLE",
+        )
+        assert (
+            "automatedDiscoveryMonitoringStatus is NOT_MONITORED"
+            in self._hr_rows(findings, "Failed")[0]["Finding_Details"]
+        )
+
+    def test_br46_scheduled_job_clears_a_monitored_bucket(self):
         findings = self._run([self._job("nightly-hr")])
 
         assert not [f for f in findings if f["Status"] == "Failed"]
@@ -15158,18 +16515,25 @@ class TestBR46ClassificationJobCoverage:
             "job was created at 2026-08-15T00:00:00Z",
         )
 
-    def test_br46_ingestion_after_the_last_run_is_na_and_says_so(self):
-        """The latest ingestion started after the job's last run, so an object
-        written between the two may have been ingested unclassified."""
+    # hr's job last ran 2026-09-01 and its latest ingestion started 2026-09-10.
+    HR_OBJECTS = {
+        "hr-bucket": {
+            "old.pdf": ("2026-08-25T00:00:00Z", None),
+            "between.pdf": ("2026-09-05T00:00:00Z", None),
+            "later.pdf": ("2026-09-12T00:00:00Z", None),
+        }
+    }
+
+    def test_br46_an_object_written_between_the_last_run_and_ingestion_fails(self):
+        """The object written between the two was ingested unclassified. This
+        case was N/A when object write times were not read; it now fails."""
         findings = self._run(
             [self._job("nightly-hr")],
             {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
             ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
+            s3_objects=self.HR_OBJECTS,
         )
-        assert not [f for f in findings if f["Status"] == "Failed"]
-        passed = [f for f in findings if f["Status"] == "Passed"]
-        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
-        details = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        details = self._hr_rows(findings, "Failed")[0]["Finding_Details"]
         assert (
             "the first ingestion job started at 2026-08-20T00:00:00Z, after the job "
             "was created" in details
@@ -15178,7 +16542,172 @@ class TestBR46ClassificationJobCoverage:
             "the latest ingestion job started at 2026-09-10T00:00:00Z, after the "
             "last run" in details
         )
-        assert "object write times are not read" in details
+        assert "1 object(s) were written between the two" in details
+        assert "between.pdf" in details
+        assert "old.pdf" not in details and "later.pdf" not in details
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+
+    def test_br46_no_object_written_between_the_last_run_and_ingestion_passes(self):
+        objects = {"hr-bucket": dict(self.HR_OBJECTS["hr-bucket"])}
+        del objects["hr-bucket"]["between.pdf"]
+        objects["hr-bucket"]["old.pdf.metadata.json"] = (
+            "2026-08-25T00:00:00Z",
+            self._sidecar({"tier": "x"}),
+        )
+        objects["hr-bucket"]["later.pdf.metadata.json"] = (
+            "2026-09-12T00:00:00Z",
+            self._sidecar({"tier": "x"}),
+        )
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
+            s3_objects=objects,
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "2 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert (
+            "none of the 4 object(s) listed was written between the two"
+            in passed[0]["Finding_Details"]
+        )
+
+    def test_br46_unlisted_objects_after_the_last_run_are_na_and_say_so(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
+            s3_list_error=_make_client_error("AccessDenied"),
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        details = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert "object write times were not read" in details
+        assert "(s3:ListBucket on s3://hr-bucket, AccessDenied)" in details
+
+    def test_br46_a_customization_job_after_the_last_run_reads_unclassified(self):
+        """A customization job is a read too: an object written after the last
+        run and before the job started was read unclassified."""
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            customization_jobs={
+                "tune": {
+                    "jobName": "tune",
+                    "creationTime": "2026-09-10T00:00:00Z",
+                    "trainingDataConfig": {"s3Uri": "s3://hr-bucket/train/"},
+                    "outputDataConfig": {"s3Uri": "s3://out-bucket/"},
+                }
+            },
+            s3_objects={
+                "hr-bucket": {
+                    "train/new.jsonl": ("2026-09-05T00:00:00Z", None),
+                    "train/old.jsonl": ("2026-08-05T00:00:00Z", None),
+                }
+            },
+        )
+        failed = [
+            f["Finding_Details"]
+            for f in findings
+            if f["Status"] == "Failed"
+            and "customization job 'tune'" in f["Finding_Details"]
+        ]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert "train/new.jsonl" in failed[0]
+        assert "train/old.jsonl" not in failed[0]
+
+    @staticmethod
+    def _sidecar(attributes):
+        return json.dumps({"metadataAttributes": attributes}).encode()
+
+    def test_br46_a_document_without_a_metadata_sidecar_fails(self):
+        objects = {
+            "hr-bucket": {
+                "a.pdf": ("2026-08-01T00:00:00Z", None),
+                "a.pdf.metadata.json": (
+                    "2026-08-01T00:00:00Z",
+                    self._sidecar({"classification": "PII"}),
+                ),
+                "b.pdf": ("2026-08-01T00:00:00Z", None),
+                "c.pdf": ("2026-08-01T00:00:00Z", None),
+                "c.pdf.metadata.json": ("2026-08-01T00:00:00Z", self._sidecar({})),
+                "folder/": ("2026-08-01T00:00:00Z", None),
+            }
+        }
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+        )
+        failed = self._hr_rows(findings, "Failed")
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert failed[0]["Severity"] == "Medium"
+        detail = failed[0]["Finding_Details"]
+        assert "1 of its 3 document(s) have no .metadata.json sidecar (b.pdf)" in detail
+        assert "1 sidecar(s) hold no metadataAttributes (c.pdf.metadata.json)" in detail
+        assert "a.pdf," not in detail and "folder/" not in detail
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert "(bucket hr-bucket)" not in passed[0]["Finding_Details"]
+
+    def test_br46_every_document_with_a_labelled_sidecar_passes(self):
+        objects = {
+            "hr-bucket": {
+                key: ("2026-08-01T00:00:00Z", self._sidecar({"tier": "x"}))
+                for key in (
+                    "a.pdf",
+                    "a.pdf.metadata.json",
+                    "b.txt",
+                    "b.txt.metadata.json",
+                )
+            }
+        }
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            "each of its 2 document(s) has a .metadata.json sidecar with "
+            "metadataAttributes" in passed[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize("unread", ["get_error", "cap"])
+    def test_br46_an_unread_sidecar_is_na_not_passed(self, unread, monkeypatch):
+        objects = {
+            "hr-bucket": {
+                key: ("2026-08-01T00:00:00Z", self._sidecar({"tier": "x"}))
+                for key in (
+                    "a.pdf",
+                    "a.pdf.metadata.json",
+                    "b.txt",
+                    "b.txt.metadata.json",
+                )
+            }
+        }
+        kwargs = {}
+        if unread == "cap":
+            monkeypatch.setattr(bedrock_app, "METADATA_SIDECAR_READ_CAP", 1)
+        else:
+            kwargs["s3_get_error"] = _make_client_error("AccessDenied")
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            s3_objects=objects,
+            **kwargs,
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        detail = self._hr_rows(findings, "N/A")[0]["Finding_Details"]
+        assert "not every .metadata.json sidecar was read" in detail
+        assert (
+            "past the first 1" if unread == "cap" else "(s3:GetObject, AccessDenied)"
+        ) in detail
 
     def test_br46_an_incomplete_source_list_withholds_passed(self):
         findings = self._run(
@@ -15285,7 +16814,13 @@ class TestBR46ClassificationJobCoverage:
                 "job-nightly-hr": self._detail(createdAt=self.CREATED),
                 "job-train-a": self._detail(createdAt=self.CREATED),
             },
-            macie_buckets=self._BUCKETS + [{"bucketName": "train-a"}],
+            macie_buckets=self._BUCKETS
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                }
+            ],
             ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
             training_jobs={"tj-a": self._training_job("s3://train-a/data/")},
         )
@@ -15325,7 +16860,16 @@ class TestBR46ClassificationJobCoverage:
             [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
             {"job-train-a": self._detail(createdAt=self.CREATED)},
             macie_buckets=self._BUCKETS
-            + [{"bucketName": "train-a"}, {"bucketName": "train-b"}],
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "train-b",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+            ],
             training_jobs={"tj-a": job},
         )
         failed = [f for f in findings if f["Status"] == "Failed"]
@@ -15343,7 +16887,13 @@ class TestBR46ClassificationJobCoverage:
         findings = self._run(
             [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
             {"job-train-a": self._detail(createdAt=self.CREATED)},
-            macie_buckets=self._BUCKETS + [{"bucketName": "train-a"}],
+            macie_buckets=self._BUCKETS
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                }
+            ],
             training_jobs={
                 "tj-new": self._training_job(
                     "s3://train-a/data/", created="2026-08-20T00:00:00Z"
@@ -15407,7 +16957,16 @@ class TestBR46ClassificationJobCoverage:
             [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
             {"job-train-a": self._detail(createdAt=self.CREATED)},
             macie_buckets=self._BUCKETS
-            + [{"bucketName": "train-a"}, {"bucketName": "train-b"}],
+            + [
+                {
+                    "bucketName": "train-a",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "train-b",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+            ],
             training_jobs={
                 "tj-a": self._training_job("s3://train-a/data/"),
                 "tj-b": self._training_job("s3://train-b/data/"),
@@ -17932,13 +19491,50 @@ class TestKnowledgeBaseScreening:
         ]
 
     def _br26(
-        self, inventory, jobs=None, jobs_error=None, ingestions=None, objects=None
+        self,
+        inventory,
+        jobs=None,
+        jobs_error=None,
+        ingestions=None,
+        objects=None,
+        glue_jobs=(),
+        glue_jobs_error=None,
+        glue_runs=None,
+        glue_tables=None,
     ):
+        """
+        ``glue_runs`` maps a Glue job name to its (JobRunState, CompletedOn)
+        runs, newest first, or to an exception; ``glue_tables`` maps
+        (database, table) to an S3 location or an exception.
+        """
         client = MagicMock()
         client.list_guardrails.return_value = {"guardrails": []}
         ingestions = ingestions or {}
         objects = objects or {}
+        glue_runs = glue_runs or {}
+        glue_tables = glue_tables or {}
         self.listed_prefixes = []
+
+        def get_jobs():
+            if glue_jobs_error:
+                raise glue_jobs_error
+            yield {"Jobs": list(glue_jobs)}
+
+        def get_job_runs(JobName):
+            # One run per page, so a newer run on a later page is still read.
+            runs = glue_runs.get(JobName, [])
+            if isinstance(runs, Exception):
+                raise runs
+            for state, completed in runs:
+                yield {"JobRuns": [{"JobRunState": state, "CompletedOn": completed}]}
+
+        def get_table(DatabaseName, Name):
+            location = glue_tables[(DatabaseName, Name)]
+            if isinstance(location, Exception):
+                raise location
+            return {"Table": {"StorageDescriptor": {"Location": location}}}
+
+        client.get_table.side_effect = get_table
 
         def list_objects(Bucket, Prefix):
             self.listed_prefixes.append((Bucket, Prefix))
@@ -17952,6 +19548,10 @@ class TestKnowledgeBaseScreening:
             paginator = MagicMock()
             if name == "list_objects_v2":
                 paginator.paginate.side_effect = list_objects
+            if name == "get_jobs":
+                paginator.paginate.side_effect = get_jobs
+            if name == "get_job_runs":
+                paginator.paginate.side_effect = get_job_runs
             return paginator
 
         client.get_paginator.side_effect = get_paginator
@@ -18362,6 +19962,177 @@ class TestKnowledgeBaseScreening:
             in rows[0]["Finding_Details"]
         )
         assert "data source 'whole' (S3)" in rows[1]["Finding_Details"]
+
+    @staticmethod
+    def _glue_job(name, target, pii_type="RowMasking", bypass=False):
+        """
+        A visual job reading one S3 source through a PIIDetection node into
+        ``target``; ``bypass`` adds a second, unmasked path into the target.
+        """
+        nodes = {
+            "src": {"S3CsvSource": {"Name": "raw", "Paths": ["s3://raw/"]}},
+            "pii": {
+                "PIIDetection": {
+                    "Name": "detect",
+                    "Inputs": ["src"],
+                    "PiiType": pii_type,
+                    "EntityTypesToDetect": ["EMAIL", "USA_SSN"],
+                }
+            },
+            "out": {next(iter(target)): dict(next(iter(target.values())))},
+        }
+        nodes["out"][next(iter(target))]["Inputs"] = (
+            ["pii", "src"] if bypass else ["pii"]
+        )
+        return {"Name": name, "CodeGenConfigurationNodes": nodes}
+
+    GLUE_DONE = [("SUCCEEDED", "2026-09-01T00:00:00Z")]
+
+    def _glue_estate(self, glue_jobs, glue_runs=None, glue_tables=None, **kwargs):
+        return self._br26(
+            self._inventory(
+                [
+                    self._kb(
+                        f"kb-{name}",
+                        [self._source(name, bucket=name, prefixes=["clean/2026/"])],
+                    )
+                    for name in ("a", "b")
+                ]
+            ),
+            ingestions={"a": ["2026-09-02T00:00:00Z"], "b": ["2026-09-02T00:00:00Z"]},
+            glue_jobs=glue_jobs,
+            glue_runs=glue_runs or {job["Name"]: self.GLUE_DONE for job in glue_jobs},
+            glue_tables=glue_tables,
+            **kwargs,
+        )
+
+    def test_br26_a_glue_masking_job_credits_only_the_source_it_writes(self):
+        rows = self._glue_estate(
+            [self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}})]
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "knowledge base 'kb-a'" in details
+        assert (
+            "ingests only the output of AWS Glue job 'mask-a' (s3://a/clean), every "
+            "path into whose S3 target passes a PIIDetection node with PiiType "
+            "RowMasking over entity type(s) EMAIL, USA_SSN, and whose newest "
+            "SUCCEEDED run completed before the latest ingestion job started" in details
+        )
+        assert "whether those entity types cover the PII" in details
+        assert "knowledge base 'kb-b'" in rows[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "job",
+        [
+            {"pii_type": "ColumnAudit"},
+            {"pii_type": "RowAudit"},
+            {"bypass": True},
+        ],
+        ids=["column-audit", "row-audit", "unmasked-second-path"],
+    )
+    def test_br26_a_glue_job_that_does_not_mask_every_path_is_not_credited(self, job):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean/"}}),
+                self._glue_job(
+                    "mask-b", {"S3DirectTarget": {"Path": "s3://b/clean/"}}, **job
+                ),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "AWS Glue job 'mask-b'" not in rows[1]["Finding_Details"]
+
+    def test_br26_a_glue_path_is_a_folder_not_a_name_prefix(self):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}}),
+                self._glue_job("mask-b", {"S3DirectTarget": {"Path": "s3://b/cle"}}),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+
+    def test_br26_a_glue_catalog_target_resolves_through_get_table(self):
+        rows = self._glue_estate(
+            [
+                self._glue_job(
+                    "mask-a", {"S3CatalogTarget": {"Database": "d", "Table": "ta"}}
+                ),
+                self._glue_job(
+                    "mask-b", {"CatalogTarget": {"Database": "d", "Table": "tb"}}
+                ),
+            ],
+            glue_tables={
+                ("d", "ta"): "s3://a/clean/",
+                ("d", "tb"): _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "AWS Glue job 'mask-a' (s3://a/clean/)" in rows[0]["Finding_Details"]
+        assert (
+            "the S3 location of Glue job 'mask-b' target table d.tb was not read "
+            "with glue:GetTable" in rows[1]["Finding_Details"]
+        )
+        assert "is not failed" not in rows[1]["Finding_Details"]
+
+    def test_br26_a_glue_run_after_the_ingestion_or_none_succeeded_is_not_credited(
+        self,
+    ):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}}),
+                self._glue_job("mask-b", {"S3DirectTarget": {"Path": "s3://b/clean"}}),
+            ],
+            glue_runs={
+                "mask-a": [("SUCCEEDED", "2026-09-03T00:00:00Z")],
+                "mask-b": [("FAILED", "2026-08-30T00:00:00Z")],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+
+    def test_br26_the_newest_succeeded_glue_run_is_the_one_judged(self):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}}),
+                self._glue_job("mask-b", {"S3DirectTarget": {"Path": "s3://b/clean"}}),
+            ],
+            glue_runs={
+                "mask-a": [
+                    ("FAILED", "2026-09-05T00:00:00Z"),
+                    ("SUCCEEDED", "2026-08-01T00:00:00Z"),
+                    ("SUCCEEDED", "2026-09-01T00:00:00Z"),
+                ],
+                "mask-b": [
+                    ("SUCCEEDED", "2026-08-01T00:00:00Z"),
+                    ("SUCCEEDED", "2026-09-03T00:00:00Z"),
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "completed at" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kwargs, text",
+        [
+            (
+                {"glue_jobs_error": _make_client_error("AccessDeniedException")},
+                "AWS Glue jobs were not read with glue:GetJobs",
+            ),
+            (
+                {"glue_runs": {"mask-a": _make_client_error("ThrottlingException")}},
+                "the runs of Glue job 'mask-a' were not read with glue:GetJobRuns",
+            ),
+        ],
+        ids=["get-jobs", "get-job-runs"],
+    )
+    def test_br26_an_unread_glue_job_withholds_the_failure(self, kwargs, text):
+        rows = self._glue_estate(
+            [self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}})],
+            **kwargs,
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        for row in rows:
+            assert text in row["Finding_Details"]
 
     def _redacted_estate(self, objects):
         return self._br26(
@@ -19123,6 +20894,54 @@ class TestDeployedGuardrailVersions:
         rows = self._rows(result, "Guardrail Sensitive Information Filter Check")
         assert rows[0]["Status"] == "Failed"
         assert "no custom regex blocks or masks secrets" in rows[0]["Finding_Details"]
+
+    # GRD-03: a secrets regex that acts on the output only used to pass, so a
+    # credential the built-in types do not name went to the model on input.
+    @pytest.mark.parametrize(
+        "input_action, status", [("NONE", "Failed"), ("ANONYMIZE", "Passed")]
+    )
+    def test_br26_a_secrets_regex_must_act_on_the_input(self, input_action, status):
+        policy = dict(
+            self.GOOD_PII,
+            regexes=[
+                {
+                    "name": "api-key",
+                    "pattern": "key_[0-9a-f]{40}",
+                    "inputAction": input_action,
+                    "outputAction": "BLOCK",
+                }
+            ],
+        )
+        result = self._pii(
+            {"Regex": policy},
+            self._attachments(
+                {
+                    ("gr-0", "1"): (
+                        ["agent 'a' version 1"],
+                        {"sensitiveInformationPolicy": policy},
+                    )
+                }
+            ),
+        )
+        draft = self._rows(result, "Guardrail Sensitive Information Filter Check")
+        deployed = self._rows(result, "Deployed Guardrail Sensitive Information Filter")
+        assert [row["Status"] for row in draft + deployed] == [status, status]
+        for row in draft + deployed:
+            details = row["Finding_Details"]
+            if status == "Failed":
+                assert (
+                    "no custom regex blocks or masks secrets, credentials or "
+                    "internal identifiers on the input" in details
+                )
+                assert "internal identifiers on the output" not in details
+        if status == "Passed":
+            assert (
+                "with a custom regex acting on each side" in draft[0]["Finding_Details"]
+            )
+            assert (
+                "custom regex 'api-key' acts on the input and 'api-key' on the output"
+                in deployed[0]["Finding_Details"]
+            )
 
     def test_br26_two_guardrails_reach_both_verdicts(self):
         result = self._pii(
@@ -20535,6 +22354,82 @@ INVOCATION_LOGGING = {
 }
 
 
+BR32_FORWARDED = [
+    {
+        "filterName": "to-siem",
+        "destinationArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/siem",
+    }
+]
+
+
+def _br32_guardrail_selector(*extra_fields, types=("AWS::Bedrock::Guardrail",)):
+    return {
+        "Name": "guardrail-calls",
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": ["Data"]},
+            {"Field": "resources.type", "Equals": list(types)},
+            *extra_fields,
+        ],
+    }
+
+
+def _br32_trail(name, selectors=None, multi=True, home="us-east-1", logging=True):
+    return {
+        "name": name,
+        "multi": multi,
+        "home": home,
+        "logging": logging,
+        "selectors": [_br32_guardrail_selector()] if selectors is None else selectors,
+    }
+
+
+def _br32_cloudtrail(trails=(), stores=(), denied=()):
+    """A CloudTrail client holding the given trails and event data stores."""
+    by_arn = {
+        f"arn:aws:cloudtrail:us-east-1:123456789012:trail/{t['name']}": t
+        for t in trails
+    }
+    client = MagicMock()
+    client.list_trails.return_value = {
+        "Trails": [{"TrailARN": arn, "Name": t["name"]} for arn, t in by_arn.items()]
+    }
+    client.get_trail.side_effect = lambda Name: {
+        "Trail": {
+            "IsMultiRegionTrail": by_arn[Name]["multi"],
+            "HomeRegion": by_arn[Name]["home"],
+        }
+    }
+    client.get_trail_status.side_effect = lambda Name: {
+        "IsLogging": by_arn[Name]["logging"]
+    }
+
+    def selectors(TrailName):
+        if by_arn[TrailName]["name"] in denied:
+            raise ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                "GetEventSelectors",
+            )
+        return {"AdvancedEventSelectors": by_arn[TrailName]["selectors"]}
+
+    client.get_event_selectors.side_effect = selectors
+    store_arns = {
+        f"arn:aws:cloudtrail:us-east-1:123456789012:eventdatastore/{store['name']}": store
+        for store in stores
+    }
+    client.list_event_data_stores.return_value = {
+        "EventDataStores": [
+            {"EventDataStoreArn": arn, "Name": store["name"]}
+            for arn, store in store_arns.items()
+        ]
+    }
+    client.get_event_data_store.side_effect = lambda EventDataStore: {
+        "Status": store_arns[EventDataStore]["status"],
+        "MultiRegionEnabled": False,
+        "AdvancedEventSelectors": store_arns[EventDataStore]["selectors"],
+    }
+    return client
+
+
 def _intervened_alarm(
     name, actions_enabled=True, actions=True, metric="InvocationsIntervened", **fields
 ):
@@ -20611,6 +22506,7 @@ class TestBR32ActingIntervention:
         logging_config=INVOCATION_LOGGING,
         subscriptions=None,
         versions=None,
+        cloudtrail=None,
     ):
         cw_client = MagicMock()
         paginator = MagicMock()
@@ -20652,10 +22548,15 @@ class TestBR32ActingIntervention:
             "subscriptionFilters": subscriptions or []
         }
 
+        self.logs_client = logs_client
+        cloudtrail_client = cloudtrail or _br32_cloudtrail()
+
         def factory(service, **kwargs):
-            return {"bedrock": bedrock_client, "logs": logs_client}.get(
-                service, cw_client
-            )
+            return {
+                "bedrock": bedrock_client,
+                "logs": logs_client,
+                "cloudtrail": cloudtrail_client,
+            }.get(service, cw_client)
 
         with patch("bedrock_app.boto3.client", side_effect=factory):
             findings = extract_csv_data(
@@ -21066,7 +22967,9 @@ class TestBR32ActingIntervention:
                     "all",
                     Dimensions=[{"Name": "Operation", "Value": "ApplyGuardrail"}],
                 )
-            ]
+            ],
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail([_br32_trail("org-trail")]),
         )
         assert signal["Status"] == "Passed"
         assert (
@@ -21130,6 +23033,8 @@ class TestBR32ActingIntervention:
                 _version_alarm("g2-v4", "gr-2", "4"),
             ],
             versions={"gr-1": ["DRAFT", "1"], "gr-2": ["DRAFT", "4"]},
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail([_br32_trail("org-trail")]),
         )
         assert signal["Status"] == "Passed"
         assert (
@@ -21476,6 +23381,257 @@ class TestBR32ActingIntervention:
             "No subscription filter forwards log group '/aws/bedrock/invocations'"
             in signal["Finding_Details"]
         )
+
+    OPERATION_ALARM = _intervened_alarm(
+        "all", Dimensions=[{"Name": "Operation", "Value": "ApplyGuardrail"}]
+    )
+
+    @pytest.mark.parametrize(
+        "forwarded, recorded, status",
+        [
+            (True, True, "Passed"),
+            (False, True, "Failed"),
+            (True, False, "Failed"),
+            (False, False, "Failed"),
+        ],
+    )
+    def test_an_acting_alarm_needs_forwarding_and_a_guardrail_trail(
+        self, forwarded, recorded, status
+    ):
+        _, signal = self._run(
+            [self.OPERATION_ALARM],
+            subscriptions=BR32_FORWARDED if forwarded else None,
+            cloudtrail=_br32_cloudtrail(
+                [
+                    _br32_trail(
+                        "org-trail",
+                        selectors=None
+                        if recorded
+                        else [
+                            _br32_guardrail_selector(types=["AWS::Bedrock::AgentAlias"])
+                        ],
+                    )
+                ]
+            ),
+        )
+        assert signal["Status"] == status
+        details = signal["Finding_Details"]
+        forwarding_gap = (
+            "no subscription filter forwards invocation log group "
+            "'/aws/bedrock/invocations' to a SIEM"
+        )
+        trail_gap = (
+            "no logging trail or enabled event data store records every "
+            "AWS::Bedrock::Guardrail data event in this Region"
+        )
+        assert (forwarding_gap in details) is not forwarded
+        assert (trail_gap in details) is not recorded
+        assert ("Add a subscription filter" in signal["Resolution"]) is not forwarded
+        assert (
+            "Record AWS::Bedrock::Guardrail data events" in signal["Resolution"]
+        ) is not recorded
+        if recorded:
+            assert (
+                "AWS::Bedrock::Guardrail data events, which record ApplyGuardrail "
+                "including the guardrail evaluations made during model invocation, "
+                "are recorded in full by trail org-trail." in details
+            )
+
+    def test_every_version_alarmed_still_needs_the_record_legs(self):
+        self.guardrails = {
+            "items": [{"summary": {"id": "gr-1", "arn": _br32_guardrail_arn("gr-1")}}],
+            "errors": [],
+            "list_error": None,
+        }
+        _, signal = self._run(
+            [_version_alarm("g1-draft", "gr-1", "DRAFT")],
+            versions={"gr-1": ["DRAFT"]},
+            cloudtrail=_br32_cloudtrail([_br32_trail("org-trail")]),
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "every one of the 1 guardrail version(s) defined or applied in this "
+            "Region" in signal["Finding_Details"]
+        )
+        assert (
+            "This is not reported as Passed, because no subscription filter "
+            "forwards invocation log group" in signal["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "trails, denied, status, text",
+        [
+            (
+                [
+                    _br32_trail(
+                        "narrow",
+                        selectors=[
+                            _br32_guardrail_selector(
+                                {"Field": "eventName", "Equals": ["ApplyGuardrail"]}
+                            )
+                        ],
+                    ),
+                    _br32_trail("stopped", logging=False),
+                    _br32_trail("elsewhere", multi=False, home="eu-west-1"),
+                ],
+                (),
+                "Failed",
+                "(trail narrow narrows it by eventName, which records a subset of "
+                "the calls)",
+            ),
+            (
+                [
+                    _br32_trail(
+                        "narrow",
+                        selectors=[
+                            _br32_guardrail_selector(
+                                {"Field": "readOnly", "Equals": ["false"]}
+                            )
+                        ],
+                    ),
+                    _br32_trail("locked"),
+                ],
+                ("locked",),
+                "N/A",
+                "whether a trail or event data store records AWS::Bedrock::Guardrail "
+                "data events was not read: trail locked (AccessDenied",
+            ),
+            (
+                [_br32_trail("locked"), _br32_trail("org-trail")],
+                ("locked",),
+                "Passed",
+                "are recorded in full by trail org-trail.",
+            ),
+            (
+                [
+                    _br32_trail(
+                        "mixed",
+                        selectors=[
+                            _br32_guardrail_selector(
+                                types=[
+                                    "AWS::Bedrock::AgentAlias",
+                                    "AWS::Bedrock::Guardrail",
+                                ]
+                            )
+                        ],
+                    )
+                ],
+                (),
+                "Passed",
+                "are recorded in full by trail mixed.",
+            ),
+        ],
+    )
+    def test_the_guardrail_trail_is_judged_by_value_across_every_trail(
+        self, trails, denied, status, text
+    ):
+        _, signal = self._run(
+            [self.OPERATION_ALARM],
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail(trails, denied=denied),
+        )
+        assert signal["Status"] == status
+        assert text in signal["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "status_value, expected",
+        [("ENABLED", "Passed"), ("STOPPED_INGESTION", "Failed")],
+    )
+    def test_an_event_data_store_can_record_guardrail_calls(
+        self, status_value, expected
+    ):
+        _, signal = self._run(
+            [self.OPERATION_ALARM],
+            subscriptions=BR32_FORWARDED,
+            cloudtrail=_br32_cloudtrail(
+                stores=[
+                    {
+                        "name": "lake",
+                        "status": status_value,
+                        "selectors": [_br32_guardrail_selector()],
+                    }
+                ]
+            ),
+        )
+        assert signal["Status"] == expected
+        assert (
+            "recorded in full by event data store lake." in signal["Finding_Details"]
+        ) is (expected == "Passed")
+
+    def test_an_unread_trail_list_holds_the_pass(self):
+        cloudtrail = _br32_cloudtrail()
+        cloudtrail.list_trails.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "x"}}, "ListTrails"
+        )
+        _, signal = self._run(
+            [self.OPERATION_ALARM], subscriptions=BR32_FORWARDED, cloudtrail=cloudtrail
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            "CloudTrail trails (cloudtrail:ListTrails: AccessDenied"
+            in signal["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "logging_config, error, status, text",
+        [
+            (
+                INVOCATION_LOGGING,
+                True,
+                "N/A",
+                "because the subscription filters on log group "
+                "'/aws/bedrock/invocations' were not read",
+            ),
+            (
+                {
+                    "s3Config": {"bucketName": "invocation-logs"},
+                    "textDataDeliveryEnabled": True,
+                },
+                False,
+                "N/A",
+                "invocation logs go only to S3 bucket invocation-logs, and whether a "
+                "reader forwards them from there to a SIEM is not read",
+            ),
+            (
+                dict(INVOCATION_LOGGING, s3Config={"bucketName": "invocation-logs"}),
+                False,
+                "N/A",
+                "no subscription filter forwards invocation log group "
+                "'/aws/bedrock/invocations', and whether a reader forwards the copy "
+                "in S3 bucket invocation-logs to a SIEM is not read",
+            ),
+            (
+                {},
+                False,
+                "Failed",
+                "model invocation logging is off, so no request, response or "
+                "guardrail trace of an inference is recorded",
+            ),
+        ],
+    )
+    def test_forwarding_is_judged_on_every_logging_shape(
+        self, logging_config, error, status, text
+    ):
+        cloudtrail = _br32_cloudtrail([_br32_trail("org-trail")])
+        if error:
+            with patch.object(
+                bedrock_app,
+                "_describe_log_forwarding",
+                return_value=("unread", "The subscription filters were not read."),
+            ):
+                _, signal = self._run(
+                    [self.OPERATION_ALARM],
+                    logging_config=logging_config,
+                    cloudtrail=cloudtrail,
+                )
+        else:
+            _, signal = self._run(
+                [self.OPERATION_ALARM],
+                logging_config=logging_config,
+                cloudtrail=cloudtrail,
+            )
+        assert signal["Status"] == status
+        assert text in signal["Finding_Details"]
 
     def test_every_row_names_the_apply_guardrail_ceiling(self):
         _, signal = self._run([_intervened_alarm("paged")])
@@ -23738,6 +25894,11 @@ class TestBR47DataPathBucketTLS:
         runtimes=None,
         browsers=None,
         agentcore_error=None,
+        transform_jobs=None,
+        processing_jobs=None,
+        endpoints=None,
+        evaluation_jobs=None,
+        evaluation_error=None,
     ):
         agent_client = MagicMock()
         if list_knowledge_bases_error:
@@ -23822,6 +25983,61 @@ class TestBR47DataPathBucketTLS:
             }
         sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
             training_jobs[TrainingJobName]
+        )
+        # transform_jobs and processing_jobs map a name to its Describe
+        # response; endpoints map a name to (DescribeEndpoint,
+        # DescribeEndpointConfig); evaluation_jobs map a name to its Get
+        # response. A value that is an exception is raised.
+        transform_jobs = transform_jobs or {}
+        processing_jobs = processing_jobs or {}
+        endpoints = endpoints or {}
+        evaluation_jobs = evaluation_jobs or {}
+
+        def answer(value):
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        sagemaker_client.list_transform_jobs.return_value = {
+            "TransformJobSummaries": [
+                {"TransformJobName": name} for name in transform_jobs
+            ]
+        }
+        sagemaker_client.describe_transform_job.side_effect = lambda TransformJobName: (
+            answer(transform_jobs[TransformJobName])
+        )
+        sagemaker_client.list_processing_jobs.return_value = {
+            "ProcessingJobSummaries": [
+                {"ProcessingJobName": name} for name in processing_jobs
+            ]
+        }
+        sagemaker_client.describe_processing_job.side_effect = (
+            lambda ProcessingJobName: answer(processing_jobs[ProcessingJobName])
+        )
+        sagemaker_client.list_endpoints.return_value = {
+            "Endpoints": [{"EndpointName": name} for name in endpoints]
+        }
+        sagemaker_client.describe_endpoint.side_effect = lambda EndpointName: answer(
+            {"EndpointConfigName": EndpointName, **endpoints[EndpointName][0]}
+        )
+        sagemaker_client.describe_endpoint_config.side_effect = (
+            lambda EndpointConfigName: answer(endpoints[EndpointConfigName][1])
+        )
+        self.sagemaker_client = sagemaker_client
+        if evaluation_error:
+            bedrock_client.list_evaluation_jobs.side_effect = evaluation_error
+        else:
+            bedrock_client.list_evaluation_jobs.return_value = {
+                "jobSummaries": [
+                    {
+                        "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:evaluation-job/{name}",
+                        "jobName": name,
+                    }
+                    for name in evaluation_jobs
+                ]
+            }
+        bedrock_client.get_evaluation_job.side_effect = lambda jobIdentifier: answer(
+            evaluation_jobs[jobIdentifier.rsplit("/", 1)[-1]]
         )
 
         # runtimes and browsers map an id to its Get response.
@@ -24422,6 +26638,250 @@ class TestBR47DataPathBucketTLS:
         assert [f["Status"] for f in findings] == ["Passed"]
         assert f"principal {self.INGEST_ROLE} " in findings[0]["Finding_Details"]
         assert f"principal {second} " in findings[0]["Finding_Details"]
+
+    # DAT-02: the Passed text used to name only the first five enforcing
+    # buckets, so an exemption on a sixth or later bucket went unnamed.
+    def test_br47_an_exemption_on_the_seventh_bucket_is_named(self):
+        enforced = [f"a{index}" for index in range(1, 7)]
+        findings = self._run(
+            processing_jobs={
+                "pj": {
+                    "ProcessingInputs": [
+                        {"InputName": name, "S3Input": {"S3Uri": f"s3://{name}/in/"}}
+                        for name in enforced + ["z-exempt"]
+                    ]
+                }
+            },
+            bucket_policies={
+                **self._enforced(*enforced),
+                "z-exempt": self._exempting(
+                    "z-exempt", "ArnNotEquals", "aws:PrincipalArn", self.INGEST_ROLE
+                ),
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "7 of 7 Bedrock data path bucket(s)" in details
+        assert "z-exempt (the input 'z-exempt' of SageMaker processing job" in details
+        assert f"exempts principal {self.INGEST_ROLE} " in details
+        assert all(f"{name} (" in details for name in enforced)
+
+    # DAT-02: SageMaker transform, processing and endpoint buckets and Bedrock
+    # evaluation buckets are on the data path. Each source alone names one
+    # bucket with no policy, so without its leg the estate has no bucket.
+    @pytest.mark.parametrize(
+        "source, bucket, label",
+        [
+            (
+                {
+                    "transform_jobs": {
+                        "tj": {
+                            "TransformInput": {
+                                "DataSource": {
+                                    "S3DataSource": {"S3Uri": "s3://tf-in/x/"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "tf-in",
+                "the input of SageMaker transform job 'tj'",
+            ),
+            (
+                {
+                    "transform_jobs": {
+                        "tj": {"TransformOutput": {"S3OutputPath": "s3://tf-out/"}}
+                    }
+                },
+                "tf-out",
+                "the output of SageMaker transform job 'tj'",
+            ),
+            (
+                {
+                    "processing_jobs": {
+                        "pj": {
+                            "ProcessingOutputConfig": {
+                                "Outputs": [
+                                    {
+                                        "OutputName": "report",
+                                        "S3Output": {"S3Uri": "s3://pj-out/r/"},
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+                "pj-out",
+                "the output 'report' of SageMaker processing job 'pj'",
+            ),
+            (
+                {
+                    "endpoints": {
+                        "ep": (
+                            {
+                                "DataCaptureConfig": {
+                                    "EnableCapture": True,
+                                    "DestinationS3Uri": "s3://capture/ep/",
+                                }
+                            },
+                            {},
+                        )
+                    }
+                },
+                "capture",
+                "the data capture destination of SageMaker endpoint 'ep'",
+            ),
+            (
+                {
+                    "endpoints": {
+                        "ep": (
+                            {},
+                            {
+                                "AsyncInferenceConfig": {
+                                    "OutputConfig": {"S3OutputPath": "s3://async/"}
+                                }
+                            },
+                        )
+                    }
+                },
+                "async",
+                "the asynchronous inference output of SageMaker endpoint 'ep'",
+            ),
+            (
+                {
+                    "endpoints": {
+                        "ep": (
+                            {},
+                            {
+                                "AsyncInferenceConfig": {
+                                    "OutputConfig": {"S3FailurePath": "s3://async-f/"}
+                                }
+                            },
+                        )
+                    }
+                },
+                "async-f",
+                "the asynchronous inference failure output of SageMaker endpoint 'ep'",
+            ),
+            (
+                {
+                    "evaluation_jobs": {
+                        "ev": {
+                            "evaluationConfig": {
+                                "human": {
+                                    "datasetMetricConfigs": [
+                                        {
+                                            "dataset": {
+                                                "name": "qa",
+                                                "datasetLocation": {
+                                                    "s3Uri": "s3://ev-data/qa.jsonl"
+                                                },
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                },
+                "ev-data",
+                "the dataset 'qa' of evaluation job 'ev'",
+            ),
+            (
+                {
+                    "evaluation_jobs": {
+                        "ev": {"outputDataConfig": {"s3Uri": "s3://ev-out/"}}
+                    }
+                },
+                "ev-out",
+                "the output of evaluation job 'ev'",
+            ),
+        ],
+        ids=[
+            "transform-input",
+            "transform-output",
+            "processing-output",
+            "data-capture",
+            "async-output",
+            "async-failure",
+            "evaluation-dataset",
+            "evaluation-output",
+        ],
+    )
+    def test_br47_sagemaker_and_evaluation_buckets_are_on_the_data_path(
+        self, source, bucket, label
+    ):
+        findings = self._run(
+            bucket_policies=self._enforced("kb-ok"),
+            logging_config={"loggingConfig": {"s3Config": {"bucketName": "kb-ok"}}},
+            **source,
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert (
+            f"Bucket {bucket} is on the Bedrock data path as {label} and it has no "
+            "bucket policy" in findings[0]["Finding_Details"]
+        )
+
+    def test_br47_disabled_data_capture_is_not_on_the_data_path(self):
+        findings = self._run(
+            endpoints={
+                "ep": (
+                    {
+                        "DataCaptureConfig": {
+                            "EnableCapture": False,
+                            "DestinationS3Uri": "s3://capture/ep/",
+                        }
+                    },
+                    {},
+                )
+            }
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "capture" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "unread, action",
+        [
+            ("evaluation_error", "bedrock:ListEvaluationJobs"),
+            ("transform", "sagemaker:DescribeTransformJob"),
+            ("processing", "sagemaker:DescribeProcessingJob"),
+            ("endpoint", "sagemaker:DescribeEndpointConfig"),
+            ("evaluation", "bedrock:GetEvaluationJob"),
+        ],
+    )
+    def test_br47_an_unread_new_data_path_leg_withholds_the_pass(self, unread, action):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "Read"
+        )
+        overrides = {
+            "evaluation_error": {"evaluation_error": denied},
+            "transform": {"transform_jobs": {"tj": denied}},
+            "processing": {"processing_jobs": {"pj": denied}},
+            "endpoint": {"endpoints": {"ep": ({}, denied)}},
+            "evaluation": {"evaluation_jobs": {"ev": denied}},
+        }[unread]
+        findings = self._two_bucket_estate(
+            bucket_policies=self._enforced("support-bucket", "hr-bucket"),
+            **overrides,
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert action in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "N/A"
+        )
+
+    def test_br47_transform_jobs_past_the_read_cap_withhold_the_pass(self):
+        cap = bedrock_app.MAX_SAGEMAKER_TRAINING_JOB_READS
+        jobs = {f"tj-{index:03d}": {} for index in range(cap + 1)}
+        jobs["tj-000"] = {"TransformOutput": {"S3OutputPath": "s3://tf-ok/"}}
+        findings = self._run(
+            transform_jobs=jobs, bucket_policies=self._enforced("tf-ok")
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            f"1 older transform job(s) past the newest {cap} were not read"
+            in " ".join(f["Finding_Details"] for f in findings)
+        )
+        assert self.sagemaker_client.describe_transform_job.call_count == cap
 
     @pytest.mark.parametrize("operator", ["Bool", "BoolIfExists"])
     def test_br47_a_via_aws_service_false_exemption_passes(self, operator):
@@ -25106,6 +27566,43 @@ class TestBR48AIServicesOptOut:
         assert "'ai-lock' (attached to root r-root) delegates @@assign" in details
         assert "no policy attached below it can opt a service back in" not in details
         assert [f["Status"] for f in clean] == ["Passed"]
+
+    # DAT-09: a service section that allows @@assign to child policies but
+    # holds no opt_out_policy leaf used to record no delegation, so the row
+    # passed while a child could add services.lex.opt_out_policy optIn. A
+    # section whose own leaf is locked with @@none still passes.
+    @pytest.mark.parametrize(
+        "lex, status",
+        [
+            ({"@@operators_allowed_for_child_policies": ["@@assign"]}, "Failed"),
+            (
+                {
+                    "@@operators_allowed_for_child_policies": ["@@assign"],
+                    "opt_out_policy": {
+                        "@@operators_allowed_for_child_policies": ["@@none"],
+                        "@@assign": "optOut",
+                    },
+                },
+                "Passed",
+            ),
+        ],
+        ids=["section-without-leaf", "section-with-locked-leaf"],
+    )
+    def test_br48_a_service_section_with_no_leaf_still_delegates(self, lex, status):
+        policy = json.loads(json.dumps(self.LOCKED))
+        policy["services"]["lex"] = lex
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": policy},
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+        details = findings[0]["Finding_Details"]
+        if status == "Failed":
+            assert "'ai-lock' (attached to root r-root) delegates @@assign" in details
+        else:
+            assert "delegates" not in details
 
     def test_br48_opt_out_value_is_compared_case_sensitively(self):
         findings = self._run(
@@ -27989,6 +30486,40 @@ class TestBR43ApprovedModelControl:
         assert "through NotResource" in rows[0]["Finding_Details"]
         assert "policy 'policy-1'" in rows[0]["Finding_Details"]
 
+    # MDL-01: a service control policy never restricts the management account,
+    # so the same model list is credited in a member account and fails here.
+    @pytest.mark.parametrize(
+        "management, status", [(True, "Failed"), (False, "Passed")]
+    )
+    def test_br43_model_list_is_not_credited_in_the_management_account(
+        self, management, status
+    ):
+        inventory = self._inventory(
+            _policy(
+                {
+                    "Effect": "Deny",
+                    "Action": [
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    "NotResource": self.MODELS,
+                },
+                self.MANTLE_LIST,
+            )
+        )
+        inventory["management_account"] = management
+        inventory["account"] = "123456789012"
+        rows = self._run(inventory)
+
+        assert [r["Status"] for r in rows] == [status]
+        if management:
+            assert rows[0]["Severity"] == "Medium"
+            assert (
+                "this is the management account 123456789012, which service "
+                "control policies never restrict" in rows[0]["Finding_Details"]
+            )
+            assert "policy 'policy-0'" in rows[0]["Finding_Details"]
+
     # MDL-01: ForAnyValue: is false when the key is absent, and streaming
     # invocation sends no bedrock:ModelArn while a direct foundation-model call
     # sends no bedrock:InferenceProfileArn, so that Deny never fires on them. This
@@ -28522,6 +31053,82 @@ class TestBR50AIUserAccessKeys:
         rows = self._assume_run(user_policies, self._trust(principal))
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "No IAM user in the permissions cache" in rows[0]["Finding_Details"]
+
+    # IAM-03: the role path was one hop, so a user who assumed a non-AI role
+    # that could in turn assume an AI role was never placed in scope.
+    @pytest.mark.parametrize(
+        "ai_principal, hop_policies, how",
+        [
+            ("arn:aws:iam::123456789012:role/HopRole", [], "names the role"),
+            (
+                "arn:aws:iam::123456789012:root",
+                [("Assume", _allow("sts:AssumeRole", "arn:aws:iam::*:role/Ai*"))],
+                "trusts the account",
+            ),
+        ],
+    )
+    def test_br50_a_user_reaching_ai_through_a_chain_of_roles_is_in_scope(
+        self, ai_principal, hop_policies, how
+    ):
+        cache = _identity_cache(
+            roles={
+                "AiRole": [("Invoke", _allow("bedrock:InvokeModel", "*"))],
+                "HopRole": hop_policies,
+                "FarRole": [],
+                "SideRole": [("Read", _allow("s3:GetObject", "*"))],
+            },
+            users={"carol": [], "erin": [], "dave": []},
+        )
+        trusts = {
+            "AiRole": self._trust(ai_principal),
+            "HopRole": self._trust(
+                [
+                    "arn:aws:iam::123456789012:user/carol",
+                    "arn:aws:iam::123456789012:role/FarRole",
+                ]
+            ),
+            "FarRole": self._trust("arn:aws:iam::123456789012:user/erin"),
+            "SideRole": self._trust("arn:aws:iam::123456789012:user/dave"),
+        }
+        iam = MagicMock()
+        iam.list_access_keys.side_effect = lambda UserName, **kwargs: {
+            "AccessKeyMetadata": self.ACTIVE_KEY
+        }
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "Arn": f"arn:aws:iam::123456789012:role/{RoleName}",
+                "AssumeRolePolicyDocument": trusts[RoleName],
+            }
+        }
+        with patch("boto3.client", return_value=iam):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_access_keys(cache, region="Global")
+            )
+        failed = {
+            row["Finding_Details"].split("'")[1]: row["Finding_Details"]
+            for row in rows
+            if row["Status"] == "Failed"
+        }
+        assert sorted(failed) == ["carol", "erin"]
+        hop = (
+            f"role 'HopRole' can assume role 'AiRole', whose trust policy {how}, "
+            "and role 'AiRole' holds attached policy 'Invoke'"
+        )
+        assert (
+            "it can assume role 'HopRole', whose trust policy names the user, and "
+            + hop
+        ) in failed["carol"]
+        assert (
+            "it can assume role 'FarRole', whose trust policy names the user, and "
+            "role 'FarRole' can assume role 'HopRole', whose trust policy names "
+            "the role, and " + hop
+        ) in failed["erin"]
+        assert "SideRole" not in " ".join(r["Finding_Details"] for r in rows)
+        assert sorted(c.kwargs["RoleName"] for c in iam.get_role.call_args_list) == [
+            "AiRole",
+            "FarRole",
+            "HopRole",
+        ]
 
     def test_br50_an_unread_ai_role_trust_policy_is_named(self):
         rows = self._assume_run(
@@ -29858,6 +32465,89 @@ class TestBR51AIUserConsoleMFA:
         assert "2 of the 5 in-scope IAM role(s)" in passed[0]["Finding_Details"]
         assert "ReaderRole" not in json.dumps(rows)
 
+    # IAM-02: role principals in a trust policy were skipped, so an AI write
+    # role reached by chaining from a role a user assumes without MFA passed.
+    def test_br51_a_role_chain_without_mfa_fails_the_ai_role(self):
+        cache = {"role_permissions": {}, "user_permissions": {}}
+        write = [
+            _customer_policy(
+                "Write", {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
+            )
+        ]
+        for name in ("ChainRole", "DeepRole", "GuardedRole", "SafeRole", "CrossRole"):
+            cache["role_permissions"][name] = _identity(attached=write)
+        mfa = {"Bool": {"aws:MultiFactorAuthPresent": "true"}}
+
+        def trust(principal, condition=None):
+            statement = {
+                "Sid": "Trust",
+                "Effect": "Allow",
+                "Principal": {"AWS": principal},
+                "Action": "sts:AssumeRole",
+            }
+            if condition:
+                statement["Condition"] = condition
+            return _policy(statement)
+
+        account = "arn:aws:iam::123456789012"
+        trusts = {
+            "ChainRole": trust(f"{account}:role/HopRole"),
+            "DeepRole": trust("arn:aws:sts::123456789012:assumed-role/FarHop/session"),
+            "GuardedRole": trust(f"{account}:role/HopRole", mfa),
+            "SafeRole": trust(f"{account}:role/SafeHop"),
+            "CrossRole": trust("arn:aws:iam::999999999999:role/Ci"),
+            "HopRole": trust(f"{account}:user/dev"),
+            "FarHop": trust(f"{account}:role/team/HopRole"),
+            "SafeHop": trust(f"{account}:user/dev", mfa),
+        }
+        iam = MagicMock()
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "Arn": f"{account}:role/{RoleName}",
+                "AssumeRolePolicyDocument": trusts[RoleName],
+            }
+        }
+        iam.list_instances.return_value = {"Instances": []}
+        with patch("boto3.client", return_value=iam):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+            )
+
+        failed = {
+            r["Finding_Details"].split("'")[1]: r["Finding_Details"]
+            for r in rows
+            if r["Status"] == "Failed"
+        }
+        assert sorted(failed) == ["ChainRole", "DeepRole"]
+        assert (
+            "IAM role 'ChainRole' can be reached without MFA through a chain of "
+            "roles: role 'ChainRole' trusts role 'HopRole', whose statement 'Trust' "
+            "trusts arn:aws:iam::123456789012:user/dev with no Bool "
+            "aws:MultiFactorAuthPresent true condition."
+        ) in failed["ChainRole"]
+        assert (
+            "role 'DeepRole' trusts role 'FarHop', which trusts role 'HopRole', "
+            "whose statement 'Trust'"
+        ) in failed["DeepRole"]
+        unread = [
+            r
+            for r in rows
+            if r["Status"] == "N/A"
+            and "in-scope IAM role(s)" not in r["Finding_Details"]
+        ]
+        assert len(unread) == 1
+        assert (
+            "IAM role 'CrossRole' trusts roles that were not all read"
+            in unread[0]["Finding_Details"]
+        )
+        assert "in account 999999999999" in unread[0]["Finding_Details"]
+        summary = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert "2 of the 5 in-scope IAM role(s)" in summary[0]["Finding_Details"]
+        assert "GuardedRole, SafeRole" in summary[0]["Finding_Details"]
+        assert [c.kwargs["RoleName"] for c in iam.get_role.call_args_list].count(
+            "HopRole"
+        ) == 1
+
     def test_br51_unread_principal_stops_a_passed_row(self):
         cache = _ai_user_cache()
         cache["cache_schema_version"] = 2
@@ -30069,6 +32759,9 @@ class TestBR52DataPathObjectLock:
         sagemaker.describe_training_job.side_effect = lambda TrainingJobName: details[
             TrainingJobName
         ]
+        sagemaker.list_transform_jobs.return_value = {"TransformJobSummaries": []}
+        sagemaker.list_processing_jobs.return_value = {"ProcessingJobSummaries": []}
+        sagemaker.list_endpoints.return_value = {"Endpoints": []}
         agent = MagicMock()
         agent.list_knowledge_bases.return_value = {"knowledgeBaseSummaries": []}
         bedrock = MagicMock()
@@ -30076,6 +32769,7 @@ class TestBR52DataPathObjectLock:
         bedrock.list_model_customization_jobs.return_value = {
             "modelCustomizationJobSummaries": []
         }
+        bedrock.list_evaluation_jobs.return_value = {"jobSummaries": []}
         batch = MagicMock()
         batch.paginate.return_value = [{"invocationJobSummaries": []}]
         bedrock.get_paginator.side_effect = lambda operation: {
@@ -30486,6 +33180,10 @@ class TestBR53OwnerTagSweep:
         "list_training_jobs": "TrainingJobSummaries",
         "list_domains": "Domains",
         "list_code_interpreters": "codeInterpreterSummaries",
+        "list_inference_components": "InferenceComponents",
+        "list_pipelines": "PipelineSummaries",
+        "list_processing_jobs": "ProcessingJobSummaries",
+        "list_workload_identities": "workloadIdentities",
     }
 
     def _run(self, pages, errors=None, runtimes=None, lists=None):
@@ -30586,9 +33284,10 @@ class TestBR53OwnerTagSweep:
         assert "APIReference/API_GetResources.html)." in details
         assert (
             "SageMaker and AgentCore resource types other than endpoints, models, "
-            "notebook instances, training jobs, domains, agent runtimes, memories, "
-            "gateways, custom browsers and custom code interpreters are read only "
-            "through GetResources" in details
+            "notebook instances, training jobs, domains, inference components, "
+            "pipelines, processing jobs, agent runtimes, memories, gateways, custom "
+            "browsers, custom code interpreters and workload identities are read "
+            "only through GetResources" in details
         )
         assert "not granted" not in details
         assert "ceiling reached" not in details
@@ -30626,6 +33325,81 @@ class TestBR53OwnerTagSweep:
         assert (
             "bedrock-agentcore:ListMemories (AccessDeniedException)"
             in rows[0]["Finding_Details"]
+        )
+
+    def test_never_tagged_components_pipelines_jobs_and_identities_fail(self):
+        component = "arn:aws:sagemaker:us-east-1:123456789012:inference-component/{}"
+        identity = (
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+            "workload-identity-directory/default/workload-identity/{}"
+        )
+        pipeline = "arn:aws:sagemaker:us-east-1:123456789012:pipeline/never"
+        processing = "arn:aws:sagemaker:us-east-1:123456789012:processing-job/never"
+        _, rows, tagging = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": component.format("tagged"),
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        }
+                    ]
+                ],
+                "bedrock-agentcore": [
+                    [
+                        {
+                            "ResourceARN": identity.format("tagged"),
+                            "Tags": [{"Key": "Owner", "Value": "agents"}],
+                        }
+                    ]
+                ],
+            },
+            lists={
+                "list_inference_components": [
+                    {"InferenceComponentArn": component.format("tagged")},
+                    {"InferenceComponentArn": component.format("never")},
+                ],
+                "list_pipelines": [{"PipelineArn": pipeline}],
+                "list_processing_jobs": [{"ProcessingJobArn": processing}],
+                "list_workload_identities": [
+                    {"workloadIdentityArn": identity.format("tagged")},
+                    {"workloadIdentityArn": identity.format("never")},
+                ],
+            },
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 4
+        for arn, action in (
+            (component.format("never"), "sagemaker:ListInferenceComponents"),
+            (pipeline, "sagemaker:ListPipelines"),
+            (processing, "sagemaker:ListProcessingJobs"),
+            (identity.format("never"), "bedrock-agentcore:ListWorkloadIdentities"),
+        ):
+            assert any(
+                arn in details and f"listed by {action}" in details
+                for details in failed
+            ), arn
+        assert not any("/tagged" in details for details in failed)
+        assert tagging.list_workload_identities.call_args.kwargs["maxResults"] == 20
+
+    def test_an_unread_pipeline_list_withholds_the_pass(self):
+        _, rows, _ = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": self.SM_OWNED,
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        }
+                    ]
+                ]
+            },
+            lists={"list_pipelines": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "sagemaker:ListPipelines (AccessDeniedException), so pipelines never "
+            "tagged are not listed" in rows[0]["Finding_Details"]
         )
 
     def test_no_resource_at_all_is_na_not_passed(self):
@@ -30895,11 +33669,28 @@ class TestBR53ResourceOwnerTag:
     GUARDRAIL_BARE = "arn:aws:bedrock:us-east-1:123456789012:guardrail/g-bare"
     AGENT = "arn:aws:bedrock:us-east-1:123456789012:agent/AGENT1"
 
-    def _run(self, listings=None, tag_mappings=None, tag_error=None, list_errors=None):
+    def _run(
+        self,
+        listings=None,
+        tag_mappings=None,
+        tag_error=None,
+        list_errors=None,
+        job_tags=None,
+    ):
+        """``job_tags`` maps a job ARN to its ListTagsForResource tags or an error."""
         listings = listings or {}
         list_errors = list_errors or {}
+        job_tags = job_tags or {}
         bedrock = MagicMock()
         agent = MagicMock()
+
+        def list_tags_for_resource(resourceARN):
+            tags = job_tags.get(resourceARN, [])
+            if isinstance(tags, Exception):
+                raise tags
+            return {"tags": tags}
+
+        bedrock.list_tags_for_resource.side_effect = list_tags_for_resource
         result_keys = {
             "list_agents": "agentSummaries",
             "list_knowledge_bases": "knowledgeBaseSummaries",
@@ -30910,6 +33701,9 @@ class TestBR53ResourceOwnerTag:
             "list_flows": "flowSummaries",
             "list_prompts": "promptSummaries",
             "list_inference_profiles": "inferenceProfileSummaries",
+            "list_model_invocation_jobs": "invocationJobSummaries",
+            "list_model_customization_jobs": "modelCustomizationJobSummaries",
+            "list_evaluation_jobs": "jobSummaries",
         }
         for operation, key in result_keys.items():
             client = (
@@ -31015,6 +33809,69 @@ class TestBR53ResourceOwnerTag:
         assert "arn:aws:bedrock:us-east-1:123456789012:knowledge-base/KB1" in arns
         assert len(arns) == 3
         assert [r["Status"] for r in rows] == ["Failed"] * 3
+
+    JOB = "arn:aws:bedrock:us-east-1:123456789012:{}/{}"
+
+    def test_br53_bedrock_jobs_are_judged_by_their_own_tags(self):
+        batch_owned = self.JOB.format("model-invocation-job", "b-owned")
+        batch_bare = self.JOB.format("model-invocation-job", "b-bare")
+        custom = self.JOB.format("model-customization-job", "c-tbd")
+        evaluation = self.JOB.format("evaluation-job", "e-unread")
+        result, rows, tagging = self._run(
+            {
+                "list_guardrails": [{"arn": self.GUARDRAIL_OWNED}],
+                "list_model_invocation_jobs": [
+                    {"jobArn": batch_owned},
+                    {"jobArn": batch_bare},
+                ],
+                "list_model_customization_jobs": [{"jobArn": custom}],
+                "list_evaluation_jobs": [{"jobArn": evaluation}],
+            },
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                }
+            ],
+            job_tags={
+                batch_owned: [{"key": "owner", "value": "data-team"}],
+                batch_bare: [{"key": "env", "value": "dev"}],
+                custom: [{"key": "Owner", "value": "TBD"}],
+                evaluation: _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "N/A", "N/A"]
+        assert f"Bedrock model customization job {custom}" in rows[0]["Finding_Details"]
+        assert "placeholder 'TBD'" in rows[0]["Finding_Details"]
+        assert (
+            f"Bedrock batch inference job {batch_bare} has no owner tag"
+            in rows[1]["Finding_Details"]
+        )
+        assert "tag keys: env" in rows[1]["Finding_Details"]
+        assert "2 of the 5 Bedrock resource(s)" in rows[2]["Finding_Details"]
+        assert batch_owned in rows[2]["Finding_Details"]
+        assert "not a verdict on every resource" in rows[2]["Finding_Details"]
+        assert "AccessDeniedException" in rows[3]["Finding_Details"]
+        assert evaluation in rows[3]["Finding_Details"]
+        tagging.get_resources.assert_called_once_with(
+            ResourceARNList=[self.GUARDRAIL_OWNED]
+        )
+
+    def test_br53_an_unread_job_list_downgrades_the_pass(self):
+        _, rows, _ = self._run(
+            {"list_guardrails": [{"arn": self.GUARDRAIL_OWNED}]},
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "owner", "Value": "a"}],
+                }
+            ],
+            list_errors={
+                "list_evaluation_jobs": _make_client_error("AccessDeniedException")
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "evaluation jobs: AccessDeniedException" in rows[0]["Finding_Details"]
 
     def test_br53_arns_are_sent_in_batches_of_100(self):
         guardrails = [
@@ -31932,6 +34789,55 @@ class TestBR55EnclaveKeyBinding:
             result = bedrock_app.check_kms_enclave_key_binding(region="us-east-1")
         return result, extract_csv_data(result), kms
 
+    # DAT-10: a debug-mode enclave presents all zeros for each PCR, so a pin
+    # to zeros admits any image run in debug mode. Allow and Deny pins to the
+    # zero value used to be credited as exact; the real digest still passes.
+    ZERO = "0" * 96
+
+    def test_br55_an_all_zero_allow_pin_is_not_a_measurement(self):
+        zero = self._enclave_allow()
+        zero["Condition"] = {
+            "StringEqualsIgnoreCase": {
+                "kms:RecipientAttestation:ImageSha384": self.ZERO,
+                self.PCR3: self.ZERO,
+            }
+        }
+        _, rows, _ = self._run(
+            {
+                "a-zero": [self._admin(), zero],
+                "b-real": [self._admin(), self._enclave_allow()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-zero" in rows[0]["Finding_Details"]
+        assert (
+            "statement 'EnclaveDecrypt' allows kms:decrypt, kms:generatedatakey "
+            "with no exact attestation measurement" in rows[0]["Finding_Details"]
+        )
+        assert "arn:k/a-zero" not in rows[1]["Finding_Details"]
+
+    def test_br55_an_all_zero_deny_pin_is_not_a_measurement(self):
+        def zeroed(statement):
+            key = next(iter(statement["Condition"]["StringNotEqualsIgnoreCase"]))
+            return dict(
+                statement,
+                Condition={"StringNotEqualsIgnoreCase": {key: self.ZERO}},
+            )
+
+        _, rows, _ = self._run(
+            {
+                "a-zero": [
+                    self.ROOT,
+                    zeroed(self._deployment_deny()),
+                    zeroed(self._image_deny()),
+                ],
+                "b-real": [self.ROOT, self._deployment_deny(), self._image_deny()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-zero" in rows[0]["Finding_Details"]
+        assert "arn:k/a-zero" not in rows[1]["Finding_Details"]
+
     def test_br55_first_key_pinned_second_root_bypass_fails(self):
         result, rows, _ = self._run(
             {
@@ -31988,7 +34894,9 @@ class TestBR55EnclaveKeyBinding:
         ):
             _, rows, _ = self._run({"k": [self._enclave_allow(condition=condition)]})
             assert [r["Status"] for r in rows] == ["Failed"], condition
-            assert "with no attestation condition" in rows[0]["Finding_Details"]
+            # The statement carries an attestation test, so the text now says
+            # no exact measurement instead of no attestation condition.
+            assert "with no exact attestation measurement" in rows[0]["Finding_Details"]
 
     def test_br55_set_operator_prefix_on_the_operator_is_stripped(self):
         _, rows, _ = self._run(
@@ -32634,7 +35542,14 @@ _PROBE_PASSING_DETAIL = {
             {"type": t, "inputAction": "BLOCK", "outputAction": "ANONYMIZE"}
             for t in ("AWS_ACCESS_KEY", "AWS_SECRET_KEY", "PASSWORD")
         ],
-        "regexes": [{"name": "k", "pattern": "k", "outputAction": "BLOCK"}],
+        "regexes": [
+            {
+                "name": "k",
+                "pattern": "k",
+                "inputAction": "BLOCK",
+                "outputAction": "BLOCK",
+            }
+        ],
     }
 }
 
@@ -33653,8 +36568,19 @@ class TestBR04RetentionDepth:
     def _not_found(code, operation):
         return ClientError({"Error": {"Code": code, "Message": "x"}}, operation)
 
-    def _rows(self, logging_config, lifecycles, locks=None, replication=None):
-        """lifecycles, locks, replication: {bucket: response or exception}."""
+    def _rows(
+        self,
+        logging_config,
+        lifecycles,
+        locks=None,
+        replication=None,
+        objects=None,
+        head_error=None,
+    ):
+        """
+        lifecycles, locks, replication: {bucket: response or exception}.
+        objects: {bucket: {key: ReplicationStatus or None}}.
+        """
 
         def per_bucket(table, missing_code, operation):
             def read(Bucket):
@@ -33685,6 +36611,27 @@ class TestBR04RetentionDepth:
             "GetBucketReplication",
         )
         s3.get_bucket_encryption.return_value = {}
+        listed = objects or {}
+        self.heads = []
+
+        def paginate(Bucket, Prefix, **kwargs):
+            yield {
+                "Contents": [
+                    {"Key": key}
+                    for key in sorted(listed.get(Bucket) or {})
+                    if key.startswith(Prefix)
+                ]
+            }
+
+        def head_object(Bucket, Key):
+            self.heads.append((Bucket, Key))
+            if head_error is not None:
+                raise head_error
+            status = listed[Bucket][Key]
+            return {"ReplicationStatus": status} if status else {}
+
+        s3.get_paginator.return_value.paginate.side_effect = paginate
+        s3.head_object.side_effect = head_object
         bedrock = MagicMock()
         bedrock.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": logging_config
@@ -33693,9 +36640,11 @@ class TestBR04RetentionDepth:
         logs.describe_log_groups.return_value = {
             "logGroups": [{"logGroupName": "/bedrock/logs", "retentionInDays": 30}]
         }
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "111122223333"}
 
         def factory(service, **kwargs):
-            return {"s3": s3, "bedrock": bedrock, "logs": logs}.get(
+            return {"s3": s3, "bedrock": bedrock, "logs": logs, "sts": sts}.get(
                 service, MagicMock()
             )
 
@@ -33791,6 +36740,8 @@ class TestBR04RetentionDepth:
                 ),
             },
             replication={"logs": self._replicates("replica")},
+            objects={"logs": {self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         assert sorted(r["Status"] for r in rows) == ["N/A", "N/A"]
         na = [r for r in rows if r["Status"] == "N/A"]
@@ -33844,11 +36795,17 @@ class TestBR04RetentionDepth:
         assert "'large'" not in passed["Finding_Details"]
         assert "S3 bucket 'logs' lifecycle" in passed["Finding_Details"]
 
-    def test_enabled_replication_leaves_the_replication_status_unread(self):
+    LOG_KEY = "AWSLogs/111122223333/BedrockModelInvocationLogs/us-east-1/2026/"
+
+    def test_an_unread_replication_status_leaves_the_bucket_unjudged(self):
+        """Was the default when s3:GetObject was not granted; now a HeadObject
+        failure."""
         rows, _ = self._rows(
             {"s3Config": {"bucketName": "logs"}},
             {"logs": EXPIRING, "replica": EXPIRING},
             replication={"logs": self._replicates("replica")},
+            objects={"logs": {self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
         na = [r for r in rows if r["Status"] == "N/A"][0]
@@ -33856,9 +36813,67 @@ class TestBR04RetentionDepth:
             "S3 bucket 'logs': an enabled replication rule copies it to 'replica'"
             in (na["Finding_Details"])
         )
-        assert "HeadObject" in na["Finding_Details"]
-        assert "s3:GetObject" in na["Finding_Details"]
+        assert "ReplicationStatus" in na["Finding_Details"]
+        assert "s3:GetObject, AccessDenied" in na["Finding_Details"]
         assert "action named above" in na["Resolution"]
+
+    def test_a_failed_replication_holds_log_objects_back_from_expiry(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "ok.json.gz": "COMPLETED",
+                    self.LOG_KEY + "stuck.json.gz": "FAILED",
+                    self.LOG_KEY + "fresh.json.gz": "PENDING",
+                    # Outside the Bedrock log path, so never read.
+                    "AWSLogs/111122223333/CloudTrail/x.json.gz": "FAILED",
+                }
+            },
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert "ReplicationStatus FAILED on 1 of the 3 invocation log" in detail
+        assert "stuck.json.gz" in detail
+        assert "ok.json.gz" not in detail and "CloudTrail" not in detail
+        assert not any("CloudTrail" in key for _, key in self.heads)
+
+    def test_every_replicated_log_object_read_and_none_failed_is_retained(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "ok.json.gz": "COMPLETED",
+                    self.LOG_KEY + "plain.json.gz": None,
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "no ReplicationStatus FAILED on any of the 2 invocation log object(s)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_the_head_object_cap_leaves_the_rest_unread(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "REPLICATION_STATUS_HEAD_CAP", 1)
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+            objects={
+                "logs": {
+                    self.LOG_KEY + "a.json.gz": "COMPLETED",
+                    self.LOG_KEY + "b.json.gz": "FAILED",
+                }
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        na = [r for r in rows if r["Status"] == "N/A"][0]
+        assert "past the first 1 were not read" in na["Finding_Details"]
 
     def test_a_replicated_or_unread_replication_bucket_is_not_passed(self):
         # The source bucket's own expiry is held back for objects whose
@@ -33867,6 +36882,8 @@ class TestBR04RetentionDepth:
             {"s3Config": {"bucketName": "logs"}},
             {"logs": EXPIRING, "replica": EXPIRING},
             replication={"logs": self._replicates("replica")},
+            objects={"logs": {self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         passed = [r for r in rows if r["Status"] == "Passed"]
         assert len(passed) == 1
@@ -33887,6 +36904,8 @@ class TestBR04RetentionDepth:
             self.LARGE,
             {"logs": EXPIRING, "large": EXPIRING, "replica": EXPIRING},
             replication={"large": self._replicates("replica")},
+            objects={"large": {"big/" + self.LOG_KEY + "a.json.gz": "COMPLETED"}},
+            head_error=_make_client_error("AccessDenied"),
         )
         na = [r for r in rows if r["Status"] == "N/A"]
         assert len(na) == 1
@@ -34566,12 +37585,66 @@ class TestBR20ValueDepth:
         client.describe_db_instances.side_effect = describe_db_instances
         return client
 
-    def _aurora_cluster(self, *members):
-        return {
+    def _aurora_cluster(self, *members, iam_auth=True):
+        cluster = {
             "StorageEncrypted": True,
             "KmsKeyId": self.CMK,
             "DBClusterMembers": [{"DBInstanceIdentifier": m} for m in members],
         }
+        if iam_auth is not None:
+            cluster["IAMDatabaseAuthenticationEnabled"] = iam_auth
+        return cluster
+
+    def test_aurora_with_iam_database_authentication_off_fails(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", "kb-db-2", iam_auth=False)],
+                    instances={"kb-db-1": False, "kb-db-2": False},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "No member instance of the cluster is PubliclyAccessible" in details
+        assert (
+            "IAM database authentication is off (IAMDatabaseAuthenticationEnabled "
+            "false), so database users authenticate only with passwords" in details
+        )
+        assert rows[0]["Resolution"].startswith(
+            "Enable IAM database authentication on the Aurora cluster"
+        )
+        assert "PubliclyAccessible to false" not in rows[0]["Resolution"]
+
+    def test_aurora_public_and_password_only_names_both_fixes(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", iam_auth=False)],
+                    instances={"kb-db-1": True},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Set PubliclyAccessible to false" in rows[0]["Resolution"]
+        assert "Enable IAM database authentication" in rows[0]["Resolution"]
+
+    def test_aurora_with_no_iam_authentication_value_is_na(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds(
+                    [self._aurora_cluster("kb-db-1", iam_auth=None)],
+                    instances={"kb-db-1": False},
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "returned no IAMDatabaseAuthenticationEnabled" in rows[0]["Finding_Details"]
+        )
 
     def test_aurora_with_a_public_member_instance_fails(self):
         rows = self._run(
@@ -34602,6 +37675,11 @@ class TestBR20ValueDepth:
         assert (
             "No member instance of the cluster is PubliclyAccessible (kb-db-1, "
             "kb-db-2)" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "IAM database authentication is enabled (IAMDatabaseAuthenticationEnabled "
+            "true); whether password logins also remain is not read"
+            in rows[0]["Finding_Details"]
         )
 
     def test_aurora_with_an_unread_member_instance_is_na(self):
@@ -34750,14 +37828,22 @@ class TestBR20ValueDepth:
     WORKGROUP = f"arn:aws:redshift-serverless:us-west-2:{ACCOUNT}:workgroup/wg-1"
 
     @classmethod
-    def _sql_body(cls, engine, storage=("REDSHIFT",)):
+    def _sql_body(cls, engine, storage=("REDSHIFT",), tables=None):
         return {
             "knowledgeBaseConfiguration": {
                 "type": "SQL",
                 "sqlKnowledgeBaseConfiguration": {
                     "type": "REDSHIFT",
                     "redshiftConfiguration": {
-                        "storageConfigurations": [{"type": s} for s in storage],
+                        "storageConfigurations": [
+                            {"type": s}
+                            if s != "AWS_DATA_CATALOG" or tables is None
+                            else {
+                                "type": s,
+                                "awsDataCatalogConfiguration": {"tableNames": tables},
+                            }
+                            for s in storage
+                        ],
                         "queryEngineConfiguration": engine,
                     },
                 },
@@ -34951,6 +38037,183 @@ class TestBR20ValueDepth:
         )
         assert [r["Status"] for r in rows] == ["N/A", "Passed"]
         assert "AWS Glue Data Catalog" in rows[0]["Finding_Details"]
+
+    # DAT-01: a SQL knowledge base reading AWS Glue Data Catalog tables was
+    # always N/A, though glue:GetTable returns each table's S3 location.
+    @staticmethod
+    def _glue(tables, partitions=None, error=None):
+        glue = MagicMock()
+
+        def get_table(DatabaseName, Name):
+            if error is not None:
+                raise error
+            return {"Table": tables[f"{DatabaseName}.{Name}"]}
+
+        glue.get_table.side_effect = get_table
+
+        def paginator(name):
+            pager = MagicMock()
+            if name == "get_tables":
+                pager.paginate.side_effect = lambda DatabaseName: [
+                    {
+                        "TableList": [
+                            table
+                            for key, table in tables.items()
+                            if key.startswith(f"{DatabaseName}.")
+                        ]
+                    }
+                ]
+            else:
+                pager.paginate.side_effect = lambda DatabaseName, TableName, **_: (
+                    partitions or {}
+                )[f"{DatabaseName}.{TableName}"]
+            return pager
+
+        glue.get_paginator.side_effect = paginator
+        return glue
+
+    @staticmethod
+    def _table(database, name, location, partitioned=False, table_type=None):
+        table = {
+            "DatabaseName": database,
+            "Name": name,
+            "StorageDescriptor": {"Location": location} if location else {},
+        }
+        if partitioned:
+            table["PartitionKeys"] = [{"Name": "dt"}]
+        if table_type:
+            table["TableType"] = table_type
+        return table
+
+    def _catalog_run(self, glue, encryption, tables=("sales.orders", "sales.ev*")):
+        cluster = self._cluster(
+            [{"PubliclyAccessible": False, "Encrypted": True, "KmsKeyId": self.CMK}]
+        )
+        return self._run(
+            {
+                "kb1": self._sql_body(
+                    self._provisioned_engine(),
+                    storage=("REDSHIFT", "AWS_DATA_CATALOG"),
+                    tables=list(tables),
+                )
+            },
+            clients={"redshift": cluster, "glue": glue},
+            bucket_encryption=encryption,
+        )
+
+    @staticmethod
+    def _catalog_sse(algorithm, key=None):
+        default = {"SSEAlgorithm": algorithm}
+        if key:
+            default["KMSMasterKeyID"] = key
+        return {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [{"ApplyServerSideEncryptionByDefault": default}]
+            }
+        }
+
+    @pytest.mark.parametrize("partition_key", [None, "AWS"])
+    def test_sql_data_catalog_tables_are_judged_by_their_buckets(self, partition_key):
+        glue = self._glue(
+            {
+                "sales.orders": self._table("sales", "orders", "s3://cmk-data/orders/"),
+                "sales.events": self._table(
+                    "sales", "events", "s3://cmk-data/events/", partitioned=True
+                ),
+                "other.events": self._table("other", "events", "s3://ignored/"),
+            },
+            partitions={
+                "sales.events": [
+                    {
+                        "Partitions": [
+                            {"StorageDescriptor": {"Location": "s3://cmk-data/e/1/"}}
+                        ]
+                    },
+                    {
+                        "Partitions": [
+                            {"StorageDescriptor": {"Location": "s3://part-data/e/2/"}}
+                        ]
+                    },
+                ]
+            },
+        )
+        part_key = self.AWS_KEY if partition_key else self.CMK
+        rows = self._catalog_run(
+            glue,
+            {
+                "cmk-data": self._catalog_sse("aws:kms", self.CMK),
+                "part-data": self._catalog_sse("aws:kms", part_key),
+            },
+        )
+        status = "Failed" if partition_key else "Passed"
+        assert [r["Status"] for r in rows] == [status]
+        details = rows[0]["Finding_Details"]
+        assert "It reads 2 AWS Glue Data Catalog table name(s)" in details
+        assert "ignored" not in details
+        if partition_key:
+            assert (
+                "Default encryption is not a customer managed key: S3 bucket "
+                "'part-data' "
+                "(table(s) sales.events) uses aws:kms with KMS key"
+            ) in details
+            assert (
+                "Default encryption is a customer managed key: S3 bucket 'cmk-data'"
+            ) in details
+        else:
+            assert "S3 bucket 'part-data' (table(s) sales.events)" in details
+            assert "is not a customer managed key" not in details
+            assert "not the key of each object already written" in details
+
+    def test_sql_data_catalog_plaintext_bucket_fails(self):
+        glue = self._glue(
+            {"sales.orders": self._table("sales", "orders", "s3://plain-data/o/")}
+        )
+        rows = self._catalog_run(
+            glue, {"plain-data": self._catalog_sse("AES256")}, tables=("sales.orders",)
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "S3 bucket 'plain-data' (table(s) sales.orders) uses AES256, not a "
+            "customer managed KMS key"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tables, glue_kwargs, phrase",
+        [
+            (
+                ("sales.orders",),
+                {"error": _client_error("AccessDeniedException", "d", "GetTable")},
+                "glue:GetTable",
+            ),
+            (("sales.nothing*",), {}, "matches no table GetTables returns"),
+            (("*.orders",), {}, "names no single database"),
+            (("sales.view",), {}, "names no storage location"),
+            (("sales.remote",), {}, "which is not an S3 location"),
+            (("sales.big",), {}, "more than 20 pages of partitions"),
+        ],
+    )
+    def test_sql_data_catalog_unread_tables_withhold_the_pass(
+        self, tables, glue_kwargs, phrase
+    ):
+        glue = self._glue(
+            {
+                "sales.orders": self._table("sales", "orders", "s3://cmk-data/o/"),
+                "sales.view": self._table(
+                    "sales", "view", None, table_type="VIRTUAL_VIEW"
+                ),
+                "sales.remote": self._table("sales", "remote", "hdfs://x/y"),
+                "sales.big": self._table(
+                    "sales", "big", "s3://cmk-data/b/", partitioned=True
+                ),
+            },
+            partitions={"sales.big": [{"Partitions": []}] * 21},
+            **glue_kwargs,
+        )
+        rows = self._catalog_run(
+            glue, {"cmk-data": self._catalog_sse("aws:kms", self.CMK)}, tables=tables
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
 
     def test_sql_data_catalog_storage_does_not_soften_a_failure(self):
         client = self._cluster(
@@ -35654,9 +38917,12 @@ class TestBR57AgentRoleConfusedDeputy:
             "ArnLike": {"aws:SourceArn": cls.AGENT_ARN},
         }
 
-    def _run(self, roles, trusts, errors=(), agents=None, function_roles=None):
+    def _run(
+        self, roles, trusts, errors=(), agents=None, function_roles=None, listed=()
+    ):
         """`agents` is {agent id: {"aliases": [versions], version: [function
-        ARNs]}}; `function_roles` maps a function ARN to its role or an error."""
+        ARNs]}}; `function_roles` maps a function ARN to its role or an error;
+        `listed` is the ListFunctions pages, or an error."""
         agents = agents or {}
         function_roles = function_roles or {}
         agent_client = MagicMock()
@@ -35699,6 +38965,13 @@ class TestBR57AgentRoleConfusedDeputy:
             return {"Configuration": {"Role": outcome}}
 
         lambda_client.get_function.side_effect = get_function
+        if isinstance(listed, Exception):
+            lambda_client.get_paginator.return_value.paginate.side_effect = listed
+        else:
+            lambda_client.get_paginator.return_value.paginate.return_value = [
+                {"Functions": list(page)} for page in listed
+            ]
+        self.lambda_client = lambda_client
         self.agent_client = agent_client
         inventory = {
             "roles": {self._role(name): labels for name, labels in roles.items()},
@@ -35925,6 +39198,50 @@ class TestBR57AgentRoleConfusedDeputy:
         assert result["status"] == "N/A"
         iam.get_role.assert_not_called()
 
+    def test_a_function_outside_every_action_group_on_a_watched_role_fails(self):
+        """The second page holds the outsider; another version of an action
+        group function and a function on an unwatched role are not counted."""
+        result, _, _ = self._run(
+            {"a": ["Bedrock agent 'a' version DRAFT"]},
+            {"a": [self._statement(self._bound())]},
+            agents={"ag1": {"DRAFT": [self.FN.format("one") + ":live"]}},
+            function_roles={self.FN.format("one") + ":live": self.ROLE_A},
+            listed=[
+                [
+                    {"FunctionArn": self.FN.format("one") + ":3", "Role": self.ROLE_A},
+                    {"FunctionArn": self.FN.format("other"), "Role": self.ROLE_SHARED},
+                ],
+                [
+                    {"FunctionArn": self.FN.format("cron"), "Role": self.ROLE_A},
+                    {"FunctionArn": self.FN.format("etl"), "Role": self._role("a")},
+                ],
+            ],
+        )
+        assert [r["Status"] for r in self.function_rows] == ["Failed", "Failed"]
+        details = " ".join(r["Finding_Details"] for r in self.function_rows)
+        assert self.FN.format("cron") in details and self.FN.format("etl") in details
+        assert self.FN.format("other") not in details
+        assert self.FN.format("one") + ":3" not in details
+        assert "Bedrock agent 'a' version DRAFT" in details
+        assert result["status"] == "WARN"
+        self.lambda_client.get_paginator.return_value.paginate.assert_called_with(
+            FunctionVersion="ALL"
+        )
+
+    def test_unlisted_lambda_functions_keep_the_function_row_from_passing(self):
+        self._run(
+            {},
+            {},
+            agents={"ag1": {"DRAFT": [self.FN.format("one")]}},
+            function_roles={self.FN.format("one"): self.ROLE_A},
+            listed=_client_error("AccessDenied", "d", "ListFunctions"),
+        )
+        assert [r["Status"] for r in self.function_rows] == ["N/A"]
+        assert (
+            "lambda:ListFunctions (AccessDenied)"
+            in self.function_rows[0]["Finding_Details"]
+        )
+
 
 class TestBR57AgentHandoffSourceIdentity:
     """BR-57: agent-to-agent handoffs need a checked caller binding."""
@@ -36055,6 +39372,174 @@ class TestBR57AgentHandoffSourceIdentity:
         )
         assert "not evaluated per principal" in passed[0]["Finding_Details"]
         assert "ECS task roles" in passed[0]["Finding_Details"]
+
+    # AGT-05: the inbound gate of an AgentCore runtime was not read, so a
+    # runtime any JWT holder can invoke passed the handoff row.
+    RUNTIME = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
+
+    def _gate_run(self, gates=(), policies=None, gate_errors=()):
+        inventory = self._inventory({"agent-a": ["AgentCore runtime 'rt-1' version 1"]})
+        inventory["runtime_gates"] = [
+            {"label": label, "authorizer": authorizer} for label, authorizer in gates
+        ]
+        inventory["runtime_policies"] = dict(policies or {})
+        inventory["gate_errors"] = list(gate_errors)
+        _, rows, _ = self._run(self._cache({"agent-a": _identity()}), inventory, {})
+        return rows
+
+    @staticmethod
+    def _jwt(**bounds):
+        return {
+            "customJWTAuthorizer": {
+                "discoveryUrl": "https://idp.example.com/.well-known/openid-configuration",
+                **bounds,
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "bound",
+        [
+            {"allowedAudience": ["agents"]},
+            {"allowedClients": ["client-1"]},
+            {"allowedScopes": ["invoke"]},
+            {"customClaims": [{"inboundTokenClaimName": "team"}]},
+        ],
+    )
+    def test_a_runtime_any_jwt_holder_can_invoke_fails(self, bound):
+        rows = self._gate_run(
+            gates=[
+                ("AgentCore runtime 'open' version 1", self._jwt(allowedClients=[])),
+                ("AgentCore runtime 'bound' version 1", self._jwt(**bound)),
+                ("AgentCore runtime 'iam' version 1", None),
+            ]
+        )
+        assert [row["Status"] for row in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "AgentCore runtime 'open' version 1 accepts every token its JWT issuer "
+            "https://idp.example.com/.well-known/openid-configuration signs"
+        ) in details
+        assert "'bound'" not in details and "'iam'" not in details
+
+    def test_bounded_jwt_runtimes_pass_and_say_so(self):
+        rows = self._gate_run(
+            gates=[
+                ("AgentCore runtime 'a' version 1", self._jwt(allowedAudience=["x"])),
+                ("AgentCore runtime 'b' version 2", None),
+            ],
+            policies={self.RUNTIME: None},
+        )
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "2 AgentCore runtime version(s) were read, and none has a JWT "
+            "authorizer that accepts every token its issuer signs; 0 runtime and "
+            "endpoint resource polic(ies) were read"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement, status",
+        [
+            (
+                {"Principal": "*", "Action": "bedrock-agentcore:InvokeAgentRuntime"},
+                "Failed",
+            ),
+            (
+                {"Principal": {"AWS": "*"}, "Action": "bedrock-agentcore:Invoke*"},
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                    "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Condition": {
+                        "StringEquals": {"aws:PrincipalAccount": "999999999999"}
+                    },
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Condition": {
+                        "StringEqualsIfExists": {"aws:PrincipalAccount": "123456789012"}
+                    },
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": {"AWS": "arn:aws:iam::999999999999:root"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Condition": {
+                        "StringEquals": {"aws:PrincipalAccount": "123456789012"}
+                    },
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:role/caller"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                },
+                "Passed",
+            ),
+            ({"Principal": "*", "Action": "bedrock-agentcore:GetAgentCard"}, "Passed"),
+        ],
+    )
+    def test_runtime_resource_policies_are_judged_by_value(self, statement, status):
+        endpoint = f"{self.RUNTIME}/runtime-endpoint/live"
+        rows = self._gate_run(
+            gates=[("AgentCore runtime 'rt-1' version 1", None)],
+            policies={
+                self.RUNTIME: _policy(
+                    {
+                        "Sid": "own",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    }
+                ),
+                endpoint: _policy({"Sid": "probe", "Effect": "Allow", **statement}),
+            },
+        )
+        assert [row["Status"] for row in rows] == [status]
+        if status == "Failed":
+            assert (
+                f"the resource policy of {endpoint} statement 'probe' lets"
+                in rows[0]["Finding_Details"]
+            )
+        else:
+            assert (
+                "2 runtime and endpoint resource polic(ies) were read"
+                in rows[0]["Finding_Details"]
+            )
+
+    def test_an_unread_runtime_policy_withholds_the_pass(self):
+        rows = self._gate_run(
+            gates=[("AgentCore runtime 'rt-1' version 1", None)],
+            gate_errors=[
+                f"the resource policy of {self.RUNTIME} was not read with "
+                "bedrock-agentcore:GetResourcePolicy (AccessDeniedException)"
+            ],
+        )
+        assert [row["Status"] for row in rows] == ["N/A", "N/A"]
+        assert "bedrock-agentcore:GetResourcePolicy" in rows[1]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "condition",
@@ -36465,7 +39950,14 @@ class TestBR57AgentRoleInventory:
             f"arn:aws:bedrock:us-east-1:{cls.ACCOUNT}:agent-alias/{agent_id}/{alias_id}"
         )
 
-    def _run(self, agents, runtimes=None, runtime_error=None, collaborators=None):
+    def _run(
+        self,
+        agents,
+        runtimes=None,
+        runtime_error=None,
+        collaborators=None,
+        policies=None,
+    ):
         """agents: id -> {"name", "versions": {v: (role, collab)}, "aliases": {id: [v]}}"""
         agent = MagicMock()
         agent.list_agents.return_value = {
@@ -36536,6 +40028,7 @@ class TestBR57AgentRoleInventory:
                         "agentRuntimeId": runtime_id,
                         "agentRuntimeName": runtime_id,
                         "agentRuntimeVersion": spec["latest"],
+                        "agentRuntimeArn": spec.get("arn"),
                     }
                     for runtime_id, spec in runtimes.items()
                 ]
@@ -36545,9 +40038,24 @@ class TestBR57AgentRoleInventory:
         }
         control.get_agent_runtime.side_effect = (
             lambda agentRuntimeId, agentRuntimeVersion: {
-                "roleArn": runtimes[agentRuntimeId]["roles"][agentRuntimeVersion]
+                "roleArn": runtimes[agentRuntimeId]["roles"][agentRuntimeVersion],
+                "authorizerConfiguration": runtimes[agentRuntimeId]
+                .get("authorizers", {})
+                .get(agentRuntimeVersion),
             }
         )
+
+        def get_resource_policy(resourceArn):
+            outcome = (policies or {}).get(resourceArn)
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome is None:
+                raise _client_error(
+                    "ResourceNotFoundException", "none", "GetResourcePolicy"
+                )
+            return {"policy": json.dumps(outcome)}
+
+        control.get_resource_policy.side_effect = get_resource_policy
 
         def client(service, **kwargs):
             return {"bedrock-agent": agent, "bedrock-agentcore-control": control}[
@@ -36604,6 +40112,46 @@ class TestBR57AgentRoleInventory:
             any_order=True,
         )
         assert agent.get_agent_version.call_count == 2
+
+    def test_runtime_authorizers_and_every_resource_policy_are_read(self):
+        runtime = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt1"
+        live = f"{runtime}/runtime-endpoint/live"
+        dev = f"{runtime}/runtime-endpoint/dev"
+        jwt = {"customJWTAuthorizer": {"discoveryUrl": "https://idp/x"}}
+        inventory, _, control = self._run(
+            {},
+            runtimes={
+                "rt1": {
+                    "latest": "2",
+                    "arn": runtime,
+                    "endpoints": [
+                        {"liveVersion": "1", "agentRuntimeEndpointArn": live},
+                        {"liveVersion": "2", "agentRuntimeEndpointArn": dev},
+                    ],
+                    "roles": {"1": self._role("rt"), "2": self._role("rt")},
+                    "authorizers": {"2": jwt},
+                }
+            },
+            policies={
+                live: {"Statement": []},
+                dev: _client_error(
+                    "AccessDeniedException", "denied", "GetResourcePolicy"
+                ),
+            },
+        )
+        assert inventory["runtime_gates"] == [
+            {"label": "AgentCore runtime 'rt1' version 1", "authorizer": None},
+            {"label": "AgentCore runtime 'rt1' version 2", "authorizer": jwt},
+        ]
+        assert inventory["runtime_policies"] == {
+            runtime: None,
+            live: {"Statement": []},
+        }
+        assert inventory["gate_errors"] == [
+            f"the resource policy of {dev} was not read with "
+            "bedrock-agentcore:GetResourcePolicy (AccessDeniedException)"
+        ]
+        assert not inventory["errors"]
 
     def test_collaborators_resolve_to_alias_version_roles(self):
         inventory, agent, _ = self._run(
@@ -36826,7 +40374,11 @@ class TestBR37MantleDataRetention:
         assert row["Check_ID"] == "BR-37"
         if status != "N/A":
             assert f"mode in us-east-1 is {account}" in row["Finding_Details"]
-            assert "allowed_modes are not read" in row["Finding_Details"]
+            assert (
+                "allowed_modes are not read: GET /v1/models returns them, but "
+                "bedrock-mantle:ListModels is not granted to the Bedrock assessment "
+                "role, so they are a missing grant, not an API limit."
+            ) in row["Finding_Details"]
 
     def test_an_unread_mantle_account_mode_is_na(self):
         account_rows = []
@@ -36908,7 +40460,11 @@ class TestBR37MantleDataRetention:
         [project] = projects
         assert project["Status"] == "Failed"
         assert "effective mode model default" in project["Finding_Details"]
-        assert "allowed_modes are not read" in project["Finding_Details"]
+        assert (
+            "per-model allowed_modes are not read, because "
+            "bedrock-mantle:ListModels (GET /v1/models), which returns them, is not "
+            "granted to the Bedrock assessment role."
+        ) in project["Finding_Details"]
 
     def test_provider_data_share_fails(self):
         _, projects = self._run(
@@ -37510,10 +41066,13 @@ class TestBR33ContainerWorkloadImageScanning:
         cache_errors=None,
         list_tasks_error=None,
         coverage_error=None,
+        container_instances=None,
+        container_instance_error=None,
     ):
         definitions = (
             {"td-bedrock": "bedrock-task"} if definitions is None else definitions
         )
+        container_instances = container_instances or {}
         roles = {"bedrock-task": self.BEDROCK} if roles is None else roles
         endpoints = endpoints or {}
         ecs = MagicMock()
@@ -37588,8 +41147,54 @@ class TestBR33ContainerWorkloadImageScanning:
             }
 
         inspector.list_coverage.side_effect = list_coverage
-        clients = {"ecs": ecs, "sagemaker": sagemaker, "inspector2": inspector}
+
+        def describe_container_instances(cluster, containerInstances):
+            if container_instance_error is not None:
+                raise container_instance_error
+            return {
+                "containerInstances": [
+                    {"ec2InstanceId": f"i-{arn.rsplit('/', 1)[-1]}"}
+                    for arn in containerInstances
+                    if arn in container_instances
+                ]
+            }
+
+        ecs.describe_container_instances.side_effect = describe_container_instances
+        hosts = {
+            f"i-{arn.rsplit('/', 1)[-1]}": role
+            for arn, role in container_instances.items()
+        }
+        ec2 = MagicMock()
+        ec2.describe_instances.side_effect = lambda InstanceIds: {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "IamInstanceProfile": {
+                                "Arn": f"arn:aws:iam::1:instance-profile/p/{role}"
+                            }
+                        }
+                        if role
+                        else {}
+                        for instance_id in InstanceIds
+                        for role in [hosts[instance_id]]
+                    ]
+                }
+            ]
+        }
+        iam = MagicMock()
+        iam.get_instance_profile.side_effect = lambda InstanceProfileName: {
+            "InstanceProfile": {"Roles": [{"RoleName": InstanceProfileName}]}
+        }
+        clients = {
+            "ecs": ecs,
+            "sagemaker": sagemaker,
+            "inspector2": inspector,
+            "ec2": ec2,
+            "iam": iam,
+        }
         self.inspector = inspector
+        self.ecs = ecs
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
@@ -37688,6 +41293,69 @@ class TestBR33ContainerWorkloadImageScanning:
 
         assert [row["Status"] for row in rows] == ["Failed"]
         assert "has scan frequency SCAN_ON_PUSH" in rows[0]["Finding_Details"]
+
+    # CMP-01: a task with no task role dropped out of scope silently, so an EC2
+    # task whose container instance role holds Bedrock was never judged.
+    def _host_task(self, task_id, repo, instance):
+        task = self._task(task_id, repo=repo, definition="td-none")
+        task["containerInstanceArn"] = (
+            f"arn:aws:ecs:us-east-1:123456789012:container-instance/main/{instance}"
+        )
+        return task
+
+    def _host_run(self, coverage, **kwargs):
+        prefix = "arn:aws:ecs:us-east-1:123456789012:container-instance/main/"
+        return self._run(
+            tasks=[
+                self._host_task("t-host", "tools", "ci-1"),
+                self._host_task("t-plain", "unscanned", "ci-2"),
+                self._host_task("t-bare", "unscanned", "ci-3"),
+            ],
+            definitions={"td-none": None},
+            roles={"bedrock-host": self.BEDROCK, "s3-host": ["s3:GetObject"]},
+            container_instances={
+                prefix + "ci-1": "bedrock-host",
+                prefix + "ci-2": "s3-host",
+                prefix + "ci-3": None,
+            },
+            coverage=coverage,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("scanned, status", [(False, "Failed"), (True, "Passed")])
+    def test_a_task_without_a_task_role_is_judged_by_its_instance_role(
+        self, scanned, status
+    ):
+        rows = self._host_run(
+            self._scanned("tools") if scanned else [self._repository("tools")]
+        )
+
+        assert [row["Status"] for row in rows] == [status]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "ECS task 'main/t-host', which has no task role, on container "
+            "instance 'ci-1'" in detail
+        )
+        assert "t-plain" not in detail
+        assert "t-bare" not in detail
+
+    def test_an_unread_container_instance_withholds_the_pass(self):
+        rows = self._host_run(
+            self._scanned("tools"),
+            container_instance_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "DescribeContainerInstances",
+            ),
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "ECS task 'main/t-host' has no task role and runs on container instance "
+            "arn:aws:ecs:us-east-1:123456789012:container-instance/main/ci-1, whose "
+            "EC2 instance role was not read" in detail
+        )
+        assert self.ecs.describe_container_instances.call_count == 3
 
     def test_an_overridden_task_role_is_read_before_the_definition_role(self):
         rows = self._run(
@@ -37841,6 +41509,14 @@ class TestInvocationLogGuardrailEvidence:
     LOG_GROUP = "/aws/bedrock/model-invocation-logs"
     TAG = "amazon-bedrock-guardrails-guardContent"
     BODY_TEXT = "SECRET-PROMPT-TEXT"
+    S3_HOUR = _dt.now(_tz.utc).strftime("%Y/%m/%d/%H/")
+    S3_ROOT = "inv/AWSLogs/111122223333/BedrockModelInvocationLogs/us-east-1/"
+    S3_CONFIG = {
+        "loggingConfig": {
+            "textDataDeliveryEnabled": True,
+            "s3Config": {"bucketName": "logs", "keyPrefix": "inv"},
+        }
+    }
 
     def _record(self, request_id, operation="InvokeModel", inp=None, out=None):
         record = {
@@ -37866,7 +41542,10 @@ class TestInvocationLogGuardrailEvidence:
         return self._record(
             request_id,
             operation,
-            inp={"prompt": prompt},
+            inp={
+                "prompt": prompt,
+                "amazon-bedrock-guardrailConfig": {"tagSuffix": "xyz"},
+            },
             out={"amazon-bedrock-guardrailAction": "NONE", "completion": "x"},
         )
 
@@ -37923,8 +41602,13 @@ class TestInvocationLogGuardrailEvidence:
         config_error=None,
         logs_error=None,
         endless=False,
+        s3_objects=None,
+        s3_error=None,
     ):
-        """``pages`` maps a filter pattern to a list of pages of records."""
+        """
+        ``pages`` maps a filter pattern to a list of pages of records.
+        ``s3_objects`` maps an S3 key to its body, listed two keys per page.
+        """
         bedrock = MagicMock()
         if config_error is not None:
             bedrock.get_model_invocation_logging_configuration.side_effect = (
@@ -37964,7 +41648,32 @@ class TestInvocationLogGuardrailEvidence:
 
         logs.filter_log_events.side_effect = filter_log_events
         self.logs = logs
-        clients = {"bedrock": bedrock, "logs": logs}
+        s3 = MagicMock()
+        objects = s3_objects or {}
+        self.s3_gets = []
+
+        def list_objects_v2(Bucket, Prefix, ContinuationToken=None):
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            index = int(ContinuationToken or 0)
+            response = {
+                "Contents": [{"Key": k} for k in keys[index : index + 2]],
+                "IsTruncated": index + 2 < len(keys),
+            }
+            if response["IsTruncated"]:
+                response["NextContinuationToken"] = str(index + 2)
+            return response
+
+        def get_object(Bucket, Key):
+            if s3_error is not None:
+                raise s3_error
+            self.s3_gets.append(Key)
+            return {"Body": io.BytesIO(objects[Key])}
+
+        s3.list_objects_v2.side_effect = list_objects_v2
+        s3.get_object.side_effect = get_object
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "111122223333"}
+        clients = {"bedrock": bedrock, "logs": logs, "s3": s3, "sts": sts}
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
@@ -38095,9 +41804,14 @@ class TestInvocationLogGuardrailEvidence:
                             "textDataDeliveryEnabled": True,
                             "s3Config": {"bucketName": "logs"},
                         }
-                    }
+                    },
+                    "s3_objects": {
+                        "AWSLogs/111122223333/BedrockModelInvocationLogs/"
+                        "us-east-1/" + S3_HOUR + "a.json.gz": b"",
+                    },
+                    "s3_error": _make_client_error("AccessDenied"),
                 },
-                "delivered to Amazon S3 only",
+                "(s3:GetObject, AccessDenied)",
             ),
             (
                 {"config_error": _make_client_error("AccessDeniedException")},
@@ -38177,9 +41891,14 @@ class TestInvocationLogGuardrailEvidence:
                             "textDataDeliveryEnabled": True,
                             "s3Config": {"bucketName": "logs"},
                         }
-                    }
+                    },
+                    "s3_objects": {
+                        "AWSLogs/111122223333/BedrockModelInvocationLogs/"
+                        "us-east-1/" + S3_HOUR + "a.json.gz": b"",
+                    },
+                    "s3_error": _make_client_error("AccessDenied"),
                 },
-                "delivered to Amazon S3 only",
+                "(s3:GetObject, AccessDenied)",
             ),
             (
                 {"config_error": _make_client_error("AccessDeniedException")},
@@ -38192,3 +41911,1345 @@ class TestInvocationLogGuardrailEvidence:
 
         assert [row["Status"] for row in rows] == ["N/A"]
         assert phrase in rows[0]["Finding_Details"]
+
+    @staticmethod
+    def _s3_body(records, compress=True):
+        text = "\n".join(json.dumps(record) for record in records).encode()
+        return gzip.compress(text) if compress else text
+
+    def _converse(self, request_id, turns, guarded=True, intervened=False):
+        body = {
+            "messages": [{"role": role, "content": content} for role, content in turns]
+        }
+        if guarded:
+            body["guardrailConfig"] = {"guardrailIdentifier": "g1"}
+        out = {"stopReason": "guardrail_intervened" if intervened else "end_turn"}
+        return self._record(request_id, "Converse", inp=body, out=out)
+
+    CONVERSE = '{ ($.operation = "Converse") || ($.operation = "ConverseStream") }'
+    TEXT_BLOCK = {"text": "SECRET-PROMPT-TEXT"}
+    GUARD_BLOCK = {"guardContent": {"text": {"text": "SECRET-PROMPT-TEXT"}}}
+
+    @pytest.mark.parametrize(
+        "body, status",
+        [
+            # The tag names a suffix other than the configured one.
+            (
+                {
+                    "prompt": f"<{TAG}_abc>SECRET-PROMPT-TEXT</{TAG}_abc>",
+                    "amazon-bedrock-guardrailConfig": {"tagSuffix": "xyz"},
+                },
+                "Failed",
+            ),
+            # An opening tag with no closing tag wraps nothing.
+            (
+                {
+                    "prompt": f"<{TAG}_xyz>SECRET-PROMPT-TEXT",
+                    "amazon-bedrock-guardrailConfig": {"tagSuffix": "xyz"},
+                },
+                "Failed",
+            ),
+            # No tagSuffix and no tag at all.
+            ({"prompt": "SECRET-PROMPT-TEXT"}, "Failed"),
+            # The tag name appears but no tagSuffix says which tag counts.
+            ({"prompt": f"<{TAG}_xyz>SECRET-PROMPT-TEXT</{TAG}_xyz>"}, "N/A"),
+        ],
+    )
+    def test_the_input_tag_must_match_the_configured_tag_suffix(self, body, status):
+        guarded = self._record(
+            "req-odd",
+            inp=body,
+            out={"amazon-bedrock-guardrailAction": "NONE"},
+        )
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-ok", True), guarded]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == [status]
+        detail = rows[0]["Finding_Details"]
+        assert "req-odd (InvokeModel anthropic.test)" in detail
+        assert "req-ok" not in detail
+        if status == "N/A":
+            assert "names no tagSuffix" in detail
+
+    def test_a_guarded_converse_turn_without_guard_content_fails(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])]),
+                        # The earlier user turn is marked, the latest is not.
+                        self._converse(
+                            "req-c-late",
+                            [
+                                ("user", [self.GUARD_BLOCK]),
+                                ("assistant", [{"text": "a"}]),
+                                ("user", [self.TEXT_BLOCK]),
+                            ],
+                        ),
+                        self._converse(
+                            "req-c-unguarded", [("user", [self.TEXT_BLOCK])], False
+                        ),
+                    ],
+                    [
+                        self._converse(
+                            "req-c-blocked",
+                            [("user", [self.TEXT_BLOCK])],
+                            guarded=False,
+                            intervened=True,
+                        )
+                    ],
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "2 of the 3 guarded Converse call(s)" in detail
+        assert "req-c-late (Converse anthropic.test)" in detail
+        assert "req-c-blocked (Converse anthropic.test)" in detail
+        for other in ("req-c-ok", "req-c-unguarded", "InvokeModel call(s)"):
+            assert other not in detail
+
+    def test_every_guarded_converse_turn_marked_passes(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])])]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "every one of the 1 guarded Converse call(s)" in detail
+        assert "counts as guarded only when" in detail
+
+    def test_s3_only_records_are_read_and_an_untagged_call_fails(self):
+        old_hour = (_dt.now(_tz.utc) - _td(hours=30)).strftime("%Y/%m/%d/%H/")
+        stale = self._guarded("req-stale", False)
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                # Three record objects listed across two pages.
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._catch("req-catch"), self._guarded("req-ok", True)]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz": self._s3_body(
+                    [self._record("req-plain")]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "c.json": self._s3_body(
+                    [self._guarded("req-untagged", False)], compress=False
+                ),
+                # A large-data body is not a record.
+                self.S3_ROOT + self.S3_HOUR + "data/x_input.json.gz": b"not json",
+                # Outside the 24-hour folders.
+                self.S3_ROOT + old_hour + "z.json.gz": self._s3_body([stale]),
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 2 guarded InvokeModel call(s)" in detail
+        assert f"s3://logs/{self.S3_ROOT}" in detail
+        assert "req-untagged" in detail
+        assert "1 prompt attack block(s)" in detail
+        assert "req-stale" not in detail
+        assert not any("/data/" in key for key in self.s3_gets)
+        assert self.logs.filter_log_events.call_count == 0
+
+    def test_an_s3_record_older_than_24_hours_is_not_judged(self):
+        stale = self._guarded("req-stale", False)
+        stale["timestamp"] = (_dt.now(_tz.utc) - _td(hours=25)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        fresh = self._guarded("req-fresh", True)
+        fresh["timestamp"] = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        catch = self._catch("req-catch")
+        catch["input"]["inputBodyJson"] = {
+            "messages": [{"role": "user", "content": [self.GUARD_BLOCK]}]
+        }
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [catch, stale, fresh]
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "req-stale" not in detail
+        assert "Every one of the 1 guarded InvokeModel call(s)" in detail
+        assert "every one of the 1 guarded Converse call(s)" in detail
+
+    def test_the_s3_object_cap_is_na_not_passed(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "INVOCATION_LOG_S3_MAX_OBJECTS", 1)
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._catch("req-catch"), self._guarded("req-ok", True)]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz": self._s3_body(
+                    [self._guarded("req-ok-2", True)]
+                ),
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "(object cap)" in rows[0]["Finding_Details"]
+
+    def test_s3_only_grounding_scores_are_read(self):
+        rows = self._grounding(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._scored("req-x", None), self._scored("req-g", 0.4)]
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert f"s3://logs/{self.S3_ROOT}" in detail
+        assert "req-g GROUNDING score 0.4" in detail
+        assert "req-x" not in detail
+
+    def test_s3_only_grounding_with_no_score_is_na(self):
+        rows = self._grounding(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [self._scored("req-x", None)]
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+
+
+class TestBR04AgentMemoryRetention:
+    """AIR-FND-DAT-08: Bedrock agent memory storageDays at DRAFT and every routed version."""
+
+    @staticmethod
+    def _client(agents, drafts, aliases=None, versions=None, list_error=None):
+        client = MagicMock()
+        if list_error is not None:
+            client.list_agents.side_effect = list_error
+        else:
+            client.list_agents.return_value = {"agentSummaries": agents}
+
+        def get_agent(agentId):
+            value = drafts[agentId]
+            if isinstance(value, Exception):
+                raise value
+            return {"agent": {"agentId": agentId, "memoryConfiguration": value}}
+
+        def get_agent_version(agentId, agentVersion):
+            value = (versions or {})[(agentId, agentVersion)]
+            if isinstance(value, Exception):
+                raise value
+            return {"agentVersion": {"memoryConfiguration": value}}
+
+        client.get_agent.side_effect = get_agent
+        client.list_agent_aliases.side_effect = lambda agentId, **_: {
+            "agentAliasSummaries": [
+                {"routingConfiguration": [{"agentVersion": v} for v in routed]}
+                for routed in (aliases or {}).get(agentId, [])
+            ]
+        }
+        client.get_agent_version.side_effect = get_agent_version
+        return client
+
+    @staticmethod
+    def _rows(client):
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            rows = bedrock_app._bedrock_agent_memory_findings("us-east-1")
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-04"
+        return rows
+
+    MEMORY_30 = {"enabledMemoryTypes": ["SESSION_SUMMARY"], "storageDays": 30}
+
+    def test_every_routed_version_is_judged_and_a_memoryless_agent_is_skipped(self):
+        client = self._client(
+            [
+                {"agentId": "AG1", "agentName": "support"},
+                {"agentId": "AG2", "agentName": "plain"},
+            ],
+            {"AG1": self.MEMORY_30, "AG2": None},
+            aliases={"AG1": [["2", "DRAFT"], ["3"]], "AG2": [["1"]]},
+            versions={
+                ("AG1", "2"): {"enabledMemoryTypes": ["SESSION_SUMMARY"]},
+                ("AG1", "3"): {
+                    "enabledMemoryTypes": ["SESSION_SUMMARY"],
+                    "storageDays": 365,
+                },
+                ("AG2", "1"): {"enabledMemoryTypes": []},
+            },
+        )
+        rows = self._rows(client)
+        assert [(r["Status"], r["Finding_Details"][:41]) for r in rows] == [
+            ("Passed", "Bedrock agent 'support' (AG1) DRAFT keeps"),
+            ("N/A", "Bedrock agent 'support' (AG1) version 2 e"),
+            ("Passed", "Bedrock agent 'support' (AG1) version 3 k"),
+        ]
+        assert "keeps session summaries for 30 days" in rows[0]["Finding_Details"]
+        assert "returned no storageDays" in rows[1]["Finding_Details"]
+        assert "for 365 days" in rows[2]["Finding_Details"]
+        assert sorted(
+            call.kwargs["agentVersion"]
+            for call in client.get_agent_version.call_args_list
+        ) == ["1", "2", "3"]
+
+    def test_zero_storage_days_is_not_passed(self):
+        rows = self._rows(
+            self._client(
+                [{"agentId": "AG1", "agentName": "support"}],
+                {"AG1": {"enabledMemoryTypes": ["SESSION_SUMMARY"], "storageDays": 0}},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "storageDays 0" in rows[0]["Finding_Details"]
+
+    def test_an_unread_agent_is_named_beside_a_read_one(self):
+        rows = self._rows(
+            self._client(
+                [
+                    {"agentId": "AG1", "agentName": "support"},
+                    {"agentId": "AG2", "agentName": "locked"},
+                ],
+                {"AG1": self.MEMORY_30, "AG2": self.MEMORY_30},
+                aliases={"AG2": [["4"]]},
+                versions={("AG2", "4"): _make_client_error("AccessDeniedException")},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert (
+            "The memory configuration of Bedrock agent 'locked' was not read"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_an_unlisted_agent_population_is_na(self):
+        rows = self._rows(
+            self._client([], {}, list_error=_make_client_error("AccessDeniedException"))
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "were not listed with bedrock:ListAgents" in rows[0]["Finding_Details"]
+
+    def test_no_memory_anywhere_is_said_so(self):
+        rows = self._rows(
+            self._client([{"agentId": "AG1", "agentName": "plain"}], {"AG1": None})
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "No Bedrock agent version in us-east-1 enables memory (1 agent(s) read"
+            in rows[0]["Finding_Details"]
+        )
+
+
+class TestBR04SageMakerInferenceRetention:
+    """AIR-FND-DAT-08: the lifecycle of every SageMaker data capture and async output URI."""
+
+    @staticmethod
+    def _s3(buckets):
+        """buckets: name -> {"rules", "versioning", "replicas", "error"}."""
+        client = MagicMock()
+
+        def lifecycle(Bucket):
+            spec = buckets[Bucket]
+            if spec.get("error"):
+                raise spec["error"]
+            if spec.get("rules") is None:
+                raise _make_client_error("NoSuchLifecycleConfiguration")
+            return {"Rules": spec["rules"]}
+
+        def replication(Bucket):
+            replicas = buckets[Bucket].get("replicas")
+            if not replicas:
+                raise _make_client_error("ReplicationConfigurationNotFoundError")
+            return {
+                "ReplicationConfiguration": {
+                    "Rules": [
+                        {
+                            "Status": "Enabled",
+                            "Destination": {"Bucket": f"arn:aws:s3:::{r}"},
+                        }
+                        for r in replicas
+                    ]
+                }
+            }
+
+        client.get_bucket_lifecycle_configuration.side_effect = lifecycle
+        client.get_bucket_versioning.side_effect = lambda Bucket: (
+            {"Status": buckets[Bucket]["versioning"]}
+            if buckets[Bucket].get("versioning")
+            else {}
+        )
+        client.get_object_lock_configuration.side_effect = lambda Bucket: (
+            _ for _ in ()
+        ).throw(_make_client_error("ObjectLockConfigurationNotFoundError"))
+        client.get_bucket_replication.side_effect = replication
+        return client
+
+    def _rows(self, uris, buckets, errors=()):
+        located = {
+            "locations": [],
+            "uris": [(uri, label) for uri, label in uris],
+            "errors": list(errors),
+        }
+        with (
+            patch.object(
+                bedrock_app, "_sagemaker_endpoint_locations", return_value=located
+            ),
+            patch.object(bedrock_app.boto3, "client", return_value=self._s3(buckets)),
+        ):
+            rows = bedrock_app._sagemaker_inference_retention_findings("us-east-1")
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-04"
+        return rows
+
+    @staticmethod
+    def _rule(prefix, noncurrent=False, **extra):
+        rule = {
+            "ID": f"rule-{prefix or 'root'}",
+            "Status": "Enabled",
+            "Filter": {"Prefix": prefix},
+            "Expiration": {"Days": 30},
+            **extra,
+        }
+        if noncurrent:
+            rule["NoncurrentVersionExpiration"] = {"NoncurrentDays": 7}
+        return rule
+
+    CAPTURE = (
+        "s3://capture-a/capture/ep1",
+        "the data capture destination of SageMaker endpoint 'ep1'",
+    )
+    ASYNC = (
+        "s3://async-b/out/",
+        "the asynchronous inference output of SageMaker endpoint 'ep2'",
+    )
+
+    def test_a_rule_must_cover_the_uri_path_on_every_destination(self):
+        rows = self._rows(
+            [self.CAPTURE, self.ASYNC],
+            {
+                "capture-a": {"rules": [self._rule("capture/")]},
+                "async-b": {"rules": [self._rule("other/")]},
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "rule-other/ applies to prefix 'other/', which does not cover 'out/'"
+            in rows[0]["Finding_Details"]
+        )
+        assert (
+            "captured requests and responses are kept indefinitely"
+            in rows[0]["Finding_Details"]
+        )
+        assert (
+            "'capture-a' lifecycle: rule-capture/ expires objects after 30 day(s)"
+            in rows[1]["Finding_Details"]
+        )
+        assert "async-b" not in rows[1]["Finding_Details"]
+
+    def test_a_versioned_destination_needs_a_noncurrent_expiration(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {"capture-a": {"rules": [self._rule("")], "versioning": "Enabled"}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "overwritten and expired captured objects are kept indefinitely"
+            in rows[0]["Finding_Details"]
+        )
+        rows = self._rows(
+            [self.CAPTURE],
+            {
+                "capture-a": {
+                    "rules": [self._rule("", noncurrent=True)],
+                    "versioning": "Enabled",
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_replicated_destination_is_held_and_its_replica_judged(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {
+                "capture-a": {"rules": [self._rule("")], "replicas": ["copy-c"]},
+                "copy-c": {"rules": None},
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert (
+            "Replica S3 bucket (copied from 'capture-a') 'copy-c'"
+            in rows[0]["Finding_Details"]
+        )
+        assert (
+            "the ReplicationStatus of the objects under 'capture/ep1/' was not read"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_an_unread_endpoint_withholds_the_pass(self):
+        rows = self._rows(
+            [self.CAPTURE],
+            {"capture-a": {"rules": [self._rule("")]}},
+            errors=["endpoint 'ep9' was not read with sagemaker:DescribeEndpoint"],
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "This is not reported as Passed" in rows[0]["Finding_Details"]
+        assert "endpoint 'ep9' was not read" in rows[1]["Finding_Details"]
+
+    def test_no_inference_destination_is_said_so(self):
+        rows = self._rows([], {})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "No SageMaker endpoint in us-east-1 captures data"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_the_collector_records_each_enabled_capture_uri(self):
+        client = MagicMock()
+        client.list_endpoints.return_value = {
+            "Endpoints": [{"EndpointName": "on"}, {"EndpointName": "off"}]
+        }
+        client.describe_endpoint.side_effect = lambda EndpointName: {
+            "EndpointConfigName": f"{EndpointName}-config",
+            "DataCaptureConfig": {
+                "EnableCapture": EndpointName == "on",
+                "DestinationS3Uri": f"s3://cap/{EndpointName}",
+            },
+        }
+        client.describe_endpoint_config.return_value = {}
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            located = bedrock_app._sagemaker_endpoint_locations("us-east-1")
+        assert located["uris"] == [
+            ("s3://cap/on", "the data capture destination of SageMaker endpoint 'on'")
+        ]
+
+
+class TestBR34GuardDutyPromptInjection:
+    """AIR-FND-DET-04: GuardDuty AI Protection raises prompt injection findings."""
+
+    INJECTION = "Impact:IAMUser/PromptInjection.Direct"
+
+    @staticmethod
+    def _finding(finding_id, kind, updated, api="ApplyGuardrail"):
+        return {
+            "Id": finding_id,
+            "Type": kind,
+            "Severity": 2.0,
+            "UpdatedAt": updated,
+            "Service": {"Action": {"AwsApiCallAction": {"Api": api}}},
+        }
+
+    def _run(
+        self,
+        detector_pages=(["det-1"],),
+        detector=None,
+        finding_pages=None,
+        findings=(),
+        errors=None,
+    ):
+        errors = errors or {}
+        client = MagicMock()
+        self.calls = {"list_detectors": [], "list_findings": [], "get_findings": []}
+
+        def paged(name, key, pages):
+            def call(**kwargs):
+                self.calls[name].append(kwargs)
+                if name in errors:
+                    raise errors[name]
+                index = int(kwargs.get("NextToken") or 0)
+                response = {key: list(pages[index])}
+                if index + 1 < len(pages):
+                    response["NextToken"] = str(index + 1)
+                return response
+
+            return call
+
+        client.list_detectors.side_effect = paged(
+            "list_detectors", "DetectorIds", detector_pages
+        )
+        if "get_detector" in errors:
+            client.get_detector.side_effect = errors["get_detector"]
+        else:
+            client.get_detector.return_value = (
+                detector
+                if detector is not None
+                else {
+                    "Status": "ENABLED",
+                    "Features": [
+                        {"Name": "CLOUD_TRAIL", "Status": "ENABLED"},
+                        {"Name": "AI_PROTECTION", "Status": "ENABLED"},
+                    ],
+                }
+            )
+        by_id = {finding["Id"]: finding for finding in findings}
+        client.list_findings.side_effect = paged(
+            "list_findings",
+            "FindingIds",
+            finding_pages if finding_pages is not None else [list(by_id)],
+        )
+
+        def get_findings(DetectorId, FindingIds):
+            self.calls["get_findings"].append(list(FindingIds))
+            if "get_findings" in errors:
+                raise errors["get_findings"]
+            return {"Findings": [by_id[i] for i in FindingIds]}
+
+        client.get_findings.side_effect = get_findings
+        with patch("bedrock_app.boto3.client", return_value=client):
+            return extract_csv_data(
+                bedrock_app.check_guardduty_prompt_injection_detection(
+                    region="us-east-1"
+                )
+            )
+
+    def test_enabled_ai_protection_passes_and_names_only_injection_findings(self):
+        findings = [
+            self._finding("f-old", self.INJECTION, "2026-09-01T00:00:00Z"),
+            self._finding(
+                "f-anom",
+                "Impact:IAMUser/AnomalousModelInvocation",
+                "2026-10-02T00:00:00Z",
+                api="InvokeModel",
+            ),
+            self._finding("f-new", self.INJECTION, "2026-10-01T00:00:00Z"),
+        ]
+        rows = self._run(findings=findings)
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert rows[0]["Check_ID"] == "BR-34"
+        detail = rows[0]["Finding_Details"]
+        assert "AI_PROTECTION ENABLED" in detail
+        assert "3 unarchived finding(s)" in detail
+        assert f"2 {self.INJECTION}" in detail
+        assert "1 Impact:IAMUser/AnomalousModelInvocation" in detail
+        assert detail.index("f-new") < detail.index("f-old")
+        assert "f-anom" not in detail
+        assert "Which Bedrock APIs AI Protection analyzes is not judged" in detail
+        criterion = self.calls["list_findings"][0]["FindingCriteria"]["Criterion"]
+        assert criterion["service.action.awsApiCallAction.serviceName"] == {
+            "Eq": ["bedrock.amazonaws.com"]
+        }
+        assert criterion["service.archived"] == {"Eq": ["false"]}
+
+    def test_no_injection_finding_still_passes_and_says_so(self):
+        rows = self._run(findings=[])
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "none is a prompt injection finding" in rows[0]["Finding_Details"]
+        assert self.calls["get_findings"] == []
+
+    @pytest.mark.parametrize(
+        "detector, named",
+        [
+            (
+                {
+                    "Status": "ENABLED",
+                    "Features": [
+                        {"Name": "CLOUD_TRAIL", "Status": "ENABLED"},
+                        {"Name": "AI_PROTECTION", "Status": "DISABLED"},
+                    ],
+                },
+                "AI_PROTECTION DISABLED",
+            ),
+            (
+                {
+                    "Status": "ENABLED",
+                    "Features": [{"Name": "CLOUD_TRAIL", "Status": "ENABLED"}],
+                },
+                "AI_PROTECTION not listed among its Features",
+            ),
+            (
+                {
+                    "Status": "DISABLED",
+                    "Features": [{"Name": "AI_PROTECTION", "Status": "ENABLED"}],
+                },
+                "Status DISABLED",
+            ),
+        ],
+    )
+    def test_a_detector_without_enabled_ai_protection_fails(self, detector, named):
+        rows = self._run(detector=detector)
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert named in rows[0]["Finding_Details"]
+        assert self.calls["list_findings"] == []
+
+    def test_no_detector_fails(self):
+        rows = self._run(detector_pages=([],))
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "No GuardDuty detector exists in us-east-1" in rows[0]["Finding_Details"]
+
+    def test_a_detector_on_a_later_page_is_read(self):
+        rows = self._run(detector_pages=([], ["det-2"]))
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "det-2" in rows[0]["Finding_Details"]
+        assert self.calls["list_detectors"][1]["NextToken"] == "1"
+        assert self.calls["list_detectors"][0]["MaxResults"] == 50
+
+    def test_every_findings_page_and_batch_is_read(self):
+        findings = [
+            self._finding(
+                f"f-{index:03d}", self.INJECTION, f"2026-09-{index % 28 + 1:02d}"
+            )
+            for index in range(120)
+        ]
+        ids = [finding["Id"] for finding in findings]
+        rows = self._run(findings=findings, finding_pages=[ids[:50], ids[50:]])
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "120 unarchived finding(s)" in rows[0]["Finding_Details"]
+        assert [len(batch) for batch in self.calls["get_findings"]] == [50, 50, 20]
+        assert self.calls["list_findings"][1]["NextToken"] == "1"
+
+    @pytest.mark.parametrize(
+        "failed",
+        ["list_detectors", "get_detector", "list_findings", "get_findings"],
+    )
+    def test_a_failed_read_is_never_passed(self, failed):
+        findings = [self._finding("f-1", self.INJECTION, "2026-10-01T00:00:00Z")]
+        rows = self._run(
+            findings=findings,
+            errors={
+                failed: ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    failed,
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "AccessDenied" in rows[0]["Finding_Details"]
+
+
+class TestBR57AgentRoleScope:
+    """AIR-FND-IAM-05: each Bedrock agent and action group role is scoped to
+    the model, data and API ARNs it needs."""
+
+    ACCOUNT = "123456789012"
+    FN = "arn:aws:lambda:us-east-1:123456789012:function:{}"
+
+    @classmethod
+    def _role(cls, name):
+        return f"arn:aws:iam::{cls.ACCOUNT}:role/{name}"
+
+    @staticmethod
+    def _allow(action, resource, sid="s", **extra):
+        return {
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": action,
+            "Resource": resource,
+            **extra,
+        }
+
+    def _run(
+        self, roles, agent_roles, function_roles=None, cache_extra=None, errors=()
+    ):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": roles,
+            "user_permissions": {},
+        }
+        cache.update(cache_extra or {})
+        inventory = {
+            "roles": {self._role(name): labels for name, labels in agent_roles.items()},
+            "errors": list(errors),
+        }
+        functions = {"roles": {}, "functions": 0, "errors": []}
+        for arn, role in (function_roles or {}).items():
+            functions["roles"].setdefault(self._role(role), []).append(arn)
+            functions["functions"] += 1
+        result = bedrock_app.check_bedrock_agent_role_scope(
+            cache,
+            region="us-east-1",
+            agent_inventory=inventory,
+            function_roles=functions,
+        )
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-57"
+        return result, rows
+
+    def test_one_wide_role_fails_beside_a_scoped_one(self):
+        roles = {
+            "agent-wide": _identity(
+                attached=[
+                    _customer_policy(
+                        "wide",
+                        self._allow("bedrock:InvokeModel", "*", sid="AnyModel"),
+                    )
+                ]
+            ),
+            "agent-tight": _identity(
+                inline=[
+                    {
+                        "name": "tight",
+                        "document": _policy(
+                            self._allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*::foundation-model/anthropic.claude-v2",
+                            ),
+                            self._allow("s3:GetObject", "arn:aws:s3:::kb-docs/*"),
+                            self._allow("bedrock:ListFoundationModels", "*"),
+                        ),
+                    }
+                ]
+            ),
+        }
+        result, rows = self._run(
+            roles,
+            {
+                "agent-wide": ["Bedrock agent 'w' version DRAFT"],
+                "agent-tight": ["Bedrock agent 't' version 1"],
+                "runtime": ["AgentCore runtime 'r' version 1"],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert self._role("agent-wide") in detail
+        assert "statement 'AnyModel'" in detail and "bedrock:invokemodel on *" in detail
+        assert self._role("agent-tight") not in detail
+        assert result["status"] == "WARN"
+
+    @pytest.mark.parametrize(
+        "action, resource",
+        [
+            ("s3:*", "arn:aws:s3:::*"),
+            ("s3:GetObject", "arn:aws:s3:::*/*"),
+            ("dynamodb:GetItem", "arn:aws:dynamodb:us-east-1:123456789012:table/*"),
+            ("secretsmanager:*", "arn:aws:secretsmanager:*:*:secret:*"),
+            (
+                "lambda:InvokeFunction",
+                "arn:aws:lambda:us-east-1:123456789012:function:*",
+            ),
+            ("bedrock:Invoke*", "arn:aws:bedrock:*::foundation-model/*"),
+            ("bedrock:Retrieve", "arn:aws:bedrock:us-east-1:123456789012:*"),
+            ("execute-api:Invoke", "arn:aws:execute-api:*"),
+            ("*", "*"),
+        ],
+    )
+    def test_a_probed_action_on_every_resource_of_its_type_fails(
+        self, action, resource
+    ):
+        _, rows = self._run(
+            {
+                "role": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(self._allow(action, resource)),
+                        }
+                    ]
+                )
+            },
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "action, resource",
+        [
+            ("s3:GetObject", "arn:aws:s3:::kb-docs/*"),
+            ("s3:GetObject", "arn:aws:s3:::kb-*/*"),
+            ("dynamodb:GetItem", "arn:aws:dynamodb:*:123456789012:table/orders"),
+            ("lambda:InvokeFunction", "arn:aws:lambda:*:*:function:tool-*"),
+            (
+                "execute-api:Invoke",
+                "arn:aws:execute-api:us-east-1:123456789012:abc123/*",
+            ),
+            ("bedrock:InvokeModel", "arn:aws:bedrock:*::foundation-model/anthropic.*"),
+            ("ec2:DescribeInstances", "*"),
+        ],
+    )
+    def test_a_named_resource_or_an_unprobed_action_passes(self, action, resource):
+        _, rows = self._run(
+            {
+                "role": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(self._allow(action, resource)),
+                        }
+                    ]
+                )
+            },
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Actions outside this set are not judged" in rows[0]["Finding_Details"]
+
+    def test_an_action_group_function_role_is_judged(self):
+        _, rows = self._run(
+            {
+                "fn-role": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(self._allow("s3:PutObject", "*")),
+                        }
+                    ]
+                )
+            },
+            {},
+            function_roles={self.FN.format("tool"): "fn-role"},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"action group function {self.FN.format('tool')}"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_not_resource_counts_as_unscoped(self):
+        statement = {
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "NotResource": "arn:aws:s3:::secret/*",
+        }
+        _, rows = self._run(
+            {"role": _identity(inline=[{"name": "p", "document": _policy(statement)}])},
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "everything but its NotResource" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "boundary, status",
+        [
+            (
+                _policy(
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:GetObject",
+                        "Resource": "arn:aws:s3:::kb/*",
+                    }
+                ),
+                "Passed",
+            ),
+            (
+                _policy({"Effect": "Allow", "Action": "ec2:*", "Resource": "*"}),
+                "Passed",
+            ),
+            (_policy({"Effect": "Allow", "Action": "s3:*", "Resource": "*"}), "Failed"),
+        ],
+    )
+    def test_a_boundary_bounds_the_grant_only_when_it_scopes_it(self, boundary, status):
+        permissions = _identity(
+            inline=[
+                {"name": "p", "document": _policy(self._allow("s3:GetObject", "*"))}
+            ]
+        )
+        permissions["permissions_boundary"] = {"document": boundary}
+        _, rows = self._run(
+            {"role": permissions}, {"role": ["Bedrock agent 'a' version DRAFT"]}
+        )
+        assert [r["Status"] for r in rows] == [status]
+
+    def test_a_conditioned_wide_grant_is_not_passed(self):
+        statement = self._allow(
+            "s3:GetObject",
+            "*",
+            Condition={"StringEquals": {"aws:ResourceTag/agent": "a"}},
+        )
+        _, rows = self._run(
+            {"role": _identity(inline=[{"name": "p", "document": _policy(statement)}])},
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "only under a Condition, which is not judged" in rows[0]["Finding_Details"]
+        )
+
+    def test_an_unread_role_keeps_the_row_from_passing(self):
+        tight = _identity(
+            inline=[
+                {
+                    "name": "p",
+                    "document": _policy(
+                        self._allow("s3:GetObject", "arn:aws:s3:::kb/*")
+                    ),
+                }
+            ]
+        )
+        _, rows = self._run(
+            {"tight": tight, "errored": tight},
+            {
+                "tight": ["Bedrock agent 'a' version DRAFT"],
+                "errored": ["Bedrock agent 'b' version DRAFT"],
+                "missing": ["Bedrock agent 'c' version DRAFT"],
+            },
+            cache_extra={
+                "principal_errors": [
+                    {
+                        "type": "role",
+                        "name": "errored",
+                        "stage": "inline_policies",
+                        "error": "x",
+                    }
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            f"role {self._role('missing')} is not in the IAM permissions cache"
+            in detail
+        )
+        assert f"role {self._role('errored')} had a policy read fail" in detail
+
+    def test_an_unread_inventory_keeps_the_row_from_passing(self):
+        _, rows = self._run(
+            {},
+            {},
+            errors=[
+                "Bedrock agents were not read with bedrock:ListAgents (AccessDenied)"
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "bedrock:ListAgents (AccessDenied)" in rows[0]["Finding_Details"]
+
+    def test_a_version_one_cache_says_errors_were_not_recorded(self):
+        tight = _identity(
+            inline=[
+                {
+                    "name": "p",
+                    "document": _policy(
+                        self._allow("s3:GetObject", "arn:aws:s3:::kb/*")
+                    ),
+                }
+            ]
+        )
+        _, rows = self._run(
+            {"role": tight},
+            {"role": ["Bedrock agent 'a' version DRAFT"]},
+            cache_extra={"cache_schema_version": 1},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert bedrock_app.IAM_CACHE_V1_NOTE in rows[0]["Finding_Details"]
+
+
+class TestBR06InferenceTrace:
+    """AIR-BDR-MDL-07: one invocation traced from CloudTrail to its invocation
+    log record, and the CloudTrail events queryable centrally."""
+
+    GROUP = "/aws/bedrock/model-invocation-logs"
+    TRACE = "Bedrock Inference End-to-End Trace"
+    CENTRAL = "Bedrock Inference Trace Centralization"
+
+    @staticmethod
+    def _event(request_id, time, error=None, operation="InvokeModel"):
+        detail = {
+            "eventTime": time,
+            "requestID": request_id,
+            "userIdentity": {"arn": f"arn:aws:sts::1:assumed-role/app/{request_id}"},
+            "sourceIPAddress": "10.0.0.1",
+            "requestParameters": {"modelId": "anthropic.claude"},
+            "additionalEventData": {"inferenceRegion": "us-east-2"},
+        }
+        if error:
+            detail["errorCode"] = error
+        return {"CloudTrailEvent": json.dumps(detail)}
+
+    @staticmethod
+    def _record(request_id, body=True):
+        return {
+            "requestId": request_id,
+            "timestamp": "2026-10-03T10:00:00Z",
+            "modelId": "arn:aws:bedrock:us-east-1:1:inference-profile/x",
+            "identity": {"arn": f"arn:aws:sts::1:assumed-role/app/{request_id}"},
+            "input": {"inputBodyJson": {}} if body else {"inputTokenCount": 1},
+            "output": {"outputBodyJson": {}} if body else {},
+        }
+
+    def _run(
+        self,
+        events=None,
+        records=(),
+        source=None,
+        lookup_error=None,
+        logs_error=None,
+        stores=None,
+        glue=None,
+        glue_error=None,
+        home=None,
+    ):
+        events = events or {}
+        cloudtrail = MagicMock()
+
+        def lookup_events(LookupAttributes, **kwargs):
+            if lookup_error:
+                raise lookup_error
+            self.lookups.append(
+                {**kwargs, "name": LookupAttributes[0]["AttributeValue"]}
+            )
+            return {"Events": events.get(LookupAttributes[0]["AttributeValue"], [])}
+
+        self.lookups = []
+        cloudtrail.lookup_events.side_effect = lookup_events
+        logs = MagicMock()
+        self.patterns = []
+
+        def filter_log_events(**request):
+            self.patterns.append(request["filterPattern"])
+            if logs_error:
+                raise logs_error
+            return {"events": [{"message": json.dumps(r)} for r in records]}
+
+        logs.filter_log_events.side_effect = filter_log_events
+        glue_clients = {}
+
+        def glue_client(region):
+            client = MagicMock()
+            tables = (glue or {}).get(region, {})
+
+            def paginator(name):
+                pages = MagicMock()
+                if name == "get_databases":
+                    if glue_error:
+                        pages.paginate.side_effect = glue_error
+                    else:
+                        pages.paginate.return_value = [
+                            {"DatabaseList": [{"Name": db} for db in tables]}
+                        ]
+                else:
+                    pages.paginate.side_effect = lambda DatabaseName: [
+                        {
+                            "TableList": [
+                                {"Name": name, "StorageDescriptor": {"Location": loc}}
+                                for name, loc in tables[DatabaseName].items()
+                            ]
+                        }
+                    ]
+                return pages
+
+            client.get_paginator.side_effect = paginator
+            glue_clients[region] = client
+            return client
+
+        def client(service, region_name=None, **_):
+            if service == "glue":
+                return glue_client(region_name)
+            return {"cloudtrail": cloudtrail, "logs": logs}[service]
+
+        coverage = {
+            "names": [],
+            "error": None,
+            "management": [],
+            "credited": {},
+            "narrowed": {},
+            "inactive": [],
+            "unread": [],
+            **(stores or {}),
+        }
+        with (
+            patch("bedrock_app.boto3.client", side_effect=client),
+            patch.object(
+                bedrock_app,
+                "_invocation_log_source",
+                return_value=source
+                or {
+                    "log_group": self.GROUP,
+                    "s3": None,
+                    "where": self.GROUP,
+                    "logging": True,
+                    "reason": None,
+                },
+            ),
+            patch.object(
+                bedrock_app,
+                "_assessed_event_data_store_coverage",
+                return_value=coverage,
+            ),
+            patch.object(
+                bedrock_app,
+                "_event_data_store_home_regions",
+                return_value=home or {"regions": ["eu-west-1"], "error": None},
+            ),
+        ):
+            result = bedrock_app.check_bedrock_inference_trace(region="us-east-1")
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-06"
+        return {row["Finding"]: row for row in rows}, result
+
+    def test_a_joined_call_is_the_trace_example_and_an_unjoined_one_is_named(self):
+        rows, _ = self._run(
+            events={
+                "InvokeModel": [
+                    self._event("req-old", "2026-10-03T08:00:00Z"),
+                    self._event("req-denied", "2026-10-03T11:00:00Z", "AccessDenied"),
+                ],
+                "Converse": [self._event("req-new", "2026-10-03T10:00:00Z")],
+            },
+            records=[self._record("req-old"), self._record("req-other")],
+        )
+        row = rows[self.TRACE]
+        assert row["Status"] == "Passed"
+        detail = row["Finding_Details"]
+        assert "1 of the 2 newest" in detail
+        assert "event req-old at 2026-10-03T08:00:00Z" in detail
+        assert "assumed-role/app/req-old" in detail and "us-east-2" in detail
+        assert "an input body and an output body" in detail
+        assert "Unjoined: req-new." in detail
+        assert "req-denied" not in detail
+        assert "req-other" not in detail
+        assert self.patterns == [
+            '{ ($.requestId = "req-new") || ($.requestId = "req-old") }'
+        ]
+        assert sorted(call["name"] for call in self.lookups) == sorted(
+            bedrock_app.INFERENCE_TRACE_OPERATIONS
+        )
+        assert all(
+            call["EndTime"] - call["StartTime"]
+            == bedrock_app.INVOCATION_LOG_SCAN_LOOKBACK
+            - bedrock_app.INFERENCE_TRACE_SETTLE
+            for call in self.lookups
+        )
+
+    def test_only_the_newest_calls_are_joined(self):
+        calls = [
+            self._event(f"req-{index:02d}", f"2026-10-03T{index:02d}:00:00Z")
+            for index in range(12)
+        ]
+        rows, _ = self._run(
+            events={"InvokeModel": calls}, records=[self._record("req-11")]
+        )
+        assert "req-00" not in self.patterns[0] and "req-01" not in self.patterns[0]
+        assert "req-02" in self.patterns[0] and "req-11" in self.patterns[0]
+        assert "1 of the 10 newest" in rows[self.TRACE]["Finding_Details"]
+
+    def test_no_joined_call_fails(self):
+        rows, result = self._run(
+            events={"InvokeModel": [self._event("req-1", "2026-10-03T08:00:00Z")]},
+            records=[self._record("req-2")],
+        )
+        assert rows[self.TRACE]["Status"] == "Failed"
+        assert "req-1" in rows[self.TRACE]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_a_record_without_bodies_says_so(self):
+        rows, _ = self._run(
+            events={"InvokeModel": [self._event("req-1", "2026-10-03T08:00:00Z")]},
+            records=[self._record("req-1", body=False)],
+        )
+        assert "no request or response body" in rows[self.TRACE]["Finding_Details"]
+
+    def test_text_delivery_off_fails_and_an_unread_config_is_na(self):
+        rows, _ = self._run(
+            source={
+                "log_group": None,
+                "s3": None,
+                "where": None,
+                "logging": False,
+                "reason": "invocation logging does not deliver text",
+            }
+        )
+        assert rows[self.TRACE]["Status"] == "Failed"
+        rows, _ = self._run(
+            source={
+                "log_group": None,
+                "s3": None,
+                "where": None,
+                "logging": None,
+                "reason": "the invocation logging configuration was not read",
+            }
+        )
+        assert rows[self.TRACE]["Status"] == "N/A"
+
+    @pytest.mark.parametrize("failed", ["lookup", "logs"])
+    def test_a_failed_read_is_never_passed_or_failed(self, failed):
+        error = ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "Op")
+        rows, _ = self._run(
+            events={"InvokeModel": [self._event("req-1", "2026-10-03T08:00:00Z")]},
+            lookup_error=error if failed == "lookup" else None,
+            logs_error=error if failed == "logs" else None,
+        )
+        assert rows[self.TRACE]["Status"] == "N/A"
+        assert "AccessDenied" in rows[self.TRACE]["Finding_Details"]
+
+    def test_no_call_is_na(self):
+        rows, _ = self._run(
+            events={"InvokeModel": [self._event("bad id!", "2026-10-03T08:00:00Z")]}
+        )
+        assert rows[self.TRACE]["Status"] == "N/A"
+        assert self.patterns == []
+
+    def test_a_lake_store_recording_bedrock_is_central(self):
+        rows, _ = self._run(stores={"management": ["event data store lake"]})
+        assert rows[self.CENTRAL]["Status"] == "Passed"
+        assert "event data store lake" in rows[self.CENTRAL]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "s3://trail-bucket/AWSLogs/123456789012/CloudTrail/",
+            "s3://lake-bucket/aws/CLOUD_TRAIL_MGMT/1.0/",
+        ],
+    )
+    def test_a_glue_table_in_another_region_is_central(self, location):
+        rows, _ = self._run(
+            glue={
+                "us-east-1": {
+                    "logs": {"elb": "s3://b/AWSLogs/1/elasticloadbalancing/"}
+                },
+                "eu-west-1": {"audit": {"trail": location}},
+            }
+        )
+        row = rows[self.CENTRAL]
+        assert row["Status"] == "Passed"
+        assert "audit.trail in eu-west-1" in row["Finding_Details"]
+        assert "logs.elb" not in row["Finding_Details"]
+
+    def test_no_store_and_no_trail_table_fails(self):
+        rows, _ = self._run(
+            glue={
+                "us-east-1": {"logs": {"elb": "s3://b/AWSLogs/1/elasticloadbalancing/"}}
+            }
+        )
+        assert rows[self.CENTRAL]["Status"] == "Failed"
+        assert "eu-west-1, us-east-1" in rows[self.CENTRAL]["Finding_Details"]
+
+    @pytest.mark.parametrize("unread", ["glue", "stores", "regions"])
+    def test_an_unread_part_withholds_the_centralization_verdict(self, unread):
+        rows, _ = self._run(
+            glue_error=ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetDatabases"
+            )
+            if unread == "glue"
+            else None,
+            stores={"error": "stores were not listed (AccessDenied)"}
+            if unread == "stores"
+            else None,
+            home={"regions": [], "error": "account:ListRegions (AccessDenied)"}
+            if unread == "regions"
+            else None,
+        )
+        assert rows[self.CENTRAL]["Status"] == "N/A"
+        assert "AccessDenied" in rows[self.CENTRAL]["Finding_Details"]

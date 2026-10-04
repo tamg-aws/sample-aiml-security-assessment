@@ -1249,6 +1249,18 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"inspector2:ListCoverage"}
 # reference JSON.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:ListTrainingJobs"}
 
+# BR-47 transform, endpoint and evaluation job legs, 2026-10-03: validate-policy
+# reported the negative controls sagemaker:ListTransformJob and
+# bedrock:GetEvaluationJobs as INVALID_ACTION at statement index 1 and nothing
+# at index 0. Each name is also in its service reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "sagemaker:ListTransformJobs",
+    "sagemaker:DescribeTransformJob",
+    "sagemaker:ListEndpoints",
+    "sagemaker:DescribeEndpointConfig",
+    "bedrock:GetEvaluationJob",
+}
+
 # BR-33 asks for lambda:ListTags, without which GetFunction withholds a
 # function's tags. validate-policy on 2026-09-28 reported the negative control
 # lambda:ListTagz as INVALID_ACTION at Action index 1 of one statement and

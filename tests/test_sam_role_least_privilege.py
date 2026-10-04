@@ -147,12 +147,17 @@ _EXPECTED_ACTIONS = {
         "aoss:ListAccessPolicies",
         "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:GetMemory",
+        "bedrock-agentcore:GetResourcePolicy",
         "bedrock-agentcore:ListCodeInterpreters",
+        "bedrock-agentcore:ListWorkloadIdentities",
         "bedrock-mantle:GetAccountDataRetention",
         "bedrock-mantle:ListProjects",
         "bedrock:ApplyGuardrail",
+        "bedrock:GetEvaluationJob",
         "bedrock:ListIngestionJobs",
+        "bedrock:ListTagsForResource",
         "cloudtrail:GetEventDataStore",
+        "ecs:DescribeContainerInstances",
         "ecs:DescribeTasks",
         "ecs:ListTasks",
         "eks:DescribeCluster",
@@ -160,6 +165,17 @@ _EXPECTED_ACTIONS = {
         "eks:ListClusters",
         "eks:ListPodIdentityAssociations",
         "events:ListTargetsByRule",
+        "firehose:DescribeDeliveryStream",
+        "glue:GetDatabases",
+        "glue:GetJobRuns",
+        "glue:GetJobs",
+        "glue:GetPartitions",
+        "glue:GetTable",
+        "glue:GetTables",
+        "guardduty:GetDetector",
+        "guardduty:GetFindings",
+        "guardduty:ListDetectors",
+        "guardduty:ListFindings",
         "iam:GetAccountSummary",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
@@ -170,15 +186,21 @@ _EXPECTED_ACTIONS = {
         "redshift-serverless:GetNamespace",
         "redshift-serverless:ListWorkgroups",
         "redshift:DescribeClusters",
+        "s3:GetObject",
         "s3:ListBucket",
         "sagemaker:DescribeEndpoint",
         "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeInferenceComponent",
         "sagemaker:DescribeModel",
+        "sagemaker:DescribeProcessingJob",
         "sagemaker:DescribeTrainingJob",
+        "sagemaker:DescribeTransformJob",
         "sagemaker:ListDomains",
         "sagemaker:ListInferenceComponents",
+        "sagemaker:ListPipelines",
+        "sagemaker:ListProcessingJobs",
         "sagemaker:ListTrainingJobs",
+        "sagemaker:ListTransformJobs",
         "sso:DescribeInstanceAccessControlAttributeConfiguration",
         "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
         "sso:ListManagedPoliciesInPermissionSet",
@@ -858,50 +880,127 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             ("Allow", "aoss:ListAccessPolicies", '"*"'),
             ("Allow", "aoss:GetAccessPolicy", '"*"'),
             ("Allow", "sagemaker:ListTrainingJobs", '"*"'),
+            ("Allow", "sagemaker:ListTransformJobs", '"*"'),
+            ("Allow", "sagemaker:ListProcessingJobs", '"*"'),
             ("Allow", "sagemaker:ListInferenceComponents", '"*"'),
+            ("Allow", "sagemaker:ListPipelines", '"*"'),
             ("Allow", "eks:ListClusters", '"*"'),
             ("Allow", "sagemaker:ListDomains", '"*"'),
             ("Allow", "bedrock-agentcore:ListCodeInterpreters", '"*"'),
             ("Allow", "ecs:ListTasks", '"*"'),
-            scoped(
-                "sagemaker:DescribeEndpoint",
-                "sagemaker:*:${AWS::AccountId}:endpoint/*",
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "sagemaker:*:${AWS::AccountId}:endpoint/*",
+                                "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
+                                "sagemaker:*:${AWS::AccountId}:model/*",
+                                "sagemaker:*:${AWS::AccountId}:inference-component/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "sagemaker:DescribeEndpoint",
+                    "sagemaker:DescribeEndpointConfig",
+                    "sagemaker:DescribeModel",
+                    "sagemaker:DescribeInferenceComponent",
+                )
             ),
-            scoped(
-                "sagemaker:DescribeEndpointConfig",
-                "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "eks:*:${AWS::AccountId}:cluster/*",
+                                "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "eks:DescribeCluster",
+                    "eks:ListPodIdentityAssociations",
+                    "eks:DescribePodIdentityAssociation",
+                )
             ),
-            scoped("sagemaker:DescribeModel", "sagemaker:*:${AWS::AccountId}:model/*"),
-            scoped(
-                "sagemaker:DescribeInferenceComponent",
-                "sagemaker:*:${AWS::AccountId}:inference-component/*",
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:ecs:*:"
+                                "${AWS::AccountId}:task/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:ecs:*:"
+                                "${AWS::AccountId}:container-instance/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in ("ecs:DescribeTasks", "ecs:DescribeContainerInstances")
             ),
-            scoped("eks:DescribeCluster", "eks:*:${AWS::AccountId}:cluster/*"),
-            scoped(
-                "eks:ListPodIdentityAssociations", "eks:*:${AWS::AccountId}:cluster/*"
-            ),
-            scoped(
-                "eks:DescribePodIdentityAssociation",
-                "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
-            ),
-            scoped("ecs:DescribeTasks", "ecs:*:${AWS::AccountId}:task/*"),
-            scoped("rds:DescribeDBInstances", "rds:*:${AWS::AccountId}:db:*"),
-            scoped("kendra:DescribeIndex", "kendra:*:${AWS::AccountId}:index/*"),
             scoped("logs:DescribeLogStreams", "logs:*:${AWS::AccountId}:log-group:*"),
             scoped("logs:FilterLogEvents", "logs:*:${AWS::AccountId}:log-group:*"),
-            scoped(
-                "redshift:DescribeClusters", "redshift:*:${AWS::AccountId}:cluster:*"
-            ),
-            scoped(
-                "redshift-serverless:GetNamespace",
-                "redshift-serverless:*:${AWS::AccountId}:namespace/*",
-            ),
             ("Allow", "redshift-serverless:ListWorkgroups", '"*"'),
-            scoped(
-                "bedrock-agentcore:GetMemory",
-                "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
-            ),
             scoped("s3:ListBucket", "s3:::*"),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "rds:*:${AWS::AccountId}:db:*",
+                                "kendra:*:${AWS::AccountId}:index/*",
+                                "redshift:*:${AWS::AccountId}:cluster:*",
+                                "redshift-serverless:*:${AWS::AccountId}:namespace/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "rds:DescribeDBInstances",
+                    "kendra:DescribeIndex",
+                    "redshift:DescribeClusters",
+                    "redshift-serverless:GetNamespace",
+                )
+            ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": f"arn:${{AWS::Partition}}:{suffix}"}
+                            for suffix in (
+                                "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
+                                "bedrock-agentcore:*:${AWS::AccountId}:memory/*",
+                                "bedrock-agentcore:*:${AWS::AccountId}:runtime/*",
+                                "bedrock-agentcore:*:${AWS::AccountId}:"
+                                "workload-identity-directory/*",
+                            )
+                        ]
+                    ),
+                )
+                for action in (
+                    "bedrock-agentcore:GetBrowser",
+                    "bedrock-agentcore:GetMemory",
+                    "bedrock-agentcore:GetResourcePolicy",
+                    "bedrock-agentcore:ListWorkloadIdentities",
+                )
+            ),
             (
                 "Allow",
                 "bedrock:ApplyGuardrail",
@@ -918,23 +1017,42 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     ]
                 ),
             ),
-            scoped(
-                "sso:DescribeInstanceAccessControlAttributeConfiguration",
-                "sso:::instance/*",
-            ),
-            scoped(
-                "bedrock-agentcore:GetBrowser",
-                "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
-            ),
-            (
-                "Allow",
-                "cloudtrail:GetEventDataStore",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:cloudtrail:*:"
-                        "${AWS::AccountId}:eventdatastore/*"
-                    }
-                ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:cloudtrail:*:"
+                                "${AWS::AccountId}:eventdatastore/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:firehose:*:"
+                                "${AWS::AccountId}:deliverystream/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:account::"
+                                "${AWS::AccountId}:account"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:events:*:"
+                                "${AWS::AccountId}:rule/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:guardduty:*:"
+                                "${AWS::AccountId}:detector/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in (
+                    "cloudtrail:GetEventDataStore",
+                    "firehose:DescribeDeliveryStream",
+                    "account:ListRegions",
+                    "events:ListTargetsByRule",
+                    "guardduty:GetDetector",
+                )
             ),
             (
                 "Allow",
@@ -946,35 +1064,46 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     }
                 ),
             ),
-            (
-                "Allow",
-                "sagemaker:DescribeTrainingJob",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
-                        "${AWS::AccountId}:training-job/*"
-                    }
-                ),
-            ),
-            (
-                "Allow",
-                "account:ListRegions",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:account::"
-                        "${AWS::AccountId}:account"
-                    }
-                ),
-            ),
-            (
-                "Allow",
-                "events:ListTargetsByRule",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:events:*:"
-                        "${AWS::AccountId}:rule/*"
-                    }
-                ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                                "${AWS::AccountId}:training-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                                "${AWS::AccountId}:transform-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                                "${AWS::AccountId}:processing-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                                "${AWS::AccountId}:evaluation-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                                "${AWS::AccountId}:model-invocation-job/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                                "${AWS::AccountId}:model-customization-job/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in (
+                    "sagemaker:DescribeTrainingJob",
+                    "sagemaker:DescribeTransformJob",
+                    "sagemaker:DescribeProcessingJob",
+                    "bedrock:GetEvaluationJob",
+                    "bedrock:ListTagsForResource",
+                )
             ),
             *(
                 (
@@ -992,8 +1121,46 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 for action in (
                     "sso:ListManagedPoliciesInPermissionSet",
                     "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
+                    "sso:DescribeInstanceAccessControlAttributeConfiguration",
                 )
             ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:catalog"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:database/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:table/*/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:job/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in (
+                    "glue:GetTable",
+                    "glue:GetTables",
+                    "glue:GetPartitions",
+                    "glue:GetJobRuns",
+                    "glue:GetDatabases",
+                )
+            ),
+            ("Allow", "glue:GetJobs", '"*"'),
+            ("Allow", "guardduty:ListDetectors", '"*"'),
+            ("Allow", "guardduty:ListFindings", '"*"'),
+            ("Allow", "guardduty:GetFindings", '"*"'),
             scoped("iam:GetPolicy", "iam::aws:policy/*"),
             scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
             ("Allow", "bedrock-mantle:GetAccountDataRetention", '"*"'),
@@ -1002,10 +1169,46 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 "bedrock-mantle:ListProjects",
                 "bedrock-mantle:*:${AWS::AccountId}:project/*",
             ),
+            (
+                "Allow",
+                "s3:GetObject",
+                json.dumps(
+                    [
+                        {
+                            "Fn::Sub": "arn:${AWS::Partition}:s3:::*/*AWSLogs/"
+                            "${AWS::AccountId}/BedrockModelInvocationLogs/*"
+                        },
+                        {"Fn::Sub": "arn:${AWS::Partition}:s3:::*/*.metadata.json"},
+                    ]
+                ),
+            ),
         ]
     )
+    # s3:GetObject and bedrock:ListTagsForResource are the actions in both.
+    # The inline s3:GetObject grant reads the permission cache in the report
+    # bucket, and the managed grant reads invocation log records and knowledge
+    # base sidecars, never that bucket. The inline tag read covers application
+    # inference profiles only, and the managed one covers the three job types.
     inline = _actions(template, "BedrockSecurityAssessmentFunction")
-    assert not {action for _, action, _ in grants} & inline
+    assert {action for _, action, _ in grants} & inline == {
+        "s3:GetObject",
+        "bedrock:ListTagsForResource",
+    }
+    profile_tags = _statement_block(
+        template, "BedrockSecurityAssessmentFunction", "BedrockInferenceProfileTagRead"
+    )
+    assert "bedrock:*:${AWS::AccountId}:inference-profile/*" in profile_tags
+    assert "-job/*" not in profile_tags
+    assert not [
+        grant
+        for grant in grants
+        if grant[1] == "bedrock:ListTagsForResource" and "inference-profile" in grant[2]
+    ]
+    assert not [
+        grant
+        for grant in grants
+        if grant[1] == "s3:GetObject" and "AIMLAssessmentBucket" in grant[2]
+    ]
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -2406,40 +2609,24 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "sso:ListPermissionSets",
             "sso:::instance/*",
         ),
-        ("BedrockAssessmentReadsPolicy", "CloudTrailEventDataStoreRead"): (
+        ("BedrockAssessmentReadsPolicy", "ScopedReadsAcrossServices"): (
             "cloudtrail:GetEventDataStore",
-            "cloudtrail:*:${AWS::AccountId}:eventdatastore/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "AccountListRegions"): (
+            "firehose:DescribeDeliveryStream",
             "account:ListRegions",
-            "account::${AWS::AccountId}:account",
-        ),
-        ("BedrockAssessmentReadsPolicy", "EventBridgeRuleTargetList"): (
             "events:ListTargetsByRule",
-            "events:*:${AWS::AccountId}:rule/*",
+            "guardduty:GetDetector",
+            "guardduty:*:${AWS::AccountId}:detector/*",
         ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointRead"): (
+        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointPathRead"): (
             "sagemaker:DescribeEndpoint",
-            "sagemaker:*:${AWS::AccountId}:endpoint/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerEndpointConfigRead"): (
             "sagemaker:DescribeEndpointConfig",
-            "sagemaker:*:${AWS::AccountId}:endpoint-config/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerModelRead"): (
             "sagemaker:DescribeModel",
-            "sagemaker:*:${AWS::AccountId}:model/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "SageMakerInferenceComponentRead"): (
             "sagemaker:DescribeInferenceComponent",
             "sagemaker:*:${AWS::AccountId}:inference-component/*",
         ),
         ("BedrockAssessmentReadsPolicy", "EKSClusterRead"): (
             "eks:DescribeCluster",
             "eks:ListPodIdentityAssociations",
-            "eks:*:${AWS::AccountId}:cluster/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "EKSPodIdentityAssociationRead"): (
             "eks:DescribePodIdentityAssociation",
             "eks:*:${AWS::AccountId}:podidentityassociation/*/*",
         ),

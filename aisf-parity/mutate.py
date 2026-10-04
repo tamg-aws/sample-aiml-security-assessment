@@ -628,9 +628,9 @@ MUTATIONS = [
         "file": BEDROCK,
         "defect": "a user whose only route to AI is sts:AssumeRole into a role the "
         "account trusts drops out of scope, so its access key is never judged",
-        "find": "                elif delegates and _identity_allows_assume_role("
-        "permissions, role_arn):\n",
-        "replace": "                elif False:\n",
+        "find": "        if delegates and _identity_allows_assume_role(permissions, "
+        "role_arn):\n",
+        "replace": "        if False:\n",
     },
     {
         "name": "a KENDRA knowledge base goes back to manual review",
@@ -707,6 +707,867 @@ MUTATIONS = [
         "replace": '                    Prefix="",\n',
     },
     {
+        "name": "BR-04 retains a log object whose replication FAILED",
+        "file": BEDROCK,
+        "defect": "BR-04 ignores ReplicationStatus FAILED, so a replicated log "
+        "bucket whose objects S3 Lifecycle never expires passes",
+        "find": '                if status == "FAILED":\n',
+        "replace": "                if False:\n",
+    },
+    {
+        "name": "BR-46 passes an object written between the last run and the latest read",
+        "file": BEDROCK,
+        "defect": "BR-46 lists the source but ignores each LastModified, so an "
+        "object ingested after the Macie job last ran passes unclassified",
+        "find": "            elif after_run > 0 and before_read >= 0:\n",
+        "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-46 credits a document with no metadata sidecar",
+        "file": BEDROCK,
+        "defect": "BR-46 stops pairing documents with their .metadata.json "
+        "sidecars, so a knowledge base whose classification never reaches "
+        "per-document metadata passes",
+        "find": "    missing = [key for key in documents if key + METADATA_SIDECAR_SUFFIX not in keys]\n",
+        "replace": "    missing = []\n",
+    },
+    {
+        "name": "BR-43 credits a Region allow-list in the management account",
+        "file": BEDROCK,
+        "defect": "BR-43 passes a Region allow-list in the management account, which no service control policy restricts",
+        "find": "        if allow_listed and not uncovered and not global_open and management:\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-42 credits a model list in the management account",
+        "file": BEDROCK,
+        "defect": "BR-42 passes an approved model list in the management account, which no service control policy restricts",
+        "find": '        if enforcing and not uncovered and inventory.get("management_account"):\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-43 credits an AI service Region deny in the management account",
+        "file": BEDROCK,
+        "defect": "BR-43 passes the AI service Region deny in the management account, which no service control policy restricts",
+        "find": '        if not uncovered and scp_inventory.get("management_account"):\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-43 credits a Region deny that names only the listed invoke actions",
+        "file": BEDROCK,
+        "defect": "BR-43 drops its service probes, so a Region deny naming the nine listed actions passes while bedrock:CreateAgent runs in any Region",
+        "find": '    _region_probe("bedrock"),\n    _region_probe("bedrock-agentcore"),\n    _region_probe("bedrock-mantle"),\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-43 credits an AI service Region deny that omits the vector stores",
+        "file": BEDROCK,
+        "defect": "BR-43 drops the vector store probes, so es:CreateDomain and rds:CreateDBCluster run in any Region while the row passes",
+        "find": '    _region_probe("es"),\n    _region_probe("rds"),\n    _region_probe("neptune-graph"),\n    _region_probe("kendra"),\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-47 names only five enforcing buckets in its Passed text",
+        "file": BEDROCK,
+        "defect": "BR-47's Passed text lists the first five enforcing buckets, so the exempted principals of a sixth bucket go unnamed",
+        "find": '                            len(inventory["buckets"]),\n                            denied,\n                            "; ".join(enforced),\n                        )\n                    ),\n                    resolution=(\n                        "No action required.',
+        "replace": '                            len(inventory["buckets"]),\n                            denied,\n                            "; ".join(enforced[:5]),\n                        )\n                    ),\n                    resolution=(\n                        "No action required.',
+    },
+    {
+        "name": "BR-47 drops the SageMaker transform and processing job buckets",
+        "file": BEDROCK,
+        "defect": "BR-47 never reads transform or processing jobs, so their plaintext buckets are missing from the data path and the row passes",
+        "find": "        _sagemaker_batch_job_locations,\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-47 drops the SageMaker endpoint capture and async buckets",
+        "file": BEDROCK,
+        "defect": "BR-47 never reads endpoints, so a data capture or asynchronous output bucket that accepts plaintext is missing from the data path",
+        "find": "        _sagemaker_endpoint_locations,\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-47 drops the Bedrock evaluation job buckets",
+        "file": BEDROCK,
+        "defect": "BR-47 never reads evaluation jobs, so a dataset or output bucket that accepts plaintext is missing from the data path",
+        "find": "        _evaluation_job_locations,\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-55 credits an all-zero PCR pin",
+        "file": BEDROCK,
+        "defect": "BR-55 reads a pin on the all-zero measurement a debug-mode "
+        "enclave presents as an exact image measurement, so a debug enclave can "
+        "decrypt",
+        "find": '        "*" in str(value) or "?" in str(value) or not str(value).strip("0")\n',
+        "replace": '        "*" in str(value) or "?" in str(value)\n',
+    },
+    {
+        "name": "BR-48 ignores a service section with no leaf",
+        "file": BEDROCK,
+        "defect": "BR-48 reads a service section that delegates operators but sets "
+        "no opt_out_policy as delegating nothing, so a child can opt the service in",
+        "find": '            if list(control) != ["@@none"] and "opt_out_policy" not in node:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-26 credits a secrets regex that acts on the output only",
+        "file": BEDROCK,
+        "defect": "BR-26 passes a guardrail whose secrets regex acts on the output "
+        "only, so a credential the built-in types do not name reaches the model",
+        "find": '    for side in ("output", "input"):\n        if not side_regexes[side]:\n',
+        "replace": '    for side in ("output",):\n        if not side_regexes[side]:\n',
+    },
+    {
+        "name": "BR-42 credits an IfExists or ForAllValues bound on an open training grant",
+        "file": BEDROCK,
+        "defect": "BR-42 reads an IfExists or ForAllValues: account test as limiting an every-principal training bucket grant, though either is true when the key is absent",
+        "find": '    if operator.startswith("forallvalues:") or operator.endswith("ifexists"):\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-42 ignores a training grant to another account",
+        "file": BEDROCK,
+        "defect": "BR-42 skips a training bucket grant to another account's principals, so that account's own IAM decides who reads the training data",
+        "find": "            foreign = [other for other in named if other != account]\n",
+        "replace": "            foreign = []\n",
+    },
+    {
+        "name": "BR-42 credits a bound naming another account",
+        "file": BEDROCK,
+        "defect": "BR-42 credits an every-principal training bucket grant whose aws:PrincipalAccount test also names another account",
+        "find": '        inside = [text for text, accounts in bounds if accounts <= {account, "org"}]\n',
+        "replace": "        inside = [text for text, accounts in bounds]\n",
+    },
+    {
+        "name": "BR-42 credits any condition on an open training grant",
+        "file": BEDROCK,
+        "defect": "BR-42 passes an every-principal training bucket grant under any condition, such as aws:SourceVpce, that names no account of the caller",
+        "find": '        else:\n            grants["failed"].append(\n                f"{label} allows s3:GetObject to every principal under a "\n',
+        "replace": '        elif False:\n            grants["failed"].append(\n                f"{label} allows s3:GetObject to every principal under a "\n',
+    },
+    {
+        "name": "BR-50 walks one role hop only",
+        "file": BEDROCK,
+        "defect": "BR-50 stops after one role, so a user who assumes a non-AI role that can assume an AI role keeps an access key nobody lists",
+        "find": "        frontier = sorted(reached)\n",
+        "replace": "        frontier = []\n",
+    },
+    {
+        "name": "BR-51 skips the role principals of an AI role's trust",
+        "file": BEDROCK,
+        "defect": "BR-51 skips a role principal in an AI write role's trust, so a chain from a role a user assumes without MFA passes",
+        "find": "        for owner, name in _trust_role_principals_without_mfa(trust_policy)\n",
+        "replace": "        for owner, name in []\n",
+    },
+    {
+        "name": "BR-51 follows one role hop only",
+        "file": BEDROCK,
+        "defect": "BR-51 follows one trusted role only, so a longer chain to a role assumed without MFA passes",
+        "find": "            for next_owner, next_name in onward\n",
+        "replace": "            for next_owner, next_name in []\n",
+    },
+    {
+        "name": "BR-20 skips the Data Catalog tables of a SQL knowledge base",
+        "file": BEDROCK,
+        "defect": "BR-20 ignores the Glue Data Catalog tables a SQL knowledge base "
+        "reads, so a table whose S3 bucket has no customer managed key passes",
+        "find": "    buckets, unread = _data_catalog_table_buckets(table_names, region)\n",
+        "replace": "    buckets, unread = {}, []\n",
+    },
+    {
+        "name": "BR-20 reads no Data Catalog partition locations",
+        "file": BEDROCK,
+        "defect": "BR-20 judges a partitioned table by its table location only, so "
+        "a partition in a plaintext bucket passes",
+        "find": "                    locations.extend(\n",
+        "replace": "                    list(\n",
+    },
+    {
+        "name": "BR-20 reads Data Catalog partitions past its page cap",
+        "file": BEDROCK,
+        "defect": "BR-20 stops at the partition page cap and judges the pages it "
+        "read, so a partition past the cap goes unjudged in a Passed result",
+        "find": "                    if count > DATA_CATALOG_PARTITION_PAGES:\n",
+        "replace": "                    if False:\n",
+    },
+    {
+        "name": "BR-07 reads no CreatePrompt holder",
+        "file": BEDROCK,
+        "defect": "BR-07 never lists the holders of bedrock:CreatePrompt, which has "
+        "no resource type, so who can add prompts to the catalog goes unreported",
+        "find": "            if creates:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-07 lets a prompt creator render prompts",
+        "file": BEDROCK,
+        "defect": "BR-07 passes a runtime role that holds bedrock:RenderPrompt and "
+        "bedrock:CreatePrompt, so a runtime caller can add a prompt to the catalog",
+        "find": "                    creating_renderers.append(f\"{kind} '{name}'\")\n",
+        "replace": "                    pass\n",
+    },
+    {
+        "name": "BR-57 reads no runtime JWT authorizer",
+        "file": BEDROCK,
+        "defect": "BR-57 passes an AgentCore runtime whose JWT authorizer names no audience, client, scope or claim, so any token its issuer signs invokes it",
+        "find": "        if jwt is not None and not any(jwt.get(field) for field in RUNTIME_JWT_BOUNDS):\n",
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-57 credits any account bound on an open runtime policy",
+        "file": BEDROCK,
+        "defect": "BR-57 passes a runtime resource policy open to every principal under a condition naming another account",
+        "find": '                    accounts is not None and accounts <= {account, "org"}\n',
+        "replace": "                    accounts is not None\n",
+    },
+    {
+        "name": "BR-57 ignores a runtime policy grant to another account",
+        "file": BEDROCK,
+        "defect": "BR-57 passes a runtime resource policy that lets another account's principals invoke it",
+        "find": '            if foreign:\n                failures.append(\n                    f"{label} lets principals of account(s)',
+        "replace": '            if False:\n                failures.append(\n                    f"{label} lets principals of account(s)',
+    },
+    {
+        "name": "BR-57 passes beside an unread runtime policy",
+        "file": BEDROCK,
+        "defect": "BR-57 reports Passed while a runtime or endpoint resource policy was not read",
+        "find": '        unread += inventory.get("gate_errors") or []\n',
+        "replace": "        pass\n",
+    },
+    {
+        "name": "BR-57 reads no runtime endpoint policy",
+        "file": BEDROCK,
+        "defect": "BR-57 reads the runtime's resource policy only, so an endpoint policy open to every principal goes unread",
+        "find": '        targets = [runtime.get("agentRuntimeArn")] + [\n',
+        "replace": '        targets = [runtime.get("agentRuntimeArn")] + 0 * [\n',
+    },
+    {
+        "name": "BR-02 credits a gateway endpoint for its whole VPC",
+        "file": BEDROCK,
+        "defect": "BR-02 credits an S3 or DynamoDB gateway endpoint to every workload in its VPC, so a subnet whose route table it does not name passes",
+        "find": "            if table not in gateway_routes[(vpc_id, surface)]:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-02 credits a gateway endpoint to a workload with unread subnets",
+        "file": BEDROCK,
+        "defect": "BR-02 passes a gateway-only workload whose subnets were not read, though its route tables were never compared",
+        "find": "        if not subnets:\n            return None, (\n",
+        "replace": "        if not subnets:\n            return None, None and (\n",
+    },
+    {
+        "name": "BR-02 leaves a SageMaker runtime workload out",
+        "file": BEDROCK,
+        "defect": "BR-02 judges only workloads granted a Bedrock or AgentCore surface, so a workload that invokes SageMaker endpoints is never judged",
+        "find": "            surfaces = _granted_bedrock_surfaces(roles[role], AI_WORKLOAD_SURFACES)\n",
+        "replace": "            surfaces = _granted_bedrock_surfaces(roles[role], WORKLOAD_ENDPOINT_SURFACES)\n",
+    },
+    {
+        "name": "BR-02 passes beside unread route tables",
+        "file": BEDROCK,
+        "defect": "BR-02 reports a gateway-only workload Passed while the route tables of its VPC were not read",
+        "find": "        elif held:\n            unread.extend(held)\n",
+        "replace": "        elif False:\n            unread.extend(held)\n",
+    },
+    {
+        "name": "BR-02 drops the subnets of a Lambda workload",
+        "file": BEDROCK,
+        "defect": "BR-02 never records a Lambda function's subnets, so its gateway endpoint coverage can never be compared",
+        "find": '                    "subnets": (function.get("VpcConfig") or {}).get("SubnetIds")\n',
+        "replace": '                    "subnets": (function.get("VpcConfig") or {}).get("SubnetIdz")\n',
+    },
+    {
+        "name": "BR-32 passes an acting alarm with no log forwarding",
+        "file": BEDROCK,
+        "defect": "BR-32 passes an acting intervention alarm while no subscription filter forwards the invocation log group",
+        "find": '        elif forwarding_state == "none":\n',
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "BR-32 reads a log group beside S3 as unforwarded",
+        "file": BEDROCK,
+        "defect": "BR-32 fails a log group with no subscription filter whose logs also go to S3, though forwarding from the S3 copy is not read",
+        "find": '        if forwarding_state == "none" and log_bucket:\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "BR-32 credits a trail that records another Region",
+        "file": BEDROCK,
+        "defect": "BR-32 credits a single-Region trail homed in another Region with recording this Region's guardrail calls",
+        "find": '            records_region = trail_config.get("IsMultiRegionTrail") or (\n',
+        "replace": "            records_region = True or (\n",
+    },
+    {
+        "name": "BR-32 credits a trail that is not logging",
+        "file": BEDROCK,
+        "defect": "BR-32 credits a stopped trail with recording guardrail calls",
+        "find": '            if not client.get_trail_status(Name=trail_arn).get("IsLogging", False):\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-32 credits a narrowed guardrail selector",
+        "file": BEDROCK,
+        "defect": "BR-32 credits a trail whose AWS::Bedrock::Guardrail selector is narrowed by eventName or readOnly, which records a subset of the calls",
+        "find": "        if GUARDRAIL_DATA_EVENT_TYPE in credited:\n",
+        "replace": "        if GUARDRAIL_DATA_EVENT_TYPE in credited or GUARDRAIL_DATA_EVENT_TYPE in narrowed:\n",
+    },
+    {
+        "name": "BR-32 ignores event data stores for guardrail calls",
+        "file": BEDROCK,
+        "defect": "BR-32 fails a Region whose enabled event data store records every AWS::Bedrock::Guardrail data event",
+        "find": '    state["recorders"].extend(stores["credited"].get(GUARDRAIL_DATA_EVENT_TYPE, []))\n',
+        "replace": '    state["recorders"].extend(stores["credited"].get("AWS::Bedrock::Guardrailz", []))\n',
+    },
+    {
+        "name": "BR-32 passes beside an unread record leg",
+        "file": BEDROCK,
+        "defect": "BR-32 passes an acting alarm while the subscription filters, the trails or the event data stores were not read",
+        "find": "        if record_unread:\n            return row(\n",
+        "replace": "        if False:\n            return row(\n",
+    },
+    {
+        "name": "BR-32 drops an unread trail list",
+        "file": BEDROCK,
+        "defect": "BR-32 fails, and does not hold, a Region whose trail list could not be read",
+        "find": '        state["unread"].append(\n            f"CloudTrail trails (cloudtrail:ListTrails: "\n',
+        "replace": '        [].append(\n            f"CloudTrail trails (cloudtrail:ListTrails: "\n',
+    },
+    {
+        "name": "BR-46 clears a source by a job alone",
+        "file": BEDROCK,
+        "defect": "BR-46 passes a source a qualifying Macie job covers while automated sensitive data discovery is off or does not monitor its bucket",
+        "find": '                if precondition["ready"] and automated == "MONITORED":\n',
+        "replace": "                if True:\n",
+    },
+    {
+        "name": "BR-46 fails an unread discovery state",
+        "file": BEDROCK,
+        "defect": "BR-46 fails a source whose automated discovery configuration or bucket monitoring status was not read, though neither was established",
+        "find": '                elif precondition["permissions"] or (\n',
+        "replace": "                elif False and (\n",
+    },
+    {
+        "name": "BR-04 reads agent memory at DRAFT only",
+        "file": BEDROCK,
+        "defect": "BR-04 judges a Bedrock agent's memory retention at DRAFT and never at the versions its aliases route to",
+        "find": '                configurations.append(\n                    (f"version {version}", detail.get("memoryConfiguration"))\n',
+        "replace": '                [].append(\n                    (f"version {version}", detail.get("memoryConfiguration"))\n',
+    },
+    {
+        "name": "BR-04 passes an agent memory of 0 days",
+        "file": BEDROCK,
+        "defect": "BR-04 passes an agent memory whose storageDays is 0, a period the API reference does not define",
+        "find": "            elif days == 0:\n",
+        "replace": "            elif False:\n",
+    },
+    {
+        "name": "BR-04 judges inference data at the AWSLogs root",
+        "file": BEDROCK,
+        "defect": "BR-04 requires a SageMaker capture bucket's lifecycle rule to cover AWSLogs/ and not the capture URI's own path",
+        "find": "    if root is not None:\n        log_root = root\n",
+        "replace": "    if False:\n        log_root = root\n",
+    },
+    {
+        "name": "BR-04 probes replicated inference data it cannot read",
+        "file": BEDROCK,
+        "defect": "BR-04 runs the invocation log ReplicationStatus probe on a replicated SageMaker capture bucket, whose objects it has no s3:GetObject grant on",
+        "find": "    if replicas and root is not None:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-04 passes inference data beside an unread endpoint",
+        "file": BEDROCK,
+        "defect": "BR-04 reports SageMaker inference data retention Passed while an endpoint was not read",
+        "find": '                "N/A" if undetermined else "Passed",\n',
+        "replace": '                "Passed",\n',
+    },
+    {
+        "name": "BR-26 credits a Glue PIIDetection node that only audits",
+        "file": BEDROCK,
+        "defect": "BR-26 treats an Audit PiiType as masking, so a Glue job that only reports PII is credited as redacting a knowledge base source",
+        "find": '    "ColumnHashing",\n)\n',
+        "replace": '    "ColumnHashing",\n    "ColumnAudit",\n    "RowAudit",\n)\n',
+    },
+    {
+        "name": "BR-26 credits a Glue target one path reaches unmasked",
+        "file": BEDROCK,
+        "defect": "BR-26 skips an unmasked path into a Glue target, so a job whose raw input also flows straight to the target is credited",
+        "find": "        if upstream is None:\n            return None\n",
+        "replace": "        if upstream is None:\n            continue\n",
+    },
+    {
+        "name": "BR-26 matches a Glue path as a name prefix",
+        "file": BEDROCK,
+        "defect": "BR-26 stops treating a Glue path as a folder, so s3://b/cle is credited as covering s3://b/clean/",
+        "find": '            prefix = prefix.rstrip("/") + "/" if prefix.strip("/") else ""\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-26 judges the oldest SUCCEEDED Glue run",
+        "file": BEDROCK,
+        "defect": "BR-26 dates a Glue job by its oldest successful run, so a run that rewrote the source after the latest ingestion is missed",
+        "find": "            end = max(succeeded) if succeeded else None\n",
+        "replace": "            end = min(succeeded) if succeeded else None\n",
+    },
+    {
+        "name": "BR-26 dates a Glue job by a run that did not succeed",
+        "file": BEDROCK,
+        "defect": "BR-26 counts every Glue run state, so a FAILED run dates the job's redaction",
+        "find": 'if run.get("JobRunState") == "SUCCEEDED" and run.get("CompletedOn")',
+        "replace": 'if run.get("CompletedOn")',
+    },
+    {
+        "name": "BR-26 fails a source over an unread Glue read",
+        "file": BEDROCK,
+        "defect": "BR-26 drops the Glue read errors, so an unread GetJobs or GetJobRuns fails a source a Glue job may redact",
+        "find": "        ) + glue_errors\n",
+        "replace": "        )\n",
+    },
+    {
+        "name": "BR-26 ignores Glue redaction jobs",
+        "file": BEDROCK,
+        "defect": "BR-26 drops the Glue outputs, so a source a Glue job masks still fails",
+        "find": "        redaction_outputs = redaction_outputs + glue_outputs\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-53 trusts GetResources for Bedrock job tags",
+        "file": BEDROCK,
+        "defect": "BR-53 sends Bedrock job ARNs to GetResources, which may not return jobs, so a job's own tags are never read",
+        "find": '        job_arns = [arn for arn in arns if inventory["arns"][arn] in BEDROCK_JOB_LABELS]\n',
+        "replace": "        job_arns = []\n",
+    },
+    {
+        "name": "BR-53 reads Bedrock job tags with the tagging API's key case",
+        "file": BEDROCK,
+        "defect": "BR-53 reads Key and Value from bedrock:ListTagsForResource, whose tags use key and value, so every owned job fails",
+        "find": '{"Key": tag.get("key"), "Value": tag.get("value")}',
+        "replace": '{"Key": tag.get("Key"), "Value": tag.get("Value")}',
+    },
+    {
+        "name": "BR-53 fails a job whose tags were not read",
+        "file": BEDROCK,
+        "defect": "BR-53 treats an unread job tag read as no tags, so AccessDenied fails the job",
+        "find": "                unread.append(arn)\n",
+        "replace": "                tags_by_arn[arn] = []\n",
+    },
+    {
+        "name": "BR-53 lists workload identities past the page cap",
+        "file": BEDROCK,
+        "defect": "BR-53 asks ListWorkloadIdentities for 100 per page, above its maximum of 20, so the read fails",
+        "find": '{"max_results": 20}',
+        "replace": "{}",
+    },
+    {
+        "name": "BR-53 drops never-tagged pipelines",
+        "file": BEDROCK,
+        "defect": "BR-53 reads the wrong result key for ListPipelines, so a pipeline never tagged passes unseen",
+        "find": '"PipelineSummaries",',
+        "replace": '"Pipelines",',
+    },
+    {
+        "name": "BR-20 credits an Aurora store with password logins only",
+        "file": BEDROCK,
+        "defect": "BR-20 drops the IAM database authentication leg, so an Aurora cluster with IAMDatabaseAuthenticationEnabled false passes",
+        "find": "            (_aurora_iam_authentication(cluster), AURORA_IAM_AUTH_RESOLUTION),\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-20 reads an absent IAM authentication value as off",
+        "file": BEDROCK,
+        "defect": "BR-20 fails an Aurora cluster whose IAMDatabaseAuthenticationEnabled was not returned",
+        "find": "    if enabled is False:\n",
+        "replace": "    if enabled is not True:\n",
+    },
+    {
+        "name": "BR-20 names only one Aurora fix",
+        "file": BEDROCK,
+        "defect": "BR-20 joins only the first failed Aurora leg's fix, so a public, password-only cluster is told one of two changes",
+        "find": '" ".join(fix for leg, fix in legs if leg["status"] == "Failed")',
+        "replace": 'next((fix for leg, fix in legs if leg["status"] == "Failed"), "")',
+    },
+    {
+        "name": "BR-12 credits a GOVERNANCE-mode invocation log bucket",
+        "file": BEDROCK,
+        "defect": "BR-12 accepts any Object Lock retention mode, so a GOVERNANCE bucket a privileged principal can override passes",
+        "find": '    if mode != "COMPLIANCE":\n',
+        "replace": '    if mode not in ("COMPLIANCE", "GOVERNANCE"):\n',
+    },
+    {
+        "name": "BR-12 credits a filter pattern on the invocation log group",
+        "file": BEDROCK,
+        "defect": "BR-12 ignores the subscription filter pattern, so a filter forwarding only ERROR events counts as the archive",
+        "find": '    pattern = str(subscription.get("filterPattern") or "").strip()\n',
+        "replace": '    pattern = ""\n',
+    },
+    {
+        "name": "BR-12 follows another account's Firehose stream",
+        "file": BEDROCK,
+        "defect": "BR-12 reads a Firehose stream in another account as this account's, so it judges a stream it cannot see",
+        "find": "    if parts[4] != account:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-12 credits a Firehose stream with a Lambda processor",
+        "file": BEDROCK,
+        "defect": "BR-12 ignores a Lambda record processor, which can drop or rewrite records before the bucket holds them",
+        "find": '        if processing.get("Enabled") is True and any(\n',
+        "replace": "        if False and any(\n",
+    },
+    {
+        "name": "BR-12 credits an inactive Firehose stream",
+        "file": BEDROCK,
+        "defect": "BR-12 accepts a stream that is not ACTIVE",
+        "find": '    if status != "ACTIVE":\n',
+        "replace": '    if status == "DELETING":\n',
+    },
+    {
+        "name": "BR-12 drops the invocation log archive rows",
+        "file": BEDROCK,
+        "defect": "BR-12 stops reporting the WORM archive leg",
+        "find": "            log_group_name, [name for name, _ in buckets], s3_client, region\n",
+        "replace": "            None, [], s3_client, region\n",
+    },
+    {
+        "name": "BR-12 credits a bucket with Object Lock off",
+        "file": BEDROCK,
+        "defect": "BR-12 reads the default retention without ObjectLockEnabled",
+        "find": '    if value.get("ObjectLockEnabled") != "Enabled":\n',
+        "replace": "    if not value:\n",
+    },
+    {
+        "name": "BR-12 credits a filter on transformed logs",
+        "file": BEDROCK,
+        "defect": "BR-12 credits a subscription filter applied on transformed logs as forwarding the ingested events",
+        "find": '    if subscription.get("applyOnTransformedLogs") is True:\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-34 credits a detector with AI Protection off",
+        "file": BEDROCK,
+        "defect": "BR-34 reads only the detector Status, so a detector without the AI_PROTECTION feature passes",
+        "find": '        if detector.get("Status") != "ENABLED" or ai_protection != "ENABLED":\n',
+        "replace": '        if detector.get("Status") != "ENABLED":\n',
+    },
+    {
+        "name": "BR-34 credits a disabled GuardDuty detector",
+        "file": BEDROCK,
+        "defect": "BR-34 reads only the AI_PROTECTION feature, so a suspended detector passes",
+        "find": '        if detector.get("Status") != "ENABLED" or ai_protection != "ENABLED":\n',
+        "replace": '        if ai_protection != "ENABLED":\n',
+    },
+    {
+        "name": "BR-34 passes a Region with no GuardDuty detector",
+        "file": BEDROCK,
+        "defect": "BR-34 reports nothing for a Region with no detector",
+        "find": "    if not detector_ids:\n",
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-34 reads only the first GuardDuty findings page",
+        "file": BEDROCK,
+        "defect": "BR-34 stops at the first ListFindings page",
+        "find": '                token_response_keys=("NextToken",),\n                max_results=GUARDDUTY_FINDINGS_BATCH,\n                DetectorId=detector_id,\n',
+        "replace": "                token_response_keys=(),\n                max_results=GUARDDUTY_FINDINGS_BATCH,\n                DetectorId=detector_id,\n",
+    },
+    {
+        "name": "BR-34 reads only the first GetFindings batch",
+        "file": BEDROCK,
+        "defect": "BR-34 reads 50 finding details and drops the rest",
+        "find": "            for start in range(0, len(finding_ids), GUARDDUTY_FINDINGS_BATCH):\n",
+        "replace": "            for start in range(0, min(len(finding_ids), 1), GUARDDUTY_FINDINGS_BATCH):\n",
+    },
+    {
+        "name": "BR-34 counts archived GuardDuty findings",
+        "file": BEDROCK,
+        "defect": "BR-34 drops the service.archived criterion, so archived findings read as current",
+        "find": '                        "service.archived": {"Eq": ["false"]},\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-34 names a non-injection finding as a flagged event",
+        "file": BEDROCK,
+        "defect": "BR-34 names any Bedrock finding as a prompt injection example",
+        "find": '                if finding.get("Type") == GUARDDUTY_PROMPT_INJECTION_TYPE\n',
+        "replace": '                if finding.get("Type")\n',
+    },
+    {
+        "name": "BR-34 names the oldest injection finding first",
+        "file": BEDROCK,
+        "defect": "BR-34 sorts the flagged events oldest first, so the newest can fall outside the three named",
+        "find": '            key=lambda finding: str(finding.get("UpdatedAt") or ""),\n            reverse=True,\n',
+        "replace": '            key=lambda finding: str(finding.get("UpdatedAt") or ""),\n            reverse=False,\n',
+    },
+    {
+        "name": "BR-34 passes an unread GuardDuty detector",
+        "file": BEDROCK,
+        "defect": "BR-34 turns a failed GetDetector into Passed",
+        "find": '                "whether its AI Protection feature is on is not known.",\n                COULD_NOT_ASSESS_RESOLUTION,\n                "Informational",\n                "N/A",\n',
+        "replace": '                "whether its AI Protection feature is on is not known.",\n                COULD_NOT_ASSESS_RESOLUTION,\n                "Informational",\n                "Passed",\n',
+    },
+    {
+        "name": "BR-34 passes an unread GuardDuty findings list",
+        "file": BEDROCK,
+        "defect": "BR-34 turns a failed ListFindings or GetFindings into Passed",
+        "find": '                "is named.",\n                COULD_NOT_ASSESS_RESOLUTION,\n                "Informational",\n                "N/A",\n',
+        "replace": '                "is named.",\n                COULD_NOT_ASSESS_RESOLUTION,\n                "Informational",\n                "Passed",\n',
+    },
+    {
+        "name": "BR-34 drops the GuardDuty row from the handler",
+        "file": BEDROCK,
+        "defect": "BR-34 never runs the GuardDuty leg",
+        "find": "        all_findings.append(check_guardduty_prompt_injection_detection(region=region))\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-57 credits an S3 wildcard bucket name as scoped",
+        "file": BEDROCK,
+        "defect": "BR-57 reads only a bare * as unscoped, so arn:aws:s3:::* passes",
+        "find": '    if not name or name[0] in "*?":\n        return True\n',
+        "replace": "    if not name:\n        return True\n",
+    },
+    {
+        "name": "BR-57 credits a type-wide ARN such as table/*",
+        "file": BEDROCK,
+        "defect": "BR-57 ignores a wildcard right after the resource type",
+        "find": '    return cut >= 0 and name[cut + 1 : cut + 2] in ("*", "?", "")\n',
+        "replace": "    return False\n",
+    },
+    {
+        "name": "BR-57 reads a bucket-named S3 key wildcard as unscoped",
+        "file": BEDROCK,
+        "defect": "BR-57 treats arn:aws:s3:::bucket/* as every bucket, so a scoped data grant fails",
+        "find": "    if parts[2] in ARN_WITHOUT_TYPE_PREFIX_SERVICES:\n        return False\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-57 credits a NotResource grant as scoped",
+        "file": BEDROCK,
+        "defect": "BR-57 judges only Resource, so an Allow with NotResource passes",
+        "find": '                    if "NotResource" not in statement and not any(\n                        _arn_covers_every_resource(resource) for resource in resources\n                    ):\n',
+        "replace": "                    if not any(\n                        _arn_covers_every_resource(resource) for resource in resources\n                    ):\n",
+    },
+    {
+        "name": "BR-57 ignores the permissions boundary on a wide grant",
+        "file": BEDROCK,
+        "defect": "BR-57 fails a role whose boundary already scopes the grant",
+        "find": '                        and _boundary_allowance(\n                            permissions, action, _arn_covers_every_resource\n                        )\n                        in ("none", "unscoped")\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-57 judges the boundary with the model-only scope test",
+        "file": BEDROCK,
+        "defect": "BR-57 reads bucket/* in a boundary as unscoped, so a scoping boundary is not credited",
+        "find": "                            permissions, action, _arn_covers_every_resource\n",
+        "replace": "                            permissions, action\n",
+    },
+    {
+        "name": "BR-57 passes a conditioned wide grant",
+        "file": BEDROCK,
+        "defect": "BR-57 drops a wide grant under a Condition instead of naming it",
+        "find": '                    if statement.get("Condition"):\n                        held.append(label)\n',
+        "replace": '                    if statement.get("Condition"):\n                        pass\n',
+    },
+    {
+        "name": "BR-57 passes a role missing from the IAM cache",
+        "file": BEDROCK,
+        "defect": "BR-57 skips a role the cache does not hold without saying so",
+        "find": '                unread.append(f"role {role_arn} is not in the IAM permissions cache")\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-57 passes a role with a policy read error",
+        "file": BEDROCK,
+        "defect": "BR-57 ignores the principal_errors the cache records for a role",
+        "find": "            if name in errored:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-57 leaves action group function roles out of the scope test",
+        "file": BEDROCK,
+        "defect": "BR-57 judges only agent roles",
+        "find": '        for role_arn, arns in functions["roles"].items():\n            population.setdefault(role_arn, []).extend(\n',
+        "replace": "        for role_arn, arns in {}.items():\n            population.setdefault(role_arn, []).extend(\n",
+    },
+    {
+        "name": "BR-57 drops the scope row from the handler",
+        "file": BEDROCK,
+        "defect": "BR-57 never runs the role scope leg",
+        "find": "            else check_bedrock_agent_role_scope(\n                permission_cache,\n",
+        "replace": "            else check_bedrock_agent_workload_identity(\n                permission_cache,\n",
+    },
+    {
+        "name": "BR-57 counts another version of an action group function as outside",
+        "file": BEDROCK,
+        "defect": "BR-57 compares qualified ARNs, so version 3 of an action group function reads as a second function",
+        "find": "                if _unqualified_function_arn(arn) in inside:\n",
+        "replace": "                if arn in inside:\n",
+    },
+    {
+        "name": "BR-57 reads only the $LATEST function versions",
+        "file": BEDROCK,
+        "defect": "BR-57 lists functions without FunctionVersion ALL",
+        "find": '        for page in lambda_client.get_paginator("list_functions").paginate(\n            FunctionVersion="ALL"\n        ):\n',
+        "replace": '        for page in lambda_client.get_paginator("list_functions").paginate():\n',
+    },
+    {
+        "name": "BR-57 drops the outside-function sharing rows",
+        "file": BEDROCK,
+        "defect": "BR-57 never fails a role a function outside every action group runs as",
+        "find": '        for role_arn, arns in sorted(outside["roles"].items()):\n',
+        "replace": "        for role_arn, arns in sorted({}.items()):\n",
+    },
+    {
+        "name": "BR-57 passes the function row when ListFunctions fails",
+        "file": BEDROCK,
+        "defect": "BR-57 ignores a failed ListFunctions read",
+        "find": '        function_errors = functions["errors"] + outside["errors"]\n',
+        "replace": '        function_errors = functions["errors"]\n',
+    },
+    {
+        "name": "BR-06 skips stores homed in unassessed enabled Regions",
+        "file": BEDROCK,
+        "defect": "BR-06 reads stores only in the assessed Regions, so a multi-Region store homed elsewhere reads as a gap",
+        "find": '        others.update(enabled["regions"])\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-06 ignores an unlisted Region list",
+        "file": BEDROCK,
+        "defect": "BR-06 drops a failed account:ListRegions, so a store homed in an unread Region reads as a gap",
+        "find": '        if enabled["error"]:\n            coverage["unread"].append(\n                "the Regions enabled for the account, where a multi-Region store "\n',
+        "replace": '        if False:\n            coverage["unread"].append(\n                "the Regions enabled for the account, where a multi-Region store "\n',
+    },
+    {
+        "name": "BR-06 traces a failed invoke call",
+        "file": BEDROCK,
+        "defect": "BR-06 keeps a call CloudTrail recorded with an errorCode, which has no invocation log record",
+        "find": '            if not isinstance(detail, dict) or detail.get("errorCode"):\n',
+        "replace": "            if not isinstance(detail, dict):\n",
+    },
+    {
+        "name": "BR-06 joins the oldest calls",
+        "file": BEDROCK,
+        "defect": "BR-06 samples the oldest calls of the day, not the newest",
+        "find": '    calls.sort(key=lambda call: call["time"], reverse=True)\n',
+        "replace": '    calls.sort(key=lambda call: call["time"])\n',
+    },
+    {
+        "name": "BR-06 reads calls newer than the settle time",
+        "file": BEDROCK,
+        "defect": "BR-06 looks up calls up to now, which may have no record yet",
+        "find": "                EndTime=now - INFERENCE_TRACE_SETTLE,\n",
+        "replace": "                EndTime=now,\n",
+    },
+    {
+        "name": "BR-06 credits an unjoined call as traced",
+        "file": BEDROCK,
+        "defect": "BR-06 counts every sampled call as joined",
+        "find": '        joined = [call for call in events["calls"] if call["request_id"] in records]\n',
+        "replace": '        joined = list(events["calls"])\n',
+    },
+    {
+        "name": "BR-06 claims logged bodies a record lacks",
+        "file": BEDROCK,
+        "defect": "BR-06 reports input and output bodies from any input key",
+        "find": "                if any(str(name).startswith(key) for name in (record.get(part) or {}))\n",
+        "replace": "                if record.get(part) is not None\n",
+    },
+    {
+        "name": "BR-06 fails a trace whose read failed",
+        "file": BEDROCK,
+        "defect": "BR-06 turns a failed invocation log read into Failed",
+        "find": '        elif scan["error"] or scan["capped"]:\n',
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "BR-06 reads text delivery off as unread",
+        "file": BEDROCK,
+        "defect": "BR-06 reports logging without text as N/A, though no trace can be built",
+        "find": '            "Failed" if source["logging"] is False else "N/A",\n',
+        "replace": '            "N/A",\n',
+    },
+    {
+        "name": "BR-06 ignores a Lake store for centralization",
+        "file": BEDROCK,
+        "defect": "BR-06 never credits a CloudTrail Lake store recording Bedrock",
+        "find": '    if stores["management"]:\n',
+        "replace": "    if False:\n",
+    },
+    {
+        "name": "BR-06 credits any AWSLogs table as CloudTrail",
+        "file": BEDROCK,
+        "defect": "BR-06 accepts a Glue table over any AWS log path",
+        "find": '                            logs >= 0 and "/CloudTrail" in location[logs:]\n',
+        "replace": "                            logs >= 0\n",
+    },
+    {
+        "name": "BR-06 misses a Security Lake CloudTrail table",
+        "file": BEDROCK,
+        "defect": "BR-06 does not read the Security Lake CLOUD_TRAIL_MGMT source as central",
+        "find": '                        ) or "/aws/CLOUD_TRAIL_MGMT/" in location:\n',
+        "replace": "                        ):\n",
+    },
+    {
+        "name": "BR-06 fails centralization over an unread Glue catalog",
+        "file": BEDROCK,
+        "defect": "BR-06 drops Glue read errors, so an unread catalog reads as no table",
+        "find": '    unread += tables["errors"]\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-06 drops the trace rows from the handler",
+        "file": BEDROCK,
+        "defect": "BR-06 never runs the trace legs",
+        "find": "        all_findings.append(check_bedrock_inference_trace(region=region))\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-44 passes a Subscribe bound with no invocation block",
+        "file": BEDROCK,
+        "defect": "BR-44 passes a Subscribe Deny alone, which Bedrock's auto-subscription bypasses",
+        "find": '            if invocation["blocked_by"]:\n',
+        "replace": "            if True:\n",
+    },
+    {
+        "name": "BR-44 credits an organization leg with a failed row",
+        "file": BEDROCK,
+        "defect": "BR-44 reads one Passed row of BR-42's organization leg as a block",
+        "find": '    elif statuses == {"Passed"}:\n',
+        "replace": '    elif "Passed" in statuses:\n',
+    },
+    {
+        "name": "BR-44 fails over an unread BR-42 leg",
+        "file": BEDROCK,
+        "defect": "BR-44 reports Failed when a BR-42 leg was not read",
+        "find": '            if invocation["unread"]:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-42 lists no identity that can invoke any model",
+        "file": BEDROCK,
+        "defect": "BR-42's invocation_open stays empty, so BR-44 reads every account as blocked",
+        "find": '            if access["unrestricted"] or access["mantle"]:\n',
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "BR-44 is not given the BR-42 identity leg",
+        "file": BEDROCK,
+        "defect": "the handler drops BR-42's identity leg from BR-44",
+        "find": "                        allow_list_findings=allow_list_findings,\n",
+        "replace": "",
+    },
+    {
+        "name": "BR-33 drops a task with no task role",
+        "file": BEDROCK,
+        "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
+        "container instance role holds Bedrock is never judged",
+        "find": '                if not role_arn and task.get("containerInstanceArn"):\n',
+        "replace": "                if False:\n",
+    },
+    {
         "name": "an unread list read lets the BR-53 sweep summary pass",
         "file": BEDROCK,
         "defect": "BR-53 passes the SageMaker and AgentCore summary while a list "
@@ -767,8 +1628,52 @@ MUTATIONS = [
         "file": BEDROCK,
         "defect": "BR-34 stops reading the request body for the guardContent tag, so "
         "an InvokeModel prompt the prompt attack filter never evaluated passes",
-        "find": "            elif GUARDRAIL_INPUT_TAG not in json.dumps(body):\n",
-        "replace": "            elif False:\n",
+        "find": '            if state == "untagged":\n',
+        "replace": "            if False:\n",
+    },
+    # Round 7: the tagSuffix match, the Converse turn, the S3-only destination
+    # and the large-data skip. Each was killed by hand on a byte backup on
+    # 2026-10-03 before it was added here.
+    {
+        "name": "BR-34 credits an input tag with another tagSuffix",
+        "file": BEDROCK,
+        "defect": "BR-34 credits any guardContent tag, so a prompt wrapped in a "
+        "tag whose suffix is not the configured tagSuffix passes, although the "
+        "prompt attack filter evaluates only the configured tag",
+        "find": "        tagged = any(\n",
+        "replace": "        tagged = GUARDRAIL_INPUT_TAG in text or any(\n",
+    },
+    {
+        "name": "BR-34 judges the first Converse user turn",
+        "file": BEDROCK,
+        "defect": "BR-34 reads the first user message of a Converse request, so a "
+        "call whose earlier turn was marked and whose latest turn was not passes",
+        "find": "    for message in reversed(messages if isinstance(messages, list) else []):\n",
+        "replace": "    for message in messages if isinstance(messages, list) else []:\n",
+    },
+    {
+        "name": "BR-34 credits a Converse turn with no guardContent block",
+        "file": BEDROCK,
+        "defect": "BR-34 accepts any content block as a mark, so a guarded Converse "
+        "call that sent plain text passes",
+        "find": '                isinstance(block, dict) and "guardContent" in block for block in turn\n',
+        "replace": "                isinstance(block, dict) for block in turn\n",
+    },
+    {
+        "name": "BR-27 and BR-34 read nothing from an S3-only log destination",
+        "file": BEDROCK,
+        "defect": "the S3 reader returns an empty read, so an untagged call or a "
+        "grounding score in an S3-only invocation log is never seen",
+        "find": '    return _scan_invocation_log_s3(region, source["s3"], match, visit)\n',
+        "replace": '    return {"read": 0, "capped": False, "error": None, "action": "s3:GetObject"}\n',
+    },
+    {
+        "name": "BR-34 reads a large-data body as an invocation log record",
+        "file": BEDROCK,
+        "defect": "the S3 reader opens the data/ objects too, which hold request "
+        "bodies and not records, and reads prompts it does not need",
+        "find": '                    if "/data/" in key[len(request["Prefix"]) - 1 :]:\n',
+        "replace": "                    if False:\n",
     },
     {
         "name": "BR-27 reads an absent text delivery flag as delivered",
@@ -2738,6 +3643,49 @@ GROUPS: dict[str, str] = {
     "BR-04 credits any object in the log bucket as a retained entry": (
         "in the Bedrock invocation log entries"
     ),
+    "BR-04 retains a log object whose replication FAILED": (
+        "in the Bedrock invocation log entries"
+    ),
+    "BR-46 passes an object written between the last run and the latest read": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-46 credits a document with no metadata sidecar": (
+        "in the Bedrock knowledge base classification"
+    ),
+    "BR-43 credits a Region allow-list in the management account": (
+        "in the Bedrock management-account SCP credit"
+    ),
+    "BR-42 credits a model list in the management account": (
+        "in the Bedrock management-account SCP credit"
+    ),
+    "BR-43 credits an AI service Region deny in the management account": (
+        "in the Bedrock management-account SCP credit"
+    ),
+    "BR-43 credits a Region deny that names only the listed invoke actions": (
+        "in the Bedrock Region deny service prefixes"
+    ),
+    "BR-43 credits an AI service Region deny that omits the vector stores": (
+        "in the Bedrock Region deny service prefixes"
+    ),
+    "BR-47 names only five enforcing buckets in its Passed text": (
+        "in the Bedrock data path TLS exemptions"
+    ),
+    "BR-47 drops the SageMaker transform and processing job buckets": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 drops the SageMaker endpoint capture and async buckets": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-47 drops the Bedrock evaluation job buckets": (
+        "in the Bedrock data path inventory"
+    ),
+    "BR-55 credits an all-zero PCR pin": ("in the Bedrock attestation pins"),
+    "BR-48 ignores a service section with no leaf": (
+        "in the Bedrock AI opt-out delegation"
+    ),
+    "BR-26 credits a secrets regex that acts on the output only": (
+        "in the Bedrock guardrail secrets regex"
+    ),
     "an unread list read lets the BR-53 sweep summary pass": (
         "in the Bedrock owner tag sweep"
     ),
@@ -2756,6 +3704,208 @@ GROUPS: dict[str, str] = {
     "BR-33 judges another account's image by this account's coverage": (
         "in the Bedrock container image scanning"
     ),
+    "BR-33 drops a task with no task role": ("in the Bedrock container image scanning"),
+    "BR-50 walks one role hop only": ("in the Bedrock AI role chains"),
+    "BR-51 skips the role principals of an AI role's trust": (
+        "in the Bedrock AI role chains"
+    ),
+    "BR-51 follows one role hop only": ("in the Bedrock AI role chains"),
+    "BR-20 skips the Data Catalog tables of a SQL knowledge base": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 reads no Data Catalog partition locations": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 reads Data Catalog partitions past its page cap": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-07 reads no CreatePrompt holder": ("in the Bedrock prompt creators"),
+    "BR-07 lets a prompt creator render prompts": ("in the Bedrock prompt creators"),
+    "BR-57 reads no runtime JWT authorizer": ("in the Bedrock runtime inbound gate"),
+    "BR-57 credits any account bound on an open runtime policy": (
+        "in the Bedrock runtime inbound gate"
+    ),
+    "BR-57 ignores a runtime policy grant to another account": (
+        "in the Bedrock runtime inbound gate"
+    ),
+    "BR-57 passes beside an unread runtime policy": (
+        "in the Bedrock runtime inbound gate"
+    ),
+    "BR-57 reads no runtime endpoint policy": ("in the Bedrock runtime inbound gate"),
+    "BR-02 credits a gateway endpoint for its whole VPC": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-02 credits a gateway endpoint to a workload with unread subnets": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-02 leaves a SageMaker runtime workload out": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-02 passes beside unread route tables": ("in the Bedrock workload route tables"),
+    "BR-02 drops the subnets of a Lambda workload": (
+        "in the Bedrock workload route tables"
+    ),
+    "BR-32 passes an acting alarm with no log forwarding": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 reads a log group beside S3 as unforwarded": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 credits a trail that records another Region": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 credits a trail that is not logging": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 credits a narrowed guardrail selector": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 ignores event data stores for guardrail calls": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 passes beside an unread record leg": (
+        "in the Bedrock guardrail record legs"
+    ),
+    "BR-32 drops an unread trail list": ("in the Bedrock guardrail record legs"),
+    "BR-46 clears a source by a job alone": (
+        "in the Bedrock Macie discovery requirement"
+    ),
+    "BR-46 fails an unread discovery state": (
+        "in the Bedrock Macie discovery requirement"
+    ),
+    "BR-04 reads agent memory at DRAFT only": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 passes an agent memory of 0 days": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 judges inference data at the AWSLogs root": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 probes replicated inference data it cannot read": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-04 passes inference data beside an unread endpoint": (
+        "in the Bedrock agent and SageMaker retention legs"
+    ),
+    "BR-26 credits a Glue PIIDetection node that only audits": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 credits a Glue target one path reaches unmasked": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 matches a Glue path as a name prefix": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 judges the oldest SUCCEEDED Glue run": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 dates a Glue job by a run that did not succeed": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 fails a source over an unread Glue read": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 ignores Glue redaction jobs": ("in the Bedrock knowledge base redaction"),
+    "BR-53 trusts GetResources for Bedrock job tags": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-53 reads Bedrock job tags with the tagging API's key case": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-53 fails a job whose tags were not read": ("in the Bedrock owner tag sweep"),
+    "BR-53 lists workload identities past the page cap": (
+        "in the Bedrock owner tag sweep"
+    ),
+    "BR-53 drops never-tagged pipelines": ("in the Bedrock owner tag sweep"),
+    "BR-20 credits an Aurora store with password logins only": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 reads an absent IAM authentication value as off": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 names only one Aurora fix": ("in the Bedrock knowledge base stores"),
+    "BR-12 credits a GOVERNANCE-mode invocation log bucket": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a filter pattern on the invocation log group": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 follows another account's Firehose stream": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a Firehose stream with a Lambda processor": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits an inactive Firehose stream": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 drops the invocation log archive rows": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a bucket with Object Lock off": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-12 credits a filter on transformed logs": (
+        "in the Bedrock invocation log WORM archive"
+    ),
+    "BR-34 credits a detector with AI Protection off": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 credits a disabled GuardDuty detector": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 passes a Region with no GuardDuty detector": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 reads only the first GuardDuty findings page": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 reads only the first GetFindings batch": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 counts archived GuardDuty findings": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 names a non-injection finding as a flagged event": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 names the oldest injection finding first": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 passes an unread GuardDuty detector": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 passes an unread GuardDuty findings list": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-34 drops the GuardDuty row from the handler": "in the Bedrock GuardDuty prompt injection leg",
+    "BR-57 credits an S3 wildcard bucket name as scoped": "in the Bedrock agent role scope",
+    "BR-57 credits a type-wide ARN such as table/*": "in the Bedrock agent role scope",
+    "BR-57 reads a bucket-named S3 key wildcard as unscoped": "in the Bedrock agent role scope",
+    "BR-57 credits a NotResource grant as scoped": "in the Bedrock agent role scope",
+    "BR-57 ignores the permissions boundary on a wide grant": "in the Bedrock agent role scope",
+    "BR-57 judges the boundary with the model-only scope test": "in the Bedrock agent role scope",
+    "BR-57 passes a conditioned wide grant": "in the Bedrock agent role scope",
+    "BR-57 passes a role missing from the IAM cache": "in the Bedrock agent role scope",
+    "BR-57 passes a role with a policy read error": "in the Bedrock agent role scope",
+    "BR-57 leaves action group function roles out of the scope test": "in the Bedrock agent role scope",
+    "BR-57 drops the scope row from the handler": "in the Bedrock agent role scope",
+    "BR-57 counts another version of an action group function as outside": "in the Bedrock agent role scope",
+    "BR-57 reads only the $LATEST function versions": "in the Bedrock agent role scope",
+    "BR-57 drops the outside-function sharing rows": "in the Bedrock agent role scope",
+    "BR-57 passes the function row when ListFunctions fails": "in the Bedrock agent role scope",
+    "BR-06 skips stores homed in unassessed enabled Regions": "in the Bedrock inference trace",
+    "BR-06 ignores an unlisted Region list": "in the Bedrock inference trace",
+    "BR-06 traces a failed invoke call": "in the Bedrock inference trace",
+    "BR-06 joins the oldest calls": "in the Bedrock inference trace",
+    "BR-06 reads calls newer than the settle time": "in the Bedrock inference trace",
+    "BR-06 credits an unjoined call as traced": "in the Bedrock inference trace",
+    "BR-06 claims logged bodies a record lacks": "in the Bedrock inference trace",
+    "BR-06 fails a trace whose read failed": "in the Bedrock inference trace",
+    "BR-06 reads text delivery off as unread": "in the Bedrock inference trace",
+    "BR-06 ignores a Lake store for centralization": "in the Bedrock inference trace",
+    "BR-06 credits any AWSLogs table as CloudTrail": "in the Bedrock inference trace",
+    "BR-06 misses a Security Lake CloudTrail table": "in the Bedrock inference trace",
+    "BR-06 fails centralization over an unread Glue catalog": "in the Bedrock inference trace",
+    "BR-06 drops the trace rows from the handler": "in the Bedrock inference trace",
+    "BR-44 passes a Subscribe bound with no invocation block": "in the Bedrock Marketplace invocation gate",
+    "BR-44 credits an organization leg with a failed row": "in the Bedrock Marketplace invocation gate",
+    "BR-44 fails over an unread BR-42 leg": "in the Bedrock Marketplace invocation gate",
+    "BR-42 lists no identity that can invoke any model": "in the Bedrock Marketplace invocation gate",
+    "BR-44 is not given the BR-42 identity leg": "in the Bedrock Marketplace invocation gate",
+    "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
+        "in the Bedrock training bucket policies"
+    ),
+    "BR-42 ignores a training grant to another account": (
+        "in the Bedrock training bucket policies"
+    ),
+    "BR-42 credits a bound naming another account": (
+        "in the Bedrock training bucket policies"
+    ),
+    "BR-42 credits any condition on an open training grant": (
+        "in the Bedrock training bucket policies"
+    ),
     "BR-34 credits a detected prompt attack the guardrail let through": (
         "in the Bedrock invocation log guardrail evidence"
     ),
@@ -2763,6 +3913,21 @@ GROUPS: dict[str, str] = {
         "in the Bedrock invocation log guardrail evidence"
     ),
     "BR-27 reads an absent text delivery flag as delivered": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 credits an input tag with another tagSuffix": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 judges the first Converse user turn": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 credits a Converse turn with no guardContent block": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 and BR-34 read nothing from an S3-only log destination": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 reads a large-data body as an invocation log record": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     "SM-39 evaluates DNS Firewall rule groups in list order": (
