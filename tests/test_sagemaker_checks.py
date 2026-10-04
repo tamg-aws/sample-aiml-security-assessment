@@ -23083,6 +23083,10 @@ class TestSM39WorkloadEgress:
         profiles=None,
         microvms=None,
         connectors=None,
+        tgw_attachments=None,
+        tgw_routes=None,
+        tgw_vpc_attachments=None,
+        tgw_truncated=(),
     ):
         """associations: {vpc: [associations]}; rules: {group: [rules] or pages};
         tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}};
@@ -23090,7 +23094,14 @@ class TestSM39WorkloadEgress:
         {Lambda ARN: [agent resources naming it]}; tasks: {ECS cluster:
         [DescribeTasks entries]}; profiles: {EKS cluster: {profile: [subnets]}};
         microvms: GetMicrovm entries; connectors: {connector id:
-        VpcEgressConfiguration}."""
+        VpcEgressConfiguration}; tgw_attachments: DescribeTransitGatewayAttachments
+        entries; tgw_routes: {route table: [routes] or pages of routes};
+        tgw_vpc_attachments: {attachment id: DescribeTransitGatewayVpcAttachments
+        entry}; tgw_truncated: route tables whose last page reports
+        AdditionalRoutesAvailable."""
+        tgw_attachments = tgw_attachments or []
+        tgw_routes = tgw_routes or {}
+        tgw_vpc_attachments = tgw_vpc_attachments or {}
         services = services or {}
         functions = functions or []
         clusters = clusters or {}
@@ -23219,8 +23230,59 @@ class TestSM39WorkloadEgress:
                         }
                     ]
 
+                def describe_tgw_attachments(Filters):
+                    wanted = {f["Name"]: f["Values"] for f in Filters}
+                    return [
+                        {
+                            "TransitGatewayAttachments": [
+                                a
+                                for a in tgw_attachments
+                                if a["ResourceId"] in wanted["resource-id"]
+                                and a["TransitGatewayId"]
+                                in wanted["transit-gateway-id"]
+                                and a["ResourceType"] in wanted["resource-type"]
+                            ]
+                        }
+                    ]
+
+                def search_tgw_routes(TransitGatewayRouteTableId, Filters, **kw):
+                    # The state filter is applied as the API applies it, so a
+                    # reader that drops it reads a blackhole route.
+                    states = next(f["Values"] for f in Filters if f["Name"] == "state")
+                    found = tgw_routes.get(TransitGatewayRouteTableId, [])
+                    pages = found if found and isinstance(found[0], list) else [found]
+                    index = int(kw.get("NextToken") or 0)
+                    response = {
+                        "Routes": [r for r in pages[index] if r.get("State") in states],
+                        "AdditionalRoutesAvailable": (
+                            TransitGatewayRouteTableId in tgw_truncated
+                            and index == len(pages) - 1
+                        ),
+                    }
+                    if index < len(pages) - 1:
+                        response["NextToken"] = str(index + 1)
+                    return response
+
+                client.search_transit_gateway_routes.side_effect = guarded(
+                    "tgw_routes", search_tgw_routes
+                )
                 client.get_paginator.side_effect = _pager(
                     {
+                        "describe_transit_gateway_attachments": guarded(
+                            "tgw_attachments", describe_tgw_attachments
+                        ),
+                        "describe_transit_gateway_vpc_attachments": guarded(
+                            "tgw_vpc_attachments",
+                            lambda TransitGatewayAttachmentIds: [
+                                {
+                                    "TransitGatewayVpcAttachments": [
+                                        tgw_vpc_attachments[i]
+                                        for i in TransitGatewayAttachmentIds
+                                        if i in tgw_vpc_attachments
+                                    ]
+                                }
+                            ],
+                        ),
                         "describe_subnets": guarded("subnets", describe_subnets),
                         "describe_route_tables": guarded(
                             "route_tables", describe_route_tables
@@ -23714,7 +23776,7 @@ class TestSM39WorkloadEgress:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "subnet-a2" in rows[0]["Finding_Details"]
 
-    def test_a_transit_gateway_route_is_not_judged(self):
+    def test_a_transit_gateway_route_with_no_attachment_is_not_judged(self):
         rows = self._firewalled(
             tables={
                 "vpc-a": [
@@ -23727,6 +23789,435 @@ class TestSM39WorkloadEgress:
         )
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "tgw-1" in rows[0]["Finding_Details"]
+        assert (
+            "whose transit gateway holds no available attachment of vpc-a"
+            in rows[0]["Finding_Details"]
+        )
+
+    @staticmethod
+    def _tgw_route(destination, attachment="tgw-attach-hub", vpc="vpc-hub", **extra):
+        return {
+            "DestinationCidrBlock": destination,
+            "State": "active",
+            "Type": "static",
+            "TransitGatewayAttachments": [
+                {
+                    "TransitGatewayAttachmentId": attachment,
+                    "ResourceId": vpc,
+                    "ResourceType": "vpc",
+                }
+            ],
+            **extra,
+        }
+
+    def _through_tgw(self, hub_route=None, **kwargs):
+        """vpc-a's subnets route 0.0.0.0/0 to tgw-1, whose route table sends it
+        to vpc-hub, whose attachment subnet routes to firewall hub-fw."""
+        hub_route = hub_route or ("0.0.0.0/0", {"VpcEndpointId": "vpce-hub"})
+        defaults = {
+            "functions": [self._function("agent-fn", ["subnet-a1", "subnet-a2"])],
+            "firewalls": {"vpc-hub": {"hub-fw": "vpce-hub"}},
+            "groups": {_ALLOW_ALL: _allowlist_group(home=["10.0.0.0/16"])},
+            "tables": {
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"TransitGatewayId": "tgw-1"}),
+                    )
+                ],
+                "vpc-hub": [self._table(["subnet-h1"], hub_route)],
+            },
+            "tgw_attachments": [
+                {
+                    "TransitGatewayAttachmentId": "tgw-attach-a",
+                    "TransitGatewayId": "tgw-1",
+                    "ResourceId": "vpc-a",
+                    "ResourceType": "vpc",
+                    "ResourceOwnerId": "123456789012",
+                    "State": "available",
+                    "Association": {
+                        "TransitGatewayRouteTableId": "tgw-rtb-1",
+                        "State": "associated",
+                    },
+                }
+            ],
+            "tgw_routes": {"tgw-rtb-1": [self._tgw_route("0.0.0.0/0")]},
+            "tgw_vpc_attachments": {
+                "tgw-attach-hub": {
+                    "TransitGatewayAttachmentId": "tgw-attach-hub",
+                    "VpcId": "vpc-hub",
+                    "VpcOwnerId": "123456789012",
+                    "SubnetIds": ["subnet-h1"],
+                }
+            },
+        }
+        defaults.update(kwargs)
+        return self._run(**defaults)
+
+    @pytest.mark.parametrize("where", ["rule group", "policy"])
+    def test_a_transit_gateway_route_is_followed_to_the_hub_firewall(self, where):
+        # Stricter than the former test_a_transit_gateway_route_is_not_judged,
+        # which read every transit gateway route as N/A.
+        overrides = {}
+        if where == "policy":
+            overrides = {
+                "groups": {_ALLOW_ALL: _allowlist_group()},
+                "policy": {
+                    "StatelessDefaultActions": ["aws:forward_to_sfe"],
+                    "StatefulRuleGroupReferences": [{"ResourceArn": _ALLOW_ALL}],
+                    "PolicyVariables": {
+                        "RuleVariables": {"HOME_NET": {"Definition": ["10.0.0.0/8"]}}
+                    },
+                },
+            }
+        rows = self._nfw(self._through_tgw(**overrides))
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "firewall(s) hub-fw" in rows[0]["Finding_Details"]
+
+    def test_a_hub_firewall_without_home_net_fails(self):
+        rows = self._nfw(self._through_tgw(groups={_ALLOW_ALL: _allowlist_group()}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "firewall hub-fw sits in VPC vpc-hub, outside the hosting VPC, and sets "
+            "no HOME_NET" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "subnet-a1 (10.0.1.0/24), subnet-a2 (10.0.2.0/24)"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_in_vpc_firewall_without_home_net_still_passes(self):
+        # HOME_NET defaults to the firewall's own VPC, which holds the hosting
+        # subnets when no transit gateway is crossed.
+        rows = self._firewalled()
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_hub_home_net_missing_the_hosting_subnets_fails(self):
+        rows = self._nfw(
+            self._through_tgw(
+                groups={_ALLOW_ALL: _allowlist_group(home=["10.9.0.0/16"])}
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "does not hold hosting subnet(s)" in rows[0]["Finding_Details"]
+
+    def test_a_hub_subnet_routing_to_an_internet_gateway_fails(self):
+        rows = self._nfw(
+            self._through_tgw(hub_route=("0.0.0.0/0", {"GatewayId": "igw-hub"}))
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "subnet-a1 (0.0.0.0/0 to tgw-1), then 0.0.0.0/0 to attachment "
+            "tgw-attach-hub in VPC vpc-hub, then subnet-h1 (0.0.0.0/0 to igw-hub)"
+            in rows[0]["Finding_Details"]
+        )
+        assert "through no Network Firewall" in rows[0]["Finding_Details"]
+
+    def test_only_active_overlapping_internet_routes_are_followed(self):
+        bypass = {
+            "TransitGatewayAttachmentId": "tgw-attach-bypass",
+            "VpcId": "vpc-bypass",
+            "VpcOwnerId": "123456789012",
+            "SubnetIds": ["subnet-x1"],
+        }
+        rows = self._through_tgw(
+            tgw_routes={
+                "tgw-rtb-1": [
+                    self._tgw_route("0.0.0.0/0"),
+                    self._tgw_route("10.0.0.0/8", "tgw-attach-bypass", "vpc-bypass"),
+                    self._tgw_route("::/0", "tgw-attach-bypass", "vpc-bypass"),
+                    self._tgw_route(
+                        "0.0.0.0/1",
+                        "tgw-attach-bypass",
+                        "vpc-bypass",
+                        State="blackhole",
+                    ),
+                ]
+            },
+            tgw_vpc_attachments={
+                "tgw-attach-hub": {
+                    "TransitGatewayAttachmentId": "tgw-attach-hub",
+                    "VpcId": "vpc-hub",
+                    "VpcOwnerId": "123456789012",
+                    "SubnetIds": ["subnet-h1"],
+                },
+                "tgw-attach-bypass": bypass,
+            },
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"TransitGatewayId": "tgw-1"}),
+                    )
+                ],
+                "vpc-hub": [
+                    self._table(
+                        ["subnet-h1"], ("0.0.0.0/0", {"VpcEndpointId": "vpce-hub"})
+                    )
+                ],
+                "vpc-bypass": [
+                    self._table(["subnet-x1"], ("0.0.0.0/0", {"GatewayId": "igw-x"}))
+                ],
+            },
+        )
+        nfw = self._nfw(rows)
+        assert [r["Status"] for r in nfw] == ["Passed"]
+        assert "vpc-bypass" not in nfw[0]["Finding_Details"]
+
+    def test_routes_on_a_later_search_page_are_followed(self):
+        rows = self._nfw(
+            self._through_tgw(
+                hub_route=("0.0.0.0/0", {"GatewayId": "igw-hub"}),
+                tgw_routes={
+                    "tgw-rtb-1": [
+                        [self._tgw_route("10.0.0.0/8")],
+                        [self._tgw_route("0.0.0.0/0")],
+                    ]
+                },
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "igw-hub" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("key", "action"),
+        [
+            ("tgw_attachments", "ec2:DescribeTransitGatewayAttachments"),
+            ("tgw_routes", "ec2:SearchTransitGatewayRoutes"),
+            ("tgw_vpc_attachments", "ec2:DescribeTransitGatewayVpcAttachments"),
+            ("describe_firewall", "network-firewall:DescribeFirewall"),
+        ],
+    )
+    def test_a_denied_transit_gateway_read_is_not_applicable(self, key, action):
+        rows = self._nfw(
+            self._through_tgw(
+                errors={key: ClientError({"Error": {"Code": "AccessDenied"}}, "x")}
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Resolution"] == f"Grant {action} and retry."
+        assert f"({action}: AccessDenied" in rows[0]["Finding_Details"]
+        assert "was not judged" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("change", "text"),
+        [
+            ("truncated", "holds more routes than the search returns"),
+            ("vpn", "vpn attachment tgw-attach-vpn (vpn-1), which this check does"),
+            ("other account", "of account 210987654321, whose routes and firewalls"),
+            ("prefix list", "then prefix list pl-1, whose entries are not read"),
+            ("unassociated", "whose attachment of vpc-a is associated with no route"),
+        ],
+    )
+    def test_a_hop_the_check_cannot_follow_is_not_applicable(self, change, text):
+        kwargs = {}
+        if change == "truncated":
+            kwargs["tgw_truncated"] = {"tgw-rtb-1"}
+        elif change == "vpn":
+            route = self._tgw_route("0.0.0.0/0", "tgw-attach-vpn", "vpn-1")
+            route["TransitGatewayAttachments"][0]["ResourceType"] = "vpn"
+            kwargs["tgw_routes"] = {"tgw-rtb-1": [route]}
+        elif change == "other account":
+            kwargs["tgw_vpc_attachments"] = {
+                "tgw-attach-hub": {
+                    "TransitGatewayAttachmentId": "tgw-attach-hub",
+                    "VpcId": "vpc-hub",
+                    "VpcOwnerId": "210987654321",
+                    "SubnetIds": ["subnet-h1"],
+                }
+            }
+        elif change == "prefix list":
+            kwargs["tgw_routes"] = {
+                "tgw-rtb-1": [{"PrefixListId": "pl-1", "State": "active"}]
+            }
+        else:
+            kwargs["tgw_attachments"] = [
+                {
+                    "TransitGatewayAttachmentId": "tgw-attach-a",
+                    "TransitGatewayId": "tgw-1",
+                    "ResourceId": "vpc-a",
+                    "ResourceType": "vpc",
+                    "ResourceOwnerId": "123456789012",
+                    "State": "available",
+                    "Association": {
+                        "TransitGatewayRouteTableId": "tgw-rtb-1",
+                        "State": "disassociated",
+                    },
+                }
+            ]
+        rows = self._nfw(self._through_tgw(**kwargs))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert text in rows[0]["Finding_Details"]
+
+    def test_two_vpcs_behind_one_transit_gateway_are_judged_apart(self):
+        attachment = {
+            "TransitGatewayId": "tgw-1",
+            "ResourceType": "vpc",
+            "ResourceOwnerId": "123456789012",
+            "State": "available",
+        }
+        rows = self._nfw(
+            self._through_tgw(
+                functions=[
+                    self._function("agent-a", ["subnet-a1", "subnet-a2"]),
+                    self._function("agent-b", ["subnet-b1"]),
+                ],
+                groups={_ALLOW_ALL: _allowlist_group(home=["10.0.0.0/16"])},
+                tables={
+                    "vpc-a": [
+                        self._table(
+                            ["subnet-a1", "subnet-a2"],
+                            ("0.0.0.0/0", {"TransitGatewayId": "tgw-1"}),
+                        )
+                    ],
+                    "vpc-b": [
+                        self._table(
+                            ["subnet-b1"], ("0.0.0.0/0", {"TransitGatewayId": "tgw-1"})
+                        )
+                    ],
+                    "vpc-hub": [
+                        self._table(
+                            ["subnet-h1"], ("0.0.0.0/0", {"VpcEndpointId": "vpce-hub"})
+                        )
+                    ],
+                },
+                tgw_attachments=[
+                    {
+                        **attachment,
+                        "TransitGatewayAttachmentId": "tgw-attach-a",
+                        "ResourceId": "vpc-a",
+                        "Association": {
+                            "TransitGatewayRouteTableId": "tgw-rtb-1",
+                            "State": "associated",
+                        },
+                    },
+                    {
+                        **attachment,
+                        "TransitGatewayAttachmentId": "tgw-attach-b",
+                        "ResourceId": "vpc-b",
+                        "Association": {
+                            "TransitGatewayRouteTableId": "tgw-rtb-1",
+                            "State": "associated",
+                        },
+                    },
+                ],
+            )
+        )
+        # One hub firewall whose HOME_NET holds vpc-a's subnets but not vpc-b's.
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        assert "VPC vpc-a" in rows[0]["Finding_Details"]
+        assert "VPC vpc-b" in rows[1]["Finding_Details"]
+        assert "subnet-b1 (10.1.1.0/24)" in rows[1]["Finding_Details"]
+
+    def _sync(self, rows):
+        return self._rows(rows, "Agent Workload Egress Allow-List Sync")
+
+    def _allow_dns(self, *names):
+        return {
+            "associations": {
+                "vpc-a": [
+                    _dns_association("rslvr-frg-allow", 100),
+                    _dns_association("rslvr-frg-block", 200),
+                ],
+                "vpc-hub": [],
+            },
+            "rules": {
+                "rslvr-frg-allow": [
+                    {
+                        "Name": "allow-agents",
+                        "Priority": 100,
+                        "Action": "ALLOW",
+                        "FirewallDomainListId": "rslvr-fdl-allow",
+                    }
+                ]
+            },
+            "domains": {"rslvr-fdl-allow": list(names)},
+        }
+
+    def test_matching_allow_lists_pass_the_sync_row(self):
+        rows = self._through_tgw(**self._allow_dns("example.com.", "*.example.com."))
+        assert [r["Status"] for r in self._dns(rows)] == ["Passed"]
+        sync = self._sync(rows)
+        assert [(r["Status"], r["Severity"]) for r in sync] == [("Passed", "Low")]
+        assert (
+            "admit the same 2 DNS Firewall name(s) and 1 Network Firewall"
+            in (sync[0]["Finding_Details"])
+        )
+        assert sync[0]["Check_ID"] == "SM-39"
+
+    @pytest.mark.parametrize(
+        ("names", "text"),
+        [
+            (
+                ("example.com.", "*.example.com.", "api.other.com."),
+                "the DNS Firewall allow-list admits api.other.com, which firewall "
+                "hub-fw's ALLOWLIST does not",
+            ),
+            (
+                ("*.example.com.",),
+                "firewall hub-fw's ALLOWLIST admits .example.com, which the DNS "
+                "Firewall allow-list does not",
+            ),
+        ],
+    )
+    def test_differing_allow_lists_fail_the_sync_row(self, names, text):
+        rows = self._through_tgw(**self._allow_dns(*names))
+        sync = self._sync(rows)
+        assert [(r["Status"], r["Severity"]) for r in sync] == [("Failed", "Low")]
+        assert text in sync[0]["Finding_Details"]
+
+    def test_the_sync_row_compares_an_in_vpc_firewall(self):
+        dns = self._allow_dns("api.other.com.")
+        rows = self._run(
+            functions=[self._function("agent-fn", ["subnet-a1", "subnet-a2"])],
+            firewalls={"vpc-a": {"egress-fw": "vpce-fw1"}},
+            tables={
+                "vpc-a": [
+                    self._table(
+                        ["subnet-a1", "subnet-a2"],
+                        ("0.0.0.0/0", {"VpcEndpointId": "vpce-fw1"}),
+                    )
+                ]
+            },
+            **dns,
+        )
+        assert [r["Status"] for r in self._sync(rows)] == ["Failed"]
+        assert "egress-fw's ALLOWLIST" in self._sync(rows)[0]["Finding_Details"]
+
+    def test_a_dns_firewall_without_a_block_over_every_name_is_not_compared(self):
+        rows = self._through_tgw()
+        sync = self._sync(rows)
+        assert [r["Status"] for r in sync] == ["N/A"]
+        assert 'has no BLOCK over "*"' in sync[0]["Finding_Details"]
+
+    def test_no_reached_firewall_is_not_compared(self):
+        rows = self._through_tgw(
+            hub_route=("0.0.0.0/0", {"GatewayId": "igw-hub"}),
+            **self._allow_dns("example.com."),
+        )
+        sync = self._sync(rows)
+        assert [r["Status"] for r in sync] == ["N/A"]
+        assert "reaches no Network Firewall" in sync[0]["Finding_Details"]
+
+    def test_a_denied_dns_read_leaves_the_sync_row_not_applicable(self):
+        dns = self._allow_dns("example.com.")
+        rows = self._through_tgw(
+            errors={"domains": ClientError({"Error": {"Code": "AccessDenied"}}, "x")},
+            **dns,
+        )
+        sync = self._sync(rows)
+        assert [r["Status"] for r in sync] == ["N/A"]
+        assert sync[0]["Resolution"] == (
+            "Grant route53resolver:ListFirewallDomains and retry."
+        )
+
+    def test_a_connector_only_vpc_has_no_sync_row(self):
+        rows = self._run(
+            microvms=[_microvm("mvm-1", egress=["nc-1"])],
+            connectors={"nc-1": {"SubnetIds": ["subnet-a1"], "SecurityGroupIds": []}},
+        )
+        assert self._nfw(rows)
+        assert self._sync(rows) == []
 
     def test_an_allow_list_without_http_host_fails(self):
         rows = self._firewalled(groups={_ALLOW_ALL: _allowlist_group(("TLS_SNI",))})

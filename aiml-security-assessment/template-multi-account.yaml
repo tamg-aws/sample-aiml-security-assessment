@@ -1285,6 +1285,23 @@ Resources:
               - lambda:ListMicrovms # SM-39
               - ec2:DescribeNetworkInterfaces # SM-39
             Resource: '*'
+          - Sid: TransitGatewayEgressRead
+            # SM-39 follows a workload subnet's internet route through a transit
+            # gateway: the VPC's attachment and the route table it is associated
+            # with, then each VPC attachment an internet route names. Neither
+            # action has a resource type in the service authorization reference.
+            Effect: Allow
+            Action:
+              - ec2:DescribeTransitGatewayAttachments # SM-39
+              - ec2:DescribeTransitGatewayVpcAttachments # SM-39
+            Resource: '*'
+          - Sid: TransitGatewayRouteRead
+            # SM-39 searches the route table the workload VPC's transit gateway
+            # attachment is associated with, in this account.
+            Effect: Allow
+            Action:
+              - ec2:SearchTransitGatewayRoutes # SM-39
+            Resource: !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:transit-gateway-route-table/*'
           - Sid: MicrovmRead
             # SM-39 reads each MicroVM's network connectors. GetMicrovm has the
             # microvmImage resource type, and an AWS-managed image carries the

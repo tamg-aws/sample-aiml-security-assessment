@@ -19865,6 +19865,7 @@ def check_workload_network_segmentation(region: str = "") -> Dict[str, Any]:
 # check_agentcore_network_firewall_egress in the AgentCore module.
 WORKLOAD_DNS_EGRESS_FINDING = "Agent Workload DNS Egress Control"
 WORKLOAD_FIREWALL_EGRESS_FINDING = "Agent Workload Network Firewall Egress"
+WORKLOAD_EGRESS_SYNC_FINDING = "Agent Workload Egress Allow-List Sync"
 DNS_FIREWALL_RULE_ACTION_REFERENCE = (
     "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/"
     "resolver-dns-firewall-rule-actions.html"
@@ -20540,9 +20541,12 @@ def _network_firewall_allow_list_gaps(
     policy: Dict[str, Any],
     rule_groups: Dict[str, Dict[str, Any]],
     subnet_cidrs: Dict[str, str],
+    remote_vpc: str = "",
 ) -> Tuple[List[str], List[str]]:
     """(allow-list gaps, unread notes) for one firewall policy, as AC-49's egress
-    row judges them. rule_groups maps each customer group ARN to its RuleGroup."""
+    row judges them. rule_groups maps each customer group ARN to its RuleGroup.
+    An unset HOME_NET is the firewall's own VPC, which holds the hosting subnets
+    unless the firewall sits in remote_vpc, a VPC a transit gateway reaches."""
     gaps: List[str] = []
     unread: List[str] = []
     rule_order = (policy.get("StatefulEngineOptions") or {}).get(
@@ -20622,6 +20626,16 @@ def _network_firewall_allow_list_gaps(
                 uncovered.append(f"{subnet_id} ({cidr})")
         return uncovered
 
+    if allow_groups and remote_vpc and not definitions:
+        gaps.append(
+            f"firewall {firewall_name} sits in VPC {remote_vpc}, outside the hosting "
+            "VPC, and sets no HOME_NET, so its allow-list inspects only traffic "
+            "from its own VPC and not hosting subnet(s) "
+            + ", ".join(
+                f"{subnet_id} ({cidr})"
+                for subnet_id, cidr in sorted(subnet_cidrs.items())
+            )
+        )
     if allow_groups and definitions:
         results = [(where, cidrs, uncovered_by(cidrs)) for where, cidrs in definitions]
         failing = [result for result in results if result[2]]
@@ -20726,6 +20740,438 @@ def _network_firewall_allow_list_gaps(
     return gaps, unread
 
 
+class _HopReadError(Exception):
+    """A read on the path a route takes failed; carries the action to grant."""
+
+    def __init__(self, text: str, action: str) -> None:
+        super().__init__(text)
+        self.text = text
+        self.action = action
+
+
+def _vpc_firewall_endpoints(
+    firewall_client: Any, vpc_id: str
+) -> Dict[str, Dict[str, Any]]:
+    """Map each Network Firewall endpoint in a VPC to its firewall.
+
+    Raises _HopReadError naming the network-firewall action that failed.
+    """
+    try:
+        listed = _paged(firewall_client, "list_firewalls", "Firewalls", VpcIds=[vpc_id])
+    except Exception as error:
+        raise _HopReadError(
+            f"the Network Firewalls in {vpc_id} could not be listed "
+            f"(network-firewall:ListFirewalls: {get_assessment_error_label(error)})",
+            "network-firewall:ListFirewalls",
+        ) from None
+    endpoints: Dict[str, Dict[str, Any]] = {}
+    for metadata in listed:
+        arn = metadata.get("FirewallArn")
+        try:
+            described = firewall_client.describe_firewall(FirewallArn=arn)
+        except Exception as error:
+            raise _HopReadError(
+                f"Network Firewall {metadata.get('FirewallName') or arn} in "
+                f"{vpc_id} could not be described (network-firewall:DescribeFirewall: "
+                f"{get_assessment_error_label(error)})",
+                "network-firewall:DescribeFirewall",
+            ) from None
+        firewall = described.get("Firewall") or {}
+        for state in (
+            (described.get("FirewallStatus") or {}).get("SyncStates") or {}
+        ).values():
+            endpoint_id = (state.get("Attachment") or {}).get("EndpointId")
+            if endpoint_id:
+                endpoints[endpoint_id] = firewall
+    return endpoints
+
+
+def _transit_gateway_hops(
+    ec2_client: Any,
+    firewall_client: Any,
+    vpc_id: str,
+    tgw_id: str,
+    destination: str,
+    cache: Dict[Any, Any],
+) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """Follow a hosting subnet's internet route through a transit gateway, as
+    AC-49 does.
+
+    The VPC's attachment names the transit gateway route table its traffic is
+    looked up in. Every active route there whose destination holds an internet
+    address and overlaps the hosting route's is followed, to each attachment
+    it names. A VPC attachment of this account is followed one hop further: each
+    subnet the attachment uses routes on to a firewall endpoint in that VPC, to
+    an internet gateway, or elsewhere. Returns (outcome, text, firewall) entries,
+    outcome being "reached", "bypassing", "unresolved" or "unrouted" and text
+    the hop's description after the hosting route. A reached firewall carries
+    the VpcId of the VPC the transit gateway reached. A VPN, Direct Connect,
+    peering or Connect attachment, another account's VPC and a prefix-list
+    route are not followed. Raises _HopReadError on a failed read.
+    """
+    key = ("attachment", vpc_id, tgw_id)
+    if key not in cache:
+        try:
+            cache[key] = _paged(
+                ec2_client,
+                "describe_transit_gateway_attachments",
+                "TransitGatewayAttachments",
+                Filters=[
+                    {"Name": "resource-id", "Values": [vpc_id]},
+                    {"Name": "transit-gateway-id", "Values": [tgw_id]},
+                    {"Name": "resource-type", "Values": ["vpc"]},
+                ],
+            )
+        except Exception as error:
+            cache[key] = _HopReadError(
+                f"the attachment of {vpc_id} to transit gateway {tgw_id} could not "
+                "be read (ec2:DescribeTransitGatewayAttachments: "
+                f"{get_assessment_error_label(error)})",
+                "ec2:DescribeTransitGatewayAttachments",
+            )
+    if isinstance(cache[key], _HopReadError):
+        raise cache[key]
+    attachment = next((a for a in cache[key] if a.get("State") == "available"), None)
+    if attachment is None:
+        return [
+            (
+                "unresolved",
+                f", whose transit gateway holds no available attachment of {vpc_id}",
+                {},
+            )
+        ]
+    association = attachment.get("Association") or {}
+    table_id = association.get("TransitGatewayRouteTableId")
+    if not table_id or association.get("State") != "associated":
+        return [
+            (
+                "unresolved",
+                f", whose attachment of {vpc_id} is associated with no route table",
+                {},
+            )
+        ]
+    key = ("routes", table_id)
+    if key not in cache:
+        routes: List[Dict[str, Any]] = []
+        request: Dict[str, Any] = {
+            "TransitGatewayRouteTableId": table_id,
+            "Filters": [{"Name": "state", "Values": ["active"]}],
+        }
+        try:
+            while True:
+                response = ec2_client.search_transit_gateway_routes(**request)
+                routes.extend(response.get("Routes") or [])
+                if not response.get("NextToken"):
+                    break
+                request["NextToken"] = response["NextToken"]
+            cache[key] = (routes, response.get("AdditionalRoutesAvailable") is True)
+        except Exception as error:
+            cache[key] = _HopReadError(
+                f"route table {table_id} of transit gateway {tgw_id} could not be "
+                "searched (ec2:SearchTransitGatewayRoutes: "
+                f"{get_assessment_error_label(error)})",
+                "ec2:SearchTransitGatewayRoutes",
+            )
+    if isinstance(cache[key], _HopReadError):
+        raise cache[key]
+    routes, truncated = cache[key]
+    if truncated:
+        return [
+            (
+                "unresolved",
+                f", whose route table {table_id} holds more routes than the search "
+                "returns, so the route taken is not read",
+                {},
+            )
+        ]
+    origin = ipaddress.ip_network(destination, strict=False)
+    hops: List[Tuple[str, str, Dict[str, Any]]] = []
+    for route in routes:
+        if not route.get("DestinationCidrBlock"):
+            hops.append(
+                (
+                    "unresolved",
+                    f", then prefix list {route.get('PrefixListId') or '?'}, whose "
+                    "entries are not read",
+                    {},
+                )
+            )
+            continue
+        try:
+            network = ipaddress.ip_network(route["DestinationCidrBlock"], strict=False)
+        except ValueError:
+            continue
+        if (
+            network.version != origin.version
+            or not network.overlaps(origin)
+            or not _network_reaches_internet(network)
+        ):
+            continue
+        hop = f", then {route['DestinationCidrBlock']} to"
+        for target in route.get("TransitGatewayAttachments") or [{}]:
+            attachment_id = target.get("TransitGatewayAttachmentId") or "no attachment"
+            kind = target.get("ResourceType")
+            if kind != "vpc":
+                hops.append(
+                    (
+                        "unresolved",
+                        f"{hop} {kind or 'an unknown'} attachment {attachment_id} "
+                        f"({target.get('ResourceId') or '?'}), which this check "
+                        "does not follow",
+                        {},
+                    )
+                )
+                continue
+            key = ("vpc attachment", attachment_id)
+            if key not in cache:
+                try:
+                    cache[key] = next(
+                        iter(
+                            _paged(
+                                ec2_client,
+                                "describe_transit_gateway_vpc_attachments",
+                                "TransitGatewayVpcAttachments",
+                                TransitGatewayAttachmentIds=[attachment_id],
+                            )
+                        ),
+                        {},
+                    )
+                except Exception as error:
+                    cache[key] = _HopReadError(
+                        f"attachment {attachment_id}, which transit gateway "
+                        f"{tgw_id} routes {route['DestinationCidrBlock']} to, could "
+                        "not be read (ec2:DescribeTransitGatewayVpcAttachments: "
+                        f"{get_assessment_error_label(error)})",
+                        "ec2:DescribeTransitGatewayVpcAttachments",
+                    )
+            if isinstance(cache[key], _HopReadError):
+                raise cache[key]
+            vpc_attachment = cache[key]
+            next_vpc = vpc_attachment.get("VpcId") or target.get("ResourceId") or "?"
+            hop_text = f"{hop} attachment {attachment_id} in VPC {next_vpc}"
+            owner = vpc_attachment.get("VpcOwnerId")
+            if not owner or owner != attachment.get("ResourceOwnerId"):
+                hops.append(
+                    (
+                        "unresolved",
+                        f"{hop_text} of account {owner or 'unknown'}, whose routes "
+                        "and firewalls this account cannot read",
+                        {},
+                    )
+                )
+                continue
+            key = ("vpc", next_vpc)
+            if key not in cache:
+                try:
+                    tables = _paged(
+                        ec2_client,
+                        "describe_route_tables",
+                        "RouteTables",
+                        Filters=[{"Name": "vpc-id", "Values": [next_vpc]}],
+                    )
+                except Exception as error:
+                    cache[key] = _HopReadError(
+                        f"the route tables of {next_vpc}, which transit gateway "
+                        f"{tgw_id} routes to, could not be read "
+                        f"(ec2:DescribeRouteTables: "
+                        f"{get_assessment_error_label(error)})",
+                        "ec2:DescribeRouteTables",
+                    )
+                else:
+                    try:
+                        cache[key] = (
+                            tables,
+                            _vpc_firewall_endpoints(firewall_client, next_vpc),
+                        )
+                    except _HopReadError as error:
+                        cache[key] = error
+            if isinstance(cache[key], _HopReadError):
+                raise cache[key]
+            tables, endpoints = cache[key]
+            for subnet_id in sorted(vpc_attachment.get("SubnetIds") or []):
+                onward = _egress_routes(_route_table_for_subnet(tables, subnet_id))
+                if not onward:
+                    hops.append(("unrouted", "", {}))
+                for onward_destination, onward_key, onward_target in onward:
+                    text = (
+                        f"{hop_text}, then {subnet_id} ({onward_destination} to "
+                        f"{onward_target})"
+                    )
+                    if onward_key == "VpcEndpointId" and onward_target in endpoints:
+                        hops.append(
+                            (
+                                "reached",
+                                text,
+                                {**endpoints[onward_target], "VpcId": next_vpc},
+                            )
+                        )
+                    elif (
+                        onward_key == "GatewayId" and onward_target.startswith("igw-")
+                    ) or onward_key == "EgressOnlyInternetGatewayId":
+                        hops.append(("bypassing", text, {}))
+                    else:
+                        hops.append(("unresolved", text, {}))
+    if not hops:
+        hops.append(("unrouted", "", {}))
+    return hops
+
+
+def _dns_firewall_allowed_names(
+    resolver: Any, vpc_id: str, managed_lists: Dict[str, Any]
+) -> Tuple[Optional[List[str]], str, Optional[str]]:
+    """Return the names a VPC's DNS Firewall answers ahead of its BLOCK over "*".
+
+    The rules are walked in the order the DNS row walks them. An ALLOW or ALERT
+    rule over a customer domain list answers its names, less any an earlier
+    BLOCK lists as the same entry; a BLOCK over an AWS managed list or a rule
+    scoped to one query type admits nothing. Returns (names, "", None) for an
+    allow-list, or (None, reason, action), action naming the grant to retry
+    with when a read failed.
+    """
+    try:
+        associations = _paged(
+            resolver,
+            "list_firewall_rule_group_associations",
+            "FirewallRuleGroupAssociations",
+            VpcId=vpc_id,
+        )
+    except Exception as error:
+        return (
+            None,
+            f"the DNS Firewall rule groups associated with {vpc_id} could not be "
+            f"listed ({get_assessment_error_label(error)})",
+            "route53resolver:ListFirewallRuleGroupAssociations",
+        )
+    live = sorted(
+        (a for a in associations if (a.get("Status") or "COMPLETE") != "DELETING"),
+        key=lambda item: item.get("Priority") or 0,
+    )
+    allowed: List[str] = []
+    blocked: set = set()
+    for association in live:
+        group_id = association.get("FirewallRuleGroupId") or "unknown"
+        try:
+            rules = _paged(
+                resolver,
+                "list_firewall_rules",
+                "FirewallRules",
+                FirewallRuleGroupId=group_id,
+            )
+        except Exception as error:
+            return (
+                None,
+                f"the rules of DNS Firewall rule group {group_id} could not be "
+                f"listed ({get_assessment_error_label(error)})",
+                "route53resolver:ListFirewallRules",
+            )
+        for rule in sorted(
+            [r for r in rules if (r.get("Status") or "COMPLETE") == "COMPLETE"],
+            key=lambda item: item.get("Priority") or 0,
+        ):
+            list_id = rule.get("FirewallDomainListId")
+            action = rule.get("Action")
+            if not list_id:
+                continue
+            try:
+                if "ids" not in managed_lists:
+                    managed_lists["ids"] = {
+                        d.get("Id")
+                        for d in _paged(
+                            resolver,
+                            "list_firewall_domain_lists",
+                            "FirewallDomainLists",
+                        )
+                        if d.get("Id") and d.get("ManagedOwnerName")
+                    }
+            except Exception as error:
+                return (
+                    None,
+                    "the DNS Firewall domain lists could not be listed "
+                    f"({get_assessment_error_label(error)})",
+                    "route53resolver:ListFirewallDomainLists",
+                )
+            if list_id in managed_lists["ids"]:
+                if action != "BLOCK":
+                    return (
+                        None,
+                        f"rule '{rule.get('Name') or 'unnamed'}' in {group_id} "
+                        "allows an AWS managed domain list, whose names are not read",
+                        None,
+                    )
+                continue
+            try:
+                domains = [
+                    str(domain).rstrip(".").lower()
+                    for domain in _paged(
+                        resolver,
+                        "list_firewall_domains",
+                        "Domains",
+                        FirewallDomainListId=list_id,
+                    )
+                ]
+            except Exception as error:
+                return (
+                    None,
+                    f"domain list {list_id} could not be read "
+                    f"({get_assessment_error_label(error)})",
+                    "route53resolver:ListFirewallDomains",
+                )
+            if rule.get("Qtype"):
+                continue
+            if "*" in domains:
+                if action == "BLOCK":
+                    return list(dict.fromkeys(allowed)), "", None
+                return (
+                    None,
+                    f"the DNS Firewall associated with {vpc_id} answers every name, "
+                    "so it holds no allow-list to compare",
+                    None,
+                )
+            if action == "BLOCK":
+                blocked.update(domains)
+            else:
+                allowed.extend(domain for domain in domains if domain not in blocked)
+    return (
+        None,
+        f'the DNS Firewall associated with {vpc_id} has no BLOCK over "*", so it '
+        "holds no allow-list to compare",
+        None,
+    )
+
+
+def _domain_pattern(entry: str, network_firewall: bool) -> Tuple[str, bool, bool]:
+    """Return (base name, admits the base, admits every subdomain) for an entry.
+
+    A Network Firewall target ".example.com" admits example.com and every
+    subdomain; a DNS Firewall "*.example.com" admits the subdomains only.
+    """
+    entry = entry.lower()
+    if network_firewall and entry.startswith("."):
+        return entry[1:], True, True
+    if not network_firewall and entry.startswith("*."):
+        return entry[2:], False, True
+    return entry, True, False
+
+
+def _domain_patterns_cover(
+    patterns: List[Tuple[str, bool, bool]], item: Tuple[str, bool, bool]
+) -> bool:
+    """Return whether the patterns admit every name `item` admits."""
+    base, exact, subdomains = item
+
+    def admits(pattern, name):
+        return (pattern[1] and name == pattern[0]) or (
+            pattern[2] and name.endswith("." + pattern[0])
+        )
+
+    def admits_subdomains(pattern):
+        return pattern[2] and (base == pattern[0] or base.endswith("." + pattern[0]))
+
+    return (not exact or any(admits(pattern, base) for pattern in patterns)) and (
+        not subdomains or any(admits_subdomains(pattern) for pattern in patterns)
+    )
+
+
 def _workload_firewall_vpc_finding(
     firewall_client: Any,
     ec2_client: Any,
@@ -20734,22 +21180,35 @@ def _workload_firewall_vpc_finding(
     hosting: Dict[str, str],
     region: str,
     nat_subnets: Dict[str, Any],
-) -> Dict[str, Any]:
+    tgw_cache: Dict[Any, Any],
+    resolver: Any = None,
+    managed_lists: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """
     Judge the Network Firewall one VPC's hosting subnets egress through, as
-    AC-49's egress row does.
+    AC-49's egress and Egress Allow-List Sync rows do.
 
     Each hosting subnet's internet routes are followed one hop: to a firewall
     endpoint in the VPC, or through a NAT gateway to the endpoint the NAT
-    gateway's subnet routes to. A route to an internet gateway, or a NAT gateway
-    whose subnet routes to one, bypasses inspection and fails. Any other target
-    is not followed and is not judged.
+    gateway's subnet routes to. A route to a transit gateway is followed through
+    the route table the VPC's attachment is associated with to each VPC
+    attachment of this account, and on through the subnets that attachment uses
+    (see _transit_gateway_hops). A route to an internet gateway, or a NAT gateway
+    or transit gateway hop that routes to one, bypasses inspection and fails. A
+    firewall reached through a transit gateway must set a HOME_NET that holds
+    the hosting subnets. Any other target is not followed and is not judged.
+
+    With a resolver, a sync row follows the egress row: it compares the names
+    the VPC's DNS Firewall answers ahead of its BLOCK over "*" with each reached
+    firewall's ALLOWLIST Targets.
     """
 
-    def _row(details, resolution, severity, status):
+    def _row(
+        details, resolution, severity, status, name=WORKLOAD_FIREWALL_EGRESS_FINDING
+    ):
         return create_finding(
             check_id="SM-39",
-            finding_name=WORKLOAD_FIREWALL_EGRESS_FINDING,
+            finding_name=name,
             finding_details=details,
             resolution=resolution,
             reference=NETWORK_FIREWALL_DOMAIN_LIST_REFERENCE,
@@ -20759,7 +21218,7 @@ def _workload_firewall_vpc_finding(
         )
 
     def _not_read(details, action):
-        return _row(details, f"Grant {action} and retry.", "Informational", "N/A")
+        return [_row(details, f"Grant {action} and retry.", "Informational", "N/A")]
 
     subject = f"VPC {vpc_id}, which hosts {hosted},"
     try:
@@ -20808,6 +21267,7 @@ def _workload_firewall_vpc_finding(
     bypassing: List[str] = []
     unresolved: List[str] = []
     unrouted: List[str] = []
+    remote: Dict[str, str] = {}
     for subnet_id in sorted(hosting):
         routes = _egress_routes(_route_table_for_subnet(tables, subnet_id))
         if not routes:
@@ -20852,6 +21312,30 @@ def _workload_firewall_vpc_finding(
                         unresolved.append(f"{where}, then to {onward_target}")
                 if not onward:
                     unrouted.append(subnet_id)
+            elif key == "TransitGatewayId":
+                try:
+                    hops = _transit_gateway_hops(
+                        ec2_client,
+                        firewall_client,
+                        vpc_id,
+                        target,
+                        destination,
+                        tgw_cache,
+                    )
+                except _HopReadError as error:
+                    return _not_read(
+                        f"{subject} was not judged: {error.text}.", error.action
+                    )
+                for outcome, text, firewall in hops:
+                    if outcome == "reached":
+                        reached[str(firewall.get("FirewallArn"))] = firewall
+                        remote[str(firewall.get("FirewallArn"))] = firewall["VpcId"]
+                    elif outcome == "bypassing":
+                        bypassing.append(f"{where}{text}")
+                    elif outcome == "unrouted":
+                        unrouted.append(subnet_id)
+                    else:
+                        unresolved.append(f"{where}{text}")
             elif (key == "GatewayId" and target.startswith("igw-")) or (
                 key == "EgressOnlyInternetGatewayId"
             ):
@@ -20861,6 +21345,7 @@ def _workload_firewall_vpc_finding(
 
     gaps: List[str] = []
     unread: List[str] = []
+    allow_targets: Dict[str, List[str]] = {}
     policy_action = None
     for arn in sorted(reached):
         firewall = reached[arn]
@@ -20906,8 +21391,23 @@ def _workload_firewall_vpc_finding(
             unread.append(group_error)
             policy_action = policy_action or "network-firewall:DescribeRuleGroup"
             continue
+        allow_targets[arn] = [
+            str(target)
+            for reference in policy.get("StatefulRuleGroupReferences") or []
+            for list_source in [
+                (
+                    groups.get(str(reference.get("ResourceArn") or ""), {}).get(
+                        "RulesSource"
+                    )
+                    or {}
+                ).get("RulesSourceList")
+                or {}
+            ]
+            if list_source.get("GeneratedRulesType") == "ALLOWLIST"
+            for target in list_source.get("Targets") or []
+        ]
         policy_gaps, notes = _network_firewall_allow_list_gaps(
-            name, policy, groups, hosting
+            name, policy, groups, hosting, remote.get(arn, "")
         )
         gaps.extend(policy_gaps)
         unread.extend(notes)
@@ -20934,7 +21434,7 @@ def _workload_firewall_vpc_finding(
             "no Network Firewall",
         )
     if problems:
-        return _row(
+        row = _row(
             f"{subject} {'; and '.join(problems)}.{route_text}",
             "Route each hosting subnet's internet routes through a Network Firewall "
             "endpoint whose policy holds an ALLOWLIST domain rule group matching "
@@ -20942,8 +21442,8 @@ def _workload_firewall_vpc_finding(
             "Medium",
             "Failed",
         )
-    if unread:
-        return _row(
+    elif unread:
+        row = _row(
             f"{subject} reaches firewall(s) {reached_text}, but "
             f"{'; '.join(unread)}.{route_text}",
             f"Grant {policy_action} and retry."
@@ -20952,8 +21452,8 @@ def _workload_firewall_vpc_finding(
             "Informational",
             "N/A",
         )
-    if not reached and not unresolved and set(unrouted) >= set(hosting):
-        return _row(
+    elif not reached and not unresolved and set(unrouted) >= set(hosting):
+        row = _row(
             f"{subject} routes no hosting subnet toward an internet address, so it "
             "has no internet egress for a Network Firewall to inspect. A route to a "
             "prefix-list destination is not read.",
@@ -20961,18 +21461,18 @@ def _workload_firewall_vpc_finding(
             "Informational",
             "N/A",
         )
-    if not reached:
-        return _row(
+    elif not reached:
+        row = _row(
             f"{subject} has no hosting subnet whose internet route reaches a Network "
             f"Firewall in the VPC ({len(endpoints)} firewall endpoint(s) "
-            f"listed).{route_text}",
+            f"listed) or through a transit gateway.{route_text}",
             "No action required if egress is inspected in a VPC this check does "
             "not follow.",
             "Informational",
             "N/A",
         )
-    if unresolved:
-        return _row(
+    elif unresolved:
+        row = _row(
             f"{subject} routes through firewall(s) {reached_text}, which pass this "
             f"row, but not every hosting subnet does.{route_text}",
             "No action required if the other routes are inspected in a VPC this "
@@ -20980,15 +21480,107 @@ def _workload_firewall_vpc_finding(
             "Informational",
             "N/A",
         )
-    return _row(
-        f"{subject} routes every hosting subnet's internet routes through "
-        f"firewall(s) {reached_text}, whose policy holds a domain allow-list over "
-        f"TLS_SNI and HTTP_HOST. IP and CIDR rules beside it are not judged."
-        f"{route_text}",
-        "No action required",
-        "Medium",
-        "Passed",
-    )
+    else:
+        row = _row(
+            f"{subject} routes every hosting subnet's internet routes through "
+            f"firewall(s) {reached_text}, whose policy holds a domain allow-list over "
+            f"TLS_SNI and HTTP_HOST. IP and CIDR rules beside it are not judged."
+            f"{route_text}",
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    if resolver is None:
+        return [row]
+
+    # The recommendation keeps the DNS Firewall allow-list and each firewall's
+    # ALLOWLIST Targets in sync, since a name only one of them admits is held
+    # by a single layer.
+    sync_action = None
+    names: Optional[List[str]] = None
+    unsynced = [
+        f"firewall {f.get('FirewallName') or arn}'s policy was not read"
+        for arn, f in sorted(reached.items())
+        if arn not in allow_targets
+    ] + [
+        f"firewall {f.get('FirewallName') or arn}'s policy holds no ALLOWLIST "
+        "Targets, which the egress row judges"
+        for arn, f in sorted(reached.items())
+        if arn in allow_targets and not allow_targets[arn]
+    ]
+    if any(arn not in allow_targets for arn in reached):
+        sync_action = policy_action
+    if not reached:
+        unsynced.append("it reaches no Network Firewall whose ALLOWLIST to compare")
+    if not unsynced:
+        names, reason, sync_action = _dns_firewall_allowed_names(
+            resolver, vpc_id, managed_lists if managed_lists is not None else {}
+        )
+        if names is None:
+            unsynced.append(reason)
+    if unsynced:
+        return [
+            row,
+            _row(
+                f"{subject} was not compared: {'; '.join(unsynced)}.",
+                f"Grant {sync_action} and retry."
+                if sync_action
+                else "No action required for this row; the DNS and egress rows "
+                "name what to fix.",
+                "Informational",
+                "N/A",
+                WORKLOAD_EGRESS_SYNC_FINDING,
+            ),
+        ]
+    dns_patterns = [_domain_pattern(name, False) for name in names]
+    mismatches: List[str] = []
+    for arn, firewall in sorted(reached.items()):
+        label = f"firewall {firewall.get('FirewallName') or arn}'s ALLOWLIST"
+        nfw_patterns = [_domain_pattern(t, True) for t in allow_targets[arn]]
+        dns_only = [
+            name
+            for name, pattern in zip(names, dns_patterns)
+            if not _domain_patterns_cover(nfw_patterns, pattern)
+        ]
+        nfw_only = [
+            target
+            for target, pattern in zip(allow_targets[arn], nfw_patterns)
+            if not _domain_patterns_cover(dns_patterns, pattern)
+        ]
+        if dns_only:
+            mismatches.append(
+                f"the DNS Firewall allow-list admits {', '.join(dns_only[:10])}"
+                f"{f' and {len(dns_only) - 10} more' if len(dns_only) > 10 else ''}"
+                f", which {label} does not"
+            )
+        if nfw_only:
+            mismatches.append(
+                f"{label} admits {', '.join(nfw_only[:10])}"
+                f"{f' and {len(nfw_only) - 10} more' if len(nfw_only) > 10 else ''}"
+                ", which the DNS Firewall allow-list does not"
+            )
+    if mismatches:
+        sync = _row(
+            f"{subject} egresses under allow-lists that differ: "
+            f"{'; '.join(mismatches)}.",
+            "Keep the DNS Firewall allow-list and each Network Firewall ALLOWLIST "
+            "rule group's Targets in sync, so every name is held by both layers.",
+            "Low",
+            "Failed",
+            WORKLOAD_EGRESS_SYNC_FINDING,
+        )
+    else:
+        targets = sum(len(allow_targets[arn]) for arn in reached)
+        sync = _row(
+            f"{subject} egresses under a DNS Firewall allow-list and firewall(s) "
+            f"{reached_text}, which admit the same {len(names)} DNS Firewall "
+            f"name(s) and {targets} Network Firewall target(s).",
+            "No action required",
+            "Low",
+            "Passed",
+            WORKLOAD_EGRESS_SYNC_FINDING,
+        )
+    return [row, sync]
 
 
 def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
@@ -21174,6 +21766,7 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     )
     managed_lists: Dict[str, Any] = {}
     nat_subnets: Dict[str, Any] = {}
+    tgw_cache: Dict[Any, Any] = {}
 
     def _hosted(found: set) -> str:
         users = sorted(found)
@@ -21188,7 +21781,9 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                     resolver, vpc_id, _hosted(vpc_users[vpc_id]), region, managed_lists
                 )
             )
-        findings["csv_data"].append(
+        # The sync row compares against the DNS Firewall, which the DNS leg
+        # judges only in VPCs that hold a workload besides MicroVM connectors.
+        findings["csv_data"].extend(
             _workload_firewall_vpc_finding(
                 firewall_client,
                 ec2_client,
@@ -21197,6 +21792,9 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 vpc_subnets[vpc_id],
                 region,
                 nat_subnets,
+                tgw_cache,
+                resolver if vpc_id in vpc_users else None,
+                managed_lists,
             )
         )
     return findings

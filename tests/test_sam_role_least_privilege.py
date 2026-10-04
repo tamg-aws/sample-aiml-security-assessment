@@ -407,6 +407,9 @@ _EXPECTED_ACTIONS = {
     "SageMakerAssessmentReadsPolicy2": {
         "lambda:ListMicrovms",
         "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeTransitGatewayAttachments",
+        "ec2:DescribeTransitGatewayVpcAttachments",
+        "ec2:SearchTransitGatewayRoutes",
         "lambda:GetMicrovm",
         "lambda:GetNetworkConnector",
         "ecs:DescribeTasks",
@@ -1617,6 +1620,17 @@ def _sagemaker_policy2_arn(suffix):
 _SAGEMAKER_MANAGED_GRANTS_2 = [
     ("Allow", "lambda:ListMicrovms", '"*"', None),
     ("Allow", "ec2:DescribeNetworkInterfaces", '"*"', None),
+    # SM-39's transit gateway hop. The two Describe actions have no resource
+    # type in the service authorization reference (2026-10-04);
+    # SearchTransitGatewayRoutes takes transit-gateway-route-table.
+    ("Allow", "ec2:DescribeTransitGatewayAttachments", '"*"', None),
+    ("Allow", "ec2:DescribeTransitGatewayVpcAttachments", '"*"', None),
+    (
+        "Allow",
+        "ec2:SearchTransitGatewayRoutes",
+        _sagemaker_policy2_arn("ec2:*:ACCOUNT:transit-gateway-route-table/*"),
+        None,
+    ),
     (
         "Allow",
         "lambda:GetMicrovm",
