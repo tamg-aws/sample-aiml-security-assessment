@@ -596,6 +596,10 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
     "bedrock-agentcore:ListGateways",
     "bedrock-agentcore:ListOnlineEvaluationConfigs",
     "bedrock-agentcore:ListPolicies",
+    # bedrock:ApplyGuardrail (IsWrite false, resource types guardrail and
+    # guardrail-profile) was read from the bedrock service reference JSON on
+    # 2026-10-04.
+    "bedrock:ApplyGuardrail",
     "bedrock:CreateModelInvocationJob",
     "bedrock:CreatePrompt",
     "bedrock:GetAgent",

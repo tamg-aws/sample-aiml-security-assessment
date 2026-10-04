@@ -704,6 +704,34 @@ MUTATIONS = [
         "replace": "        if True:\n",
     },
     {
+        "name": "BR-26 probe blames no owner policy for a cross-account denial",
+        "file": BEDROCK,
+        "defect": "BR-26 reports an ApplyGuardrail denial on another account's guardrail as a missing grant in this account, though the owner's resource policy is what refused it",
+        "find": "\n            if _guardrail_apply_denied_cross_account(error, identifier, accounts):\n",
+        "replace": "\n            if False:\n",
+    },
+    {
+        "name": "BR-26 probe calls every ARN denial cross-account",
+        "file": BEDROCK,
+        "defect": "BR-26 blames the owner's resource policy for an ApplyGuardrail denial on this account's own guardrail",
+        "find": '\n    return isinstance(accounts["self"], str) and parts[4] != accounts["self"]\n',
+        "replace": "\n    return True\n",
+    },
+    {
+        "name": "BR-26 probe ignores the different-account denial message",
+        "file": BEDROCK,
+        "defect": "BR-26 misses Bedrock's 'from a different account' denial on a guardrail named by id, so the owner's resource policy goes unnamed",
+        "find": '\n    ):\n        return True\n    parts = identifier.split(":")\n',
+        "replace": '\n    ):\n        pass\n    parts = identifier.split(":")\n',
+    },
+    {
+        "name": "BR-26 probe blames the owner when this account is unknown",
+        "file": BEDROCK,
+        "defect": "BR-26 names the owner's resource policy for an ARN denial although sts:GetCallerIdentity failed, so whose guardrail it is was not established",
+        "find": '\n    return isinstance(accounts["self"], str) and parts[4]',
+        "replace": "\n    return parts[4]",
+    },
+    {
         "name": "BR-51 stops matching the tag key to its access control attribute",
         "file": BEDROCK,
         "defect": "BR-51 never finds the configured attribute for a Deny's tag key, "
@@ -1472,6 +1500,27 @@ MUTATIONS = [
         "replace": '\nGUARDRAIL_CROSS_ACCOUNT_DENIAL = "from another account"\n',
     },
     {
+        "name": "BR-10 names GetGuardrail for a denied cross-account version listing",
+        "file": BEDROCK,
+        "defect": "BR-10 labels a ListGuardrails refusal on another account's guardrail as the owner's resource policy not allowing bedrock:GetGuardrail, a remedy that cannot work",
+        "find": '\n                    result["unread"] = GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING\n',
+        "replace": '\n                    result["unread"] = _guardrail_read_error(error)\n',
+    },
+    {
+        "name": "BR-10 calls any version listing denial the cross-account ceiling",
+        "file": BEDROCK,
+        "defect": "BR-10 reports an in-account ListGuardrails denial, a missing grant, as the AWS limit on listing another account's versions",
+        "find": '\n                ) == "AccessDeniedException" and GUARDRAIL_CROSS_ACCOUNT_DENIAL in str(\n',
+        "replace": '\n                ) == "AccessDeniedException" or GUARDRAIL_CROSS_ACCOUNT_DENIAL in str(\n',
+    },
+    {
+        "name": "BR-10 unread row omits the cross-account listing ceiling",
+        "file": BEDROCK,
+        "defect": "BR-10's N/A row does not say a versionless pin to another account's guardrail stays N/A at the listing limit",
+        "find": "\n                            if ceilings\n",
+        "replace": "\n                            if False\n",
+    },
+    {
         "name": "every guardrail denial blames the owner's resource policy",
         "file": BEDROCK,
         "defect": "an AccessDeniedException from this role's own policies is reported as the owner's guardrail resource policy",
@@ -1526,6 +1575,41 @@ MUTATIONS = [
         "defect": "BR-02 credits a gateway endpoint on every route table to any workload without subnets, though a Lambda's or instance's subnets are read and their absence is a missing read",
         "find": '\n                workload["kind"] in EKS_WORKLOAD_KINDS\n',
         "replace": "\n                True\n",
+    },
+    {
+        "name": "BR-02 drops running SageMaker training and processing jobs",
+        "file": BEDROCK,
+        "defect": "BR-02's workload inventory reads no SageMaker training or processing job, so one in a VPC with no S3 gateway endpoint is never failed",
+        "find": "\n    _sagemaker_job_workloads(region, inventory)\n",
+        "replace": "\n",
+    },
+    {
+        "name": "BR-02 reads every SageMaker job, not only running ones",
+        "file": BEDROCK,
+        "defect": "BR-02 lists SageMaker jobs with no status filter, so finished jobs that no longer run in any subnet are judged",
+        "find": '\n                StatusEquals="InProgress",\n',
+        "replace": "\n",
+    },
+    {
+        "name": "BR-02 reads a processing job's VpcConfig at the top level",
+        "file": BEDROCK,
+        "defect": "BR-02 looks for a processing job's VpcConfig outside NetworkConfig, so every processing job reads as having no VPC",
+        "find": '\n        ("NetworkConfig", "VpcConfig"),\n',
+        "replace": '\n        ("VpcConfig",),\n',
+    },
+    {
+        "name": "BR-02 job descriptions ignore the invocation deadline",
+        "file": BEDROCK,
+        "defect": "BR-02 keeps describing running SageMaker jobs past the deadline",
+        "find": '\n            if _deadline_reached():\n                inventory["errors"].append(\n                    "{} running {}(s) from',
+        "replace": '\n            if False:\n                inventory["errors"].append(\n                    "{} running {}(s) from',
+    },
+    {
+        "name": "BR-02 keeps a job whose subnet EC2 does not return",
+        "file": BEDROCK,
+        "defect": "BR-02 judges a SageMaker job on the subnets EC2 returned and drops the one it did not, so the job is not named as unread",
+        "find": '\n            if missing:\n                inventory["errors"].append(\n                    "subnet(s) {} of {} were not returned by ec2:DescribeSubnets".format(\n                        ", ".join(missing), label\n                    )\n                )\n                continue\n            role_arn = str(detail.get("RoleArn") or "")\n',
+        "replace": '\n            vpcs = {subnet: vpc for subnet, vpc in vpcs.items() if vpc}\n            role_arn = str(detail.get("RoleArn") or "")\n',
     },
     {
         "name": "BR-02 credits an EKS workload a gateway on one route table",
@@ -6576,8 +6660,29 @@ MUTATIONS = [
         "name": "BR-46 prompt fails beside an unmatched invocation",
         "file": BEDROCK,
         "defect": "BR-46's prompt leg drops logged calls whose guardrail is unknown, so it fails an estate it has not read",
-        "find": '\n            elif not resolved.get("unguarded"):\n                joins_unread += 1\n',
+        "find": "\n            else:\n                joins_unread += 1\n",
         "replace": "\n            elif False:\n                joins_unread += 1\n",
+    },
+    {
+        "name": "BR-46 prompt skips an unguarded invocation",
+        "file": BEDROCK,
+        "defect": "BR-46's prompt leg drops a logged call whose CloudTrail event names no guardrail, so a Region passes while prompts reach the model unscreened",
+        "find": "\n                unguarded_requests.append(request_id)\n",
+        "replace": "\n                pass\n",
+    },
+    {
+        "name": "BR-46 prompt credits any guardrail for an unguarded invocation",
+        "file": BEDROCK,
+        "defect": "BR-46's prompt leg treats a guardrail an agent or a logged call applies as account-enforced, so a call naming no guardrail is credited to it",
+        "find": '\n                surface.startswith("account-enforced configuration ")\n',
+        "replace": "\n                True\n",
+    },
+    {
+        "name": "BR-46 prompt fails an unguarded invocation beside an unread enforced guardrail",
+        "file": BEDROCK,
+        "defect": "BR-46's prompt leg fails a call naming no guardrail though the account-enforced guardrail that would screen it was not read",
+        "find": '\n            elif enforced["unread"]:\n',
+        "replace": "\n            elif False:\n",
     },
     {
         "name": "BR-46 prompt reads a joined guardrail at its working draft",
@@ -6669,6 +6774,34 @@ MUTATIONS = [
         "defect": "BR-51 leaves a set whose own policies grant AI writes out of the count when its provisioned role is absent, so the summary says no set grants them",
         "find": "\n                    if own:\n                        granting.append(\n",
         "replace": "\n                    if False:\n                        granting.append(\n",
+    },
+    {
+        "name": "BR-51 leaves a federated role without a tag Deny unjudged",
+        "file": BEDROCK,
+        "defect": "BR-51 never fails an in-account role assumed through a SAML or OIDC provider whose policies carry no aws:PrincipalTag Deny over its AI writes",
+        "find": '\n                if tag_deny["uncovered"]:\n',
+        "replace": "\n                if False:\n",
+    },
+    {
+        "name": "BR-51 judges a visible instance's SSO role a second time",
+        "file": BEDROCK,
+        "defect": "BR-51 fails an AWSReservedSSO_ role on its own policies though the visible Identity Center instance already judges it through its permission set",
+        "find": '\n                if identity_center["visible"] and role_name.startswith(\n',
+        "replace": "\n                if False and role_name.startswith(\n",
+    },
+    {
+        "name": "BR-51 ignores a tag Deny in a federated role's boundary",
+        "file": BEDROCK,
+        "defect": "BR-51 fails a federated role whose permissions boundary holds the aws:PrincipalTag Deny, because only its identity policies are read",
+        "find": '\n        sources.append(("permissions boundary", boundary))\n    services = _ai_write_services(permissions)\n',
+        "replace": "\n        pass\n    services = _ai_write_services(permissions)\n",
+    },
+    {
+        "name": "BR-51 passes beside a tag-guarded federated role",
+        "file": BEDROCK,
+        "defect": "BR-51 reports Passed though a federated role is held only by a session tag whose MFA meaning the provider decides and is not read",
+        "find": '\n            if (federated or federated_guarded) and status == "Passed":\n',
+        "replace": '\n            if federated and status == "Passed":\n',
     },
 ]
 
@@ -7005,6 +7138,18 @@ GROUPS: dict[str, str] = {
         "in the Bedrock knowledge base redaction"
     ),
     "a guardrail that lets an example key through passes the BR-26 probe": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe blames no owner policy for a cross-account denial": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe calls every ARN denial cross-account": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe ignores the different-account denial message": (
+        "in the Bedrock guardrail output probe"
+    ),
+    "BR-26 probe blames the owner when this account is unknown": (
         "in the Bedrock guardrail output probe"
     ),
     "BR-51 stops matching the tag key to its access control attribute": (
@@ -7920,6 +8065,9 @@ GROUPS: dict[str, str] = {
     "BR-46 prompt credits an output-only PII entity": "in the Bedrock knowledge base classification",
     "BR-46 prompt credits a narrowed enforced configuration": "in the Bedrock knowledge base classification",
     "BR-46 prompt fails beside an unmatched invocation": "in the Bedrock knowledge base classification",
+    "BR-46 prompt skips an unguarded invocation": "in the Bedrock knowledge base classification",
+    "BR-46 prompt credits any guardrail for an unguarded invocation": "in the Bedrock knowledge base classification",
+    "BR-46 prompt fails an unguarded invocation beside an unread enforced guardrail": "in the Bedrock knowledge base classification",
     "BR-46 prompt reads a joined guardrail at its working draft": "in the Bedrock knowledge base classification",
     "BR-46 prompt passes beside an unread guardrail": "in the Bedrock knowledge base classification",
     "BR-46 prompt guardrail listing ignores the invocation deadline": "in the Bedrock invocation deadline",
@@ -7933,14 +8081,26 @@ GROUPS: dict[str, str] = {
     "BR-51 sets aside a customer managed set with a provisioned role": "in the Bedrock Identity Center attributes",
     "BR-51 ignores a provisioned role the cache failed to read": "in the Bedrock Identity Center attributes",
     "BR-51 drops an unjudged customer managed set from the granting count": "in the Bedrock Identity Center attributes",
+    "BR-51 leaves a federated role without a tag Deny unjudged": "in the Bedrock Identity Center attributes",
+    "BR-51 judges a visible instance's SSO role a second time": "in the Bedrock Identity Center attributes",
+    "BR-51 ignores a tag Deny in a federated role's boundary": "in the Bedrock Identity Center attributes",
+    "BR-51 passes beside a tag-guarded federated role": "in the Bedrock Identity Center attributes",
     "BR-02 credits every route table to a Lambda without subnets": "in the Bedrock workload route tables",
     "BR-02 credits an EKS workload a gateway on one route table": "in the Bedrock workload route tables",
     "BR-02 credits an EKS workload beside an unread route table listing": "in the Bedrock workload route tables",
     "BR-02 collects no route table of a gateway VPC": "in the Bedrock workload route tables",
+    "BR-02 drops running SageMaker training and processing jobs": "in the Bedrock workload route tables",
+    "BR-02 reads every SageMaker job, not only running ones": "in the Bedrock workload route tables",
+    "BR-02 reads a processing job's VpcConfig at the top level": "in the Bedrock workload route tables",
+    "BR-02 job descriptions ignore the invocation deadline": "in the Bedrock invocation deadline",
+    "BR-02 keeps a job whose subnet EC2 does not return": "in the Bedrock workload route tables",
     "BR-10 caps the versions an unversioned pin reads": "in the Bedrock cross-account guardrail reads",
     "BR-10 caps the versions a guardrail condition value reads": "in the Bedrock cross-account guardrail reads",
     "guardrail attachment reads ignore the invocation deadline": "in the Bedrock invocation deadline",
     "a cross-account guardrail denial is not recognised": "in the Bedrock cross-account guardrail reads",
+    "BR-10 names GetGuardrail for a denied cross-account version listing": "in the Bedrock cross-account guardrail reads",
+    "BR-10 calls any version listing denial the cross-account ceiling": "in the Bedrock cross-account guardrail reads",
+    "BR-10 unread row omits the cross-account listing ceiling": "in the Bedrock cross-account guardrail reads",
     "every guardrail denial blames the owner's resource policy": "in the Bedrock cross-account guardrail reads",
     "the attachment inventory drops the cross-account denial text": "in the Bedrock cross-account guardrail reads",
     "BR-10 condition values drop the cross-account denial text": "in the Bedrock cross-account guardrail reads",

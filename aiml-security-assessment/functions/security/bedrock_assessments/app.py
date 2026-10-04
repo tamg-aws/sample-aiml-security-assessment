@@ -2675,8 +2675,11 @@ WORKLOAD_CONNECTIVITY_FINDING = "Bedrock Workload Private Connectivity"
 
 WORKLOAD_CONNECTIVITY_CEILING = (
     "Lambda functions, EC2 instances, ECS services and standalone tasks, "
-    "SageMaker notebook instances and endpoints, EKS pod identity associations "
-    "and VPC-mode AgentCore runtime versions are read. A PUBLIC-mode AgentCore "
+    "SageMaker notebook instances and endpoints, running SageMaker training and "
+    "processing jobs, EKS pod identity associations and VPC-mode AgentCore "
+    "runtime versions are read. A training or processing job with no VPC "
+    "configuration runs in a network SageMaker manages, not in this account's "
+    "subnets, and is out of scope. A PUBLIC-mode AgentCore "
     "runtime is judged by AC-01. A role an EKS pod takes through IAM roles for "
     "service accounts is read as every role whose trust policy allows "
     "sts:AssumeRoleWithWebIdentity to the cluster's OIDC provider, in the "
@@ -3045,6 +3048,128 @@ def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
                 "subnets": [subnet] if subnet else None,
             }
         )
+
+
+# (kind, list operation, summaries key, name key, describe operation,
+# describe name parameter, path to the VpcConfig in the describe response)
+SAGEMAKER_JOB_WORKLOAD_SOURCES = (
+    (
+        "SageMaker training job",
+        "list_training_jobs",
+        "TrainingJobSummaries",
+        "TrainingJobName",
+        "describe_training_job",
+        "TrainingJobName",
+        ("VpcConfig",),
+    ),
+    (
+        "SageMaker processing job",
+        "list_processing_jobs",
+        "ProcessingJobSummaries",
+        "ProcessingJobName",
+        "describe_processing_job",
+        "ProcessingJobName",
+        ("NetworkConfig", "VpcConfig"),
+    ),
+)
+
+
+def _sagemaker_job_workloads(region: str, inventory: Dict[str, Any]) -> None:
+    """
+    Add every running (InProgress) SageMaker training and processing job that
+    runs in a VPC, with the VPC of its subnets and its execution role, to
+    ``inventory``. A job with no VPC configuration runs in a network SageMaker
+    manages, not in the account's subnets, so it is not added.
+    """
+    sagemaker_client = boto3.client(
+        "sagemaker", config=boto3_config, region_name=region
+    )
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    subnet_cache: Dict[str, Optional[str]] = {}
+    for (
+        kind,
+        list_operation,
+        summaries_key,
+        name_key,
+        describe_operation,
+        describe_param,
+        vpc_path,
+    ) in SAGEMAKER_JOB_WORKLOAD_SOURCES:
+        api = "".join(part.title() for part in list_operation.split("_"))
+        try:
+            jobs = _list_all_items(
+                sagemaker_client,
+                list_operation,
+                summaries_key,
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                StatusEquals="InProgress",
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"running {kind}s were not listed with sagemaker:{api} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        names = [str(job.get(name_key) or "unnamed") for job in jobs]
+        for index, name in enumerate(names):
+            label = f"{kind} '{name}'"
+            if _deadline_reached():
+                inventory["errors"].append(
+                    "{} running {}(s) from '{}' on were not described, {}".format(
+                        len(names) - index, kind, name, DEADLINE_STOP
+                    )
+                )
+                break
+            try:
+                detail = getattr(sagemaker_client, describe_operation)(
+                    **{describe_param: name}
+                )
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"{label} was not described with sagemaker:"
+                    + "".join(part.title() for part in describe_operation.split("_"))
+                    + f" ({get_assessment_error_label(error)})"
+                )
+                continue
+            vpc_config = detail
+            for key in vpc_path:
+                vpc_config = (vpc_config or {}).get(key)
+            subnets = sorted(
+                subnet for subnet in (vpc_config or {}).get("Subnets") or [] if subnet
+            )
+            if not subnets:
+                continue
+            try:
+                vpcs = _subnet_vpcs(ec2_client, subnets, subnet_cache)
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"the subnets of {label} were not read with "
+                    f"ec2:DescribeSubnets ({get_assessment_error_label(error)})"
+                )
+                continue
+            missing = sorted(subnet for subnet, vpc in vpcs.items() if not vpc)
+            if missing:
+                inventory["errors"].append(
+                    "subnet(s) {} of {} were not returned by ec2:DescribeSubnets".format(
+                        ", ".join(missing), label
+                    )
+                )
+                continue
+            role_arn = str(detail.get("RoleArn") or "")
+            for vpc_id in sorted(set(vpcs.values())):
+                inventory["workloads"].append(
+                    {
+                        "kind": kind,
+                        "name": name,
+                        "vpc_id": vpc_id,
+                        "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                        "subnets": sorted(
+                            subnet for subnet, vpc in vpcs.items() if vpc == vpc_id
+                        ),
+                    }
+                )
 
 
 def _sagemaker_endpoint_workloads(region: str, inventory: Dict[str, Any]) -> None:
@@ -3462,9 +3587,9 @@ def _agentcore_runtime_workloads(region: str, inventory: Dict[str, Any]) -> None
 def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     """
     List Lambda functions, ECS services and standalone tasks, SageMaker
-    notebook instances and endpoint models, EKS pod identity associations,
-    VPC-mode AgentCore runtime versions and EC2 instances with the VPC and
-    role each runs as.
+    notebook instances, endpoint models and running training and processing
+    jobs in a VPC, EKS pod identity associations, VPC-mode AgentCore runtime
+    versions and EC2 instances with the VPC and role each runs as.
 
     A listing that fails is named in ``errors`` so the population is never
     reported complete without it.
@@ -3502,6 +3627,7 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     _ecs_service_workloads(region, inventory)
     _notebook_workloads(region, inventory)
     _sagemaker_endpoint_workloads(region, inventory)
+    _sagemaker_job_workloads(region, inventory)
     _eks_pod_identity_workloads(region, inventory)
     _agentcore_runtime_workloads(region, inventory)
 
@@ -10114,6 +10240,15 @@ def _guardrail_blocked_categories(detail: Dict[str, Any]) -> Dict[str, List[str]
     return {"input": blocked("input"), "output": blocked("output")}
 
 
+GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING = (
+    "AccessDeniedException: bedrock:ListGuardrails refused to list the versions "
+    "of a guardrail another account owns. A guardrail resource policy can allow "
+    "only bedrock:ApplyGuardrail and bedrock:GetGuardrail, so this account "
+    "cannot enumerate another account's versions, and the versions a pin with no "
+    "version lets a caller name cannot be read from here (an AWS limit)"
+)
+
+
 def _read_guardrail_directions(
     value: str, region: str, clients: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -10141,12 +10276,23 @@ def _read_guardrail_directions(
     versions = [reference["version"]] if reference["version"] else []
     try:
         if not versions:
-            summaries = _list_all_items(
-                client,
-                "list_guardrails",
-                "guardrails",
-                guardrailIdentifier=reference["identifier"],
-            )
+            try:
+                summaries = _list_all_items(
+                    client,
+                    "list_guardrails",
+                    "guardrails",
+                    guardrailIdentifier=reference["identifier"],
+                )
+            except ClientError as error:
+                if get_assessment_error_label(
+                    error
+                ) == "AccessDeniedException" and GUARDRAIL_CROSS_ACCOUNT_DENIAL in str(
+                    error.response.get("Error", {}).get("Message", "")
+                ):
+                    result["unread"] = GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING
+                    result["ceiling"] = True
+                    return result
+                raise
             versions = sorted(
                 {
                     str(summary.get("version"))
@@ -10551,11 +10697,13 @@ def check_bedrock_guardrail_iam_enforcement(
         blocked_by_value = []
         missing = []
         unread = []
+        ceilings = 0
         for value in sorted(named_values):
             reading = _read_guardrail_directions(value, region, clients)
             holders = ", ".join(sorted(named_values[value])[:3])
             if reading["unread"]:
                 unread.append(f"{value} ({reading['unread']})")
+                ceilings += bool(reading.get("ceiling"))
             elif reading["missing"]:
                 missing.append(value)
             elif reading["gaps"]:
@@ -10608,7 +10756,16 @@ def check_bedrock_guardrail_iam_enforcement(
                     finding_details=(
                         "{} guardrail(s) required on invocation could not be "
                         "read, so whether they filter input and output is not "
-                        "known: {}.".format(len(unread), "; ".join(unread[:5]))
+                        "known: {}.{}".format(
+                            len(unread),
+                            "; ".join(unread[:5]),
+                            " A pin with no version to another account's "
+                            "guardrail stays N/A at that limit; pinning the "
+                            "condition to a version lets bedrock:GetGuardrail "
+                            "read it under the owner's resource policy."
+                            if ceilings
+                            else "",
+                        )
                     ),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=GUARDRAIL_IAM_REFERENCE,
@@ -21121,6 +21278,34 @@ SENSITIVE_OUTPUT_PROBE_TEXT = (
 SENSITIVE_OUTPUT_PROBE_TYPES = ("AWS_ACCESS_KEY", "AWS_SECRET_KEY")
 
 
+def _guardrail_apply_denied_cross_account(
+    error: Exception, identifier: str, accounts: Dict[str, Any]
+) -> bool:
+    """
+    Whether an ApplyGuardrail AccessDeniedException is on a guardrail another
+    account owns: Bedrock says the ARN is from a different account, or the
+    guardrail ARN's account segment is not this account. ``accounts`` caches
+    this account's id under "self" (None when sts:GetCallerIdentity failed).
+    """
+    if get_assessment_error_label(error) != "AccessDeniedException":
+        return False
+    if GUARDRAIL_CROSS_ACCOUNT_DENIAL in str(
+        getattr(error, "response", {}).get("Error", {}).get("Message", "")
+    ):
+        return True
+    parts = identifier.split(":")
+    if not identifier.startswith("arn:") or len(parts) < 6 or not parts[4]:
+        return False
+    if "self" not in accounts:
+        try:
+            accounts["self"] = boto3.client(
+                "sts", config=boto3_config
+            ).get_caller_identity()["Account"]
+        except (ClientError, BotoCoreError, KeyError, TypeError):
+            accounts["self"] = None
+    return isinstance(accounts["self"], str) and parts[4] != accounts["self"]
+
+
 def _sensitive_output_probe_findings(
     region: str, attachment_inventory: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -21145,7 +21330,7 @@ def _sensitive_output_probe_findings(
             region=region,
         )
 
-    clients, rows = {}, []
+    clients, rows, accounts = {}, [], {}
     for (identifier, version), entry in sorted(
         (attachment_inventory.get("versions") or {}).items()
     ):
@@ -21170,13 +21355,27 @@ def _sensitive_output_probe_findings(
                 outputScope="INTERVENTIONS",
             )
         except (ClientError, BotoCoreError) as error:
+            reason = get_assessment_error_label(error)
+            resolution = (
+                "Grant bedrock:ApplyGuardrail on the guardrail and re-run the "
+                "assessment."
+            )
+            if _guardrail_apply_denied_cross_account(error, identifier, accounts):
+                reason = (
+                    f"{reason}: the owner's guardrail resource policy does not "
+                    "allow bedrock:ApplyGuardrail to this account"
+                )
+                resolution = (
+                    "Ask the guardrail's owner to allow bedrock:ApplyGuardrail to "
+                    "this account in the guardrail resource policy, and re-run the "
+                    "assessment."
+                )
             rows.append(
                 row(
                     f"The {label} was not probed with bedrock:ApplyGuardrail "
-                    f"({get_assessment_error_label(error)}), so whether it acts on "
-                    "credentials in model output was not observed.",
-                    "Grant bedrock:ApplyGuardrail on the guardrail and re-run the "
-                    "assessment.",
+                    f"({reason}), so whether it acts on credentials in model "
+                    "output was not observed.",
+                    resolution,
                     "Informational",
                     "N/A",
                 )
@@ -28651,9 +28850,9 @@ def check_ai_workload_subnet_privacy(
     internet gateway.
 
     The population is BR-02's workload inventory: every Lambda function, ECS
-    service and standalone task, EC2 instance, SageMaker notebook instance and
-    endpoint, EKS pod identity association and VPC-mode AgentCore runtime
-    version. A workload is AI compute when its role is granted one of those
+    service and standalone task, EC2 instance, SageMaker notebook instance,
+    endpoint and running training or processing job in a VPC, EKS pod identity
+    association and VPC-mode AgentCore runtime version. A workload is AI compute when its role is granted one of those
     surfaces, the test BR-02 applies.
     """
     findings = {"csv_data": []}
@@ -28796,7 +28995,8 @@ def check_ai_workload_subnet_privacy(
             findings["csv_data"].append(
                 row(
                     "No Lambda function, ECS service or task, EC2 instance, "
-                    "SageMaker notebook instance or endpoint, EKS pod identity "
+                    "SageMaker notebook instance, endpoint or running training or "
+                    "processing job in a VPC, EKS pod identity "
                     "association or AgentCore runtime in "
                     f"{region or 'this Region'} runs as a role granted a Bedrock, "
                     "AgentCore or SageMaker runtime surface.",
@@ -34992,6 +35192,7 @@ def _identity_center_leg(
                 "status": "Passed",
                 "severity": "High",
                 "unguarded": [],
+                "visible": False,
             }
         if not errors:
             note = (
@@ -35013,6 +35214,7 @@ def _identity_center_leg(
             "status": "N/A",
             "severity": "Informational",
             "unguarded": [],
+            "visible": False,
         }
     permission_sets = {
         "granting": [],
@@ -35087,6 +35289,7 @@ def _identity_center_leg(
         "status": "N/A",
         "severity": "Informational",
         "unguarded": permission_sets["unguarded"],
+        "visible": True,
     }
 
 
@@ -35431,6 +35634,36 @@ def _trust_federated_providers(trust_policy: Any) -> List[str]:
     return sorted(set(providers))
 
 
+def _federated_role_tag_deny(permissions: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Judge a role assumed through a federated identity provider as the role a
+    permission set is provisioned as is judged: the AI services its cached
+    policies grant writes in, and which of them a Deny keyed on one
+    aws:PrincipalTag value, in those policies or its permissions boundary,
+    covers. A policy that cannot be parsed raises ValueError or TypeError.
+    """
+    sources = [
+        (f"{source} '{policy.get('name') or 'unnamed'}'", policy.get("document"))
+        for source, policy in _cached_identity_policies(permissions)
+    ]
+    boundary = _boundary_document(permissions)
+    if boundary is not None:
+        sources.append(("permissions boundary", boundary))
+    services = _ai_write_services(permissions)
+    denies = [
+        _principal_tag_deny_statement(statement)
+        for _, document in sources
+        if document
+        for statement in _policy_statements(document)
+    ]
+    covered = {service for deny in denies for service in deny["services"]}
+    return {
+        "services": services,
+        "uncovered": [service for service in services if service not in covered],
+        "tests": [deny["test"] for deny in denies if deny["services"]],
+    }
+
+
 def check_bedrock_ai_user_console_mfa(
     permission_cache, region: str = "", identity_center_region: str = ""
 ) -> Dict[str, Any]:
@@ -35438,8 +35671,11 @@ def check_bedrock_ai_user_console_mfa(
     BR-51: Flag identities that can change Bedrock, bedrock-mantle, SageMaker AI or AgentCore
     resources without MFA: an IAM user with a console password and no MFA
     device, an IAM user with an active access key and no Deny requiring MFA,
-    and an IAM role whose trust policy lets a user or account assume it
-    without MFA. An IAM Identity Center instance visible in
+    an IAM role whose trust policy lets a user or account assume it
+    without MFA, and an IAM role assumed through a federated identity provider
+    (SAML, OIDC, or an AWSReservedSSO_ role when no Identity Center instance is
+    visible) with no aws:PrincipalTag Deny over its AI writes. An IAM Identity
+    Center instance visible in
     identity_center_region keeps the IAM-only Passed row at N/A.
     """
     logger.debug("Starting check for AI user console MFA")
@@ -35674,6 +35910,7 @@ def check_bedrock_ai_user_console_mfa(
 
         trusted = []
         federated = []
+        federated_guarded = []
         chained_trusts: Dict[str, Any] = {}
         for role_name, evidence in sorted(roles["users"].items()):
             try:
@@ -35761,32 +35998,112 @@ def check_bedrock_ai_user_console_mfa(
                 providers = _trust_federated_providers(
                     role.get("AssumeRolePolicyDocument")
                 )
-                if providers:
-                    federated.append(
-                        "{} ({})".format(role_name, ", ".join(providers[:3]))
-                    )
-                else:
+                if not providers:
                     trusted.append(role_name)
+                    continue
+                provider_text = ", ".join(providers[:3])
+                if identity_center["visible"] and role_name.startswith(
+                    "AWSReservedSSO_"
+                ):
+                    # Judged through its permission set in the Identity
+                    # Center leg.
+                    federated.append(f"{role_name} ({provider_text})")
+                    continue
+                try:
+                    tag_deny = _federated_role_tag_deny(
+                        permission_cache["role_permissions"][role_name]
+                    )
+                except (ValueError, TypeError, AttributeError) as error:
+                    findings["csv_data"].append(
+                        row(
+                            f"IAM role '{role_name}' is assumed through the "
+                            f"federated identity provider(s) {provider_text}, and "
+                            "a policy of the role could not be parsed "
+                            f"({get_assessment_error_label(error)}), so whether a "
+                            "Deny keyed on aws:PrincipalTag holds its sessions to "
+                            "MFA is not known. The role is in scope because "
+                            f"{evidence[0]}.",
+                            COULD_NOT_ASSESS_RESOLUTION,
+                            "Informational",
+                            "N/A",
+                        )
+                    )
+                    continue
+                if tag_deny["uncovered"]:
+                    findings["status"] = "WARN"
+                    findings["csv_data"].append(
+                        row(
+                            "IAM role '{}' is assumed through the federated "
+                            "identity provider(s) {} and grants AI writes ({}) in "
+                            "its policies, and no Deny in its policies or "
+                            "permissions boundary keyed on an aws:PrincipalTag "
+                            "authentication tag covers {}{}, so a federated session "
+                            "that did not complete MFA is not denied those writes. "
+                            "A Deny on aws:MultiFactorAuthPresent does not hold "
+                            "federated sessions to MFA, because the key is not "
+                            "present for them. The role is in scope because "
+                            "{}.".format(
+                                role_name,
+                                provider_text,
+                                ", ".join(tag_deny["services"]),
+                                ", ".join(tag_deny["uncovered"]),
+                                " (the PrincipalTag Deny it has, {}, covers only "
+                                "the other services)".format(
+                                    "; ".join(tag_deny["tests"])
+                                )
+                                if tag_deny["tests"]
+                                else "",
+                                evidence[0],
+                            ),
+                            "Have the identity provider pass the authentication "
+                            "method as a session tag, and add to the role a Deny "
+                            "on every Bedrock, SageMaker AI and AgentCore write it "
+                            "grants, with StringNotEquals on that aws:PrincipalTag "
+                            "key and the value the provider sends for MFA.",
+                            "High",
+                            "Failed",
+                        )
+                    )
+                    continue
+                federated_guarded.append(
+                    "{} ({}; {})".format(
+                        role_name, provider_text, "; ".join(tag_deny["tests"])
+                    )
+                )
 
-        if protected or no_console or deny_protected or trusted or federated:
+        if (
+            protected
+            or no_console
+            or deny_protected
+            or trusted
+            or federated
+            or federated_guarded
+        ):
             sso_note, status, severity = (
                 identity_center["note"],
                 identity_center["status"],
                 identity_center["severity"],
             )
-            if federated:
-                # A member account lists no Identity Center instance, yet its
-                # AWSReservedSSO_ roles are people signing in.
+            if federated_guarded:
                 sso_note = (
-                    "{} in-scope IAM role(s) are assumed through a federated "
-                    "identity provider ({}), and whether that provider required "
-                    "MFA is not read, so the people who sign in through them are "
-                    "judged by no row. {}".format(
+                    "{} in-scope IAM role(s) assumed through a federated identity "
+                    "provider carry a Deny keyed on aws:PrincipalTag over every "
+                    "AI service they grant ({}), and whether the provider sets "
+                    "that tag only after MFA is not read. {}".format(
+                        len(federated_guarded),
+                        "; ".join(federated_guarded[:10]),
+                        sso_note,
+                    )
+                )
+            if federated:
+                sso_note = (
+                    "{} in-scope IAM Identity Center role(s) ({}) are judged "
+                    "through their permission sets. {}".format(
                         len(federated), "; ".join(federated[:10]), sso_note
                     )
                 )
-                if status == "Passed":
-                    status, severity = "N/A", "Informational"
+            if (federated or federated_guarded) and status == "Passed":
+                status, severity = "N/A", "Informational"
             findings["csv_data"].append(
                 row(
                     "{} of the {} in-scope IAM user(s) have an MFA device ({}) and "
@@ -37293,6 +37610,9 @@ def _prompt_pii_entity_types(detail: Dict[str, Any]) -> List[str]:
     )
 
 
+MAX_REPORTED_UNGUARDED_REQUESTS = 10
+
+
 def check_bedrock_prompt_pii_screening(
     region: str = "",
     attachment_inventory: Optional[Dict[str, Any]] = None,
@@ -37309,7 +37629,9 @@ def check_bedrock_prompt_pii_screening(
     un-narrowed account-enforced configuration or guardrail condition pin in
     ``attachment_inventory`` applies it, or when a logged invocation joined to
     CloudTrail through ``joins`` (BR-27 and BR-34's shared state) names it. Only
-    a used version passes; an unread one is N/A.
+    a used version passes; an unread one is N/A. A logged invocation whose
+    CloudTrail event names no guardrail fails, unless an un-narrowed
+    account-enforced configuration screens it; an unjoined one is N/A.
     """
     findings = {
         "check_name": PROMPT_PII_SCREENING_FINDING,
@@ -37394,6 +37716,7 @@ def check_bedrock_prompt_pii_screening(
                 "region": entry.get("region") or region,
             }
         joins_unread = 0
+        unguarded_requests = []
         for request_id, resolved in sorted(
             ((joins or {}).get("resolved") or {}).items()
         ):
@@ -37410,7 +37733,9 @@ def check_bedrock_prompt_pii_screening(
                     },
                 )
                 entry["surfaces"].append(f"logged invocation {request_id}")
-            elif not resolved.get("unguarded"):
+            elif resolved.get("unguarded"):
+                unguarded_requests.append(request_id)
+            else:
                 joins_unread += 1
         if joins_unread:
             unread.append(
@@ -37439,20 +37764,71 @@ def check_bedrock_prompt_pii_screening(
                 entry["error"] = _guardrail_read_error(error)
 
         screening, unscreened = [], []
+        # An un-narrowed account-enforced configuration applies its guardrail
+        # to every invocation, including one whose request names none.
+        enforced = {"screening": [], "unread": []}
         for (identifier, version), entry in sorted(used.items()):
             label = "guardrail {} version {} (applied by {})".format(
                 identifier, version, ", ".join(entry["surfaces"][:5])
+            )
+            is_enforced = any(
+                surface.startswith("account-enforced configuration ")
+                for surface in entry["surfaces"]
             )
             if entry["detail"] is None:
                 unread.append(
                     f"{label} was not read with bedrock:GetGuardrail ({entry['error']})"
                 )
+                if is_enforced:
+                    enforced["unread"].append(label)
                 continue
             types = _prompt_pii_entity_types(entry["detail"])
             if types:
                 screening.append(f"{label} blocks or anonymizes {', '.join(types)}")
+                if is_enforced:
+                    enforced["screening"].append(label)
             else:
                 unscreened.append(label)
+        if unguarded_requests:
+            requests = "{}{}".format(
+                ", ".join(unguarded_requests[:MAX_REPORTED_UNGUARDED_REQUESTS]),
+                " and {} more".format(
+                    len(unguarded_requests) - MAX_REPORTED_UNGUARDED_REQUESTS
+                )
+                if len(unguarded_requests) > MAX_REPORTED_UNGUARDED_REQUESTS
+                else "",
+            )
+            if enforced["screening"]:
+                screening.append(
+                    "{} logged invocation(s) whose CloudTrail event names no "
+                    "guardrailIdentifier ({}) are screened by the account-enforced "
+                    "{}".format(
+                        len(unguarded_requests),
+                        requests,
+                        "; ".join(enforced["screening"]),
+                    )
+                )
+            elif enforced["unread"]:
+                unread.append(
+                    "{} logged invocation(s) whose CloudTrail event names no "
+                    "guardrailIdentifier ({}), screened only by an account-enforced "
+                    "configuration whose guardrail was not read".format(
+                        len(unguarded_requests), requests
+                    )
+                )
+            else:
+                findings["status"] = "WARN"
+                row(
+                    "{} logged invocation(s) in {} reached the model with no "
+                    "guardrail: the CloudTrail event of each names no "
+                    "guardrailIdentifier, and no un-narrowed account-enforced "
+                    "configuration applies a guardrail that acts on PII on the "
+                    "input, so these prompts reached the model unscreened for "
+                    "PII: {}.".format(len(unguarded_requests), region, requests),
+                    resolution,
+                    "High",
+                    "Failed",
+                )
 
         unused = sorted(
             f"'{name}' ({', '.join(types)})"

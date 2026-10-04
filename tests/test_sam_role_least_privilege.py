@@ -146,6 +146,7 @@ _EXPECTED_ACTIONS = {
         "athena:ListDataCatalogs",
         "bedrock-agentcore:ListHarnesses",
         "bedrock-agentcore:ListTagsForResource",
+        "bedrock:ApplyGuardrail",
         "bedrock:GetGuardrail",
         "bedrock:ListCustomModelDeployments",
         "bedrock:ListPromptRouters",
@@ -1411,6 +1412,17 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
                 "CrossAccountGuardrailRead",
                 "Allow",
                 "bedrock:GetGuardrail",
+                json.dumps(
+                    {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:*:guardrail/*"},
+                    sort_keys=True,
+                ),
+            ),
+            # BR-26 probes such a guardrail on the OUTPUT source; the owner's
+            # resource policy must also allow ApplyGuardrail.
+            (
+                "CrossAccountGuardrailOutputProbe",
+                "Allow",
+                "bedrock:ApplyGuardrail",
                 json.dumps(
                     {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:*:guardrail/*"},
                     sort_keys=True,

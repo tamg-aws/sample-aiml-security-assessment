@@ -977,6 +977,8 @@ def _empty_ecs_and_sagemaker():
     sagemaker = MagicMock()
     sagemaker.list_notebook_instances.return_value = {"NotebookInstances": []}
     sagemaker.list_endpoints.return_value = {"Endpoints": []}
+    sagemaker.list_training_jobs.return_value = {"TrainingJobSummaries": []}
+    sagemaker.list_processing_jobs.return_value = {"ProcessingJobSummaries": []}
     eks = MagicMock()
     eks.list_clusters.return_value = {"clusters": []}
     agentcore = MagicMock()
@@ -1204,8 +1206,11 @@ class TestBR02WorkloadConnectivity:
         detail = rows[0]["Finding_Details"]
         assert (
             "Lambda functions, EC2 instances, ECS services and standalone tasks, "
-            "SageMaker notebook instances and endpoints, EKS pod identity "
-            "associations and VPC-mode AgentCore runtime versions are read." in detail
+            "SageMaker notebook instances and endpoints, running SageMaker "
+            "training and processing jobs, EKS pod identity associations and "
+            "VPC-mode AgentCore runtime versions are read. A training or "
+            "processing job with no VPC configuration runs in a network SageMaker "
+            "manages, not in this account's subnets, and is out of scope." in detail
         )
         assert (
             "A role an EKS pod takes through IAM roles for service accounts is read "
@@ -1856,8 +1861,15 @@ class TestBR02WorkloadConnectivity:
         iam_roles=None,
         lambda_pages=None,
         describe_instances_error=None,
+        training_jobs=None,
+        processing_jobs=None,
+        job_details=None,
     ):
         """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired.
+
+        `training_jobs` and `processing_jobs` are the ListTrainingJobs and
+        ListProcessingJobs pages (or an error), and `job_details` maps a job
+        name to its Describe response (or an error).
 
         `container_instances` maps a container instance ARN to (EC2 instance id,
         subnet), `iam_roles` is what iam:ListRoles returns (or an error), and
@@ -2048,6 +2060,37 @@ class TestBR02WorkloadConnectivity:
             return outcome
 
         sagemaker.describe_model.side_effect = describe_model
+        self.job_list_calls = []
+        for operation, key, pages in (
+            ("list_training_jobs", "TrainingJobSummaries", training_jobs),
+            ("list_processing_jobs", "ProcessingJobSummaries", processing_jobs),
+        ):
+            if isinstance(pages, Exception):
+                getattr(sagemaker, operation).side_effect = pages
+                continue
+            by_token = {
+                page.get("token"): {
+                    key: page["jobs"],
+                    **({"NextToken": page["next"]} if page.get("next") else {}),
+                }
+                for page in pages or [{"jobs": []}]
+            }
+
+            def list_jobs(operation=operation, by_token=by_token, **kwargs):
+                self.job_list_calls.append((operation, kwargs))
+                return by_token[kwargs.get("NextToken")]
+
+            getattr(sagemaker, operation).side_effect = list_jobs
+        job_details = job_details or {}
+
+        def describe_job(**kwargs):
+            outcome = job_details[next(iter(kwargs.values()))]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        sagemaker.describe_training_job.side_effect = describe_job
+        sagemaker.describe_processing_job.side_effect = describe_job
         eks = MagicMock()
         eks_clusters = eks_clusters if eks_clusters is not None else {}
         if isinstance(eks_clusters, Exception):
@@ -2894,6 +2937,178 @@ class TestBR02WorkloadConnectivity:
             "SageMaker notebook instance 'denied' was not described with "
             "sagemaker:DescribeNotebookInstance (AccessDeniedException)"
         ]
+
+    JOB_ROLE = "arn:aws:iam::123456789012:role/service-role/JobRole"
+
+    def test_br02_running_jobs_on_every_page_carry_their_vpc_and_role(self):
+        inventory = self._inventory(
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "train-a"}], "next": "t2"},
+                {"token": "t2", "jobs": [{"TrainingJobName": "train-b"}]},
+            ],
+            processing_jobs=[
+                {"jobs": [{"ProcessingJobName": "proc-a"}], "next": "p2"},
+                {"token": "p2", "jobs": [{"ProcessingJobName": "proc-b"}]},
+            ],
+            job_details={
+                "train-a": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1"], "SecurityGroupIds": []},
+                },
+                "train-b": {"RoleArn": self.JOB_ROLE},
+                "proc-a": {
+                    "RoleArn": self.JOB_ROLE,
+                    "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-2"]}},
+                },
+                "proc-b": {"RoleArn": self.JOB_ROLE, "NetworkConfig": {}},
+            },
+        )
+        assert inventory["errors"] == []
+        jobs = [w for w in inventory["workloads"] if "job" in w["kind"]]
+        assert jobs == [
+            {
+                "kind": "SageMaker training job",
+                "name": "train-a",
+                "vpc_id": "vpc-1",
+                "role": "JobRole",
+                "subnets": ["subnet-1"],
+            },
+            {
+                "kind": "SageMaker processing job",
+                "name": "proc-a",
+                "vpc_id": "vpc-2",
+                "role": "JobRole",
+                "subnets": ["subnet-2"],
+            },
+        ]
+        assert [
+            (operation, kwargs.get("StatusEquals"), kwargs.get("NextToken"))
+            for operation, kwargs in self.job_list_calls
+        ] == [
+            ("list_training_jobs", "InProgress", None),
+            ("list_training_jobs", "InProgress", "t2"),
+            ("list_processing_jobs", "InProgress", None),
+            ("list_processing_jobs", "InProgress", "p2"),
+        ]
+
+    def test_br02_unlisted_training_jobs_are_named_and_processing_still_read(self):
+        inventory = self._inventory(
+            training_jobs=_make_client_error("AccessDeniedException"),
+            processing_jobs=[{"jobs": [{"ProcessingJobName": "proc-a"}]}],
+            job_details={
+                "proc-a": {
+                    "RoleArn": self.JOB_ROLE,
+                    "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-1"]}},
+                }
+            },
+        )
+        assert inventory["errors"] == [
+            "running SageMaker training jobs were not listed with "
+            "sagemaker:ListTrainingJobs (AccessDeniedException)"
+        ]
+        assert ("SageMaker processing job", "proc-a", "vpc-1", "JobRole") in (
+            self._names(inventory)
+        )
+
+    def test_br02_an_undescribed_job_is_named_and_the_next_kept(self):
+        inventory = self._inventory(
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "denied"}, {"TrainingJobName": "ok"}]}
+            ],
+            job_details={
+                "denied": _make_client_error("AccessDeniedException"),
+                "ok": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1"]},
+                },
+            },
+        )
+        assert inventory["errors"] == [
+            "SageMaker training job 'denied' was not described with "
+            "sagemaker:DescribeTrainingJob (AccessDeniedException)"
+        ]
+        assert ("SageMaker training job", "ok", "vpc-1", "JobRole") in self._names(
+            inventory
+        )
+
+    def test_br02_a_job_subnet_ec2_does_not_return_is_named(self):
+        inventory = self._inventory(
+            training_jobs=[{"jobs": [{"TrainingJobName": "lost"}]}],
+            job_details={
+                "lost": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1", "subnet-gone"]},
+                }
+            },
+        )
+        assert inventory["errors"] == [
+            "subnet(s) subnet-gone of SageMaker training job 'lost' were not "
+            "returned by ec2:DescribeSubnets"
+        ]
+        assert not [w for w in inventory["workloads"] if "job" in w["kind"]]
+
+    def test_br02_job_descriptions_stop_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        inventory = self._inventory(
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "one"}, {"TrainingJobName": "two"}]}
+            ],
+        )
+        self.sagemaker.describe_training_job.assert_not_called()
+        assert (
+            "2 running SageMaker training job(s) from 'one' on were not described, "
+            f"{bedrock_app.DEADLINE_STOP}" in inventory["errors"]
+        )
+
+    def test_br02_only_the_training_job_off_the_s3_gateway_route_fails(self):
+        """Two running jobs in one VPC: the one whose subnet's route table the
+        S3 gateway endpoint does not name fails, the other is covered."""
+        inventory = self._inventory(
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-1"},
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "routed"}, {"TrainingJobName": "off"}]}
+            ],
+            job_details={
+                "routed": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1"]},
+                },
+                "off": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-2"]},
+                },
+            },
+        )
+        gateway = {
+            **self._endpoint("s3", endpoint_id="vpce-s3"),
+            "type": "Gateway",
+            "route_tables": ["rtb-1"],
+        }
+        rows = self._run(
+            self._cache(
+                {"JobRole": self._role(["sagemaker:InvokeEndpoint", "s3:GetObject"])}
+            ),
+            [self._endpoint("sagemaker.runtime"), gateway],
+            inventory["workloads"],
+            inventory["errors"],
+            route_tables={
+                "vpc-1": {
+                    "subnets": {"subnet-1": "rtb-1", "subnet-2": "rtb-2"},
+                    "main": "rtb-1",
+                    "all": {"rtb-1", "rtb-2"},
+                }
+            },
+        )
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert (
+            "SageMaker training job 'off' in vpc-1 (role 'JobRole') reaches s3 "
+            "through a gateway endpoint its subnets do not route to: s3: the "
+            "gateway endpoint names no route table of subnet(s) subnet-2 (rtb-2)"
+            in rows[0]["Finding_Details"]
+        )
+        assert "'routed'" not in rows[0]["Finding_Details"]
+        assert "SageMaker training job 'routed' in vpc-1" in rows[1]["Finding_Details"]
 
     def test_br02_only_the_second_notebook_fails(self):
         inventory = self._inventory(
@@ -8041,6 +8256,51 @@ class TestBR10GuardrailBinding:
         assert [f["Status"] for f in findings] == ["N/A", "N/A"]
         assert GR_ARN + ":1" in findings[0]["Finding_Details"]
         assert "could not be read" in findings[0]["Finding_Details"]
+
+    def test_a_versionless_cross_account_pin_is_na_at_the_listing_ceiling(self):
+        """Two pins: the cross-account versionless one is the ceiling, the other is not."""
+        client = MagicMock()
+        client.list_guardrails.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        versionless = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+        pinned = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-two:2"
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "OrgRole": _br10_identity(_br10_bound(versionless)),
+                    "PinRole": _br10_identity(_br10_bound(pinned)),
+                }
+            ),
+            client=client,
+        )
+        assert "Passed" not in [f["Status"] for f in findings]
+        (row,) = [f for f in findings if "could not be read" in f["Finding_Details"]]
+        details = row["Finding_Details"]
+        assert row["Status"] == "N/A"
+        assert (
+            f"{versionless} ({bedrock_app.GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING})"
+            in (details)
+        )
+        assert f"{pinned} ({CROSS_ACCOUNT_GUARDRAIL_ERROR})" in details
+        assert "stays N/A at that limit" in details
+
+    def test_a_cross_account_get_denial_names_no_listing_ceiling(self):
+        client = MagicMock()
+        client.get_guardrail.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        pinned = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-two:2"
+        findings, _ = self._run(
+            _br10_cache(roles={"PinRole": _br10_identity(_br10_bound(pinned))}),
+            client=client,
+        )
+        (row,) = [f for f in findings if "could not be read" in f["Finding_Details"]]
+        assert CROSS_ACCOUNT_GUARDRAIL_ERROR in row["Finding_Details"]
+        assert "stays N/A at that limit" not in row["Finding_Details"]
 
     def test_a_missing_guardrail_is_named_but_not_failed(self):
         client = MagicMock()
@@ -17562,6 +17822,114 @@ class TestBR46PromptPiiScreening:
         assert (arn, "4") in self.get_calls
         (passed,) = self._status(findings, "Passed")
         assert "logged invocation req-1" in passed["Finding_Details"]
+        (failed,) = self._status(findings, "Failed")
+        assert "req-2" in failed["Finding_Details"]
+        assert "req-1" not in failed["Finding_Details"]
+
+    UNGUARDED_JOINS = {
+        "resolved": {
+            "req-1": {"guardrail": "g1", "version": "1"},
+            "req-2": {"reason": "x", "unguarded": True},
+            "req-3": {"reason": "x", "unguarded": True},
+            "req-4": {"reason": "not read"},
+        }
+    }
+
+    def test_br46_prompt_unguarded_invocations_fail_by_request_id(self):
+        """Every logged call whose event names no guardrail is failed by name."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            joins=self.UNGUARDED_JOINS,
+        )
+        (failed,) = self._status(findings, "Failed")
+        assert "2 logged invocation(s) in us-east-1" in failed["Finding_Details"]
+        assert "req-2, req-3" in failed["Finding_Details"]
+        assert "req-4" not in failed["Finding_Details"]
+        assert failed["Severity"] == "High"
+        (na,) = self._status(findings, "N/A")
+        assert (
+            "1 logged invocation(s) whose CloudTrail event was"
+            in (na["Finding_Details"])
+        )
+
+    def test_br46_prompt_unguarded_invocations_screened_by_enforced_config(self):
+        """An un-narrowed account-enforced guardrail screens a call naming none."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    "account-enforced configuration c1", self.INPUT_PII
+                )
+            },
+            joins={"resolved": {"req-2": {"reason": "x", "unguarded": True}}},
+        )
+        assert not self._status(findings, "Failed")
+        (passed,) = self._status(findings, "Passed")
+        assert (
+            "1 logged invocation(s) whose CloudTrail event names no"
+            in (passed["Finding_Details"])
+        )
+        assert "req-2" in passed["Finding_Details"]
+
+    def test_br46_prompt_unguarded_invocations_fail_past_a_narrowed_config(self):
+        """A narrowed enforced configuration does not screen a call naming none."""
+        surface = "account-enforced configuration c1"
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    surface, self.INPUT_PII, narrowings={surface: ["inputTags HONOR"]}
+                )
+            },
+            joins=self.UNGUARDED_JOINS,
+        )
+        assert any(
+            "req-2, req-3" in f["Finding_Details"]
+            for f in self._status(findings, "Failed")
+        )
+
+    def test_br46_prompt_unguarded_invocations_fail_past_an_unscreening_config(
+        self,
+    ):
+        """An enforced guardrail with no input PII action leaves the calls unscreened."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.OUTPUT_ONLY_PII},
+            versions={
+                ("g1", "1"): self._entry(
+                    "account-enforced configuration c1", self.OUTPUT_ONLY_PII
+                )
+            },
+            joins={"resolved": {"req-2": {"reason": "x", "unguarded": True}}},
+        )
+        assert any(
+            "reached the model with no guardrail" in f["Finding_Details"]
+            and "req-2" in f["Finding_Details"]
+            for f in self._status(findings, "Failed")
+        )
+
+    def test_br46_prompt_unguarded_invocations_with_unread_enforced_config_are_na(
+        self,
+    ):
+        """An enforced guardrail that was not read cannot prove the calls unscreened."""
+        entry = self._entry("account-enforced configuration c1", None)
+        entry["error"] = "AccessDeniedException"
+        findings = self._run(
+            guardrails=["g1"],
+            details={
+                "g1": self.INPUT_PII,
+                ("g1", "1"): _make_client_error("AccessDeniedException"),
+            },
+            versions={("g1", "1"): entry},
+            joins={"resolved": {"req-2": {"reason": "x", "unguarded": True}}},
+        )
+        assert not self._status(findings, "Failed")
+        assert not self._status(findings, "Passed")
+        (na,) = self._status(findings, "N/A")
+        assert "guardrailIdentifier (req-2), screened only by" in na["Finding_Details"]
 
     def test_br46_prompt_denied_cross_account_guardrail_names_the_resource_policy(
         self,
@@ -34082,6 +34450,42 @@ class TestBR51AIUserConsoleMFA:
         )
         assert self.iam.list_instances.call_count == 2
 
+    ONE_REGION = [
+        {
+            "Regions": [
+                {"RegionName": "us-east-1", "RegionOptStatus": "ENABLED_BY_DEFAULT"}
+            ]
+        }
+    ]
+
+    @staticmethod
+    def _federated_trust(provider, action="sts:AssumeRoleWithSAML"):
+        return _policy(
+            {"Effect": "Allow", "Principal": {"Federated": provider}, "Action": action}
+        )
+
+    def _run_federated(self, roles, instances=None):
+        """``roles`` maps a role name to (provider, action, statements)."""
+        cache = _ai_user_cache()
+        for role, (_, _, statements) in roles.items():
+            cache["role_permissions"][role] = _identity(
+                attached=[_customer_policy("Write", *statements)]
+            )
+        _, rows = self._run(
+            cache,
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            regions=self.ONE_REGION,
+            instances=instances,
+            role_trust={
+                role: self._federated_trust(provider, action)
+                for role, (provider, action, _) in roles.items()
+            },
+        )
+        return rows
+
+    WRITE = {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
+
     @pytest.mark.parametrize(
         "role, provider, action",
         [
@@ -34095,50 +34499,148 @@ class TestBR51AIUserConsoleMFA:
                 "arn:aws:iam::123456789012:saml-provider/Okta",
                 ["sts:AssumeRoleWithSAML", "sts:TagSession"],
             ),
+            (
+                "GitHubAIDeploy",
+                "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com",
+                "sts:AssumeRoleWithWebIdentity",
+            ),
         ],
     )
-    def test_br51_a_federated_ai_write_role_stops_passed(self, role, provider, action):
+    def test_br51_a_federated_ai_write_role_without_a_tag_deny_fails(
+        self, role, provider, action
+    ):
         """With no instance visible, as in a member account, a federated AI
-        write role is still people signing in, and no row judges their MFA."""
-        cache = _ai_user_cache()
-        cache["role_permissions"][role] = _identity(
-            attached=[
-                _customer_policy(
-                    "Write", {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
-                )
-            ]
+        write role with no aws:PrincipalTag Deny is failed on its policies."""
+        rows = self._run_federated({role: (provider, action, [self.WRITE])})
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        details = failed[0]["Finding_Details"]
+        assert (
+            f"IAM role '{role}' is assumed through the federated identity "
+            f"provider(s) {provider} and grants AI writes (bedrock)" in details
         )
+        assert "keyed on an aws:PrincipalTag authentication tag covers bedrock," in (
+            details
+        )
+        assert failed[0]["Severity"] == "High"
+
+    def test_br51_only_the_federated_role_without_the_tag_deny_fails(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        deny = self._tag_deny()
+        rows = self._run_federated(
+            {
+                "OktaGuarded": (saml, "sts:AssumeRoleWithSAML", [self.WRITE, deny]),
+                "OktaOpen": (saml, "sts:AssumeRoleWithSAML", [self.WRITE]),
+            }
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A"]
+        (failed,) = [r for r in rows if r["Status"] == "Failed"]
+        assert "IAM role 'OktaOpen'" in failed["Finding_Details"]
+        assert "OktaGuarded" not in failed["Finding_Details"]
+        (summary,) = [r for r in rows if r["Status"] == "N/A"]
+        assert (
+            "1 in-scope IAM role(s) assumed through a federated identity provider "
+            "carry a Deny keyed on aws:PrincipalTag over every AI service they "
+            f"grant (OktaGuarded ({saml}; StringNotEquals aws:PrincipalTag/authn "
+            "mfa))" in summary["Finding_Details"]
+        )
+        assert (
+            "whether the provider sets that tag only after MFA is not read"
+            in (summary["Finding_Details"])
+        )
+
+    def test_br51_a_federated_tag_deny_covering_one_service_fails_the_other(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        rows = self._run_federated(
+            {
+                "OktaAI": (
+                    saml,
+                    "sts:AssumeRoleWithSAML",
+                    [
+                        self.WRITE,
+                        {"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"},
+                        self._tag_deny(actions=("bedrock:*",)),
+                    ],
+                )
+            }
+        )
+        (failed,) = [r for r in rows if r["Status"] == "Failed"]
+        details = failed["Finding_Details"]
+        assert "grants AI writes (bedrock, sagemaker)" in details
+        assert (
+            "covers sagemaker (the PrincipalTag Deny it has, StringNotEquals "
+            "aws:PrincipalTag/authn mfa, covers only the other services)" in details
+        )
+
+    def test_br51_a_federated_tag_deny_in_the_boundary_is_credited(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        cache = _ai_user_cache()
+        cache["role_permissions"]["OktaAI"] = {
+            **_identity(attached=[_customer_policy("Write", self.WRITE)]),
+            "permissions_boundary": {
+                "document": _policy(
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    self._tag_deny(),
+                )
+            },
+        }
         _, rows = self._run(
             cache,
             login={"alice": "yes"},
             devices={"alice": [{"SerialNumber": "s"}]},
-            regions=[
-                {
-                    "Regions": [
-                        {
-                            "RegionName": "us-east-1",
-                            "RegionOptStatus": "ENABLED_BY_DEFAULT",
-                        }
-                    ]
-                }
-            ],
-            role_trust={
-                role: _policy(
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"Federated": provider},
-                        "Action": action,
-                    }
-                )
-            },
+            regions=self.ONE_REGION,
+            role_trust={"OktaAI": self._federated_trust(saml)},
         )
         assert [r["Status"] for r in rows] == ["N/A"]
-        details = rows[0]["Finding_Details"]
-        assert f"{role} ({provider})" in details
-        assert "0 of the 1 in-scope IAM role(s)" in details
-        assert (
-            "1 in-scope IAM role(s) are assumed through a federated identity provider"
-            in details
+        assert "OktaAI (" in rows[0]["Finding_Details"]
+
+    def test_br51_an_unparsable_federated_role_policy_is_na(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        cache = _ai_user_cache()
+        cache["role_permissions"]["OktaAI"] = _identity(
+            attached=[_customer_policy("Write", self.WRITE)]
+        )
+        with patch.object(
+            bedrock_app,
+            "_federated_role_tag_deny",
+            side_effect=ValueError("bad document"),
+        ):
+            _, rows = self._run(
+                cache,
+                login={"alice": "yes"},
+                devices={"alice": [{"SerialNumber": "s"}]},
+                regions=self.ONE_REGION,
+                role_trust={"OktaAI": self._federated_trust(saml)},
+            )
+        assert "Failed" not in [r["Status"] for r in rows]
+        assert any(
+            "IAM role 'OktaAI'" in r["Finding_Details"]
+            and "could not be parsed" in r["Finding_Details"]
+            and r["Status"] == "N/A"
+            for r in rows
+        )
+
+    def test_br51_a_visible_instance_judges_its_sso_role_through_the_set(self):
+        """An AWSReservedSSO_ role is judged through its permission set when
+        the instance is visible; an Okta role beside it is still judged."""
+        sso_role = "AWSReservedSSO_AIAdmin_0123456789abcdef"
+        sso = "arn:aws:iam::123456789012:saml-provider/AWSSSO_0123_DO_NOT_DELETE"
+        okta = "arn:aws:iam::123456789012:saml-provider/Okta"
+        rows = self._run_federated(
+            {
+                sso_role: (sso, "sts:AssumeRoleWithSAML", [self.WRITE]),
+                "OktaAI": (okta, "sts:AssumeRoleWithSAML", [self.WRITE]),
+            },
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "IAM role 'OktaAI'" in failed[0]["Finding_Details"]
+        assert sso_role not in failed[0]["Finding_Details"]
+        assert any(
+            f"IAM Identity Center role(s) ({sso_role} ({sso})) are judged through "
+            "their permission sets" in r["Finding_Details"]
+            for r in rows
         )
 
     def test_br51_an_unread_region_is_not_passed(self):
@@ -38712,8 +39214,9 @@ def _probe_response(action, **entities):
     }
 
 
-def _probe_rows(versions, responses):
+def _probe_rows(versions, responses, account="123456789012"):
     client = MagicMock()
+    client.get_caller_identity.return_value = {"Account": account}
     regions = []
 
     def make_client(service, region_name=None, **_):
@@ -38823,6 +39326,78 @@ def test_br26_output_probe_error_is_na_and_does_not_hide_the_next_version():
         in (rows[0]["Finding_Details"])
     )
     assert len(calls) == 2
+
+
+_PROBE_OWNER_POLICY = (
+    "AccessDeniedException: the owner's guardrail resource policy does not "
+    "allow bedrock:ApplyGuardrail to this account"
+)
+
+
+def test_br26_output_probe_cross_account_denial_names_the_owner_policy():
+    """Two denied ARNs: only the one another account owns blames its policy."""
+    other = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+    own = "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-own"
+    rows, calls, _ = _probe_rows(
+        {
+            (other, "1"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+            (own, "1"): (_PROBE_PASSING_DETAIL, "us-east-1"),
+        },
+        {
+            (other, "1"): _make_client_error("AccessDeniedException", "denied"),
+            (own, "1"): _make_client_error("AccessDeniedException", "denied"),
+        },
+    )
+    assert len(calls) == 2
+    by_arn = {
+        arn: next(r for r in rows if f"guardrail {arn} version" in r["Finding_Details"])
+        for arn in (other, own)
+    }
+    assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+    assert _PROBE_OWNER_POLICY in by_arn[other]["Finding_Details"]
+    assert "guardrail resource policy" in by_arn[other]["Resolution"]
+    assert "owner's" not in by_arn[own]["Finding_Details"]
+    assert by_arn[own]["Resolution"].startswith("Grant bedrock:ApplyGuardrail")
+
+
+def test_br26_output_probe_different_account_message_names_the_owner_policy():
+    rows, _, _ = _probe_rows(
+        {("gr-org", "2"): (_PROBE_PASSING_DETAIL, "us-east-1")},
+        {
+            ("gr-org", "2"): _make_client_error(
+                "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+            )
+        },
+    )
+    assert [r["Status"] for r in rows] == ["N/A"]
+    assert _PROBE_OWNER_POLICY in rows[0]["Finding_Details"]
+
+
+def test_br26_output_probe_unread_caller_account_does_not_blame_the_owner():
+    other = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+    rows, _, _ = _probe_rows(
+        {(other, "1"): (_PROBE_PASSING_DETAIL, "us-east-1")},
+        {(other, "1"): _make_client_error("AccessDeniedException", "denied")},
+        account=None,
+    )
+    assert [r["Status"] for r in rows] == ["N/A"]
+    assert "owner's" not in rows[0]["Finding_Details"]
+
+
+def test_br26_output_probe_runs_on_a_guardrail_another_account_owns():
+    other = "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org"
+    rows, calls, _ = _probe_rows(
+        {(other, "1"): (_PROBE_PASSING_DETAIL, "us-east-1")},
+        {
+            (other, "1"): _probe_response(
+                "GUARDRAIL_INTERVENED",
+                AWS_ACCESS_KEY="BLOCKED",
+                AWS_SECRET_KEY="BLOCKED",
+            )
+        },
+    )
+    assert [(i, v) for i, v, _ in calls] == [(other, "1")]
+    assert [r["Status"] for r in rows] == ["Passed"]
 
 
 def test_br26_output_probe_skips_failing_and_unread_versions_and_uses_their_region():
@@ -50935,6 +51510,35 @@ class TestInvocationDeadline:
             {"us-east-1": bedrock},
         )
         assert reading["unread"] == CROSS_ACCOUNT_GUARDRAIL_ERROR
+
+    def test_br10_a_denied_cross_account_version_listing_names_list_guardrails(self):
+        """A versionless pin to another account fails at ListGuardrails, not GetGuardrail."""
+        bedrock = MagicMock()
+        bedrock.list_guardrails.side_effect = _make_client_error(
+            "AccessDeniedException", CROSS_ACCOUNT_DENIAL
+        )
+        reading = bedrock_app._read_guardrail_directions(
+            "arn:aws:bedrock:us-east-1:999988887777:guardrail/gr-org",
+            "us-east-1",
+            {"us-east-1": bedrock},
+        )
+        bedrock.get_guardrail.assert_not_called()
+        assert reading["unread"] == bedrock_app.GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING
+        assert reading["ceiling"] is True
+        assert "bedrock:ListGuardrails" in reading["unread"]
+        assert "does not allow bedrock:GetGuardrail" not in reading["unread"]
+
+    def test_br10_a_same_account_list_denial_is_not_the_ceiling(self):
+        """An in-account ListGuardrails denial is a missing grant, not the AWS limit."""
+        bedrock = MagicMock()
+        bedrock.list_guardrails.side_effect = _make_client_error(
+            "AccessDeniedException", "User is not authorized"
+        )
+        reading = bedrock_app._read_guardrail_directions(
+            "gr-1", "us-east-1", {"us-east-1": bedrock}
+        )
+        assert reading["unread"] == "AccessDeniedException"
+        assert "ceiling" not in reading
 
     def test_the_redaction_source_listing_stops_at_the_deadline(self):
         s3 = MagicMock()
