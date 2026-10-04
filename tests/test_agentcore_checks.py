@@ -6152,25 +6152,38 @@ class TestAC12GatewayKeyScope:
             not in by_name["AgentCore Gateway Encryption Check"][0]["Finding_Details"]
         )
 
+    @pytest.mark.parametrize(
+        "context_value",
+        [
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*",
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-?",
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-x*",
+        ],
+        ids=["every-gateway", "one-character", "name-prefix"],
+    )
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
-    def test_a_gateway_wide_context_in_this_account_binds(self, mock_ac, mock_kms):
+    def test_a_gateway_id_wildcard_does_not_bind(
+        self, mock_ac, mock_kms, context_value
+    ):
+        """gateway-encryption.html scopes the context to the actual gateway ARN.
+
+        Before this fix gateway/* in the account was credited, so a key every
+        gateway in the account can use passed.
+        """
         key = "arn:aws:kms:us-east-1:123456789012:key/x"
         self._wire(
-            mock_ac,
-            mock_kms,
-            ["gw-x"],
-            policies={
-                key: _ac12_key_policy(
-                    "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*"
-                )
-            },
+            mock_ac, mock_kms, ["gw-x"], policies={key: _ac12_key_policy(context_value)}
         )
 
         by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
 
-        assert set(by_name) == {"AgentCore Gateway Encryption Check"}
-        assert by_name["AgentCore Gateway Encryption Check"][0]["Status"] == "Passed"
+        assert "AgentCore Gateway Encryption Check" not in by_name
+        details = by_name["AgentCore Gateway Key Policy Unscoped"][0]["Finding_Details"]
+        assert "'gw-x'" in details
+        assert "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn naming" in (
+            details
+        )
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
@@ -13508,8 +13521,21 @@ class TestAC27ConsentPortalRoleTrust:
                 ),
                 "Source ARN Not Scoped",
             ),
+            # AIR-ACR-GW-03 asks for the portal's own ARN. Before this fix each
+            # of the next three passed, because only the type was required.
+            (_portal_trust(_PORTAL_PREFIX + "*"), "Source ARN Not Scoped"),
+            (_portal_trust(_PORTAL_PREFIX + "cp-ope?"), "Source ARN Not Scoped"),
+            (_portal_trust(_PORTAL_PREFIX + "cp-other"), "Source ARN Not Scoped"),
         ],
-        ids=["no-condition", "other-account", "account-only", "other-type"],
+        ids=[
+            "no-condition",
+            "other-account",
+            "account-only",
+            "other-type",
+            "every-portal",
+            "one-character",
+            "other-portal",
+        ],
     )
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
@@ -13528,6 +13554,15 @@ class TestAC27ConsentPortalRoleTrust:
         ]
         assert "Consent portal 'cp-open' (cp-open)" in rows[1]["Finding_Details"]
         assert "runs as cp-open-role" in rows[1]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_shared_by_two_portals_naming_both_passes(self, mock_ac, mock_iam):
+        both = _portal_trust([_PORTAL_PREFIX + "cp-a", _PORTAL_PREFIX + "cp-b"])
+        rows = self._run(mock_ac, mock_iam, {"cp-a": both, "cp-b": both})
+
+        assert [row["Status"] for row in rows] == ["Passed", "Passed"]
+        assert f"this portal's ARN {_PORTAL_PREFIX}cp-b" in rows[1]["Finding_Details"]
 
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
@@ -17216,6 +17251,27 @@ class TestAC30RuntimeInboundAuthorization:
         assert by_runtime["rt-open"]["Finding"].endswith("Unbounded")
 
     @patch("agentcore_app.agentcore_client")
+    def test_an_unbounded_runtime_authorizer_fails_the_identity_provider_control(
+        self, mock_ac
+    ):
+        """AIR-ACR-ID-11 asks the allow-list layer of a runtime invoked directly.
+
+        Before AC-30 was mapped to ID-11, only gateways (AC-31) carried that
+        layer, so this runtime did not fail the control.
+        """
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[2]]
+        }
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "AISF AIR-ACR-ID-11 (1 of 3 checks)" in (
+            findings[0]["Compliance_Frameworks"].split(" | ")
+        )
+
+    @patch("agentcore_app.agentcore_client")
     def test_a_runtime_with_no_authorizer_enforces_sigv4(self, mock_ac):
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [self._RUNTIMES[0]]
@@ -20020,7 +20076,10 @@ class TestAC34RuntimeCode:
         assert "(rt-a)" in rows[0]["Finding_Details"]
         assert "1 file(s) scanned" in rows[0]["Finding_Details"]
         assert "64 MiB" in rows[0]["Finding_Details"]
-        assert "files over 4 MiB are not scanned" in rows[0]["Finding_Details"]
+        assert (
+            "every file of an archive read is scanned whole"
+            in (rows[0]["Finding_Details"])
+        )
         assert "lib/cfg.py in s3://code-bucket/b.zip" in rows[1]["Finding_Details"]
         assert rows[1]["Severity"] == "High"
         for row in rows:
@@ -20058,21 +20117,122 @@ class TestAC34RuntimeCode:
         assert "(version v-7)" in rows[0]["Finding_Details"]
         assert self.s3.get_object.call_args.kwargs["VersionId"] == "v-7"
 
-    def test_a_file_over_its_bound_is_counted_not_scanned(self):
-        with patch.object(agentcore_app, "AC34_CODE_FILE_MAX_BYTES", 16):
+    def test_a_large_file_is_scanned_in_chunks_across_the_boundary(self):
+        """AIR-ACR-ID-05: no file is skipped for its size.
+
+        Before this fix a file over the 4 MiB per-file bound was counted and not
+        scanned, and the row still passed. The key here straddles two 16-byte
+        chunks, so a chunked read with no overlap misses it too.
+        """
+        big = "y" * 50 + "\nK = '" + self._ACCESS_KEY + "'\n" + "z" * 50
+        with (
+            patch.object(agentcore_app, "AC34_SCAN_CHUNK_BYTES", 16),
+            patch.object(agentcore_app, "AC34_SCAN_OVERLAP_CHARS", 64),
+        ):
             rows = self._run(
-                {"rt-a": "a.zip"},
+                {"rt-a": "a.zip", "rt-b": "b.zip"},
                 {
-                    "code-bucket/a.zip": self._zip(
-                        {"small.py": "x = 1\n", "big.bin": "y" * 64}
-                    )
+                    "code-bucket/a.zip": self._zip({"small.py": "x = 1\n"}),
+                    "code-bucket/b.zip": self._zip(
+                        {"small.py": "x = 1\n", "big.py": big}
+                    ),
                 },
             )
-        assert [r["Status"] for r in rows] == ["Passed"]
-        assert (
-            "1 file(s) scanned, 1 over the per-file bound not scanned"
-            in rows[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        details = rows[1]["Finding_Details"]
+        assert details.count("big.py in s3://code-bucket/b.zip") == 1
+        assert "small.py" not in details
+        assert self._ACCESS_KEY not in details
+
+    @pytest.mark.parametrize(
+        "source, name, secret",
+        [
+            (
+                'CLIENT_SECRET = "Zx9kP2mQ7rT4vW1y"\n',
+                "CLIENT_SECRET",
+                "Zx9kP2mQ7rT4vW1y",
+            ),
+            (
+                "client = OpenAI(api_key='sk-proj9Ab3Cd5Ef7Gh')\n",
+                "api_key",
+                "sk-proj9Ab3Cd5Ef7Gh",
+            ),
+            (
+                '{"oauth": {"refreshToken": "1x0gAbCdEf123456"}}\n',
+                "refreshToken",
+                "1x0gAbCdEf123456",
+            ),
+            (
+                "headers: {Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9abc'}\n",
+                None,
+                "eyJhbGciOiJIUzI1NiJ9abc",
+            ),
+        ],
+        ids=["client-secret", "api-key-kwarg", "json-token", "bearer-literal"],
+    )
+    def test_an_inline_api_key_or_client_secret_in_code_fails(
+        self, source, name, secret
+    ):
+        """AIR-ACR-ID-05 names API keys and client secrets, not only AWS keys.
+
+        Before this fix code files were matched only for an access key ID or a
+        private key block, so each of these passed.
+        """
+        rows = self._run(
+            {"rt-a": "a.zip"},
+            {"code-bucket/a.zip": self._zip({"agent/main.py": source})},
         )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        expected = (
+            f"agent/main.py assignment {name}"
+            if name
+            else "agent/main.py assignment Authorization (a Bearer token)"
+        )
+        assert expected in rows[0]["Finding_Details"]
+        assert secret not in json.dumps(rows[0])
+
+    @pytest.mark.parametrize(
+        "path, source",
+        [
+            ("main.py", 'api_key = "YOUR_API_KEY_HERE_123"\n'),
+            ("main.py", 'password = "example-password-123"\n'),
+            ("main.py", 'token_url = "https://idp.example.com/oauth2/token"\n'),
+            ("main.py", 'SECRET_NAME = "prod/agent/oauth-client"\n'),
+            ("main.py", 'API_KEY_ENV = "OPENAI_API_KEY_VALUE"\n'),
+            ("main.py", 'max_tokens = "100000000000"\n'),
+            ("main.py", 'region_name = "Ab3Cd5Ef7Gh9Jk"\n'),
+            (
+                "lib/python3.12/site-packages/x/tests.py",
+                'client_secret = "Zx9kP2mQ7rT4vW1y"\n',
+            ),
+            ("main.py", 'if password == "Zx9kP2mQ7rT4vW1y":\n'),
+            ("main.py", '{"ChangeToken": "abcd12f2-46da-4fdb-b8d5-fbd4c4d1a2b3"}\n'),
+            ("main.py", '{"PasswordLastUsed": "2016-09-08T21:47:36Z"}\n'),
+            ("main.py", '{"ApiKeyType": "AWS::BedrockAgentCore::ApiKey2"}\n'),
+            ("main.py", 'client_secret = "NoDigitsInThisWord"\n'),
+        ],
+        ids=[
+            "placeholder",
+            "example",
+            "url",
+            "secret-name",
+            "env-var-name",
+            "digits",
+            "not-a-credential-name",
+            "installed-package",
+            "comparison",
+            "uuid",
+            "date",
+            "resource-type",
+            "no-digit",
+        ],
+    )
+    def test_a_pointer_or_placeholder_assignment_passes(self, path, source):
+        rows = self._run(
+            {"rt-a": "a.zip"},
+            {"code-bucket/a.zip": self._zip({path: source})},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"], rows[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "objects, patches, reason",
@@ -20839,9 +20999,11 @@ class TestAC34RuntimeImages:
     @patch("agentcore_app.urlopen")
     @patch("agentcore_app.ecr_client")
     @patch("agentcore_app.agentcore_client")
-    def test_a_file_over_the_per_file_bound_is_counted(
+    def test_a_large_layer_file_is_scanned_in_chunks(
         self, mock_ac, mock_ecr, mock_open
     ):
+        """Before this fix big.bin, over the per-file bound, was skipped and the
+        row passed; the key straddles two 16-byte chunks."""
         self._wire(
             mock_ac,
             mock_ecr,
@@ -20850,21 +21012,25 @@ class TestAC34RuntimeImages:
             {"cfg-big": self._config(env=["A=1"])},
             layers={
                 "lyr-big": self._layer(
-                    {"small.py": b"x = 1\n", "big.bin": b"AKIAIOSFODNN7EXAMPLE" * 4}
+                    {
+                        "small.py": b"x = 1\n",
+                        "big.bin": b"y" * 30 + b" AKIAIOSFODNN7EXAMPLE " + b"z" * 30,
+                    }
                 )
             },
         )
 
-        with patch.object(agentcore_app, "AC34_CODE_FILE_MAX_BYTES", 40):
+        with (
+            patch.object(agentcore_app, "AC34_SCAN_CHUNK_BYTES", 16),
+            patch.object(agentcore_app, "AC34_SCAN_OVERLAP_CHARS", 64),
+        ):
             rows = self._image_rows(
                 agentcore_app.check_agentcore_runtime_inline_credentials()
             )
 
-        assert [r["Status"] for r in rows] == ["Passed"]
-        assert (
-            "1 layer(s), 1 file(s) scanned, 1 over the per-file bound not scanned"
-            in rows[0]["Finding_Details"]
-        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "big.bin in layer lyr-big" in rows[0]["Finding_Details"]
+        assert "small.py" not in rows[0]["Finding_Details"]
 
     @patch("agentcore_app.urlopen")
     @patch("agentcore_app.ecr_client")
@@ -29686,7 +29852,9 @@ class TestAC45ToolRoleInvokerBound:
     ):
         return self._allow(action, resource or self._CI_ARN)
 
-    def _run(self, mock_ac, tool_role, roles=None, users=None, browser=False):
+    def _run(
+        self, mock_ac, tool_role, roles=None, users=None, browser=False, **cache_extra
+    ):
         if browser:
             _wire_tools(
                 mock_ac,
@@ -29707,6 +29875,7 @@ class TestAC45ToolRoleInvokerBound:
         cache = {
             "role_permissions": {"ToolRole": tool_role, **(roles or {})},
             "user_permissions": users or {},
+            **cache_extra,
         }
         findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
         rows = [f for f in findings if f["Finding"] == self._FINDING]
@@ -29737,6 +29906,72 @@ class TestAC45ToolRoleInvokerBound:
         assert row["Severity"] == "Medium"
         assert f"role Ops lacks s3:getobject on {self._APP}" in row["Finding_Details"]
         assert "user dev" not in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "unread",
+        [
+            {"type": "user", "name": "contractor"},
+            {"type": "role", "name": "Unread"},
+        ],
+        ids=["user", "role"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_principal_holds_the_bound_at_not_applicable(
+        self, mock_ac, unread
+    ):
+        """A principal the cache could not read may start sessions unseen."""
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                )
+            },
+            cache_schema_version=2,
+            principal_errors=[
+                {**unread, "stage": "list_attached_policies", "error": "AccessDenied"}
+            ],
+        )
+
+        assert row["Status"] == "N/A"
+        assert (
+            f"{unread['type']} {unread['name']} (list_attached_policies"
+            in (row["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_read_gap_on_another_principal_does_not_mask_a_failure(self, mock_ac):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={"dev": self._principal(self._start())},
+            cache_schema_version=2,
+            principal_errors=[
+                {"type": "user", "name": "contractor", "stage": "s", "error": "e"}
+            ],
+        )
+
+        assert row["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_version_2_cache_with_no_read_gap_passes_without_the_v1_note(
+        self, mock_ac
+    ):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                )
+            },
+            cache_schema_version=2,
+            principal_errors=[],
+        )
+
+        assert row["Status"] == "Passed"
+        assert agentcore_app.IAM_CACHE_V1_NOTE not in row["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_invokers_holding_every_tool_role_grant_pass(self, mock_ac):
@@ -31914,7 +32149,10 @@ class TestR8NetworkPathNeedsAVpcKey:
             )
         }
         cache = {
-            "endpoints": {"vpce-1": "com.amazonaws.us-east-1.bedrock-agentcore.gateway"}
+            "endpoints": {
+                "vpce-1": "com.amazonaws.us-east-1.bedrock-agentcore.gateway"
+            },
+            "vpcs": {"vpc-1"},
         }
         return {
             finding["Finding"]: finding
@@ -31944,6 +32182,83 @@ class TestR8NetworkPathNeedsAVpcKey:
         assert list(legs) == ["AgentCore Gateway Network Path Unrestricted"]
         details = legs["AgentCore Gateway Network Path Unrestricted"]["Finding_Details"]
         assert "no Deny keyed only on aws:SourceVpc or aws:SourceVpce" in details
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_vpc_outside_this_account_fails(self, mock_ac, mock_ec2):
+        """AIR-ACR-GW-04: a Deny naming another account's VPC admits its callers.
+
+        Before this fix aws:SourceVpc values were checked only for wildcards, so
+        vpc-foreign passed beside vpc-1.
+        """
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps(
+                {
+                    "Statement": [
+                        _deny_gateway_invoke(
+                            {
+                                "StringNotEquals": {
+                                    "aws:SourceVpc": ["vpc-1", "vpc-foreign"]
+                                }
+                            }
+                        )
+                    ]
+                }
+            )
+        }
+        mock_ec2.describe_vpcs.return_value = {
+            "Vpcs": [{"VpcId": "vpc-1"}, {"VpcId": "vpc-2"}]
+        }
+        cache = {}
+        legs = {
+            finding["Finding"]: finding
+            for finding in agentcore_app._gateway_resource_policy_findings(
+                "Gateway 'one' (gw-1)", _GATEWAY_ARN_R8, cache
+            )
+            + agentcore_app._gateway_resource_policy_findings(
+                "Gateway 'two' (gw-2)", _GATEWAY_ARN_R8, cache
+            )
+            if "Network Path" in finding["Finding"]
+        }
+
+        assert list(legs) == ["AgentCore Gateway Network Path VPC Not Found"]
+        failed = legs["AgentCore Gateway Network Path VPC Not Found"]
+        assert failed["Status"] == "Failed"
+        assert "names vpc-foreign, and none" in failed["Finding_Details"]
+        assert_finding_schema(failed)
+        # The VPCs are read once for every gateway in the Region.
+        assert mock_ec2.describe_vpcs.call_count == 1
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_vpc_list_withholds_the_passed(self, mock_ac, mock_ec2):
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps(
+                {
+                    "Statement": [
+                        _deny_gateway_invoke(
+                            {"StringNotEquals": {"aws:SourceVpc": "vpc-1"}}
+                        )
+                    ]
+                }
+            )
+        }
+        mock_ec2.describe_vpcs.side_effect = _make_client_error(
+            "UnauthorizedOperation", "no"
+        )
+        legs = [
+            finding
+            for finding in agentcore_app._gateway_resource_policy_findings(
+                "Gateway 'one' (gw-1)", _GATEWAY_ARN_R8, {}
+            )
+            if "Network Path" in finding["Finding"]
+        ]
+
+        assert [f["Status"] for f in legs] == ["N/A"]
+        assert (
+            "ec2:DescribeVpcs failed with UnauthorizedOperation"
+            in (legs[0]["Finding_Details"])
+        )
 
     @pytest.mark.parametrize("conditions", _PRIVATE_PATH_DENIES)
     @patch("agentcore_app.agentcore_client")
@@ -32722,6 +33037,9 @@ class TestAC48ExecutionRoleTrustAndSharing:
         assert failed[0]["Severity"] == "High"
         assert "WideRole" in failed[0]["Finding_Details"]
         assert "[runtime family]" in failed[0]["Finding_Details"]
+        assert "AISF AIR-ACR-RT-13 (1 of 6 checks)" in (
+            failed[0]["Compliance_Frameworks"].split(" | ")
+        )
         assert not self._named(findings, "AgentCore Execution Role Trust Guard Missing")
 
     @patch("agentcore_app.iam_client")
@@ -38671,6 +38989,11 @@ class TestAC27RoleTrustSourceArnNamesTheGateway:
         assert "gw-a (role RoleA)" in details
         assert "gw-c (role RoleC)" in details
         assert_finding_schema(reach[0])
+        # AIR-ACR-RT-13's gateway-role restriction needs this role's trust
+        # hardened, so the row carries the control.
+        assert "AISF AIR-ACR-RT-13 (1 of 6 checks)" in (
+            reach[0]["Compliance_Frameworks"].split(" | ")
+        )
         passed = self._named(
             findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
         )
@@ -43003,8 +43326,74 @@ class TestAC41EvaluationKeyProtection:
         )
 
     @patch("agentcore_app.agentcore_client")
+    def test_an_evaluator_nothing_attaches_is_judged(self, mock_ac):
+        """A listed custom evaluator holds instructions under its key unattached."""
+        _ac44_custom(
+            mock_ac,
+            {
+                "attached-1": {
+                    "evaluatorId": "attached-1",
+                    "evaluatorArn": f"{_EVAL_ARN_PREFIX}evaluator/attached-1",
+                    "kmsKeyArn": _EVAL_KEY,
+                },
+                "idle-1": {"evaluatorId": "idle-1"},
+            },
+            configs=[
+                _online_evaluation_detail(evaluators=[{"evaluatorId": "attached-1"}])
+            ],
+        )
+        findings, _ = self._run_with_client(mock_ac)
+
+        rows = {f["Finding_Details"].split(" ", 3)[2]: f["Status"] for f in findings}
+        assert rows == {"attached-1": "Passed", "idle-1": "Failed"}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_evaluator_listing_is_na_beside_the_attached_ones(self, mock_ac):
+        _ac44_custom(mock_ac, {"judge-1": {"evaluatorId": "judge-1"}})
+        mock_ac.list_evaluators.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+        findings, _ = self._run_with_client(mock_ac)
+
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        assert (
+            "ListEvaluators failed with AccessDeniedException"
+            in (findings[0]["Finding_Details"])
+        )
+        assert findings[0]["Resolution"] == (
+            "Grant bedrock-agentcore:ListEvaluators and retry."
+        )
+        assert (
+            "Custom evaluator judge-1 names no kmsKeyArn"
+            in (findings[1]["Finding_Details"])
+        )
+
+    def _run_with_client(self, mock_ac):
+        data = MagicMock()
+        data.list_batch_evaluations.return_value = {"batchEvaluations": []}
+        kms = MagicMock()
+        kms.describe_key.return_value = _key_metadata()
+        kms.get_key_policy.return_value = _evaluation_key_policy()
+        with (
+            patch.object(agentcore_app, "agentcore_data_client", data),
+            patch.object(agentcore_app, "kms_client", kms),
+        ):
+            return agentcore_app.check_agentcore_evaluation_key_protection(), kms
+
+    @patch("agentcore_app.agentcore_client")
     def test_built_in_evaluators_only_and_no_batch_is_na(self, mock_ac):
-        _online_evaluation_client(mock_ac)
+        _online_evaluation_client(
+            mock_ac,
+            catalogue=[
+                e for e in _evaluator_catalogue() if e["evaluatorType"] == "Builtin"
+            ]
+            + [
+                {
+                    "evaluatorId": "ThirdParty.DeepEval.Bias",
+                    "evaluatorType": "ThirdParty",
+                }
+            ],
+        )
         data = MagicMock()
         data.list_batch_evaluations.return_value = {"batchEvaluations": []}
         with (
@@ -43249,8 +43638,12 @@ def _judge_evaluator(model_id, kind="llmAsAJudge"):
     }
 
 
-def _ac44_custom(mock_ac, evaluators_by_id, configs=None):
-    """Attach custom evaluators to the configurations and serve GetEvaluator."""
+def _ac44_custom(mock_ac, evaluators_by_id, configs=None, listed=None):
+    """Attach custom evaluators to the configurations and serve GetEvaluator.
+
+    ListEvaluators returns the Builtin catalogue plus each served custom
+    evaluator, or the ids in listed when given.
+    """
     configs = configs or [
         _online_evaluation_detail(
             evaluators=[
@@ -43258,7 +43651,13 @@ def _ac44_custom(mock_ac, evaluators_by_id, configs=None):
             ]
         )
     ]
-    _online_evaluation_client(mock_ac, configs)
+    catalogue = [e for e in _evaluator_catalogue() if e["evaluatorType"] == "Builtin"]
+    catalogue += [
+        {"evaluatorId": evaluator_id, "evaluatorType": "Custom"}
+        for evaluator_id in (evaluators_by_id if listed is None else listed)
+        if not evaluator_id.startswith(("Builtin.", "ThirdParty."))
+    ]
+    _online_evaluation_client(mock_ac, configs, catalogue)
 
     def _get(evaluatorId, includedData):
         found = evaluators_by_id[evaluatorId]
@@ -48849,6 +49248,105 @@ class TestAC46CostAnomalyAlerting:
         )
         assert finding["Status"] == "N/A"
         assert "team-tag" in finding["Finding_Details"]
+
+    @staticmethod
+    def _linked(name, values, match=None):
+        dimensions = {"Key": "LINKED_ACCOUNT", "Values": list(values)}
+        if match:
+            dimensions["MatchOptions"] = match
+        return {
+            "MonitorArn": f"arn:aws:ce::111122223333:anomalymonitor/{name}",
+            "MonitorName": name,
+            "MonitorType": "CUSTOM",
+            "MonitorSpecification": {"Dimensions": dimensions},
+        }
+
+    def _run_linked(self, mock_ac, mock_ce, monitors):
+        """One runtime in account 123456789012, its ListAgentRuntimes summary
+        carrying the ARN, and one live subscription on `monitors`."""
+        summary, detail = _bounded_runtime()
+        summary["agentRuntimeArn"] = detail["agentRuntimeArn"]
+        _wire_runtimes(mock_ac, [(summary, detail)])
+        by_arn = {monitor["MonitorArn"]: monitor for monitor in monitors}
+        mock_ce.get_anomaly_subscriptions.return_value = {
+            "AnomalySubscriptions": [self._subscription("linked", list(by_arn))]
+        }
+        mock_ce.get_anomaly_monitors.side_effect = lambda MonitorArnList, **_: {
+            "AnomalyMonitors": [by_arn[arn] for arn in MonitorArnList]
+        }
+        (finding,) = agentcore_app.check_agentcore_runtime_cost_alerting()
+        return finding
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_monitor_tracking_this_account_passes(self, mock_ac, mock_ce):
+        finding = self._run_linked(
+            mock_ac,
+            mock_ce,
+            [
+                self._linked("elsewhere", ["999999999999"]),
+                self._linked("here", ["999999999999", "123456789012"]),
+            ],
+        )
+        assert finding["Status"] == "Passed"
+        assert "names account 123456789012" in finding["Finding_Details"]
+        assert "threshold is not judged" in finding["Finding_Details"]
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_monitor_tracking_other_accounts_fails(self, mock_ac, mock_ce):
+        finding = self._run_linked(
+            mock_ac, mock_ce, [self._linked("elsewhere", ["999999999999"])]
+        )
+        assert finding["Status"] == "Failed"
+        assert (
+            "CUSTOM monitor(s) elsewhere track only linked accounts other than "
+            "123456789012"
+        ) in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "monitor",
+        [
+            {
+                "MonitorArn": "arn:aws:ce::111122223333:anomalymonitor/tag",
+                "MonitorName": "tag",
+                "MonitorType": "CUSTOM",
+                "MonitorSpecification": {"Tags": {"Key": "team", "Values": ["agents"]}},
+            },
+            {
+                "MonitorArn": "arn:aws:ce::111122223333:anomalymonitor/prefix",
+                "MonitorName": "prefix",
+                "MonitorType": "CUSTOM",
+                "MonitorSpecification": {
+                    "Dimensions": {
+                        "Key": "LINKED_ACCOUNT",
+                        "Values": ["1234"],
+                        "MatchOptions": ["STARTS_WITH"],
+                    }
+                },
+            },
+            {
+                "MonitorArn": "arn:aws:ce::111122223333:anomalymonitor/not",
+                "MonitorName": "not",
+                "MonitorType": "CUSTOM",
+                "MonitorSpecification": {
+                    "Not": {
+                        "Dimensions": {
+                            "Key": "LINKED_ACCOUNT",
+                            "Values": ["123456789012"],
+                        }
+                    }
+                },
+            },
+        ],
+        ids=["tag", "starts-with", "not"],
+    )
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_specification_not_judged_is_na(self, mock_ac, mock_ce, monitor):
+        finding = self._run_linked(mock_ac, mock_ce, [monitor])
+        assert finding["Status"] == "N/A"
+        assert monitor["MonitorName"] in finding["Finding_Details"]
 
     @patch("agentcore_app.ce_client")
     @patch("agentcore_app.agentcore_client")
@@ -55036,11 +55534,18 @@ class TestAC35PolicyInputGuards:
         },
     ]
 
-    def _run(self, statements, targets=None, target_error=None, s3_objects=None):
+    def _run(
+        self,
+        statements,
+        targets=None,
+        target_error=None,
+        s3_objects=None,
+        apigateway=None,
+    ):
         """Gateway gw-a enforces `statements[0]`, gw-b `statements[1]`; both
         front Lambda target pay with the inline tools above, plus `targets`.
         `s3_objects` maps "bucket/key" to the bytes GetObject returns; any other
-        key is denied, so no test reaches S3."""
+        key is denied, so no test reaches S3. `apigateway` serves GetExport."""
         mock_ac = MagicMock()
         mock_ac.list_gateways.return_value = {
             "items": [
@@ -55090,6 +55595,11 @@ class TestAC35PolicyInputGuards:
         with (
             patch("agentcore_app.agentcore_client", mock_ac),
             patch("agentcore_app.s3_client", self.s3),
+            patch(
+                "agentcore_app.apigateway_client",
+                apigateway or MagicMock(),
+                create=True,
+            ),
         ):
             findings = agentcore_app.check_agentcore_policy_input_guards()
         for finding in findings:
@@ -55481,6 +55991,148 @@ class TestAC35PolicyInputGuards:
         assert reason in rows["gw-a"]["Finding_Details"]
         assert rows["gw-b"]["Status"] == "Passed"
 
+    # The stage's export: POST /send and GET /send carry an operationId, and
+    # DELETE /admin/purge carries none, so only a tool override names it.
+    _EXPORT = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/send": {
+                "post": {
+                    "operationId": "send",
+                    "parameters": [{"name": "note", "in": "query"}],
+                },
+                "get": {
+                    "operationId": "peek",
+                    "parameters": [{"name": "note", "in": "query"}],
+                },
+            },
+            "/admin/purge": {
+                "delete": {"parameters": [{"name": "note", "in": "query"}]}
+            },
+        },
+    }
+
+    def _api_gateway(self, error=None, overrides=True):
+        """Target api fronts stage prod of REST API abc123, selecting POST
+        /send and DELETE /admin/*, with GetExport serving _EXPORT."""
+        client = MagicMock()
+        if error is not None:
+            client.get_export.side_effect = error
+        else:
+            client.get_export.side_effect = lambda **_: {
+                "body": io.BytesIO(json.dumps(self._EXPORT).encode())
+            }
+        tool_configuration = {
+            "toolFilters": [
+                {"filterPath": "/send", "methods": ["POST"]},
+                {"filterPath": "/admin/*", "methods": ["DELETE"]},
+            ]
+        }
+        if overrides:
+            tool_configuration["toolOverrides"] = [
+                {"path": "/admin/purge", "method": "DELETE", "name": "purge"}
+            ]
+        target = {
+            "t-api": {
+                "name": "api",
+                "targetConfiguration": {
+                    "mcp": {
+                        "apiGateway": {
+                            "restApiId": "abc123",
+                            "stage": "prod",
+                            "apiGatewayToolConfiguration": tool_configuration,
+                        }
+                    }
+                },
+            }
+        }
+        return target, client
+
+    @pytest.mark.parametrize("tool", ["send", "purge"])
+    def test_an_api_gateway_operation_is_judged_from_the_stage_export(self, tool):
+        target, client = self._api_gateway()
+        rows = self._run(
+            [
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action=f'action == AgentCore::Action::"api___{tool}"',
+                ),
+                _input_forbid(
+                    'when { context.input has note && context.input.note == "x" }',
+                    action=f'action == AgentCore::Action::"api___{tool}"',
+                ),
+            ],
+            targets=target,
+            apigateway=client,
+        )
+        assert rows["gw-a"]["Status"] == "Failed"
+        assert (
+            f"context.input.note on api___{tool}, whose schema does not list"
+            in rows["gw-a"]["Finding_Details"]
+        )
+        assert rows["gw-b"]["Status"] == "Passed"
+        client.get_export.assert_called_with(
+            restApiId="abc123",
+            stageName="prod",
+            exportType="oas30",
+            accepts="application/json",
+        )
+
+    def test_an_operation_the_filters_leave_out_is_not_a_tool(self):
+        target, client = self._api_gateway()
+        rows = self._run(
+            [
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action='action == AgentCore::Action::"api___peek"',
+                ),
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action='action == AgentCore::Action::"api___send"',
+                ),
+            ],
+            targets=target,
+            apigateway=client,
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert "api___peek, which no operation" in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "error, overrides, reason",
+        [
+            (
+                ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetExport"
+                ),
+                True,
+                "export was not read (API Gateway GetExport AccessDenied)",
+            ),
+            (
+                None,
+                False,
+                "DELETE /admin/purge has no operationId and no tool override",
+            ),
+        ],
+        ids=["denied", "unnamed-operation"],
+    )
+    def test_an_unread_api_gateway_export_is_na(self, error, overrides, reason):
+        target, client = self._api_gateway(error=error, overrides=overrides)
+        rows = self._run(
+            [
+                _input_forbid(
+                    'when { context.input.note == "x" }',
+                    action='action == AgentCore::Action::"api___send"',
+                ),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=target,
+            apigateway=client,
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert reason in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
     def test_an_s3_openapi_schema_is_na(self):
         target = {
             "t-api": {
@@ -55768,6 +56420,329 @@ class TestAC35PolicyInputGuards:
         assert rows["gw-a"]["Status"] == "N/A"
         assert reason in rows["gw-a"]["Finding_Details"]
         assert rows["gw-b"]["Status"] == "Passed"
+
+
+class TestAC53AgentLogScheduledQueries:
+    """AIR-FND-DET-10: an enabled scheduled Logs Insights query reads each
+    AgentCore runtime log group."""
+
+    _A = "/aws/bedrock-agentcore/runtimes/rt-a-DEFAULT"
+    _B = "/aws/bedrock-agentcore/runtimes/rt-b-DEFAULT"
+    _ARN = "arn:aws:logs:us-east-1:123456789012:scheduled-query:"
+
+    def _query(self, name, groups, state="ENABLED", status="Complete"):
+        return (
+            {
+                "scheduledQueryArn": f"{self._ARN}{name}",
+                "name": name,
+                "state": state,
+                "lastExecutionStatus": status,
+            },
+            {"logGroupIdentifiers": list(groups)},
+        )
+
+    def _run(self, queries, groups=None, get_error=None, list_error=None):
+        logs = MagicMock()
+        logs.describe_log_groups.return_value = {
+            "logGroups": [{"logGroupName": g} for g in (groups or [self._A, self._B])]
+        }
+        if list_error is not None:
+            logs.list_scheduled_queries.side_effect = list_error
+        else:
+            logs.list_scheduled_queries.return_value = {
+                "scheduledQueries": [summary for summary, _ in queries]
+            }
+        details = {summary["scheduledQueryArn"]: detail for summary, detail in queries}
+
+        def get(identifier):
+            if get_error is not None:
+                raise get_error
+            return details[identifier]
+
+        logs.get_scheduled_query.side_effect = get
+        with patch("agentcore_app.logs_client", logs):
+            findings = agentcore_app.check_agentcore_agent_log_scheduled_queries()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-53"
+            assert finding["Finding"] == "AgentCore Agent Log Scheduled Queries"
+        self.logs = logs
+        return findings
+
+    def test_every_runtime_group_named_by_an_enabled_query_passes(self):
+        (finding,) = self._run(
+            [
+                self._query("by-name", [self._A]),
+                self._query(
+                    "by-arn",
+                    [f"arn:aws:logs:us-east-1:123456789012:log-group:{self._B}:*"],
+                ),
+            ]
+        )
+        assert finding["Status"] == "Passed"
+        assert f"{self._A} by by-name" in finding["Finding_Details"]
+        assert f"{self._B} by by-arn" in finding["Finding_Details"]
+        self.logs.describe_log_groups.assert_called_with(
+            logGroupNamePrefix="/aws/bedrock-agentcore/runtimes/"
+        )
+
+    @pytest.mark.parametrize(
+        "state, status",
+        [("DISABLED", "Complete"), ("ENABLED", "InvalidQuery"), ("ENABLED", "Failed")],
+        ids=["disabled", "invalid-query", "failed"],
+    )
+    def test_a_disabled_or_failing_query_does_not_count(self, state, status):
+        (finding,) = self._run(
+            [
+                self._query("good", [self._A]),
+                self._query("bad", [self._B], state=state, status=status),
+            ]
+        )
+        assert finding["Status"] == "Failed"
+        assert "1 of 2 AgentCore runtime log group(s)" in finding["Finding_Details"]
+        assert self._B in finding["Finding_Details"]
+
+    def test_no_scheduled_query_fails(self):
+        (finding,) = self._run([])
+        assert finding["Status"] == "Failed"
+        assert "2 of 2" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize("leg", ["list", "get"])
+    def test_a_failed_read_never_passes(self, leg):
+        error = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "X")
+        (finding,) = self._run(
+            [self._query("q", [self._A, self._B])],
+            list_error=error if leg == "list" else None,
+            get_error=error if leg == "get" else None,
+        )
+        assert finding["Status"] == "N/A"
+        assert "AccessDenied" in finding["Finding_Details"]
+
+    def test_no_runtime_log_group_gets_no_row(self):
+        logs = MagicMock()
+        logs.describe_log_groups.return_value = {"logGroups": []}
+        with patch("agentcore_app.logs_client", logs):
+            assert agentcore_app.check_agentcore_agent_log_scheduled_queries() == []
+        logs.list_scheduled_queries.assert_not_called()
+
+    def test_the_handler_registers_the_query_check_once(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_agent_log_scheduled_queries") == 1
+
+
+class TestGatewayMetricAlarms:
+    """AIR-ACR-GW-05: an alarm with actions reads each gateway's Throttles
+    metric (AC-24) and, where a web ACL is associated, its WafBlocks,
+    WafFailOpens and WafFailCloses metrics (AG-27), on a published series."""
+
+    _ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+    _OTHER = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-2"
+    _NS = "AWS/Bedrock-AgentCore"
+
+    @staticmethod
+    def _dims(**values):
+        return [{"Name": name, "Value": value} for name, value in values.items()]
+
+    def _alarm(self, name, metric, dimensions, enabled=True):
+        return {
+            "AlarmName": name,
+            "Namespace": self._NS,
+            "MetricName": metric,
+            "Dimensions": dimensions,
+            "ActionsEnabled": enabled,
+            "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:ops"],
+        }
+
+    def _throttle_dims(self, resource):
+        return self._dims(Operation="InvokeGateway", Protocol="MCP", Resource=resource)
+
+    def _waf_alarms(self, metrics=("WafBlocks", "WafFailOpens", "WafFailCloses")):
+        return [
+            self._alarm(f"waf-{m}", m, self._dims(Resource=self._ARN)) for m in metrics
+        ]
+
+    def _run(self, alarms, listed=None, alarm_error=None, metric_error=None):
+        """Gateway gw-1 has a web ACL and gw-2 has none. `listed` maps a
+        metric name to the dimension lists ListMetrics returns; by default
+        every alarm's own series is listed."""
+        mock_ac = MagicMock()
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-1", "name": "One"},
+                {"gatewayId": "gw-2", "name": "Two"},
+            ]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayArn": self._ARN if gatewayIdentifier == "gw-1" else self._OTHER,
+            **(
+                {
+                    "webAclArn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/a/1"
+                }
+                if gatewayIdentifier == "gw-1"
+                else {}
+            ),
+        }
+        if listed is None:
+            listed = {}
+            for alarm in alarms:
+                listed.setdefault(alarm["MetricName"], []).append(alarm["Dimensions"])
+        cloudwatch = MagicMock()
+        if alarm_error is not None:
+            cloudwatch.describe_alarms.side_effect = alarm_error
+        else:
+            cloudwatch.describe_alarms.return_value = {"MetricAlarms": alarms}
+        if metric_error is not None:
+            cloudwatch.list_metrics.side_effect = metric_error
+        else:
+            cloudwatch.list_metrics.side_effect = lambda **kwargs: {
+                "Metrics": [
+                    {
+                        "Namespace": self._NS,
+                        "MetricName": kwargs["MetricName"],
+                        "Dimensions": dimensions,
+                    }
+                    for dimensions in listed.get(kwargs["MetricName"], [])
+                ]
+            }
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.cloudwatch_client", cloudwatch),
+        ):
+            findings = agentcore_app.check_agentcore_gateway_metric_alarms()
+        self.cloudwatch = cloudwatch
+        return {
+            (f["Check_ID"], f["Finding_Details"].split("(", 2)[1][:4]): f
+            for f in findings
+        }
+
+    def test_alarms_on_each_published_series_pass(self):
+        rows = self._run(
+            [
+                self._alarm("throttle-1", "Throttles", self._throttle_dims(self._ARN)),
+                self._alarm(
+                    "throttle-all",
+                    "Throttles",
+                    self._dims(Operation="InvokeGateway", Protocol="MCP"),
+                ),
+                *self._waf_alarms(),
+            ]
+        )
+        assert set(rows) == {("AC-24", "gw-1"), ("AC-24", "gw-2"), ("AG-27", "gw-1")}
+        assert all(row["Status"] == "Passed" for row in rows.values())
+        assert "throttle-1, throttle-all" in rows[("AC-24", "gw-1")]["Finding_Details"]
+        assert "throttle-1" not in rows[("AC-24", "gw-2")]["Finding_Details"]
+        assert (
+            "WafFailCloses is read by alarm waf-WafFailCloses"
+            in (rows[("AG-27", "gw-1")]["Finding_Details"])
+        )
+        # One DescribeAlarms read and one ListMetrics read per metric serve
+        # both gateways.
+        assert self.cloudwatch.describe_alarms.call_count == 1
+        assert self.cloudwatch.list_metrics.call_count == 4
+
+    @pytest.mark.parametrize(
+        "dimensions, enabled",
+        [
+            (
+                {"Operation": "InvokeGateway", "Protocol": "MCP", "Resource": _OTHER},
+                True,
+            ),
+            (
+                {
+                    "Operation": "InvokeGateway",
+                    "Protocol": "MCP",
+                    "Resource": _ARN,
+                    "Name": "t___x",
+                },
+                True,
+            ),
+            (
+                {
+                    "Operation": "InvokeGateway",
+                    "Protocol": "MCP",
+                    "Resource": _ARN,
+                    "Method": "tools/list",
+                },
+                True,
+            ),
+            ({"Operation": "InvokeAgentRuntime", "Resource": _ARN}, True),
+            (
+                {"Operation": "InvokeGateway", "Protocol": "MCP", "Resource": _ARN},
+                False,
+            ),
+        ],
+        ids=["other-gateway", "one-tool", "one-method", "runtime", "no-actions"],
+    )
+    def test_a_throttle_alarm_that_misses_this_gateway_fails(self, dimensions, enabled):
+        rows = self._run(
+            [
+                self._alarm(
+                    "throttle", "Throttles", self._dims(**dimensions), enabled=enabled
+                ),
+                *self._waf_alarms(),
+            ]
+        )
+        row = rows[("AC-24", "gw-1")]
+        assert row["Status"] == "Failed"
+        assert row["Finding"] == "AgentCore Gateway Throttle Alarm"
+        assert "no alarm with actions reads Throttles" in row["Finding_Details"]
+        assert self._ARN in row["Resolution"]
+
+    def test_an_alarm_on_an_unpublished_series_is_not_applicable(self):
+        rows = self._run(
+            [
+                self._alarm("throttle", "Throttles", self._throttle_dims(self._ARN)),
+                *self._waf_alarms(),
+            ],
+            listed={
+                "Throttles": [],
+                "WafBlocks": [],
+                "WafFailOpens": [],
+                "WafFailCloses": [],
+            },
+        )
+        assert rows[("AC-24", "gw-1")]["Status"] == "N/A"
+        assert (
+            "ListMetrics lists no such series"
+            in (rows[("AC-24", "gw-1")]["Finding_Details"])
+        )
+        assert rows[("AG-27", "gw-1")]["Status"] == "N/A"
+
+    def test_a_missing_waf_metric_alarm_fails_naming_it(self):
+        rows = self._run(
+            [
+                self._alarm("throttle", "Throttles", self._throttle_dims(self._ARN)),
+                *self._waf_alarms(("WafBlocks", "WafFailOpens")),
+            ]
+        )
+        row = rows[("AG-27", "gw-1")]
+        assert row["Status"] == "Failed"
+        assert row["Finding"] == "Agentic AI Gateway WAF Metric Alarms"
+        assert "no alarm with actions reads WafFailCloses in" in row["Finding_Details"]
+        assert "WafBlocks," not in row["Finding_Details"]
+        assert rows[("AC-24", "gw-1")]["Status"] == "Passed"
+
+    @pytest.mark.parametrize("leg", ["alarms", "metrics"])
+    def test_a_failed_read_never_passes(self, leg):
+        error = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "X")
+        rows = self._run(
+            [
+                self._alarm("throttle", "Throttles", self._throttle_dims(self._ARN)),
+                *self._waf_alarms(),
+            ],
+            alarm_error=error if leg == "alarms" else None,
+            metric_error=error if leg == "metrics" else None,
+        )
+        assert rows[("AC-24", "gw-1")]["Status"] == "N/A"
+        assert rows[("AG-27", "gw-1")]["Status"] == "N/A"
+        assert "failed with AccessDenied" in rows[("AC-24", "gw-1")]["Finding_Details"]
+        # No alarm reads gw-2's series at all, which needs no ListMetrics read.
+        assert rows[("AC-24", "gw-2")]["Status"] == (
+            "N/A" if leg == "alarms" else "Failed"
+        )
+
+    def test_the_handler_registers_the_alarm_check_once(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_gateway_metric_alarms") == 1
 
 
 class TestGatewayWafUnreadFrontDoors:
@@ -56732,6 +57707,12 @@ class TestAC41EvaluationPersonalData:
                     "evaluatorArn": "arn:aws:bedrock-agentcore:::evaluator/Builtin.Helpfulness",
                 },
                 {
+                    "evaluatorId": "ThirdParty.DeepEval.Toxicity",
+                    "evaluatorName": "ThirdParty.DeepEval.Toxicity",
+                    "evaluatorType": "ThirdParty",
+                    "evaluatorArn": "arn:aws:bedrock-agentcore:::evaluator/ThirdParty.DeepEval.Toxicity",
+                },
+                {
                     "evaluatorId": "ev-1",
                     "evaluatorName": "tone",
                     "evaluatorType": "Custom",
@@ -56839,6 +57820,13 @@ class TestAC41EvaluationPersonalData:
         assert "Personal data in any other form is not detected" in details
         assert all(
             "Builtin" not in str(c) for c in mock_ac.get_evaluator.call_args_list
+        )
+        # A ThirdParty evaluator's ARN names no account, so the account-scoped
+        # grants deny both reads; it is AWS's own and not in the population.
+        assert all(
+            "ThirdParty" not in str(c)
+            for c in mock_ac.get_evaluator.call_args_list
+            + mock_ac.list_tags_for_resource.call_args_list
         )
         assert {
             c.kwargs["resourceArn"]

@@ -800,7 +800,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-01", "AC-08", "AC-10", "AC-47"],
+        ["AC-01", "AC-08", "AC-10", "AC-47", "AC-27", "AC-48"],
         "AC-47 passes the network leg only on a resource policy Deny that refuses the "
         "invoke action to every principal outside a bounded aws:SourceVpc or "
         "aws:SourceVpce value. A Deny keyed on aws:SourceIp or aws:VpcSourceIp, alone "
@@ -827,7 +827,12 @@ AI_SUBJECT_ROWS = [
         "bedrock-agentcore interface endpoint whose policy does not allow "
         "GetRuntimeProtectedResourceMetadata to Principal '*' on that runtime with only "
         "network conditions, because the OAuth discovery call carries no SigV4 "
-        "identity, and a Deny reaching it on any non-network key blocks it. "
+        "identity, and a Deny reaching it on any non-network key blocks it. The "
+        "trust-policy hardening the gateway-role restriction requires is judged on "
+        "each gateway's execution role: AC-27 fails a service or wildcard statement "
+        "whose aws:SourceArn does not name a gateway, or admits another gateway that "
+        "runs with a different role, and AC-48 fails a missing deputy guard, another "
+        "service principal and an account-root principal on it. "
         "AC-10 fails an Allow that opens the runtime to any principal without binding "
         "the caller's account or organization. AC-01's VPC Placement Guardrail fails "
         "unless an attached SCP denies CreateAgentRuntime, UpdateAgentRuntime, "
@@ -1334,7 +1339,14 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-31", "AC-32"],
+        ["AC-31", "AC-32", "AC-30"],
+        "AC-30 asks the allow-list layer of each runtime, since a runtime invoked "
+        "directly passes no gateway authorizer: a customJWTAuthorizer that pins "
+        "neither allowedAudience nor allowedClients fails, a blank or * value does "
+        "not count, a discoveryUrl that is not https fails, and a runtime with no "
+        "authorizer passes because it accepts no bearer token. It reads the version "
+        "GetAgentRuntime returns by default and each other version an endpoint "
+        "serves, on its own row. "
         "AC-31 reads each gateway JWT authorizer's allow-lists and fails a gateway "
         "that pins neither allowedAudience nor allowedClients, because it then honours "
         "any token its issuer minted for any application registered there; a list "
