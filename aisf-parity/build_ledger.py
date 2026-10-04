@@ -1832,7 +1832,14 @@ AI_SUBJECT_ROWS = [
         "answered. A deciding BLOCK passes only when the VPC's DNS Firewall config has "
         "FirewallFailOpen DISABLED: ENABLED fails, because VPC Resolver answers every "
         "query while DNS Firewall is impaired, and any other value is Not Applicable with "
-        "the value named. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
+        "the value named. "
+        "AC-49's Network Firewall rows follow each hosting subnet's internet routes "
+        "to a firewall endpoint in the VPC, through a NAT gateway, or through the "
+        "transit gateway route table the VPC's attachment is associated with to a VPC "
+        "attachment of this account and on through the subnets that attachment uses. A "
+        "firewall reached through a transit gateway must set a HOME_NET that holds the "
+        "hosting subnets, and a route to another account's VPC, a VPN, Direct Connect, "
+        "peering or Connect attachment, or a prefix-list route is N/A. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
         "does not substitute for this: the devguide lists those keys while the "
         "machine-readable IAM reference lists none for CreateGatewayTarget or "
         "UpdateGatewayTarget, so such a Deny can fail open. The tool-level allow-list "
@@ -1915,17 +1922,36 @@ FOUNDATION_ROWS = [
         "AIR-FND-NET-03",
         COVERED,
         None,
-        "agentcore_assessments",
-        ["AC-49", "AC-01"],
+        ["agentcore_assessments", "sagemaker_assessments"],
+        ["AC-49", "AC-01", "SM-39"],
         "AC-01 is the security-group port leg: on each VPC-mode AgentCore runtime, "
         "code interpreter and browser it fails an outbound rule naming an IP range or "
         "prefix list that allows every protocol, or TCP or UDP ports 1 (or lower) "
         "through 65535, and a passing row lists the protocol and ports each such rule "
         "allows. The control names no port list, so a named port is reported and not "
         "graded. A rule naming only a security group is not judged on ports. "
-        "The population of both checks is AgentCore's hosting VPCs. ECS services "
-        "and VPC Lambda functions are judged by the SageMaker module's SM-39 under "
-        "AIR-SLF-RT-02, not in this row, and other AI workloads are not read here. "
+        "SM-39 extends the population to every VPC an ECS awsvpc service, a "
+        "VPC-attached Lambda function, an EKS cluster or an EC2 instance runs in, and "
+        "fails an ECS service or Lambda function whose security groups together allow "
+        "egress to any destination, a DNS Firewall whose first rule in force over "
+        "every name is not a BLOCK or that fails open, and an internet route that "
+        "reaches an internet gateway, alone or through a NAT gateway, without passing "
+        "a Network Firewall whose policy holds an ALLOWLIST domain group over TLS_SNI "
+        "and HTTP_HOST. In those VPCs a transit gateway route is N/A and the two "
+        "allow-lists are not compared. "
+        "AC-49's Network Firewall rows follow each hosting subnet's internet routes "
+        "to a firewall endpoint in the VPC, through a NAT gateway, or through the "
+        "transit gateway route table the VPC's attachment is associated with to a VPC "
+        "attachment of this account and on through the subnets that attachment uses. A "
+        "firewall reached through a transit gateway must set a HOME_NET that holds the "
+        "hosting subnets, and a route to another account's VPC, a VPN, Direct Connect, "
+        "peering or Connect attachment, or a prefix-list route is N/A. AC-49's Egress Allow-List Sync row "
+        "compares the names the VPC's DNS Firewall answers ahead of its BLOCK over "
+        '"*" with each reached firewall\'s ALLOWLIST Targets, reading a Network '
+        'Firewall ".example.com" as example.com and its subdomains and a DNS '
+        'Firewall "*.example.com" as the subdomains only, and fails a name one '
+        "list admits and the other does not; a DNS Firewall that is not an "
+        "allow-list, one allowing an AWS managed list, or an unread list is N/A. "
         "AC-49 asserts an egress allow-list by destination name on each VPC that "
         "hosts an AgentCore runtime, at any version ListAgentRuntimeVersions "
         "returns, browser or code interpreter. It passes only "

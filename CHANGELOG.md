@@ -330,6 +330,21 @@ section.
     does not make this read.
   - `AIR-ACR-RT-13` now maps `AC-01`, whose VPC Placement Guardrail judges
     the create-time SCP Null leg the control asks for.
+  - `AC-49` follows a hosting subnet's route to a transit gateway: the VPC's
+    attachment, the route table it is associated with, each active route
+    overlapping the subnet route that reaches the internet, and each VPC
+    attachment such a route names, whose subnets are judged as the hosting
+    subnets are. Before, every transit gateway route read `N/A`. A firewall
+    reached in another VPC with no `HOME_NET` fails the allow-list, because
+    it inspects only its own VPC's traffic. A route to a non-VPC attachment,
+    a prefix list, a truncated route search, or a VPC in another account is
+    `N/A` naming it, and a denied read is `N/A` naming the action.
+  - `AC-49` adds an `AgentCore Egress Allow-List Sync` row per hosting VPC. It
+    fails when the DNS Firewall allow-list ahead of a `BLOCK` over `"*"` and a
+    reached firewall's `ALLOWLIST` admit different names, naming each one,
+    and is `N/A` when either list cannot be read or is absent.
+  - `AIR-ACR-NET-03` now maps `SM-39`, whose egress legs judge the ECS,
+    Lambda, EKS and EC2 VPCs the control names.
 
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.
@@ -1724,6 +1739,14 @@ already uses, and `AC-26`'s owner read reuses
 `s3:GetBucketObjectLockConfiguration`. A container runtime's image now costs
 up to 512 MiB of layer download per assessed image, inside the AgentCore
 assessment Lambda's existing 600 second timeout.
+
+**AgentCore transit gateway egress reads.** `AgentCoreAssessmentReadsPolicy`
+gains `ec2:DescribeTransitGatewayAttachments` and
+`ec2:DescribeTransitGatewayVpcAttachments` on `*`, since neither action has a
+resource type, and `ec2:SearchTransitGatewayRoutes` on this account's
+`transit-gateway-route-table/*` (`AC-49`). Until the stack is updated, a VPC
+whose hosting subnets route to a transit gateway reads `N/A` naming the
+denied action.
 
 **SageMaker IoT audit and monitoring execution reads.**
 `SageMakerAssessmentReadsPolicy` gains `iot:ListAuditTasks` and

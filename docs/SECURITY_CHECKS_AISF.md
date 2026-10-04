@@ -248,7 +248,7 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 182 check-control pairs over 113 tagged checks in 4 modules, naming 103
+every run: 183 check-control pairs over 113 tagged checks in 4 modules, naming 103
 distinct controls. Tagged checks per module are bedrock 33, sagemaker 26,
 agentcore 50, agent_registry 4.
 
@@ -266,7 +266,7 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 54 bare, 0 `(partial)`, 128
+Census at the current head, also printed by gate 14: 54 bare, 0 `(partial)`, 129
 joint. The 54 bare tags plus the 49 jointly covered controls account for the 103
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
 incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
@@ -467,12 +467,12 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 424/424 find-strings validated`, aborting and naming each entry whose
+   `entries 435/435 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 424 ways and requires a ledger gate or a test to go red for
+   breaks the code 435 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
-   in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown renderer, 1 in the census anchor, 1 in the published battery figures, 2 in the coverage bullets, 1 in the multi-control figures, 2 in the report section's coverage figures, 1 in the foundation scope, 3 in `SM-39`'s egress legs, 2 in `SM-43`'s artifact reads, 23 in the SageMaker verdict legs, 4 in the live tag probe, 1 in the Bedrock condition parsers, 1 in the Bedrock endpoint collector, 1 in the Bedrock cross-Region agent roles, 1 in the Bedrock CloudTrail Lake reader, 5 in the Bedrock training bucket policies, 1 in the Bedrock AI user population, 8 in the Bedrock knowledge base stores, 2 in the Bedrock data path TLS exemptions, 1 in the Bedrock AgentCore memory retention, 9 in the Bedrock knowledge base redaction, 1 in the Bedrock guardrail output probe, 1 in the Bedrock Identity Center attributes, 2 in the Bedrock invocation log entries, 2 in the Bedrock knowledge base classification, 6 in the Bedrock owner tag sweep, 1 in the Bedrock profiles in use, 2 in the Bedrock agent workload identity, 3 in the Bedrock container image scanning, 3 in the Bedrock management-account SCP credit, 2 in the Bedrock Region deny service prefixes, 3 in the Bedrock data path inventory, 1 in the Bedrock attestation pins, 1 in the Bedrock AI opt-out delegation, 1 in the Bedrock guardrail secrets regex, 3 in the Bedrock AI role chains, 2 in the Bedrock prompt creators, 5 in the Bedrock runtime inbound gate, 5 in the Bedrock workload route tables, 8 in the Bedrock guardrail record legs, 2 in the Bedrock Macie discovery requirement, 5 in the Bedrock agent and SageMaker retention legs and 8 in the Bedrock invocation log guardrail evidence, 8 in the Bedrock invocation log WORM archive, 11 in the Bedrock GuardDuty prompt injection leg, 15 in the Bedrock agent role scope, 14 in the Bedrock inference trace, 5 in the Bedrock Marketplace invocation gate and 212 in the AgentCore verdict legs. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
+   in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown renderer, 1 in the census anchor, 1 in the published battery figures, 2 in the coverage bullets, 1 in the multi-control figures, 2 in the report section's coverage figures, 1 in the foundation scope, 3 in `SM-39`'s egress legs, 2 in `SM-43`'s artifact reads, 23 in the SageMaker verdict legs, 4 in the live tag probe, 1 in the Bedrock condition parsers, 1 in the Bedrock endpoint collector, 1 in the Bedrock cross-Region agent roles, 1 in the Bedrock CloudTrail Lake reader, 5 in the Bedrock training bucket policies, 1 in the Bedrock AI user population, 8 in the Bedrock knowledge base stores, 2 in the Bedrock data path TLS exemptions, 1 in the Bedrock AgentCore memory retention, 9 in the Bedrock knowledge base redaction, 1 in the Bedrock guardrail output probe, 1 in the Bedrock Identity Center attributes, 2 in the Bedrock invocation log entries, 2 in the Bedrock knowledge base classification, 6 in the Bedrock owner tag sweep, 1 in the Bedrock profiles in use, 2 in the Bedrock agent workload identity, 3 in the Bedrock container image scanning, 3 in the Bedrock management-account SCP credit, 2 in the Bedrock Region deny service prefixes, 3 in the Bedrock data path inventory, 1 in the Bedrock attestation pins, 1 in the Bedrock AI opt-out delegation, 1 in the Bedrock guardrail secrets regex, 3 in the Bedrock AI role chains, 2 in the Bedrock prompt creators, 5 in the Bedrock runtime inbound gate, 5 in the Bedrock workload route tables, 8 in the Bedrock guardrail record legs, 2 in the Bedrock Macie discovery requirement, 5 in the Bedrock agent and SageMaker retention legs and 8 in the Bedrock invocation log guardrail evidence, 8 in the Bedrock invocation log WORM archive, 11 in the Bedrock GuardDuty prompt injection leg, 15 in the Bedrock agent role scope, 14 in the Bedrock inference trace, 5 in the Bedrock Marketplace invocation gate and 223 in the AgentCore verdict legs. Gate 20 derives every figure in this step from `mutate.py`'s own entry list and
    fails if this paragraph disagrees with it, because the earlier copy of this
    sentence went stale at 17 while the battery grew to 22 and nothing read the
    two together. The last of those entries is what keeps gate 20 itself honest:

@@ -339,6 +339,9 @@ _EXPECTED_ACTIONS = {
         "access-analyzer:ListAnalyzers",
         "bedrock-agentcore:ListTagsForResource",
         "cloudfront:ListDistributions",
+        "ec2:DescribeTransitGatewayAttachments",
+        "ec2:DescribeTransitGatewayVpcAttachments",
+        "ec2:SearchTransitGatewayRoutes",
         "ecr:BatchGetImage",
         "ecr:DescribeImages",
         "ecr:GetDownloadUrlForLayer",
@@ -1697,6 +1700,23 @@ _AGENTCORE_MANAGED_GRANTS = [
         "Allow",
         "s3:GetObject",
         json.dumps({"Fn::Sub": "${AIMLAssessmentBucket.Arn}/permissions_cache_*.json"}),
+    ),
+    # AC-49's transit gateway hop. The two Describe actions have no resource
+    # type in the service authorization reference (2026-10-04);
+    # SearchTransitGatewayRoutes takes transit-gateway-route-table.
+    ("Allow", "ec2:DescribeTransitGatewayAttachments", json.dumps("*")),
+    ("Allow", "ec2:DescribeTransitGatewayVpcAttachments", json.dumps("*")),
+    (
+        "Allow",
+        "ec2:SearchTransitGatewayRoutes",
+        json.dumps(
+            {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:"
+                    "transit-gateway-route-table/*"
+                )
+            }
+        ),
     ),
     # AC-34 code archives and AC-35 tool schemas, read by exact key.
     (

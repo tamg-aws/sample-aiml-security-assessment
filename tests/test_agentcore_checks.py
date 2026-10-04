@@ -48875,13 +48875,18 @@ class TestAC49NetworkFirewallEgress:
         groups=None,
         nat_subnets=None,
         log_types=None,
+        tgw=None,
     ):
         """Stub VPC-mode runtimes, their subnets' routes and the firewalls.
 
         subnets maps subnet id to (vpc id, cidr); routes maps subnet id to its
         0.0.0.0/0 target; firewalls maps firewall name to (vpc id, endpoint ids,
         policy name); log_types maps firewall name to the log types it sends to
-        a destination, ALERT and FLOW when absent, or to an exception.
+        a destination, ALERT and FLOW when absent, or to an exception. tgw holds
+        "attachments" (DescribeTransitGatewayAttachments entries), "routes"
+        (transit gateway route table id to its routes) and "vpc_attachments"
+        (attachment id to its DescribeTransitGatewayVpcAttachments entry); any
+        of the three may be an exception the read raises.
         """
         subnets = subnets or {"subnet-a": ("vpc-a", "10.0.1.0/24")}
         runtime_subnets = [s for s in subnets if not s.startswith("subnet-pub")]
@@ -48997,6 +49002,63 @@ class TestAC49NetworkFirewallEgress:
         mock_nfw.describe_logging_configuration.side_effect = (
             describe_logging_configuration
         )
+        tgw = tgw or {}
+
+        def tgw_read(key, select):
+            value = tgw.get(key, [] if key == "attachments" else {})
+            if isinstance(value, Exception):
+                raise value
+            return select(value)
+
+        def describe_transit_gateway_attachments(Filters, **_):
+            wanted = {f["Name"]: f["Values"] for f in Filters}
+            return {
+                "TransitGatewayAttachments": tgw_read(
+                    "attachments",
+                    lambda listed: [
+                        a
+                        for a in listed
+                        if all(
+                            a.get(
+                                {
+                                    "resource-id": "ResourceId",
+                                    "transit-gateway-id": "TransitGatewayId",
+                                    "resource-type": "ResourceType",
+                                }[name]
+                            )
+                            in values
+                            for name, values in wanted.items()
+                        )
+                    ],
+                )
+            }
+
+        mock_ec2.describe_transit_gateway_attachments.side_effect = (
+            describe_transit_gateway_attachments
+        )
+        mock_ec2.search_transit_gateway_routes.side_effect = (
+            lambda TransitGatewayRouteTableId, Filters, **_: {
+                "Routes": tgw_read(
+                    "routes",
+                    lambda tables: [
+                        route
+                        for route in tables.get(TransitGatewayRouteTableId, [])
+                        if route.get("State") in Filters[0]["Values"]
+                    ],
+                ),
+                "AdditionalRoutesAvailable": tgw.get("truncated", False),
+            }
+        )
+        mock_ec2.describe_transit_gateway_vpc_attachments.side_effect = (
+            lambda TransitGatewayAttachmentIds, **_: {
+                "TransitGatewayVpcAttachments": tgw_read(
+                    "vpc_attachments",
+                    lambda listed: [
+                        listed[i] for i in TransitGatewayAttachmentIds if i in listed
+                    ],
+                )
+            }
+        )
         return None
 
     @staticmethod
@@ -49022,9 +49084,12 @@ class TestAC49NetworkFirewallEgress:
         findings = self._run(mock_ac, mock_ec2, mock_nfw)
 
         rows = self._rows(findings)
-        assert len(findings) == 2
+        # Round 8: a third row compares the DNS and Network Firewall
+        # allow-lists, N/A here because no Route 53 Resolver client is wired.
+        assert len(findings) == 3
         assert rows["egress"]["Status"] == "Passed"
         assert rows["threat"]["Status"] == "Passed"
+        assert rows["egress Allow-List Sync"]["Status"] == "N/A"
         assert "firewall(s) fw1" in rows["egress"]["Finding_Details"]
         assert all(f["Check_ID"] == "AC-49" for f in findings)
         for finding in findings:
@@ -49304,6 +49369,275 @@ class TestAC49NetworkFirewallEgress:
         )
         assert "fw1's" not in rows["egress"]["Finding_Details"]
 
+    @staticmethod
+    def _tgw(
+        target=("vpc", "vpc-insp"),
+        owner="123456789012",
+        association=True,
+        routes=None,
+        truncated=False,
+    ):
+        """A transit gateway whose route table sends 0.0.0.0/0 from vpc-a to
+        one attachment, by default the inspection VPC's, whose attachment
+        subnet is subnet-tgw."""
+        kind, resource = target
+        attachment = {
+            "TransitGatewayAttachmentId": "tgw-attach-a",
+            "TransitGatewayId": "tgw-1",
+            "ResourceType": "vpc",
+            "ResourceId": "vpc-a",
+            "ResourceOwnerId": "123456789012",
+            "State": "available",
+        }
+        if association:
+            attachment["Association"] = {
+                "TransitGatewayRouteTableId": "tgw-rtb-1",
+                "State": "associated",
+            }
+        return {
+            "attachments": [attachment],
+            "routes": {
+                "tgw-rtb-1": routes
+                if routes is not None
+                else [
+                    {
+                        "DestinationCidrBlock": "0.0.0.0/0",
+                        "State": "active",
+                        "TransitGatewayAttachments": [
+                            {
+                                "TransitGatewayAttachmentId": "tgw-attach-insp",
+                                "ResourceId": resource,
+                                "ResourceType": kind,
+                            }
+                        ],
+                    }
+                ]
+            },
+            "vpc_attachments": {
+                "tgw-attach-insp": {
+                    "TransitGatewayAttachmentId": "tgw-attach-insp",
+                    "VpcId": resource,
+                    "VpcOwnerId": owner,
+                    "SubnetIds": ["subnet-tgw"],
+                }
+            },
+            "truncated": truncated,
+        }
+
+    def _run_tgw(self, mock_ac, mock_ec2, mock_nfw, tgw, inspection, **kwargs):
+        return self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                routes={
+                    "subnet-a": ("TransitGatewayId", "tgw-1"),
+                    "subnet-tgw": inspection,
+                },
+                firewalls={"fw9": ("vpc-insp", ["vpce-fw9"], "p1")},
+                tgw=tgw,
+                **kwargs,
+            )
+        )
+
+    @pytest.mark.parametrize("home_net", [["10.0.0.0/8"], None])
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transit_gateway_route_to_an_inspection_firewall_is_judged(
+        self, mock_ac, mock_ec2, mock_nfw, home_net
+    ):
+        # Before round 8 a transit gateway route was never followed, so a
+        # central inspection VPC read N/A.
+        rows = self._run_tgw(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            self._tgw(),
+            ("VpcEndpointId", "vpce-fw9"),
+            policies={"p1": _nfw_policy(home_net=home_net)},
+        )
+
+        assert rows["threat"]["Status"] == "Passed"
+        details = rows["egress"]["Finding_Details"]
+        if home_net:
+            assert rows["egress"]["Status"] == "Passed"
+            assert "firewall(s) fw9" in details
+        else:
+            assert rows["egress"]["Status"] == "Failed"
+            assert (
+                "firewall fw9 sits in VPC vpc-insp, outside the hosting VPC, and "
+                "sets no HOME_NET, so its allow-list inspects only traffic from "
+                "its own VPC and not hosting subnet(s) subnet-a (10.0.1.0/24)"
+                in details
+            )
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_inspection_vpc_routing_to_an_internet_gateway_fails(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._run_tgw(
+            mock_ac, mock_ec2, mock_nfw, self._tgw(), ("GatewayId", "igw-9")
+        )
+
+        assert rows["egress"]["Status"] == "Failed"
+        assert rows["threat"]["Status"] == "Failed"
+        assert (
+            "subnet-a (0.0.0.0/0 to tgw-1), then 0.0.0.0/0 to attachment "
+            "tgw-attach-insp in VPC vpc-insp, then subnet-tgw (0.0.0.0/0 to igw-9)"
+            in rows["egress"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_internet_route_of_the_transit_gateway_table_is_followed(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        tgw = self._tgw()
+        tgw["routes"]["tgw-rtb-1"] += [
+            {
+                "DestinationCidrBlock": "52.0.0.0/8",
+                "State": "active",
+                "TransitGatewayAttachments": [
+                    {
+                        "TransitGatewayAttachmentId": "tgw-attach-egress",
+                        "ResourceId": "vpc-egress",
+                        "ResourceType": "vpc",
+                    }
+                ],
+            },
+            {
+                "DestinationCidrBlock": "10.9.0.0/16",
+                "State": "active",
+                "TransitGatewayAttachments": [
+                    {
+                        "TransitGatewayAttachmentId": "tgw-attach-private",
+                        "ResourceId": "vpc-private",
+                        "ResourceType": "vpc",
+                    }
+                ],
+            },
+        ]
+        tgw["vpc_attachments"]["tgw-attach-egress"] = {
+            "TransitGatewayAttachmentId": "tgw-attach-egress",
+            "VpcId": "vpc-egress",
+            "VpcOwnerId": "123456789012",
+            "SubnetIds": ["subnet-egress"],
+        }
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                routes={
+                    "subnet-a": ("TransitGatewayId", "tgw-1"),
+                    "subnet-tgw": ("VpcEndpointId", "vpce-fw9"),
+                    "subnet-egress": ("NatGatewayId", "nat-9"),
+                },
+                firewalls={"fw9": ("vpc-insp", ["vpce-fw9"], "p1")},
+                policies={"p1": _nfw_policy(home_net=["10.0.0.0/8"])},
+                tgw=tgw,
+            )
+        )
+
+        details = rows["egress"]["Finding_Details"]
+        assert rows["egress"]["Status"] == "N/A"
+        assert "firewall(s) fw9" in details
+        assert (
+            "subnet-a (0.0.0.0/0 to tgw-1), then 52.0.0.0/8 to attachment "
+            "tgw-attach-egress in VPC vpc-egress, then subnet-egress (0.0.0.0/0 "
+            "to nat-9)" in details
+        )
+        assert "tgw-attach-private" not in details
+        assert "tgw-attach-insp in VPC vpc-insp, then" not in details
+
+    @pytest.mark.parametrize(
+        "tgw, text",
+        [
+            (
+                {"owner": "444455556666"},
+                "then 0.0.0.0/0 to attachment tgw-attach-insp in VPC vpc-insp of "
+                "account 444455556666, whose routes and firewalls this account "
+                "cannot read",
+            ),
+            (
+                {"target": ("vpn", "vpn-1")},
+                "then 0.0.0.0/0 to vpn attachment tgw-attach-insp (vpn-1), which "
+                "this check does not follow",
+            ),
+            (
+                {"association": False},
+                "whose attachment of vpc-a is associated with no route table",
+            ),
+            (
+                {
+                    "routes": [
+                        {
+                            "PrefixListId": "pl-1",
+                            "State": "active",
+                            "TransitGatewayAttachments": [],
+                        }
+                    ]
+                },
+                "then prefix list pl-1, whose entries are not read",
+            ),
+            (
+                {"truncated": True},
+                "whose route table tgw-rtb-1 holds more routes than the search "
+                "returns, so the route taken is not read",
+            ),
+        ],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transit_gateway_hop_not_followed_is_na(
+        self, mock_ac, mock_ec2, mock_nfw, tgw, text
+    ):
+        rows = self._run_tgw(
+            mock_ac, mock_ec2, mock_nfw, self._tgw(**tgw), ("VpcEndpointId", "vpce-fw9")
+        )
+
+        assert rows["egress"]["Status"] == "N/A"
+        assert rows["threat"]["Status"] == "N/A"
+        assert text in rows["egress"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "key, action",
+        [
+            ("attachments", "ec2:DescribeTransitGatewayAttachments"),
+            ("routes", "ec2:SearchTransitGatewayRoutes"),
+            ("vpc_attachments", "ec2:DescribeTransitGatewayVpcAttachments"),
+        ],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_transit_gateway_read_is_na(
+        self, mock_ac, mock_ec2, mock_nfw, key, action
+    ):
+        tgw = self._tgw()
+        tgw[key] = _make_client_error("UnauthorizedOperation", "denied")
+        findings = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            routes={
+                "subnet-a": ("TransitGatewayId", "tgw-1"),
+                "subnet-tgw": ("VpcEndpointId", "vpce-fw9"),
+            },
+            firewalls={"fw9": ("vpc-insp", ["vpce-fw9"], "p1")},
+            tgw=tgw,
+        )
+
+        (row,) = findings
+        assert row["Status"] == "N/A"
+        assert row["Resolution"] == f"Grant {action} and retry."
+        assert "tgw-1" in row["Finding_Details"]
+
     @patch("agentcore_app.network_firewall_client")
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
@@ -49419,7 +49753,8 @@ class TestAC49NetworkFirewallEgress:
 
         findings = agentcore_app.check_agentcore_network_firewall_egress()
 
-        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        # Round 8: the allow-list sync row is N/A on the unread policy.
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "N/A"]
 
     @patch("agentcore_app.network_firewall_client", None)
     @patch("agentcore_app.ec2_client")
@@ -51254,6 +51589,266 @@ def _nfw_stateful_pass(destination="ANY", port="443", protocol="TCP"):
             ]
         }
     }
+
+
+class TestAC49EgressAllowListSync:
+    """AIR-FND-NET-03: the DNS Firewall allow-list and the Network Firewall
+    ALLOWLIST Targets of each firewall a hosting VPC egresses through admit the
+    same names."""
+
+    _SYNC = "AgentCore Egress Allow-List Sync"
+
+    @staticmethod
+    def _dns(mock_r53, vpcs, managed=()):
+        """vpcs maps a VPC id to its rules in evaluation order, each
+        (action, domains) or (action, "managed"), or to an exception the
+        association list raises."""
+        lists = {}
+
+        def associations(VpcId=None, **_):
+            value = vpcs.get(VpcId, [])
+            if isinstance(value, Exception):
+                raise value
+            return {
+                "FirewallRuleGroupAssociations": [
+                    {"FirewallRuleGroupId": f"rslvr-frg-{VpcId}", "Priority": 101}
+                ]
+                if value
+                else []
+            }
+
+        def rules(FirewallRuleGroupId=None, **_):
+            vpc = FirewallRuleGroupId.removeprefix("rslvr-frg-")
+            listed = []
+            for i, (action, domains) in enumerate(vpcs[vpc]):
+                list_id = (
+                    f"rslvr-fdl-managed-{i}"
+                    if domains == "managed"
+                    else f"rslvr-fdl-{vpc}-{i}"
+                )
+                lists[list_id] = [] if domains == "managed" else list(domains)
+                listed.append(
+                    {
+                        "Name": f"rule-{i}",
+                        "Priority": 10 * (i + 1),
+                        "Action": action,
+                        "FirewallDomainListId": list_id,
+                    }
+                )
+            return {"FirewallRules": listed}
+
+        mock_r53.list_firewall_rule_group_associations.side_effect = associations
+        mock_r53.list_firewall_rules.side_effect = rules
+        mock_r53.list_firewall_domains.side_effect = lambda FirewallDomainListId, **_: {
+            "Domains": lists[FirewallDomainListId]
+        }
+        mock_r53.list_firewall_domain_lists.side_effect = lambda **_: {
+            "FirewallDomainLists": [
+                {"Id": list_id, "ManagedOwnerName": "Route 53 Resolver DNS Firewall"}
+                for list_id in lists
+                if "managed" in list_id
+            ]
+        }
+
+    def _run(self, mock_ac, mock_ec2, mock_nfw, mock_r53, vpcs, targets, **wire):
+        """Two hosting VPCs, vpc-a through fw1 and vpc-b through fw2, each
+        firewall with its own allow-list of `targets[name]`."""
+        group = "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/{}".format
+        TestAC49NetworkFirewallEgress()._wire(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            subnets={
+                "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                "subnet-b": ("vpc-b", "10.1.1.0/24"),
+            },
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-b": ("VpcEndpointId", "vpce-fw2"),
+            },
+            firewalls={
+                "fw1": ("vpc-a", ["vpce-fw1"], "p1"),
+                "fw2": ("vpc-b", ["vpce-fw2"], "p2"),
+            },
+            policies={
+                "p1": _nfw_policy(groups=(group("allow-fw1"),)),
+                "p2": _nfw_policy(groups=(group("allow-fw2"),)),
+            },
+            groups={
+                group(name): {
+                    "RulesSource": {
+                        "RulesSourceList": {
+                            "Targets": list(targets[name.removeprefix("allow-")]),
+                            "TargetTypes": ["TLS_SNI", "HTTP_HOST"],
+                            "GeneratedRulesType": "ALLOWLIST",
+                        }
+                    }
+                }
+                for name in ("allow-fw1", "allow-fw2")
+            },
+            **wire,
+        )
+        self._dns(mock_r53, vpcs)
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+        rows = {
+            f["Finding_Details"].split(",", 1)[0].removeprefix("VPC "): f
+            for f in findings
+            if f["Finding"] == self._SYNC
+        }
+        for finding in rows.values():
+            assert finding["Check_ID"] == "AC-49"
+            assert_finding_schema(finding)
+        return rows
+
+    _IN_SYNC = [
+        ("ALLOW", ["example.com.", "*.example.com.", "api.partner.io."]),
+        ("BLOCK", ["*."]),
+    ]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_name_one_list_admits_and_the_other_does_not_fails(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {"vpc-a": self._IN_SYNC, "vpc-b": self._IN_SYNC},
+            {
+                "fw1": [".example.com", "api.partner.io"],
+                "fw2": [".example.com", "evil.io"],
+            },
+        )
+
+        assert rows["vpc-a"]["Status"] == "Passed"
+        assert (
+            "admit the same 3 DNS Firewall name(s) and 2 Network Firewall target(s)"
+            in rows["vpc-a"]["Finding_Details"]
+        )
+        assert rows["vpc-b"]["Status"] == "Failed"
+        details = rows["vpc-b"]["Finding_Details"]
+        assert (
+            "the DNS Firewall allow-list admits api.partner.io, which firewall "
+            "fw2's ALLOWLIST does not" in details
+        )
+        assert (
+            "firewall fw2's ALLOWLIST admits evil.io, which the DNS Firewall "
+            "allow-list does not" in details
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_must_match_on_both_sides(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        # A Network Firewall ".example.com" target admits example.com and every
+        # subdomain; a DNS Firewall "*.example.com" admits only the subdomains.
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {
+                "vpc-a": [("ALLOW", ["*.example.com."]), ("BLOCK", ["*."])],
+                "vpc-b": [("ALLOW", ["www.example.com."]), ("BLOCK", ["*."])],
+            },
+            {"fw1": [".example.com"], "fw2": ["www.example.com"]},
+        )
+
+        assert rows["vpc-a"]["Status"] == "Failed"
+        assert (
+            "firewall fw1's ALLOWLIST admits .example.com, which the DNS Firewall "
+            "allow-list does not" in rows["vpc-a"]["Finding_Details"]
+        )
+        assert rows["vpc-b"]["Status"] == "Passed"
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_block_of_the_same_name_removes_it(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {
+                "vpc-a": [
+                    ("BLOCK", ["api.partner.io."]),
+                    ("BLOCK", "managed"),
+                    ("ALERT", ["example.com.", "api.partner.io."]),
+                    ("BLOCK", ["*."]),
+                ],
+                "vpc-b": [("ALLOW", ["example.com."]), ("BLOCK", ["*."])],
+            },
+            {"fw1": ["example.com"], "fw2": ["example.com", "api.partner.io"]},
+        )
+
+        assert rows["vpc-a"]["Status"] == "Passed"
+        assert rows["vpc-b"]["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "vpc_a, text, action",
+        [
+            (
+                [("ALLOW", ["example.com."]), ("ALERT", ["*."])],
+                "the DNS Firewall associated with vpc-a answers every name, so it "
+                "holds no allow-list to compare",
+                None,
+            ),
+            (
+                [("ALLOW", "managed"), ("BLOCK", ["*."])],
+                "allows an AWS managed domain list, whose names are not read",
+                None,
+            ),
+            (
+                _make_client_error("AccessDeniedException", "denied"),
+                "the DNS Firewall rule groups associated with vpc-a could not be "
+                "listed",
+                "route53resolver:ListFirewallRuleGroupAssociations",
+            ),
+        ],
+    )
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_dns_allow_list_not_read_is_na(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53, vpc_a, text, action
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {"vpc-a": vpc_a, "vpc-b": self._IN_SYNC},
+            {"fw1": [".example.com"], "fw2": [".example.com", "api.partner.io"]},
+        )
+
+        assert rows["vpc-a"]["Status"] == "N/A"
+        assert text in rows["vpc-a"]["Finding_Details"]
+        if action:
+            assert rows["vpc-a"]["Resolution"] == f"Grant {action} and retry."
+        assert rows["vpc-b"]["Status"] == "Passed"
+
+    @patch("agentcore_app.route53resolver_client", None)
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_resolver_client_is_na(self, mock_ac, mock_ec2, mock_nfw):
+        TestAC49NetworkFirewallEgress()._wire(mock_ac, mock_ec2, mock_nfw)
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+        (row,) = [f for f in findings if f["Finding"] == self._SYNC]
+        assert row["Status"] == "N/A"
+        assert "Route 53 Resolver client is not available" in row["Finding_Details"]
 
 
 class TestAC49FirewallBypasses:
@@ -54829,7 +55424,12 @@ class TestAC49FirewallAlertLogging:
             patch("agentcore_app.network_firewall_client", mock_nfw),
         ):
             findings = agentcore_app.check_agentcore_network_firewall_egress(inventory)
-        assert len(findings) == 2
+        # Round 8: the third row is the allow-list sync row, N/A with no
+        # Route 53 Resolver client wired.
+        assert [f["Finding"] for f in findings][2:] == [
+            "AgentCore Egress Allow-List Sync"
+        ]
+        assert len(findings) == 3
         return self._base._rows(findings)
 
     def test_both_firewalls_logging_alerts_pass(self):
