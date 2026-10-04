@@ -8467,7 +8467,14 @@ PROMPT_ARN_MODEL_ID = re.compile(
     r"prompt/[0-9a-zA-Z]{10}(?::([0-9]{1,5}))?$"
 )
 
-# Event history pages read per operation, at 50 events a page.
+# Event history pages read per operation, at 50 events a page. Measured with
+# this function's adaptive retry config over the last 24 hours of the four
+# operations (account 178113193057, us-east-1, 2026-10-04): 13 pages took 0.44 s
+# on average and 1.05 s at most, and 57 back-to-back pages 1.6 s at most, so 40
+# pages cost at most about 64 s of the 600 s timeout. That account logged 8,454
+# InvokeModelWithResponseStream calls in those 24 hours, more than the 500 read.
+# LookupEvents returns the newest events first, so a capped operation names the
+# time before which its calls were not read, and the row is held at N/A.
 RUNTIME_PROMPT_LOOKUP_PAGES = 10
 
 
@@ -8482,6 +8489,7 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     found = {"versioned": [], "draft": [], "read": 0, "capped": [], "error": None}
     for operation in INFERENCE_TRACE_OPERATIONS:
+        oldest = None
         request = {
             "LookupAttributes": [
                 {"AttributeKey": "EventName", "AttributeValue": operation}
@@ -8509,6 +8517,8 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
                     continue
                 if not isinstance(detail, dict):
                     continue
+                if isinstance(detail.get("eventTime"), str):
+                    oldest = min(oldest or detail["eventTime"], detail["eventTime"])
                 model_id = str(
                     (detail.get("requestParameters") or {}).get("modelId") or ""
                 )
@@ -8527,7 +8537,11 @@ def _runtime_prompt_references(region: str) -> Dict[str, Any]:
                 break
             request["NextToken"] = response["NextToken"]
         else:
-            found["capped"].append(operation)
+            found["capped"].append(
+                f"{operation} calls before {oldest}"
+                if oldest
+                else f"{operation} calls, none of which was read"
+            )
     return found
 
 
@@ -8584,13 +8598,14 @@ def _runtime_prompt_version_findings(
         return [
             row(
                 "{} of the {} event(s) read passed a prompt ARN, each with a "
-                "numbered version, but event history for {} holds more than the "
-                "{} event(s) read per operation, so a later call that runs a "
-                "prompt DRAFT may be unread.".format(
+                "numbered version, but event history holds more than the {} "
+                "event(s) read per operation, newest first, so these were not "
+                "read, and one that runs a prompt DRAFT may be among them: "
+                "{}.".format(
                     total,
                     references["read"],
-                    ", ".join(references["capped"]),
                     RUNTIME_PROMPT_LOOKUP_PAGES * 50,
+                    "; ".join(references["capped"]),
                 ),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",

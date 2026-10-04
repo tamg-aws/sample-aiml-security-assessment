@@ -6035,11 +6035,15 @@ class TestBR07PromptProductionVersion:
         ]
 
     @staticmethod
-    def _call(model_id, caller="arn:aws:sts::123456789012:assumed-role/app/s"):
+    def _call(
+        model_id,
+        caller="arn:aws:sts::123456789012:assumed-role/app/s",
+        when="2026-10-04T10:00:00Z",
+    ):
         return {
             "CloudTrailEvent": json.dumps(
                 {
-                    "eventTime": "2026-10-04T10:00:00Z",
+                    "eventTime": when,
                     "userIdentity": {"arn": caller},
                     "requestParameters": {"modelId": model_id},
                 }
@@ -6097,6 +6101,30 @@ class TestBR07PromptProductionVersion:
         )
         assert ("Converse", "1") in calls
 
+    def test_br07_a_capped_lookup_names_the_time_it_stopped_at(self):
+        client = self._flow_client([], {})
+        newer = self._call(f"{self._PROMPT_ARN}:2", when="2026-10-04T11:00:00Z")
+        older = self._call("anthropic.model", when="2026-10-04T09:30:00Z")
+        with patch.object(bedrock_app, "RUNTIME_PROMPT_LOOKUP_PAGES", 2):
+            self._lookup(
+                client,
+                {
+                    "InvokeModel": [[newer], [older], [newer]],
+                    "Converse": [[], [], []],
+                    "ConverseStream": [[self._call(f"{self._PROMPT_ARN}:3")]],
+                },
+            )
+            rows = self._runtime_rows(self._run(client))
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "event history holds more than the 100 event(s) read per operation, "
+            "newest first, so these were not read, and one that runs a prompt "
+            "DRAFT may be among them: InvokeModel calls before "
+            "2026-10-04T09:30:00Z; Converse calls, none of which was read."
+        ) in detail
+        assert "ConverseStream before" not in detail
+
     def test_br07_runtime_calls_naming_versions_pass(self):
         client = self._flow_client([], {})
         self._lookup(
@@ -6122,8 +6150,10 @@ class TestBR07PromptProductionVersion:
             (
                 {"Converse": [[]] * 11},
                 None,
-                "event history for Converse holds more than the 500 event(s) read "
-                "per operation",
+                "event history holds more than the 500 event(s) read per "
+                "operation, newest first, so these were not read, and one that "
+                "runs a prompt DRAFT may be among them: Converse calls, none of "
+                "which was read.",
             ),
             (
                 {},

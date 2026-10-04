@@ -1807,6 +1807,14 @@ MUTATIONS = [
         "replace": '                found["versioned"].append(label)\n',
     },
     {
+        "name": "BR-07 runtime: a capped lookup names its newest event",
+        "file": BEDROCK,
+        "defect": "event history is read newest first, so naming the newest time "
+        "read as the cap claims every older call of the window was read",
+        "find": '                    oldest = min(oldest or detail["eventTime"], detail["eventTime"])\n',
+        "replace": '                    oldest = max(oldest or detail["eventTime"], detail["eventTime"])\n',
+    },
+    {
         "name": "BR-06 centralization: any CloudTrail table credited",
         "file": BEDROCK,
         "defect": "a Glue table under no recording trail's log root was credited as central",
@@ -4740,6 +4748,9 @@ GROUPS: dict[str, str] = {
     "BR-57 scope: only the probe actions are judged": "in the Bedrock agent role scope",
     "BR-57 scope: an unbounded NotAction read on the probe set": "in the Bedrock agent role scope",
     "BR-07 runtime: a draft prompt call counted as versioned": "in the Bedrock runtime prompt references",
+    "BR-07 runtime: a capped lookup names its newest event": (
+        "in the Bedrock runtime prompt references"
+    ),
     "BR-06 centralization: any CloudTrail table credited": "in the Bedrock inference trace",
     "BR-06 centralization: invocation logs not required": "in the Bedrock inference trace",
     "BR-34 Converse: an earlier untagged turn not judged": "in the Bedrock invocation log guardrail evidence",
