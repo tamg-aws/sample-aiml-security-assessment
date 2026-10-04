@@ -1214,17 +1214,19 @@ def _principal_boundary(permissions: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
-def _action_patterns_overlap(first: str, second: str) -> bool:
+def _action_patterns_overlap(first: str, second: str, ignore_case: bool = True) -> bool:
     """Return whether two IAM action patterns match at least one common action.
 
     Both patterns use the IAM grammar, where `*` matches any run of characters
     and `?` matches one. The table is indexed by position in each pattern and
     filled from the ends backwards one row at a time, so the cost is the product
     of the two lengths and no input deepens the stack: a policy can carry a
-    pattern thousands of characters long.
+    pattern thousands of characters long. ARNs compare case-sensitively, so
+    `ignore_case` is False when the patterns are resources.
     """
-    first = first.lower()
-    second = second.lower()
+    if ignore_case:
+        first = first.lower()
+        second = second.lower()
     # below[j] answers whether first[i + 1:] overlaps second[j:]; row[j] is the
     # same for first[i:].
     below = bytearray(len(second) + 1)
@@ -1329,14 +1331,114 @@ def _boundary_allows_action(
     return False
 
 
-def _grant_survives(permissions: Dict[str, Any], action_pattern: str) -> bool:
+def _deny_overlaps_grant(statement: Dict[str, Any], action: str, resource: str) -> bool:
+    """Return whether one Deny, read without its condition, reaches at least one
+    action and one ARN of a grant of `action` on `resource`.
+
+    Both may be patterns. A NotAction or NotResource Deny reaches the grant
+    unless one exclusion covers the whole of it.
+    """
+    if "Action" in statement:
+        if not any(
+            _action_patterns_overlap(denied, action)
+            for denied in _statement_actions(statement)
+        ):
+            return False
+    elif "NotAction" not in statement or any(
+        _action_pattern_covers(excluded, action)
+        for excluded in _statement_not_actions(statement)
+    ):
+        return False
+    if "Resource" in statement:
+        return any(
+            _action_patterns_overlap(denied, resource, ignore_case=False)
+            for denied in _statement_resources(statement)
+        )
+    excluded = statement.get("NotResource")
+    if excluded is None:
+        return False
+    excluded = excluded if isinstance(excluded, list) else [excluded]
+    return not any(_resource_pattern_covers(str(p), resource) for p in excluded)
+
+
+def _conditioned_denies_on_grant(
+    permissions: Dict[str, Any], action: str, resource: str
+) -> List[str]:
+    """Return the policy names holding a conditioned Deny that reaches a grant
+    of `action` on `resource`, which _grant_survives does not subtract. The
+    permissions boundary is named `permissions boundary`."""
+    documents: List[Tuple[str, Dict[str, Any]]] = []
+    for policy in _principal_policies(permissions):
+        try:
+            documents.append((str(policy.get("name", "")), _policy_document(policy)))
+        except (TypeError, ValueError):
+            continue
+    boundary = _principal_boundary(permissions)
+    if boundary is not None:
+        documents.append(("permissions boundary", boundary))
+    return [
+        name
+        for name, document in documents
+        if any(
+            _statement_condition_keys(statement)
+            and _deny_overlaps_grant(statement, action, resource)
+            for statement in _document_statements(document, effect="Deny")
+        )
+    ]
+
+
+def _unconditioned_deny_reaches(
+    permissions: Dict[str, Any], action: str, resource: str
+) -> bool:
+    """Return whether an unconditioned Deny in the principal's identity
+    policies or permissions boundary reaches any action and ARN of a grant of
+    `action` on `resource`. A document that cannot be parsed is skipped
+    because the caller reports it as unreadable."""
+    documents: List[Dict[str, Any]] = []
+    for policy in _principal_policies(permissions):
+        try:
+            documents.append(_policy_document(policy))
+        except (TypeError, ValueError):
+            continue
+    boundary = _principal_boundary(permissions)
+    if boundary is not None:
+        documents.append(boundary)
+    return any(
+        not _statement_condition_keys(statement)
+        and _deny_overlaps_grant(statement, action, resource)
+        for document in documents
+        for statement in _document_statements(document, effect="Deny")
+    )
+
+
+def _grant_survives(
+    permissions: Dict[str, Any], action_pattern: str, resource: Optional[str] = None
+) -> bool:
     """Return whether a grant of `action_pattern` survives Deny and boundary.
 
     An unconditioned Deny on `Resource: "*"` in any of the principal's own
     identity policies removes the grant, and so does a permissions boundary that
     allows none of the actions the pattern reaches. A policy document that cannot
     be parsed is skipped here because the caller reports it as unreadable.
+
+    With `resource`, the question is whether the whole grant of
+    `action_pattern` on `resource` survives: an unconditioned Deny that reaches
+    any action and ARN of it removes part, and so does a boundary with no
+    unconditioned Allow covering both. A conditioned Deny is not subtracted;
+    _conditioned_denies_on_grant names it.
     """
+    if resource is not None:
+        boundary = _principal_boundary(permissions)
+        return not _unconditioned_deny_reaches(
+            permissions, action_pattern, resource
+        ) and (
+            boundary is None
+            or any(
+                statement.get("Effect") == "Allow"
+                and _statement_covers_grant(statement, action_pattern, resource, {})
+                for statement in _document_statements(boundary)
+            )
+        )
     for policy in _principal_policies(permissions):
         try:
             document = _policy_document(policy)
@@ -18871,15 +18973,39 @@ def _confused_deputy_guard_account(
     return False
 
 
-def _statement_pins_source_arn(statement: Dict[str, Any], resource_arn: str) -> bool:
-    """Return whether an aws:SourceArn condition names `resource_arn` in every
-    value, under a binding operator.
+def _source_arn_names_one_resource(value: str, account_id: str) -> bool:
+    """Return whether an aws:SourceArn value is a wildcard-free ARN in
+    `account_id` that names one resource.
 
-    A pattern value matches more than the one resource, so only the literal
-    ARN counts.
+    AWS's confused-deputy example scopes aws:SourceArn to the invoking
+    resource (`arn:aws:lambda:...:function/SpecificFunction`), so the value
+    need not be the protected resource's own ARN. A `*`, `?` or policy
+    variable in any segment matches more than the one resource.
+    """
+    if any(token in value for token in ("*", "?", "${")):
+        return False
+    parts = value.split(":", 5)
+    return (
+        len(parts) == 6
+        and parts[0] == "arn"
+        and bool(parts[1])
+        and bool(parts[2])
+        and parts[4] == account_id
+        and bool(parts[5])
+    )
+
+
+def _statement_pins_source_arn(statement: Dict[str, Any], resource_arn: str) -> bool:
+    """Return whether an aws:SourceArn condition, under a binding operator,
+    names one wildcard-free resource in `resource_arn`'s account in every
+    value. `resource_arn` itself is one such resource.
+
+    A pattern value matches more than the one resource, and an ARN in another
+    account names a resource this account does not own, so neither counts.
     """
     conditions = statement.get("Condition")
-    if not isinstance(conditions, dict):
+    account_id = _arn_account(resource_arn)
+    if not account_id or not isinstance(conditions, dict):
         return False
     for operator, entries in conditions.items():
         if not isinstance(entries, dict):
@@ -18893,7 +19019,10 @@ def _statement_pins_source_arn(statement: Dict[str, Any], resource_arn: str) -> 
             if str(key).strip().lower() != "aws:sourcearn":
                 continue
             values = _condition_values(raw)
-            if values and all(value.strip() == resource_arn for value in values):
+            if values and all(
+                _source_arn_names_one_resource(value.strip(), account_id)
+                for value in values
+            ):
                 return True
     return False
 
@@ -19650,7 +19779,8 @@ def _gateway_resource_policy_findings(
             and _statement_is_confused_deputy_exposed(statement, account_id)
         ]
         # The control asks for both keys: SourceAccount alone admits any
-        # resource in the account, and SourceArn must name this gateway.
+        # resource in the account, and SourceArn must name one resource, this
+        # gateway or the invoking resource, in the account.
         half_guarded = [
             statement
             for statement in statements
@@ -19668,6 +19798,11 @@ def _gateway_resource_policy_findings(
             )
         ]
         if half_guarded:
+            no_source_arn = sum(
+                1
+                for statement in half_guarded
+                if not _statement_pins_source_arn(statement, str(gateway_arn))
+            )
             findings.append(
                 create_finding(
                     check_id="AC-27",
@@ -19679,14 +19814,18 @@ def _gateway_resource_policy_findings(
                         "Allow statement(s) that trust an AWS service principal or "
                         "every principal without both an aws:SourceAccount "
                         f"condition naming account {account_id} and an "
-                        f"aws:SourceArn condition naming {gateway_arn} in every "
-                        "value, so another resource in the account can make the "
-                        "service call this gateway on its behalf."
+                        "aws:SourceArn condition whose every value is a "
+                        f"wildcard-free ARN in account {account_id}. "
+                        f"{no_source_arn} of them carry no such aws:SourceArn, "
+                        "so the policy does not limit the deputy to one named "
+                        "resource; the rest lack the aws:SourceAccount condition "
+                        "the control also asks for."
                     ),
                     resolution=(
                         "Add aws:SourceAccount for this account and aws:SourceArn "
-                        "for this gateway's ARN to every statement whose principal "
-                        "is an AWS service or a wildcard."
+                        "naming the invoking resource or this gateway, with no "
+                        "wildcard, to every statement whose principal is an AWS "
+                        "service or a wildcard."
                     ),
                     reference=CONFUSED_DEPUTY_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -19728,7 +19867,8 @@ def _gateway_resource_policy_findings(
                         f"{label} guards all {len(statements)} Allow statement(s) "
                         "in its resource policy with an aws:SourceAccount "
                         f"condition naming account {account_id} and an "
-                        f"aws:SourceArn condition naming {gateway_arn}, or names "
+                        "aws:SourceArn condition whose every value is a "
+                        f"wildcard-free ARN in account {account_id}, or names "
                         "no service or wildcard principal"
                         + (
                             f", or, for {len(jwt_bounded)} statement(s) allowing "
@@ -19745,9 +19885,8 @@ def _gateway_resource_policy_findings(
                         + "."
                     ),
                     resolution=(
-                        "No action required. Confirm the aws:SourceArn pattern "
-                        "names this gateway rather than every resource in the "
-                        "account."
+                        "No action required. Confirm each aws:SourceArn names "
+                        "this gateway or the resource meant to invoke it."
                     ),
                     reference=CONFUSED_DEPUTY_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -24570,6 +24709,14 @@ ECR_IMAGE_INDEX_TYPES = (
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.oci.image.index.v1+json",
 )
+# Each platform an image index names costs one BatchGetImage, one
+# GetDownloadUrlForLayer and one configuration fetch before any layer is
+# read. Measured on 2026-10-04 in account 178113193057, us-east-1, from a
+# workstation and not from the function, over the three images that account's
+# runtimes run: BatchGetImage took 112 to 194 ms warm and 1305 ms on the first
+# call, GetDownloadUrlForLayer 69 to 178 ms on average, so 8 platforms cost
+# about 4 s. Every image there names one platform. An index naming more is
+# reported as not read, which holds the row at N/A, never Passed.
 ECR_IMAGE_MAX_PLATFORMS = 8
 ECR_IMAGE_CONFIG_MAX_BYTES = 1024 * 1024
 ECR_IMAGE_CONFIG_TIMEOUT_SECONDS = 10
@@ -24579,6 +24726,23 @@ ECR_IMAGE_CONFIG_TIMEOUT_SECONDS = 10
 # the time a scan takes: the compressed one is checked against the sizes the
 # manifest declares before anything is fetched, and an image over either is
 # not read.
+#
+# The bounds are set from measurement on 2026-10-04 in account 178113193057,
+# us-east-1, from a workstation and not from the function. Download:
+# GetDownloadUrlForLayer plus an HTTPS read of every layer of the two largest
+# runtime images there (117.5 MiB and 114.0 MiB compressed) ran at 8.6 MiB/s
+# compressed. Download, unpack and scan together through
+# _image_config_credentials took 25.1 s for the first (11 layers, 12,849
+# files, 330.7 MiB unpacked) and 21.6 s for the second (318.5 MiB unpacked),
+# 15.7 and 16.1 MiB/s of unpacked bytes, and 1.2 s for the third (4.0 MiB).
+# Scan alone: _image_layer_credentials over a local gzip layer of base64 text
+# (198.2 MiB compressed, 256 MiB unpacked) ran at 16.8 MiB/s of unpacked bytes.
+# At those rates an image at both bounds takes 59.5 s to fetch and 61.0 s to
+# scan, about 125 s with 8 platforms' reads, so 4 such distinct images fit in
+# the 600 s Lambda timeout; the three distinct images that account runs took
+# 47.9 s in all, the largest under a third of either bound. An image is read
+# once per digest however many runtimes or versions name it. An image past
+# either bound is named in the row, which is then N/A, never Passed.
 AC34_IMAGE_LAYERS_MAX_BYTES = 512 * 1024 * 1024
 AC34_IMAGE_UNPACKED_MAX_BYTES = 1024 * 1024 * 1024
 ECR_IMAGE_LAYER_TIMEOUT_SECONDS = 30
@@ -33622,19 +33786,22 @@ def _tool_role_invoker_gaps(
     role_name: str,
     role_permissions: Dict[str, Any],
     cache: Dict[str, Any],
-) -> Tuple[List[str], List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str], List[str]]:
     """Compare a tool role's grants with each principal that starts its sessions.
 
-    Returns (invokers, gaps, unreadable): every cached role and user other than
-    the tool role whose Allow reaches start_action on tool_arn and survives its
-    own Deny and boundary, one line per invoker naming the tool role grants it
-    lacks, and each principal with a policy that could not be parsed. A grant
-    is compared as action, resource and condition: a NotAction tool grant is
-    read as every action and a NotResource one as every resource. A tool role
-    grant its own Deny or boundary removes is not compared, and an invoker's
-    grant counts only when it survives the invoker's own Deny and boundary.
+    Returns (invokers, gaps, unreadable, conditioned): every cached role and
+    user other than the tool role whose Allow reaches start_action on tool_arn
+    and survives its own Deny and boundary, one line per invoker naming the
+    tool role grants it lacks, each principal with a policy that could not be
+    parsed, and each invoker policy holding a conditioned Deny that reaches a
+    compared grant. A grant is compared as action, resource and condition: a
+    NotAction tool grant is read as every action and a NotResource one as
+    every resource. A tool role grant its own Deny or boundary removes is not
+    compared, and an invoker's grant counts only when the whole of it on that
+    resource survives the invoker's own unconditioned Deny and boundary.
     """
     unreadable: List[str] = []
+    conditioned: List[str] = []
     grants: List[Tuple[str, str, Any]] = []
     for policy in _principal_policies(role_permissions):
         try:
@@ -33672,7 +33839,14 @@ def _tool_role_invoker_gaps(
                 except (TypeError, ValueError):
                     unreadable.append(f"{label} (policy {policy.get('name', '')})")
                     readable = False
-            if not readable or not _grant_survives(permissions, start_action):
+            # Whether a principal can start a session is read generously, so a
+            # boundary scoped to a resource or condition still leaves it an
+            # invoker; only an unconditioned Deny reaching this tool removes it.
+            if (
+                not readable
+                or not _grant_survives(permissions, start_action)
+                or _unconditioned_deny_reaches(permissions, start_action, tool_arn)
+            ):
                 continue
             if not any(
                 _statement_reaches_arn(statement, tool_arn)
@@ -33686,19 +33860,29 @@ def _tool_role_invoker_gaps(
                 + (" under its condition" if condition else "")
                 for action, resource, condition in grants
                 if not (
-                    _grant_survives(permissions, action)
+                    _grant_survives(permissions, action, resource)
                     and any(
                         _statement_covers_grant(statement, action, resource, condition)
                         for statement in statements
                     )
                 )
             ]
+            conditioned.extend(
+                f"{label} (policy {name})"
+                for name in dict.fromkeys(
+                    name
+                    for action, resource, _ in grants
+                    for name in _conditioned_denies_on_grant(
+                        permissions, action, resource
+                    )
+                )
+            )
             if lacking:
                 gaps.append(
                     f"{label} lacks {', '.join(lacking[:5])}"
                     + (f" and {len(lacking) - 5} more" if len(lacking) > 5 else "")
                 )
-    return invokers, gaps, unreadable
+    return invokers, gaps, unreadable, conditioned
 
 
 # The two ways to run a command inside a live runtime session. The shell opens
@@ -34502,8 +34686,15 @@ def _tool_role_invoker_finding(
             StatusEnum.NA,
         )
     start_action = AGENTCORE_TOOL_SESSION_ACTIONS[arn_key]
-    invokers, gaps, unreadable = _tool_role_invoker_gaps(
+    invokers, gaps, unreadable, conditioned = _tool_role_invoker_gaps(
         str(detail[arn_key]), start_action, role_name, permissions, cache
+    )
+    conditioned_note = (
+        " A conditioned Deny is not credited as removing a grant, so these "
+        "policies may withhold a grant the comparison counted: "
+        f"{', '.join(conditioned)}."
+        if conditioned
+        else ""
     )
     # A principal the cache could not read may hold the start action, so it is
     # an invoker nobody compared; the tool role's own read gap is judged above.
@@ -34513,7 +34704,8 @@ def _tool_role_invoker_finding(
         return finding(
             f"{label} uses execution role {role_name}, and principals granted "
             f"{start_action} on it, who run code with that role, hold fewer "
-            f"grants than it: {'; '.join(gaps)}. {IAM_CACHE_SCP_NOTE}",
+            f"grants than it: {'; '.join(gaps)}.{conditioned_note} "
+            f"{IAM_CACHE_SCP_NOTE}",
             "Narrow the tool's execution role to grants each principal that "
             "starts its sessions already holds, or withdraw "
             f"{start_action} from the principals that should not reach the "
@@ -34557,9 +34749,10 @@ def _tool_role_invoker_finding(
     return finding(
         f"{label} uses execution role {role_name}, and each principal granted "
         f"{start_action} on it ({', '.join(invokers)}) holds every action and "
-        "resource the role is granted, under the same or no condition. A Deny "
-        "scoped to a resource or condition, session policies and service "
-        f"control policies are not read.{v1_note}",
+        "resource the role is granted, under the same or no condition, and no "
+        "unconditioned Deny or permissions boundary of theirs removes any part "
+        f"of it.{conditioned_note} Session policies and service control "
+        f"policies are not read.{v1_note}",
         "No action required for this check.",
         SeverityEnum.MEDIUM,
         StatusEnum.PASSED,
