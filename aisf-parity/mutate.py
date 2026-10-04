@@ -628,9 +628,9 @@ MUTATIONS = [
         "file": BEDROCK,
         "defect": "a user whose only route to AI is sts:AssumeRole into a role the "
         "account trusts drops out of scope, so its access key is never judged",
-        "find": "                elif delegates and _identity_allows_assume_role("
-        "permissions, role_arn):\n",
-        "replace": "                elif False:\n",
+        "find": "        if delegates and _identity_allows_assume_role(permissions, "
+        "role_arn):\n",
+        "replace": "        if False:\n",
     },
     {
         "name": "a KENDRA knowledge base goes back to manual review",
@@ -846,6 +846,27 @@ MUTATIONS = [
         "defect": "BR-42 passes an every-principal training bucket grant under any condition, such as aws:SourceVpce, that names no account of the caller",
         "find": '        else:\n            grants["failed"].append(\n                f"{label} allows s3:GetObject to every principal under a "\n',
         "replace": '        elif False:\n            grants["failed"].append(\n                f"{label} allows s3:GetObject to every principal under a "\n',
+    },
+    {
+        "name": "BR-50 walks one role hop only",
+        "file": BEDROCK,
+        "defect": "BR-50 stops after one role, so a user who assumes a non-AI role that can assume an AI role keeps an access key nobody lists",
+        "find": "        frontier = sorted(reached)\n",
+        "replace": "        frontier = []\n",
+    },
+    {
+        "name": "BR-51 skips the role principals of an AI role's trust",
+        "file": BEDROCK,
+        "defect": "BR-51 skips a role principal in an AI write role's trust, so a chain from a role a user assumes without MFA passes",
+        "find": "        for owner, name in _trust_role_principals_without_mfa(trust_policy)\n",
+        "replace": "        for owner, name in []\n",
+    },
+    {
+        "name": "BR-51 follows one role hop only",
+        "file": BEDROCK,
+        "defect": "BR-51 follows one trusted role only, so a longer chain to a role assumed without MFA passes",
+        "find": "            for next_owner, next_name in onward\n",
+        "replace": "            for next_owner, next_name in []\n",
     },
     {
         "name": "BR-33 drops a task with no task role",
@@ -2567,6 +2588,11 @@ GROUPS: dict[str, str] = {
         "in the Bedrock container image scanning"
     ),
     "BR-33 drops a task with no task role": ("in the Bedrock container image scanning"),
+    "BR-50 walks one role hop only": ("in the Bedrock AI role chains"),
+    "BR-51 skips the role principals of an AI role's trust": (
+        "in the Bedrock AI role chains"
+    ),
+    "BR-51 follows one role hop only": ("in the Bedrock AI role chains"),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

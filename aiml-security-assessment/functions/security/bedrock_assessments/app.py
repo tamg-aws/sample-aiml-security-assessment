@@ -27241,11 +27241,12 @@ def _users_reaching_ai_roles(
 ) -> Dict[str, Any]:
     """
     Find the cached IAM users outside ``in_scope`` who can assume a cached role
-    that holds an AI permission, so a user whose only route to AI is
+    that holds an AI permission, directly or through a chain of cached roles
+    each able to assume the next, so a user whose only route to AI is
     sts:AssumeRole is still judged. A same-account trust statement naming the
-    user admits it alone; one trusting the account or every principal admits a
-    user whose identity policies allow sts:AssumeRole on the role. Trust
-    conditions are not evaluated, which can only add a user.
+    user or role admits it alone; one trusting the account or every principal
+    admits a user or role whose identity policies allow sts:AssumeRole on the
+    role. Trust conditions are not evaluated, which can only add a user.
     """
     found: Dict[str, List[str]] = {}
     unread: List[str] = []
@@ -27259,59 +27260,106 @@ def _users_reaching_ai_roles(
     }
     if not roles or not candidates:
         return {"users": found, "unread": unread}
+    role_permissions = permission_cache["role_permissions"]
+    # How each role reaches AI: an AI role holds the grant itself, and a role
+    # added by the walk can assume the role that added it.
+    tails = {name: f"the role holds {roles[name][0]}" for name in roles}
     iam_client = boto3.client("iam", config=boto3_config)
-    for role_name in sorted(roles):
-        try:
-            role = iam_client.get_role(RoleName=role_name).get("Role", {})
-            document = _trust_policy_document(role)
-            statements = _policy_statements(document or {})
-        except (ClientError, BotoCoreError, ValueError, TypeError) as error:
-            unread.append(
-                f"The trust policy of AI role '{role_name}' was not read with "
-                f"iam:GetRole ({get_assessment_error_label(error)}), so an IAM "
-                "user who reaches AI only by assuming it was not placed in scope."
-            )
-            continue
-        role_arn = str(role.get("Arn") or "")
-        account = role_arn.split(":")[4] if role_arn.count(":") >= 5 else ""
-        for statement in statements:
-            if str(statement.get("Effect", "")).upper() != "ALLOW":
-                continue
-            if not _statement_matches_action(statement, "sts:assumerole"):
-                continue
-            principal = statement.get("Principal")
-            entries = _principal_entries(
-                principal.get("AWS") if isinstance(principal, dict) else principal
-            )
-            if "*" in entries or "NotPrincipal" in statement:
-                delegates = "trusts every principal"
-            elif account and any(
-                entry == account
-                or (entry.endswith(":root") and entry.split(":")[4:5] == [account])
-                for entry in entries
-            ):
-                delegates = "trusts the account"
-            else:
-                delegates = ""
-            for user_name, permissions in sorted(candidates.items()):
-                if user_name in found:
-                    continue
-                named = any(
-                    ":user/" in entry
-                    and entry.rsplit("/", 1)[-1] == user_name
-                    and entry.split(":")[4:5] == [account]
-                    for entry in entries
+
+    def admits(entries, delegates, account, kind, name, permissions, role_arn):
+        if any(
+            f":{kind}/" in entry
+            and entry.rsplit("/", 1)[-1] == name
+            and entry.split(":")[4:5] == [account]
+            for entry in entries
+        ):
+            return f"names the {kind}"
+        if delegates and _identity_allows_assume_role(permissions, role_arn):
+            return delegates
+        return ""
+
+    frontier = sorted(roles)
+    while frontier:
+        reached = []
+        for role_name in frontier:
+            try:
+                role = iam_client.get_role(RoleName=role_name).get("Role", {})
+                document = _trust_policy_document(role)
+                statements = _policy_statements(document or {})
+            except (ClientError, BotoCoreError, ValueError, TypeError) as error:
+                unread.append(
+                    "The trust policy of {} role '{}' was not read with iam:GetRole "
+                    "({}), so an IAM user who reaches AI only by assuming it was not "
+                    "placed in scope.".format(
+                        "AI" if role_name in roles else "IAM",
+                        role_name,
+                        get_assessment_error_label(error),
+                    )
                 )
-                if named:
-                    how = "names the user"
-                elif delegates and _identity_allows_assume_role(permissions, role_arn):
-                    how = delegates
-                else:
+                continue
+            role_arn = str(role.get("Arn") or "")
+            account = role_arn.split(":")[4] if role_arn.count(":") >= 5 else ""
+            tail = tails[role_name]
+            for statement in statements:
+                if str(statement.get("Effect", "")).upper() != "ALLOW":
                     continue
-                found[user_name] = [
-                    f"it can assume role '{role_name}', whose trust policy {how}, "
-                    f"and the role holds {roles[role_name][0]}"
-                ]
+                if not _statement_matches_action(statement, "sts:assumerole"):
+                    continue
+                principal = statement.get("Principal")
+                entries = _principal_entries(
+                    principal.get("AWS") if isinstance(principal, dict) else principal
+                )
+                if "*" in entries or "NotPrincipal" in statement:
+                    delegates = "trusts every principal"
+                elif account and any(
+                    entry == account
+                    or (entry.endswith(":root") and entry.split(":")[4:5] == [account])
+                    for entry in entries
+                ):
+                    delegates = "trusts the account"
+                else:
+                    delegates = ""
+                for user_name, permissions in sorted(candidates.items()):
+                    if user_name in found:
+                        continue
+                    how = admits(
+                        entries,
+                        delegates,
+                        account,
+                        "user",
+                        user_name,
+                        permissions,
+                        role_arn,
+                    )
+                    if how:
+                        found[user_name] = [
+                            f"it can assume role '{role_name}', whose trust policy "
+                            f"{how}, and {tail}"
+                        ]
+                for other, permissions in sorted(role_permissions.items()):
+                    if other in tails:
+                        continue
+                    how = admits(
+                        entries,
+                        delegates,
+                        account,
+                        "role",
+                        other,
+                        permissions,
+                        role_arn,
+                    )
+                    if how:
+                        tails[other] = (
+                            f"role '{other}' can assume role '{role_name}', whose "
+                            f"trust policy {how}, and "
+                            + (
+                                f"role '{role_name}' holds {roles[role_name][0]}"
+                                if role_name in roles
+                                else tail
+                            )
+                        )
+                        reached.append(other)
+        frontier = sorted(reached)
     return {"users": found, "unread": unread}
 
 
@@ -28307,6 +28355,106 @@ def _trust_statements_without_mfa(trust_policy: Any) -> List[str]:
     return open_statements
 
 
+def _trust_role_principals_without_mfa(trust_policy: Any) -> List[tuple]:
+    """
+    Return (account, role name) for each role principal an Allow of
+    sts:AssumeRole in a trust policy names with no Bool
+    aws:MultiFactorAuthPresent true condition. A role session ARN names the
+    role it is a session of.
+    """
+    found = []
+    for statement in _policy_statements(trust_policy):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        actions = [str(action).lower() for action in _as_list(statement.get("Action"))]
+        if not any(_wildcard_matches(action, "sts:assumerole") for action in actions):
+            continue
+        if any(
+            _strip_condition_set_operator(operator) == "bool"
+            and key == MFA_PRESENT_CONDITION_KEY
+            and values
+            and all(str(value).strip().lower() == "true" for value in values)
+            for operator, key, values in _condition_keys_by_operator(statement)
+        ):
+            continue
+        principal = statement.get("Principal")
+        for value in _as_list(
+            principal.get("AWS") if isinstance(principal, dict) else None
+        ):
+            parts = str(value).split(":", 5)
+            if len(parts) != 6:
+                continue
+            if parts[5].startswith("role/"):
+                name = parts[5].rsplit("/", 1)[-1]
+            elif parts[5].startswith("assumed-role/"):
+                name = parts[5].split("/")[1]
+            else:
+                continue
+            if (parts[4], name) not in found:
+                found.append((parts[4], name))
+    return found
+
+
+def _role_chain_without_mfa(
+    iam_client, role_name: str, trust_policy: Any, account: str, trusts: Dict
+) -> Dict[str, List[str]]:
+    """
+    Follow the role principals a trust policy admits without MFA, and the
+    roles those admit in turn, to a role an IAM user or an account can assume
+    without MFA. A role session carries the MFA of the session that assumed
+    it, so such a chain reaches ``role_name`` with no MFA at all. ``trusts``
+    caches the trust policies read across calls.
+    """
+    chains: List[str] = []
+    unread: List[str] = []
+    seen = {role_name}
+    queue = [
+        (owner, name, f"role '{role_name}' trusts role '{name}'")
+        for owner, name in _trust_role_principals_without_mfa(trust_policy)
+    ]
+    while queue:
+        owner, name, path = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        if owner != account:
+            unread.append(
+                f"{path}, in account {owner}, whose trust policy this account does "
+                "not read"
+            )
+            continue
+        if name not in trusts:
+            try:
+                trusts[name] = iam_client.get_role(RoleName=name)["Role"].get(
+                    "AssumeRolePolicyDocument"
+                )
+            except (ClientError, BotoCoreError, KeyError) as error:
+                trusts[name] = error
+        document = trusts[name]
+        if isinstance(document, Exception):
+            unread.append(
+                f"{path}, whose trust policy was not read with iam:GetRole "
+                f"({get_assessment_error_label(document)})"
+            )
+            continue
+        try:
+            open_statements = _trust_statements_without_mfa(document)
+            onward = _trust_role_principals_without_mfa(document)
+        except (ValueError, TypeError) as error:
+            unread.append(
+                f"{path}, whose trust policy could not be parsed "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        if open_statements:
+            chains.append(f"{path}, whose {open_statements[0]}")
+        queue.extend(
+            (next_owner, next_name, f"{path}, which trusts role '{next_name}'")
+            for next_owner, next_name in onward
+        )
+    return {"chains": chains, "unread": unread}
+
+
 def _trust_federated_providers(trust_policy: Any) -> List[str]:
     """
     Return the federated identity providers an Allow in a role trust policy
@@ -28556,6 +28704,7 @@ def check_bedrock_ai_user_console_mfa(
 
         trusted = []
         federated = []
+        chained_trusts: Dict[str, Any] = {}
         for role_name, evidence in sorted(roles["users"].items()):
             try:
                 role = iam_client.get_role(RoleName=role_name)["Role"]
@@ -28586,6 +28735,16 @@ def check_bedrock_ai_user_console_mfa(
                     )
                 )
                 continue
+            chain = {"chains": [], "unread": []}
+            if not open_statements:
+                role_arn = str(role.get("Arn") or "")
+                chain = _role_chain_without_mfa(
+                    iam_client,
+                    role_name,
+                    role.get("AssumeRolePolicyDocument"),
+                    role_arn.split(":")[4] if role_arn.count(":") >= 5 else "",
+                    chained_trusts,
+                )
             if open_statements:
                 findings["status"] = "WARN"
                 findings["csv_data"].append(
@@ -28599,6 +28758,33 @@ def check_bedrock_ai_user_console_mfa(
                         "Identity Center.",
                         "High",
                         "Failed",
+                    )
+                )
+            elif chain["chains"]:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    row(
+                        f"IAM role '{role_name}' can be reached without MFA through "
+                        f"a chain of roles: {'; '.join(chain['chains'])}. The role "
+                        f"is in scope because {evidence[0]}.",
+                        "Add a Bool aws:MultiFactorAuthPresent true condition to "
+                        "each trust statement in the chain that names an IAM user, "
+                        "an account or a role, or move the people who assume the "
+                        "first role to IAM Identity Center.",
+                        "High",
+                        "Failed",
+                    )
+                )
+            elif chain["unread"]:
+                findings["csv_data"].append(
+                    row(
+                        f"IAM role '{role_name}' trusts roles that were not all "
+                        f"read, so whether a user reaches it without MFA through "
+                        f"them is not known: {'; '.join(chain['unread'])}. The "
+                        f"role is in scope because {evidence[0]}.",
+                        COULD_NOT_ASSESS_RESOLUTION,
+                        "Informational",
+                        "N/A",
                     )
                 )
             else:

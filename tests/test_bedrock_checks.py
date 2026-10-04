@@ -29537,6 +29537,82 @@ class TestBR50AIUserAccessKeys:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "No IAM user in the permissions cache" in rows[0]["Finding_Details"]
 
+    # IAM-03: the role path was one hop, so a user who assumed a non-AI role
+    # that could in turn assume an AI role was never placed in scope.
+    @pytest.mark.parametrize(
+        "ai_principal, hop_policies, how",
+        [
+            ("arn:aws:iam::123456789012:role/HopRole", [], "names the role"),
+            (
+                "arn:aws:iam::123456789012:root",
+                [("Assume", _allow("sts:AssumeRole", "arn:aws:iam::*:role/Ai*"))],
+                "trusts the account",
+            ),
+        ],
+    )
+    def test_br50_a_user_reaching_ai_through_a_chain_of_roles_is_in_scope(
+        self, ai_principal, hop_policies, how
+    ):
+        cache = _identity_cache(
+            roles={
+                "AiRole": [("Invoke", _allow("bedrock:InvokeModel", "*"))],
+                "HopRole": hop_policies,
+                "FarRole": [],
+                "SideRole": [("Read", _allow("s3:GetObject", "*"))],
+            },
+            users={"carol": [], "erin": [], "dave": []},
+        )
+        trusts = {
+            "AiRole": self._trust(ai_principal),
+            "HopRole": self._trust(
+                [
+                    "arn:aws:iam::123456789012:user/carol",
+                    "arn:aws:iam::123456789012:role/FarRole",
+                ]
+            ),
+            "FarRole": self._trust("arn:aws:iam::123456789012:user/erin"),
+            "SideRole": self._trust("arn:aws:iam::123456789012:user/dave"),
+        }
+        iam = MagicMock()
+        iam.list_access_keys.side_effect = lambda UserName, **kwargs: {
+            "AccessKeyMetadata": self.ACTIVE_KEY
+        }
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "Arn": f"arn:aws:iam::123456789012:role/{RoleName}",
+                "AssumeRolePolicyDocument": trusts[RoleName],
+            }
+        }
+        with patch("boto3.client", return_value=iam):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_access_keys(cache, region="Global")
+            )
+        failed = {
+            row["Finding_Details"].split("'")[1]: row["Finding_Details"]
+            for row in rows
+            if row["Status"] == "Failed"
+        }
+        assert sorted(failed) == ["carol", "erin"]
+        hop = (
+            f"role 'HopRole' can assume role 'AiRole', whose trust policy {how}, "
+            "and role 'AiRole' holds attached policy 'Invoke'"
+        )
+        assert (
+            "it can assume role 'HopRole', whose trust policy names the user, and "
+            + hop
+        ) in failed["carol"]
+        assert (
+            "it can assume role 'FarRole', whose trust policy names the user, and "
+            "role 'FarRole' can assume role 'HopRole', whose trust policy names "
+            "the role, and " + hop
+        ) in failed["erin"]
+        assert "SideRole" not in " ".join(r["Finding_Details"] for r in rows)
+        assert sorted(c.kwargs["RoleName"] for c in iam.get_role.call_args_list) == [
+            "AiRole",
+            "FarRole",
+            "HopRole",
+        ]
+
     def test_br50_an_unread_ai_role_trust_policy_is_named(self):
         rows = self._assume_run(
             [("Assume", _allow("sts:AssumeRole", self.AI_ROLE_ARN))],
@@ -30871,6 +30947,89 @@ class TestBR51AIUserConsoleMFA:
         assert len(unread) == 1 and "'Unread'" in unread[0]["Finding_Details"]
         assert "2 of the 5 in-scope IAM role(s)" in passed[0]["Finding_Details"]
         assert "ReaderRole" not in json.dumps(rows)
+
+    # IAM-02: role principals in a trust policy were skipped, so an AI write
+    # role reached by chaining from a role a user assumes without MFA passed.
+    def test_br51_a_role_chain_without_mfa_fails_the_ai_role(self):
+        cache = {"role_permissions": {}, "user_permissions": {}}
+        write = [
+            _customer_policy(
+                "Write", {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
+            )
+        ]
+        for name in ("ChainRole", "DeepRole", "GuardedRole", "SafeRole", "CrossRole"):
+            cache["role_permissions"][name] = _identity(attached=write)
+        mfa = {"Bool": {"aws:MultiFactorAuthPresent": "true"}}
+
+        def trust(principal, condition=None):
+            statement = {
+                "Sid": "Trust",
+                "Effect": "Allow",
+                "Principal": {"AWS": principal},
+                "Action": "sts:AssumeRole",
+            }
+            if condition:
+                statement["Condition"] = condition
+            return _policy(statement)
+
+        account = "arn:aws:iam::123456789012"
+        trusts = {
+            "ChainRole": trust(f"{account}:role/HopRole"),
+            "DeepRole": trust("arn:aws:sts::123456789012:assumed-role/FarHop/session"),
+            "GuardedRole": trust(f"{account}:role/HopRole", mfa),
+            "SafeRole": trust(f"{account}:role/SafeHop"),
+            "CrossRole": trust("arn:aws:iam::999999999999:role/Ci"),
+            "HopRole": trust(f"{account}:user/dev"),
+            "FarHop": trust(f"{account}:role/team/HopRole"),
+            "SafeHop": trust(f"{account}:user/dev", mfa),
+        }
+        iam = MagicMock()
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "Arn": f"{account}:role/{RoleName}",
+                "AssumeRolePolicyDocument": trusts[RoleName],
+            }
+        }
+        iam.list_instances.return_value = {"Instances": []}
+        with patch("boto3.client", return_value=iam):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+            )
+
+        failed = {
+            r["Finding_Details"].split("'")[1]: r["Finding_Details"]
+            for r in rows
+            if r["Status"] == "Failed"
+        }
+        assert sorted(failed) == ["ChainRole", "DeepRole"]
+        assert (
+            "IAM role 'ChainRole' can be reached without MFA through a chain of "
+            "roles: role 'ChainRole' trusts role 'HopRole', whose statement 'Trust' "
+            "trusts arn:aws:iam::123456789012:user/dev with no Bool "
+            "aws:MultiFactorAuthPresent true condition."
+        ) in failed["ChainRole"]
+        assert (
+            "role 'DeepRole' trusts role 'FarHop', which trusts role 'HopRole', "
+            "whose statement 'Trust'"
+        ) in failed["DeepRole"]
+        unread = [
+            r
+            for r in rows
+            if r["Status"] == "N/A"
+            and "in-scope IAM role(s)" not in r["Finding_Details"]
+        ]
+        assert len(unread) == 1
+        assert (
+            "IAM role 'CrossRole' trusts roles that were not all read"
+            in unread[0]["Finding_Details"]
+        )
+        assert "in account 999999999999" in unread[0]["Finding_Details"]
+        summary = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert "2 of the 5 in-scope IAM role(s)" in summary[0]["Finding_Details"]
+        assert "GuardedRole, SafeRole" in summary[0]["Finding_Details"]
+        assert [c.kwargs["RoleName"] for c in iam.get_role.call_args_list].count(
+            "HopRole"
+        ) == 1
 
     def test_br51_unread_principal_stops_a_passed_row(self):
         cache = _ai_user_cache()
