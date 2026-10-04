@@ -24343,6 +24343,7 @@ class TestSM39WorkloadEgress:
         tgw_vpc_attachments=None,
         tgw_truncated=(),
         sagemaker=None,
+        versions=(),
     ):
         """associations: {vpc: [associations]}; rules: {group: [rules] or pages};
         tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}};
@@ -24358,7 +24359,9 @@ class TestSM39WorkloadEgress:
         "config"}], "models": {name: DescribeModel}, "training" and
         "processing": {status: [Describe*Job entries]}, "notebooks":
         [DescribeNotebookInstance entries], "studio": [DescribeDomain
-        entries]}."""
+        entries]}; versions: published Lambda versions, which ListFunctions
+        returns only with FunctionVersion ALL, as it then qualifies the
+        $LATEST ARN."""
         sagemaker = sagemaker or {}
         tgw_attachments = tgw_attachments or []
         tgw_routes = tgw_routes or {}
@@ -24398,6 +24401,23 @@ class TestSM39WorkloadEgress:
                 return value(**kwargs) if callable(value) else value
 
             return call
+
+        def list_functions(FunctionVersion=None):
+            if FunctionVersion != "ALL":
+                return [{"Functions": functions}]
+            latest = [
+                dict(
+                    f,
+                    Version="$LATEST",
+                    **(
+                        {"FunctionArn": f"{f['FunctionArn']}:$LATEST"}
+                        if f.get("FunctionArn")
+                        else {}
+                    ),
+                )
+                for f in functions
+            ]
+            return [{"Functions": latest}, {"Functions": list(versions)}]
 
         def rule_pages(FirewallRuleGroupId):
             found = rules[FirewallRuleGroupId]
@@ -24460,7 +24480,7 @@ class TestSM39WorkloadEgress:
                 client.describe_services.side_effect = describe_services
             elif service == "lambda":
                 client.get_paginator.side_effect = _pager(
-                    {"list_functions": guarded("lambda", [{"Functions": functions}])}
+                    {"list_functions": guarded("lambda", list_functions)}
                 )
             elif service == "ec2":
 
@@ -27861,6 +27881,49 @@ class TestRound9SM39SageMakerWorkloads:
         assert len(incomplete) == 2
         assert all(r["Status"] == "N/A" for r in incomplete)
         assert all(text in r["Finding_Details"] for r in incomplete)
+
+
+class TestRound9SM39LambdaVersions:
+    """AIR-FND-NET-03: SM-39 judges the subnets of every published Lambda
+    version, which keeps the VpcConfig it was published with."""
+
+    suite = TestSM39WorkloadEgress()
+    ARN = "arn:aws:lambda:us-east-1:111122223333:function:tool"
+
+    def test_a_published_version_in_other_subnets_is_judged(self):
+        version = dict(
+            self.suite._function("agent-fn", ["subnet-b1"]),
+            Version="3",
+            FunctionArn=f"{self.ARN}:3",
+        )
+        rows = self.suite._run(
+            functions=[self.suite._function("agent-fn", ["subnet-a1"])],
+            versions=[version],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+        )
+        dns = self.suite._dns(rows)
+        assert [r["Status"] for r in dns] == ["Passed", "Failed"]
+        assert "Lambda function agent-fn version 3" in dns[1]["Finding_Details"]
+        assert "version 3" not in dns[0]["Finding_Details"]
+
+    def test_a_named_function_matches_its_qualified_latest_once(self):
+        version = {
+            "FunctionName": "tool",
+            "FunctionArn": f"{self.ARN}:2",
+            "Version": "2",
+        }
+        rows = self.suite._run(
+            functions=[{"FunctionName": "tool", "FunctionArn": self.ARN}],
+            versions=[version],
+            named={self.ARN: ["gateway gw target t"]},
+        )
+        assert [(r["Finding"], r["Status"]) for r in rows] == [
+            ("Agent Workload DNS Egress Control", "Failed"),
+            ("Agent Workload Network Firewall Egress", "Failed"),
+        ]
+        assert rows[0]["Finding_Details"].startswith(
+            "Lambda function tool, named by gateway gw target t, runs outside a VPC"
+        )
 
 
 class TestSM39EgressForEveryAgentHost:

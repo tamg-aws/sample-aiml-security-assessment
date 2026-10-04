@@ -513,6 +513,10 @@ section.
   and an endpoint or running job with no VPC that is not network isolated,
   since their internet traffic leaves through SageMaker's network. A failed
   SageMaker read is named in the incomplete row.
+- `SM-39` reads the subnets of every published Lambda version with
+  `ListFunctions` `FunctionVersion` `ALL`. A version keeps the `VpcConfig` it
+  was published with, so an alias could run a version in subnets whose egress
+  was never judged.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule

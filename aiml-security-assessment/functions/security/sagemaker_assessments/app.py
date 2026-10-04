@@ -20798,7 +20798,7 @@ def _egress_workload_subnets(
 ) -> Tuple[List[Tuple[str, str]], List[str], List[Dict[str, Any]]]:
     """(workload label, subnet id) for each ECS awsvpc service and standalone
     task, VPC Lambda, EKS cluster and Fargate profile and EC2 instance, the
-    unread lists, and every Lambda function."""
+    unread lists, and every Lambda function version."""
     references = []
     services, unread = _ecs_services(region)
     for cluster_name, service in services:
@@ -20817,13 +20817,16 @@ def _egress_workload_subnets(
     for cluster_name, task in tasks:
         for subnet_id in _ecs_task_interfaces(task)[0]:
             references.append((_ecs_task_label(cluster_name, task), subnet_id))
-    functions, lambda_unread = _lambda_functions(region)
+    # A published version keeps the VpcConfig it was published with, so an
+    # alias can run a version in subnets $LATEST no longer names.
+    functions, lambda_unread = _lambda_functions(region, all_versions=True)
     unread.extend(lambda_unread)
     for function in functions:
+        label = f"Lambda function {function.get('FunctionName')}"
+        if function.get("Version") not in (None, "$LATEST"):
+            label += f" version {function['Version']}"
         for subnet_id in (function.get("VpcConfig") or {}).get("SubnetIds") or []:
-            references.append(
-                (f"Lambda function {function.get('FunctionName')}", subnet_id)
-            )
+            references.append((label, subnet_id))
     # AIR-SLF-RT-02: agents hosted on EKS or EC2 egress from the subnets of
     # the cluster, of each Fargate profile and of each instance's network
     # interfaces.
@@ -22779,7 +22782,10 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
             )
         return findings
 
-    listed = {str(f.get("FunctionArn") or ""): f for f in functions}
+    # ListFunctions with FunctionVersion ALL qualifies $LATEST's ARN.
+    listed = {
+        str(f.get("FunctionArn") or "").removesuffix(":$LATEST"): f for f in functions
+    }
     open_functions = []
     for arn in sorted(named):
         match = LAMBDA_IN_URI.search(arn)
