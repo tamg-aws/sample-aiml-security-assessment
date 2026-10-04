@@ -5043,12 +5043,38 @@ class TestSM31EndpointDataCapture:
 
     @classmethod
     def _endpoints(
-        cls, mock_client, endpoints, alarms=None, alarm_error=None, composites=()
+        cls,
+        mock_client,
+        endpoints,
+        alarms=None,
+        alarm_error=None,
+        composites=(),
+        capture_modes=None,
     ):
+        """capture_modes maps an endpoint to its config's CaptureMode list, or
+        to an exception DescribeEndpointConfig raises; the default is Input
+        and Output."""
         mock_sm = MagicMock()
         mock_client.return_value = mock_sm
-        for detail in endpoints.values():
+        capture_modes = capture_modes or {}
+        for name, detail in endpoints.items():
             detail.setdefault("ProductionVariants", [{"VariantName": "AllTraffic"}])
+            detail.setdefault("EndpointConfigName", f"{name}-config")
+
+        def endpoint_config(EndpointConfigName):
+            name = EndpointConfigName.removesuffix("-config")
+            modes = capture_modes.get(name, ["Input", "Output"])
+            if isinstance(modes, Exception):
+                raise modes
+            return {
+                "EndpointConfigName": EndpointConfigName,
+                "DataCaptureConfig": {
+                    "EnableCapture": True,
+                    "CaptureOptions": [{"CaptureMode": m} for m in modes],
+                },
+            }
+
+        mock_sm.describe_endpoint_config.side_effect = endpoint_config
         if alarms is None:
             alarms = [cls._disk_alarm(name) for name in endpoints]
         paginator = MagicMock()
@@ -26926,3 +26952,67 @@ class TestSM35RegionalMacieAndDetective:
             )
         assert (administrator, reason) == (self.TOOLING, None)
         assert client.list_invitations.call_args_list[1].kwargs == {"NextToken": "t"}
+
+
+class TestSM31CaptureModes:
+    """AIR-SGM-EP-06: an endpoint passes only when its config captures both
+    requests and responses."""
+
+    @staticmethod
+    def _run(capture_modes):
+        started = {
+            "DataCaptureConfig": {
+                "EnableCapture": True,
+                "CaptureStatus": "Started",
+                "DestinationS3Uri": "s3://audit/capture",
+            }
+        }
+        endpoints = {name: json.loads(json.dumps(started)) for name in ("a", "b")}
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            TestSM31EndpointDataCapture._endpoints(
+                mock_client, endpoints, capture_modes=capture_modes
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+            )
+        return [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.ENDPOINT_DATA_CAPTURE_FINDING
+        ]
+
+    @pytest.mark.parametrize(
+        "modes", [["InputAndOutput"], ["Input", "Output"], ["Output", "Input"]]
+    )
+    def test_both_directions_pass(self, modes):
+        rows = self._run({"a": modes, "b": modes})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 of 2 endpoint(s)" in rows[0]["Finding_Details"]
+        assert "capture both requests and responses" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("modes", "named"),
+        [(["Input"], "Input"), (["Output"], "Output"), ([], "no mode")],
+    )
+    def test_one_direction_fails_only_that_endpoint(self, modes, named):
+        rows = self._run({"b": modes})
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = next(r for r in rows if r["Status"] == "Failed")
+        assert "Endpoint 'b'" in failed["Finding_Details"]
+        assert f"CaptureOptions capture {named}," in failed["Finding_Details"]
+        passed = next(r for r in rows if r["Status"] == "Passed")
+        assert "1 of 2 endpoint(s)" in passed["Finding_Details"]
+
+    def test_an_unread_config_withholds_that_endpoint_from_the_pass(self):
+        rows = self._run({"a": _make_client_error("AccessDeniedException")})
+        statuses = sorted(r["Status"] for r in rows)
+        assert statuses == ["N/A", "Passed"]
+        unread = next(r for r in rows if r["Status"] == "N/A")
+        assert "Endpoint 'a'" in unread["Finding_Details"]
+        assert (
+            "sagemaker:DescribeEndpointConfig on 'a-config'"
+            in (unread["Finding_Details"])
+        )
+        passed = next(r for r in rows if r["Status"] == "Passed")
+        assert "1 of 2 endpoint(s)" in passed["Finding_Details"]
+        assert "'a'" not in passed["Finding_Details"]

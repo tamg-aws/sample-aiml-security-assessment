@@ -11949,7 +11949,10 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
     DescribeEndpoint reports the live capture state (EnableCapture plus
     CaptureStatus, which is Started or Stopped), so an endpoint whose
     configuration enables capture but whose capture has stopped is reported as a
-    failure and not as compliant.
+    failure and not as compliant. DescribeEndpoint does not return what is
+    captured, so the endpoint config's DataCaptureConfig.CaptureOptions is read:
+    the control asks for requests and responses, so the modes must cover Input
+    and Output.
     """
     logger.debug("Starting check for SageMaker endpoint data capture")
     findings = {"csv_data": []}
@@ -11988,7 +11991,53 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                     capture_config = {}
                 enabled = capture_config.get("EnableCapture") is True
                 capture_status = capture_config.get("CaptureStatus")
+                modes = set()
                 if enabled and capture_status == "Started":
+                    config_name = detail.get("EndpointConfigName") or ""
+                    try:
+                        config = sagemaker_client.describe_endpoint_config(
+                            EndpointConfigName=config_name
+                        )
+                    except Exception as error:
+                        describe_errors.append(
+                            {
+                                "name": endpoint_name,
+                                "label": (
+                                    "sagemaker:DescribeEndpointConfig on "
+                                    f"'{config_name}' "
+                                    f"({get_assessment_error_label(error)}), so "
+                                    "which records it captures was not read"
+                                ),
+                            }
+                        )
+                        continue
+                    modes = {
+                        option.get("CaptureMode")
+                        for option in (
+                            (config.get("DataCaptureConfig") or {}).get(
+                                "CaptureOptions"
+                            )
+                            or []
+                        )
+                        if isinstance(option, dict)
+                    }
+                if (
+                    enabled
+                    and capture_status == "Started"
+                    and not ("InputAndOutput" in modes or {"Input", "Output"} <= modes)
+                ):
+                    not_capturing.append(
+                        {
+                            "name": endpoint_name,
+                            "reason": (
+                                "CaptureStatus is Started, but the endpoint config's "
+                                "DataCaptureConfig.CaptureOptions capture "
+                                f"{', '.join(sorted(m for m in modes if m)) or 'no mode'}, "
+                                "so requests and responses are not both recorded"
+                            ),
+                        }
+                    )
+                elif enabled and capture_status == "Started":
                     capturing.append(
                         {
                             "name": endpoint_name,
@@ -12085,7 +12134,9 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                     finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
                     finding_details=(
                         f"{len(capturing)} of {endpoints_seen} endpoint(s) report "
-                        f"CaptureStatus Started: {described}. Whether the captured "
+                        "CaptureStatus Started and capture both requests and "
+                        "responses (endpoint config CaptureOptions): "
+                        f"{described}. Whether the captured "
                         "records are reviewed, and at what sampling percentage, is "
                         "not readable from the endpoint."
                     ),
@@ -12112,7 +12163,10 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                         f"Endpoint '{entry['name']}' could not be assessed for data "
                         f"capture. Assessment error: {entry['label']}."
                     ),
-                    resolution="Grant sagemaker:DescribeEndpoint and retry.",
+                    resolution=(
+                        "Grant sagemaker:DescribeEndpoint and "
+                        "sagemaker:DescribeEndpointConfig and retry."
+                    ),
                     reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
                     severity="Informational",
                     status="N/A",

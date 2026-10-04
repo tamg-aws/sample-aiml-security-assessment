@@ -2095,6 +2095,27 @@ MUTATIONS = [
         "replace": "    ):\n        pass\n\n    def _administrator():\n",
     },
     {
+        "name": "SM-31 passes a capture that records one direction",
+        "file": SAGEMAKER,
+        "defect": "DescribeEndpoint reports Started for an Input-only capture, so without the endpoint config's CaptureOptions an endpoint that never records responses passes",
+        "find": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} <= modes)\n',
+        "replace": "                    and False\n",
+    },
+    {
+        "name": "SM-31 takes either capture direction for both",
+        "file": SAGEMAKER,
+        "defect": "an endpoint config with only Input or only Output then reads as capturing requests and responses",
+        "find": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} <= modes)\n',
+        "replace": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} & modes)\n',
+    },
+    {
+        "name": "SM-31 passes an endpoint whose config was not read",
+        "file": SAGEMAKER,
+        "defect": "a denied DescribeEndpointConfig leaves the capture modes unknown, so crediting them puts an unread endpoint in the Passed count",
+        "find": "                        continue\n                    modes = {\n",
+        "replace": '                        config = {"DataCaptureConfig": {"CaptureOptions": [{"CaptureMode": "InputAndOutput"}]}}\n                    modes = {\n',
+    },
+    {
         "name": "SM-09 holds no Studio domain or update action",
         "file": SAGEMAKER,
         "defect": "UpdateNotebookInstance can turn RootAccess back on and "
@@ -5180,6 +5201,9 @@ GROUPS: dict[str, str] = {
     "SM-34 has no non-compliant AppNetworkAccessType value": "in the SageMaker verdict legs",
     "SM-34 probes a job ARN with no category segment": "in the SageMaker verdict legs",
     "SM-09 holds no Studio domain or update action": "in the SageMaker verdict legs",
+    "SM-31 passes a capture that records one direction": "in the SageMaker verdict legs",
+    "SM-31 takes either capture direction for both": "in the SageMaker verdict legs",
+    "SM-31 passes an endpoint whose config was not read": "in the SageMaker verdict legs",
     "SM-35 regional leg never reads Detective": "in the SageMaker verdict legs",
     "SM-35 regional leg drops the Macie administrator it read": "in the SageMaker verdict legs",
     "SM-35 takes any Detective membership as the organization graph": "in the SageMaker verdict legs",

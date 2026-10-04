@@ -456,6 +456,11 @@ section.
   graph this account administers counts only when
   `DescribeOrganizationConfiguration` answers for it, so a standalone graph is
   not taken for the organization graph.
+- `SM-31` reads each capturing endpoint's config and passes it only when
+  `DataCaptureConfig.CaptureOptions` covers both `Input` and `Output`.
+  `DescribeEndpoint` reports `Started` for an `Input`-only capture, so an
+  endpoint that never recorded responses passed. An unread endpoint config
+  holds that endpoint out of the `Passed` count as `N/A`.
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule
