@@ -1985,7 +1985,8 @@ Resources:
             Resource: !Sub '${AIMLAssessmentBucket.Arn}/permissions_cache_*.json'
           - Sid: AgentRuntimeArtifactObjectRead
             # AC-34 reads the code archive each runtime's agentRuntimeArtifact
-            # names, and AC-35 the tool schema a gateway target names in S3.
+            # names, and AC-34 and AC-35 each tool schema a gateway target names
+            # in S3.
             # Each is read by its exact key within a byte bound; no bucket is
             # listed. The bucket is any the customer names, so the resource
             # cannot be narrower.
