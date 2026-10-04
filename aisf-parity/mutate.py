@@ -2348,6 +2348,41 @@ MUTATIONS = [
         "find": '                except _HopReadError as error:\n                    return _not_read(\n                        f"{subject} was not judged: {error.text}.", error.action\n                    )\n',
         "replace": "                except _HopReadError:\n                    continue\n",
     },
+    {
+        "name": "SM-39 sync: an earlier BLOCK does not withdraw a name",
+        "file": SAGEMAKER,
+        "defect": "a name an earlier DNS Firewall BLOCK refuses was still counted as answered, so a Network Firewall allow-list that correctly omits it failed the row",
+        "find": "                    if domain in allowed or _domain_patterns_cover(\n",
+        "replace": "                    if domain in allowed or False and _domain_patterns_cover(\n",
+    },
+    {
+        "name": "SM-39 sync: a wildcard BLOCK is matched literally",
+        "file": SAGEMAKER,
+        "defect": "an earlier DNS Firewall BLOCK on *.example.com withdrew only the entry *.example.com, so the subdomains it refuses counted as allowed",
+        "find": "                blocked.extend(_domain_pattern(domain, False) for domain in domains)\n",
+        "replace": "                blocked.extend((domain, True, False) for domain in domains)\n",
+    },
+    {
+        "name": "SM-39 sync: an allowed wildcard is compared whole",
+        "file": SAGEMAKER,
+        "defect": "an allowed *.example.com counted every subdomain as answered, so a firewall target a.example.com that an earlier BLOCK refuses read as in sync",
+        "find": "            if not _dns_allow_list_covers(names, pattern)\n",
+        "replace": "            if not _domain_patterns_cover(dns_patterns, pattern)\n",
+    },
+    {
+        "name": "SM-39 sync: a BLOCK inside an allowed wildcard is not recorded",
+        "file": SAGEMAKER,
+        "defect": "an earlier BLOCK on a name under an allowed wildcard was dropped, so the refused name counted as answered",
+        "find": '                        if subdomains and pattern[0].endswith("." + base)\n',
+        "replace": "                        if False\n",
+    },
+    {
+        "name": "SM-39 sync: a refused part another ALLOW answers is not rescued",
+        "file": SAGEMAKER,
+        "defect": "a name an earlier ALLOW answers ahead of the BLOCK was read as refused, failing an allow-list that is in sync",
+        "find": "                    answered(part) if exact else subdomains_answered(part)\n",
+        "replace": "                    False\n",
+    },
     # ------------------------------------------ the AgentCore verdict legs
     # Each entry reverts one round-6 verdict leg in agentcore_assessments to the
     # behaviour the regrade graded partial. The catcher is the test that pins the
@@ -4991,6 +5026,11 @@ GROUPS: dict[str, str] = {
     "SM-39 sync row ignores names only the DNS Firewall admits": "in the SageMaker verdict legs",
     "SM-39 sync row ignores targets only the Network Firewall admits": "in the SageMaker verdict legs",
     "SM-39 drops the action of a denied transit gateway read": "in the SageMaker verdict legs",
+    "SM-39 sync: an earlier BLOCK does not withdraw a name": "in the SageMaker verdict legs",
+    "SM-39 sync: a wildcard BLOCK is matched literally": "in the SageMaker verdict legs",
+    "SM-39 sync: an allowed wildcard is compared whole": "in the SageMaker verdict legs",
+    "SM-39 sync: a BLOCK inside an allowed wildcard is not recorded": "in the SageMaker verdict legs",
+    "SM-39 sync: a refused part another ALLOW answers is not rescued": "in the SageMaker verdict legs",
     "AC-37 reads an allow-list SCP's omission as an Allow": "in the AgentCore verdict legs",
     "AC-37 passes when the organization's SCPs could not be listed": "in the AgentCore verdict legs",
     "AC-42 passes the population beside an unread configuration": "in the AgentCore verdict legs",

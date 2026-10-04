@@ -21018,15 +21018,17 @@ def _transit_gateway_hops(
 
 def _dns_firewall_allowed_names(
     resolver: Any, vpc_id: str, managed_lists: Dict[str, Any]
-) -> Tuple[Optional[List[str]], str, Optional[str]]:
+) -> Tuple[Optional[Dict[str, List[Tuple[str, bool, bool]]]], str, Optional[str]]:
     """Return the names a VPC's DNS Firewall answers ahead of its BLOCK over "*".
 
     The rules are walked in the order the DNS row walks them. An ALLOW or ALERT
     rule over a customer domain list answers its names, less any an earlier
-    BLOCK lists as the same entry; a BLOCK over an AWS managed list or a rule
-    scoped to one query type admits nothing. Returns (names, "", None) for an
-    allow-list, or (None, reason, action), action naming the grant to retry
-    with when a read failed.
+    BLOCK covers as DNS Firewall matches ("*.example.com" covers every
+    subdomain of example.com, not example.com); a BLOCK over an AWS managed
+    list or a rule scoped to one query type admits nothing. Returns (names, "",
+    None) for an allow-list, names mapping each answered entry to the patterns
+    of the earlier BLOCK entries that refuse part of it, or (None, reason,
+    action), action naming the grant to retry with when a read failed.
     """
     try:
         associations = _paged(
@@ -21046,8 +21048,8 @@ def _dns_firewall_allowed_names(
         (a for a in associations if (a.get("Status") or "COMPLETE") != "DELETING"),
         key=lambda item: item.get("Priority") or 0,
     )
-    allowed: List[str] = []
-    blocked: set = set()
+    allowed: Dict[str, List[Tuple[str, bool, bool]]] = {}
+    blocked: List[Tuple[str, bool, bool]] = []
     for association in live:
         group_id = association.get("FirewallRuleGroupId") or "unknown"
         try:
@@ -21120,7 +21122,7 @@ def _dns_firewall_allowed_names(
                 continue
             if "*" in domains:
                 if action == "BLOCK":
-                    return list(dict.fromkeys(allowed)), "", None
+                    return allowed, "", None
                 return (
                     None,
                     f"the DNS Firewall associated with {vpc_id} answers every name, "
@@ -21128,9 +21130,21 @@ def _dns_firewall_allowed_names(
                     None,
                 )
             if action == "BLOCK":
-                blocked.update(domains)
+                blocked.extend(_domain_pattern(domain, False) for domain in domains)
             else:
-                allowed.extend(domain for domain in domains if domain not in blocked)
+                for domain in domains:
+                    base, _, subdomains = _domain_pattern(domain, False)
+                    if domain in allowed or _domain_patterns_cover(
+                        blocked, _domain_pattern(domain, False)
+                    ):
+                        continue
+                    # A BLOCK on a name or wildcard under a wildcard entry
+                    # refuses that part of it.
+                    allowed[domain] = [
+                        pattern
+                        for pattern in blocked
+                        if subdomains and pattern[0].endswith("." + base)
+                    ]
     return (
         None,
         f'the DNS Firewall associated with {vpc_id} has no BLOCK over "*", so it '
@@ -21169,6 +21183,51 @@ def _domain_patterns_cover(
 
     return (not exact or any(admits(pattern, base) for pattern in patterns)) and (
         not subdomains or any(admits_subdomains(pattern) for pattern in patterns)
+    )
+
+
+def _dns_allow_list_covers(
+    allowed: Dict[str, List[Tuple[str, bool, bool]]], item: Tuple[str, bool, bool]
+) -> bool:
+    """Return whether a DNS Firewall allow-list answers every name `item` admits.
+
+    allowed is _dns_firewall_allowed_names' map of each answered entry to the
+    earlier BLOCK patterns that refuse part of it. A name is answered when an
+    entry admits it and none of that entry's BLOCK patterns does. A wildcard's
+    subdomains are answered when an entry admits them all and each part a BLOCK
+    refuses is answered by another entry, which is decided the same way one
+    label deeper.
+    """
+    entries = [
+        (_domain_pattern(name, False), refused) for name, refused in allowed.items()
+    ]
+    decided: Dict[str, bool] = {}
+
+    def answered(name: str) -> bool:
+        exact = (name, True, False)
+        return any(
+            _domain_patterns_cover([pattern], exact)
+            and not _domain_patterns_cover(refused, exact)
+            for pattern, refused in entries
+        )
+
+    def subdomains_answered(base: str) -> bool:
+        if base not in decided:
+            decided[base] = any(
+                _domain_patterns_cover([pattern], (base, False, True))
+                and not _domain_patterns_cover(refused, (base, False, True))
+                and all(
+                    answered(part) if exact else subdomains_answered(part)
+                    for part, exact, _ in refused
+                    if part.endswith("." + base)
+                )
+                for pattern, refused in entries
+            )
+        return decided[base]
+
+    base, exact, subdomains = item
+    return (not exact or answered(base)) and (
+        not subdomains or subdomains_answered(base)
     )
 
 
@@ -21545,7 +21604,7 @@ def _workload_firewall_vpc_finding(
         nfw_only = [
             target
             for target, pattern in zip(allow_targets[arn], nfw_patterns)
-            if not _domain_patterns_cover(dns_patterns, pattern)
+            if not _dns_allow_list_covers(names, pattern)
         ]
         if dns_only:
             mismatches.append(
