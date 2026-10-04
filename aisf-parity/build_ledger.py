@@ -1497,9 +1497,12 @@ AI_SUBJECT_ROWS = [
         "returns each job's full description. A SageMaker transform or processing "
         "job is read from the trial component SageMaker records for it, found by "
         "Search on its Source.SourceArn, and one with no trial component is "
-        "described, newest first, to 200 of each kind. Bedrock evaluation jobs have "
-        "no bulk read, since ListEvaluationJobs summaries carry no S3 location, so "
-        "they are read to the newest 200. An unread job past either cap withholds "
+        "described, newest first, to 200 of each kind. Bedrock evaluation jobs are "
+        "listed on every ListEvaluationJobs page, and their summaries carry no S3 "
+        "location, so each is read with GetEvaluationJob to the newest 600: a live "
+        "call took 0.079 s at the median and 0.188 s at the slowest, and the 5,000 "
+        "job quota would take 940 s against the function's 600 s timeout. The jobs "
+        "past that cap are named. An unread job past any cap withholds "
         "the Passed row, as does a failed read, since an unread bucket may accept "
         "plaintext",
         [],

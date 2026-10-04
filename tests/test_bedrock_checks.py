@@ -26291,6 +26291,7 @@ class TestBR47DataPathBucketTLS:
         endpoints=None,
         evaluation_jobs=None,
         evaluation_error=None,
+        evaluation_paged=False,
     ):
         agent_client = MagicMock()
         if list_knowledge_bases_error:
@@ -26419,17 +26420,28 @@ class TestBR47DataPathBucketTLS:
             lambda EndpointConfigName: answer(endpoints[EndpointConfigName][1])
         )
         self.sagemaker_client = sagemaker_client
+        summaries = [
+            {
+                "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:evaluation-job/{name}",
+                "jobName": name,
+            }
+            for name in evaluation_jobs
+        ]
         if evaluation_error:
             bedrock_client.list_evaluation_jobs.side_effect = evaluation_error
+        elif evaluation_paged:
+            # One job a page, so every job past the first is on a later page.
+            def list_evaluation_jobs(nextToken=None, **kwargs):
+                index = int(nextToken or 0)
+                page = {"jobSummaries": summaries[index : index + 1]}
+                if index + 1 < len(summaries):
+                    page["nextToken"] = str(index + 1)
+                return page
+
+            bedrock_client.list_evaluation_jobs.side_effect = list_evaluation_jobs
         else:
             bedrock_client.list_evaluation_jobs.return_value = {
-                "jobSummaries": [
-                    {
-                        "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:evaluation-job/{name}",
-                        "jobName": name,
-                    }
-                    for name in evaluation_jobs
-                ]
+                "jobSummaries": summaries
             }
         bedrock_client.get_evaluation_job.side_effect = lambda jobIdentifier: answer(
             evaluation_jobs[jobIdentifier.rsplit("/", 1)[-1]]
@@ -27347,6 +27359,40 @@ class TestBR47DataPathBucketTLS:
         assert "no-tls" in failed[0]["Finding_Details"]
         assert "past the newest" not in " ".join(f["Finding_Details"] for f in findings)
         self.sagemaker_client.describe_training_job.assert_not_called()
+
+    def test_br47_evaluation_jobs_past_the_old_cap_are_all_read(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                evaluation_jobs={
+                    "ev-new": {"outputDataConfig": {"s3Uri": "s3://tls-ok/"}},
+                    "ev-mid": {"outputDataConfig": {"s3Uri": "s3://tls-ok/"}},
+                    "ev-old": {"outputDataConfig": {"s3Uri": "s3://no-tls/"}},
+                },
+                evaluation_paged=True,
+                bucket_policies=self._enforced("tls-ok"),
+            )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "no-tls" in failed[0]["Finding_Details"]
+        assert "past the newest" not in " ".join(f["Finding_Details"] for f in findings)
+        assert self.bedrock_client.get_evaluation_job.call_count == 3
+
+    def test_br47_evaluation_jobs_past_the_read_cap_are_named(self):
+        with patch.object(bedrock_app, "MAX_EVALUATION_JOB_READS", 1):
+            findings = self._run(
+                evaluation_jobs={
+                    "ev-new": {"outputDataConfig": {"s3Uri": "s3://tls-ok/"}},
+                    "ev-old": {"outputDataConfig": {"s3Uri": "s3://no-tls/"}},
+                },
+                bucket_policies=self._enforced("tls-ok"),
+            )
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            "1 older evaluation job(s) past the newest 1 were not read with "
+            "bedrock:GetEvaluationJob: ev-old" in details
+        )
+        assert self.bedrock_client.get_evaluation_job.call_count == 1
 
     def test_br47_batch_jobs_a_trial_component_holds_need_no_describe(self):
         with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):

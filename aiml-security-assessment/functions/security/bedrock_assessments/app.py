@@ -33946,11 +33946,22 @@ def _sagemaker_endpoint_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "uris": uris, "errors": errors}
 
 
+# Evaluation job summaries carry no S3 location, so each job is read with
+# GetEvaluationJob. A live call took 0.079 s at the median and 0.188 s at the
+# slowest of ten (us-east-1, 2026-10-04), and the account quota allows 5,000
+# evaluation jobs, which at 0.188 s is 940 s against the function's 600 s
+# timeout. 600 reads stay under 113 s, a fifth of that timeout.
+MAX_EVALUATION_JOB_READS = 600
+
+# Jobs past MAX_EVALUATION_JOB_READS named in the N/A text; the rest are counted.
+EVALUATION_JOBS_NAMED_PAST_CAP = 50
+
+
 def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 datasets and output of the Bedrock evaluation jobs in
-    ``region``, newest first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs; older
-    jobs are named in ``errors``. Each automated or human dataset's
+    ``region`` (ListEvaluationJobs, every page), newest first, to
+    MAX_EVALUATION_JOB_READS jobs; older jobs are named in ``errors``. Each automated or human dataset's
     datasetLocation.s3Uri is read and outputDataConfig.s3Uri is written.
     Returns {"locations": [(bucket, label)], "errors"}.
     """
@@ -33973,15 +33984,22 @@ def _evaluation_job_locations(region: str = "") -> Dict[str, Any]:
                 f"({get_assessment_error_label(error)})"
             ],
         }
-    if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
+    unread = [
+        job.get("jobName") or job.get("jobArn") or "unnamed"
+        for job in jobs[MAX_EVALUATION_JOB_READS:]
+    ]
+    if unread:
+        rest = len(unread) - EVALUATION_JOBS_NAMED_PAST_CAP
         errors.append(
             "{} older evaluation job(s) past the newest {} were not read with "
-            "bedrock:GetEvaluationJob".format(
-                len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
-                MAX_SAGEMAKER_TRAINING_JOB_READS,
+            "bedrock:GetEvaluationJob: {}{}".format(
+                len(unread),
+                MAX_EVALUATION_JOB_READS,
+                ", ".join(unread[:EVALUATION_JOBS_NAMED_PAST_CAP]),
+                f", and {rest} more" if rest > 0 else "",
             )
         )
-    for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
+    for job in jobs[:MAX_EVALUATION_JOB_READS]:
         name = job.get("jobName") or job.get("jobArn") or "unnamed"
         try:
             detail = client.get_evaluation_job(jobIdentifier=job.get("jobArn"))
