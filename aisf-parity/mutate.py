@@ -1835,6 +1835,20 @@ MUTATIONS = [
         "find": "            if _tool_result_only(content):\n                continue\n",
         "replace": "            if False:\n                continue\n",
     },
+    {
+        "name": "BR-27 InvokeModel: one grounding tag counts as both",
+        "file": BEDROCK,
+        "defect": "a guarded InvokeModel call sending a source tag and no query tag passed",
+        "find": "            if len(tags) < 2:\n",
+        "replace": "            if not tags:\n",
+    },
+    {
+        "name": "BR-27 InvokeModel: an untagged call with an unknown guardrail is judged",
+        "file": BEDROCK,
+        "defect": "an untagged InvokeModel call was failed though its guardrail is not logged",
+        "find": "            if not tags and not any(\n",
+        "replace": "            if False and not any(\n",
+    },
     # ------------------------------------------- SageMaker round-6 check logic
     # SM-39's egress legs for ECS and Lambda VPCs (AIR-SLF-RT-02) and SM-43's
     # artifact reads (AIR-SLF-CMP-08). Each was killed by hand on a byte backup
@@ -3728,6 +3742,12 @@ GROUPS: dict[str, str] = {
     "BR-42 parse: an unparsed policy keeps Passed": "in the Bedrock model allow-list policy reads",
     "BR-42 training: Search results ignored": "in the Bedrock training bucket policies",
     "BR-34 Converse: a tool-result turn is judged as the latest turn": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: one grounding tag counts as both": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 InvokeModel: an untagged call with an unknown guardrail is judged": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     DERIVED_PARTIAL_QUALIFIER_NAME: "in the tag column",

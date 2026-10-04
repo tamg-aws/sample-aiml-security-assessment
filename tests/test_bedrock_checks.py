@@ -43517,6 +43517,108 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["N/A"]
         assert phrase in rows[0]["Finding_Details"]
 
+    # GRD-09: an InvokeModel caller marks the grounding source and query with
+    # suffixed tags in the body, which were never read.
+    def _grounded_invoke(self, request_id, tags, assessed=False, suffix="xyz"):
+        prompt = "".join(
+            f"<amazon-bedrock-guardrails-{tag}_xyz>{self.BODY_TEXT}"
+            f"</amazon-bedrock-guardrails-{tag}_xyz>"
+            for tag in tags
+        )
+        out = {"amazon-bedrock-guardrailAction": "NONE", "completion": "x"}
+        if assessed:
+            out["amazon-bedrock-trace"] = {
+                "guardrail": {"outputs": [{"g1": self.GROUNDS}]}
+            }
+        config = {"tagSuffix": suffix} if suffix else {}
+        return self._record(
+            request_id,
+            "InvokeModel",
+            inp={
+                "prompt": prompt or self.BODY_TEXT,
+                "amazon-bedrock-guardrailConfig": config,
+            },
+            out=out,
+        )
+
+    def test_an_invoke_call_missing_a_grounding_tag_fails(self):
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.GUARDED: [
+                    [
+                        self._grounded_invoke("req-both", ["groundingSource", "query"]),
+                        self._grounded_invoke("req-source", ["groundingSource"]),
+                        self._grounded_invoke("req-query", ["query"]),
+                        self._grounded_invoke("req-bare", [], assessed=True),
+                    ]
+                ],
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "3 of the 4 guarded InvokeModel call(s)" in detail
+        for named in ("req-source", "req-query", "req-bare"):
+            assert f"{named} (InvokeModel anthropic.test)" in detail
+        assert "req-both" not in detail
+        assert "guarded Converse call(s)" not in detail
+
+    def test_tagged_invoke_calls_and_a_score_pass(self):
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.GUARDED: [
+                    [
+                        self._grounded_invoke("req-a", ["groundingSource", "query"]),
+                        self._grounded_invoke(
+                            "req-b", ["query", "groundingSource"], assessed=True
+                        ),
+                    ]
+                ],
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "every one of the 2 guarded InvokeModel call(s) wrapped both a "
+            "groundingSource and a query tag"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "call, phrase",
+        [
+            (
+                "bare",
+                "which sent no grounding tag and names its guardrail only in "
+                "request headers the invocation log does not record",
+            ),
+            (
+                "no-suffix",
+                "whose body names no tagSuffix in amazon-bedrock-guardrailConfig to "
+                "match its grounding tags against",
+            ),
+        ],
+    )
+    def test_an_unjudged_guarded_invoke_call_withholds_the_pass(self, call, phrase):
+        record = (
+            self._grounded_invoke("req-u", [])
+            if call == "bare"
+            else self._grounded_invoke("req-u", ["query"], suffix=None)
+        )
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.GUARDED: [[record]],
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            f"req-u (InvokeModel anthropic.test), {phrase}"
+            in rows[0]["Finding_Details"]
+        )
+
     def test_s3_only_grounding_with_no_score_is_na(self):
         rows = self._grounding(
             {},

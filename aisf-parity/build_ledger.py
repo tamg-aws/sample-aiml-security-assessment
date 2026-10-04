@@ -195,9 +195,12 @@ AI_SUBJECT_ROWS = [
         "with contextual grounding filters (bedrock:GetGuardrail on the version the"
         " call names) and fails one that does not qualify both a grounding_source "
         "and a query guardContent block; an unread version, a call naming no "
-        "guardrailConfig or a capped read is N/A. The grounding_source and query "
-        "tags of InvokeModel calls are not read, and Automated Reasoning checks are"
-        " reported, not judged",
+        "guardrailConfig or a capped read is N/A. It fails a guarded InvokeModel "
+        "call that sends one of the groundingSource and query tags without the "
+        "other, or neither while its response carries a contextual grounding "
+        "assessment; an untagged call with no such assessment is N/A, since its "
+        "guardrail is named only in request headers the log does not record. "
+        "Automated Reasoning checks are reported, not judged",
         [],
         3,
     ),

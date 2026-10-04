@@ -19725,6 +19725,12 @@ INVOCATION_LOG_SCAN_LOOKBACK = timedelta(hours=24)
 # tagSuffix: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html
 GUARDRAIL_INPUT_TAG = "amazon-bedrock-guardrails-guardContent"
 
+# InvokeModel callers mark the contextual grounding source and query with these
+# tags, suffixed the same way: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-contextual-grounding-check.html
+GROUNDING_SOURCE_TAG = "amazon-bedrock-guardrails-groundingSource"
+
+GROUNDING_QUERY_TAG = "amazon-bedrock-guardrails-query"
+
 # A guarded InvokeModel response body carries this field, per the InvokeModel
 # API reference example response.
 GUARDRAIL_ACTION_FIELD = "amazon-bedrock-guardrailAction"
@@ -19922,6 +19928,32 @@ def _invoke_input_tag_state(body: Any) -> str:
         )
         return "tagged" if tagged else "untagged"
     return "unknown" if GUARDRAIL_INPUT_TAG in text else "untagged"
+
+
+def _invoke_grounding_tags(body: Any) -> Optional[Set[str]]:
+    """
+    Return which of the grounding source and query tags an InvokeModel body
+    wraps text in, matched to its amazon-bedrock-guardrailConfig tagSuffix, or
+    None when a grounding tag appears with no tagSuffix to match.
+    """
+    text = json.dumps(body, ensure_ascii=False)
+    suffixes = {
+        item["amazon-bedrock-guardrailConfig"].get("tagSuffix")
+        for item in _nested_dicts(body)
+        if isinstance(item.get("amazon-bedrock-guardrailConfig"), dict)
+    }
+    suffixes = {suffix for suffix in suffixes if isinstance(suffix, str) and suffix}
+    tags = (GROUNDING_SOURCE_TAG, GROUNDING_QUERY_TAG)
+    if not suffixes:
+        return None if any(tag in text for tag in tags) else set()
+    return {
+        tag
+        for tag in tags
+        if any(
+            f"<{tag}_{suffix}>" in text and f"</{tag}_{suffix}>" in text
+            for suffix in suffixes
+        )
+    }
 
 
 def _converse_guarded(body: Any, output: Any) -> bool:
@@ -20743,25 +20775,111 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 f"first {converse_scan['read']} "
                 f"({'page cap' if source['log_group'] else 'object cap'})"
             )
-        if unqualified:
+        # A guarded InvokeModel call names its guardrail only in request
+        # headers, which the log does not record, so it is judged when it sends
+        # one grounding tag without the other, or when its response shows the
+        # grounding filter ran.
+        invoke_calls = []
+        invoke_unqualified = []
+
+        def visit_invoke(record):
+            if record.get("operation") not in INVOKE_GUARDRAIL_TAG_OPERATIONS:
+                return
+            output = (record.get("output") or {}).get("outputBodyJson")
+            if not any(
+                GUARDRAIL_ACTION_FIELD in item for item in _nested_dicts(output)
+            ):
+                return
+            label = "{} ({} {})".format(
+                record.get("requestId") or "no request ID",
+                record.get("operation"),
+                record.get("modelId") or "no model ID",
+            )
+            body = (record.get("input") or {}).get("inputBodyJson")
+            if body is None:
+                unjudged.append(f"{label}, whose request body is not inline")
+                return
+            tags = _invoke_grounding_tags(body)
+            if tags is None:
+                unjudged.append(
+                    f"{label}, whose body names no tagSuffix in "
+                    "amazon-bedrock-guardrailConfig to match its grounding tags against"
+                )
+                return
+            if not tags and not any(
+                "contextualGroundingPolicy" in item for item in _nested_dicts(output)
+            ):
+                unjudged.append(
+                    f"{label}, which sent no grounding tag and names its guardrail "
+                    "only in request headers the invocation log does not record, so "
+                    "whether that guardrail has contextual grounding filters is not "
+                    "known"
+                )
+                return
+            invoke_calls.append(label)
+            if len(tags) < 2:
+                invoke_unqualified.append(label)
+
+        invoke_scan = _scan_invocation_records(
+            region,
+            source,
+            f'"{GUARDRAIL_ACTION_FIELD}"',
+            lambda line, record: GUARDRAIL_ACTION_FIELD in line,
+            visit_invoke,
+        )
+        if invoke_scan["error"]:
+            unjudged.append(
+                f"records carrying {GUARDRAIL_ACTION_FIELD} in {log_group} "
+                f"({invoke_scan['action']}, {invoke_scan['error']})"
+            )
+        elif invoke_scan["capped"]:
+            unjudged.append(
+                f"records carrying {GUARDRAIL_ACTION_FIELD} in {log_group} past the "
+                f"first {invoke_scan['read']} "
+                f"({'page cap' if source['log_group'] else 'object cap'})"
+            )
+        if unqualified or invoke_unqualified:
             findings["status"] = "FAIL"
+            failures = []
+            if unqualified:
+                failures.append(
+                    "{} of the {} guarded Converse call(s) logged in {} in the last "
+                    "24 hours through a guardrail version with contextual grounding "
+                    "filters did not qualify both a grounding_source and a query "
+                    "guardContent block, so the grounding check did not score their "
+                    "responses: {}.".format(
+                        len(unqualified),
+                        len(grounded_calls),
+                        log_group,
+                        "; ".join(unqualified[:5]),
+                    )
+                )
+            if invoke_unqualified:
+                failures.append(
+                    "{} of the {} guarded InvokeModel call(s) logged in {} in the "
+                    "last 24 hours that sent a grounding tag or whose response "
+                    "carries a contextual grounding assessment did not wrap both a "
+                    "{}_<tagSuffix> source and a {}_<tagSuffix> query matching the "
+                    "tagSuffix in amazon-bedrock-guardrailConfig: {}.".format(
+                        len(invoke_unqualified),
+                        len(invoke_calls),
+                        log_group,
+                        GROUNDING_SOURCE_TAG,
+                        GROUNDING_QUERY_TAG,
+                        "; ".join(invoke_unqualified[:5]),
+                    )
+                )
             row(
-                "{} of the {} guarded Converse call(s) logged in {} in the last 24 "
-                "hours through a guardrail version with contextual grounding "
-                "filters did not qualify both a grounding_source and a query "
-                "guardContent block, so the grounding check did not score their "
-                "responses: {}.{}".format(
-                    len(unqualified),
-                    len(grounded_calls),
-                    log_group,
-                    "; ".join(unqualified[:5]),
+                "{}{}".format(
+                    " ".join(failures),
                     " Not read: {}.".format("; ".join(unjudged[:5]))
                     if unjudged
                     else "",
                 ),
                 "Pass the reference source and the user query in guardContent "
                 "text blocks qualified grounding_source and query on each Converse "
-                "call through a guardrail with contextual grounding filters.",
+                "call through a guardrail with contextual grounding filters, and "
+                "in groundingSource and query tags on each such InvokeModel call.",
                 "Medium",
                 "Failed",
             )
@@ -20769,8 +20887,8 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
         if unjudged:
             findings["status"] = "N/A"
             row(
-                "No guarded Converse call read in {} omitted the grounding_source "
-                "and query qualifiers, but not every guarded call was judged: "
+                "No guarded Converse or InvokeModel call read in {} omitted a "
+                "grounding source or query, but not every guarded call was judged: "
                 "{}.".format(log_group, "; ".join(unjudged[:5])),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
@@ -20783,9 +20901,14 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 "contextual grounding assessment(s) were logged in the last 24 "
                 "hours: {}. In the same 24 hours every one of the {} guarded "
                 "Converse call(s) through a guardrail version with contextual "
-                "grounding filters qualified a grounding_source and a query; "
-                "InvokeModel calls are not read for them.".format(
-                    log_group, len(scored), "; ".join(scored[:5]), len(grounded_calls)
+                "grounding filters qualified a grounding_source and a query, and "
+                "every one of the {} guarded InvokeModel call(s) wrapped both a "
+                "groundingSource and a query tag.".format(
+                    log_group,
+                    len(scored),
+                    "; ".join(scored[:5]),
+                    len(grounded_calls),
+                    len(invoke_calls),
                 ),
                 "No action required.",
                 "Medium",
