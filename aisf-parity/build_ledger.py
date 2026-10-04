@@ -1755,7 +1755,10 @@ AI_SUBJECT_ROWS = [
         "CloudTrail applies passes only when a PII entity type blocks or "
         "anonymizes on the input with inputEnabled not false. An unread guardrail, "
         "version or logged invocation is N/A, a used version with no such entity "
-        "fails, and a Region where nothing applies a guardrail fails",
+        "fails, and a Region where nothing applies a guardrail fails. A logged "
+        "invocation whose CloudTrail event names no guardrail fails by requestId, "
+        "unless an un-narrowed account-enforced configuration applies a guardrail "
+        "that screens the input; when that guardrail is unread it is N/A",
         [],
         5,
     ),
