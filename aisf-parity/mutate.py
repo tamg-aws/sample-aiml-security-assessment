@@ -1726,6 +1726,31 @@ MUTATIONS = [
         "replace": "            elif False:\n",
     },
     {
+        "name": "BR-32 composite: an AND rule credits each alarm it names",
+        "file": BEDROCK,
+        "defect": "an intervention alarm ANDed with another raises the composite "
+        "only with it, so crediting it passes an alarm that never notifies alone",
+        "find": "                    can_false or right_false,\n",
+        "replace": "                    can_false and right_false,\n",
+    },
+    {
+        "name": "BR-32 composite: an ARN reference is not mapped to its name",
+        "file": BEDROCK,
+        "defect": "a composite rule may name an alarm by ARN, so crediting only "
+        "the ARN leaves the alarm, judged by name, reading as silent",
+        "find": "                notifying.update(aliases.get(reference, {reference}))\n",
+        "replace": "                notifying.add(reference)\n",
+    },
+    {
+        "name": "BR-32 composite: an unread rule credits its alarms",
+        "file": BEDROCK,
+        "defect": "a rule this parser does not read, such as AT_LEAST, may need "
+        "several alarms, so crediting its alarms passes one that never notifies "
+        "alone",
+        "find": "        if not match or match.end() == position:\n            return None\n",
+        "replace": "        if not match or match.end() == position:\n            return True\n",
+    },
+    {
         "name": "BR-20 network: a public rule is not judged",
         "file": BEDROCK,
         "defect": "a network policy allowing the collection from public networks passed",
@@ -4698,6 +4723,15 @@ GROUPS: dict[str, str] = {
     "BR-32 spike: a lower-band alarm credited": "in the Bedrock guardrail spike alarms",
     "BR-32 S3 forward: any notification event credited": "in the Bedrock guardrail spike alarms",
     "BR-32 S3 forward: a narrower prefix rule credited": "in the Bedrock guardrail spike alarms",
+    "BR-32 composite: an AND rule credits each alarm it names": (
+        "in the Bedrock guardrail spike alarms"
+    ),
+    "BR-32 composite: an ARN reference is not mapped to its name": (
+        "in the Bedrock guardrail spike alarms"
+    ),
+    "BR-32 composite: an unread rule credits its alarms": (
+        "in the Bedrock guardrail spike alarms"
+    ),
     "BR-20 network: a public rule is not judged": "in the Bedrock knowledge base stores",
     "BR-20 APIAccessAll: only a bare * is wide": "in the Bedrock knowledge base stores",
     "BR-20 source: a PrincipalArn allow-list is not compared": "in the Bedrock knowledge base stores",

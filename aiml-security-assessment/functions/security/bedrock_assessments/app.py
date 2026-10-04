@@ -23153,6 +23153,100 @@ def _spike_alarm_bound(alarm: Dict[str, Any]) -> str:
 
 COMPOSITE_ALARM_REFERENCE = re.compile(r'(NOT\s+)?ALARM\(\s*"?([^")]+?)"?\s*\)')
 
+# One token of a composite alarm rule: a state function and the alarm it names,
+# a keyword, or a parenthesis. Anything else, such as AT_LEAST, is not read.
+COMPOSITE_RULE_TOKEN = re.compile(
+    r'\s*(?:(ALARM|OK|INSUFFICIENT_DATA)\(\s*(?:"([^"]*)"|([^")]+?))\s*\)'
+    r"|(AND|OR|NOT|TRUE|FALSE)\b|([()]))"
+)
+
+
+def _composite_rule_forced(rule: str, reference: str) -> Optional[bool]:
+    """
+    Whether a composite alarm rule is TRUE whenever the alarm ``reference``
+    names is in ALARM, whatever state every other alarm it names is in, so that
+    alarm alone raises the composite. Each node is read as whether it can be
+    true and whether it can be false with every other reference free, which can
+    miss a rule true only through a repeated reference but never credits one
+    that is not. Returns None for syntax this does not read (AT_LEAST, or AND
+    and OR mixed at one level without parentheses).
+    """
+    tokens = []
+    position = 0
+    text = rule.strip()
+    while position < len(text):
+        match = COMPOSITE_RULE_TOKEN.match(text, position)
+        if not match or match.end() == position:
+            return None
+        state, quoted, bare, keyword, paren = match.groups()
+        if state:
+            tokens.append(
+                ("state", state, (quoted if quoted is not None else bare).strip())
+            )
+        else:
+            tokens.append(("word", keyword or paren, None))
+        position = match.end()
+        while position < len(text) and text[position].isspace():
+            position += 1
+    index = [0]
+
+    def peek():
+        return tokens[index[0]] if index[0] < len(tokens) else None
+
+    def term():
+        token = peek()
+        if token is None:
+            raise ValueError("rule ends early")
+        index[0] += 1
+        kind, word, name = token
+        if kind == "state":
+            if name != reference:
+                return (True, True)
+            return (True, False) if word == "ALARM" else (False, True)
+        if word == "NOT":
+            can_true, can_false = term()
+            return (can_false, can_true)
+        if word == "TRUE":
+            return (True, False)
+        if word == "FALSE":
+            return (False, True)
+        if word == "(":
+            value = expression()
+            if peek() != ("word", ")", None):
+                raise ValueError("unclosed parenthesis")
+            index[0] += 1
+            return value
+        raise ValueError(f"unexpected {word}")
+
+    def expression():
+        can_true, can_false = term()
+        operator = None
+        while peek() is not None and peek()[1] in ("AND", "OR"):
+            if operator and peek()[1] != operator:
+                raise ValueError("AND and OR mixed without parentheses")
+            operator = peek()[1]
+            index[0] += 1
+            right_true, right_false = term()
+            if operator == "AND":
+                can_true, can_false = (
+                    can_true and right_true,
+                    can_false or right_false,
+                )
+            else:
+                can_true, can_false = (
+                    can_true or right_true,
+                    can_false and right_false,
+                )
+        return can_true, can_false
+
+    try:
+        can_true, can_false = expression()
+    except ValueError:
+        return None
+    if peek() is not None:
+        return None
+    return can_true and not can_false
+
 
 def _alarm_metrics(alarm: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Name each (namespace, metric name) an alarm evaluates, metric math included."""
@@ -23170,13 +23264,20 @@ def _notifying_alarm_names(
 ) -> set:
     """
     Name the alarms whose state change reaches an action: an alarm with
-    ActionsEnabled true and an AlarmActions target, or an alarm an acting
-    composite alarm's rule reads as ALARM(...).
+    ActionsEnabled true and an AlarmActions target, or an alarm whose ALARM
+    state alone makes an acting composite alarm's rule true
+    (_composite_rule_forced), so an alarm under an AND with another is not
+    credited. Each alarm is named by its name and its ARN.
     """
 
     def acts(alarm: Dict[str, Any]) -> bool:
         return alarm.get("ActionsEnabled") is True and bool(alarm.get("AlarmActions"))
 
+    aliases: Dict[str, set] = {}
+    for alarm in metric_alarms + composite_alarms:
+        keys = {key for key in (alarm.get("AlarmName"), alarm.get("AlarmArn")) if key}
+        for key in keys:
+            aliases[key] = keys
     notifying = set()
     for alarm in metric_alarms + composite_alarms:
         if acts(alarm):
@@ -23192,12 +23293,14 @@ def _notifying_alarm_names(
                 or composite.get("AlarmArn") in notifying
             ):
                 continue
-            for negated, reference in COMPOSITE_ALARM_REFERENCE.findall(
-                composite.get("AlarmRule") or ""
-            ):
-                if negated or reference in notifying:
+            rule = composite.get("AlarmRule") or ""
+            for _, reference in COMPOSITE_ALARM_REFERENCE.findall(rule):
+                reference = reference.strip()
+                if reference in notifying or not _composite_rule_forced(
+                    rule, reference
+                ):
                     continue
-                notifying.add(reference)
+                notifying.update(aliases.get(reference, {reference}))
                 changed = True
     return notifying
 
@@ -23646,7 +23749,7 @@ def check_bedrock_cloudwatch_alarms(
                 lambda ns, _name: ns == "AWS/Bedrock"
             )
             silent_note = (
-                f" Alarm(s) {', '.join(silent_bedrock_alarms)} evaluate AWS/Bedrock metrics but reach no action: ActionsEnabled is false or AlarmActions is empty, and no acting composite alarm reads them."
+                f" Alarm(s) {', '.join(silent_bedrock_alarms)} evaluate AWS/Bedrock metrics but reach no action: ActionsEnabled is false or AlarmActions is empty, and no acting composite alarm's rule is true whenever they alone are in ALARM."
                 if silent_bedrock_alarms
                 else ""
             )

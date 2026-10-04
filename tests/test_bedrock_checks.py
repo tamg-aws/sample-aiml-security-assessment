@@ -23497,6 +23497,95 @@ class TestBR32ActingIntervention:
             in signal["Finding_Details"]
         )
 
+    def test_an_and_composite_does_not_carry_the_alarm_beside_an_or_one(self):
+        """Under AND the intervention alarm raises the composite only with the
+        other alarm, so it never notifies on its own; under OR it does. The
+        slice dimensions make the credited alarm name itself."""
+        sliced = [
+            {"Name": "GuardrailArn", "Value": "arn:g"},
+            {"Name": "GuardrailVersion", "Value": "1"},
+        ]
+        _, signal = self._run(
+            [
+                _intervened_alarm("anded", actions=False, Dimensions=sliced),
+                _intervened_alarm("ored", actions=False, Dimensions=sliced),
+            ],
+            composites=[
+                {
+                    "AlarmName": "both",
+                    "AlarmRule": 'ALARM("anded") AND ALARM("other")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+                {
+                    "AlarmName": "either",
+                    "AlarmRule": '(ALARM("x") AND ALARM("y")) OR ALARM("ored")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+            ],
+        )
+        detail = signal["Finding_Details"]
+        assert signal["Status"] == "N/A"
+        assert "alarm ored counts only GuardrailArn arn:g, GuardrailVersion 1" in detail
+        assert "alarm anded counts only" not in detail
+        assert "anded on InvocationsIntervened reach no action" in detail
+
+    def test_an_and_composite_alone_leaves_the_alarm_silent(self):
+        _, signal = self._run(
+            [_intervened_alarm("anded", actions=False)],
+            composites=[
+                {
+                    "AlarmName": "both",
+                    "AlarmRule": 'ALARM("anded") AND ALARM("other")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+                {
+                    "AlarmName": "counted",
+                    # AT_LEAST is not read, so the alarm beside it is not
+                    # credited; here it would need a second alarm anyway.
+                    "AlarmRule": ('ALARM("anded") AND AT_LEAST(1, ALARM, ("x", "y"))'),
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "anded on InvocationsIntervened reach no action"
+            in signal["Finding_Details"]
+        )
+
+    def test_a_composite_naming_the_alarm_by_arn_carries_it(self):
+        arn = "arn:aws:cloudwatch:us-east-1:123456789012:alarm:by-arn"
+        _, signal = self._run(
+            [
+                _intervened_alarm(
+                    "by-arn",
+                    actions=False,
+                    AlarmArn=arn,
+                    Dimensions=[
+                        {"Name": "GuardrailArn", "Value": "arn:g"},
+                        {"Name": "GuardrailVersion", "Value": "1"},
+                    ],
+                )
+            ],
+            composites=[
+                {
+                    "AlarmName": "parent",
+                    "AlarmRule": f'ALARM("{arn}") OR ALARM("other")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                }
+            ],
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            "alarm by-arn counts only GuardrailArn arn:g, GuardrailVersion 1"
+            in signal["Finding_Details"]
+        )
+
     def test_metric_filter_without_an_alarm_is_not_a_signal(self):
         _, signal = self._run(
             [ACTING_RUNTIME_ALARM],
@@ -24288,7 +24377,8 @@ class TestBR32ActingIntervention:
         assert (
             "Alarm(s) orphan-throttle evaluate AWS/Bedrock metrics but reach no "
             "action: ActionsEnabled is false or AlarmActions is empty, and no "
-            "acting composite alarm reads them." in runtime[0]["Finding_Details"]
+            "acting composite alarm's rule is true whenever they alone are in ALARM."
+            in runtime[0]["Finding_Details"]
         )
 
     def test_runtime_alarm_under_a_silent_or_negated_composite_fails(self):
@@ -24318,7 +24408,8 @@ class TestBR32ActingIntervention:
         assert (
             "Alarm(s) child-throttle, sibling-throttle evaluate AWS/Bedrock metrics "
             "but reach no action: ActionsEnabled is false or AlarmActions is empty, "
-            "and no acting composite alarm reads them." in runtime[0]["Finding_Details"]
+            "and no acting composite alarm's rule is true whenever they alone are in ALARM."
+            in runtime[0]["Finding_Details"]
         )
 
     def test_log_forwarding_is_reported(self):
