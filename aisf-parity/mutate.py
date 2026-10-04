@@ -928,6 +928,93 @@ MUTATIONS = [
         ),
         "replace": "        or False\n",
     },
+    {
+        "name": "SM-43 lets an IMDSv1 instance read the weights",
+        "file": SAGEMAKER,
+        "defect": "an EC2 instance whose role can read the artifact bucket and "
+        "whose metadata service still answers without a session token hands the "
+        "role's credentials to any request it serves. Skipping every instance "
+        "passes the endpoint beside it",
+        "find": (
+            '            if options.get("HttpTokens") == "required":\n'
+            "                continue\n"
+        ),
+        "replace": (
+            '            if options.get("HttpTokens") != "never":\n'
+            "                continue\n"
+        ),
+    },
+    {
+        "name": "SM-43 reads only the first instance",
+        "file": SAGEMAKER,
+        "defect": "the instance population is the whole DescribeInstances "
+        "listing. Judging only the first instance passes an IMDSv1 instance that "
+        "sorts after a compliant one",
+        "find": "        for instance in instances:\n            profile_arn = str(",
+        "replace": "        for instance in instances[:1]:\n            profile_arn = str(",
+    },
+    {
+        "name": "SM-40 ignores the MicroVM resume hook",
+        "file": SAGEMAKER,
+        "defect": "a MicroVM resumed from a suspended state runs only its /resume "
+        "hook, so an image version without one never re-fetches a rotated "
+        "secret. Ignoring the hook passes every MicroVM image",
+        "find": '        if hooks.get("resume") != "ENABLED":\n',
+        "replace": "        if False:\n",
+    },
+    {
+        "name": "SM-02 leaves IAM-authorized methods unjudged",
+        "file": SAGEMAKER,
+        "defect": "the execute-api:Invoke grants that split read from write are "
+        "in the IAM cache. Sending IAM methods to the not-judged row hides a "
+        "grant whose one pattern reaches both the read and the write method",
+        "find": '        elif kind == "AWS_IAM" and permission_cache is not None:\n',
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "SM-02 lets a stage span a slash",
+        "file": SAGEMAKER,
+        "defect": "no stage name holds a slash, so a GET/* grant reaches no POST "
+        "method. Letting the stage token take a slash reads a read-only grant as "
+        "reaching the write method and fails it",
+        "find": (
+            '                here == "?" or token == EXECUTE_API_REST or here != "/"\n'
+        ),
+        "replace": "                True\n",
+    },
+    {
+        "name": "SM-39 does not count an agent Lambda outside a VPC",
+        "file": SAGEMAKER,
+        "defect": "an agent Lambda function outside a VPC egresses with no DNS "
+        "Firewall or Network Firewall in its path. Not counting it reports the "
+        "Region as having no workload VPC to judge",
+        "find": (
+            '        elif not (function.get("VpcConfig") or {}).get("SubnetIds"):\n'
+            "            open_functions.append("
+        ),
+        "replace": "        elif False:\n            open_functions.append(",
+    },
+    {
+        "name": "SM-39 drops EKS cluster subnets",
+        "file": SAGEMAKER,
+        "defect": "an agent on EKS egresses from its cluster's subnets. Dropping "
+        "them leaves the cluster's VPC without a DNS or Network Firewall row",
+        "find": '            references.append((f"EKS cluster {cluster}", subnet_id))\n',
+        "replace": "            pass\n",
+    },
+    {
+        "name": "SM-26 passes active prompt-injection findings",
+        "file": SAGEMAKER,
+        "defect": "an unarchived Impact:IAMUser/PromptInjection.Direct finding is "
+        "a detected attempt nobody closed. Passing on the listing alone hides it",
+        "find": (
+            "    if not ids:\n        return _row(\n"
+            '            f"No active (unarchived)'
+        ),
+        "replace": (
+            '    if True:\n        return _row(\n            f"No active (unarchived)'
+        ),
+    },
     # ------------------------------------------ the AgentCore verdict legs
     # Each entry reverts one round-6 verdict leg in agentcore_assessments to the
     # behaviour the regrade graded partial. The catcher is the test that pins the
@@ -2441,6 +2528,14 @@ GROUPS: dict[str, str] = {
     "SM-41 drops iot:RetainPublish from the device actions": "in the SageMaker verdict legs",
     "SM-41 credits a thing attribute two things share": "in the SageMaker verdict legs",
     "SM-23 and SM-31 ignore composite alarm routing": "in the SageMaker verdict legs",
+    "SM-43 lets an IMDSv1 instance read the weights": "in the SageMaker verdict legs",
+    "SM-43 reads only the first instance": "in the SageMaker verdict legs",
+    "SM-40 ignores the MicroVM resume hook": "in the SageMaker verdict legs",
+    "SM-02 leaves IAM-authorized methods unjudged": "in the SageMaker verdict legs",
+    "SM-02 lets a stage span a slash": "in the SageMaker verdict legs",
+    "SM-39 does not count an agent Lambda outside a VPC": "in the SageMaker verdict legs",
+    "SM-39 drops EKS cluster subnets": "in the SageMaker verdict legs",
+    "SM-26 passes active prompt-injection findings": "in the SageMaker verdict legs",
     "AC-37 reads an allow-list SCP's omission as an Allow": "in the AgentCore verdict legs",
     "AC-37 passes when the organization's SCPs could not be listed": "in the AgentCore verdict legs",
     "AC-42 passes the population beside an unread configuration": "in the AgentCore verdict legs",

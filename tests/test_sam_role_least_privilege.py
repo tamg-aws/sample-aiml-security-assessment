@@ -333,6 +333,11 @@ _EXPECTED_ACTIONS = {
         "iot:ListThingsInThingGroup",
         "iot:ListThings",
         "securityhub:GetFindings",
+        "iam:GetInstanceProfile",
+        "lambda:ListMicrovmImages",
+        "lambda:ListMicrovmImageVersions",
+        "guardduty:ListFindings",
+        "guardduty:GetFindings",
         "organizations:ListAWSServiceAccessForOrganization",
         "sagemaker:DescribeModelBiasJobDefinition",
         "sagemaker:DescribeModelExplainabilityJobDefinition",
@@ -1160,6 +1165,29 @@ _SAGEMAKER_MANAGED_GRANTS = [
             {
                 "Fn::Sub": "arn:${AWS::Partition}:securityhub:*:"
                 "${AWS::AccountId}:hub/default"
+            }
+        ),
+    ),
+    ("Allow", "lambda:ListMicrovmImages", '"*"'),
+    ("Allow", "guardduty:ListFindings", '"*"'),
+    ("Allow", "guardduty:GetFindings", '"*"'),
+    (
+        "Allow",
+        "lambda:ListMicrovmImageVersions",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:lambda:*:"
+                "${AWS::AccountId}:microvm-image:*"
+            }
+        ),
+    ),
+    (
+        "Allow",
+        "iam:GetInstanceProfile",
+        json.dumps(
+            {
+                "Fn::Sub": "arn:${AWS::Partition}:iam::"
+                "${AWS::AccountId}:instance-profile/*"
             }
         ),
     ),

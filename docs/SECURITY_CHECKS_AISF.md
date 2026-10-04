@@ -467,17 +467,17 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 245/245 find-strings validated`, aborting and naming each entry whose
+   `entries 253/253 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 245 ways and requires a ledger gate or a test to go red for
+   breaks the code 253 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
    in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names
    the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown
    renderer, 1 in the census anchor, 1 in the published battery figures, 2 in the
    coverage bullets, 1 in the multi-control figures, 2 in the report section's
    coverage figures, 1 in the foundation scope, 3 in `SM-39`'s egress legs, 2 in
-   `SM-43`'s artifact reads, 7 in the SageMaker verdict legs, 4 in the live tag probe, 1 in
+   `SM-43`'s artifact reads, 15 in the SageMaker verdict legs, 4 in the live tag probe, 1 in
    the Bedrock condition parsers, 1 in the Bedrock endpoint collector, 1 in
    the Bedrock cross-Region agent roles, 1 in the Bedrock CloudTrail Lake
    reader, 1 in the Bedrock training bucket policies, 1 in the Bedrock

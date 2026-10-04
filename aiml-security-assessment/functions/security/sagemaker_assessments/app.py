@@ -1339,10 +1339,103 @@ def _guardduty_org_auto_enable_finding(region: str, detector_id: str) -> Dict[st
     )
 
 
+GUARDDUTY_PROMPT_INJECTION_FINDING = "GuardDuty Prompt Injection Findings"
+# The type was read live from GetFindings in us-east-1 on 2026-10-03.
+GUARDDUTY_PROMPT_INJECTION_TYPE = "Impact:IAMUser/PromptInjection.Direct"
+
+
+def _guardduty_prompt_injection_finding(
+    region: str, detector_id: str, protected: bool
+) -> Dict[str, Any]:
+    """AIR-FND-DET-04: GuardDuty prompt-injection findings still active."""
+    reference = "https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html"
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-26",
+            finding_name=GUARDDUTY_PROMPT_INJECTION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=reference,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if not protected:
+        return _row(
+            "AI Protection is not enabled on this detector, so GuardDuty raises no "
+            f"{GUARDDUTY_PROMPT_INJECTION_TYPE} finding to read; that is reported "
+            "by the 'GuardDuty AI Protection' row.",
+            "Enable the GuardDuty AI_PROTECTION detector feature for this region.",
+            "Informational",
+            "N/A",
+        )
+    try:
+        client = boto3.client("guardduty", config=boto3_config, region_name=region)
+        ids = []
+        for page in client.get_paginator("list_findings").paginate(
+            DetectorId=detector_id,
+            FindingCriteria={
+                "Criterion": {
+                    "type": {"Equals": [GUARDDUTY_PROMPT_INJECTION_TYPE]},
+                    "service.archived": {"Equals": ["false"]},
+                }
+            },
+            SortCriteria={"AttributeName": "updatedAt", "OrderBy": "DESC"},
+        ):
+            ids.extend(page.get("FindingIds") or [])
+    except Exception as error:
+        return _row(
+            f"guardduty:ListFindings failed ({get_assessment_error_label(error)}), "
+            f"so whether any {GUARDDUTY_PROMPT_INJECTION_TYPE} finding is active "
+            "was not read.",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    if not ids:
+        return _row(
+            f"No active (unarchived) {GUARDDUTY_PROMPT_INJECTION_TYPE} finding is "
+            f"open on detector {detector_id}. Archived findings are not counted.",
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    try:
+        latest = (
+            client.get_findings(DetectorId=detector_id, FindingIds=ids[:1]).get(
+                "Findings"
+            )
+            or [{}]
+        )[0]
+        example = (
+            f" The latest, {ids[0]}, was last updated {latest.get('UpdatedAt')} "
+            f"and counts {(latest.get('Service') or {}).get('Count')} event(s) "
+            f"against a {(latest.get('Resource') or {}).get('ResourceType')} "
+            "resource."
+        )
+    except Exception as error:
+        example = (
+            f" The latest is {ids[0]}; guardduty:GetFindings failed "
+            f"({get_assessment_error_label(error)}), so its detail was not read."
+        )
+    return _row(
+        f"{len(ids)} active (unarchived) {GUARDDUTY_PROMPT_INJECTION_TYPE} "
+        f"finding(s) are open on detector {detector_id}, each a prompt-injection "
+        f"attempt GuardDuty detected that is not archived.{example}",
+        "Review each finding, identify the principal and the prompt it sent, and "
+        "archive the finding once it is handled.",
+        "Medium",
+        "Failed",
+    )
+
+
 def check_guardduty_ai_protection(
     region: str = "", detector_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
-    """SM-26: Verify GuardDuty AI Protection is enabled."""
+    """SM-26: Verify GuardDuty AI Protection is enabled, and that no
+    prompt-injection finding it raised is still active."""
     findings = {"csv_data": []}
     try:
         inventory = detector_inventory or get_guardduty_detector_inventory(region)
@@ -1407,6 +1500,11 @@ def check_guardduty_ai_protection(
                 severity="High",
                 status="Passed" if enabled else "Failed",
                 region=region,
+            )
+        )
+        findings["csv_data"].append(
+            _guardduty_prompt_injection_finding(
+                region, inventory["detector_id"], enabled
             )
         )
         findings["csv_data"].append(
@@ -6388,6 +6486,8 @@ def _api_methods(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
                         methods.append(
                             {
                                 "api": f"REST API {api.get('name')} ({api.get('id')})",
+                                "api_id": api.get("id"),
+                                "path": resource.get("path"),
                                 "label": f"{verb} {resource.get('path')}",
                                 "verbs": _method_verbs(verb),
                                 "type": method.get("authorizationType") or "NONE",
@@ -6430,6 +6530,8 @@ def _api_methods(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
                     methods.append(
                         {
                             "api": f"HTTP API {api.get('Name')} ({api_id})",
+                            "api_id": api_id,
+                            "path": key.split(" ", 1)[1] if " " in key else None,
                             "label": f"route {key}",
                             "verbs": _method_verbs(verb),
                             "type": route.get("AuthorizationType") or "NONE",
@@ -6445,7 +6547,217 @@ def _api_methods(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     return methods, unread
 
 
-def check_ai_api_method_authorization(region: str = "") -> Dict[str, Any]:
+# A path segment of an execute-api ARN that the request fills in: the stage
+# name or a {param}, one or more characters other than "/".
+EXECUTE_API_SEGMENT = "segment"
+# A greedy {param+} path, or the whole path of an HTTP API $default route.
+EXECUTE_API_REST = "rest"
+
+
+def _execute_api_arn_template(
+    partition: str, region: str, account: str, api_id: str, verb: str, path: Any
+) -> List[str]:
+    """The execute-api ARNs one method answers to, as characters and the two
+    variable tokens: arn:...:api-id/stage/VERB/path."""
+    tokens = list(f"arn:{partition}:execute-api:{region}:{account}:{api_id}/")
+    tokens += [EXECUTE_API_SEGMENT] + list(f"/{verb}/")
+    if path is None:
+        return tokens + [EXECUTE_API_REST]
+    for index, part in enumerate(str(path).lstrip("/").split("/")):
+        if index:
+            tokens.append("/")
+        if part.startswith("{") and part.endswith("+}"):
+            tokens.append(EXECUTE_API_REST)
+        elif part.startswith("{") and part.endswith("}"):
+            tokens.append(EXECUTE_API_SEGMENT)
+        else:
+            tokens += list(part)
+    return tokens
+
+
+def _iam_glob_reaches(pattern: str, tokens: List[str]) -> bool:
+    """Whether an IAM Resource glob ("*" and "?") matches some ARN the token
+    template can take, searched over (pattern index, token index, filled)."""
+    pattern = re.sub(r"\$\{[^}]*\}", "*", pattern.strip())
+    pending, seen = [(0, 0, False)], set()
+    while pending:
+        state = pending.pop()
+        if state in seen:
+            continue
+        seen.add(state)
+        i, j, filled = state
+        here = pattern[i] if i < len(pattern) else None
+        if j == len(tokens):
+            if all(char == "*" for char in pattern[i:]):
+                return True
+            continue
+        if here == "*":
+            pending.append((i + 1, j, filled))
+        token = tokens[j]
+        if token in (EXECUTE_API_SEGMENT, EXECUTE_API_REST):
+            if filled or token == EXECUTE_API_REST:
+                pending.append((i, j + 1, False))
+            if here == "*":
+                pending.append((i, j, True))
+            elif here is not None and (
+                here == "?" or token == EXECUTE_API_REST or here != "/"
+            ):
+                pending.append((i + 1, j, True))
+        elif here == "*":
+            pending.append((i, j + 1, False))
+        elif here is not None and here in ("?", token):
+            pending.append((i + 1, j + 1, False))
+    return False
+
+
+def _iam_method_grant_problems(
+    region: str, iam_methods: List[Dict[str, Any]], permission_cache: Dict[str, Any]
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    (problems, unjudged, unread) for the AI methods an IAM authorizer guards.
+
+    A Resource pattern of one execute-api:Invoke Allow that reaches both a read
+    and a write AI method of one API grants them together, so the identity it
+    is attached to cannot be given read without write. Each identity in the
+    IAM cache is read, AWS managed policies included, with account-wide
+    Denies and the permissions boundary applied.
+    """
+    try:
+        caller = boto3.client("sts", config=boto3_config).get_caller_identity()
+        account, partition = caller["Account"], _caller_identity_partition(caller)
+    except Exception as error:
+        return (
+            [],
+            [],
+            [f"sts:GetCallerIdentity ({get_assessment_error_label(error)})"],
+        )
+    apis = {}
+    for method in iam_methods:
+        for verb in sorted(method["verbs"]):
+            apis.setdefault(method["api"], []).append(
+                (
+                    method["label"],
+                    verb in READ_VERBS,
+                    _execute_api_arn_template(
+                        partition,
+                        region,
+                        account,
+                        method["api_id"],
+                        verb,
+                        method["path"],
+                    ),
+                )
+            )
+    problems, unjudged, unread = [], [], []
+    boundary_unread = _boundary_unread(permission_cache)
+    for identity_type, cache_key in (
+        ("Role", "role_permissions"),
+        ("User", "user_permissions"),
+    ):
+        for name, permissions in (permission_cache.get(cache_key) or {}).items():
+            label = f"{identity_type.lower()} '{name}'"
+            policies = [
+                *(permissions.get("attached_policies") or []),
+                *(permissions.get("group_policies") or []),
+                *(permissions.get("inline_policies") or []),
+            ]
+            parsed = []
+            for policy in policies:
+                try:
+                    parsed.append(
+                        (
+                            policy.get("name") or "inline policy",
+                            _merged_statements(policy.get("document")),
+                        )
+                    )
+                except (ValueError, TypeError):
+                    unread.append(
+                        f"{label} policy '{policy.get('name') or 'inline policy'}'"
+                    )
+            denies = [
+                statement
+                for _, statements in parsed
+                for statement in statements
+                if str(statement.get("Effect", "")).upper() == "DENY"
+            ]
+            judged_apis = set()
+            for policy_name, statements in parsed:
+                for statement in statements:
+                    if str(statement.get("Effect", "")).upper() != "ALLOW" or not (
+                        _granted_actions(
+                            permissions, [statement, *denies], {"execute-api:invoke"}
+                        )
+                    ):
+                        continue
+                    where = (
+                        f"policy {policy_name} statement "
+                        f"{statement.get('Sid') or 'without a Sid'}"
+                    )
+                    if "NotResource" in statement:
+                        excluded = _policy_values(statement["NotResource"])
+                        grants = [
+                            (
+                                f"every resource but NotResource "
+                                f"{', '.join(excluded[:3])}",
+                                lambda tokens, excluded=excluded: (
+                                    not any(
+                                        _iam_glob_reaches(e, tokens) for e in excluded
+                                    )
+                                ),
+                            )
+                        ]
+                    else:
+                        grants = [
+                            (
+                                resource,
+                                lambda tokens, resource=resource: _iam_glob_reaches(
+                                    resource, tokens
+                                ),
+                            )
+                            for resource in _policy_values(statement.get("Resource"))
+                        ]
+                    for api, targets in apis.items():
+                        if api in judged_apis:
+                            continue
+                        for resource, reaches in grants:
+                            reached = [t for t in targets if reaches(t[2])]
+                            reads = sorted({t[0] for t in reached if t[1]})
+                            writes = sorted({t[0] for t in reached if not t[1]})
+                            if not reads or not writes:
+                                continue
+                            judged_apis.add(api)
+                            text = (
+                                f"{label} is allowed execute-api:Invoke on "
+                                f"{resource} by {where}, one grant that reaches "
+                                f"read method(s) {', '.join(reads[:3])} and write "
+                                f"method(s) {', '.join(writes[:3])} of {api}"
+                            )
+                            if statement.get("Condition"):
+                                unjudged.append(
+                                    f"{text}, under a Condition this check does not "
+                                    "evaluate"
+                                )
+                            elif (
+                                identity_type.lower(),
+                                name,
+                            ) in boundary_unread and permissions.get(
+                                "permissions_boundary"
+                            ) is None:
+                                unjudged.append(
+                                    f"{text}, and its permissions boundary was not read"
+                                )
+                            else:
+                                problems.append(
+                                    f"{text}, so that grant cannot give read "
+                                    "without write"
+                                )
+                            break
+    return problems, unjudged, unread
+
+
+def check_ai_api_method_authorization(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     SM-02: Verify every API Gateway method that reaches a model or agent is
     authorized, and that read and write methods are authorized separately
@@ -6454,8 +6766,9 @@ def check_ai_api_method_authorization(region: str = "") -> Dict[str, Any]:
     A method is in the population when its integration URI names a Bedrock,
     AgentCore or SageMaker runtime, or a Lambda function an agent action group
     or AgentCore gateway target names. A token authorizer separates read from
-    write only by scopes; an IAM or Lambda authorizer separates them in policy
-    or code this row does not read.
+    write only by scopes, and an IAM authorizer by the execute-api:Invoke
+    grants in the IAM permissions cache; a Lambda authorizer separates them in
+    code no API returns.
     """
     findings = {"csv_data": []}
     named, unread = _ai_lambda_references(region)
@@ -6473,7 +6786,7 @@ def check_ai_api_method_authorization(region: str = "") -> Dict[str, Any]:
         if target:
             ai_methods.append(dict(method, target=target))
 
-    problems, unjudged, token_methods = [], [], {}
+    problems, unjudged, token_methods, iam_methods = [], [], {}, []
     for method in ai_methods:
         where = f"{method['api']} {method['label']} (reaches {method['target']})"
         kind = method["type"].upper()
@@ -6483,8 +6796,20 @@ def check_ai_api_method_authorization(region: str = "") -> Dict[str, Any]:
             token_methods.setdefault(
                 (method["api"], method["authorizer"], method["scopes"]), []
             ).append(method)
+        elif kind == "AWS_IAM" and permission_cache is not None:
+            iam_methods.append(method)
         else:
             unjudged.append(f"{where} ({kind})")
+    if iam_methods:
+        iam_problems, iam_unjudged, iam_unread = _iam_method_grant_problems(
+            region, iam_methods, permission_cache
+        )
+        problems += iam_problems
+        unjudged += iam_unjudged
+        unread += iam_unread + [
+            f"IAM cache entries ({e})"
+            for e in _principal_read_errors(permission_cache) or []
+        ]
     for (api, _, scopes), group in token_methods.items():
         verbs = set().union(*(m["verbs"] for m in group))
         if verbs & READ_VERBS and verbs & WRITE_VERBS:
@@ -6521,10 +6846,11 @@ def check_ai_api_method_authorization(region: str = "") -> Dict[str, Any]:
                 check_id="SM-02",
                 finding_name=f"{AI_API_AUTHORIZATION_FINDING} Not Judged",
                 finding_details=(
-                    f"{len(unjudged)} AI method(s) use an IAM or Lambda authorizer: "
-                    f"{shown}. Whether read and write are authorized separately is "
-                    "held in execute-api:Invoke grants or in the authorizer's code, "
-                    "which this row does not read."
+                    f"{len(unjudged)} AI method(s) or grant(s) were not judged: "
+                    f"{shown}. A Lambda authorizer separates read from write in "
+                    "its code, which no API returns, and an IAM authorizer in "
+                    "execute-api:Invoke grants, read only from the IAM "
+                    "permissions cache."
                 ),
                 resolution=AI_API_AUTHORIZATION_RESOLUTION,
                 reference=AI_API_AUTHORIZATION_REFERENCE,
@@ -6552,8 +6878,13 @@ def check_ai_api_method_authorization(region: str = "") -> Dict[str, Any]:
                 finding_name=AI_API_AUTHORIZATION_FINDING,
                 finding_details=(
                     f"All {len(ai_methods)} API method(s) that reach a model or "
-                    "agent use a token authorizer, and no read and write methods "
-                    "of one API share an authorizer and scopes. A Lambda function "
+                    "agent use a token or IAM authorizer, no read and write methods "
+                    "of one API share a token authorizer and scopes, and no "
+                    "execute-api:Invoke Resource pattern of an identity in the IAM "
+                    f"cache reaches both a read and a write method of one API "
+                    f"({len(iam_methods)} IAM-authorized method(s)). API resource "
+                    "policies, and a Deny narrower than every resource, are not "
+                    "read for those grants. A Lambda function "
                     "no agent action group or gateway target names is not "
                     "recognized as AI."
                     if ai_methods
@@ -15987,6 +16318,11 @@ MODEL_ARTIFACT_INTEGRITY_RESOLUTION = (
     "create the component from a model (ModelName) whose container loads its "
     "data through ModelDataSource with the ETag recorded."
 )
+MODEL_ARTIFACT_INSTANCE_RESOLUTION = (
+    "Require IMDSv2 on the instance (MetadataOptions HttpTokens required), or "
+    "move the model read to the workload's own role, such as an ECS task role "
+    "or an EKS Pod Identity role, so the instance role cannot read the weights."
+)
 SM43_PREFIX_OBJECT_CAP = 1000
 MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "A recorded ETag, ManifestEtag or ModelDataETag means an expected value is "
@@ -16001,9 +16337,14 @@ MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "SHA256 digest to compare. The execution role's s3:GetObject reach is judged "
     "per bucket from its Allow statements and permissions boundary, not against "
     "the artifact prefix; a Deny narrower than every resource, and SCPs, are not "
-    "subtracted. Weights fetched by "
-    "container startup code, and models loaded by workloads on ECS, EKS or EC2, "
-    "are not read. Of each container's environment only the keys are read."
+    "subtracted. Each EC2 instance with an instance profile, which includes EKS "
+    "nodes and ECS container instances, must require IMDSv2 or have its "
+    "metadata endpoint disabled when its role is allowed s3:GetObject in an "
+    "artifact bucket; that reach is judged from the role's identity policies "
+    "and permissions boundary, and bucket policies and SCPs are not read for "
+    "it. Weights fetched by container startup code, and which model a workload "
+    "on ECS, EKS or EC2 loads, are not read. Of each container's environment "
+    "only the keys are read."
 )
 ECR_IMAGE_URI = re.compile(
     r"^(\d{12})\.dkr\.ecr(?:-fips)?\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?/"
@@ -16082,6 +16423,60 @@ def _s3_object_reach_beyond(
     return reach
 
 
+def _s3_object_reach_into(
+    statements: List[Tuple[str, Dict[str, Any]]], buckets: set
+) -> List[Tuple[str, str, bool]]:
+    """
+    Each Allow that grants s3:GetObject on an object inside ``buckets``, as
+    (resource, "policy P statement S", uncertain). A grant is uncertain when it
+    carries a Condition, or when its NotResource names a pattern that may
+    exclude the artifact objects.
+    """
+    reach = []
+    for policy_name, statement in statements:
+        if not _statement_allows_action(statement, "s3:GetObject"):
+            continue
+        where = (
+            f"policy {policy_name} statement {statement.get('Sid') or 'without a Sid'}"
+        )
+        conditioned = bool(statement.get("Condition"))
+
+        def _reaches(value):
+            # Segment by segment, so a wildcard partition cannot stand in for
+            # the bucket name that follows it.
+            pattern = re.sub(r"\$\{[^}]*\}", "*", value.strip()).lower()
+            parts = pattern.split(":", 5)
+            if len(parts) < 6:
+                return any(
+                    _globs_overlap(pattern, f"arn:aws:s3:::{bucket.lower()}/*")
+                    for bucket in buckets
+                )
+            return (
+                _globs_overlap(parts[0], "arn")
+                and _globs_overlap(parts[2], "s3")
+                and any(
+                    _globs_overlap(parts[5], f"{bucket.lower()}/*")
+                    for bucket in buckets
+                )
+            )
+
+        if "NotResource" in statement:
+            kept_out = _policy_values(statement["NotResource"])
+            reach.append(
+                (
+                    f"every resource but NotResource {', '.join(kept_out[:3])}",
+                    where,
+                    conditioned or any(_reaches(value) for value in kept_out),
+                )
+            )
+            continue
+        for resource in _policy_values(statement.get("Resource")):
+            if _reaches(resource):
+                reach.append((resource, where, conditioned))
+                break
+    return reach
+
+
 def check_sagemaker_model_artifact_integrity(
     region: str = "", permission_cache: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -16096,8 +16491,9 @@ def check_sagemaker_model_artifact_integrity(
     it does not name an HF_MODEL_ID with no model data; and each artifact
     bucket defaults to SSE-KMS with a named customer managed key. Each object
     named or listed under a prefix is read with HeadObject, and each execution
-    role's s3:GetObject grants must stay inside the artifact buckets. A denied
-    read leaves that endpoint N/A, never Failed.
+    role's s3:GetObject grants must stay inside the artifact buckets. Each EC2
+    instance whose instance profile role can read an artifact bucket must
+    require IMDSv2. A denied read leaves that endpoint N/A, never Failed.
     """
     findings = {"csv_data": []}
 
@@ -16736,8 +17132,163 @@ def check_sagemaker_model_artifact_integrity(
                 )
         return units, unreads
 
+    def _judge_instances(artifact_buckets):
+        """
+        Each EC2 instance whose metadata service accepts IMDSv1 and whose
+        instance profile role is allowed s3:GetObject in an artifact bucket, as
+        (failed rows as (instance, problem), unreads, instances judged).
+        """
+        problems, unreads, judged = [], [], 0
+        try:
+            ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+            instances = [
+                instance
+                for page in ec2_client.get_paginator("describe_instances").paginate(
+                    Filters=[
+                        {
+                            "Name": "instance-state-name",
+                            "Values": ["pending", "running", "stopping", "stopped"],
+                        }
+                    ]
+                )
+                for reservation in page.get("Reservations", [])
+                for instance in reservation.get("Instances", [])
+            ]
+        except Exception as error:
+            return (
+                [],
+                [
+                    "EC2 instances that can read the artifact buckets were not "
+                    f"read (ec2:DescribeInstances: {get_assessment_error_label(error)})"
+                ],
+                0,
+            )
+        iam_client = None
+        profile_roles = {}
+        cached = (permission_cache or {}).get("role_permissions") or {}
+        unread_principals = (
+            _principal_read_errors(permission_cache) or [] if permission_cache else []
+        )
+        for instance in instances:
+            profile_arn = str(
+                (instance.get("IamInstanceProfile") or {}).get("Arn") or ""
+            )
+            if not profile_arn:
+                continue
+            judged += 1
+            instance_id = instance.get("InstanceId") or "unnamed"
+            options = instance.get("MetadataOptions") or {}
+            if options.get("HttpEndpoint") == "disabled":
+                continue
+            if options.get("HttpTokens") == "required":
+                continue
+            if not options.get("HttpTokens"):
+                unreads.append(
+                    f"EC2 instance {instance_id} returned no MetadataOptions "
+                    "HttpTokens to judge"
+                )
+                continue
+            profile_name = profile_arn.rsplit("/", 1)[-1]
+            if profile_name not in profile_roles:
+                try:
+                    iam_client = iam_client or boto3.client("iam", config=boto3_config)
+                    roles = iam_client.get_instance_profile(
+                        InstanceProfileName=profile_name
+                    )["InstanceProfile"].get("Roles", [])
+                    profile_roles[profile_name] = (
+                        roles[0].get("RoleName") if roles else None
+                    )
+                except Exception as error:
+                    profile_roles[profile_name] = (
+                        f"iam:GetInstanceProfile: {get_assessment_error_label(error)}"
+                    )
+            role = profile_roles[profile_name]
+            if role is None:
+                continue
+            if role.startswith("iam:GetInstanceProfile: "):
+                unreads.append(
+                    f"EC2 instance {instance_id} accepts IMDSv1 and the role of "
+                    f"its instance profile {profile_name} was not read ({role})"
+                )
+                continue
+            reason = None
+            if permission_cache is None:
+                reason = "the IAM permissions cache was not available"
+            elif role not in cached:
+                reason = "not in the IAM cache"
+            elif any(
+                p.lower().startswith(f"role '{role.lower()}' ")
+                and p.lower() != f"role '{role.lower()}' (permissions_boundary)"
+                for p in unread_principals
+            ):
+                reason = "IAM cache read error"
+            if reason:
+                unreads.append(
+                    f"EC2 instance {instance_id} accepts IMDSv1 and the artifact "
+                    f"reach of its role '{role}' was not judged ({reason})"
+                )
+                continue
+            permissions = cached[role]
+            statements = [
+                (policy.get("name") or "inline policy", statement)
+                for policy in (permissions.get("attached_policies") or [])
+                + (permissions.get("inline_policies") or [])
+                for statement in _sm_policy_statements(policy.get("document"))
+            ]
+            reach = []
+            if not any(
+                _merged_account_wide_deny(statement, "s3:getobject")
+                for _, statement in statements
+            ):
+                reach = _s3_object_reach_into(statements, artifact_buckets)
+            boundary = permissions.get("permissions_boundary")
+            if boundary is not None:
+                boundary_statements = [
+                    ("boundary", statement)
+                    for statement in _sm_policy_statements(boundary)
+                ]
+                if any(
+                    _merged_account_wide_deny(statement, "s3:getobject")
+                    for _, statement in boundary_statements
+                ) or not _s3_object_reach_into(boundary_statements, artifact_buckets):
+                    reach = []
+            plain = [r for r in reach if not r[2]]
+            if (
+                plain
+                and boundary is None
+                and ("role", role) in _boundary_unread(permission_cache)
+            ):
+                resource, where, _ = plain[0]
+                unreads.append(
+                    f"EC2 instance {instance_id} accepts IMDSv1 and its role "
+                    f"'{role}' is allowed s3:GetObject on {resource} by {where}, "
+                    "and its permissions boundary was not read"
+                )
+            elif plain:
+                resource, where, _ = plain[0]
+                problems.append(
+                    (
+                        instance_id,
+                        f"EC2 instance {instance_id} accepts IMDSv1 (MetadataOptions "
+                        f"HttpTokens is {options['HttpTokens']}), and the role "
+                        f"'{role}' of its instance profile {profile_name} is "
+                        f"allowed s3:GetObject on {resource} by {where}, which "
+                        "reaches the model artifact bucket(s) "
+                        f"{', '.join(sorted(artifact_buckets))}",
+                    )
+                )
+            elif reach:
+                resource, where, _ = reach[0]
+                unreads.append(
+                    f"EC2 instance {instance_id} accepts IMDSv1 and its role "
+                    f"'{role}' is allowed s3:GetObject on {resource} by {where} "
+                    "under a Condition or NotResource this check does not evaluate"
+                )
+        return problems, unreads, judged
+
     failed = []
     compliant = []
+    artifact_buckets = set()
     for endpoint in endpoints:
         problems, unreads = [], []
         work = [("model", name, None) for name in endpoint["models"]]
@@ -16788,6 +17339,7 @@ def check_sagemaker_model_artifact_integrity(
             )
             problems += data_problems
             unreads += data_unreads
+            artifact_buckets.update(data_buckets)
             if data_buckets and not role_arn:
                 unreads.append(f"{label} returned no ExecutionRoleArn to judge")
             elif data_buckets:
@@ -16815,12 +17367,33 @@ def check_sagemaker_model_artifact_integrity(
                 "Failed",
             )
         )
+    instance_failed, instance_unread, instances_judged = (
+        _judge_instances(artifact_buckets) if artifact_buckets else ([], [], 0)
+    )
+    unread += instance_unread
+    for _, problem in instance_failed:
+        findings["csv_data"].append(
+            _row(
+                f"{problem}. With HttpTokens optional the metadata service "
+                "returns the role's credentials to a request without a session "
+                "token, and those credentials can read the model weights.",
+                MODEL_ARTIFACT_INSTANCE_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
     read_details = (
         f"{len(compliant)} InService endpoint(s) serve only pinned images and "
         f"model data with a recorded expected value from SSE-KMS buckets, through "
         f"an execution role whose s3:GetObject grants stay inside those buckets: "
         f"{', '.join(compliant[:10]) or 'none'}."
     )
+    if artifact_buckets:
+        read_details += (
+            f" Of {instances_judged} EC2 instance(s) with an instance profile, "
+            "none that accepts IMDSv1 has a role allowed s3:GetObject in the "
+            "artifact buckets."
+        )
     if unread:
         findings["csv_data"].append(
             _unread_resources_finding(
@@ -16832,7 +17405,7 @@ def check_sagemaker_model_artifact_integrity(
                 region,
             )
         )
-    elif compliant and not failed:
+    elif compliant and not failed and not instance_failed:
         findings["csv_data"].append(
             _row(read_details, "No action required", "Medium", "Passed")
         )
@@ -18439,8 +19012,11 @@ NETWORK_FIREWALL_NAME_KEYWORDS = re.compile(r"\b(?:tls\.sni|http\.host|tls_sni)\
 SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
 
 
-def _egress_workload_subnets(region: str) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """(workload label, subnet id) for each ECS awsvpc service and VPC Lambda."""
+def _egress_workload_subnets(
+    region: str,
+) -> Tuple[List[Tuple[str, str]], List[str], List[Dict[str, Any]]]:
+    """(workload label, subnet id) for each ECS awsvpc service, VPC Lambda, EKS
+    cluster and EC2 instance, the unread lists, and every Lambda function."""
     references = []
     services, unread = _ecs_services(region)
     for cluster_name, service in services:
@@ -18461,7 +19037,62 @@ def _egress_workload_subnets(region: str) -> Tuple[List[Tuple[str, str]], List[s
             references.append(
                 (f"Lambda function {function.get('FunctionName')}", subnet_id)
             )
-    return references, unread
+    # AIR-SLF-RT-02: agents hosted on EKS or EC2 egress from the subnets of
+    # the cluster and of each instance's network interfaces.
+    try:
+        eks_client = boto3.client("eks", config=boto3_config, region_name=region)
+        clusters = []
+        for page in eks_client.get_paginator("list_clusters").paginate():
+            clusters.extend(page.get("clusters", []))
+    except Exception as error:
+        clusters = []
+        unread.append(f"eks:ListClusters ({get_assessment_error_label(error)})")
+    for cluster in clusters:
+        try:
+            detail = eks_client.describe_cluster(name=cluster).get("cluster") or {}
+        except Exception as error:
+            unread.append(
+                f"eks:DescribeCluster {cluster} ({get_assessment_error_label(error)})"
+            )
+            continue
+        for subnet_id in (detail.get("resourcesVpcConfig") or {}).get(
+            "subnetIds"
+        ) or []:
+            references.append((f"EKS cluster {cluster}", subnet_id))
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        for page in ec2_client.get_paginator("describe_instances").paginate(
+            Filters=[
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                }
+            ]
+        ):
+            for reservation in page.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    asg = next(
+                        (
+                            tag.get("Value")
+                            for tag in instance.get("Tags") or []
+                            if tag.get("Key") == "aws:autoscaling:groupName"
+                        ),
+                        None,
+                    )
+                    label = (
+                        f"EC2 Auto Scaling group {asg}"
+                        if asg
+                        else f"EC2 instance {instance.get('InstanceId')}"
+                    )
+                    subnet_ids = {
+                        interface.get("SubnetId")
+                        for interface in instance.get("NetworkInterfaces") or []
+                    } | {instance.get("SubnetId")}
+                    for subnet_id in sorted(subnet_ids - {None, ""}):
+                        references.append((label, subnet_id))
+    except Exception as error:
+        unread.append(f"ec2:DescribeInstances ({get_assessment_error_label(error)})")
+    return references, unread, functions
 
 
 def _describe_workload_subnets(
@@ -19456,11 +20087,14 @@ def _workload_firewall_vpc_finding(
 def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     """
     SM-39 (AIR-SLF-RT-02): judge DNS Firewall and Network Firewall egress for
-    every VPC an ECS awsvpc service or a VPC-attached Lambda function runs in.
+    every VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS
+    cluster or an EC2 instance runs in.
 
     One DNS row and one Network Firewall row per VPC. An unread workload list
-    or subnet description is reported N/A by name, never Passed. A workload
-    outside a VPC has no VPC egress to judge and is not counted.
+    or subnet description is reported N/A by name, never Passed. A Lambda
+    function an agent action group or AgentCore gateway target names fails
+    both legs when it runs outside a VPC, where neither firewall can apply;
+    other functions outside a VPC are not recognized as agent workloads.
     """
     findings = {"csv_data": []}
 
@@ -19481,7 +20115,9 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
         (WORKLOAD_FIREWALL_EGRESS_FINDING, NETWORK_FIREWALL_DOMAIN_LIST_REFERENCE),
     )
     try:
-        references, unread = _egress_workload_subnets(region)
+        references, unread, functions = _egress_workload_subnets(region)
+        named, named_unread = _ai_lambda_references(region)
+        unread.extend(named_unread)
         ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
         subnet_ids = sorted({subnet_id for _, subnet_id in references})
         described, missing = (
@@ -19501,7 +20137,37 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
             )
         return findings
 
+    listed = {str(f.get("FunctionArn") or ""): f for f in functions}
+    open_functions = []
+    for arn in sorted(named):
+        match = LAMBDA_IN_URI.search(arn)
+        function = listed.get(match.group(1)) if match else None
+        if function is None:
+            unread.append(
+                f"Lambda function {arn}, named by {'; '.join(named[arn][:3])}, is "
+                "not among this Region's functions, so its network was not read"
+            )
+        elif not (function.get("VpcConfig") or {}).get("SubnetIds"):
+            open_functions.append(
+                f"Lambda function {function.get('FunctionName')}, named "
+                f"by {'; '.join(named[arn][:3])}, runs outside a VPC, so no DNS "
+                "Firewall rule group or Network Firewall route applies to its "
+                "egress."
+            )
     for name, reference in legs:
+        findings["csv_data"].extend(
+            _capped_problem_rows(
+                "SM-39",
+                name,
+                open_functions,
+                "Attach each agent Lambda function to private subnets of a VPC "
+                "whose DNS Firewall and Network Firewall filter its egress.",
+                reference,
+                "Medium",
+                region,
+                "agent Lambda functions outside a VPC",
+            )
+        )
         if unread:
             findings["csv_data"].append(
                 _unread_resources_finding(
@@ -19526,14 +20192,14 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 )
             )
     if not references:
-        if not unread:
+        if not unread and not open_functions:
             for name, reference in legs:
                 findings["csv_data"].append(
                     _na(
                         name,
-                        "No ECS awsvpc service or VPC-attached Lambda function in "
-                        "this Region runs in a VPC, so no workload VPC's egress was "
-                        "judged.",
+                        "No ECS awsvpc service, VPC-attached Lambda function, EKS "
+                        "cluster or EC2 instance in this Region runs in a VPC, so "
+                        "no workload VPC's egress was judged.",
                         "No action required",
                         reference,
                     )
@@ -20138,6 +20804,44 @@ def _sagemaker_model_environments(
     return environments, len(names), unread
 
 
+def _microvm_image_versions(
+    region: str,
+) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str]]:
+    """(image name, version) of every ACTIVE version of every Lambda MicroVM
+    image, which RunMicrovm can launch, and the reads that failed."""
+    try:
+        client = boto3.client(
+            "lambda-microvms", config=boto3_config, region_name=region
+        )
+        images = []
+        for page in client.get_paginator("list_microvm_images").paginate():
+            images.extend(
+                i
+                for i in page.get("items", [])
+                if i.get("state") not in ("DELETING", "DELETED")
+            )
+    except Exception as error:
+        return [], [f"lambda:ListMicrovmImages ({get_assessment_error_label(error)})"]
+    versions, unread = [], []
+    for image in images:
+        name = image.get("name") or image.get("imageArn")
+        try:
+            for page in client.get_paginator("list_microvm_image_versions").paginate(
+                imageIdentifier=image.get("imageArn") or name
+            ):
+                versions.extend(
+                    (name, v)
+                    for v in page.get("items", [])
+                    if v.get("status") == "ACTIVE"
+                )
+        except Exception as error:
+            unread.append(
+                f"Lambda MicroVM image {name} versions "
+                f"(lambda:ListMicrovmImageVersions: {get_assessment_error_label(error)})"
+            )
+    return versions, unread
+
+
 def _propagation_and_plaintext_findings(
     region: str, secrets: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -20235,6 +20939,33 @@ def _propagation_and_plaintext_findings(
                 plaintext.append(
                     f"{where} sets {name} as a plaintext environment variable"
                 )
+    # AIR-SLF-RT-06: a MicroVM resumed from a suspended state runs only its
+    # /resume hook, so that hook is where a rotated secret is re-fetched.
+    microvm_versions, microvm_unread = _microvm_image_versions(region)
+    unread.extend(microvm_unread)
+    no_resume, resume_budgets = [], []
+    for image_name, version in microvm_versions:
+        where = (
+            f"Lambda MicroVM image {image_name} version {version.get('imageVersion')}"
+        )
+        hooks = (version.get("hooks") or {}).get("microvmHooks") or {}
+        if hooks.get("resume") != "ENABLED":
+            no_resume.append(
+                f"{where} has hooks.microvmHooks.resume "
+                f"{hooks.get('resume') or 'unset'}, so no /resume hook runs when a "
+                "MicroVM resumes from a suspended state to re-fetch a rotated "
+                "secret"
+            )
+        else:
+            resume_budgets.append(
+                f"{where} ({hooks.get('resumeTimeoutInSeconds') or 'default'}s)"
+            )
+        for name, value in (version.get("environmentVariables") or {}).items():
+            if _looks_like_plaintext_credential(name, value):
+                plaintext.append(
+                    f"{where} sets {name} as a plaintext environment variable, "
+                    "fixed at image build time"
+                )
 
     rows = []
     stale = []
@@ -20256,11 +20987,13 @@ def _propagation_and_plaintext_findings(
         _capped_problem_rows(
             "SM-40",
             SECRET_PROPAGATION_FINDING,
-            [f"{p}." for p in stale + parameters],
+            [f"{p}." for p in stale + parameters + no_resume],
             "Fetch the secret at runtime with secretsmanager:GetSecretValue under "
             "the task role, or route the rotation event to an update-service "
             "--force-new-deployment, and move Parameter Store credentials to a "
-            "rotating Secrets Manager secret.",
+            "rotating Secrets Manager secret. For a Lambda MicroVM image, enable "
+            "the /resume lifecycle hook and re-fetch the secret in it within "
+            "resumeTimeoutInSeconds.",
             SECRET_PROPAGATION_REFERENCE,
             "Medium",
             region,
@@ -20291,7 +21024,9 @@ def _propagation_and_plaintext_findings(
                 SECRET_PROPAGATION_FINDING,
                 list(dict.fromkeys(unread)),
                 f"{len(services)} ECS service(s), {len(functions)} Lambda "
-                f"function(s) and {model_count} SageMaker model(s) were read.",
+                f"function(s), {model_count} SageMaker model(s) and "
+                f"{len(microvm_versions)} ACTIVE Lambda MicroVM image version(s) "
+                "were read.",
                 SECRET_PROPAGATION_REFERENCE,
                 region,
             )
@@ -20319,7 +21054,7 @@ def _propagation_and_plaintext_findings(
                 region=region,
             )
         )
-    elif not stale and not parameters:
+    elif not stale and not parameters and not no_resume:
         rows.append(
             create_finding(
                 check_id="SM-40",
@@ -20330,7 +21065,13 @@ def _propagation_and_plaintext_findings(
                     "are not graded: no API shows whether a function re-fetches per "
                     "invocation or caches at init; "
                     f"{extension_users} of {len(functions)} use the Parameters and "
-                    "Secrets extension."
+                    "Secrets extension. Each of the "
+                    f"{len(microvm_versions)} ACTIVE Lambda MicroVM image "
+                    "version(s) enables the /resume hook, within a "
+                    "resumeTimeoutInSeconds the API holds to 1 to 60 seconds"
+                    + (f": {'; '.join(resume_budgets[:10])}" if resume_budgets else "")
+                    + ". What the hook runs, and whether it re-fetches the secret, "
+                    "is not returned by any API."
                 ),
                 resolution="No action required",
                 reference=SECRET_PROPAGATION_REFERENCE,
@@ -21536,7 +22277,11 @@ def lambda_handler(event, context):
         all_findings.append(check_ai_lambda_network_boundary(region=region))
 
         logger.info("Running AI API method authorization check (SM-02)")
-        all_findings.append(check_ai_api_method_authorization(region=region))
+        all_findings.append(
+            check_ai_api_method_authorization(
+                region=region, permission_cache=permission_cache
+            )
+        )
 
         logger.info("Running SageMaker endpoint instance count check")
         endpoint_instance_findings = check_sagemaker_endpoint_instance_count(

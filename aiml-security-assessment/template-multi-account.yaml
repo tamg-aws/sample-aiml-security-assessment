@@ -972,6 +972,9 @@ Resources:
               - route53resolver:ListFirewallRuleGroupAssociations # SM-39
               - route53resolver:ListFirewallDomainLists # SM-39
               - ec2:DescribeNatGateways # SM-39
+              - lambda:ListMicrovmImages # SM-40
+              - guardduty:ListFindings # SM-26
+              - guardduty:GetFindings # SM-26
             Resource: '*'
           - Sid: PrefixListEntriesRead
             # SM-39 judges the entries of each customer-managed prefix list a
@@ -1022,6 +1025,22 @@ Resources:
             Action:
               - s3:ListBucket # SM-43
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+          - Sid: ModelArtifactInstanceProfileRead
+            # SM-43 resolves the role of each EC2 instance that accepts IMDSv1,
+            # to judge whether that role can read the model artifact buckets.
+            # GetInstanceProfile has the instance-profile resource type.
+            Effect: Allow
+            Action:
+              - iam:GetInstanceProfile # SM-43
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
+          - Sid: MicrovmImageVersionList
+            # SM-40 reads the lifecycle hooks of each Lambda MicroVM image
+            # version. ListMicrovmImageVersions has the microvmImage resource
+            # type in the service authorization reference.
+            Effect: Allow
+            Action:
+              - lambda:ListMicrovmImageVersions # SM-40
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:microvm-image:*'
           - Sid: EKSFargateProfileList
             # SM-38 lists each EKS cluster's Fargate profiles, whose pods
             # Runtime Monitoring does not cover.

@@ -3544,9 +3544,10 @@ class TestSM02AIApiMethodAuthorization:
             method["authorizationScopes"] = scopes
         return method
 
-    def _run(self, rest=None, http=None, ai_functions=(), errors=None):
+    def _run(self, rest=None, http=None, ai_functions=(), errors=None, cache=None):
         """rest: {api: {path: {verb: method}}}; http: {api: [(route key, auth
-        type, scopes, uri)]}."""
+        type, scopes, uri)]}; cache is the IAM permissions cache, and
+        errors["sts"] fails GetCallerIdentity."""
         rest = rest or {}
         http = http or {}
         errors = errors or {}
@@ -3601,7 +3602,15 @@ class TestSM02AIApiMethodAuthorization:
                 ],
             }
         )
-        clients = {"apigateway": apigateway, "apigatewayv2": v2}
+        sts = MagicMock()
+        if "sts" in errors:
+            sts.get_caller_identity.side_effect = errors["sts"]
+        else:
+            sts.get_caller_identity.return_value = {
+                "Account": "111122223333",
+                "Arn": "arn:aws:sts::111122223333:assumed-role/a/s",
+            }
+        clients = {"apigateway": apigateway, "apigatewayv2": v2, "sts": sts}
         with (
             patch(
                 "sagemaker_app.boto3.client", side_effect=lambda svc, **_: clients[svc]
@@ -3614,7 +3623,7 @@ class TestSM02AIApiMethodAuthorization:
                 ),
             ),
         ):
-            return _rows(self.check(region="us-east-1"))
+            return _rows(self.check(region="us-east-1", permission_cache=cache))
 
     def test_an_unauthorized_ai_method_among_authorized_ones_fails(self):
         rows = self._run(
@@ -12621,13 +12630,17 @@ class TestSM40RotationHistoryAndPropagation:
         rules=None,
         errors=None,
         models=None,
+        microvms=None,
     ):
         """services: [(cluster, name, task def arn)]; rules: [(pattern, targets)].
 
         models: {name: DescribeModel response, or an exception it raises}.
+        microvms: {image name: [image versions], or an exception the version
+        listing raises}; errors["microvm"] fails the image listing.
         """
         errors = errors or {}
         models = models or {}
+        microvms = microvms or {}
         secrets = secrets if secrets is not None else [self._secret()]
         events = events or []
         services = services or []
@@ -12724,6 +12737,36 @@ class TestSM40RotationHistoryAndPropagation:
                     return models[ModelName]
 
                 client.describe_model.side_effect = describe_model
+            elif service == "lambda-microvms":
+                # One image per page, and each version listing splits its
+                # versions over two pages, so a first-page reader misses some.
+                def versions(imageIdentifier):
+                    found = microvms[imageIdentifier.rsplit(":", 1)[-1]]
+                    if isinstance(found, Exception):
+                        raise found
+                    return [{"items": found[:1]}, {"items": found[1:]}]
+
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_microvm_images": source(
+                            "microvm",
+                            [
+                                {
+                                    "items": [
+                                        {
+                                            "name": n,
+                                            "imageArn": "arn:aws:lambda:us-east-1:"
+                                            f"111122223333:microvm-image:{n}",
+                                            "state": "CREATED",
+                                        }
+                                    ]
+                                }
+                                for n in microvms
+                            ],
+                        ),
+                        "list_microvm_image_versions": versions,
+                    }
+                )
             elif service == "events":
                 client.get_paginator.side_effect = _pager(
                     {
@@ -19973,15 +20016,19 @@ def _sm43_rows(
     objects=None,
     listings=None,
     permission_cache=_SM43_DEFAULT_CACHE,
+    instances=None,
+    profiles=None,
 ):
     """
-    Run SM-43 over mocked SageMaker, ECR, S3 and KMS clients.
+    Run SM-43 over mocked SageMaker, ECR, S3, KMS, EC2 and IAM clients.
 
     endpoints maps a name to {"models": [...], "status": ..., "components":
     [variant names]}. Every other map is keyed by resource name, and an
     Exception value is raised by the matching call. listings maps a prefix URI
     to its pages of keys; an unlisted prefix holds one object. Models and
     endpoint configs run as _SM43_ROLE unless they name another role.
+    instances is the EC2 instance list, or an Exception DescribeInstances
+    raises, and profiles maps an instance profile name to its role name.
     """
     endpoints = (
         endpoints
@@ -20189,7 +20236,44 @@ def _sm43_rows(
         return {"KeyMetadata": dict(value, KeyId=KeyId)}
 
     kms.describe_key.side_effect = describe_key
-    clients = {"sagemaker": sagemaker, "ecr": ecr, "s3": s3, "kms": kms}
+    instances = instances if instances is not None else []
+    ec2 = MagicMock()
+    _sm43_rows.instance_filters = []
+
+    def describe_instances(Filters):
+        _sm43_rows.instance_filters.append(Filters)
+        if isinstance(instances, Exception):
+            raise instances
+        return [
+            {"Reservations": [{"Instances": instances[:1]}]},
+            {"Reservations": [{"Instances": instances[1:]}]},
+        ]
+
+    ec2.get_paginator.side_effect = _pager({"describe_instances": describe_instances})
+    profiles = profiles or {}
+    iam = MagicMock()
+    _sm43_rows.profile_calls = []
+
+    def get_instance_profile(InstanceProfileName):
+        _sm43_rows.profile_calls.append(InstanceProfileName)
+        value = profiles[InstanceProfileName]
+        if isinstance(value, Exception):
+            raise value
+        return {
+            "InstanceProfile": {
+                "Roles": [{"RoleName": value}] if value else [],
+            }
+        }
+
+    iam.get_instance_profile.side_effect = get_instance_profile
+    clients = {
+        "sagemaker": sagemaker,
+        "ecr": ecr,
+        "s3": s3,
+        "kms": kms,
+        "ec2": ec2,
+        "iam": iam,
+    }
     with patch("sagemaker_app.boto3.client") as mock_client:
         mock_client.side_effect = lambda service, **_: clients[service]
         return _rows(
@@ -21904,11 +21988,19 @@ class TestSM39WorkloadEgress:
         nats=None,
         errors=None,
         subnets=None,
+        clusters=None,
+        instances=None,
+        named=None,
     ):
         """associations: {vpc: [associations]}; rules: {group: [rules] or pages};
-        tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}}."""
+        tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}};
+        clusters: {EKS cluster: [subnets]}; instances: EC2 instances; named:
+        {Lambda ARN: [agent resources naming it]}."""
         services = services or {}
         functions = functions or []
+        clusters = clusters or {}
+        instances = instances or []
+        named = named or {}
         associations = associations or {}
         rules = {**_DNS_RULES, **(rules or {})}
         domains = {"rslvr-fdl-star": ["*."], **(domains or {})}
@@ -22011,7 +22103,30 @@ class TestSM39WorkloadEgress:
                             "route_tables", describe_route_tables
                         ),
                         "describe_nat_gateways": guarded("nat", describe_nat_gateways),
+                        # One instance per page, so a first-page reader misses
+                        # every later instance.
+                        "describe_instances": guarded(
+                            "instances",
+                            lambda Filters: [
+                                {"Reservations": [{"Instances": [i]}]}
+                                for i in instances
+                            ],
+                        ),
                     }
+                )
+            elif service == "eks":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_clusters": guarded(
+                            "eks", [{"clusters": [c]} for c in clusters]
+                        )
+                    }
+                )
+                client.describe_cluster.side_effect = guarded(
+                    "describe_cluster",
+                    lambda name: {
+                        "cluster": {"resourcesVpcConfig": {"subnetIds": clusters[name]}}
+                    },
                 )
             elif service == "route53resolver":
                 client.get_paginator.side_effect = _pager(
@@ -22110,7 +22225,13 @@ class TestSM39WorkloadEgress:
                 raise AssertionError(f"unexpected boto3 client: {service}")
             return client
 
-        with patch("sagemaker_app.boto3.client", side_effect=factory):
+        def references(region):
+            return named, list(errors.get("named", []))
+
+        with (
+            patch("sagemaker_app.boto3.client", side_effect=factory),
+            patch("sagemaker_app._ai_lambda_references", side_effect=references),
+        ):
             return extract_csv_data(
                 sagemaker_app.check_workload_egress_control(region="us-east-1")
             )
@@ -23199,3 +23320,882 @@ class TestSM31DiskAlarmThroughComposite:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "'a/AllTraffic'" in rows[0]["Finding_Details"]
+
+
+def _sm43_node_cache(*statements, boundary=None, errors=None):
+    """The default SM-43 cache plus a node-role holding these statements."""
+    cache = _sm43_role_cache(
+        {"Effect": "Allow", "Action": "sagemaker:DescribeModel", "Resource": "*"},
+        errors=errors,
+    )
+    cache["role_permissions"].update(
+        _sm43_role_cache(*statements, boundary=boundary, name="node-role")[
+            "role_permissions"
+        ]
+    )
+    return cache
+
+
+def _sm43_instance(
+    instance_id="i-1", tokens="optional", endpoint="enabled", profile="node-profile"
+):
+    instance = {
+        "InstanceId": instance_id,
+        "MetadataOptions": {"HttpTokens": tokens, "HttpEndpoint": endpoint},
+    }
+    if profile:
+        instance["IamInstanceProfile"] = {
+            "Arn": f"arn:aws:iam::{_SM43_ACCOUNT}:instance-profile/{profile}"
+        }
+    return instance
+
+
+class TestSM43InstanceRoleImdsV2:
+    """AIR-SLF-CMP-08: an instance role that can read the weights needs IMDSv2."""
+
+    ARTIFACT_READ = {
+        "Sid": "Weights",
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::artifacts/*",
+    }
+
+    def _run(self, *instances, cache=None, profiles=None, **kwargs):
+        kwargs.setdefault("endpoints", {"ep-1": {"models": ["m-1"]}})
+        kwargs.setdefault("models", {"m-1": _sm43_prefix_model()})
+        return _sm43_rows(
+            permission_cache=cache or _sm43_node_cache(self.ARTIFACT_READ),
+            instances=list(instances),
+            profiles=profiles or {"node-profile": "node-role"},
+            **kwargs,
+        )
+
+    def test_an_imdsv1_instance_whose_role_reads_the_weights_fails(self):
+        rows = self._run(_sm43_instance())
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert details.startswith(
+            "EC2 instance i-1 accepts IMDSv1 (MetadataOptions HttpTokens is "
+            "optional), and the role 'node-role' of its instance profile "
+            "node-profile is allowed s3:GetObject on arn:aws:s3:::artifacts/* by "
+            "policy model-access statement Weights, which reaches the model "
+            "artifact bucket(s) artifacts."
+        )
+        assert "without a session token" in details
+        assert "IMDSv2" in rows[0]["Resolution"]
+
+    def test_the_same_instance_passes_when_it_requires_imdsv2(self):
+        rows = self._run(_sm43_instance(tokens="required"))
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert (
+            "Of 1 EC2 instance(s) with an instance profile"
+            in (rows[0]["Finding_Details"])
+        )
+        assert _sm43_rows.profile_calls == []
+
+    def test_a_disabled_metadata_endpoint_passes(self):
+        rows = self._run(_sm43_instance(endpoint="disabled"))
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_only_the_second_instance_fails(self):
+        rows = self._run(
+            _sm43_instance("i-1", tokens="required"), _sm43_instance("i-2")
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith("EC2 instance i-2 ")
+        assert "i-1" not in rows[0]["Finding_Details"]
+
+    def test_each_failing_instance_gets_its_own_row(self):
+        rows = self._run(_sm43_instance("i-1"), _sm43_instance("i-2"))
+        assert _sm43_statuses(rows) == ["Failed", "Failed"]
+        assert rows[0]["Finding_Details"].startswith("EC2 instance i-1 ")
+        assert rows[1]["Finding_Details"].startswith("EC2 instance i-2 ")
+        assert _sm43_rows.profile_calls == ["node-profile"]
+
+    @pytest.mark.parametrize(
+        "resource", ["*", "arn:aws:s3:::*", "arn:aws:s3:::art*/*", "arn:*:s3:::*/m/*"]
+    )
+    def test_a_wildcard_grant_reaching_the_bucket_fails(self, resource):
+        cache = _sm43_node_cache(dict(self.ARTIFACT_READ, Resource=resource))
+        rows = self._run(_sm43_instance(), cache=cache)
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert f"s3:GetObject on {resource} by" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "resource", ["arn:aws:s3:::other-bucket/*", "arn:aws:s3:::artifacts"]
+    )
+    def test_a_role_that_reads_no_artifact_object_passes(self, resource):
+        cache = _sm43_node_cache(dict(self.ARTIFACT_READ, Resource=resource))
+        rows = self._run(_sm43_instance(), cache=cache)
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_notresource_grant_excluding_another_bucket_fails(self):
+        statement = {
+            "Sid": "Weights",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "NotResource": "arn:aws:s3:::other-bucket/*",
+        }
+        rows = self._run(_sm43_instance(), cache=_sm43_node_cache(statement))
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "every resource but NotResource arn:aws:s3:::other-bucket/*"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_notresource_grant_excluding_the_artifacts_is_not_judged(self):
+        statement = {
+            "Sid": "Weights",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "NotResource": "arn:aws:s3:::artifacts/*",
+        }
+        rows = self._run(_sm43_instance(), cache=_sm43_node_cache(statement))
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert "under a Condition or NotResource" in rows[0]["Finding_Details"]
+
+    def test_a_conditioned_grant_is_not_judged(self):
+        statement = dict(
+            self.ARTIFACT_READ,
+            Condition={"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+        )
+        rows = self._run(_sm43_instance(), cache=_sm43_node_cache(statement))
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "EC2 instance i-1 accepts IMDSv1 and its role 'node-role'"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_account_wide_deny_removes_the_reach(self):
+        deny = {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*"}
+        rows = self._run(
+            _sm43_instance(), cache=_sm43_node_cache(self.ARTIFACT_READ, deny)
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_boundary_without_s3_removes_the_reach(self):
+        boundary = {
+            "Statement": [{"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"}]
+        }
+        cache = _sm43_node_cache(self.ARTIFACT_READ, boundary=boundary)
+        rows = self._run(_sm43_instance(), cache=cache)
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_boundary_that_allows_the_read_keeps_the_failure(self):
+        boundary = {
+            "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+        }
+        cache = _sm43_node_cache(self.ARTIFACT_READ, boundary=boundary)
+        rows = self._run(_sm43_instance(), cache=cache)
+        assert _sm43_statuses(rows) == ["Failed"]
+
+    def test_an_unread_boundary_is_not_judged(self):
+        cache = _sm43_node_cache(
+            self.ARTIFACT_READ,
+            errors=[
+                {
+                    "type": "role",
+                    "name": "node-role",
+                    "stage": "permissions_boundary",
+                }
+            ],
+        )
+        rows = self._run(_sm43_instance(), cache=cache)
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert "its permissions boundary was not read" in rows[0]["Finding_Details"]
+
+    def test_a_role_missing_from_the_cache_is_not_judged(self):
+        rows = self._run(_sm43_instance(), profiles={"node-profile": "absent-role"})
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "role 'absent-role' was not judged (not in the IAM cache)"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_failed_instance_profile_read_is_not_judged(self):
+        rows = self._run(
+            _sm43_instance(),
+            profiles={"node-profile": _sm43_error("AccessDenied")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert "iam:GetInstanceProfile: AccessDenied" in rows[0]["Finding_Details"]
+
+    def test_a_failed_instance_listing_is_not_judged(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": _sm43_prefix_model()},
+            instances=_sm43_error("UnauthorizedOperation"),
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "ec2:DescribeInstances: UnauthorizedOperation"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_missing_metadata_options_are_not_judged(self):
+        instance = _sm43_instance()
+        instance.pop("MetadataOptions")
+        rows = self._run(instance)
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert "returned no MetadataOptions HttpTokens" in rows[0]["Finding_Details"]
+
+    def test_a_profile_without_a_role_passes(self):
+        rows = self._run(_sm43_instance(), profiles={"node-profile": None})
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_an_instance_without_a_profile_is_not_counted(self):
+        rows = self._run(_sm43_instance(profile=None))
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert "Of 0 EC2 instance(s)" in rows[0]["Finding_Details"]
+
+    def test_a_profile_path_is_dropped_from_the_name(self):
+        instance = _sm43_instance()
+        instance["IamInstanceProfile"]["Arn"] = (
+            f"arn:aws:iam::{_SM43_ACCOUNT}:instance-profile/team/node-profile"
+        )
+        rows = self._run(instance)
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert _sm43_rows.profile_calls == ["node-profile"]
+
+    def test_stopped_instances_are_listed(self):
+        self._run(_sm43_instance(tokens="required"))
+        values = _sm43_rows.instance_filters[0][0]["Values"]
+        assert _sm43_rows.instance_filters[0][0]["Name"] == "instance-state-name"
+        assert set(values) == {"pending", "running", "stopping", "stopped"}
+
+    def test_instances_are_not_listed_without_artifact_buckets(self):
+        rows = self._run(
+            _sm43_instance(),
+            models={"m-1": {"PrimaryContainer": _sm43_container(uri=None)}},
+        )
+        assert _sm43_rows.instance_filters == []
+        assert all("EC2 instance(s)" not in r["Finding_Details"] for r in rows)
+
+
+def _sm40_microvm_version(version="1", resume="ENABLED", timeout=20, status="ACTIVE"):
+    hooks = {"run": "ENABLED", "resume": resume}
+    if timeout is not None:
+        hooks["resumeTimeoutInSeconds"] = timeout
+    return {
+        "imageVersion": version,
+        "status": status,
+        "state": "SUCCESSFUL",
+        "hooks": {"port": 8080, "microvmHooks": hooks},
+    }
+
+
+class TestSM40MicrovmResumeHook:
+    """AIR-SLF-RT-06: a Lambda MicroVM image re-fetches secrets in /resume."""
+
+    def _propagation(self, **kwargs):
+        suite = TestSM40RotationHistoryAndPropagation()
+        rows = suite._run(**kwargs)
+        return suite._named(rows, sagemaker_app.SECRET_PROPAGATION_FINDING)
+
+    def test_a_version_with_the_resume_hook_passes(self):
+        rows = self._propagation(microvms={"agent": [_sm40_microvm_version()]})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "Each of the 1 ACTIVE Lambda MicroVM image version(s) enables" in (
+            details
+        )
+        assert "Lambda MicroVM image agent version 1 (20s)" in details
+        assert "1 to 60 seconds" in details
+
+    @pytest.mark.parametrize("resume", ["DISABLED", None])
+    def test_a_version_without_the_resume_hook_fails(self, resume):
+        version = _sm40_microvm_version(resume=resume)
+        if resume is None:
+            version["hooks"]["microvmHooks"].pop("resume")
+        rows = self._propagation(microvms={"agent": [version]})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "Lambda MicroVM image agent version 1 has hooks.microvmHooks.resume "
+            f"{resume or 'unset'}, so no /resume hook runs"
+        ) in rows[0]["Finding_Details"]
+        assert "/resume lifecycle hook" in rows[0]["Resolution"]
+
+    def test_a_version_with_no_hooks_fails(self):
+        version = _sm40_microvm_version()
+        version.pop("hooks")
+        rows = self._propagation(microvms={"agent": [version]})
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_only_the_second_version_of_the_second_image_fails(self):
+        rows = self._propagation(
+            microvms={
+                "first": [_sm40_microvm_version()],
+                "second": [
+                    _sm40_microvm_version("1"),
+                    _sm40_microvm_version("2", resume="DISABLED"),
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "Lambda MicroVM image second version 2 has" in details
+        assert "image first" not in details
+        assert "second version 1 " not in details
+
+    def test_an_inactive_version_is_not_judged(self):
+        rows = self._propagation(
+            microvms={
+                "agent": [
+                    _sm40_microvm_version("1"),
+                    _sm40_microvm_version("2", resume="DISABLED", status="INACTIVE"),
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Each of the 1 ACTIVE" in rows[0]["Finding_Details"]
+
+    def test_a_failed_image_listing_is_not_judged(self):
+        rows = self._propagation(errors={"microvm": _sm43_error("AccessDenied")})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "lambda:ListMicrovmImages (AccessDenied)" in rows[0]["Finding_Details"]
+
+    def test_a_failed_version_listing_is_not_judged(self):
+        rows = self._propagation(
+            microvms={
+                "agent": _sm43_error("AccessDeniedException"),
+                "other": [_sm40_microvm_version()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "Lambda MicroVM image agent versions (lambda:ListMicrovmImageVersions: "
+            "AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+        assert (
+            "1 ACTIVE Lambda MicroVM image version(s) were read"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_a_plaintext_credential_in_the_image_environment_fails(self):
+        version = _sm40_microvm_version()
+        version["environmentVariables"] = {"DB_PASSWORD": "hunter2", "LOG": "info"}
+        suite = TestSM40RotationHistoryAndPropagation()
+        rows = suite._named(
+            suite._run(microvms={"agent": [version]}),
+            sagemaker_app.PLAINTEXT_CREDENTIAL_FINDING,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "Lambda MicroVM image agent version 1 sets DB_PASSWORD as a plaintext "
+            "environment variable, fixed at image build time"
+        ) in rows[0]["Finding_Details"]
+        assert "hunter2" not in rows[0]["Finding_Details"]
+
+
+def _sm02_invoke_cache(
+    *statements, name="app", boundary=None, errors=None, kind="role"
+):
+    """An IAM cache holding one identity whose inline policy has these statements."""
+    entry = {
+        "attached_policies": [],
+        "inline_policies": [
+            {"name": "api", "document": {"Statement": list(statements)}}
+        ],
+        "permissions_boundary": boundary,
+    }
+    if kind == "user":
+        entry["group_policies"] = []
+    return {
+        "role_permissions": {name: entry} if kind == "role" else {},
+        "user_permissions": {name: entry} if kind == "user" else {},
+        "principal_errors": errors or [],
+    }
+
+
+class TestSM02IamAuthorizedMethodGrants:
+    """AIR-FND-IAM-09: execute-api:Invoke grants split read from write."""
+
+    ARN = "arn:aws:execute-api:us-east-1:111122223333:api"
+
+    def _rest(self, paths=None):
+        suite = TestSM02AIApiMethodAuthorization
+        method = suite._method(suite.BEDROCK, kind="AWS_IAM", authorizer=None)
+        return {
+            "api": paths or {"/models": {"GET": method, "POST": method}, "/health": {}}
+        }
+
+    def _invoke(self, *resources, **extra):
+        return dict(
+            {
+                "Sid": "Invoke",
+                "Effect": "Allow",
+                "Action": "execute-api:Invoke",
+                "Resource": list(resources),
+            },
+            **extra,
+        )
+
+    def _run(self, *statements, rest=None, **kwargs):
+        cache = kwargs.pop("cache", None) or _sm02_invoke_cache(*statements)
+        return TestSM02AIApiMethodAuthorization()._run(
+            rest=rest or self._rest(), cache=cache, **kwargs
+        )
+
+    def test_per_verb_grants_pass(self):
+        rows = self._run(
+            self._invoke(f"{self.ARN}/*/GET/models"),
+            dict(self._invoke(f"{self.ARN}/*/POST/models"), Sid="Write"),
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 IAM-authorized method(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "*",
+            "arn:aws:execute-api:*:*:*",
+            "arn:aws:execute-api:us-east-1:111122223333:api/*",
+            "arn:aws:execute-api:us-east-1:111122223333:api/prod/*/models",
+            "arn:aws:execute-api:us-east-1:111122223333:api/*/*/*",
+        ],
+    )
+    def test_one_pattern_over_read_and_write_fails(self, resource):
+        rows = self._run(self._invoke(resource))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"role 'app' is allowed execute-api:Invoke on {resource} by policy api "
+            "statement Invoke, one grant that reaches read method(s) GET /models "
+            "and write method(s) POST /models of REST API api (api)"
+        ) in details
+        assert "cannot give read without write" in details
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:execute-api:us-east-1:111122223333:api/*/GET/*",
+            "arn:aws:execute-api:us-east-1:111122223333:api/*/G*",
+            "arn:aws:execute-api:us-east-1:111122223333:other/*",
+            "arn:aws:execute-api:us-west-2:111122223333:api/*",
+            "arn:aws:execute-api:us-east-1:444455556666:api/*",
+        ],
+    )
+    def test_a_pattern_reaching_one_side_passes(self, resource):
+        rows = self._run(self._invoke(resource))
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_stage_wildcard_cannot_span_into_the_verb(self):
+        # GET/* must not be read as reaching POST /models through a stage that
+        # contains "/", which no stage name can.
+        rows = self._run(
+            self._invoke("arn:aws:execute-api:us-east-1:111122223333:api/*/GET/*")
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_an_any_method_reached_by_one_pattern_fails(self):
+        suite = TestSM02AIApiMethodAuthorization
+        method = suite._method(suite.BEDROCK, kind="AWS_IAM", authorizer=None)
+        rows = self._run(
+            self._invoke(f"{self.ARN}/*/*/chat"),
+            rest={"api": {"/chat": {"ANY": method}}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "read method(s) ANY /chat and write method(s) ANY /chat"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_any_method_split_by_verb_passes(self):
+        suite = TestSM02AIApiMethodAuthorization
+        method = suite._method(suite.BEDROCK, kind="AWS_IAM", authorizer=None)
+        rows = self._run(
+            self._invoke(f"{self.ARN}/*/GET/chat"),
+            rest={"api": {"/chat": {"ANY": method}}},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_path_parameter_matches_any_one_segment(self):
+        suite = TestSM02AIApiMethodAuthorization
+        method = suite._method(suite.BEDROCK, kind="AWS_IAM", authorizer=None)
+        rest = {"api": {"/models/{id}": {"GET": method, "DELETE": method}}}
+        failed = self._run(self._invoke(f"{self.ARN}/*/*/models/m-1"), rest=rest)
+        assert [r["Status"] for r in failed] == ["Failed"]
+        passed = self._run(self._invoke(f"{self.ARN}/*/*/models/a/b"), rest=rest)
+        assert [r["Status"] for r in passed] == ["Passed"]
+
+    def test_only_the_second_identity_fails(self):
+        cache = _sm02_invoke_cache(self._invoke(f"{self.ARN}/*/GET/models"))
+        cache["role_permissions"]["admin"] = _sm02_invoke_cache(
+            self._invoke(f"{self.ARN}/*")
+        )["role_permissions"]["app"]
+        rows = self._run(cache=cache)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "role 'admin' is allowed" in rows[0]["Finding_Details"]
+        assert "role 'app'" not in rows[0]["Finding_Details"]
+
+    def test_a_user_grant_is_read(self):
+        cache = _sm02_invoke_cache(self._invoke(f"{self.ARN}/*"), kind="user")
+        rows = self._run(cache=cache)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "user 'app' is allowed" in rows[0]["Finding_Details"]
+
+    def test_a_notresource_grant_excluding_another_api_fails(self):
+        statement = {
+            "Sid": "Invoke",
+            "Effect": "Allow",
+            "Action": "execute-api:Invoke",
+            "NotResource": f"{self.ARN.rsplit(':', 1)[0]}:other/*",
+        }
+        rows = self._run(statement)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "every resource but NotResource" in rows[0]["Finding_Details"]
+
+    def test_a_notresource_grant_excluding_the_writes_passes(self):
+        statement = {
+            "Sid": "Invoke",
+            "Effect": "Allow",
+            "Action": "execute-api:Invoke",
+            "NotResource": f"{self.ARN}/*/POST/*",
+        }
+        rows = self._run(statement)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_an_action_wildcard_grant_fails(self):
+        rows = self._run(dict(self._invoke(f"{self.ARN}/*"), Action="execute-api:*"))
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_a_grant_of_another_action_passes(self):
+        rows = self._run(
+            dict(self._invoke(f"{self.ARN}/*"), Action="execute-api:ManageConnections")
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_an_account_wide_deny_removes_the_grant(self):
+        deny = {"Effect": "Deny", "Action": "execute-api:Invoke", "Resource": "*"}
+        rows = self._run(self._invoke(f"{self.ARN}/*"), deny)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_boundary_without_invoke_removes_the_grant(self):
+        cache = _sm02_invoke_cache(
+            self._invoke(f"{self.ARN}/*"),
+            boundary={
+                "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+            },
+        )
+        rows = self._run(cache=cache)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_conditioned_grant_is_not_judged(self):
+        rows = self._run(
+            self._invoke(
+                f"{self.ARN}/*",
+                Condition={"StringEquals": {"aws:PrincipalTag/team": "ml"}},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "under a Condition this check does not evaluate"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_an_unread_boundary_is_not_judged(self):
+        cache = _sm02_invoke_cache(
+            self._invoke(f"{self.ARN}/*"),
+            errors=[{"type": "role", "name": "app", "stage": "permissions_boundary"}],
+        )
+        rows = self._run(cache=cache)
+        assert "Failed" not in [r["Status"] for r in rows]
+        assert any(
+            "its permissions boundary was not read" in r["Finding_Details"]
+            for r in rows
+        )
+
+    def test_a_failed_account_read_withholds_the_pass(self):
+        rows = self._run(
+            self._invoke(f"{self.ARN}/*/GET/models"),
+            errors={"sts": _make_client_error("AccessDenied")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sts:GetCallerIdentity (AccessDenied)" in rows[0]["Finding_Details"]
+
+    def test_an_unparseable_policy_withholds_the_pass(self):
+        cache = _sm02_invoke_cache(self._invoke(f"{self.ARN}/*/GET/models"))
+        cache["role_permissions"]["app"]["inline_policies"].append(
+            {"name": "broken", "document": "{not json"}
+        )
+        rows = self._run(cache=cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "role 'app' policy 'broken'" in rows[0]["Finding_Details"]
+
+    def test_an_http_api_route_is_judged(self):
+        suite = TestSM02AIApiMethodAuthorization
+        rows = suite()._run(
+            http={
+                "h": [
+                    ("GET /chat", "AWS_IAM", [], suite.BEDROCK),
+                    ("POST /chat", "AWS_IAM", [], suite.BEDROCK),
+                ]
+            },
+            cache=_sm02_invoke_cache(
+                self._invoke("arn:aws:execute-api:us-east-1:111122223333:h/*/*/chat")
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "of HTTP API h (h)" in rows[0]["Finding_Details"]
+
+    def test_a_lambda_authorizer_is_still_not_judged_with_a_cache(self):
+        suite = TestSM02AIApiMethodAuthorization
+        method = suite._method(suite.BEDROCK, kind="CUSTOM")
+        rows = self._run(
+            self._invoke(f"{self.ARN}/*/GET/models"),
+            rest={"api": {"/x": {"POST": method}}},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "(CUSTOM)" in rows[0]["Finding_Details"]
+
+
+class TestSM39EgressForEveryAgentHost:
+    """AIR-SLF-RT-02: EKS and EC2 VPCs, and agent Lambda functions outside a VPC."""
+
+    suite = TestSM39WorkloadEgress()
+    ARN = "arn:aws:lambda:us-east-1:111122223333:function:tool"
+
+    def _legs(self, rows):
+        return [(r["Finding"], r["Status"]) for r in rows]
+
+    def test_an_eks_cluster_vpc_is_judged(self):
+        rows = self.suite._run(clusters={"agents": ["subnet-a1"]})
+        dns = self.suite._dns(rows)
+        assert [r["Status"] for r in dns] == ["Failed"]
+        assert "EKS cluster agents" in dns[0]["Finding_Details"]
+        assert len(self.suite._nfw(rows)) == 1
+
+    def test_an_ec2_instance_vpc_is_judged_from_every_interface(self):
+        instance = {
+            "InstanceId": "i-1",
+            "SubnetId": "subnet-a1",
+            "NetworkInterfaces": [{"SubnetId": "subnet-a1"}, {"SubnetId": "subnet-b1"}],
+        }
+        rows = self.suite._run(
+            instances=[instance],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+        )
+        dns = self.suite._dns(rows)
+        assert [r["Status"] for r in dns] == ["Passed", "Failed"]
+        assert all("EC2 instance i-1" in r["Finding_Details"] for r in dns)
+
+    def test_the_second_instance_is_read(self):
+        rows = self.suite._run(
+            instances=[
+                {"InstanceId": "i-1", "SubnetId": "subnet-a1"},
+                {"InstanceId": "i-2", "SubnetId": "subnet-b1"},
+            ],
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+        )
+        dns = self.suite._dns(rows)
+        assert [r["Status"] for r in dns] == ["Passed", "Failed"]
+        assert "EC2 instance i-2" in dns[1]["Finding_Details"]
+
+    def test_an_auto_scaling_group_is_one_workload(self):
+        tags = [{"Key": "aws:autoscaling:groupName", "Value": "nodes"}]
+        rows = self.suite._run(
+            instances=[
+                {"InstanceId": "i-1", "SubnetId": "subnet-a1", "Tags": tags},
+                {"InstanceId": "i-2", "SubnetId": "subnet-a1", "Tags": tags},
+            ]
+        )
+        dns = self.suite._dns(rows)
+        assert "EC2 Auto Scaling group nodes" in dns[0]["Finding_Details"]
+        assert "i-1" not in dns[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "key, named",
+        [
+            ("eks", "eks:ListClusters"),
+            ("describe_cluster", "eks:DescribeCluster agents"),
+            ("instances", "ec2:DescribeInstances"),
+        ],
+    )
+    def test_an_unread_host_withholds_the_pass(self, key, named):
+        rows = self.suite._run(
+            functions=[self.suite._function("agent-fn", ["subnet-a1"])],
+            clusters={"agents": ["subnet-a1"]},
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+            errors={key: _make_client_error("AccessDeniedException")},
+        )
+        incomplete = [r for r in rows if r["Finding"].endswith(" Incomplete")]
+        assert len(incomplete) == 2
+        assert all(r["Status"] == "N/A" for r in incomplete)
+        assert all(named in r["Finding_Details"] for r in incomplete)
+
+    def test_an_agent_lambda_outside_a_vpc_fails_both_legs(self):
+        rows = self.suite._run(
+            functions=[{"FunctionName": "tool", "FunctionArn": self.ARN}],
+            named={self.ARN: ["gateway gw target t"]},
+        )
+        assert self._legs(rows) == [
+            ("Agent Workload DNS Egress Control", "Failed"),
+            ("Agent Workload Network Firewall Egress", "Failed"),
+        ]
+        assert (
+            "Lambda function tool, named by gateway gw target t, runs outside a VPC"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_qualified_agent_lambda_reference_matches_the_function(self):
+        rows = self.suite._run(
+            functions=[{"FunctionName": "tool", "FunctionArn": self.ARN}],
+            named={f"{self.ARN}:live": ["agent a action group g"]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+
+    def test_only_the_agent_lambda_outside_a_vpc_fails(self):
+        other = "arn:aws:lambda:us-east-1:111122223333:function:billing"
+        rows = self.suite._run(
+            functions=[
+                {"FunctionName": "billing", "FunctionArn": other},
+                {
+                    "FunctionName": "tool",
+                    "FunctionArn": self.ARN,
+                    "VpcConfig": {"SubnetIds": ["subnet-a1"]},
+                },
+            ],
+            named={self.ARN: ["gateway gw target t"]},
+            associations={"vpc-a": [_dns_association("rslvr-frg-block")]},
+        )
+        assert "Failed" not in [r["Status"] for r in self.suite._dns(rows)]
+        assert all("billing" not in r["Finding_Details"] for r in rows)
+
+    def test_a_named_function_missing_from_the_listing_is_not_judged(self):
+        rows = self.suite._run(named={self.ARN: ["gateway gw target t"]})
+        assert self._legs(rows) == [
+            ("Agent Workload DNS Egress Control Incomplete", "N/A"),
+            ("Agent Workload Network Firewall Egress Incomplete", "N/A"),
+        ]
+        assert "is not among this Region's functions" in rows[0]["Finding_Details"]
+
+    def test_an_unread_agent_reference_withholds_the_pass(self):
+        kwargs = {
+            "functions": [self.suite._function("agent-fn", ["subnet-a1"])],
+            "associations": {"vpc-a": [_dns_association("rslvr-frg-block")]},
+        }
+        rows = self.suite._run(**kwargs)
+        assert [r["Status"] for r in self.suite._dns(rows)] == ["Passed"]
+        rows = self.suite._run(
+            errors={"named": ["bedrock-agent:ListAgents (AccessDeniedException)"]},
+            **kwargs,
+        )
+        incomplete = [r for r in rows if r["Finding"].endswith(" Incomplete")]
+        assert len(incomplete) == 2
+        assert all(
+            "bedrock-agent:ListAgents (AccessDeniedException)" in r["Finding_Details"]
+            for r in incomplete
+        )
+
+
+class TestSM26PromptInjectionFindings:
+    """AIR-FND-DET-04: active GuardDuty prompt-injection findings."""
+
+    INVENTORY = TestProposedSageMakerChecks.ENABLED_INVENTORY
+
+    def _rows(self, mock_client, pages=(), latest=None, error=None, inventory=None):
+        client = mock_client.return_value
+        client.describe_organization_configuration.return_value = {}
+        calls = []
+
+        def list_findings(**kwargs):
+            calls.append(kwargs)
+            if error is not None:
+                raise error
+            return [{"FindingIds": list(page)} for page in pages]
+
+        client.get_paginator.side_effect = _pager({"list_findings": list_findings})
+        if isinstance(latest, Exception):
+            client.get_findings.side_effect = latest
+        else:
+            client.get_findings.return_value = {"Findings": [latest or {}]}
+        rows = extract_csv_data(
+            sagemaker_app.check_guardduty_ai_protection(
+                "us-east-1", inventory or self.INVENTORY
+            )
+        )
+        self.calls = calls
+        return [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.GUARDDUTY_PROMPT_INJECTION_FINDING
+        ]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_active_finding_passes(self, mock_client):
+        rows = self._rows(mock_client)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "No active (unarchived) Impact:IAMUser/PromptInjection.Direct"
+            in (rows[0]["Finding_Details"])
+        )
+        criterion = self.calls[0]["FindingCriteria"]["Criterion"]
+        assert criterion["type"] == {
+            "Equals": ["Impact:IAMUser/PromptInjection.Direct"]
+        }
+        assert criterion["service.archived"] == {"Equals": ["false"]}
+        assert self.calls[0]["DetectorId"] == "detector-1"
+
+    @patch("sagemaker_app.boto3.client")
+    def test_active_findings_on_every_page_fail(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            pages=[["f-new"], ["f-2", "f-3"]],
+            latest={
+                "UpdatedAt": "2026-10-01T11:21:39.633Z",
+                "Service": {"Count": 67},
+                "Resource": {"ResourceType": "AccessKey"},
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert details.startswith(
+            "3 active (unarchived) Impact:IAMUser/PromptInjection.Direct finding(s)"
+        )
+        assert (
+            "The latest, f-new, was last updated 2026-10-01T11:21:39.633Z and "
+            "counts 67 event(s) against a AccessKey resource."
+        ) in details
+        assert mock_client.return_value.get_findings.call_args.kwargs == {
+            "DetectorId": "detector-1",
+            "FindingIds": ["f-new"],
+        }
+        assert self.calls[0]["SortCriteria"] == {
+            "AttributeName": "updatedAt",
+            "OrderBy": "DESC",
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unread_example_keeps_the_failure(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            pages=[["f-1"]],
+            latest=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "guardduty:GetFindings failed (AccessDeniedException)"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_failed_listing_is_not_judged(self, mock_client):
+        rows = self._rows(
+            mock_client, error=_make_client_error("AccessDeniedException")
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "guardduty:ListFindings failed (AccessDeniedException)"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_without_ai_protection_the_findings_are_not_read(self, mock_client):
+        inventory = {
+            "detector_id": "detector-1",
+            "detail": {"Status": "ENABLED", "Features": []},
+            "error": None,
+        }
+        rows = self._rows(mock_client, pages=[["f-1"]], inventory=inventory)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "AI Protection is not enabled" in rows[0]["Finding_Details"]
+        assert self.calls == []
