@@ -366,6 +366,9 @@ _EXPECTED_ACTIONS = {
         "shield:DescribeSubscription",
         "shield:GetSubscriptionState",
         "shield:ListProtections",
+        "logs:ListScheduledQueries",
+        "logs:GetScheduledQuery",
+        "apigateway:GET",
     },
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
@@ -1932,6 +1935,34 @@ def test_sagemaker_managed_policy_2_is_identical_in_both_templates():
 
 
 _AGENTCORE_MANAGED_GRANTS = [
+    # AC-53's scheduled query reads: ListScheduledQueries has no resource type
+    # in the service authorization reference (2026-10-04), GetScheduledQuery
+    # takes scheduled-query.
+    ("Allow", "logs:ListScheduledQueries", json.dumps("*")),
+    (
+        "Allow",
+        "logs:GetScheduledQuery",
+        json.dumps(
+            {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:scheduled-query:*"
+                )
+            }
+        ),
+    ),
+    # AC-35 reads an API Gateway target's stage export, and nothing else of
+    # API Gateway.
+    (
+        "Allow",
+        "apigateway:GET",
+        json.dumps(
+            {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:apigateway:*::/restapis/*/stages/*/exports/*"
+                )
+            }
+        ),
+    ),
     (
         "Allow",
         "logs:DescribeSubscriptionFilters",

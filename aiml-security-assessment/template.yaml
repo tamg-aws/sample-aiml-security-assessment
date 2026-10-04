@@ -1893,6 +1893,29 @@ Resources:
             Action:
               - ec2:SearchTransitGatewayRoutes # AC-49
             Resource: !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:transit-gateway-route-table/*'
+          - Sid: AgentLogScheduledQueryList
+            # AC-53 lists the account's scheduled Logs Insights queries.
+            # ListScheduledQueries has no resource type in the service
+            # authorization reference, so it takes '*'.
+            Effect: Allow
+            Action:
+              - logs:ListScheduledQueries # AC-53
+            Resource: '*'
+          - Sid: AgentLogScheduledQueryRead
+            # AC-53 reads the log groups each scheduled query names.
+            Effect: Allow
+            Action:
+              - logs:GetScheduledQuery # AC-53
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:scheduled-query:*'
+          - Sid: GatewayTargetApiExportRead
+            # AC-35 reads the OpenAPI export of the REST API stage an API
+            # Gateway target names. The ARN reference lists no export resource
+            # for REST APIs, so this is the GetExport request path, shaped as
+            # the Sdk resource beside it is.
+            Effect: Allow
+            Action:
+              - apigateway:GET # AC-35
+            Resource: !Sub 'arn:${AWS::Partition}:apigateway:*::/restapis/*/stages/*/exports/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
@@ -1957,7 +1980,7 @@ Resources:
                 - ec2:DescribeSubnets # AC-01, AC-08, AC-49
                 - ec2:DescribeRouteTables # AC-01, AC-49
                 - ec2:DescribeVpcEndpoints # AC-08
-                - ec2:DescribeVpcs # AC-08
+                - ec2:DescribeVpcs # AC-08, AC-27
                 # AC-08 reads the inbound rules of each AgentCore endpoint's
                 # security groups, and AC-01 the outbound rules of each VPC
                 # runtime and built-in tool group. DescribeSecurityGroups has no
@@ -2001,7 +2024,7 @@ Resources:
                 # through a composite alarm. The CloudWatch API reference page
                 # API_DescribeAlarms says composite alarm information is returned
                 # only when the permission is scoped to '*'.
-                - cloudwatch:DescribeAlarms # AC-36, AC-40, AC-45, AC-46, AC-53
+                - cloudwatch:DescribeAlarms # AC-24, AC-36, AC-40, AC-45, AC-46, AC-53, AG-27
                 # Formerly AgentCoreApprovedReadsWithoutResourceType
                 # Read-only reads approved for the AgentCore legs. None of these
                 # has a resource type in the service authorization reference, so
@@ -2028,7 +2051,7 @@ Resources:
                 # request that names no resource is authorized against '*', so an
                 # ARN here would deny the call the way it does for GetTokenVault.
                 - network-firewall:ListFirewalls # AC-49
-                - cloudwatch:ListMetrics # AC-40, AC-53
+                - cloudwatch:ListMetrics # AC-24, AC-40, AC-53, AG-27
                 - ce:GetAnomalySubscriptions # AC-46
               Resource: '*'
             - Sid: AgentCoreResourceReadPermissions
@@ -2110,11 +2133,15 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
             - Sid: AgentCoreGatewayWebACLRead
               # AG-39 reads the rules of the web ACL associated with a gateway,
-              # and AC-51 reads the same ACL for the Anti-DDoS rule group.
+              # and AC-51 reads the same ACL for the Anti-DDoS rule group. Both
+              # also read the global web ACL on a CloudFront distribution that
+              # fronts a gateway, by the WebACLId ListDistributions reports.
               Effect: Allow
               Action:
                 - wafv2:GetWebACL # AG-39, AC-51
-              Resource: !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
+                - !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:global/webacl/*/*'
             - Sid: DNSFirewallRuleRead
               # AC-49 reads the rules of each rule group associated with an
               # AgentCore VPC. A rule group can be shared through AWS RAM from
