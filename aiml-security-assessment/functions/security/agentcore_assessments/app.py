@@ -13,6 +13,7 @@ from functools import lru_cache
 import logging
 import os
 import re
+import tarfile
 import time
 import zipfile
 import zlib
@@ -1037,6 +1038,25 @@ NETWORK_PATH_CONDITION_KEYS = {
     "aws:sourceip",
 }
 
+# The keys that confine a request to a private path. An address key does not: a
+# Deny on aws:SourceIp admits every caller at a listed address, a public one over
+# the internet included, and an aws:VpcSourceIp range can repeat in another
+# account's VPC. AIR-ACR-GW-04 and AIR-ACR-RT-13 name these two, with the
+# address keys as a supplement.
+PRIVATE_NETWORK_PATH_CONDITION_KEYS = {"aws:sourcevpc", "aws:sourcevpce"}
+
+
+def _address_only_restriction_text(keys: List[str]) -> str:
+    """Name a network restriction that no Deny on a VPC key carries."""
+    if not keys:
+        return ""
+    return (
+        f" A Deny restricts it by {', '.join(keys)}, but no Deny keyed only on "
+        "aws:SourceVpc or aws:SourceVpce does, so a caller at an address the "
+        "condition admits reaches it without a private path."
+    )
+
+
 # Every action that invokes a runtime, from the bedrock-agentcore service
 # reference, where each takes the runtime and runtime-endpoint resource types. A
 # restriction on InvokeAgentRuntime alone leaves the command, shell, WebSocket and
@@ -1189,38 +1209,38 @@ def _action_patterns_overlap(first: str, second: str) -> bool:
     """Return whether two IAM action patterns match at least one common action.
 
     Both patterns use the IAM grammar, where `*` matches any run of characters
-    and `?` matches one. The table is indexed by position in each pattern, so the
-    cost is the product of the two lengths.
+    and `?` matches one. The table is indexed by position in each pattern and
+    filled from the ends backwards one row at a time, so the cost is the product
+    of the two lengths and no input deepens the stack: a policy can carry a
+    pattern thousands of characters long.
     """
     first = first.lower()
     second = second.lower()
-    memo: Dict[Tuple[int, int], bool] = {}
-
-    def overlap(i: int, j: int) -> bool:
-        key = (i, j)
-        if key in memo:
-            return memo[key]
-        memo[key] = False
-        result = False
-        if i == len(first) and j == len(second):
-            result = True
-        elif i < len(first) and first[i] == "*" and overlap(i + 1, j):
-            result = True
-        elif j < len(second) and second[j] == "*" and overlap(i, j + 1):
-            result = True
-        elif i < len(first) and j < len(second):
-            left, right = first[i], second[j]
-            if left == "*" and right != "*":
-                result = overlap(i, j + 1)
-            elif right == "*" and left != "*":
-                result = overlap(i + 1, j)
-            elif left != "*" and right != "*":
-                if left == "?" or right == "?" or left == right:
-                    result = overlap(i + 1, j + 1)
-        memo[key] = result
-        return result
-
-    return overlap(0, 0)
+    # below[j] answers whether first[i + 1:] overlaps second[j:]; row[j] is the
+    # same for first[i:].
+    below = bytearray(len(second) + 1)
+    for i in range(len(first), -1, -1):
+        row = bytearray(len(second) + 1)
+        for j in range(len(second), -1, -1):
+            if i == len(first) and j == len(second):
+                row[j] = 1
+                continue
+            left = first[i] if i < len(first) else ""
+            right = second[j] if j < len(second) else ""
+            if left == "*" and below[j]:
+                row[j] = 1
+            elif right == "*" and row[j + 1]:
+                row[j] = 1
+            elif left and right:
+                if left == "*" and right != "*":
+                    row[j] = row[j + 1]
+                elif right == "*" and left != "*":
+                    row[j] = below[j]
+                elif left != "*" and right != "*":
+                    if left == "?" or right == "?" or left == right:
+                        row[j] = below[j + 1]
+        below = row
+    return bool(below[0])
 
 
 def _action_pattern_covers(outer: str, inner: str) -> bool:
@@ -11370,19 +11390,43 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             "control": len(runtimes) + len(gateways),
         }
 
-        if not runtimes and not gateways:
+        # A VPC-mode Code Interpreter or Browser reaches S3, DynamoDB and
+        # SageMaker through the endpoints of its own VPC, so a Region that holds
+        # only such tools still has data-path endpoints to judge, while the
+        # presence legs, which ask for an endpoint that runtime and gateway calls
+        # travel through, have nothing to require.
+        tools_only = not runtimes and not gateways
+        if tools_only:
+            hosting_references, hosting_errors = _agentcore_hosting_subnets()
+            if not hosting_references and not hosting_errors:
+                findings.append(
+                    create_finding(
+                        check_id="AC-08",
+                        finding_name="AgentCore VPC Endpoints Check",
+                        finding_details="No AgentCore resources found",
+                        resolution="No action required",
+                        reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                return findings
             findings.append(
                 create_finding(
                     check_id="AC-08",
                     finding_name="AgentCore VPC Endpoints Check",
-                    finding_details="No AgentCore resources found",
+                    finding_details=(
+                        "No AgentCore runtime or gateway exists in this Region, so "
+                        "no AgentCore endpoint is required; the data-path endpoints "
+                        "in the VPCs that host Code Interpreter or Browser tools are "
+                        "judged below."
+                    ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
             )
-            return findings
 
         vpcs = _paginate_aws_list(
             ec2_client,
@@ -11392,6 +11436,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             token_response_key="NextToken",
         )
 
+        if not vpcs and tools_only:
+            return findings
         if not vpcs:
             # A VPC endpoint lives in a VPC, so with none in the Region every
             # call to the runtimes and gateways listed above reaches the public
@@ -11457,7 +11503,10 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             elif _is_agentcore_data_path_endpoint(service_name):
                 data_path_candidates.append(entry)
 
-        if not found_agentcore_endpoints:
+        if tools_only:
+            # The presence and health legs stay at the N/A row above.
+            pass
+        elif not found_agentcore_endpoints:
             findings.append(
                 create_finding(
                     check_id="AC-08",
@@ -11552,13 +11601,58 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
                     )
                 )
 
-        # A data-path endpoint is judged only in a VPC that also holds an
-        # AgentCore endpoint. An S3 or DynamoDB endpoint in an unrelated VPC
-        # carries no agent traffic, and reporting its policy under AC-08 would
-        # name an endpoint this workload never calls.
+        # A data-path endpoint is judged in a VPC that holds an AgentCore
+        # endpoint or hosts a VPC-mode AgentCore resource, which reaches S3,
+        # DynamoDB and SageMaker through the endpoints of the VPC it runs in. An
+        # S3 or DynamoDB endpoint in an unrelated VPC carries no agent traffic,
+        # and reporting its policy under AC-08 would name an endpoint this
+        # workload never calls.
         agentcore_vpc_ids = {
             entry["vpc_id"] for entry in found_agentcore_endpoints if entry["vpc_id"]
         }
+        if not tools_only:
+            hosting_references, hosting_errors = _agentcore_hosting_subnets()
+        hosting_subnet_ids = sorted({subnet for _, subnet in hosting_references})
+        if hosting_subnet_ids:
+            try:
+                described, _ = _describe_subnets_reporting_missing(hosting_subnet_ids)
+                agentcore_vpc_ids.update(
+                    subnet["VpcId"] for subnet in described if subnet.get("VpcId")
+                )
+            except (BotoCoreError, ClientError) as error:
+                hosting_errors.append(
+                    (
+                        f"The {len(hosting_subnet_ids)} subnet(s) that host "
+                        "AgentCore resources",
+                        error,
+                        "ec2:DescribeSubnets",
+                    )
+                )
+        if hosting_errors:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Policy",
+                    finding_details=(
+                        "The data-path endpoints in the VPCs these resources run "
+                        "in were not judged, because their VPCs could not be "
+                        "resolved: "
+                        + "; ".join(
+                            f"{label} ({_assessment_error_label(error)} on {action})"
+                            for label, error, action in hosting_errors
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "Grant "
+                        + ", ".join(sorted({action for _, _, action in hosting_errors}))
+                        + " and retry."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
         data_path_endpoints = [
             entry
             for entry in data_path_candidates
@@ -17445,15 +17539,17 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
 
 
 def _archive_bucket_lock(
-    bucket: str, lock_cache: Dict[str, Tuple[str, Any]]
+    bucket: str, lock_cache: Dict[str, Tuple[str, Any]], source_account: str = ""
 ) -> Tuple[str, str]:
     """Judge the Object Lock default retention of one archive bucket.
 
     Returns ("ok", text), ("bad", text) or ("unread", text). Firehose writes
     objects with no retention of their own, so only the bucket's default
     retention locks them, and only COMPLIANCE mode holds against a principal
-    with s3:BypassGovernanceRetention. ExpectedBucketOwner is not passed: the
-    archive bucket belongs to a separate Log Archive account by design.
+    with s3:BypassGovernanceRetention. With `source_account`, a locked bucket
+    is read again with ExpectedBucketOwner set to it: S3 denies that read when
+    another account owns the bucket, so a read that succeeds shows the archive
+    sits in the account whose logs it holds and not in a Log Archive account.
     """
     if bucket not in lock_cache:
         try:
@@ -17493,8 +17589,40 @@ def _archive_bucket_lock(
         if retention.get("Days")
         else f"{retention.get('Years')} year(s)"
     )
-    return "ok", (
+    locked = (
         f"bucket '{bucket}', whose default retention is COMPLIANCE mode for {period}"
+    )
+    if not source_account:
+        return "ok", locked
+    owner_key = f"{bucket} owned by {source_account}"
+    if owner_key not in lock_cache:
+        try:
+            s3_client.get_object_lock_configuration(
+                Bucket=bucket, ExpectedBucketOwner=source_account
+            )
+            lock_cache[owner_key] = ("read", True)
+        except Exception as error:
+            code = _s3_error_code(error)
+            if code == "ObjectLockConfigurationNotFoundError":
+                lock_cache[owner_key] = ("read", True)
+            elif code in ("AccessDenied", "403"):
+                lock_cache[owner_key] = ("read", False)
+            else:
+                lock_cache[owner_key] = ("error", _assessment_error_label(error))
+    owner_state, owned = lock_cache[owner_key]
+    if owner_state == "error":
+        return "unread", (
+            f"s3:GetBucketObjectLockConfiguration with ExpectedBucketOwner "
+            f"{source_account} on bucket '{bucket}' ({owned})"
+        )
+    if owned:
+        return "bad", (
+            f"bucket '{bucket}', which account {source_account} owns, so the "
+            "archive is not held in a separate Log Archive account"
+        )
+    return "ok", (
+        f"{locked}, and a read naming account {source_account} as its expected "
+        "owner is denied, so another account owns it"
     )
 
 
@@ -17504,6 +17632,7 @@ def _subscription_filter_archive(
     stream_cache: Dict[str, Any],
     lock_cache: Dict[str, Tuple[str, Any]],
     label: str = "",
+    separate_account: bool = True,
 ) -> Tuple[str, str]:
     """Follow one subscription filter to its archive and judge the copy.
 
@@ -17514,7 +17643,8 @@ def _subscription_filter_archive(
     destination; a Lambda record processor on that stream can drop or rewrite
     records before the bucket holds them. A CloudWatch Logs destination, a
     Kinesis stream, a Lambda function or another account's stream is not
-    followed.
+    followed. With `separate_account`, a bucket `account` owns fails, because
+    the archive belongs in a separate Log Archive account.
     """
     label = label or f"subscription filter '{subscription.get('filterName') or '?'}'"
     pattern = str(subscription.get("filterPattern") or "").strip()
@@ -17605,7 +17735,9 @@ def _subscription_filter_archive(
             )
             continue
         bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
-        state, text = _archive_bucket_lock(bucket, lock_cache)
+        state, text = _archive_bucket_lock(
+            bucket, lock_cache, account if separate_account else ""
+        )
         verdicts.append((state, f"{stream_label}, which delivers to {text}"))
     if not verdicts:
         return "bad", f"{stream_label} reports no destination"
@@ -17852,6 +17984,7 @@ def _log_archive_destination_findings(
             stream_cache,
             lock_cache,
             label=label,
+            separate_account=False,
         )
         if state == "ok":
             details = (
@@ -18949,7 +19082,7 @@ def _restricting_source_vpce_values(
             statement,
             "bedrock-agentcore:InvokeGateway",
             gateway_arn,
-            NETWORK_PATH_CONDITION_KEYS,
+            PRIVATE_NETWORK_PATH_CONDITION_KEYS,
             _network_values_are_bounded,
             exempt_aws_service=True,
         )
@@ -19223,10 +19356,19 @@ def _gateway_resource_policy_findings(
         _document_statements(policy),
         "bedrock-agentcore:InvokeGateway",
         str(gateway_arn),
+        PRIVATE_NETWORK_PATH_CONDITION_KEYS,
+        _network_values_are_bounded,
+        exempt_aws_service=True,
+    )
+    address_keys, address_gaps = _resource_policy_restriction(
+        _document_statements(policy),
+        "bedrock-agentcore:InvokeGateway",
+        str(gateway_arn),
         NETWORK_PATH_CONDITION_KEYS,
         _network_values_are_bounded,
         exempt_aws_service=True,
     )
+    network_gaps = list(dict.fromkeys(address_gaps + network_gaps))
     vpce_values = (
         _restricting_source_vpce_values(_document_statements(policy), str(gateway_arn))
         if "aws:sourcevpce" in network_keys
@@ -19319,9 +19461,8 @@ def _gateway_resource_policy_findings(
                     )
                 ),
                 resolution=(
-                    "No action required. Confirm the VPC, VPC endpoint or address "
-                    "range named in the condition is the approved private path for "
-                    "this workload."
+                    "No action required. Confirm the VPC or VPC endpoint named in "
+                    "the condition is the approved private path for this workload."
                 ),
                 reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                 severity=SeverityEnum.MEDIUM,
@@ -19341,10 +19482,10 @@ def _gateway_resource_policy_findings(
                 finding_details=(
                     f"{label} has no resource policy Deny that refuses "
                     "bedrock-agentcore:InvokeGateway to every principal outside a "
-                    "bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or "
-                    "aws:SourceIp value, so any caller holding a valid authorizer "
-                    "token reaches it over any network path, including the public "
-                    f"internet.{gap_text}"
+                    "bounded aws:SourceVpc or aws:SourceVpce value, so any caller "
+                    "holding a valid authorizer token reaches it over any network "
+                    "path, including the public internet."
+                    f"{_address_only_restriction_text(address_keys)}{gap_text}"
                 ),
                 resolution=(
                     "Attach a gateway resource policy that denies calls whose "
@@ -23877,9 +24018,9 @@ CREDENTIAL_TEXT_PATTERN = re.compile(
 # What every passing AC-34 finding states it could not read.
 AC34_CODE_CEILING = (
     "The agent's code that agentRuntimeArtifact names in S3 is judged in the "
-    "AgentCore Runtime Code Inline Credentials row. A container image's configuration is judged in the "
-    "AgentCore Runtime Image Inline Credentials row, and its file system layers "
-    "are not scanned."
+    "AgentCore Runtime Code Inline Credentials row. A container image's "
+    "configuration and file system layers are judged in the AgentCore Runtime "
+    "Image Inline Credentials row."
 )
 AC34_IMAGE_FINDING = "AgentCore Runtime Image Inline Credentials"
 AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
@@ -23902,6 +24043,15 @@ ECR_IMAGE_INDEX_TYPES = (
 ECR_IMAGE_MAX_PLATFORMS = 8
 ECR_IMAGE_CONFIG_MAX_BYTES = 1024 * 1024
 ECR_IMAGE_CONFIG_TIMEOUT_SECONDS = 10
+# Bounds on the image layers AC-34 reads. Each layer is streamed and unpacked
+# one file at a time, so memory holds one file of at most
+# AC34_CODE_FILE_MAX_BYTES. The totals, over every platform of one image, bound
+# the time a scan takes: the compressed one is checked against the sizes the
+# manifest declares before anything is fetched, and an image over either is
+# not read.
+AC34_IMAGE_LAYERS_MAX_BYTES = 512 * 1024 * 1024
+AC34_IMAGE_UNPACKED_MAX_BYTES = 1024 * 1024 * 1024
+ECR_IMAGE_LAYER_TIMEOUT_SECONDS = 30
 
 
 def _value_is_a_credential_literal(value: str) -> bool:
@@ -24446,18 +24596,27 @@ def _code_archive_credentials(
                     f"file {info.filename} in the archive could not be read"
                 ) from None
             scanned += 1
-            if _text_holds_a_credential(text):
-                found.append(info.filename)
-            if info.filename.rsplit("/", 1)[-1].endswith(".env"):
-                environment = {}
-                for line in text.splitlines():
-                    name, separator, value = line.strip().partition("=")
-                    if separator and name and not name.startswith("#"):
-                        name = name.removeprefix("export ").strip()
-                        environment[name] = value.strip().strip("'\"")
-                literals, _ = _credential_entries(environment)
-                found.extend(f"{info.filename} variable {name}" for name in literals)
+            found.extend(_file_credentials(info.filename, text))
     return found, scanned, oversized
+
+
+def _file_credentials(path: str, text: str) -> List[str]:
+    """Name the inline credentials one file holds, never their values.
+
+    The file is named when it holds an AWS access key ID or a private key
+    block, and each credential variable of a .env file is named on its own.
+    """
+    found = [path] if _text_holds_a_credential(text) else []
+    if path.rsplit("/", 1)[-1].endswith(".env"):
+        environment = {}
+        for line in text.splitlines():
+            name, separator, value = line.strip().partition("=")
+            if separator and name and not name.startswith("#"):
+                name = name.removeprefix("export ").strip()
+                environment[name] = value.strip().strip("'\"")
+        literals, _ = _credential_entries(environment)
+        found.extend(f"{path} variable {name}" for name in literals)
+    return found
 
 
 def _agentcore_runtime_code_credential_findings(
@@ -24590,15 +24749,65 @@ def _fetch_image_config(download_url: str) -> Dict[str, Any]:
     return document
 
 
-def _image_config_credentials(
-    registry: str, region_name: str, repository: str, reference: str
+def _image_layer_credentials(
+    download_url: str, digest: str, unpacked: List[int]
 ) -> Tuple[List[str], int, int]:
-    """Scan the configuration of every platform an ECR image reference names.
+    """Scan every file of one image layer from its pre-signed ECR layer URL.
 
-    Returns the inline credentials found (named by variable or field, never
-    by value), the environment variables read, and the platforms read.
-    Raises ClientError, BotoCoreError, OSError or ValueError on a read that
-    fails, so the caller never reports an unread image as clean.
+    The layer is a tar archive, gzipped or not, read as a stream. Returns the
+    credentials found (named by layer and path), the files scanned, and the
+    files over AC34_CODE_FILE_MAX_BYTES not scanned. `unpacked` carries the
+    image's running total of unpacked bytes across its layers. Raises OSError
+    or ValueError on a layer that cannot be fetched or unpacked whole.
+    """
+    if urlsplit(download_url).scheme != "https":
+        raise ValueError("the layer URL is not HTTPS")
+    found: List[str] = []
+    scanned = oversized = 0
+    try:
+        with urlopen(download_url, timeout=ECR_IMAGE_LAYER_TIMEOUT_SECONDS) as response:
+            with tarfile.open(fileobj=response, mode="r|*") as archive:
+                for member in archive:
+                    if not member.isfile():
+                        continue
+                    if member.size > AC34_CODE_FILE_MAX_BYTES:
+                        oversized += 1
+                        continue
+                    unpacked[0] += member.size
+                    if unpacked[0] > AC34_IMAGE_UNPACKED_MAX_BYTES:
+                        raise ValueError(
+                            "the image's layers unpack to more than the "
+                            f"{AC34_IMAGE_UNPACKED_MAX_BYTES} byte bound"
+                        )
+                    handle = archive.extractfile(member)
+                    text = (handle.read() if handle else b"").decode("utf-8", "ignore")
+                    scanned += 1
+                    found.extend(
+                        f"{name} in layer {digest}"
+                        for name in _file_credentials(member.name, text)
+                    )
+    except (tarfile.TarError, EOFError, zlib.error):
+        raise ValueError(f"layer {digest} could not be unpacked") from None
+    return found, scanned, oversized
+
+
+def _image_config_credentials(
+    registry: str,
+    region_name: str,
+    repository: str,
+    reference: str,
+    scans: Dict[Tuple[str, str, str], Any],
+) -> Tuple[List[str], int, int, int, int, int]:
+    """Scan the configuration and layers of every platform an ECR image names.
+
+    Returns the inline credentials found (named by variable, field or layer
+    file, never by value), the environment variables read, the platforms
+    read, the layers read, the layer files scanned, and the layer files over
+    the per-file bound not scanned. Raises ClientError, BotoCoreError,
+    OSError or ValueError on a read that fails, so the caller never reports
+    an unread image as clean. scans holds the result, or the error, of each
+    image digest already read, so an image that several tags, versions or
+    runtimes name is downloaded once.
     """
     client = _ecr_client_for(region_name)
     image_id = (
@@ -24607,7 +24816,7 @@ def _image_config_credentials(
         else {"imageTag": reference[1:] if reference.startswith(":") else "latest"}
     )
 
-    def manifest(image: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+    def manifest(image: Dict[str, str]) -> Tuple[str, Dict[str, Any], str]:
         images = (
             client.batch_get_image(
                 registryId=registry,
@@ -24625,9 +24834,37 @@ def _image_config_credentials(
         media_type = str(
             images[0].get("imageManifestMediaType") or document.get("mediaType") or ""
         )
-        return media_type, document
+        digest = str((images[0].get("imageId") or {}).get("imageDigest") or "")
+        return media_type, document, digest
 
-    media_type, document = manifest(image_id)
+    media_type, document, image_digest = manifest(image_id)
+    key = (registry, region_name, image_digest)
+    if image_digest and key in scans:
+        if isinstance(scans[key], Exception):
+            raise scans[key]
+        return scans[key]
+    try:
+        result = _image_contents_credentials(
+            client, registry, repository, media_type, document, manifest
+        )
+    except (BotoCoreError, ClientError, OSError, ValueError) as error:
+        if image_digest:
+            scans[key] = error
+        raise
+    if image_digest:
+        scans[key] = result
+    return result
+
+
+def _image_contents_credentials(
+    client: Any,
+    registry: str,
+    repository: str,
+    media_type: str,
+    document: Dict[str, Any],
+    manifest: Callable[[Dict[str, str]], Tuple[str, Dict[str, Any], str]],
+) -> Tuple[List[str], int, int, int, int, int]:
+    """The configuration and layer scan _image_config_credentials returns."""
     if media_type in ECR_IMAGE_INDEX_TYPES:
         children = [
             str(entry.get("digest"))
@@ -24643,6 +24880,26 @@ def _image_config_credentials(
         manifests = [manifest({"imageDigest": digest})[1] for digest in children]
     else:
         manifests = [document]
+
+    # A layer two platforms share is read once.
+    layers: Dict[str, int] = {}
+    for platform in manifests:
+        if not isinstance(platform.get("layers"), list):
+            raise ValueError("a manifest names no layers list")
+        for layer in platform["layers"]:
+            if (
+                not isinstance(layer, dict)
+                or not isinstance(layer.get("size"), int)
+                or not layer.get("digest")
+            ):
+                raise ValueError("a manifest layer names no size or digest")
+            layers[str(layer["digest"])] = layer["size"]
+    compressed = sum(layers.values())
+    if compressed > AC34_IMAGE_LAYERS_MAX_BYTES:
+        raise ValueError(
+            f"the image's layers are {compressed} bytes compressed, more than the "
+            f"{AC34_IMAGE_LAYERS_MAX_BYTES} byte bound"
+        )
 
     found: List[str] = []
     variables = 0
@@ -24665,22 +24922,35 @@ def _image_config_credentials(
             text = " ".join(str(part) for part in config.get(field) or [])
             if _text_holds_a_credential(text) and field not in found:
                 found.append(field)
-    return found, variables, len(manifests)
+    files = oversized = 0
+    unpacked = [0]
+    for layer_digest in layers:
+        url = client.get_download_url_for_layer(
+            registryId=registry, repositoryName=repository, layerDigest=layer_digest
+        ).get("downloadUrl")
+        layer_found, layer_files, layer_oversized = _image_layer_credentials(
+            str(url or ""), layer_digest, unpacked
+        )
+        found.extend(layer_found)
+        files += layer_files
+        oversized += layer_oversized
+    return found, variables, len(manifests), len(layers), files, oversized
 
 
 def _agentcore_runtime_image_credential_findings(
     images: Dict[str, Tuple[str, Set[str]]],
 ) -> List[Dict[str, Any]]:
-    """AC-34's image leg: scan each runtime's container image configuration.
+    """AC-34's image leg: scan each runtime's container image configuration
+    and file system layers.
 
     A container runtime names its image in
     agentRuntimeArtifact.containerConfiguration.containerUri, and the image's
     configuration carries the Env, Entrypoint and Cmd every process in the
-    microVM starts with. images holds the URIs of every version the runtime
-    leg read, keyed by runtime label; a version whose definition could not be
-    read is already reported N/A on the runtime leg's row. An image in another
-    account's registry is not read, because the role's ECR reads are scoped
-    to this account. The image's file system layers are not scanned.
+    microVM starts with, while its layers hold the agent's code. images holds
+    the URIs of every version the runtime leg read, keyed by runtime label; a
+    version whose definition could not be read is already reported N/A on the
+    runtime leg's row. An image in another account's registry is not read,
+    because the role's ECR reads are scoped to this account.
     """
 
     def finding(details, resolution, severity, status):
@@ -24694,7 +24964,15 @@ def _agentcore_runtime_image_credential_findings(
             status=status,
         )
 
+    layer_bounds = (
+        "Images whose layers total over "
+        f"{AC34_IMAGE_LAYERS_MAX_BYTES // (1024 * 1024)} MiB compressed, or unpack "
+        f"to over {AC34_IMAGE_UNPACKED_MAX_BYTES // (1024 * 1024)} MiB, are not "
+        f"read, and layer files over {AC34_CODE_FILE_MAX_BYTES // (1024 * 1024)} "
+        "MiB are not scanned."
+    )
     findings: List[Dict[str, Any]] = []
+    scans: Dict[Tuple[str, str, str], Any] = {}
     for label, (account, uris) in images.items():
         found: List[str] = []
         unread: List[str] = []
@@ -24712,8 +24990,15 @@ def _agentcore_runtime_image_credential_findings(
                 )
                 continue
             try:
-                credentials, variables, platforms = _image_config_credentials(
-                    registry, image_region, repository, uri[match.end() :]
+                (
+                    credentials,
+                    variables,
+                    platforms,
+                    layers,
+                    files,
+                    oversized,
+                ) = _image_config_credentials(
+                    registry, image_region, repository, uri[match.end() :], scans
                 )
             except (BotoCoreError, ClientError, OSError, ValueError) as error:
                 # A ValueError is raised by this scan with a message naming
@@ -24724,20 +25009,27 @@ def _agentcore_runtime_image_credential_findings(
                     else _assessment_error_label(error)
                 )
                 unread.append(
-                    f"the configuration of {uri} could not be read ({reason})"
+                    f"the configuration or layers of {uri} could not be read ({reason})"
                 )
                 continue
             found.extend(f"{name} of {uri}" for name in credentials)
             scanned.append(
-                f"{uri} ({platforms} platform(s), {variables} Env variable(s))"
+                f"{uri} ({platforms} platform(s), {variables} Env variable(s), "
+                f"{layers} layer(s), {files} file(s) scanned"
+                + (
+                    f", {oversized} over the per-file bound not scanned"
+                    if oversized
+                    else ""
+                )
+                + ")"
             )
         if found:
             findings.append(
                 finding(
-                    f"{label} runs a container image whose configuration holds "
-                    f"credential material inline: {', '.join(found)}. Every "
-                    "process in the microVM starts with it. The values are "
-                    "withheld from this report."
+                    f"{label} runs a container image whose configuration or file "
+                    f"system layers hold credential material inline: "
+                    f"{', '.join(found)}. Every process in the microVM starts "
+                    "with it. The values are withheld from this report."
                     + (f" Not read: {'; '.join(unread)}." if unread else ""),
                     "Rebuild the image without the credential, pass a reference "
                     "to the AgentCore Identity token vault or AWS Secrets Manager "
@@ -24749,13 +25041,15 @@ def _agentcore_runtime_image_credential_findings(
         elif unread:
             findings.append(
                 finding(
-                    f"{label}: whether its container image configuration holds "
-                    f"an inline credential was not judged: {'; '.join(unread)}."
+                    f"{label}: whether its container image configuration or "
+                    "layers hold an inline credential was not judged: "
+                    f"{'; '.join(unread)}."
                     + (
                         f" Scanned with none found: {'; '.join(scanned)}."
                         if scanned
                         else ""
-                    ),
+                    )
+                    + f" {layer_bounds}",
                     "Grant ecr:BatchGetImage and ecr:GetDownloadUrlForLayer on "
                     "the repository, and let the function reach the ECR layer "
                     "URL over HTTPS, then retry.",
@@ -24767,13 +25061,14 @@ def _agentcore_runtime_image_credential_findings(
             findings.append(
                 finding(
                     f"{label} runs image(s) {'; '.join(scanned)}. No Env variable "
-                    "holds credential material inline, and neither Entrypoint "
-                    "nor Cmd holds an AWS access key ID or a private key block. "
-                    "The image's file system layers are not scanned.",
+                    "holds credential material inline, neither Entrypoint nor "
+                    "Cmd holds an AWS access key ID or a private key block, no "
+                    "layer file holds either, and no .env file in a layer holds "
+                    f"credential material inline. {layer_bounds}",
                     "No action required. The Env scan reads variable names and "
                     "value shapes, as the environment variable row does; "
-                    "Entrypoint and Cmd are matched only for those two "
-                    "credential forms.",
+                    "Entrypoint, Cmd and layer files are matched only for those "
+                    "two credential forms.",
                     SeverityEnum.HIGH,
                     StatusEnum.PASSED,
                 )
@@ -26104,17 +26399,34 @@ def _s3_schema_unread(label: str, error: Exception) -> str:
     return f"its {label} in S3 was not read ({reason})"
 
 
+def _mcp_tool_definitions(document: Any) -> List[Dict[str, Any]]:
+    """Return the tool definitions of an MCP server target's static tool schema.
+
+    The service asks for a schema aligned with the MCP specification, whose
+    tools/list result holds the definitions under "tools", so either that
+    object or the bare list is accepted.
+    """
+    if isinstance(document, dict) and "tools" in document:
+        document = document["tools"]
+    if not isinstance(document, list) or not all(
+        isinstance(tool, dict) for tool in document
+    ):
+        raise ValueError("it is not a JSON list of tool definitions")
+    return document
+
+
 def _gateway_tool_required_inputs(
     gateway_id: str,
 ) -> Tuple[Dict[str, Set[str]], Dict[str, str], Dict[str, Set[str]]]:
     """Map each tool of a gateway's targets to its required input paths.
 
     Returns `{target___tool: required paths}` for every tool a Lambda tool
-    schema defines, inline or in S3, nested required properties included, and
-    `{target name: reason}` for every target whose tool schemas were not read:
-    an MCP server, API Gateway or connector target, a schema not in JSON, an
-    S3 schema that could not be fetched within AC35_SCHEMA_MAX_BYTES, or a
-    target that could not be read. An OpenAPI or Smithy target's tools, inline
+    schema or an MCP server's static mcpToolSchema defines, inline or in S3,
+    nested required properties included, and `{target name: reason}` for
+    every target whose tool schemas were not read: an MCP server target with
+    no static mcpToolSchema, an API Gateway or connector target, a schema not
+    in JSON, an S3 schema that could not be fetched within
+    AC35_SCHEMA_MAX_BYTES, or a target that could not be read. An OpenAPI or Smithy target's tools, inline
     or in S3, go in the third map, the paths its schema marks required: those
     are unproven, because how the gateway exposes them in context.input is not
     documented, so only a read the schema does not mark required is judged on
@@ -26170,7 +26482,34 @@ def _gateway_tool_required_inputs(
             break
         else:
             schema = (mcp.get("lambda") or {}).get("toolSchema") or {}
-            if "inlinePayload" in schema:
+            server = mcp.get("mcpServer")
+            tool_schema = (
+                (server.get("mcpToolSchema") or {}) if isinstance(server, dict) else {}
+            )
+            if isinstance(server, dict) and "inlinePayload" in tool_schema:
+                try:
+                    definitions = _mcp_tool_definitions(
+                        json.loads(tool_schema.get("inlinePayload") or "")
+                    )
+                except (TypeError, ValueError) as error:
+                    unread[name] = f"its inline MCP tool schema was not read ({error})"
+                    continue
+            elif isinstance(server, dict) and tool_schema.get("s3"):
+                try:
+                    definitions = _mcp_tool_definitions(
+                        json.loads(_s3_schema_text(tool_schema["s3"]))
+                    )
+                except (BotoCoreError, ClientError, ValueError) as error:
+                    unread[name] = _s3_schema_unread("MCP tool schema", error)
+                    continue
+            elif isinstance(server, dict):
+                unread[name] = (
+                    "it is an MCP server target with no static mcpToolSchema, so "
+                    "its tools are discovered from the server at run time and no "
+                    "control-plane API returns them"
+                )
+                continue
+            elif "inlinePayload" in schema:
                 definitions = schema.get("inlinePayload") or []
             elif schema.get("s3"):
                 try:
@@ -26402,9 +26741,9 @@ def check_agentcore_policy_input_guards() -> List[Dict[str, Any]]:
                     StatusEnum.PASSED,
                     f"enforces policy engine {policy_engine_id}, and every "
                     "enforcing forbid reads a context.input path only when its "
-                    "tools' Lambda inputSchema, inline or read from S3, lists that "
-                    "path and every "
-                    "path above it as required, or after a has() test on it.",
+                    "tools' Lambda or MCP server inputSchema, inline or read from "
+                    "S3, lists that path and every path above it as required, or "
+                    "after a has() test on it.",
                     "No action required",
                 )
             )
@@ -29599,6 +29938,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
 
         tie_missing: List[str] = []
         tie_notes: List[str] = []
+        tie_unlisted: List[str] = []
         elsewhere_note = ""
         # An alarm is tied to a score only through a listed metric that names
         # an attached evaluator. Without one, an alarm on any metric in the
@@ -29671,15 +30011,24 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     if not ids:
                         continue
                     listed = sorted(set(ids) & listed_values)
-                    if not listed:
-                        tie_notes.append(
-                            f"ListMetrics lists no score of {', '.join(ids)}, so no "
-                            "alarm on it is required"
-                        )
-                        continue
                     # Each named safety evaluator scores a different failure, so
-                    # each listed safety score needs its own alarm, while either
-                    # tool-choice score answers the tool-choice leg.
+                    # each safety score needs its own alarm, while either
+                    # tool-choice score answers the tool-choice leg. A score
+                    # ListMetrics does not list has no alarm that can be shown
+                    # to read it, so it withholds the pass.
+                    unlisted = (
+                        sorted(set(ids) - listed_values)
+                        if category == "safety"
+                        else ([] if listed else ids)
+                    )
+                    if unlisted:
+                        tie_unlisted.extend(unlisted)
+                        tie_notes.append(
+                            f"ListMetrics lists no score of {', '.join(unlisted)}, "
+                            "so no alarm can be shown to read it"
+                        )
+                    if not listed:
+                        continue
                     groups = (
                         [[evaluator_id] for evaluator_id in listed]
                         if category == "safety"
@@ -29794,7 +30143,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     status=StatusEnum.NA,
                 )
             )
-        elif metric_error or untied:
+        elif metric_error or untied or tie_unlisted:
             findings.append(
                 create_finding(
                     check_id="AC-40",
@@ -29811,6 +30160,10 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                             "attached evaluator, so whether any of these alarms "
                             "reads the safety or tool-choice score, and not "
                             "another score in the namespace, is not confirmed."
+                            if untied
+                            else " Whether a falling score of "
+                            f"{', '.join(tie_unlisted)} notifies anyone is not "
+                            "confirmed."
                         )
                     ),
                     resolution=(
@@ -32399,6 +32752,164 @@ def _tool_execution_role_problems(
     return sorted(set(problems)), unreadable
 
 
+# The action that starts a session on each custom tool kind, keyed by the ARN
+# field its Get call returns. Neither tool kind accepts a resource policy (the
+# service authorization reference gives GetResourcePolicy only the gateway,
+# runtime and runtime-endpoint types), so the principals that start its
+# sessions are the identity-policy holders of this account.
+AGENTCORE_TOOL_SESSION_ACTIONS = {
+    "codeInterpreterArn": "bedrock-agentcore:StartCodeInterpreterSession",
+    "browserArn": "bedrock-agentcore:StartBrowserSession",
+}
+
+
+def _resource_pattern_covers(outer: str, inner: str) -> bool:
+    """Return whether every ARN `inner` matches is also matched by `outer`.
+
+    The rule is _action_pattern_covers's, compared case-sensitively as IAM
+    compares ARNs.
+    """
+    if "?" in outer and any(wildcard in inner for wildcard in ("*", "?")):
+        return False
+    return fnmatchcase(inner, outer.replace("[", "[[]"))
+
+
+def _statement_reaches_arn(statement: Dict[str, Any], arn: str) -> bool:
+    """Return whether one Allow's Resource or NotResource reaches one ARN."""
+    if "Resource" in statement:
+        patterns = _statement_resources(statement)
+        return any(fnmatchcase(arn, p.replace("[", "[[]")) for p in patterns)
+    excluded = statement.get("NotResource")
+    if excluded is None:
+        return False
+    excluded = excluded if isinstance(excluded, list) else [excluded]
+    return not any(fnmatchcase(arn, str(p).replace("[", "[[]")) for p in excluded)
+
+
+def _statement_covers_grant(
+    statement: Dict[str, Any], action: str, resource: str, condition: Any
+) -> bool:
+    """Return whether one Allow grants `action` on `resource` under `condition`.
+
+    `action` and `resource` may be patterns, and are covered only when every
+    action and ARN they match is. A NotAction covers an action pattern none of
+    its exclusions overlap, and a NotResource covers a literal ARN none of its
+    exclusions match. A conditioned statement covers only a grant
+    under the same condition.
+    """
+    own = statement.get("Condition") or {}
+    if own and own != condition:
+        return False
+    if "Action" in statement:
+        if not any(
+            _action_pattern_covers(pattern, action)
+            for pattern in _statement_actions(statement)
+        ):
+            return False
+    elif "NotAction" not in statement or any(
+        _action_patterns_overlap(excluded, action)
+        for excluded in _statement_not_actions(statement)
+    ):
+        return False
+    if "Resource" in statement:
+        return any(
+            _resource_pattern_covers(pattern, resource)
+            for pattern in _statement_resources(statement)
+        )
+    excluded = statement.get("NotResource")
+    if excluded is None:
+        return False
+    excluded = excluded if isinstance(excluded, list) else [excluded]
+    return not any(wildcard in resource for wildcard in ("*", "?")) and not any(
+        fnmatchcase(resource, str(p).replace("[", "[[]")) for p in excluded
+    )
+
+
+def _tool_role_invoker_gaps(
+    tool_arn: str,
+    start_action: str,
+    role_name: str,
+    role_permissions: Dict[str, Any],
+    cache: Dict[str, Any],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Compare a tool role's grants with each principal that starts its sessions.
+
+    Returns (invokers, gaps, unreadable): every cached role and user other than
+    the tool role whose Allow reaches start_action on tool_arn and survives its
+    own Deny and boundary, one line per invoker naming the tool role grants it
+    lacks, and each principal with a policy that could not be parsed. A grant
+    is compared as action, resource and condition: a NotAction tool grant is
+    read as every action and a NotResource one as every resource. A tool role
+    grant its own Deny or boundary removes is not compared, and an invoker's
+    grant counts only when it survives the invoker's own Deny and boundary.
+    """
+    unreadable: List[str] = []
+    grants: List[Tuple[str, str, Any]] = []
+    for policy in _principal_policies(role_permissions):
+        try:
+            statements = list(_allow_statements(policy))
+        except (TypeError, ValueError):
+            unreadable.append(f"role {role_name} (policy {policy.get('name', '')})")
+            continue
+        for statement in statements:
+            condition = statement.get("Condition") or {}
+            actions = _statement_actions(statement) if "Action" in statement else ["*"]
+            resources = (
+                _statement_resources(statement) if "Resource" in statement else ["*"]
+            )
+            for action in actions:
+                if _grant_survives(role_permissions, action):
+                    grants.extend(
+                        (action, resource, condition) for resource in resources
+                    )
+
+    start_suffix = start_action.split(":", 1)[1].lower()
+    invokers: List[str] = []
+    gaps: List[str] = []
+    for kind, key in (("role", "role_permissions"), ("user", "user_permissions")):
+        for name, permissions in sorted((cache.get(key) or {}).items()):
+            if not isinstance(permissions, dict) or (
+                kind == "role" and name == role_name
+            ):
+                continue
+            label = f"{kind} {name}"
+            statements = []
+            readable = True
+            for policy in _principal_policies(permissions):
+                try:
+                    statements.extend(_allow_statements(policy))
+                except (TypeError, ValueError):
+                    unreadable.append(f"{label} (policy {policy.get('name', '')})")
+                    readable = False
+            if not readable or not _grant_survives(permissions, start_action):
+                continue
+            if not any(
+                _statement_reaches_arn(statement, tool_arn)
+                and _statement_reached_actions(statement, [start_suffix])
+                for statement in statements
+            ):
+                continue
+            invokers.append(label)
+            lacking = [
+                f"{action} on {resource}"
+                + (" under its condition" if condition else "")
+                for action, resource, condition in grants
+                if not (
+                    _grant_survives(permissions, action)
+                    and any(
+                        _statement_covers_grant(statement, action, resource, condition)
+                        for statement in statements
+                    )
+                )
+            ]
+            if lacking:
+                gaps.append(
+                    f"{label} lacks {', '.join(lacking[:5])}"
+                    + (f" and {len(lacking) - 5} more" if len(lacking) > 5 else "")
+                )
+    return invokers, gaps, unreadable
+
+
 # The two ways to run a command inside a live runtime session. The shell opens
 # a terminal whose commands reach the container filesystem and every credential
 # in it, and the service does not log what is typed, so the grant is read on
@@ -33152,8 +33663,99 @@ def check_agentcore_tool_execution_role_scope(
                     status=StatusEnum.PASSED,
                 )
             )
+        if kind == "tool":
+            findings.append(
+                _tool_role_invoker_finding(label, detail, role_name, permissions, cache)
+            )
 
     return findings
+
+
+def _tool_role_invoker_finding(
+    label: str,
+    detail: Dict[str, Any],
+    role_name: str,
+    permissions: Dict[str, Any],
+    cache: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the AC-45 row holding a tool role to its session starters' grants.
+
+    AIR-ACR-RT-03 keeps a tool's execution role at equal-or-fewer privileges
+    than the invoking user, because whoever starts a session runs code with the
+    role: a role holding a grant its invoker lacks hands that grant to the
+    invoker.
+    """
+    finding_name = "AgentCore Tool Execution Role Invoker Bound"
+    arn_key = next(
+        (key for key in AGENTCORE_TOOL_SESSION_ACTIONS if detail.get(key)), None
+    )
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-45",
+            finding_name=finding_name,
+            finding_details=details,
+            resolution=resolution,
+            reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    if arn_key is None:
+        return finding(
+            f"{label} reports no ARN, so the principals that start its sessions "
+            "were not found.",
+            "No action is required on the assessed workload based on this "
+            "result. Rerun the assessment.",
+            SeverityEnum.INFORMATIONAL,
+            StatusEnum.NA,
+        )
+    start_action = AGENTCORE_TOOL_SESSION_ACTIONS[arn_key]
+    invokers, gaps, unreadable = _tool_role_invoker_gaps(
+        str(detail[arn_key]), start_action, role_name, permissions, cache
+    )
+    if gaps:
+        return finding(
+            f"{label} uses execution role {role_name}, and principals granted "
+            f"{start_action} on it, who run code with that role, hold fewer "
+            f"grants than it: {'; '.join(gaps)}. {IAM_CACHE_SCP_NOTE}",
+            "Narrow the tool's execution role to grants each principal that "
+            "starts its sessions already holds, or withdraw "
+            f"{start_action} from the principals that should not reach the "
+            "role's grants.",
+            SeverityEnum.MEDIUM,
+            StatusEnum.FAILED,
+        )
+    if unreadable:
+        return finding(
+            f"These cached policy documents could not be parsed, so whether a "
+            f"principal starting a session on {label} holds fewer grants than "
+            f"execution role {role_name} was not judged: {', '.join(unreadable)}.",
+            "No action is required on the assessed workload based on this "
+            "result. Repair the unreadable policy documents in the IAM "
+            "permission cache and rerun the assessment.",
+            SeverityEnum.INFORMATIONAL,
+            StatusEnum.NA,
+        )
+    if not invokers:
+        return finding(
+            f"{label} uses execution role {role_name}, and no principal in the "
+            f"IAM permission cache other than that role is granted {start_action} "
+            "on it, so there is no invoker to hold the role to.",
+            "No action required for this check.",
+            SeverityEnum.INFORMATIONAL,
+            StatusEnum.NA,
+        )
+    return finding(
+        f"{label} uses execution role {role_name}, and each principal granted "
+        f"{start_action} on it ({', '.join(invokers)}) holds every action and "
+        "resource the role is granted, under the same or no condition. A Deny "
+        "scoped to a resource or condition, session policies and service "
+        "control policies are not read.",
+        "No action required for this check.",
+        SeverityEnum.MEDIUM,
+        StatusEnum.PASSED,
+    )
 
 
 # Both lifecycle fields accept 60 to 1209600 seconds. A value at the ceiling is
@@ -34234,10 +34836,18 @@ def check_agentcore_runtime_invocation_path(
         network_keys, network_gaps, network_open = _runtime_invoke_restriction(
             statements,
             str(runtime_arn or ""),
+            PRIVATE_NETWORK_PATH_CONDITION_KEYS,
+            _network_values_are_bounded,
+            exempt_aws_service=True,
+        )
+        address_keys, address_gaps, _ = _runtime_invoke_restriction(
+            statements,
+            str(runtime_arn or ""),
             NETWORK_PATH_CONDITION_KEYS,
             _network_values_are_bounded,
             exempt_aws_service=True,
         )
+        network_gaps = list(dict.fromkeys(address_gaps + network_gaps))
         if network_keys:
             exemption_text = (
                 " A Deny exempts calls an AWS service makes on the caller's "
@@ -34261,9 +34871,9 @@ def check_agentcore_runtime_invocation_path(
                         f"bounded.{exemption_text}"
                     ),
                     resolution=(
-                        "No action required. Confirm the VPC, VPC endpoint or "
-                        "address range named in the condition is the approved "
-                        "private path for this workload."
+                        "No action required. Confirm the VPC or VPC endpoint "
+                        "named in the condition is the approved private path for "
+                        "this workload."
                     ),
                     reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -34283,11 +34893,11 @@ def check_agentcore_runtime_invocation_path(
                     finding_details=(
                         f"{label} has no resource policy Deny that refuses every "
                         "runtime invoke action to every principal outside a "
-                        "bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or "
-                        "aws:SourceIp value, so a caller that satisfies its inbound "
-                        "authentication reaches it over any network path, "
-                        "including the public internet."
-                        f"{_open_actions_text(network_open)}{gap_text}"
+                        "bounded aws:SourceVpc or aws:SourceVpce value, so a caller "
+                        "that satisfies its inbound authentication reaches it over "
+                        "any network path, including the public internet."
+                        f"{_open_actions_text(network_open)}"
+                        f"{_address_only_restriction_text(address_keys)}{gap_text}"
                     ),
                     resolution=(
                         "Attach a runtime resource policy that denies "
@@ -36524,13 +37134,16 @@ def _network_firewall_policy_gaps(
     policy: Dict[str, Any],
     rule_groups: Dict[str, Dict[str, Any]],
     subnet_cidrs: Dict[str, str],
+    remote_vpc: str = "",
 ) -> Tuple[List[str], List[str], List[str]]:
     """Return (allow-list gaps, threat inspection gaps, unread notes) for a policy.
 
     rule_groups maps each customer stateful group ARN the policy references to
     its DescribeRuleGroup RuleGroup. HOME_NET is compared to the hosting subnets
     only where the policy or an allow-list group sets it; unset, it is the
-    firewall's own VPC, which holds the hosting subnets.
+    firewall's own VPC, which holds the hosting subnets unless the firewall
+    sits in remote_vpc, a VPC a transit gateway reaches, where an unset
+    HOME_NET leaves the hosting subnets uninspected.
     """
     allow_gaps: List[str] = []
     threat_gaps: List[str] = []
@@ -36617,6 +37230,16 @@ def _network_firewall_policy_gaps(
                 uncovered.append(f"{subnet_id} ({cidr})")
         return uncovered
 
+    if allow_groups and remote_vpc and not definitions:
+        allow_gaps.append(
+            f"firewall {firewall_name} sits in VPC {remote_vpc}, outside the hosting "
+            "VPC, and sets no HOME_NET, so its allow-list inspects only traffic "
+            "from its own VPC and not hosting subnet(s) "
+            + ", ".join(
+                f"{subnet_id} ({cidr})"
+                for subnet_id, cidr in sorted(subnet_cidrs.items())
+            )
+        )
     if allow_groups and definitions:
         results = [(where, cidrs, covers(cidrs)) for where, cidrs in definitions]
         failing = [result for result in results if result[2]]
@@ -36776,6 +37399,452 @@ def _network_firewall_policy_gaps(
     return allow_gaps, threat_gaps, unread
 
 
+class _HopReadError(Exception):
+    """A read on the path a route takes failed; carries the action to grant."""
+
+    def __init__(self, text: str, action: str) -> None:
+        super().__init__(text)
+        self.text = text
+        self.action = action
+
+
+def _vpc_firewall_endpoints(vpc_id: str) -> Dict[str, Dict[str, Any]]:
+    """Map each Network Firewall endpoint in a VPC to its firewall.
+
+    Raises _HopReadError naming the network-firewall action that failed.
+    """
+    try:
+        listed = _paginate_aws_list(
+            network_firewall_client,
+            "list_firewalls",
+            "Firewalls",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            VpcIds=[vpc_id],
+        )
+    except (BotoCoreError, ClientError) as error:
+        raise _HopReadError(
+            f"the Network Firewalls in {vpc_id} could not be listed "
+            f"({_assessment_error_label(error)})",
+            "network-firewall:ListFirewalls",
+        ) from None
+    endpoints: Dict[str, Dict[str, Any]] = {}
+    for metadata in listed:
+        arn = metadata.get("FirewallArn")
+        try:
+            described = network_firewall_client.describe_firewall(FirewallArn=arn)
+        except (BotoCoreError, ClientError) as error:
+            raise _HopReadError(
+                f"Network Firewall {metadata.get('FirewallName') or arn} in "
+                f"{vpc_id} could not be described ({_assessment_error_label(error)})",
+                "network-firewall:DescribeFirewall",
+            ) from None
+        firewall = described.get("Firewall") or {}
+        status = described.get("FirewallStatus") or {}
+        for state in (status.get("SyncStates") or {}).values():
+            endpoint_id = (state.get("Attachment") or {}).get("EndpointId")
+            if endpoint_id:
+                endpoints[endpoint_id] = firewall
+    return endpoints
+
+
+def _transit_gateway_hops(
+    vpc_id: str, tgw_id: str, destination: str, cache: Dict[Any, Any]
+) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """Follow a hosting subnet's internet route through a transit gateway.
+
+    The VPC's attachment names the transit gateway route table its traffic is
+    looked up in. Every active route there whose destination holds an internet
+    address and overlaps the hosting route's is followed, to each attachment
+    it names. A VPC attachment of this account is followed one hop further: each
+    subnet the attachment uses routes on to a firewall endpoint in that VPC, to
+    an internet gateway, or elsewhere. Returns (outcome, text, firewall) entries,
+    outcome being "reached", "bypassing", "unresolved" or "unrouted" and text
+    the hop's description after the hosting route. A reached firewall carries
+    the VpcId of the VPC the transit gateway reached. A VPN, Direct Connect,
+    peering or Connect attachment, another account's VPC and a prefix-list
+    route are not followed. Raises _HopReadError on a failed read.
+    """
+    key = ("attachment", vpc_id, tgw_id)
+    if key not in cache:
+        try:
+            cache[key] = _paginate_aws_list(
+                ec2_client,
+                "describe_transit_gateway_attachments",
+                "TransitGatewayAttachments",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                Filters=[
+                    {"Name": "resource-id", "Values": [vpc_id]},
+                    {"Name": "transit-gateway-id", "Values": [tgw_id]},
+                    {"Name": "resource-type", "Values": ["vpc"]},
+                ],
+            )
+        except (BotoCoreError, ClientError) as error:
+            cache[key] = _HopReadError(
+                f"the attachment of {vpc_id} to transit gateway {tgw_id} could not "
+                f"be read ({_assessment_error_label(error)})",
+                "ec2:DescribeTransitGatewayAttachments",
+            )
+    if isinstance(cache[key], _HopReadError):
+        raise cache[key]
+    attachment = next((a for a in cache[key] if a.get("State") == "available"), None)
+    if attachment is None:
+        return [
+            (
+                "unresolved",
+                f", whose transit gateway holds no available attachment of {vpc_id}",
+                {},
+            )
+        ]
+    association = attachment.get("Association") or {}
+    table_id = association.get("TransitGatewayRouteTableId")
+    if not table_id or association.get("State") != "associated":
+        return [
+            (
+                "unresolved",
+                f", whose attachment of {vpc_id} is associated with no route table",
+                {},
+            )
+        ]
+    key = ("routes", table_id)
+    if key not in cache:
+        routes: List[Dict[str, Any]] = []
+        request: Dict[str, Any] = {
+            "TransitGatewayRouteTableId": table_id,
+            "Filters": [{"Name": "state", "Values": ["active"]}],
+        }
+        try:
+            while True:
+                response = ec2_client.search_transit_gateway_routes(**request)
+                routes.extend(response.get("Routes") or [])
+                if not response.get("NextToken"):
+                    break
+                request["NextToken"] = response["NextToken"]
+            cache[key] = (routes, response.get("AdditionalRoutesAvailable") is True)
+        except (BotoCoreError, ClientError) as error:
+            cache[key] = _HopReadError(
+                f"route table {table_id} of transit gateway {tgw_id} could not be "
+                f"searched ({_assessment_error_label(error)})",
+                "ec2:SearchTransitGatewayRoutes",
+            )
+    if isinstance(cache[key], _HopReadError):
+        raise cache[key]
+    routes, truncated = cache[key]
+    if truncated:
+        return [
+            (
+                "unresolved",
+                f", whose route table {table_id} holds more routes than the search "
+                "returns, so the route taken is not read",
+                {},
+            )
+        ]
+    origin = ipaddress.ip_network(destination, strict=False)
+    hops: List[Tuple[str, str, Dict[str, Any]]] = []
+    for route in routes:
+        if not route.get("DestinationCidrBlock"):
+            hops.append(
+                (
+                    "unresolved",
+                    f", then prefix list {route.get('PrefixListId') or '?'}, whose "
+                    "entries are not read",
+                    {},
+                )
+            )
+            continue
+        try:
+            network = ipaddress.ip_network(route["DestinationCidrBlock"], strict=False)
+        except ValueError:
+            continue
+        if (
+            network.version != origin.version
+            or not network.overlaps(origin)
+            or not _network_reaches_internet(network)
+        ):
+            continue
+        hop = f", then {route['DestinationCidrBlock']} to"
+        for target in route.get("TransitGatewayAttachments") or [{}]:
+            attachment_id = target.get("TransitGatewayAttachmentId") or "no attachment"
+            kind = target.get("ResourceType")
+            if kind != "vpc":
+                hops.append(
+                    (
+                        "unresolved",
+                        f"{hop} {kind or 'an unknown'} attachment {attachment_id} "
+                        f"({target.get('ResourceId') or '?'}), which this check "
+                        "does not follow",
+                        {},
+                    )
+                )
+                continue
+            key = ("vpc attachment", attachment_id)
+            if key not in cache:
+                try:
+                    cache[key] = next(
+                        iter(
+                            _paginate_aws_list(
+                                ec2_client,
+                                "describe_transit_gateway_vpc_attachments",
+                                "TransitGatewayVpcAttachments",
+                                token_request_key="NextToken",
+                                token_response_key="NextToken",
+                                TransitGatewayAttachmentIds=[attachment_id],
+                            )
+                        ),
+                        {},
+                    )
+                except (BotoCoreError, ClientError) as error:
+                    cache[key] = _HopReadError(
+                        f"attachment {attachment_id}, which transit gateway "
+                        f"{tgw_id} routes {route['DestinationCidrBlock']} to, could "
+                        f"not be read ({_assessment_error_label(error)})",
+                        "ec2:DescribeTransitGatewayVpcAttachments",
+                    )
+            if isinstance(cache[key], _HopReadError):
+                raise cache[key]
+            next_vpc = cache[key].get("VpcId") or target.get("ResourceId") or "?"
+            hop_text = f"{hop} attachment {attachment_id} in VPC {next_vpc}"
+            owner = cache[key].get("VpcOwnerId")
+            if not owner or owner != attachment.get("ResourceOwnerId"):
+                hops.append(
+                    (
+                        "unresolved",
+                        f"{hop_text} of account {owner or 'unknown'}, whose routes "
+                        "and firewalls this account cannot read",
+                        {},
+                    )
+                )
+                continue
+            key = ("vpc", next_vpc)
+            if key not in cache:
+                try:
+                    tables = _paginate_aws_list(
+                        ec2_client,
+                        "describe_route_tables",
+                        "RouteTables",
+                        token_request_key="NextToken",
+                        token_response_key="NextToken",
+                        Filters=[{"Name": "vpc-id", "Values": [next_vpc]}],
+                    )
+                except (BotoCoreError, ClientError) as error:
+                    cache[key] = _HopReadError(
+                        f"the route tables of {next_vpc}, which transit gateway "
+                        f"{tgw_id} routes to, could not be read "
+                        f"({_assessment_error_label(error)})",
+                        "ec2:DescribeRouteTables",
+                    )
+                else:
+                    try:
+                        cache[key] = (tables, _vpc_firewall_endpoints(next_vpc))
+                    except _HopReadError as error:
+                        cache[key] = error
+            if isinstance(cache[key], _HopReadError):
+                raise cache[key]
+            tables, endpoints = cache[key]
+            for subnet_id in sorted(
+                cache[("vpc attachment", attachment_id)].get("SubnetIds") or []
+            ):
+                onward = _egress_routes(_route_table_for_subnet(tables, subnet_id))
+                if not onward:
+                    hops.append(("unrouted", "", {}))
+                for onward_destination, onward_key, onward_target in onward:
+                    text = (
+                        f"{hop_text}, then {subnet_id} ({onward_destination} to "
+                        f"{onward_target})"
+                    )
+                    if onward_key == "VpcEndpointId" and onward_target in endpoints:
+                        hops.append(
+                            (
+                                "reached",
+                                text,
+                                {**endpoints[onward_target], "VpcId": next_vpc},
+                            )
+                        )
+                    elif (
+                        onward_key == "GatewayId" and onward_target.startswith("igw-")
+                    ) or onward_key == "EgressOnlyInternetGatewayId":
+                        hops.append(("bypassing", text, {}))
+                    else:
+                        hops.append(("unresolved", text, {}))
+    if not hops:
+        hops.append(("unrouted", "", {}))
+    return hops
+
+
+def _dns_firewall_allowed_names(
+    vpc_id: str,
+) -> Tuple[Optional[List[str]], str, Optional[str]]:
+    """Return the names a VPC's DNS Firewall answers ahead of its BLOCK over "*".
+
+    The rules are walked in the order AC-49's DNS row walks them. An ALLOW or
+    ALERT rule over a customer domain list answers its names, less any an
+    earlier BLOCK covers as DNS Firewall matches ("*.example.com" covers every
+    subdomain of example.com, not example.com); a BLOCK over an AWS managed
+    list or a rule scoped to one query type admits nothing. Returns (names, "", None)
+    for an allow-list, or (None, reason, action), action naming the grant to
+    retry with when a read failed.
+    """
+    if route53resolver_client is None:
+        return (
+            None,
+            "the Route 53 Resolver client is not available in this region, so the "
+            "DNS Firewall allow-list was not read",
+            None,
+        )
+    try:
+        associations = _paginate_aws_list(
+            route53resolver_client,
+            "list_firewall_rule_group_associations",
+            "FirewallRuleGroupAssociations",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            VpcId=vpc_id,
+        )
+    except (BotoCoreError, ClientError) as error:
+        return (
+            None,
+            f"the DNS Firewall rule groups associated with {vpc_id} could not be "
+            f"listed ({_assessment_error_label(error)})",
+            "route53resolver:ListFirewallRuleGroupAssociations",
+        )
+    live = sorted(
+        (
+            association
+            for association in associations
+            if (association.get("Status") or "COMPLETE") != "DELETING"
+        ),
+        key=lambda item: item.get("Priority") or 0,
+    )
+    managed: Optional[Set[str]] = None
+    allowed: List[str] = []
+    blocked: List[Tuple[str, bool, bool]] = []
+    for association in live:
+        group_id = association.get("FirewallRuleGroupId") or "unknown"
+        try:
+            rules = _paginate_aws_list(
+                route53resolver_client,
+                "list_firewall_rules",
+                "FirewallRules",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                FirewallRuleGroupId=group_id,
+            )
+        except (BotoCoreError, ClientError) as error:
+            return (
+                None,
+                f"the rules of DNS Firewall rule group {group_id} could not be "
+                f"listed ({_assessment_error_label(error)})",
+                "route53resolver:ListFirewallRules",
+            )
+        for rule in sorted(
+            _dns_firewall_enforcing_rules(rules),
+            key=lambda item: item.get("Priority") or 0,
+        ):
+            list_id = rule.get("FirewallDomainListId")
+            action = rule.get("Action")
+            if not list_id:
+                continue
+            try:
+                if managed is None:
+                    managed = _dns_firewall_managed_domain_list_ids()
+            except (BotoCoreError, ClientError) as error:
+                return (
+                    None,
+                    "the DNS Firewall domain lists could not be listed "
+                    f"({_assessment_error_label(error)})",
+                    "route53resolver:ListFirewallDomainLists",
+                )
+            if list_id in managed:
+                if action != "BLOCK":
+                    return (
+                        None,
+                        f"rule '{rule.get('Name') or 'unnamed'}' in {group_id} "
+                        "allows an AWS managed domain list, whose names are not read",
+                        None,
+                    )
+                continue
+            try:
+                domains = [
+                    str(domain).rstrip(".").lower()
+                    for domain in _paginate_aws_list(
+                        route53resolver_client,
+                        "list_firewall_domains",
+                        "Domains",
+                        token_request_key="NextToken",
+                        token_response_key="NextToken",
+                        FirewallDomainListId=list_id,
+                    )
+                ]
+            except (BotoCoreError, ClientError) as error:
+                return (
+                    None,
+                    f"domain list {list_id} could not be read "
+                    f"({_assessment_error_label(error)})",
+                    "route53resolver:ListFirewallDomains",
+                )
+            if rule.get("Qtype"):
+                continue
+            if "*" in domains:
+                if action == "BLOCK":
+                    return list(dict.fromkeys(allowed)), "", None
+                return (
+                    None,
+                    f"the DNS Firewall associated with {vpc_id} answers every name, "
+                    "so it holds no allow-list to compare",
+                    None,
+                )
+            if action == "BLOCK":
+                blocked.extend(_domain_pattern(domain, False) for domain in domains)
+            else:
+                allowed.extend(
+                    domain
+                    for domain in domains
+                    if not _domain_patterns_cover(
+                        blocked, _domain_pattern(domain, False)
+                    )
+                )
+    return (
+        None,
+        f'the DNS Firewall associated with {vpc_id} has no BLOCK over "*", so it '
+        "holds no allow-list to compare",
+        None,
+    )
+
+
+def _domain_pattern(entry: str, network_firewall: bool) -> Tuple[str, bool, bool]:
+    """Return (base name, admits the base, admits every subdomain) for an entry.
+
+    A Network Firewall target ".example.com" admits example.com and every
+    subdomain; a DNS Firewall "*.example.com" admits the subdomains only.
+    """
+    entry = entry.lower()
+    if network_firewall and entry.startswith("."):
+        return entry[1:], True, True
+    if not network_firewall and entry.startswith("*."):
+        return entry[2:], False, True
+    return entry, True, False
+
+
+def _domain_patterns_cover(
+    patterns: List[Tuple[str, bool, bool]], item: Tuple[str, bool, bool]
+) -> bool:
+    """Return whether the patterns admit every name `item` admits."""
+    base, exact, subdomains = item
+
+    def admits(pattern, name):
+        return (pattern[1] and name == pattern[0]) or (
+            pattern[2] and name.endswith("." + pattern[0])
+        )
+
+    def admits_subdomains(pattern):
+        return pattern[2] and (base == pattern[0] or base.endswith("." + pattern[0]))
+
+    return (not exact or any(admits(pattern, base) for pattern in patterns)) and (
+        not subdomains or any(admits_subdomains(pattern) for pattern in patterns)
+    )
+
+
 # The Network Firewall log type that records each stateful rule match whose
 # action is alert, drop or reject.
 NETWORK_FIREWALL_ALERT_LOG_TYPE = "ALERT"
@@ -36794,10 +37863,14 @@ def check_agentcore_network_firewall_egress(
     Each hosting subnet's internet routes, every route whose destination holds
     an internet address (see _egress_routes), are followed one hop: to a
     firewall endpoint in the VPC, or through a NAT gateway to the endpoint the
-    NAT gateway's subnet routes to. A route to an internet gateway, or a NAT
-    gateway whose subnet routes to one, bypasses inspection and fails. A transit
-    gateway, a Gateway Load Balancer endpoint or any other target is not
-    followed and is not judged. A subnet with no internet route reaches only
+    NAT gateway's subnet routes to. A route to a transit gateway is followed
+    through the route table the VPC's attachment is associated with to each VPC
+    attachment of this account, and on through the subnets that attachment uses
+    (see _transit_gateway_hops). A route to an internet gateway, or a NAT
+    gateway or transit gateway hop that routes to one, bypasses inspection and
+    fails. A firewall reached through a transit gateway must set a HOME_NET that
+    holds the hosting subnets. A Gateway Load Balancer endpoint or any other
+    target is not followed and is not judged. A subnet with no internet route reaches only
     private destinations, which this leg does not judge.
 
     Two rows are reported for each VPC. The egress row judges each reached
@@ -36819,6 +37892,7 @@ def check_agentcore_network_firewall_egress(
     """
     egress_name = "AgentCore Network Firewall Egress"
     threat_name = "AgentCore Network Firewall Threat Inspection"
+    sync_name = "AgentCore Egress Allow-List Sync"
     reference = NETWORK_FIREWALL_DOMAIN_LIST_REFERENCE_URL
     if agentcore_client is None or ec2_client is None:
         return [
@@ -36922,6 +37996,7 @@ def check_agentcore_network_firewall_egress(
         if subnet_id in subnet_vpcs:
             vpc_users.setdefault(subnet_vpcs[subnet_id], set()).add(label)
 
+    tgw_cache: Dict[Any, Any] = {}
     for vpc_id in sorted(vpc_users):
         hosted = ", ".join(sorted(vpc_users[vpc_id]))
         hosting = vpc_subnets[vpc_id]
@@ -37005,6 +38080,8 @@ def check_agentcore_network_firewall_egress(
         unresolved: List[str] = []
         unrouted: List[str] = []
         nat_error = None
+        tgw_error: Optional[_HopReadError] = None
+        remote: Dict[str, str] = {}
         nat_subnets: Dict[str, Optional[str]] = {}
         for subnet_id in sorted(hosting):
             routes = _egress_routes(_route_table_for_subnet(tables, subnet_id))
@@ -37058,14 +38135,39 @@ def check_agentcore_network_firewall_egress(
                             unresolved.append(f"{where}, then to {onward_target}")
                     if not onward:
                         unrouted.append(subnet_id)
+                elif key == "TransitGatewayId":
+                    try:
+                        hops = _transit_gateway_hops(
+                            vpc_id, target, destination, tgw_cache
+                        )
+                    except _HopReadError as error:
+                        tgw_error = error
+                        break
+                    for outcome, text, firewall in hops:
+                        if outcome == "reached":
+                            reached[str(firewall.get("FirewallArn"))] = firewall
+                            remote[str(firewall.get("FirewallArn"))] = firewall["VpcId"]
+                        elif outcome == "bypassing":
+                            bypassing.append(f"{where}{text}")
+                        elif outcome == "unrouted":
+                            unrouted.append(subnet_id)
+                        else:
+                            unresolved.append(f"{where}{text}")
                 elif (key == "GatewayId" and target.startswith("igw-")) or (
                     key == "EgressOnlyInternetGatewayId"
                 ):
                     bypassing.append(where)
                 else:
                     unresolved.append(where)
-            if nat_error:
+            if nat_error or tgw_error:
                 break
+        if tgw_error:
+            findings.append(
+                not_read(
+                    f"{subject} was not judged: {tgw_error.text}.", tgw_error.action
+                )
+            )
+            continue
         if nat_error:
             findings.append(
                 not_read(
@@ -37079,6 +38181,7 @@ def check_agentcore_network_firewall_egress(
         threat_gaps: List[str] = []
         unread: List[str] = []
         log_unread: List[str] = []
+        allow_targets: Dict[str, List[str]] = {}
         policy_action = None
         for arn in sorted(reached):
             firewall = reached[arn]
@@ -37146,8 +38249,23 @@ def check_agentcore_network_firewall_egress(
                 unread.append(group_error)
                 policy_action = policy_action or "network-firewall:DescribeRuleGroup"
                 continue
+            allow_targets[arn] = [
+                str(target)
+                for reference in policy.get("StatefulRuleGroupReferences") or []
+                for list_source in [
+                    (
+                        groups.get(str(reference.get("ResourceArn") or ""), {}).get(
+                            "RulesSource"
+                        )
+                        or {}
+                    ).get("RulesSourceList")
+                    or {}
+                ]
+                if list_source.get("GeneratedRulesType") == "ALLOWLIST"
+                for target in list_source.get("Targets") or []
+            ]
             gaps, threats, notes = _network_firewall_policy_gaps(
-                name, policy, groups, hosting
+                name, policy, groups, hosting, remote.get(arn, "")
             )
             allow_gaps.extend(gaps)
             threat_gaps.extend(threats)
@@ -37256,6 +38374,105 @@ def check_agentcore_network_firewall_egress(
                     status=status,
                 )
             )
+
+        # The recommendation keeps the DNS Firewall allow-list and each
+        # firewall's ALLOWLIST Targets in sync, since a name only one of them
+        # admits is held by a single layer.
+        sync_action = None
+        names: Optional[List[str]] = None
+        unsynced = [
+            f"firewall {f.get('FirewallName') or arn}'s policy was not read"
+            for arn, f in sorted(reached.items())
+            if arn not in allow_targets
+        ] + [
+            f"firewall {f.get('FirewallName') or arn}'s policy holds no ALLOWLIST "
+            "Targets, which the egress row judges"
+            for arn, f in sorted(reached.items())
+            if arn in allow_targets and not allow_targets[arn]
+        ]
+        if any(arn not in allow_targets for arn in reached):
+            sync_action = policy_action
+        if not reached:
+            unsynced.append("it reaches no Network Firewall whose ALLOWLIST to compare")
+        if not unsynced:
+            names, reason, sync_action = _dns_firewall_allowed_names(vpc_id)
+            if names is None:
+                unsynced.append(reason)
+        if unsynced:
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name=sync_name,
+                    finding_details=(
+                        f"{subject} was not compared: {'; '.join(unsynced)}."
+                    ),
+                    resolution=(
+                        f"Grant {sync_action} and retry."
+                        if sync_action
+                        else "No action required for this row; the DNS and egress "
+                        "rows name what to fix."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        dns_patterns = [_domain_pattern(name, False) for name in names]
+        mismatches: List[str] = []
+        for arn, firewall in sorted(reached.items()):
+            label = f"firewall {firewall.get('FirewallName') or arn}'s ALLOWLIST"
+            nfw_patterns = [_domain_pattern(t, True) for t in allow_targets[arn]]
+            dns_only = [
+                name
+                for name, pattern in zip(names, dns_patterns)
+                if not _domain_patterns_cover(nfw_patterns, pattern)
+            ]
+            nfw_only = [
+                target
+                for target, pattern in zip(allow_targets[arn], nfw_patterns)
+                if not _domain_patterns_cover(dns_patterns, pattern)
+            ]
+            if dns_only:
+                mismatches.append(
+                    f"the DNS Firewall allow-list admits {', '.join(dns_only[:10])}"
+                    f"{f' and {len(dns_only) - 10} more' if len(dns_only) > 10 else ''}"
+                    f", which {label} does not"
+                )
+            if nfw_only:
+                mismatches.append(
+                    f"{label} admits {', '.join(nfw_only[:10])}"
+                    f"{f' and {len(nfw_only) - 10} more' if len(nfw_only) > 10 else ''}"
+                    ", which the DNS Firewall allow-list does not"
+                )
+        if mismatches:
+            status, severity = StatusEnum.FAILED, SeverityEnum.LOW
+            details = f"{subject} egresses under allow-lists that differ: {'; '.join(mismatches)}."
+            resolution = (
+                "Keep the DNS Firewall allow-list and each Network Firewall "
+                "ALLOWLIST rule group's Targets in sync, so every name is held by "
+                "both layers."
+            )
+        else:
+            status, severity = StatusEnum.PASSED, SeverityEnum.LOW
+            targets = sum(len(allow_targets[arn]) for arn in reached)
+            details = (
+                f"{subject} egresses under a DNS Firewall allow-list and firewall(s) "
+                f"{reached_text}, which admit the same {len(names)} DNS Firewall "
+                f"name(s) and {targets} Network Firewall target(s)."
+            )
+            resolution = "No action required."
+        findings.append(
+            create_finding(
+                check_id="AC-49",
+                finding_name=sync_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status=status,
+            )
+        )
 
     return findings
 

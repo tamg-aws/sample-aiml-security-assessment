@@ -21,6 +21,7 @@ import inspect
 import os
 import importlib.util
 import io
+import tarfile
 import textwrap
 import zipfile
 from contextlib import nullcontext
@@ -3721,6 +3722,31 @@ class TestAC06RecordingKeyPolicy:
 
         assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
         assert "kms:GetKeyPolicy" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.s3_client")
+    def test_an_unreadable_key_policy_is_named_as_not_read(self, mock_s3, mock_kms):
+        # The write verdict also withholds on the unread key, so the status
+        # alone cannot show that the key leg recorded its failed read. The
+        # Not read clause has to name each bucket's key policy and the error.
+        findings = self._wire(
+            mock_s3,
+            mock_kms,
+            policy_error=_make_client_error("AccessDeniedException", "denied"),
+        )
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        assert (
+            "bucket 'recordings' key alias/recordings policy (kms:GetKeyPolicy "
+            "AccessDeniedException)" in findings[0]["Finding_Details"]
+        )
+        assert (
+            f"bucket 'other' key {_OPEN_RECORDING_KEY} policy (kms:GetKeyPolicy "
+            "AccessDeniedException)" in findings[1]["Finding_Details"]
+        )
+        assert "grants decrypt to no unbounded principal" not in "".join(
+            finding["Finding_Details"] for finding in findings
+        )
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.s3_client")
@@ -19205,7 +19231,9 @@ class TestAC34RuntimeInlineCredentials:
         assert "agentRuntimeArtifact" in resolution
         assert "AgentCore Runtime Code Inline Credentials row" in resolution
         assert "AgentCore Runtime Image Inline Credentials row" in resolution
-        assert "file system layers are not scanned" in resolution
+        # Stricter since round 8: the layers are scanned on the image row.
+        assert "configuration and file system layers are judged" in resolution
+        assert "not scanned" not in resolution
 
     @patch("agentcore_app.agentcore_client")
     def test_one_unreadable_runtime_does_not_hide_the_others(self, mock_ac):
@@ -20127,12 +20155,39 @@ class TestAC34RuntimeImages:
         response.__enter__.return_value = response
         return response
 
-    def _wire(self, mock_ac, mock_ecr, mock_open, runtimes, configs, index=None):
+    @staticmethod
+    def _layer(files, gzip=True):
+        """One image layer: a tar archive, gzipped by default, of {path: bytes}."""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz" if gzip else "w") as archive:
+            for path, data in files.items():
+                info = tarfile.TarInfo(path)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        return buffer.getvalue()
+
+    def _wire(
+        self,
+        mock_ac,
+        mock_ecr,
+        mock_open,
+        runtimes,
+        configs,
+        index=None,
+        layers=None,
+        digests=None,
+    ):
         """runtimes: {id: uri}. configs: {config digest: response}.
 
         A URI's tag (or digest) names its manifest; index maps a tag to the
-        child manifest digests of an image index.
+        child manifest digests of an image index. Since round 8 each manifest
+        names one layer, lyr-<ref>, whose bytes layers holds and which is a
+        clean file by default. digests maps a tag to the image digest
+        BatchGetImage reports for it; a tag absent from it reports none.
         """
+        layers = layers or {}
+        digests = digests or {}
+        clean_layer = self._layer({"app/main.py": b"print('ok')\n"})
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [
                 {"agentRuntimeId": rid, "agentRuntimeName": rid} for rid in runtimes
@@ -20165,14 +20220,32 @@ class TestAC34RuntimeImages:
                         }
                     ]
                 }
+            identity = (
+                {"imageId": {"imageDigest": digests[ref]}} if ref in digests else {}
+            )
             return {
                 "images": [
                     {
+                        **identity,
                         "imageManifestMediaType": (
                             "application/vnd.oci.image.manifest.v1+json"
                         ),
                         "imageManifest": json.dumps(
-                            {"config": {"digest": f"cfg-{ref}"}}
+                            {
+                                "config": {"digest": f"cfg-{ref}"},
+                                "layers": [
+                                    {
+                                        "mediaType": (
+                                            "application/vnd.oci.image.layer."
+                                            "v1.tar+gzip"
+                                        ),
+                                        "digest": f"lyr-{ref}",
+                                        "size": len(
+                                            layers.get(f"lyr-{ref}", clean_layer)
+                                        ),
+                                    }
+                                ],
+                            }
                         ),
                     }
                 ]
@@ -20182,7 +20255,14 @@ class TestAC34RuntimeImages:
         mock_ecr.get_download_url_for_layer.side_effect = lambda layerDigest, **kw: {
             "downloadUrl": f"https://layer.example/{layerDigest}"
         }
-        mock_open.side_effect = lambda url, timeout: configs[url.rsplit("/", 1)[1]]
+
+        def open_url(url, timeout):
+            key = url.rsplit("/", 1)[1]
+            if key.startswith("lyr-"):
+                return io.BytesIO(layers.get(key, clean_layer))
+            return configs[key]
+
+        mock_open.side_effect = open_url
 
     @staticmethod
     def _image_rows(findings):
@@ -20212,7 +20292,9 @@ class TestAC34RuntimeImages:
         assert [r["Status"] for r in rows] == ["Passed", "Failed"]
         assert "(rt-a)" in rows[0]["Finding_Details"]
         assert "1 Env variable(s)" in rows[0]["Finding_Details"]
-        assert "file system layers are not scanned" in rows[0]["Finding_Details"]
+        # Stricter since round 8: the layers are scanned, and the row says so.
+        assert "1 layer(s), 1 file(s) scanned" in rows[0]["Finding_Details"]
+        assert "layers are not scanned" not in rows[0]["Finding_Details"]
         assert "(rt-b)" in rows[1]["Finding_Details"]
         assert f"Env API_KEY of {self._URI}:bad" in rows[1]["Finding_Details"]
         assert rows[1]["Severity"] == "High"
@@ -20468,6 +20550,108 @@ class TestAC34RuntimeImages:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert f"Env API_KEY of {self._URI}:old" in rows[0]["Finding_Details"]
 
+    def _wire_shared_digest(self, mock_ac, mock_ecr, mock_open, **wire):
+        """rt-a serves :v1 on its prod endpoint and :v2 as its latest version,
+        rt-b runs :alias, and all three tags name one image digest; rt-c runs
+        :other, a different image."""
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {
+                "rt-a": f"{self._URI}:v2",
+                "rt-b": f"{self._URI}:alias",
+                "rt-c": f"{self._URI}:other",
+            },
+            {
+                f"cfg-{ref}": self._config(env=["A=1"])
+                for ref in ("v1", "v2", "alias", "other")
+            },
+            digests={
+                "v1": "sha256:same",
+                "v2": "sha256:same",
+                "alias": "sha256:same",
+                "other": "sha256:other",
+            },
+            **wire,
+        )
+        uris = {"rt-a": f"{self._URI}:v2", "rt-b": f"{self._URI}:alias"}
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId, **kw: (
+            self._detail(agentRuntimeId, f"{self._URI}:v1", "1")
+            if agentRuntimeId == "rt-a" and kw.get("agentRuntimeVersion") == "1"
+            else self._detail(
+                agentRuntimeId,
+                uris.get(agentRuntimeId, f"{self._URI}:other"),
+                "2",
+            )
+        )
+        mock_ac.list_agent_runtime_endpoints.side_effect = lambda agentRuntimeId, **kw: {
+            "runtimeEndpoints": (
+                [{"name": "prod", "liveVersion": "1"}]
+                if agentRuntimeId == "rt-a"
+                else []
+            )
+        }
+
+    @staticmethod
+    def _opened(mock_open, prefix):
+        return [
+            c.args[0].rsplit("/", 1)[1]
+            for c in mock_open.call_args_list
+            if c.args[0].rsplit("/", 1)[1].startswith(prefix)
+        ]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_digest_is_downloaded_once_per_invocation(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        # Two versions of rt-a and the image rt-b runs share one digest, so
+        # their configuration and layer are fetched once; :other is its own
+        # image and is fetched too.
+        self._wire_shared_digest(mock_ac, mock_ecr, mock_open)
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "Passed", "Passed"]
+        for uri in (f"{self._URI}:v1", f"{self._URI}:v2"):
+            assert f"{uri} (1 platform(s)" in rows[0]["Finding_Details"]
+        assert f"{self._URI}:alias (1 platform(s)" in rows[1]["Finding_Details"]
+        shared = ("lyr-v1", "lyr-v2", "lyr-alias")
+        assert len([u for u in self._opened(mock_open, "lyr-") if u in shared]) == 1
+        assert self._opened(mock_open, "lyr-other") == ["lyr-other"]
+        assert len(self._opened(mock_open, "cfg-")) == 2
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_image_digest_that_failed_is_not_fetched_again(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire_shared_digest(mock_ac, mock_ecr, mock_open)
+        original = mock_open.side_effect
+
+        def open_url(url, timeout):
+            if url.rsplit("/", 1)[1] in ("lyr-v1", "lyr-v2", "lyr-alias"):
+                raise OSError("timed out")
+            return original(url, timeout)
+
+        mock_open.side_effect = open_url
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["N/A", "N/A", "Passed"]
+        for uri in (f"{self._URI}:v1", f"{self._URI}:v2"):
+            assert f"{uri} could not be read (" in rows[0]["Finding_Details"]
+        assert f"{self._URI}:alias could not be read (" in rows[1]["Finding_Details"]
+        shared = ("lyr-v1", "lyr-v2", "lyr-alias")
+        assert len([u for u in self._opened(mock_open, "lyr-") if u in shared]) == 1
+
     @patch("agentcore_app.boto3")
     @patch("agentcore_app.urlopen")
     @patch("agentcore_app.ecr_client")
@@ -20498,6 +20682,189 @@ class TestAC34RuntimeImages:
         mock_boto3.client.assert_called_once()
         assert mock_boto3.client.call_args.kwargs["region_name"] == "eu-west-1"
         mock_ecr.batch_get_image.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "files, named",
+        [
+            (
+                {"app/settings.py": b"KEY = 'AKIAIOSFODNN7EXAMPLE'\n"},
+                "app/settings.py in layer lyr-bad",
+            ),
+            (
+                {"app/.env": f"API_KEY={_SECRET_VALUE}\n".encode()},
+                "app/.env variable API_KEY in layer lyr-bad",
+            ),
+            (
+                {"root/.ssh/id_rsa": b"-----BEGIN RSA PRIVATE KEY-----\nx\n"},
+                "root/.ssh/id_rsa in layer lyr-bad",
+            ),
+        ],
+        ids=["access-key", "dotenv", "private-key"],
+    )
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_credential_in_a_layer_fails_only_its_image(
+        self, mock_ac, mock_ecr, mock_open, files, named
+    ):
+        # Both configurations are clean, so only a layer scan tells them apart.
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean", "rt-b": f"{self._URI}:bad"},
+            {
+                "cfg-clean": self._config(env=["A=1"]),
+                "cfg-bad": self._config(env=["A=1"]),
+            },
+            layers={"lyr-bad": self._layer({"app/main.py": b"print('ok')\n", **files})},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
+        assert f"{named} of {self._URI}:bad" in rows[1]["Finding_Details"]
+        assert self._ACCESS_KEY not in json.dumps(rows)
+        assert _SECRET_VALUE not in json.dumps(rows)
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_platform_layer_is_scanned(self, mock_ac, mock_ecr, mock_open):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:multi"},
+            {
+                "cfg-sha256:amd": self._config(env=["A=1"]),
+                "cfg-sha256:arm": self._config(env=["A=1"]),
+            },
+            index={"multi": ["sha256:amd", "sha256:arm"]},
+            layers={"lyr-sha256:arm": self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"})},
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "k.txt in layer lyr-sha256:arm" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_uncompressed_layer_is_scanned(self, mock_ac, mock_ecr, mock_open):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:bad"},
+            {"cfg-bad": self._config(env=["A=1"])},
+            layers={
+                "lyr-bad": self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"}, gzip=False)
+            },
+        )
+
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "case, phrase",
+        [
+            ("unreadable", "could not be read (OSError)"),
+            ("not-a-tar", "could not be unpacked"),
+            ("no-layers", "names no layers"),
+            ("no-size", "names no size"),
+            ("compressed-bound", "compressed, more than the 10 byte bound"),
+            ("unpacked-bound", "layers unpack to more than the 5 byte bound"),
+        ],
+    )
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_layer_not_read_whole_is_not_reported_clean(
+        self, mock_ac, mock_ecr, mock_open, case, phrase
+    ):
+        # The other image's layer holds a credential, so a bound or a read
+        # failure that skipped the layer would read as Passed on rt-a.
+        bad = self._layer({"k.txt": b"AKIAIOSFODNN7EXAMPLE"})
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:held"},
+            {"cfg-held": self._config(env=["A=1"])},
+            layers={"lyr-held": b"not a tar" if case == "not-a-tar" else bad},
+        )
+        if case == "unreadable":
+            original = mock_open.side_effect
+            mock_open.side_effect = lambda url, timeout: (
+                (_ for _ in ()).throw(OSError("reset"))
+                if url.endswith("lyr-held")
+                else original(url, timeout)
+            )
+        if case in ("no-layers", "no-size"):
+            original_batch = mock_ecr.batch_get_image.side_effect
+
+            def strip(**kwargs):
+                response = original_batch(**kwargs)
+                manifest = json.loads(response["images"][0]["imageManifest"])
+                if case == "no-layers":
+                    del manifest["layers"]
+                else:
+                    del manifest["layers"][0]["size"]
+                response["images"][0]["imageManifest"] = json.dumps(manifest)
+                return response
+
+            mock_ecr.batch_get_image.side_effect = strip
+        bound = {
+            "compressed-bound": ("AC34_IMAGE_LAYERS_MAX_BYTES", 10),
+            "unpacked-bound": ("AC34_IMAGE_UNPACKED_MAX_BYTES", 5),
+        }.get(case)
+        with patch.object(agentcore_app, *bound) if bound else nullcontext():
+            rows = self._image_rows(
+                agentcore_app.check_agentcore_runtime_inline_credentials()
+            )
+
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
+        assert "ecr:GetDownloadUrlForLayer" in rows[0]["Resolution"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_file_over_the_per_file_bound_is_counted(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:big"},
+            {"cfg-big": self._config(env=["A=1"])},
+            layers={
+                "lyr-big": self._layer(
+                    {"small.py": b"x = 1\n", "big.bin": b"AKIAIOSFODNN7EXAMPLE" * 4}
+                )
+            },
+        )
+
+        with patch.object(agentcore_app, "AC34_CODE_FILE_MAX_BYTES", 40):
+            rows = self._image_rows(
+                agentcore_app.check_agentcore_runtime_inline_credentials()
+            )
+
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "1 layer(s), 1 file(s) scanned, 1 over the per-file bound not scanned"
+            in rows[0]["Finding_Details"]
+        )
 
     @patch("agentcore_app.urlopen")
     @patch("agentcore_app.ecr_client")
@@ -25647,11 +26014,27 @@ def _published(*metrics):
     }
 
 
+def _companion_scores(namespace="Bedrock-AgentCore/Evaluations"):
+    """Listed and alarmed Stereotyping and tool-choice scores, as (alarms,
+    ListMetrics entries). Since round 8 a pass needs every attached safety score
+    and a tool-choice score listed and alarmed, so a test of one Harmfulness
+    alarm adds these and still fails if that one alarm is not credited."""
+    names = ("Builtin.Stereotyping", "Builtin.ToolSelectionAccuracy")
+    return (
+        [
+            _score_alarm(name=f"eval-{name}-drop", namespace=namespace, MetricName=name)
+            for name in names
+        ],
+        [(namespace, name, {}) for name in names],
+    )
+
+
 class TestAC40AlarmTiedToTheScore:
     """AC-40 ties a score alarm to the configuration and evaluators it reads."""
 
     _NS = "Bedrock-AgentCore/Evaluations"
     _HARM = "Builtin.Harmfulness"
+    _STEREO = "Builtin.Stereotyping"
     _TOOL = "Builtin.ToolSelectionAccuracy"
     _HELP = "Builtin.Helpfulness"
 
@@ -25689,11 +26072,11 @@ class TestAC40AlarmTiedToTheScore:
         metrics = [
             (self._NS, "Score", {"Config": config, "Evaluator": ev})
             for config in (own, other)
-            for ev in (self._HARM, self._TOOL)
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
         alarms = [
             self._alarm(f"second-{ev}", "Score", Config=other, Evaluator=ev)
-            for ev in (self._HARM, self._TOOL)
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
 
         findings = self._run(mock_ac, alarms, metrics, self._two_configs())
@@ -25701,8 +26084,9 @@ class TestAC40AlarmTiedToTheScore:
         assert [f["Status"] for f in findings] == ["Failed", "Passed"]
         assert "oec-1" in findings[0]["Finding_Details"]
         assert (
-            "alarm(s) second-Builtin.Harmfulness, second-Builtin.ToolSelectionAccuracy "
-            "read only another configuration's scores" in findings[0]["Finding_Details"]
+            "alarm(s) second-Builtin.Harmfulness, second-Builtin.Stereotyping, "
+            "second-Builtin.ToolSelectionAccuracy read only another "
+            "configuration's scores" in findings[0]["Finding_Details"]
         )
         assert "second-Builtin.Harmfulness" in findings[1]["Finding_Details"]
 
@@ -25751,10 +26135,12 @@ class TestAC40AlarmTiedToTheScore:
     @patch("agentcore_app.agentcore_client")
     def test_one_alarm_per_category_passes_and_names_what_it_reads(self, mock_ac):
         metrics = [
-            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+            (self._NS, "Score", {"Evaluator": ev})
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
         alarms = [
             self._alarm("harm-drop", "Score", Evaluator=self._HARM),
+            self._alarm("stereo-drop", "Score", Evaluator=self._STEREO),
             self._alarm("tool-drop", "Score", Evaluator=self._TOOL),
         ]
 
@@ -25775,10 +26161,12 @@ class TestAC40AlarmTiedToTheScore:
         self, mock_ac
     ):
         metrics = [
-            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+            (self._NS, "Score", {"Evaluator": ev})
+            for ev in (self._HARM, self._STEREO, self._TOOL)
         ]
         alarms = [
             self._alarm("harm-drop", "Score", Evaluator=self._HARM),
+            self._alarm("stereo-drop", "Score", Evaluator=self._STEREO),
             self._alarm("tool-drop", "Score", Evaluator=self._TOOL),
         ]
 
@@ -25787,19 +26175,49 @@ class TestAC40AlarmTiedToTheScore:
         assert [f["Status"] for f in findings] == ["Passed", "Passed"]
 
     @patch("agentcore_app.agentcore_client")
-    def test_a_category_listmetrics_does_not_list_is_not_required(self, mock_ac):
+    def test_a_category_listmetrics_does_not_list_is_not_passed(self, mock_ac):
         # No tool-choice score has recent data, so an alarm on it could not be
-        # told from one on a misspelled metric; the safety alarm alone passes.
-        metrics = [(self._NS, "Score", {"Evaluator": self._HARM})]
-        alarms = [self._alarm("harm-drop", "Score", Evaluator=self._HARM)]
+        # told from one on a misspelled metric. Stricter since round 8: the
+        # safety alarm alone no longer passes, because nothing shows a falling
+        # tool-choice score alerts anyone.
+        metrics = [
+            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._STEREO)
+        ]
+        alarms = [
+            self._alarm(f"{ev}-drop", "Score", Evaluator=ev)
+            for ev in (self._HARM, self._STEREO)
+        ]
 
         findings = self._run(mock_ac, alarms, metrics)
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
         assert (
             f"ListMetrics lists no score of {self._TOOL}"
             in findings[0]["Finding_Details"]
         )
+
+    @pytest.mark.parametrize("alarmed", [False, True], ids=["no-alarm", "alarm"])
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlisted_safety_score_withholds_the_pass(self, mock_ac, alarmed):
+        # Harmfulness and the tool-choice score are listed and alarmed, and
+        # Stereotyping, attached beside them, is not listed. Its alarm, when
+        # there is one, reads a metric ListMetrics does not list, so it is not
+        # counted either way and the configuration is not reported as alerting.
+        metrics = [
+            (self._NS, "Score", {"Evaluator": ev}) for ev in (self._HARM, self._TOOL)
+        ]
+        alarms = [
+            self._alarm(f"{ev}-drop", "Score", Evaluator=ev)
+            for ev in (self._HARM, self._TOOL) + ((self._STEREO,) if alarmed else ())
+        ]
+
+        findings = self._run(mock_ac, alarms, metrics)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        details = findings[0]["Finding_Details"]
+        assert f"ListMetrics lists no score of {self._STEREO}" in details
+        assert f"alarm(s) {self._HARM}-drop read the score of {self._HARM}" in details
+        assert "is not confirmed" in details
 
     @patch("agentcore_app.agentcore_client")
     def test_metrics_that_name_no_evaluator_keep_the_namespace_match(self, mock_ac):
@@ -25870,15 +26288,22 @@ class TestAC40PublishedScoreMetrics:
         alarm = _score_alarm(
             Dimensions=[{"Name": "EvaluatorName", "Value": "Builtin.Harmfulness"}]
         )
+        others, listed = _companion_scores()
         findings = self._run(
             mock_ac,
-            [alarm, _score_alarm(name="stale", MetricName="Harmfulnes")],
-            {self._NS: _published((self._NS, "Builtin.Harmfulness", self._DIMS))},
+            [alarm, _score_alarm(name="stale", MetricName="Harmfulnes"), *others],
+            {
+                self._NS: _published(
+                    (self._NS, "Builtin.Harmfulness", self._DIMS), *listed
+                )
+            },
         )
 
         assert findings[0]["Status"] == "Passed"
         assert (
-            "alarm(s) eval-score-drop with actions" in (findings[0]["Finding_Details"])
+            "alarm(s) eval-Builtin.Stereotyping-drop, "
+            "eval-Builtin.ToolSelectionAccuracy-drop, eval-score-drop with actions"
+            in (findings[0]["Finding_Details"])
         )
         assert "Alarm(s) stale read a metric name" in findings[0]["Finding_Details"]
 
@@ -25905,10 +26330,15 @@ class TestAC40PublishedScoreMetrics:
                 }
             ],
         )
+        others, listed = _companion_scores()
         findings = self._run(
             mock_ac,
-            [alarm],
-            {self._NS: _published((self._NS, "Builtin.Harmfulness", self._DIMS))},
+            [alarm, *others],
+            {
+                self._NS: _published(
+                    (self._NS, "Builtin.Harmfulness", self._DIMS), *listed
+                )
+            },
         )
 
         assert findings[0]["Status"] == "Passed"
@@ -25964,17 +26394,34 @@ class TestAC40PublishedScoreMetrics:
         assert findings[0]["Status"] == "Failed"
 
 
+_AC40_SCORES = (
+    "Builtin.Harmfulness",
+    "Builtin.Stereotyping",
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.ToolParameterAccuracy",
+)
+
+
 class TestAC40EvaluationSafetyCoverage:
     """AC-40: what the attached evaluators score, read from the catalogue."""
 
     @pytest.fixture(autouse=True)
     def _score_alarms(self):
         with patch("agentcore_app.cloudwatch_client") as mock_cw:
-            mock_cw.describe_alarms.return_value = {"MetricAlarms": [_score_alarm()]}
-            # Every namespace publishes the safety score the default alarm
-            # reads, so an alarm is tied to an attached evaluator's score.
+            # Since round 8 each attached safety score, and a tool-choice score,
+            # must be listed and alarmed for a pass, where the Harmfulness alarm
+            # alone passed. The first alarm keeps the default name.
+            mock_cw.describe_alarms.return_value = {
+                "MetricAlarms": [_score_alarm()]
+                + [
+                    _score_alarm(name=f"eval-{name}-drop", MetricName=name)
+                    for name in _AC40_SCORES[1:]
+                ]
+            }
+            # Every namespace publishes the scores the default alarms read, so
+            # each alarm is tied to an attached evaluator's score.
             mock_cw.list_metrics.side_effect = lambda Namespace, **_: _published(
-                (Namespace, "Builtin.Harmfulness", {})
+                *((Namespace, name, {}) for name in _AC40_SCORES)
             )
             self.mock_cw = mock_cw
             yield mock_cw
@@ -26120,6 +26567,7 @@ class TestAC40EvaluationSafetyCoverage:
         _online_evaluation_client(mock_ac)
         self.mock_cw.describe_alarms.return_value = {
             "MetricAlarms": [_score_alarm(namespace="Bedrock AgentCore/Evaluations")]
+            + _companion_scores("Bedrock AgentCore/Evaluations")[0]
         }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
@@ -26142,7 +26590,9 @@ class TestAC40EvaluationSafetyCoverage:
                 },
             },
         ]
-        self.mock_cw.describe_alarms.return_value = {"MetricAlarms": [math_alarm]}
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [math_alarm] + _companion_scores()[0]
+        }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
@@ -26173,6 +26623,7 @@ class TestAC40EvaluationSafetyCoverage:
         )
         self.mock_cw.describe_alarms.return_value = {
             "MetricAlarms": [_score_alarm(namespace=alarm_namespace)]
+            + _companion_scores(alarm_namespace)[0]
         }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
@@ -26247,7 +26698,7 @@ class TestAC40EvaluationSafetyCoverage:
                 "MetricAlarms": [_score_alarm("lambda", namespace="AWS/Lambda")],
                 "NextToken": "page-2",
             },
-            {"MetricAlarms": [_score_alarm()]},
+            {"MetricAlarms": [_score_alarm()] + _companion_scores()[0]},
         ]
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
@@ -26339,7 +26790,14 @@ class TestAC40EvaluationSafetyCoverage:
         self.mock_cw.list_metrics.side_effect = lambda Namespace, **_: _published(
             (Namespace, "Builtin.Harmfulness", {}),
             (Namespace, "Builtin.Stereotyping", {}),
+            (Namespace, "Builtin.ToolSelectionAccuracy", {}),
         )
+        tool_alarm = _score_alarm(
+            name="tool-drop", MetricName="Builtin.ToolSelectionAccuracy"
+        )
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [_score_alarm(), tool_alarm]
+        }
 
         findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
@@ -26353,6 +26811,7 @@ class TestAC40EvaluationSafetyCoverage:
             "MetricAlarms": [
                 _score_alarm(),
                 _score_alarm(name="stereo-drop", MetricName="Builtin.Stereotyping"),
+                tool_alarm,
             ]
         }
 
@@ -28789,6 +29248,26 @@ class TestAC08EndpointPrivateDns:
         assert self._run(mock_ac, mock_ec2, endpoint) == []
 
 
+def _without_invoker_rows(findings, expected, reason="reports no ARN"):
+    """Split off AC-45's invoker rows, asserting `expected` of them.
+
+    Each tool with a readable role gets one, and each is N/A naming `reason`:
+    a fixture that reports no tool ARN, or one whose cache holds no principal
+    starting a session. The scope-leg assertions that follow keep their exact
+    counts.
+    """
+    rows = [
+        finding
+        for finding in findings
+        if finding["Finding"] == "AgentCore Tool Execution Role Invoker Bound"
+    ]
+    assert len(rows) == expected
+    for row in rows:
+        assert row["Status"] == "N/A"
+        assert reason in row["Finding_Details"]
+    return [finding for finding in findings if finding not in rows]
+
+
 def _tool_policy(name, document):
     return {"name": name, "document": document}
 
@@ -28905,7 +29384,9 @@ class TestAC45ToolExecutionRoleScope:
         )
         cache = _tool_cache("ToolRole", [_tool_policy("ToolPolicy", document)])
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Failed"
@@ -28928,7 +29409,9 @@ class TestAC45ToolExecutionRoleScope:
             inline=[_tool_policy("ToolInline", self._statement("s3:GetObject", "*"))],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Failed"
@@ -28950,7 +29433,9 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Passed"
@@ -29023,7 +29508,9 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 2
         assert findings[0]["Status"] == "N/A"
@@ -29043,7 +29530,9 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Failed"
@@ -29062,7 +29551,9 @@ class TestAC45ToolExecutionRoleScope:
             "ToolRole", [_tool_policy("ToolPolicy", self._statement("s3:*", "*"))]
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert sorted(finding["Status"] for finding in findings) == [
             "Failed",
@@ -29091,7 +29582,9 @@ class TestAC45ToolExecutionRoleScope:
             "ToolRole", [_tool_policy("ToolPolicy", self._statement("s3:*", "*"))]
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
         assert "ListCodeInterpreters" in findings[0]["Resolution"]
@@ -29138,7 +29631,11 @@ class TestAC45ToolExecutionRoleScope:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache),
+            1,
+            reason="no principal in the IAM permission cache",
+        )
 
         statuses = {
             tool: [f["Status"] for f in findings if tool in f["Finding_Details"]]
@@ -29153,6 +29650,340 @@ class TestAC45ToolExecutionRoleScope:
             if finding["Status"] == "N/A":
                 assert "from account 444455556666" in finding["Finding_Details"]
                 assert_finding_schema(finding)
+
+
+class TestAC45ToolRoleInvokerBound:
+    """AC-45: a tool role holds no grant a principal starting its sessions lacks.
+
+    AIR-ACR-RT-03 keeps the tool role at equal-or-fewer privileges than the
+    invoking user, because whoever starts a session runs code with the role.
+    """
+
+    _FINDING = "AgentCore Tool Execution Role Invoker Bound"
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/ToolRole"
+    _CI_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:code-interpreter-custom/ci-1"
+    )
+    _BR_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:browser-custom/br-1"
+    _APP = "arn:aws:s3:::app-bucket/*"
+
+    def _allow(self, action, resource, **extra):
+        return {"Effect": "Allow", "Action": action, "Resource": resource, **extra}
+
+    def _principal(self, *statements, boundary=None):
+        permissions = {
+            "attached_policies": [
+                _tool_policy("Policy", {"Statement": list(statements)})
+            ],
+            "inline_policies": [],
+        }
+        if boundary is not None:
+            permissions["permissions_boundary"] = boundary
+        return permissions
+
+    def _start(
+        self, resource=None, action="bedrock-agentcore:StartCodeInterpreterSession"
+    ):
+        return self._allow(action, resource or self._CI_ARN)
+
+    def _run(self, mock_ac, tool_role, roles=None, users=None, browser=False):
+        if browser:
+            _wire_tools(
+                mock_ac,
+                browsers=[
+                    _browser(browserArn=self._BR_ARN, executionRoleArn=self._ROLE_ARN)
+                ],
+            )
+        else:
+            _wire_tools(
+                mock_ac,
+                interpreters=[
+                    _code_interpreter(
+                        codeInterpreterArn=self._CI_ARN,
+                        executionRoleArn=self._ROLE_ARN,
+                    )
+                ],
+            )
+        cache = {
+            "role_permissions": {"ToolRole": tool_role, **(roles or {})},
+            "user_permissions": users or {},
+        }
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        rows = [f for f in findings if f["Finding"] == self._FINDING]
+        assert len(rows) == 1, [f["Finding"] for f in findings]
+        assert rows[0]["Check_ID"] == "AC-45"
+        assert_finding_schema(rows[0])
+        return rows[0]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_lacking_a_tool_role_grant_fails(self, mock_ac):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            roles={
+                "Ops": self._principal(
+                    self._start("*"),
+                    self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*"),
+                )
+            },
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                )
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert row["Severity"] == "Medium"
+        assert f"role Ops lacks s3:getobject on {self._APP}" in row["Finding_Details"]
+        assert "user dev" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_invokers_holding_every_tool_role_grant_pass(self, mock_ac):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            roles={"Admin": self._principal(self._allow("*", "*"))},
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    self._allow(["s3:Get*", "s3:PutObject"], "arn:aws:s3:::app-*"),
+                )
+            },
+        )
+
+        assert row["Status"] == "Passed"
+        assert "role Admin, user dev" in row["Finding_Details"]
+        assert "StartCodeInterpreterSession" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tool_statement, invoker_statement",
+        [
+            (
+                ("s3:Get*", "arn:aws:s3:::app-bucket/*"),
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+            ),
+            (
+                ("s3:GetObject", "arn:aws:s3:::app-*"),
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+            ),
+            (
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+                ("s3:GetObject", "arn:aws:s3:::app-bucket/?"),
+            ),
+        ],
+        ids=["action-pattern", "resource-pattern", "question-mark"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_narrower_pattern_does_not_cover_a_wider_one(
+        self, mock_ac, tool_statement, invoker_statement
+    ):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow(*tool_statement)),
+            users={
+                "dev": self._principal(self._start(), self._allow(*invoker_statement))
+            },
+        )
+
+        assert row["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_invoker_grant_does_not_cover_an_unconditioned_one(
+        self, mock_ac
+    ):
+        condition = {"StringEquals": {"aws:SourceVpc": "vpc-1"}}
+        tool = self._principal(self._allow("s3:GetObject", self._APP))
+        users = {
+            "dev": self._principal(
+                self._start(),
+                self._allow("s3:GetObject", self._APP, Condition=condition),
+            )
+        }
+
+        assert self._run(mock_ac, tool, users=users)["Status"] == "Failed"
+        same = self._principal(
+            self._allow("s3:GetObject", self._APP, Condition=condition)
+        )
+        assert self._run(mock_ac, same, users=users)["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_whose_boundary_removes_the_action_fails(self, mock_ac):
+        boundary = {
+            "Statement": [
+                {"Effect": "Allow", "Action": "bedrock-agentcore:*", "Resource": "*"}
+            ]
+        }
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    self._allow("s3:GetObject", self._APP),
+                    boundary=boundary,
+                )
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert "user dev lacks s3:getobject" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_tool_role_grant_its_own_deny_removes_is_not_compared(self, mock_ac):
+        tool = self._principal(
+            self._allow(["s3:GetObject", "s3:DeleteObject"], self._APP),
+            {"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"},
+        )
+        row = self._run(
+            mock_ac,
+            tool,
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                )
+            },
+        )
+
+        assert row["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "users",
+        [
+            {},
+            {"other": {"attached_policies": [], "inline_policies": []}},
+            {
+                "elsewhere": None,
+            },
+        ],
+        ids=["no-users", "no-start-grant", "not-a-dict"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_no_principal_starting_a_session_is_na(self, mock_ac, users):
+        row = self._run(
+            mock_ac,
+            self._principal(self._start(), self._allow("s3:GetObject", self._APP)),
+            users=users,
+        )
+
+        assert row["Status"] == "N/A"
+        assert "no principal in the IAM permission cache" in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_start_grant_its_own_deny_removes_does_not_make_an_invoker(self, mock_ac):
+        lacking = self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*")
+        denied = {
+            "Effect": "Deny",
+            "Action": "bedrock-agentcore:StartCodeInterpreterSession",
+            "Resource": "*",
+        }
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "denied": self._principal(self._start(), lacking, denied),
+                "dev": self._principal(self._start(), lacking),
+            },
+        )
+
+        assert row["Status"] == "Failed"
+        assert "user dev lacks" in row["Finding_Details"]
+        assert "user denied" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_start_grant_on_another_tool_or_kind_does_not_make_an_invoker(
+        self, mock_ac
+    ):
+        lacking = self._allow("s3:GetObject", "arn:aws:s3:::other-bucket/*")
+        users = {
+            "other-tool": self._principal(
+                self._start(self._CI_ARN.replace("ci-1", "ci-2")), lacking
+            ),
+            "interpreter-only": self._principal(self._start("*"), lacking),
+            "other-browser": self._principal(
+                self._start(
+                    self._BR_ARN.replace("br-1", "br-2"),
+                    "bedrock-agentcore:StartBrowserSession",
+                ),
+                lacking,
+            ),
+        }
+        tool = self._principal(self._allow("s3:GetObject", self._APP))
+
+        assert self._run(mock_ac, tool, users=users, browser=True)["Status"] == "N/A"
+        users["browser-user"] = self._principal(
+            self._start(self._BR_ARN, "bedrock-agentcore:StartBrowserSession"), lacking
+        )
+        row = self._run(mock_ac, tool, users=users, browser=True)
+        assert row["Status"] == "Failed"
+        assert "user browser-user lacks" in row["Finding_Details"]
+        assert "other-tool" not in row["Finding_Details"]
+        assert "interpreter-only" not in row["Finding_Details"]
+        assert "other-browser" not in row["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_invoker_policy_is_na(self, mock_ac):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", self._APP)),
+            users={
+                "dev": self._principal(
+                    self._start(), self._allow("s3:GetObject", self._APP)
+                ),
+                "broken": {
+                    "attached_policies": [_tool_policy("Bad", "not json")],
+                    "inline_policies": [],
+                },
+            },
+        )
+
+        assert row["Status"] == "N/A"
+        assert "user broken (policy Bad)" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tool_resource, status",
+        [
+            ("arn:aws:s3:::app-bucket/report.json", "Passed"),
+            ("arn:aws:s3:::secrets/key.pem", "Failed"),
+            ("arn:aws:s3:::app-bucket/*", "Failed"),
+        ],
+        ids=["literal-outside", "literal-excluded", "pattern"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_invoker_not_resource_covers_only_a_literal_arn_it_spares(
+        self, mock_ac, tool_resource, status
+    ):
+        row = self._run(
+            mock_ac,
+            self._principal(self._allow("s3:GetObject", tool_resource)),
+            users={
+                "dev": self._principal(
+                    self._start(),
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:GetObject",
+                        "NotResource": "arn:aws:s3:::secrets/*",
+                    },
+                )
+            },
+        )
+
+        assert row["Status"] == status
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_not_action_tool_grant_needs_an_every_action_invoker(self, mock_ac):
+        tool = self._principal(
+            {"Effect": "Allow", "NotAction": "iam:*", "Resource": self._APP}
+        )
+        users = {
+            "dev": self._principal(
+                self._start(), self._allow(["s3:*", "dynamodb:*"], "*")
+            )
+        }
+
+        assert self._run(mock_ac, tool, users=users)["Status"] == "Failed"
+        users["dev"] = self._principal(self._start(), self._allow("*", "*"))
+        assert self._run(mock_ac, tool, users=users)["Status"] == "Passed"
 
 
 class TestAC46RuntimeSessionLimits:
@@ -29957,19 +30788,21 @@ class TestAC47RuntimeInvocationPath:
             assert_finding_schema(finding)
 
     # The address keys now carry an address range: "vpce-123" is not one, and a
-    # value that does not parse as a range bounds nothing.
+    # value that does not parse as a range bounds nothing. Stricter since round
+    # 8: an address key alone no longer passes, since a Deny on it admits a
+    # caller at a listed address without a private path.
     @pytest.mark.parametrize(
-        ("condition_key", "value"),
+        ("condition_key", "value", "leg"),
         [
-            ("aws:SourceVpc", "vpc-123"),
-            ("aws:SourceVpce", "vpce-123"),
-            ("aws:VpcSourceIp", "10.0.0.0/16"),
-            ("aws:SourceIp", "203.0.113.0/24"),
+            ("aws:SourceVpc", "vpc-123", "Network Path Scope"),
+            ("aws:SourceVpce", "vpce-123", "Network Path Scope"),
+            ("aws:VpcSourceIp", "10.0.0.0/16", "Network Path Unrestricted"),
+            ("aws:SourceIp", "203.0.113.0/24", "Network Path Unrestricted"),
         ],
     )
     @patch("agentcore_app.agentcore_client")
     def test_a_deny_network_condition_passes_the_network_leg(
-        self, mock_ac, condition_key, value
+        self, mock_ac, condition_key, value, leg
     ):
         # "Deny unless aws:SourceVpce is the approved endpoint" is the documented
         # form of this restriction. Reading Allow statements only would report
@@ -29993,8 +30826,10 @@ class TestAC47RuntimeInvocationPath:
 
         legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
 
-        assert legs["Network Path Scope"]["Status"] == "Passed"
-        assert condition_key.lower() in legs["Network Path Scope"]["Finding_Details"]
+        assert legs[leg]["Status"] == (
+            "Passed" if leg == "Network Path Scope" else "Failed"
+        )
+        assert condition_key.lower() in legs[leg]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_an_unrelated_condition_does_not_pass_the_network_leg(self, mock_ac):
@@ -30798,16 +31633,20 @@ class TestAC47DenyForm:
 
     @patch("agentcore_app.agentcore_client")
     def test_one_bounded_deny_passes_beside_an_open_one(self, mock_ac):
+        # Stricter since round 8: the bounded Deny keys on aws:SourceVpc, and an
+        # open aws:SourceVpce Deny beside it does not undo it. An aws:SourceIp
+        # Deny in its place no longer passes; TestR8NetworkPathNeedsAVpcKey
+        # holds that case.
         legs = self._judge(
             mock_ac,
             [
                 _deny_invoke({"StringNotLike": {"aws:SourceVpce": "*"}}),
-                _deny_invoke({"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}}),
+                _deny_invoke({"StringNotEquals": {"aws:SourceVpc": "vpc-1"}}),
             ],
         )
 
         assert legs["Network Path Scope"]["Status"] == "Passed"
-        assert "aws:sourceip" in legs["Network Path Scope"]["Finding_Details"]
+        assert "aws:sourcevpc" in legs["Network Path Scope"]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_every_runtime_is_judged_on_its_own_deny(self, mock_ac):
@@ -31015,6 +31854,127 @@ def _principal_deny(*roles):
             }
         }
     )
+
+
+_GATEWAY_ARN_R8 = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+
+
+def _deny_gateway_invoke(condition):
+    return {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "bedrock-agentcore:InvokeGateway",
+        "Resource": "*",
+        "Condition": condition,
+    }
+
+
+# A Deny keyed on an address admits every caller at a listed address, a public
+# one over the internet included, and aws:VpcSourceIp names a range another
+# account's VPC can repeat. AIR-ACR-GW-04 and AIR-ACR-RT-13 name aws:SourceVpc
+# or aws:SourceVpce as the private path, so only a Deny keyed on those passes.
+_ADDRESS_ONLY_DENIES = [
+    pytest.param(
+        [{"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}}], id="source-ip"
+    ),
+    pytest.param(
+        [{"NotIpAddress": {"aws:VpcSourceIp": "10.0.0.0/16"}}], id="vpc-source-ip"
+    ),
+    pytest.param(
+        [
+            {
+                "StringNotEquals": {"aws:SourceVpce": "vpce-1"},
+                "NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"},
+            }
+        ],
+        id="vpce-anded-with-source-ip",
+    ),
+]
+_PRIVATE_PATH_DENIES = [
+    pytest.param([{"StringNotEquals": {"aws:SourceVpce": "vpce-1"}}], id="vpce"),
+    pytest.param([{"StringNotEquals": {"aws:SourceVpc": "vpc-1"}}], id="vpc"),
+    pytest.param(
+        [
+            {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+            {"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}},
+        ],
+        id="vpce-beside-a-source-ip-deny",
+    ),
+]
+
+
+class TestR8NetworkPathNeedsAVpcKey:
+    """AC-27 and AC-47 credit a private path only from aws:SourceVpc or
+    aws:SourceVpce, never from an address key alone."""
+
+    def _gateway(self, mock_ac, conditions):
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps(
+                {"Statement": [_deny_gateway_invoke(c) for c in conditions]}
+            )
+        }
+        cache = {
+            "endpoints": {"vpce-1": "com.amazonaws.us-east-1.bedrock-agentcore.gateway"}
+        }
+        return {
+            finding["Finding"]: finding
+            for finding in agentcore_app._gateway_resource_policy_findings(
+                "Gateway 'one' (gw-1)", _GATEWAY_ARN_R8, cache
+            )
+            if "Network Path" in finding["Finding"]
+        }
+
+    def _runtime(self, mock_ac, conditions):
+        summary, runtime = _vpc_runtime()
+        _wire_runtimes(mock_ac, [(summary, runtime)])
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps({"Statement": [_deny_invoke(c) for c in conditions]})
+        }
+        return {
+            finding["Finding"]: finding
+            for finding in agentcore_app.check_agentcore_runtime_invocation_path()
+            if "Network Path" in finding["Finding"]
+        }
+
+    @pytest.mark.parametrize("conditions", _ADDRESS_ONLY_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_address_only_gateway_deny_fails(self, mock_ac, conditions):
+        legs = self._gateway(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Gateway Network Path Unrestricted"]
+        details = legs["AgentCore Gateway Network Path Unrestricted"]["Finding_Details"]
+        assert "no Deny keyed only on aws:SourceVpc or aws:SourceVpce" in details
+
+    @pytest.mark.parametrize("conditions", _PRIVATE_PATH_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vpc_keyed_gateway_deny_passes(self, mock_ac, conditions):
+        legs = self._gateway(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Gateway Network Path Scope"]
+        scope = legs["AgentCore Gateway Network Path Scope"]
+        assert scope["Status"] == "Passed"
+        assert "aws:sourceip" not in scope["Finding_Details"]
+        assert "address range" not in scope["Resolution"]
+
+    @pytest.mark.parametrize("conditions", _ADDRESS_ONLY_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_address_only_runtime_deny_fails(self, mock_ac, conditions):
+        legs = self._runtime(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Runtime Network Path Unrestricted"]
+        details = legs["AgentCore Runtime Network Path Unrestricted"]["Finding_Details"]
+        assert "no Deny keyed only on aws:SourceVpc or aws:SourceVpce" in details
+
+    @pytest.mark.parametrize("conditions", _PRIVATE_PATH_DENIES)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vpc_keyed_runtime_deny_passes(self, mock_ac, conditions):
+        legs = self._runtime(mock_ac, conditions)
+
+        assert list(legs) == ["AgentCore Runtime Network Path Scope"]
+        scope = legs["AgentCore Runtime Network Path Scope"]
+        assert scope["Status"] == "Passed"
+        assert "aws:sourceip" not in scope["Finding_Details"]
+        assert "address range" not in scope["Resolution"]
 
 
 class TestAC47PrincipalArnGateway:
@@ -34997,6 +35957,135 @@ class TestAC08DataPathEndpointScope:
 
         assert not self._naming(findings, "vpce-s3-other")
         assert not self._naming(findings, "vpc-2")
+
+    def _wire_hosted(self, mock_ac, mock_ec2):
+        """Runtime rt-1 runs in subnet-b of vpc-2, which holds an S3 endpoint
+        and no AgentCore endpoint; vpc-3 hosts nothing and holds another."""
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                self._agentcore_endpoint(),
+                self._gateway_endpoint(endpoint_id="vpce-s3-hosted", vpc_id="vpc-2"),
+                self._gateway_endpoint(endpoint_id="vpce-s3-other", vpc_id="vpc-3"),
+            ],
+        )
+        mock_ac.get_agent_runtime.return_value = {
+            "agentRuntimeId": "rt-1",
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {"subnets": ["subnet-b"]},
+            },
+        }
+        mock_ac.list_agent_runtime_versions.return_value = {"agentRuntimes": []}
+        mock_ac.list_code_interpreters.return_value = {"codeInterpreterSummaries": []}
+        mock_ac.list_browsers.return_value = {"browserSummaries": []}
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [{"SubnetId": "subnet-b", "VpcId": "vpc-2"}]
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_data_path_endpoint_in_a_hosting_vpc_is_judged(self, mock_ac, mock_ec2):
+        # A VPC-mode runtime reads its data through the S3 endpoint of the VPC
+        # it runs in, whether or not that VPC also holds an AgentCore endpoint.
+        self._wire_hosted(mock_ac, mock_ec2)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        hosted = self._naming(findings, "vpce-s3-hosted")
+
+        assert [finding["Finding"] for finding in hosted] == [
+            "AgentCore VPC Endpoint Policy Unrestricted"
+        ]
+        assert hosted[0]["Status"] == "Failed"
+        assert not self._naming(findings, "vpce-s3-other")
+
+    def _wire_tools_only(
+        self, mock_ac, mock_ec2, network_mode="VPC", groups=("sg-tool",)
+    ):
+        """No runtime or gateway; Code Interpreter ci-1 runs in subnet-tool of
+        vpc-2, which holds an S3 endpoint; vpc-3 hosts nothing and holds
+        another."""
+        self._wire_hosted(mock_ac, mock_ec2)
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_ac.list_gateways.return_value = {"items": []}
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(network_mode=network_mode, security_groups=groups)
+            ],
+        )
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [{"SubnetId": "subnet-tool", "VpcId": "vpc-2"}]
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_tools_only_vpc_has_its_data_path_endpoints_judged(
+        self, mock_ac, mock_ec2
+    ):
+        # A VPC-mode Code Interpreter reaches S3 through its own VPC's endpoint
+        # even when the region holds no runtime or gateway to call through an
+        # AgentCore endpoint, so the presence legs stay N/A and the data path
+        # is still judged.
+        self._wire_tools_only(mock_ac, mock_ec2)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        hosted = self._naming(findings, "vpce-s3-hosted")
+
+        assert [finding["Finding"] for finding in hosted] == [
+            "AgentCore VPC Endpoint Policy Unrestricted"
+        ]
+        assert hosted[0]["Status"] == "Failed"
+        assert not self._naming(findings, "vpce-s3-other")
+        presence = [
+            f for f in findings if f["Finding"] == "AgentCore VPC Endpoints Check"
+        ]
+        assert [f["Status"] for f in presence] == ["N/A"]
+        assert "no AgentCore endpoint is required" in presence[0]["Finding_Details"]
+        assert not [f for f in findings if "Missing" in f["Finding"]]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_tools_outside_a_vpc_still_find_no_agentcore_resources(
+        self, mock_ac, mock_ec2
+    ):
+        # A PUBLIC tool reports no vpcConfig.
+        self._wire_tools_only(mock_ac, mock_ec2, network_mode="PUBLIC", groups=None)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding_Details"] == "No AgentCore resources found"
+
+    @pytest.mark.parametrize(
+        "denied, action",
+        [
+            ("get_agent_runtime", "bedrock-agentcore:GetAgentRuntime"),
+            ("describe_subnets", "ec2:DescribeSubnets"),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_hosting_vpc_is_na(self, mock_ac, mock_ec2, denied, action):
+        self._wire_hosted(mock_ac, mock_ec2)
+        client = mock_ec2 if denied == "describe_subnets" else mock_ac
+        getattr(client, denied).side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        unread = [
+            finding
+            for finding in findings
+            if "data-path endpoints" in finding["Finding_Details"]
+        ]
+
+        assert [finding["Status"] for finding in unread] == ["N/A"]
+        assert unread[0]["Finding"] == "AgentCore VPC Endpoint Policy"
+        assert unread[0]["Resolution"] == f"Grant {action} and retry."
+        assert not self._naming(findings, "vpce-s3-hosted")
 
     @pytest.mark.parametrize(
         "service", ["dynamodb", "sagemaker.api", "sagemaker.runtime"]
@@ -42666,7 +43755,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 2
+        )
 
         assert [f["Status"] for f in findings] == ["Passed", "Failed"]
         assert "ToolRole" in findings[0]["Finding_Details"]
@@ -42690,7 +43781,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Passed"]
 
@@ -42715,7 +43808,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Failed"]
 
@@ -42738,7 +43833,9 @@ class TestAC45WholePopulation:
             roles={"ToolRole": _principal_with([self._allow("s3:*", "*")], boundary)}
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == [status]
 
@@ -42762,7 +43859,9 @@ class TestAC45WholePopulation:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["N/A", "Passed"]
         assert findings[0]["Finding"].endswith("Incomplete")
@@ -42786,7 +43885,9 @@ class TestAC45WholePopulation:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["N/A"]
 
@@ -42801,7 +43902,9 @@ class TestAC45WholePopulation:
         ]
         cache = _v2_cache(roles={"ToolRole": permissions})
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Failed"]
 
@@ -42816,7 +43919,9 @@ class TestAC45WholePopulation:
         }
         cache = _v2_cache(roles=roles) if v2 else {"role_permissions": roles}
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Passed"]
         assert (agentcore_app.IAM_CACHE_V1_NOTE in findings[0]["Finding_Details"]) is (
@@ -43163,7 +44268,9 @@ class TestAC45RuntimeExecutionRole:
             }
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Finding"] for f in findings] == [
             "AgentCore Tool Execution Role Scope",
@@ -43285,7 +44392,9 @@ class TestAC45RuntimeExecutionRole:
             {"ToolRole": [self._allow("ecr:GetAuthorizationToken", "*")]}
         )
 
-        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+        findings = _without_invoker_rows(
+            agentcore_app.check_agentcore_tool_execution_role_scope(cache), 1
+        )
 
         assert [f["Status"] for f in findings] == ["Failed"]
 
@@ -43504,6 +44613,116 @@ class TestAC45ServiceExecutionRoles:
         row = next(f for f in findings if "Memory 'm-1'" in f["Finding_Details"])
         assert row["Status"] == "Failed"
         assert "AWS managed policy" not in row["Finding_Details"]
+
+
+class TestActionPatternOverlapLength:
+    """A long action pattern in a cached policy must not crash a check.
+
+    _action_patterns_overlap recursed once per character, so a 2000-character
+    pattern raised RecursionError out of AC-45 and every check calling it.
+    """
+
+    @staticmethod
+    def _recursive_overlap(first, second):
+        """The recursive form the helper had, kept as the exactness oracle."""
+        first, second = first.lower(), second.lower()
+        memo = {}
+
+        def overlap(i, j):
+            if (i, j) in memo:
+                return memo[(i, j)]
+            memo[(i, j)] = False
+            result = False
+            if i == len(first) and j == len(second):
+                result = True
+            elif i < len(first) and first[i] == "*" and overlap(i + 1, j):
+                result = True
+            elif j < len(second) and second[j] == "*" and overlap(i, j + 1):
+                result = True
+            elif i < len(first) and j < len(second):
+                left, right = first[i], second[j]
+                if left == "*" and right != "*":
+                    result = overlap(i, j + 1)
+                elif right == "*" and left != "*":
+                    result = overlap(i + 1, j)
+                elif left != "*" and right != "*":
+                    if left == "?" or right == "?" or left == right:
+                        result = overlap(i + 1, j + 1)
+            memo[(i, j)] = result
+            return result
+
+        return overlap(0, 0)
+
+    def test_the_result_matches_the_recursive_form(self):
+        import random
+
+        rng = random.Random(20261004)
+        alphabet = "ab*?"
+        for _ in range(4000):
+            first = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 7)))
+            second = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 7)))
+            assert agentcore_app._action_patterns_overlap(
+                first, second
+            ) is self._recursive_overlap(first, second), (first, second)
+
+    @pytest.mark.parametrize(
+        "pattern, expected",
+        [
+            ("bedrock-agentcore:" + "*" * 1977 + "shell", True),
+            ("bedrock-agentcore:" + "*a" * 991, False),
+        ],
+        ids=["reaches", "does-not-reach"],
+    )
+    def test_a_2000_character_pattern_is_judged(self, pattern, expected):
+        assert len(pattern) >= 2000
+        assert (
+            agentcore_app._action_patterns_overlap(
+                pattern, "bedrock-agentcore:invokeagentruntimecommandshell"
+            )
+            is expected
+        )
+
+    def test_a_2000_character_pattern_does_not_crash_the_shell_leg(self):
+        def holder(action):
+            return {
+                "attached_policies": [
+                    _tool_policy(
+                        "Policy",
+                        {
+                            "Statement": [
+                                {"Effect": "Allow", "Action": action, "Resource": "*"}
+                            ]
+                        },
+                    )
+                ],
+                "inline_policies": [],
+            }
+
+        unbounded, named, unreadable = agentcore_app._command_shell_holders(
+            {
+                "LongShell": holder("bedrock-agentcore:" + "*" * 1977 + "shell"),
+                "LongOther": holder("bedrock-agentcore:" + "*a" * 991),
+            },
+            "role",
+        )
+
+        assert [entry.split(" (")[0] for entry in unbounded] == ["role LongShell"]
+        assert named == [] and unreadable == []
+
+    def test_a_long_pattern_against_a_long_pattern_stays_fast(self):
+        import time
+
+        hostile = "*a" * 1000 + "Z"
+        start = time.perf_counter()
+        assert agentcore_app._action_patterns_overlap(hostile, "*b" * 1000) is False
+        assert (
+            agentcore_app._resource_pattern_covers(hostile, "arn:" + "a" * 80) is False
+        )
+        assert (
+            agentcore_app._statement_reaches_arn({"Resource": hostile}, "a" * 80)
+            is False
+        )
+        assert time.perf_counter() - start < 10
 
 
 class TestAC45ShellAlarmEveryRegion:
@@ -48403,13 +49622,18 @@ class TestAC49NetworkFirewallEgress:
         groups=None,
         nat_subnets=None,
         log_types=None,
+        tgw=None,
     ):
         """Stub VPC-mode runtimes, their subnets' routes and the firewalls.
 
         subnets maps subnet id to (vpc id, cidr); routes maps subnet id to its
         0.0.0.0/0 target; firewalls maps firewall name to (vpc id, endpoint ids,
         policy name); log_types maps firewall name to the log types it sends to
-        a destination, ALERT and FLOW when absent, or to an exception.
+        a destination, ALERT and FLOW when absent, or to an exception. tgw holds
+        "attachments" (DescribeTransitGatewayAttachments entries), "routes"
+        (transit gateway route table id to its routes) and "vpc_attachments"
+        (attachment id to its DescribeTransitGatewayVpcAttachments entry); any
+        of the three may be an exception the read raises.
         """
         subnets = subnets or {"subnet-a": ("vpc-a", "10.0.1.0/24")}
         runtime_subnets = [s for s in subnets if not s.startswith("subnet-pub")]
@@ -48525,6 +49749,63 @@ class TestAC49NetworkFirewallEgress:
         mock_nfw.describe_logging_configuration.side_effect = (
             describe_logging_configuration
         )
+        tgw = tgw or {}
+
+        def tgw_read(key, select):
+            value = tgw.get(key, [] if key == "attachments" else {})
+            if isinstance(value, Exception):
+                raise value
+            return select(value)
+
+        def describe_transit_gateway_attachments(Filters, **_):
+            wanted = {f["Name"]: f["Values"] for f in Filters}
+            return {
+                "TransitGatewayAttachments": tgw_read(
+                    "attachments",
+                    lambda listed: [
+                        a
+                        for a in listed
+                        if all(
+                            a.get(
+                                {
+                                    "resource-id": "ResourceId",
+                                    "transit-gateway-id": "TransitGatewayId",
+                                    "resource-type": "ResourceType",
+                                }[name]
+                            )
+                            in values
+                            for name, values in wanted.items()
+                        )
+                    ],
+                )
+            }
+
+        mock_ec2.describe_transit_gateway_attachments.side_effect = (
+            describe_transit_gateway_attachments
+        )
+        mock_ec2.search_transit_gateway_routes.side_effect = (
+            lambda TransitGatewayRouteTableId, Filters, **_: {
+                "Routes": tgw_read(
+                    "routes",
+                    lambda tables: [
+                        route
+                        for route in tables.get(TransitGatewayRouteTableId, [])
+                        if route.get("State") in Filters[0]["Values"]
+                    ],
+                ),
+                "AdditionalRoutesAvailable": tgw.get("truncated", False),
+            }
+        )
+        mock_ec2.describe_transit_gateway_vpc_attachments.side_effect = (
+            lambda TransitGatewayAttachmentIds, **_: {
+                "TransitGatewayVpcAttachments": tgw_read(
+                    "vpc_attachments",
+                    lambda listed: [
+                        listed[i] for i in TransitGatewayAttachmentIds if i in listed
+                    ],
+                )
+            }
+        )
         return None
 
     @staticmethod
@@ -48550,9 +49831,12 @@ class TestAC49NetworkFirewallEgress:
         findings = self._run(mock_ac, mock_ec2, mock_nfw)
 
         rows = self._rows(findings)
-        assert len(findings) == 2
+        # Round 8: a third row compares the DNS and Network Firewall
+        # allow-lists, N/A here because no Route 53 Resolver client is wired.
+        assert len(findings) == 3
         assert rows["egress"]["Status"] == "Passed"
         assert rows["threat"]["Status"] == "Passed"
+        assert rows["egress Allow-List Sync"]["Status"] == "N/A"
         assert "firewall(s) fw1" in rows["egress"]["Finding_Details"]
         assert all(f["Check_ID"] == "AC-49" for f in findings)
         for finding in findings:
@@ -48832,6 +50116,275 @@ class TestAC49NetworkFirewallEgress:
         )
         assert "fw1's" not in rows["egress"]["Finding_Details"]
 
+    @staticmethod
+    def _tgw(
+        target=("vpc", "vpc-insp"),
+        owner="123456789012",
+        association=True,
+        routes=None,
+        truncated=False,
+    ):
+        """A transit gateway whose route table sends 0.0.0.0/0 from vpc-a to
+        one attachment, by default the inspection VPC's, whose attachment
+        subnet is subnet-tgw."""
+        kind, resource = target
+        attachment = {
+            "TransitGatewayAttachmentId": "tgw-attach-a",
+            "TransitGatewayId": "tgw-1",
+            "ResourceType": "vpc",
+            "ResourceId": "vpc-a",
+            "ResourceOwnerId": "123456789012",
+            "State": "available",
+        }
+        if association:
+            attachment["Association"] = {
+                "TransitGatewayRouteTableId": "tgw-rtb-1",
+                "State": "associated",
+            }
+        return {
+            "attachments": [attachment],
+            "routes": {
+                "tgw-rtb-1": routes
+                if routes is not None
+                else [
+                    {
+                        "DestinationCidrBlock": "0.0.0.0/0",
+                        "State": "active",
+                        "TransitGatewayAttachments": [
+                            {
+                                "TransitGatewayAttachmentId": "tgw-attach-insp",
+                                "ResourceId": resource,
+                                "ResourceType": kind,
+                            }
+                        ],
+                    }
+                ]
+            },
+            "vpc_attachments": {
+                "tgw-attach-insp": {
+                    "TransitGatewayAttachmentId": "tgw-attach-insp",
+                    "VpcId": resource,
+                    "VpcOwnerId": owner,
+                    "SubnetIds": ["subnet-tgw"],
+                }
+            },
+            "truncated": truncated,
+        }
+
+    def _run_tgw(self, mock_ac, mock_ec2, mock_nfw, tgw, inspection, **kwargs):
+        return self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                routes={
+                    "subnet-a": ("TransitGatewayId", "tgw-1"),
+                    "subnet-tgw": inspection,
+                },
+                firewalls={"fw9": ("vpc-insp", ["vpce-fw9"], "p1")},
+                tgw=tgw,
+                **kwargs,
+            )
+        )
+
+    @pytest.mark.parametrize("home_net", [["10.0.0.0/8"], None])
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transit_gateway_route_to_an_inspection_firewall_is_judged(
+        self, mock_ac, mock_ec2, mock_nfw, home_net
+    ):
+        # Before round 8 a transit gateway route was never followed, so a
+        # central inspection VPC read N/A.
+        rows = self._run_tgw(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            self._tgw(),
+            ("VpcEndpointId", "vpce-fw9"),
+            policies={"p1": _nfw_policy(home_net=home_net)},
+        )
+
+        assert rows["threat"]["Status"] == "Passed"
+        details = rows["egress"]["Finding_Details"]
+        if home_net:
+            assert rows["egress"]["Status"] == "Passed"
+            assert "firewall(s) fw9" in details
+        else:
+            assert rows["egress"]["Status"] == "Failed"
+            assert (
+                "firewall fw9 sits in VPC vpc-insp, outside the hosting VPC, and "
+                "sets no HOME_NET, so its allow-list inspects only traffic from "
+                "its own VPC and not hosting subnet(s) subnet-a (10.0.1.0/24)"
+                in details
+            )
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_inspection_vpc_routing_to_an_internet_gateway_fails(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._run_tgw(
+            mock_ac, mock_ec2, mock_nfw, self._tgw(), ("GatewayId", "igw-9")
+        )
+
+        assert rows["egress"]["Status"] == "Failed"
+        assert rows["threat"]["Status"] == "Failed"
+        assert (
+            "subnet-a (0.0.0.0/0 to tgw-1), then 0.0.0.0/0 to attachment "
+            "tgw-attach-insp in VPC vpc-insp, then subnet-tgw (0.0.0.0/0 to igw-9)"
+            in rows["egress"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_internet_route_of_the_transit_gateway_table_is_followed(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        tgw = self._tgw()
+        tgw["routes"]["tgw-rtb-1"] += [
+            {
+                "DestinationCidrBlock": "52.0.0.0/8",
+                "State": "active",
+                "TransitGatewayAttachments": [
+                    {
+                        "TransitGatewayAttachmentId": "tgw-attach-egress",
+                        "ResourceId": "vpc-egress",
+                        "ResourceType": "vpc",
+                    }
+                ],
+            },
+            {
+                "DestinationCidrBlock": "10.9.0.0/16",
+                "State": "active",
+                "TransitGatewayAttachments": [
+                    {
+                        "TransitGatewayAttachmentId": "tgw-attach-private",
+                        "ResourceId": "vpc-private",
+                        "ResourceType": "vpc",
+                    }
+                ],
+            },
+        ]
+        tgw["vpc_attachments"]["tgw-attach-egress"] = {
+            "TransitGatewayAttachmentId": "tgw-attach-egress",
+            "VpcId": "vpc-egress",
+            "VpcOwnerId": "123456789012",
+            "SubnetIds": ["subnet-egress"],
+        }
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                routes={
+                    "subnet-a": ("TransitGatewayId", "tgw-1"),
+                    "subnet-tgw": ("VpcEndpointId", "vpce-fw9"),
+                    "subnet-egress": ("NatGatewayId", "nat-9"),
+                },
+                firewalls={"fw9": ("vpc-insp", ["vpce-fw9"], "p1")},
+                policies={"p1": _nfw_policy(home_net=["10.0.0.0/8"])},
+                tgw=tgw,
+            )
+        )
+
+        details = rows["egress"]["Finding_Details"]
+        assert rows["egress"]["Status"] == "N/A"
+        assert "firewall(s) fw9" in details
+        assert (
+            "subnet-a (0.0.0.0/0 to tgw-1), then 52.0.0.0/8 to attachment "
+            "tgw-attach-egress in VPC vpc-egress, then subnet-egress (0.0.0.0/0 "
+            "to nat-9)" in details
+        )
+        assert "tgw-attach-private" not in details
+        assert "tgw-attach-insp in VPC vpc-insp, then" not in details
+
+    @pytest.mark.parametrize(
+        "tgw, text",
+        [
+            (
+                {"owner": "444455556666"},
+                "then 0.0.0.0/0 to attachment tgw-attach-insp in VPC vpc-insp of "
+                "account 444455556666, whose routes and firewalls this account "
+                "cannot read",
+            ),
+            (
+                {"target": ("vpn", "vpn-1")},
+                "then 0.0.0.0/0 to vpn attachment tgw-attach-insp (vpn-1), which "
+                "this check does not follow",
+            ),
+            (
+                {"association": False},
+                "whose attachment of vpc-a is associated with no route table",
+            ),
+            (
+                {
+                    "routes": [
+                        {
+                            "PrefixListId": "pl-1",
+                            "State": "active",
+                            "TransitGatewayAttachments": [],
+                        }
+                    ]
+                },
+                "then prefix list pl-1, whose entries are not read",
+            ),
+            (
+                {"truncated": True},
+                "whose route table tgw-rtb-1 holds more routes than the search "
+                "returns, so the route taken is not read",
+            ),
+        ],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transit_gateway_hop_not_followed_is_na(
+        self, mock_ac, mock_ec2, mock_nfw, tgw, text
+    ):
+        rows = self._run_tgw(
+            mock_ac, mock_ec2, mock_nfw, self._tgw(**tgw), ("VpcEndpointId", "vpce-fw9")
+        )
+
+        assert rows["egress"]["Status"] == "N/A"
+        assert rows["threat"]["Status"] == "N/A"
+        assert text in rows["egress"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "key, action",
+        [
+            ("attachments", "ec2:DescribeTransitGatewayAttachments"),
+            ("routes", "ec2:SearchTransitGatewayRoutes"),
+            ("vpc_attachments", "ec2:DescribeTransitGatewayVpcAttachments"),
+        ],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_transit_gateway_read_is_na(
+        self, mock_ac, mock_ec2, mock_nfw, key, action
+    ):
+        tgw = self._tgw()
+        tgw[key] = _make_client_error("UnauthorizedOperation", "denied")
+        findings = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            routes={
+                "subnet-a": ("TransitGatewayId", "tgw-1"),
+                "subnet-tgw": ("VpcEndpointId", "vpce-fw9"),
+            },
+            firewalls={"fw9": ("vpc-insp", ["vpce-fw9"], "p1")},
+            tgw=tgw,
+        )
+
+        (row,) = findings
+        assert row["Status"] == "N/A"
+        assert row["Resolution"] == f"Grant {action} and retry."
+        assert "tgw-1" in row["Finding_Details"]
+
     @patch("agentcore_app.network_firewall_client")
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
@@ -48947,7 +50500,8 @@ class TestAC49NetworkFirewallEgress:
 
         findings = agentcore_app.check_agentcore_network_firewall_egress()
 
-        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        # Round 8: the allow-list sync row is N/A on the unread policy.
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "N/A"]
 
     @patch("agentcore_app.network_firewall_client", None)
     @patch("agentcore_app.ec2_client")
@@ -50210,12 +51764,14 @@ class TestAgentCoreCompositeAlarmCredit:
     def test_ac40_a_score_alarm_actioned_only_by_a_composite_passes(self, mock_ac):
         _online_evaluation_client(mock_ac)
         with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            others, listed = _companion_scores()
             mock_cw.describe_alarms.return_value = {
-                "MetricAlarms": [_silent(_score_alarm())],
+                "MetricAlarms": [_silent(_score_alarm()), *others],
                 "CompositeAlarms": [_composite("rollup", 'ALARM("eval-score-drop")')],
             }
             mock_cw.list_metrics.side_effect = lambda Namespace, **_: _published(
-                (Namespace, "Builtin.Harmfulness", {})
+                (Namespace, "Builtin.Harmfulness", {}),
+                *((Namespace, name, {}) for _, name, _ in listed),
             )
             findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
 
@@ -50780,6 +52336,307 @@ def _nfw_stateful_pass(destination="ANY", port="443", protocol="TCP"):
             ]
         }
     }
+
+
+class TestAC49EgressAllowListSync:
+    """AIR-FND-NET-03: the DNS Firewall allow-list and the Network Firewall
+    ALLOWLIST Targets of each firewall a hosting VPC egresses through admit the
+    same names."""
+
+    _SYNC = "AgentCore Egress Allow-List Sync"
+
+    @staticmethod
+    def _dns(mock_r53, vpcs, managed=()):
+        """vpcs maps a VPC id to its rules in evaluation order, each
+        (action, domains) or (action, "managed"), or to an exception the
+        association list raises."""
+        lists = {}
+
+        def associations(VpcId=None, **_):
+            value = vpcs.get(VpcId, [])
+            if isinstance(value, Exception):
+                raise value
+            return {
+                "FirewallRuleGroupAssociations": [
+                    {"FirewallRuleGroupId": f"rslvr-frg-{VpcId}", "Priority": 101}
+                ]
+                if value
+                else []
+            }
+
+        def rules(FirewallRuleGroupId=None, **_):
+            vpc = FirewallRuleGroupId.removeprefix("rslvr-frg-")
+            listed = []
+            for i, (action, domains) in enumerate(vpcs[vpc]):
+                list_id = (
+                    f"rslvr-fdl-managed-{i}"
+                    if domains == "managed"
+                    else f"rslvr-fdl-{vpc}-{i}"
+                )
+                lists[list_id] = [] if domains == "managed" else list(domains)
+                listed.append(
+                    {
+                        "Name": f"rule-{i}",
+                        "Priority": 10 * (i + 1),
+                        "Action": action,
+                        "FirewallDomainListId": list_id,
+                    }
+                )
+            return {"FirewallRules": listed}
+
+        mock_r53.list_firewall_rule_group_associations.side_effect = associations
+        mock_r53.list_firewall_rules.side_effect = rules
+        mock_r53.list_firewall_domains.side_effect = lambda FirewallDomainListId, **_: {
+            "Domains": lists[FirewallDomainListId]
+        }
+        mock_r53.list_firewall_domain_lists.side_effect = lambda **_: {
+            "FirewallDomainLists": [
+                {"Id": list_id, "ManagedOwnerName": "Route 53 Resolver DNS Firewall"}
+                for list_id in lists
+                if "managed" in list_id
+            ]
+        }
+
+    def _run(self, mock_ac, mock_ec2, mock_nfw, mock_r53, vpcs, targets, **wire):
+        """Two hosting VPCs, vpc-a through fw1 and vpc-b through fw2, each
+        firewall with its own allow-list of `targets[name]`."""
+        group = "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/{}".format
+        TestAC49NetworkFirewallEgress()._wire(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            subnets={
+                "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                "subnet-b": ("vpc-b", "10.1.1.0/24"),
+            },
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-b": ("VpcEndpointId", "vpce-fw2"),
+            },
+            firewalls={
+                "fw1": ("vpc-a", ["vpce-fw1"], "p1"),
+                "fw2": ("vpc-b", ["vpce-fw2"], "p2"),
+            },
+            policies={
+                "p1": _nfw_policy(groups=(group("allow-fw1"),)),
+                "p2": _nfw_policy(groups=(group("allow-fw2"),)),
+            },
+            groups={
+                group(name): {
+                    "RulesSource": {
+                        "RulesSourceList": {
+                            "Targets": list(targets[name.removeprefix("allow-")]),
+                            "TargetTypes": ["TLS_SNI", "HTTP_HOST"],
+                            "GeneratedRulesType": "ALLOWLIST",
+                        }
+                    }
+                }
+                for name in ("allow-fw1", "allow-fw2")
+            },
+            **wire,
+        )
+        self._dns(mock_r53, vpcs)
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+        rows = {
+            f["Finding_Details"].split(",", 1)[0].removeprefix("VPC "): f
+            for f in findings
+            if f["Finding"] == self._SYNC
+        }
+        for finding in rows.values():
+            assert finding["Check_ID"] == "AC-49"
+            assert_finding_schema(finding)
+        return rows
+
+    _IN_SYNC = [
+        ("ALLOW", ["example.com.", "*.example.com.", "api.partner.io."]),
+        ("BLOCK", ["*."]),
+    ]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_name_one_list_admits_and_the_other_does_not_fails(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {"vpc-a": self._IN_SYNC, "vpc-b": self._IN_SYNC},
+            {
+                "fw1": [".example.com", "api.partner.io"],
+                "fw2": [".example.com", "evil.io"],
+            },
+        )
+
+        assert rows["vpc-a"]["Status"] == "Passed"
+        assert (
+            "admit the same 3 DNS Firewall name(s) and 2 Network Firewall target(s)"
+            in rows["vpc-a"]["Finding_Details"]
+        )
+        assert rows["vpc-b"]["Status"] == "Failed"
+        details = rows["vpc-b"]["Finding_Details"]
+        assert (
+            "the DNS Firewall allow-list admits api.partner.io, which firewall "
+            "fw2's ALLOWLIST does not" in details
+        )
+        assert (
+            "firewall fw2's ALLOWLIST admits evil.io, which the DNS Firewall "
+            "allow-list does not" in details
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_must_match_on_both_sides(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        # A Network Firewall ".example.com" target admits example.com and every
+        # subdomain; a DNS Firewall "*.example.com" admits only the subdomains.
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {
+                "vpc-a": [("ALLOW", ["*.example.com."]), ("BLOCK", ["*."])],
+                "vpc-b": [("ALLOW", ["www.example.com."]), ("BLOCK", ["*."])],
+            },
+            {"fw1": [".example.com"], "fw2": ["www.example.com"]},
+        )
+
+        assert rows["vpc-a"]["Status"] == "Failed"
+        assert (
+            "firewall fw1's ALLOWLIST admits .example.com, which the DNS Firewall "
+            "allow-list does not" in rows["vpc-a"]["Finding_Details"]
+        )
+        assert rows["vpc-b"]["Status"] == "Passed"
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_block_of_the_same_name_removes_it(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {
+                "vpc-a": [
+                    ("BLOCK", ["api.partner.io."]),
+                    ("BLOCK", "managed"),
+                    ("ALERT", ["example.com.", "api.partner.io."]),
+                    ("BLOCK", ["*."]),
+                ],
+                "vpc-b": [("ALLOW", ["example.com."]), ("BLOCK", ["*."])],
+            },
+            {"fw1": ["example.com"], "fw2": ["example.com", "api.partner.io"]},
+        )
+
+        assert rows["vpc-a"]["Status"] == "Passed"
+        assert rows["vpc-b"]["Status"] == "Failed"
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_wildcard_block_removes_the_names_it_covers(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53
+    ):
+        # DNS Firewall's "*.partner.io" matches every subdomain of partner.io
+        # and not partner.io itself, so the later ALLOW still answers the apex
+        # and answers neither api.partner.io nor anything under eu.partner.io.
+        rules = [
+            ("BLOCK", ["*.partner.io."]),
+            ("ALLOW", ["example.com.", "partner.io.", "api.partner.io."]),
+            ("ALLOW", ["*.eu.partner.io."]),
+            ("BLOCK", ["*."]),
+        ]
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {"vpc-a": rules, "vpc-b": rules},
+            {
+                "fw1": ["example.com", "partner.io"],
+                "fw2": ["example.com", "partner.io", "api.partner.io"],
+            },
+        )
+
+        assert rows["vpc-a"]["Status"] == "Passed"
+        assert (
+            "admit the same 2 DNS Firewall name(s)" in rows["vpc-a"]["Finding_Details"]
+        )
+        assert rows["vpc-b"]["Status"] == "Failed"
+        assert (
+            "firewall fw2's ALLOWLIST admits api.partner.io, which the DNS Firewall "
+            "allow-list does not" in rows["vpc-b"]["Finding_Details"]
+        )
+        assert (
+            "the DNS Firewall allow-list admits" not in rows["vpc-b"]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "vpc_a, text, action",
+        [
+            (
+                [("ALLOW", ["example.com."]), ("ALERT", ["*."])],
+                "the DNS Firewall associated with vpc-a answers every name, so it "
+                "holds no allow-list to compare",
+                None,
+            ),
+            (
+                [("ALLOW", "managed"), ("BLOCK", ["*."])],
+                "allows an AWS managed domain list, whose names are not read",
+                None,
+            ),
+            (
+                _make_client_error("AccessDeniedException", "denied"),
+                "the DNS Firewall rule groups associated with vpc-a could not be "
+                "listed",
+                "route53resolver:ListFirewallRuleGroupAssociations",
+            ),
+        ],
+    )
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_dns_allow_list_not_read_is_na(
+        self, mock_ac, mock_ec2, mock_nfw, mock_r53, vpc_a, text, action
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            mock_r53,
+            {"vpc-a": vpc_a, "vpc-b": self._IN_SYNC},
+            {"fw1": [".example.com"], "fw2": [".example.com", "api.partner.io"]},
+        )
+
+        assert rows["vpc-a"]["Status"] == "N/A"
+        assert text in rows["vpc-a"]["Finding_Details"]
+        if action:
+            assert rows["vpc-a"]["Resolution"] == f"Grant {action} and retry."
+        assert rows["vpc-b"]["Status"] == "Passed"
+
+    @patch("agentcore_app.route53resolver_client", None)
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_resolver_client_is_na(self, mock_ac, mock_ec2, mock_nfw):
+        TestAC49NetworkFirewallEgress()._wire(mock_ac, mock_ec2, mock_nfw)
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+        (row,) = [f for f in findings if f["Finding"] == self._SYNC]
+        assert row["Status"] == "N/A"
+        assert "Route 53 Resolver client is not available" in row["Finding_Details"]
 
 
 class TestAC49FirewallBypasses:
@@ -51526,12 +53383,16 @@ class TestAC26LogArchiveForwarding:
         spans=False,
         invocation=None,
         destinations=None,
+        streams=None,
+        owners=None,
     ):
         """Run the archive leg over `groups`, each with its `filters` list or
         an exception, one Firehose description and a lock per bucket.
         `invocation` is the Bedrock invocation log group name, or an exception
         the logging configuration read raises; `destinations` is this
-        account's CloudWatch Logs destinations, or an exception."""
+        account's CloudWatch Logs destinations, or an exception. `streams`
+        maps a stream name to its description; `owners` maps a bucket to the
+        account that owns it, a Log Archive account by default."""
         mock_logs = MagicMock()
         listed = {"/aws/bedrock-agentcore/": [self._group(name) for name in groups]}
         if spans:
@@ -51571,12 +53432,21 @@ class TestAC26LogArchiveForwarding:
         firehose = MagicMock()
         if isinstance(stream, Exception):
             firehose.describe_delivery_stream.side_effect = stream
+        elif streams is not None:
+            firehose.describe_delivery_stream.side_effect = (
+                lambda DeliveryStreamName=None: streams[DeliveryStreamName]
+            )
         else:
             firehose.describe_delivery_stream.return_value = stream or self._stream()
         mock_s3 = MagicMock()
         locks = locks or {"archive-bucket": self._lock()}
+        owners = owners or {}
 
-        def get_object_lock_configuration(Bucket=None, **_):
+        def get_object_lock_configuration(Bucket=None, ExpectedBucketOwner=None):
+            if ExpectedBucketOwner is not None and ExpectedBucketOwner != owners.get(
+                Bucket, "999988887777"
+            ):
+                raise _make_client_error("AccessDenied", "Access Denied")
             value = locks[Bucket]
             if isinstance(value, Exception):
                 raise value
@@ -51681,6 +53551,29 @@ class TestAC26LogArchiveForwarding:
         )
         assert rows["locked"]["Status"] == "Passed"
         assert rows["locked"]["Finding"] == "AgentCore Log Archive Destination"
+
+    def test_a_destination_bucket_the_log_archive_account_owns_passes(self):
+        # The destination leg runs in the Log Archive account, which owns its
+        # own archive bucket, so the separate-account read is not made there.
+        rows = self._run(
+            [],
+            {},
+            locks={"archive-bucket": self._lock(), "other-bucket": self._lock()},
+            owners={"archive-bucket": self._ACCOUNT, "other-bucket": self._ACCOUNT},
+            streams={
+                "archive": self._stream(),
+                "other": self._stream(bucket="other-bucket", status="CREATING"),
+            },
+            destinations=[
+                self._destination("locked", self._STREAM),
+                self._destination("creating", self._STREAM.replace("archive", "other")),
+            ],
+        )
+        assert rows["locked"]["Status"] == "Passed"
+        assert rows["creating"]["Status"] == "Failed"
+        assert [
+            c.kwargs for c in self.s3.get_object_lock_configuration.call_args_list
+        ] == [{"Bucket": "archive-bucket"}]
 
     def test_an_unlisted_destination_set_is_na(self):
         findings = self._run(
@@ -51788,7 +53681,65 @@ class TestAC26LogArchiveForwarding:
         )
         assert {row["Status"] for row in rows.values()} == {"Passed"}
         assert self.firehose.describe_delivery_stream.call_count == 1
-        assert self.s3.get_object_lock_configuration.call_count == 1
+        # Round 8: the owner read is a second call, and each is made once.
+        assert [
+            c.kwargs for c in self.s3.get_object_lock_configuration.call_args_list
+        ] == [
+            {"Bucket": "archive-bucket"},
+            {"Bucket": "archive-bucket", "ExpectedBucketOwner": "123456789012"},
+        ]
+
+    def test_a_bucket_this_account_owns_fails(self):
+        # Before round 8 ExpectedBucketOwner was never passed, so a locked
+        # bucket in the assessed account passed as a Log Archive copy.
+        rows = self._run(
+            ["/aws/bedrock-agentcore/runtimes/a", "/aws/bedrock-agentcore/runtimes/b"],
+            {
+                "/aws/bedrock-agentcore/runtimes/a": [self._filter(self._STREAM)],
+                "/aws/bedrock-agentcore/runtimes/b": [
+                    self._filter(self._STREAM.replace("archive", "local"))
+                ],
+            },
+            streams={
+                "archive": self._stream(),
+                "local": self._stream(bucket="local-bucket"),
+            },
+            locks={"archive-bucket": self._lock(), "local-bucket": self._lock()},
+            owners={"local-bucket": self._ACCOUNT},
+        )
+        good = rows["/aws/bedrock-agentcore/runtimes/a"]
+        assert good["Status"] == "Passed"
+        assert (
+            "a read naming account 123456789012 as its expected owner is denied"
+            in good["Finding_Details"]
+        )
+        bad = rows["/aws/bedrock-agentcore/runtimes/b"]
+        assert bad["Status"] == "Failed"
+        assert (
+            "bucket 'local-bucket', which account 123456789012 owns, so the "
+            "archive is not held in a separate Log Archive account"
+            in bad["Finding_Details"]
+        )
+
+    def test_an_unread_bucket_owner_is_na(self):
+        lock = self._lock()
+
+        def owner_unread(Bucket=None, ExpectedBucketOwner=None):
+            if ExpectedBucketOwner is not None:
+                raise _make_client_error("SlowDown", "slow")
+            return lock
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object_lock_configuration.side_effect = owner_unread
+        with patch("agentcore_app.s3_client", mock_s3):
+            state, text = agentcore_app._archive_bucket_lock(
+                "archive-bucket", {}, source_account=self._ACCOUNT
+            )
+        assert state == "unread"
+        assert (
+            "s3:GetBucketObjectLockConfiguration with ExpectedBucketOwner "
+            "123456789012 on bucket 'archive-bucket'" in text
+        )
 
     def test_one_good_filter_of_two_passes(self):
         rows = self._run(
@@ -53603,6 +55554,86 @@ class TestAC35PolicyInputGuards:
         assert named in rows["gw-a"]["Finding_Details"]
         assert rows["gw-b"]["Status"] == "Passed"
 
+    @staticmethod
+    def _mcp_server_target(schema):
+        server = {"endpoint": "https://mcp.example.com/mcp"}
+        if schema is not None:
+            server["mcpToolSchema"] = schema
+        return {
+            "t-mcp": {
+                "name": "ledger",
+                "targetConfiguration": {"mcp": {"mcpServer": server}},
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            ('when { context.input.memo == "x" }', "Failed"),
+            ("when { context.input.amount > 500 }", "Passed"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "where, shape",
+        [("inline", "list"), ("inline", "tools"), ("s3", "list")],
+        ids=["inline-list", "inline-tools-object", "s3-list"],
+    )
+    def test_an_mcp_server_static_tool_schema_is_judged(
+        self, condition, status, where, shape
+    ):
+        # McpServerTargetConfiguration.mcpToolSchema names the server's tools
+        # inline or in S3. Before round 8 such a target read N/A as not a
+        # Lambda, OpenAPI or Smithy target.
+        body = json.dumps(
+            self._LEDGER_TOOLS if shape == "list" else {"tools": self._LEDGER_TOOLS}
+        )
+        schema = (
+            {"inlinePayload": body}
+            if where == "inline"
+            else {"s3": {"uri": "s3://schemas/mcp.json"}}
+        )
+        post = 'action == AgentCore::Action::"ledger___post"'
+        rows = self._run(
+            [
+                _input_forbid(condition, action=post),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=self._mcp_server_target(schema),
+            s3_objects={"schemas/mcp.json": body.encode()},
+        )
+        assert rows["gw-a"]["Status"] == status
+        if status == "Failed":
+            assert (
+                "context.input.memo on ledger___post" in rows["gw-a"]["Finding_Details"]
+            )
+        assert "not a Lambda, OpenAPI or Smithy" not in rows["gw-a"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "schema, reason",
+        [
+            (None, "it is an MCP server target with no static mcpToolSchema"),
+            ({"inlinePayload": "not json"}, "its inline MCP tool schema was not read"),
+            (
+                {"inlinePayload": json.dumps({"tools": "x"})},
+                "it is not a JSON list of tool definitions",
+            ),
+            ({"s3": {"uri": "s3://schemas/absent.json"}}, "(AccessDenied)"),
+        ],
+        ids=["dynamic", "not-json", "not-a-list", "s3-denied"],
+    )
+    def test_an_mcp_server_schema_not_read_is_na(self, schema, reason):
+        post = 'action == AgentCore::Action::"ledger___post"'
+        rows = self._run(
+            [
+                _input_forbid("when { context.input.amount > 500 }", action=post),
+                _input_forbid("when { context.input.amount > 500 }"),
+            ],
+            targets=self._mcp_server_target(schema),
+        )
+        assert rows["gw-a"]["Status"] == "N/A"
+        assert reason in rows["gw-a"]["Finding_Details"]
+        assert rows["gw-b"]["Status"] == "Passed"
+
 
 class TestGatewayWafUnreadFrontDoors:
     """AIR-FND-NET-04: the WAF rows judge AgentCore gateways only, because the
@@ -54181,7 +56212,12 @@ class TestAC49FirewallAlertLogging:
             patch("agentcore_app.network_firewall_client", mock_nfw),
         ):
             findings = agentcore_app.check_agentcore_network_firewall_egress(inventory)
-        assert len(findings) == 2
+        # Round 8: the third row is the allow-list sync row, N/A with no
+        # Route 53 Resolver client wired.
+        assert [f["Finding"] for f in findings][2:] == [
+            "AgentCore Egress Allow-List Sync"
+        ]
+        assert len(findings) == 3
         return self._base._rows(findings)
 
     def test_both_firewalls_logging_alerts_pass(self):

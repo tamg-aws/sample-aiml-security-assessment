@@ -1876,6 +1876,24 @@ Resources:
             Action:
               - s3:GetObject # AC-34, AC-35
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
+          - Sid: TransitGatewayEgressRead
+            # AC-49 follows a hosting subnet's internet route through a transit
+            # gateway: the VPC's attachment and the route table it is
+            # associated with, then each VPC attachment an internet route
+            # names. Neither action has a resource type in the service
+            # authorization reference, so both take '*'.
+            Effect: Allow
+            Action:
+              - ec2:DescribeTransitGatewayAttachments # AC-49
+              - ec2:DescribeTransitGatewayVpcAttachments # AC-49
+            Resource: '*'
+          - Sid: TransitGatewayRouteRead
+            # AC-49 searches the route table the hosting VPC's transit gateway
+            # attachment is associated with, in this account.
+            Effect: Allow
+            Action:
+              - ec2:SearchTransitGatewayRoutes # AC-49
+            Resource: !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:transit-gateway-route-table/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

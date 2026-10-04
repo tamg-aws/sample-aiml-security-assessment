@@ -304,6 +304,81 @@ section.
 
 ### Fixed
 
+- AgentCore checks that passed on a partial read now fail or hold back
+  `Passed`:
+  - `AC-27` and `AC-47` credit a network-path Deny only when it is keyed on
+    `aws:SourceVpc` or `aws:SourceVpce`. A Deny keyed on `aws:SourceIp` or
+    `aws:VpcSourceIp`, alone or ANDed with a VPC key, now fails, because a
+    SourceIp list admits its public addresses from the internet and a
+    VpcSourceIp range can repeat in another VPC.
+  - `AC-40` passed a configuration on a tool-choice alarm when ListMetrics
+    listed no score for `Builtin.Harmfulness` or `Builtin.Stereotyping`. Such
+    a configuration is now `N/A`, naming the unlisted score.
+  - `AC-34` scans every file system layer of a runtime's container image,
+    every platform of an index included, for AWS access key IDs, private key
+    blocks and `.env` credentials. Layers over 512 MiB compressed or
+    unpacking past 1 GiB, or a layer that cannot be read or unpacked, make the
+    image `N/A`; files over 4 MiB are counted as not scanned.
+  - `AC-35`'s Policy Input Guard reads an MCP server target's static
+    `mcpToolSchema`, inline or in S3, and judges its tools as it judges a
+    Lambda target's. An MCP server target with no static schema stays `N/A`,
+    now naming that its tools are discovered at run time.
+  - `AC-26` fails a log group whose archive bucket the assessed account owns.
+    A second `GetObjectLockConfiguration` with `ExpectedBucketOwner` set to
+    the assessed account must be denied for the bucket to count as a
+    separate Log Archive copy. The Log Archive account's own destination leg
+    does not make this read.
+  - `AIR-ACR-RT-13` now maps `AC-01`, whose VPC Placement Guardrail judges
+    the create-time SCP Null leg the control asks for.
+  - `AC-49` follows a hosting subnet's route to a transit gateway: the VPC's
+    attachment, the route table it is associated with, each active route
+    overlapping the subnet route that reaches the internet, and each VPC
+    attachment such a route names, whose subnets are judged as the hosting
+    subnets are. Before, every transit gateway route read `N/A`. A firewall
+    reached in another VPC with no `HOME_NET` fails the allow-list, because
+    it inspects only its own VPC's traffic. A route to a non-VPC attachment,
+    a prefix list, a truncated route search, or a VPC in another account is
+    `N/A` naming it, and a denied read is `N/A` naming the action.
+  - `AC-49` adds an `AgentCore Egress Allow-List Sync` row per hosting VPC. It
+    fails when the DNS Firewall allow-list ahead of a `BLOCK` over `"*"` and a
+    reached firewall's `ALLOWLIST` admit different names, naming each one,
+    and is `N/A` when either list cannot be read or is absent.
+  - `AIR-ACR-NET-03` now maps `SM-39`, whose egress legs judge the ECS,
+    Lambda, EKS and EC2 VPCs the control names.
+  - `AC-08` judges the S3, DynamoDB and SageMaker endpoint policies in every
+    VPC that hosts a VPC-mode runtime version, Code Interpreter or Browser, as
+    well as in VPCs that hold an AgentCore endpoint. Before, a runtime whose
+    VPC held only an S3 gateway endpoint left that endpoint's policy unjudged.
+    A hosting resource or subnet whose VPC cannot be read is `N/A` naming the
+    action.
+  - `AC-45` adds an `AgentCore Tool Execution Role Invoker Bound` row per
+    custom Code Interpreter and Browser. It fails when a principal that can
+    start the tool's sessions (`StartCodeInterpreterSession` or
+    `StartBrowserSession` on the tool's ARN) lacks one of the tool role's
+    grants, because that principal runs code with the role. No IAM change:
+    the row reads the IAM permission cache.
+  - AgentCore checks no longer crash on a long action pattern. The helper
+    that tests whether two IAM action patterns overlap recursed once per
+    character, so a cached policy holding a pattern of about 1,000 characters
+    raised RecursionError out of `AC-45` and every other caller. It now fills
+    the same table iteratively; two 2,001-character patterns take under half a
+    second.
+  - `AC-08` judges the data-path endpoints of a Region that holds VPC-mode
+    Code Interpreter or Browser tools and no runtime or gateway. It used to
+    stop at `No AgentCore resources found`, so the S3, DynamoDB and SageMaker
+    endpoint policies those tools reach went unjudged. The presence legs stay
+    `N/A`, since no AgentCore endpoint is required there.
+  - `AC-34` downloads each container image once per run, keyed by the image
+    digest `BatchGetImage` reports. It pulled the configuration and layers
+    again for every tag, version or runtime naming the same image, and at up
+    to 512 MiB per pull that could run the Lambda past its 600-second timeout
+    and return no rows. A failed read is also kept, so it is not retried.
+  - `AC-49`'s `AgentCore Egress Allow-List Sync` row withdraws every name an
+    earlier DNS Firewall `BLOCK` covers, matched as DNS Firewall matches: a
+    `BLOCK` on `*.example.com` refuses each subdomain and not `example.com`.
+    Before, only an identical entry was withdrawn, so a subdomain the BLOCK
+    refuses was counted as allowed and a firewall missing it failed the row.
+
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.
 - Derive selection notices and scope descriptions from the selected assessments.
@@ -1690,6 +1765,21 @@ When upgrading from an earlier release, complete the 2.0.0 member-role and
 central infrastructure updates first. Then apply this feature's parameters
 and rerun CodeBuild to deploy the assessment/report changes. No additional
 IAM permissions are introduced by service selection.
+
+**AgentCore image layer scan.** No IAM change: `AC-34` downloads layers
+through the `ecr:GetDownloadUrlForLayer` grant the image configuration read
+already uses, and `AC-26`'s owner read reuses
+`s3:GetBucketObjectLockConfiguration`. A container runtime's image now costs
+up to 512 MiB of layer download per assessed image, inside the AgentCore
+assessment Lambda's existing 600 second timeout.
+
+**AgentCore transit gateway egress reads.** `AgentCoreAssessmentReadsPolicy`
+gains `ec2:DescribeTransitGatewayAttachments` and
+`ec2:DescribeTransitGatewayVpcAttachments` on `*`, since neither action has a
+resource type, and `ec2:SearchTransitGatewayRoutes` on this account's
+`transit-gateway-route-table/*` (`AC-49`). Until the stack is updated, a VPC
+whose hosting subnets route to a transit gateway reads `N/A` naming the
+denied action.
 
 **SageMaker IoT audit and monitoring execution reads.**
 `SageMakerAssessmentReadsPolicy` gains `iot:ListAuditTasks` and
