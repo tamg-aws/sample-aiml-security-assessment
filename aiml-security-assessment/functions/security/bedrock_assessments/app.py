@@ -17172,6 +17172,7 @@ def _comprehend_redaction_outputs(region: str) -> Tuple[List[Dict[str, str]], st
         redaction = job.get("RedactionConfig") or {}
         outputs.append(
             {
+                "kind": "comprehend",
                 "name": str(job.get("JobName") or job.get("JobId") or "unnamed"),
                 "uri": uri,
                 "bucket": bucket,
@@ -17277,6 +17278,141 @@ def _objects_written_after(
     return {"listed": listed, "later": later, "error": ""}
 
 
+# PIIDetection PiiType values that rewrite a detected value; the Audit types
+# only report it.
+GLUE_MASKING_PII_TYPES = (
+    "RowMasking",
+    "RowPartialMasking",
+    "RowHashing",
+    "ColumnMasking",
+    "ColumnHashing",
+)
+
+
+def _glue_masked_by(nodes: Dict[str, Any], node_id: str, seen=()) -> Optional[set]:
+    """
+    Name the masking PIIDetection nodes every path into ``node_id`` passes
+    through, or None when a path from a source node reaches it unmasked.
+    """
+    node = nodes.get(node_id)
+    if node_id in seen or not isinstance(node, dict) or len(node) != 1:
+        return None
+    ((node_type, spec),) = node.items()
+    spec = spec if isinstance(spec, dict) else {}
+    if node_type == "PIIDetection" and spec.get("PiiType") in GLUE_MASKING_PII_TYPES:
+        return {node_id}
+    inputs = spec.get("Inputs") or []
+    if not inputs:
+        return None
+    masked: set = set()
+    for parent in inputs:
+        upstream = _glue_masked_by(nodes, parent, seen + (node_id,))
+        if upstream is None:
+            return None
+        masked |= upstream
+    return masked
+
+
+def _glue_redaction_outputs(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    List the S3 output of each AWS Glue visual job whose every path into an S3
+    target passes a PIIDetection node that masks or hashes what it detects,
+    with the end of the job's newest SUCCEEDED run, and what was not read.
+
+    Job.CodeGenConfigurationNodes holds a visual job's graph. A script job
+    carries no graph, so what its code redacts is not read.
+    """
+    glue = boto3.client("glue", config=boto3_config, region_name=region)
+    try:
+        jobs = []
+        for page in glue.get_paginator("get_jobs").paginate():
+            jobs.extend(page.get("Jobs") or [])
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return [], [
+            "AWS Glue jobs were not read with glue:GetJobs "
+            f"({get_assessment_error_label(error)}), so a Glue job that masks PII "
+            "before writing an S3 source is not credited"
+        ]
+    outputs: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for job in jobs:
+        name = str(job.get("Name") or "unnamed")
+        nodes = job.get("CodeGenConfigurationNodes") or {}
+        targets = []
+        for node_id, node in nodes.items():
+            if not isinstance(node, dict) or len(node) != 1:
+                continue
+            ((node_type, spec),) = node.items()
+            if not node_type.endswith("Target") or not isinstance(spec, dict):
+                continue
+            masked = _glue_masked_by(nodes, node_id)
+            if not masked:
+                continue
+            uri = spec.get("Path")
+            if not uri and spec.get("Database") and spec.get("Table"):
+                try:
+                    table = (
+                        glue.get_table(
+                            DatabaseName=spec["Database"], Name=spec["Table"]
+                        ).get("Table")
+                        or {}
+                    )
+                except (ClientError, BotoCoreError) as error:
+                    errors.append(
+                        f"the S3 location of Glue job '{name}' target table "
+                        f"{spec['Database']}.{spec['Table']} was not read with "
+                        f"glue:GetTable ({get_assessment_error_label(error)})"
+                    )
+                    continue
+                uri = (table.get("StorageDescriptor") or {}).get("Location")
+            if isinstance(uri, str) and uri.startswith("s3://"):
+                targets.append((uri, masked))
+        if not targets:
+            continue
+        try:
+            succeeded = [
+                run.get("CompletedOn")
+                for page in glue.get_paginator("get_job_runs").paginate(JobName=name)
+                for run in page.get("JobRuns") or []
+                if run.get("JobRunState") == "SUCCEEDED" and run.get("CompletedOn")
+            ]
+            end = max(succeeded) if succeeded else None
+        except (ClientError, BotoCoreError, TypeError) as error:
+            errors.append(
+                f"the runs of Glue job '{name}' were not read with glue:GetJobRuns "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        if end is None:
+            continue
+        for uri, masked in targets:
+            pii_nodes = [nodes[node_id]["PIIDetection"] for node_id in sorted(masked)]
+            bucket, _, prefix = uri[len("s3://") :].partition("/")
+            # A Glue path names a folder with or without a trailing slash.
+            prefix = prefix.rstrip("/") + "/" if prefix.strip("/") else ""
+            outputs.append(
+                {
+                    "kind": "glue",
+                    "name": name,
+                    "uri": uri,
+                    "bucket": bucket,
+                    "prefix": prefix,
+                    "types": sorted(
+                        {
+                            str(entity)
+                            for node in pii_nodes
+                            for entity in node.get("EntityTypesToDetect") or []
+                        }
+                    ),
+                    "mask_mode": ", ".join(
+                        sorted({str(node.get("PiiType")) for node in pii_nodes})
+                    ),
+                    "end": end,
+                }
+            )
+    return outputs, errors
+
+
 def _redaction_job_covers(job: Dict[str, Any], source: Dict[str, Any]) -> bool:
     """True when every prefix an S3 source ingests lies under a job's output."""
     return job["bucket"] == source["bucket"] and (
@@ -17329,6 +17465,12 @@ def check_bedrock_guardrail_pii_filters(
             if knowledge_base_inventory.get("knowledge_bases")
             else ([], "")
         )
+        glue_outputs, glue_errors = (
+            _glue_redaction_outputs(region)
+            if knowledge_base_inventory.get("knowledge_bases")
+            else ([], [])
+        )
+        redaction_outputs = redaction_outputs + glue_outputs
         # A redaction job is credited only when the index was built after it
         # completed, so each source a job's output covers has its ingestion
         # jobs read.
@@ -17354,7 +17496,7 @@ def check_bedrock_guardrail_pii_filters(
             ]
             if redaction_error
             else []
-        )
+        ) + glue_errors
         source_unread += [
             f"a data source a redaction job's output covers: {error}, so whether "
             "it was ingested after the job completed is unknown"
@@ -17369,7 +17511,9 @@ def check_bedrock_guardrail_pii_filters(
                 return None
             latest = window["latest"]
             for job in redaction_outputs:
-                if not _redaction_job_covers(job, source) or "ALL" not in job["types"]:
+                if not _redaction_job_covers(job, source) or (
+                    job["kind"] == "comprehend" and "ALL" not in job["types"]
+                ):
                     continue
                 if latest is not None:
                     lead = _days_between(job["end"], latest)
@@ -17415,7 +17559,7 @@ def check_bedrock_guardrail_pii_filters(
             if not job or not later:
                 return ""
             return (
-                f", whose Comprehend PII redaction job '{job['name']}' completed at "
+                f", whose {'Comprehend PII redaction job' if job['kind'] == 'comprehend' else 'AWS Glue job run'} '{job['name']}' completed at "
                 f"{job['end']}, but {len(later)} object(s) it ingests were last "
                 f"modified after that, such as {', '.join(later[:3])}, so they were "
                 "not redacted by the job"
@@ -17431,6 +17575,24 @@ def check_bedrock_guardrail_pii_filters(
             latest = ingestion_windows[
                 (source.get("knowledge_base_id"), source.get("data_source_id"))
             ]["latest"]
+            if job["kind"] == "glue":
+                return (
+                    f"ingests only the output of AWS Glue job '{job['name']}' "
+                    f"({job['uri']}), every path into whose S3 target passes a "
+                    f"PIIDetection node with PiiType {job['mask_mode']} over entity "
+                    f"type(s) {', '.join(job['types']) or 'none named'}, and whose "
+                    "newest SUCCEEDED run completed "
+                    + (
+                        "before the latest ingestion job started"
+                        if latest is not None
+                        else "with no ingestion job recorded for the source"
+                    )
+                    + "; s3:ListBucket lists {} object(s) the source ingests, none "
+                    "last modified after that run, and whether those entity types "
+                    "cover the PII the source holds is not judged".format(
+                        listing["listed"]
+                    )
+                )
             return (
                 f"ingests only the output of Comprehend PII redaction job "
                 f"'{job['name']}' ({job['uri']}), which redacts ALL PII entity "
@@ -17462,7 +17624,9 @@ def check_bedrock_guardrail_pii_filters(
                 "Redact PII before ingestion with a Comprehend PII redaction job that "
                 "redacts ALL entity types, whose output the data source ingests and "
                 "that completes after every object it covers is written and before "
-                "the next ingestion job, or a POST_CHUNKING transformation Lambda. "
+                "the next ingestion job, an AWS Glue visual job whose PIIDetection "
+                "node masks or hashes what it detects before the S3 target the data "
+                "source ingests, or a POST_CHUNKING transformation Lambda. "
                 "An agent or flow guardrail that sets AWS_ACCESS_KEY, AWS_SECRET_KEY "
                 "and PASSWORD to BLOCK or ANONYMIZE screens user messages and model "
                 "responses as defense in depth, but is not credited for the "

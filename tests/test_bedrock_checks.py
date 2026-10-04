@@ -18918,13 +18918,50 @@ class TestKnowledgeBaseScreening:
         ]
 
     def _br26(
-        self, inventory, jobs=None, jobs_error=None, ingestions=None, objects=None
+        self,
+        inventory,
+        jobs=None,
+        jobs_error=None,
+        ingestions=None,
+        objects=None,
+        glue_jobs=(),
+        glue_jobs_error=None,
+        glue_runs=None,
+        glue_tables=None,
     ):
+        """
+        ``glue_runs`` maps a Glue job name to its (JobRunState, CompletedOn)
+        runs, newest first, or to an exception; ``glue_tables`` maps
+        (database, table) to an S3 location or an exception.
+        """
         client = MagicMock()
         client.list_guardrails.return_value = {"guardrails": []}
         ingestions = ingestions or {}
         objects = objects or {}
+        glue_runs = glue_runs or {}
+        glue_tables = glue_tables or {}
         self.listed_prefixes = []
+
+        def get_jobs():
+            if glue_jobs_error:
+                raise glue_jobs_error
+            yield {"Jobs": list(glue_jobs)}
+
+        def get_job_runs(JobName):
+            # One run per page, so a newer run on a later page is still read.
+            runs = glue_runs.get(JobName, [])
+            if isinstance(runs, Exception):
+                raise runs
+            for state, completed in runs:
+                yield {"JobRuns": [{"JobRunState": state, "CompletedOn": completed}]}
+
+        def get_table(DatabaseName, Name):
+            location = glue_tables[(DatabaseName, Name)]
+            if isinstance(location, Exception):
+                raise location
+            return {"Table": {"StorageDescriptor": {"Location": location}}}
+
+        client.get_table.side_effect = get_table
 
         def list_objects(Bucket, Prefix):
             self.listed_prefixes.append((Bucket, Prefix))
@@ -18938,6 +18975,10 @@ class TestKnowledgeBaseScreening:
             paginator = MagicMock()
             if name == "list_objects_v2":
                 paginator.paginate.side_effect = list_objects
+            if name == "get_jobs":
+                paginator.paginate.side_effect = get_jobs
+            if name == "get_job_runs":
+                paginator.paginate.side_effect = get_job_runs
             return paginator
 
         client.get_paginator.side_effect = get_paginator
@@ -19348,6 +19389,177 @@ class TestKnowledgeBaseScreening:
             in rows[0]["Finding_Details"]
         )
         assert "data source 'whole' (S3)" in rows[1]["Finding_Details"]
+
+    @staticmethod
+    def _glue_job(name, target, pii_type="RowMasking", bypass=False):
+        """
+        A visual job reading one S3 source through a PIIDetection node into
+        ``target``; ``bypass`` adds a second, unmasked path into the target.
+        """
+        nodes = {
+            "src": {"S3CsvSource": {"Name": "raw", "Paths": ["s3://raw/"]}},
+            "pii": {
+                "PIIDetection": {
+                    "Name": "detect",
+                    "Inputs": ["src"],
+                    "PiiType": pii_type,
+                    "EntityTypesToDetect": ["EMAIL", "USA_SSN"],
+                }
+            },
+            "out": {next(iter(target)): dict(next(iter(target.values())))},
+        }
+        nodes["out"][next(iter(target))]["Inputs"] = (
+            ["pii", "src"] if bypass else ["pii"]
+        )
+        return {"Name": name, "CodeGenConfigurationNodes": nodes}
+
+    GLUE_DONE = [("SUCCEEDED", "2026-09-01T00:00:00Z")]
+
+    def _glue_estate(self, glue_jobs, glue_runs=None, glue_tables=None, **kwargs):
+        return self._br26(
+            self._inventory(
+                [
+                    self._kb(
+                        f"kb-{name}",
+                        [self._source(name, bucket=name, prefixes=["clean/2026/"])],
+                    )
+                    for name in ("a", "b")
+                ]
+            ),
+            ingestions={"a": ["2026-09-02T00:00:00Z"], "b": ["2026-09-02T00:00:00Z"]},
+            glue_jobs=glue_jobs,
+            glue_runs=glue_runs or {job["Name"]: self.GLUE_DONE for job in glue_jobs},
+            glue_tables=glue_tables,
+            **kwargs,
+        )
+
+    def test_br26_a_glue_masking_job_credits_only_the_source_it_writes(self):
+        rows = self._glue_estate(
+            [self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}})]
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "knowledge base 'kb-a'" in details
+        assert (
+            "ingests only the output of AWS Glue job 'mask-a' (s3://a/clean), every "
+            "path into whose S3 target passes a PIIDetection node with PiiType "
+            "RowMasking over entity type(s) EMAIL, USA_SSN, and whose newest "
+            "SUCCEEDED run completed before the latest ingestion job started" in details
+        )
+        assert "whether those entity types cover the PII" in details
+        assert "knowledge base 'kb-b'" in rows[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "job",
+        [
+            {"pii_type": "ColumnAudit"},
+            {"pii_type": "RowAudit"},
+            {"bypass": True},
+        ],
+        ids=["column-audit", "row-audit", "unmasked-second-path"],
+    )
+    def test_br26_a_glue_job_that_does_not_mask_every_path_is_not_credited(self, job):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean/"}}),
+                self._glue_job(
+                    "mask-b", {"S3DirectTarget": {"Path": "s3://b/clean/"}}, **job
+                ),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "AWS Glue job 'mask-b'" not in rows[1]["Finding_Details"]
+
+    def test_br26_a_glue_path_is_a_folder_not_a_name_prefix(self):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}}),
+                self._glue_job("mask-b", {"S3DirectTarget": {"Path": "s3://b/cle"}}),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+
+    def test_br26_a_glue_catalog_target_resolves_through_get_table(self):
+        rows = self._glue_estate(
+            [
+                self._glue_job(
+                    "mask-a", {"S3CatalogTarget": {"Database": "d", "Table": "ta"}}
+                ),
+                self._glue_job(
+                    "mask-b", {"CatalogTarget": {"Database": "d", "Table": "tb"}}
+                ),
+            ],
+            glue_tables={
+                ("d", "ta"): "s3://a/clean/",
+                ("d", "tb"): _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "AWS Glue job 'mask-a' (s3://a/clean/)" in rows[0]["Finding_Details"]
+        assert (
+            "the S3 location of Glue job 'mask-b' target table d.tb was not read "
+            "with glue:GetTable" in rows[1]["Finding_Details"]
+        )
+        assert "is not failed" not in rows[1]["Finding_Details"]
+
+    def test_br26_a_glue_run_after_the_ingestion_or_none_succeeded_is_not_credited(
+        self,
+    ):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}}),
+                self._glue_job("mask-b", {"S3DirectTarget": {"Path": "s3://b/clean"}}),
+            ],
+            glue_runs={
+                "mask-a": [("SUCCEEDED", "2026-09-03T00:00:00Z")],
+                "mask-b": [("FAILED", "2026-08-30T00:00:00Z")],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+
+    def test_br26_the_newest_succeeded_glue_run_is_the_one_judged(self):
+        rows = self._glue_estate(
+            [
+                self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}}),
+                self._glue_job("mask-b", {"S3DirectTarget": {"Path": "s3://b/clean"}}),
+            ],
+            glue_runs={
+                "mask-a": [
+                    ("FAILED", "2026-09-05T00:00:00Z"),
+                    ("SUCCEEDED", "2026-08-01T00:00:00Z"),
+                    ("SUCCEEDED", "2026-09-01T00:00:00Z"),
+                ],
+                "mask-b": [
+                    ("SUCCEEDED", "2026-08-01T00:00:00Z"),
+                    ("SUCCEEDED", "2026-09-03T00:00:00Z"),
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "completed at" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kwargs, text",
+        [
+            (
+                {"glue_jobs_error": _make_client_error("AccessDeniedException")},
+                "AWS Glue jobs were not read with glue:GetJobs",
+            ),
+            (
+                {"glue_runs": {"mask-a": _make_client_error("ThrottlingException")}},
+                "the runs of Glue job 'mask-a' were not read with glue:GetJobRuns",
+            ),
+        ],
+        ids=["get-jobs", "get-job-runs"],
+    )
+    def test_br26_an_unread_glue_job_withholds_the_failure(self, kwargs, text):
+        rows = self._glue_estate(
+            [self._glue_job("mask-a", {"S3DirectTarget": {"Path": "s3://a/clean"}})],
+            **kwargs,
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        for row in rows:
+            assert text in row["Finding_Details"]
 
     def _redacted_estate(self, objects):
         return self._br26(

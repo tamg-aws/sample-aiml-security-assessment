@@ -313,6 +313,7 @@ Resources:
               - bedrock-mantle:GetAccountDataRetention # BR-37
               - iam:GetAccountSummary # BR-50
               - redshift-serverless:ListWorkgroups # BR-20
+              - glue:GetJobs # BR-26
             Resource: '*'
           - Sid: CloudTrailEventDataStoreRead
             # BR-06 reads each event data store's Status and
@@ -546,18 +547,22 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail-profile/*'
           - Sid: GlueTableLocationRead
             # BR-20 resolves the S3 location of each AWS Glue Data Catalog table,
-            # and of each partition, a SQL knowledge base reads. The service
-            # authorization reference gives all three actions the catalog,
-            # database and table resource types.
+            # and of each partition, a SQL knowledge base reads; BR-26 resolves
+            # the table a Glue job writes and reads that job's runs. The service
+            # authorization reference gives GetTable, GetTables and
+            # GetPartitions the catalog, database and table resource types, and
+            # GetJobRuns the job resource type.
             Effect: Allow
             Action:
-              - glue:GetTable # BR-20
+              - glue:GetTable # BR-20, BR-26
               - glue:GetTables # BR-20
               - glue:GetPartitions # BR-20
+              - glue:GetJobRuns # BR-26
             Resource:
               - !Sub 'arn:${AWS::Partition}:glue:*:${AWS::AccountId}:catalog'
               - !Sub 'arn:${AWS::Partition}:glue:*:${AWS::AccountId}:database/*'
               - !Sub 'arn:${AWS::Partition}:glue:*:${AWS::AccountId}:table/*/*'
+              - !Sub 'arn:${AWS::Partition}:glue:*:${AWS::AccountId}:job/*'
           - Sid: InvocationLogAndSidecarObjectRead
             # BR-27 and BR-34 read the invocation log records of an S3-only
             # destination, and BR-04 reads ReplicationStatus with HeadObject,

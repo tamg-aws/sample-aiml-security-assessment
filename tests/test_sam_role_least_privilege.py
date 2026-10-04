@@ -163,6 +163,8 @@ _EXPECTED_ACTIONS = {
         "eks:ListClusters",
         "eks:ListPodIdentityAssociations",
         "events:ListTargetsByRule",
+        "glue:GetJobRuns",
+        "glue:GetJobs",
         "glue:GetPartitions",
         "glue:GetTable",
         "glue:GetTables",
@@ -1080,11 +1082,21 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                                 "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
                                 "${AWS::AccountId}:table/*/*"
                             },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:job/*"
+                            },
                         ]
                     ),
                 )
-                for action in ("glue:GetTable", "glue:GetTables", "glue:GetPartitions")
+                for action in (
+                    "glue:GetTable",
+                    "glue:GetTables",
+                    "glue:GetPartitions",
+                    "glue:GetJobRuns",
+                )
             ),
+            ("Allow", "glue:GetJobs", '"*"'),
             scoped("iam:GetPolicy", "iam::aws:policy/*"),
             scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
             ("Allow", "bedrock-mantle:GetAccountDataRetention", '"*"'),

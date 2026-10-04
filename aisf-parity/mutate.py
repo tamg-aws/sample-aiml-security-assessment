@@ -1084,6 +1084,55 @@ MUTATIONS = [
         "replace": '                "Passed",\n',
     },
     {
+        "name": "BR-26 credits a Glue PIIDetection node that only audits",
+        "file": BEDROCK,
+        "defect": "BR-26 treats an Audit PiiType as masking, so a Glue job that only reports PII is credited as redacting a knowledge base source",
+        "find": '    "ColumnHashing",\n)\n',
+        "replace": '    "ColumnHashing",\n    "ColumnAudit",\n    "RowAudit",\n)\n',
+    },
+    {
+        "name": "BR-26 credits a Glue target one path reaches unmasked",
+        "file": BEDROCK,
+        "defect": "BR-26 skips an unmasked path into a Glue target, so a job whose raw input also flows straight to the target is credited",
+        "find": "        if upstream is None:\n            return None\n",
+        "replace": "        if upstream is None:\n            continue\n",
+    },
+    {
+        "name": "BR-26 matches a Glue path as a name prefix",
+        "file": BEDROCK,
+        "defect": "BR-26 stops treating a Glue path as a folder, so s3://b/cle is credited as covering s3://b/clean/",
+        "find": '            prefix = prefix.rstrip("/") + "/" if prefix.strip("/") else ""\n',
+        "replace": "",
+    },
+    {
+        "name": "BR-26 judges the oldest SUCCEEDED Glue run",
+        "file": BEDROCK,
+        "defect": "BR-26 dates a Glue job by its oldest successful run, so a run that rewrote the source after the latest ingestion is missed",
+        "find": "            end = max(succeeded) if succeeded else None\n",
+        "replace": "            end = min(succeeded) if succeeded else None\n",
+    },
+    {
+        "name": "BR-26 dates a Glue job by a run that did not succeed",
+        "file": BEDROCK,
+        "defect": "BR-26 counts every Glue run state, so a FAILED run dates the job's redaction",
+        "find": 'if run.get("JobRunState") == "SUCCEEDED" and run.get("CompletedOn")',
+        "replace": 'if run.get("CompletedOn")',
+    },
+    {
+        "name": "BR-26 fails a source over an unread Glue read",
+        "file": BEDROCK,
+        "defect": "BR-26 drops the Glue read errors, so an unread GetJobs or GetJobRuns fails a source a Glue job may redact",
+        "find": "        ) + glue_errors\n",
+        "replace": "        )\n",
+    },
+    {
+        "name": "BR-26 ignores Glue redaction jobs",
+        "file": BEDROCK,
+        "defect": "BR-26 drops the Glue outputs, so a source a Glue job masks still fails",
+        "find": "        redaction_outputs = redaction_outputs + glue_outputs\n",
+        "replace": "",
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2886,6 +2935,25 @@ GROUPS: dict[str, str] = {
     "BR-04 passes inference data beside an unread endpoint": (
         "in the Bedrock agent and SageMaker retention legs"
     ),
+    "BR-26 credits a Glue PIIDetection node that only audits": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 credits a Glue target one path reaches unmasked": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 matches a Glue path as a name prefix": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 judges the oldest SUCCEEDED Glue run": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 dates a Glue job by a run that did not succeed": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 fails a source over an unread Glue read": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 ignores Glue redaction jobs": ("in the Bedrock knowledge base redaction"),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),
