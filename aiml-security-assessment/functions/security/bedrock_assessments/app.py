@@ -19937,12 +19937,38 @@ def _converse_guarded(body: Any, output: Any) -> bool:
     return False
 
 
+def _tool_result_only(content: Any) -> bool:
+    """True when a Converse user turn holds toolResult blocks and nothing else."""
+    blocks = (
+        [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+    )
+    return bool(blocks) and all("toolResult" in block for block in blocks)
+
+
+def _tool_result_only_turns(body: Any) -> int:
+    """Count the user turns of a Converse request that hold only toolResult blocks."""
+    messages = body.get("messages") if isinstance(body, dict) else None
+    return sum(
+        1
+        for message in (messages if isinstance(messages, list) else [])
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and _tool_result_only(message.get("content"))
+    )
+
+
 def _latest_user_turn(body: Any) -> Optional[List[Any]]:
-    """Return the content blocks of the last user message in a Converse request."""
+    """
+    Return the content blocks of the last user message in a Converse request
+    that does not hold only toolResult blocks. A guardContent block cannot wrap
+    a tool result, so a tool-result turn is not the turn the caller tags.
+    """
     messages = body.get("messages") if isinstance(body, dict) else None
     for message in reversed(messages if isinstance(messages, list) else []):
         if isinstance(message, dict) and message.get("role") == "user":
             content = message.get("content")
+            if _tool_result_only(content):
+                continue
             return content if isinstance(content, list) else []
     return None
 
@@ -20298,6 +20324,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
         converse_guarded = []
         converse_untagged = []
         converse_partial = []
+        tool_result_turns = [0]
         unread = []
 
         def visit_catch(record):
@@ -20347,9 +20374,13 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 return
             label = label_of(record)
             converse_guarded.append(label)
+            tool_result_turns[0] += _tool_result_only_turns(body)
             turn = _latest_user_turn(body)
             if turn is None:
-                unread.append(f"{label}, whose logged request holds no user turn")
+                unread.append(
+                    f"{label}, whose logged request holds no user turn other than "
+                    "tool results"
+                )
             elif not any(
                 isinstance(block, dict) and "guardContent" in block for block in turn
             ):
@@ -20412,6 +20443,11 @@ def check_guardrail_prompt_attack_invocation_evidence(
             "names guardrailConfig or its response carries a guardrail trace or "
             "intervention."
         )
+        tool_result_note = (
+            " {} user turn(s) of the guarded Converse calls held only toolResult "
+            "blocks and were not judged, because a guardContent block cannot wrap "
+            "a tool result.".format(tool_result_turns[0])
+        )
         if untagged or converse_untagged or converse_partial:
             findings["status"] = "FAIL"
             failures = []
@@ -20455,7 +20491,9 @@ def check_guardrail_prompt_attack_invocation_evidence(
                     )
                 )
             row(
-                "{} {}{}".format(" ".join(failures), catch_note, unread_note),
+                "{}{} {}{}".format(
+                    " ".join(failures), tool_result_note, catch_note, unread_note
+                ),
                 "Wrap the user-supplied part of each InvokeModel prompt in "
                 "amazon-bedrock-guardrails-guardContent_<tagSuffix> tags that "
                 "match the tagSuffix in amazon-bedrock-guardrailConfig, and mark "
@@ -20480,12 +20518,14 @@ def check_guardrail_prompt_attack_invocation_evidence(
             row(
                 "{} Every one of the {} guarded InvokeModel call(s) and {} guarded "
                 "Converse call(s) logged in {} in the last 24 hours tagged its "
-                "input. No example catch was read, which does not show the filter "
+                "input, a Converse call on every user turn holding a text block."
+                "{} No example catch was read, which does not show the filter "
                 "is off. {}".format(
                     catch_note,
                     len(guarded),
                     len(converse_guarded),
                     where,
+                    tool_result_note,
                     guarded_scope,
                 ),
                 "No action required.",
@@ -20497,13 +20537,14 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 "{} Every one of the {} guarded InvokeModel call(s) logged in {} "
                 "in the last 24 hours tagged its input with {}_<tagSuffix> "
                 "matching its amazon-bedrock-guardrailConfig tagSuffix, and every "
-                "one of the {} guarded Converse call(s) marked its latest user "
-                "turn with a guardContent block. {}".format(
+                "one of the {} guarded Converse call(s) marked each user turn "
+                "holding a text block with a guardContent block.{} {}".format(
                     catch_note,
                     len(guarded),
                     where,
                     GUARDRAIL_INPUT_TAG,
                     len(converse_guarded),
+                    tool_result_note,
                     guarded_scope,
                 ),
                 "No action required.",

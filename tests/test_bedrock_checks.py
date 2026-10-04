@@ -43244,6 +43244,11 @@ class TestInvocationLogGuardrailEvidence:
         assert "req-c-partial (Converse anthropic.test), message(s) 1." in detail
         assert "req-c-all" not in detail
         assert "sent their latest user turn with no" not in detail
+        assert (
+            "1 user turn(s) of the guarded Converse calls held only toolResult "
+            "blocks and were not judged, because a guardContent block cannot wrap "
+            "a tool result." in detail
+        )
 
     def test_every_guarded_converse_turn_marked_passes(self):
         rows = self._prompt(
@@ -43260,6 +43265,42 @@ class TestInvocationLogGuardrailEvidence:
         detail = rows[0]["Finding_Details"]
         assert "every one of the 1 guarded Converse call(s)" in detail
         assert "counts as guarded only when" in detail
+        assert "0 user turn(s) of the guarded Converse calls held only toolResult" in (
+            detail
+        )
+
+    def test_a_latest_tool_result_turn_is_not_judged_beside_a_tagged_call(self):
+        """An agent loop's latest user turn often holds only a tool result, which
+        guardContent cannot wrap, so the latest text turn is the one judged and
+        the Passed text claims only the turns holding text."""
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])]),
+                        self._converse(
+                            "req-c-tool",
+                            [
+                                ("user", [self.GUARD_BLOCK]),
+                                ("assistant", [{"toolUse": {"toolUseId": "t"}}]),
+                                ("user", [{"toolResult": {"toolUseId": "t"}}]),
+                            ],
+                        ),
+                    ]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "every one of the 2 guarded Converse call(s) marked each user turn "
+            "holding a text block with a guardContent block. 1 user turn(s) of the "
+            "guarded Converse calls held only toolResult blocks and were not judged"
+        ) in detail
+        assert "req-c-tool" not in detail
 
     def test_s3_only_records_are_read_and_an_untagged_call_fails(self):
         old_hour = (_dt.now(_tz.utc) - _td(hours=30)).strftime("%Y/%m/%d/%H/")

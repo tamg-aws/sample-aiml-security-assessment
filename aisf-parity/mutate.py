@@ -1828,6 +1828,13 @@ MUTATIONS = [
         "find": '                    searched[found["TrainingJobName"]] = found\n',
         "replace": "                    pass\n",
     },
+    {
+        "name": "BR-34 Converse: a tool-result turn is judged as the latest turn",
+        "file": BEDROCK,
+        "defect": "a Converse call whose latest user turn holds only a tool result failed",
+        "find": "            if _tool_result_only(content):\n                continue\n",
+        "replace": "            if False:\n                continue\n",
+    },
     # ------------------------------------------- SageMaker round-6 check logic
     # SM-39's egress legs for ECS and Lambda VPCs (AIR-SLF-RT-02) and SM-43's
     # artifact reads (AIR-SLF-CMP-08). Each was killed by hand on a byte backup
@@ -3720,6 +3727,9 @@ GROUPS: dict[str, str] = {
     "BR-26 front layer: a credited source ends the judgment": "in the Bedrock knowledge base redaction",
     "BR-42 parse: an unparsed policy keeps Passed": "in the Bedrock model allow-list policy reads",
     "BR-42 training: Search results ignored": "in the Bedrock training bucket policies",
+    "BR-34 Converse: a tool-result turn is judged as the latest turn": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
     DERIVED_PARTIAL_QUALIFIER_NAME: "in the tag column",
     "a (1 of N checks) qualifier dropped from a joint leg": "in the tag column",
     "a tag placed in a module that does not emit the check": "in the tag column",
