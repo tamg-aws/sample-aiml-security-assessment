@@ -13398,6 +13398,167 @@ def _redshift_provisioned_engine(identifier: str, store_region: str) -> Tuple[st
     )
 
 
+# GetPartitions pages read per partitioned table before its partition
+# locations count as unread.
+DATA_CATALOG_PARTITION_PAGES = 20
+
+
+def _data_catalog_table_buckets(
+    table_names: List[str], region: str
+) -> Tuple[Dict[str, List[str]], List[str]]:
+    """
+    Resolve the S3 buckets that hold the AWS Glue Data Catalog tables a SQL
+    knowledge base reads: ({bucket: [table]}, what was not read). A name is
+    database.table, and a wildcard in the table part is matched against every
+    table GetTables returns for the database. Each table's Location and
+    AdditionalLocations are read, and each partition's Location when the table
+    is partitioned.
+    """
+    buckets: Dict[str, List[str]] = {}
+    unread: List[str] = []
+    if not table_names:
+        return buckets, unread
+    glue = boto3.client("glue", config=boto3_config, region_name=region)
+    tables: List[Dict[str, Any]] = []
+    for name in table_names:
+        database, _, table = str(name).partition(".")
+        if not database or not table or "*" in database or "?" in database:
+            unread.append(
+                f"Data Catalog table name '{name}' names no single database, so its "
+                "tables were not enumerated"
+            )
+            continue
+        try:
+            if "*" in table or "?" in table:
+                matched = [
+                    item
+                    for page in glue.get_paginator("get_tables").paginate(
+                        DatabaseName=database
+                    )
+                    for item in page.get("TableList") or []
+                    if _wildcard_matches(table.lower(), str(item.get("Name")).lower())
+                ]
+                if not matched:
+                    unread.append(
+                        f"Data Catalog table name '{name}' matches no table "
+                        "GetTables returns"
+                    )
+                tables.extend(matched)
+            else:
+                tables.append(
+                    glue.get_table(DatabaseName=database, Name=table).get("Table") or {}
+                )
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"Data Catalog table '{name}' was not read: "
+                + _store_read_error(
+                    error,
+                    "glue:GetTables"
+                    if "*" in table or "?" in table
+                    else "glue:GetTable",
+                    region,
+                )
+            )
+    for item in tables:
+        label = f"{item.get('DatabaseName')}.{item.get('Name')}"
+        descriptor = item.get("StorageDescriptor") or {}
+        locations = [descriptor.get("Location")] + list(
+            descriptor.get("AdditionalLocations") or []
+        )
+        if item.get("PartitionKeys"):
+            try:
+                pages = glue.get_paginator("get_partitions").paginate(
+                    DatabaseName=item.get("DatabaseName"),
+                    TableName=item.get("Name"),
+                    ExcludeColumnSchema=True,
+                )
+                for count, page in enumerate(pages, start=1):
+                    if count > DATA_CATALOG_PARTITION_PAGES:
+                        raise ValueError(
+                            f"more than {DATA_CATALOG_PARTITION_PAGES} pages of "
+                            "partitions"
+                        )
+                    locations.extend(
+                        (partition.get("StorageDescriptor") or {}).get("Location")
+                        for partition in page.get("Partitions") or []
+                    )
+            except ValueError as error:
+                unread.append(f"table '{label}' has {error}, which were not all read")
+                continue
+            except (ClientError, BotoCoreError) as error:
+                unread.append(
+                    f"the partitions of table '{label}' were not read: "
+                    + _store_read_error(error, "glue:GetPartitions", region)
+                )
+                continue
+        if not any(locations):
+            unread.append(
+                f"table '{label}' (type {item.get('TableType') or 'unreported'}) "
+                "names no storage location, so where its data sits was not read"
+            )
+            continue
+        for location in locations:
+            if not location:
+                continue
+            scheme, _, rest = str(location).partition("://")
+            bucket = rest.split("/", 1)[0]
+            if scheme not in ("s3", "s3a") or not bucket:
+                unread.append(
+                    f"table '{label}' keeps data at {location}, which is not an S3 "
+                    "location"
+                )
+            elif label not in buckets.setdefault(bucket, []):
+                buckets[bucket].append(label)
+    return buckets, unread
+
+
+def _data_catalog_bucket_verdicts(
+    buckets: Dict[str, List[str]], region: str
+) -> Tuple[List[str], List[str], List[str]]:
+    """Judge each Data Catalog bucket's default encryption: (passed, failed, unread)."""
+    passed: List[str] = []
+    failed: List[str] = []
+    unread: List[str] = []
+    for bucket, tables in sorted(buckets.items()):
+        located = f"S3 bucket '{bucket}' (table(s) {', '.join(tables)})"
+        try:
+            encryption = _bucket_default_encryption(bucket, region)
+        except ClientError as error:
+            if (
+                error.response.get("Error", {}).get("Code")
+                == "ServerSideEncryptionConfigurationNotFoundError"
+            ):
+                failed.append(f"{located} has no default encryption configuration")
+            else:
+                unread.append(
+                    f"{located}: "
+                    + _store_read_error(error, "s3:GetEncryptionConfiguration", region)
+                )
+            continue
+        except BotoCoreError as error:
+            unread.append(
+                f"{located}: "
+                + _store_read_error(error, "s3:GetEncryptionConfiguration", region)
+            )
+            continue
+        if not encryption["customer_managed"]:
+            failed.append(
+                f"{located} uses {encryption['algorithm'] or 'no default algorithm'}"
+                + (f" with key {encryption['key']}" if encryption["key"] else "")
+                + ", not a customer managed KMS key"
+            )
+            continue
+        status, observed = _kms_key_verdict(encryption["key"], region)
+        text = f"{located} uses {encryption['algorithm']} with {observed}"
+        if status == "Passed":
+            passed.append(text)
+        elif status == "Failed":
+            failed.append(text)
+        else:
+            unread.append(text)
+    return passed, failed, unread
+
+
 def _assess_redshift_query_engine(
     kb_configuration: Dict[str, Any], region: str
 ) -> Dict[str, str]:
@@ -13405,7 +13566,7 @@ def _assess_redshift_query_engine(
     Judge the Redshift query engine behind a SQL knowledge base: the cluster or
     Serverless namespace key and whether it is publicly accessible. Tables a
     storage configuration reads from the AWS Glue Data Catalog keep their data
-    in S3, which is not read, so such a store is not Passed.
+    in S3, so each table's bucket default encryption is judged too.
     """
     redshift = (kb_configuration.get("sqlKnowledgeBaseConfiguration") or {}).get(
         "redshiftConfiguration"
@@ -13430,18 +13591,41 @@ def _assess_redshift_query_engine(
             "which this check does not read.",
         )
     catalogs = [
-        storage
+        (storage.get("awsDataCatalogConfiguration") or {}).get("tableNames") or []
         for storage in redshift.get("storageConfigurations") or []
         if storage.get("type") == "AWS_DATA_CATALOG"
     ]
-    if catalogs and status == "Passed":
-        return _store_verdict(
-            "N/A",
-            f"is a SQL knowledge base that {text}, but {len(catalogs)} storage "
-            "configuration(s) read tables from the AWS Glue Data Catalog, whose data "
-            "sits in S3 and is not judged.",
+    if not catalogs:
+        return _store_verdict(status, f"is a SQL knowledge base that {text}.")
+    table_names = [name for names in catalogs for name in names]
+    buckets, unread = _data_catalog_table_buckets(table_names, region)
+    unread += [
+        "an AWS_DATA_CATALOG storage configuration names no table"
+        for names in catalogs
+        if not names
+    ]
+    passed, failed, unread_buckets = _data_catalog_bucket_verdicts(buckets, region)
+    unread += unread_buckets
+    if failed:
+        status = "Failed"
+    elif unread and status == "Passed":
+        status = "N/A"
+    parts = [
+        f"{label}: {'; '.join(items)}"
+        for label, items in (
+            ("Default encryption is not a customer managed key", failed),
+            ("Not read", unread),
+            ("Default encryption is a customer managed key", passed),
         )
-    return _store_verdict(status, f"is a SQL knowledge base that {text}.")
+        if items
+    ]
+    return _store_verdict(
+        status,
+        f"is a SQL knowledge base that {text}. It reads {len(table_names)} AWS Glue "
+        f"Data Catalog table name(s), whose data sits in S3; each bucket's default "
+        "encryption is judged, not the key of each object already written. "
+        f"{'. '.join(parts)}.",
+    )
 
 
 KB_DATA_SOURCE_ENCRYPTION_FINDING = "Knowledge Base Data Source Bucket Encryption"
@@ -21138,7 +21322,8 @@ def _mantle_account_sentence(mantle: Dict[str, Any], control_mode: Any) -> str:
         f"The bedrock-mantle account mode, which a project set to inherit takes, "
         f"is {account}{differs}. Mantle projects are judged in the "
         f"{MANTLE_PROJECT_RETENTION_FINDING} rows. Each model's allowed_modes are "
-        "not read by this check."
+        "not read: GET /v1/models returns them, but bedrock-mantle:ListModels is "
+        "not granted to the Bedrock assessment role."
     )
 
 
@@ -21174,7 +21359,11 @@ def _mantle_account_finding(mantle: Dict[str, Any], region: str) -> Dict[str, An
             "N/A",
         )
     mode = mantle["account_mode"]
-    allowed_modes = " Each model's allowed_modes are not read by this check."
+    allowed_modes = (
+        " Each model's allowed_modes are not read: GET /v1/models returns them, "
+        "but bedrock-mantle:ListModels is not granted to the Bedrock assessment "
+        "role, so they are a missing grant, not an API limit."
+    )
     if mode == "none":
         return row(
             f"The bedrock-mantle account data-retention mode in {region} is none, "
@@ -21287,7 +21476,9 @@ def _mantle_project_findings(
                     "and the bedrock-mantle account are both inherit, so each "
                     "model's own default applies and no scope pins zero "
                     "retention. A model whose allowed_modes include none still "
-                    "retains nothing; per-model allowed_modes are not read."
+                    "retains nothing; per-model allowed_modes are not read, "
+                    "because bedrock-mantle:ListModels (GET /v1/models), which "
+                    "returns them, is not granted to the Bedrock assessment role."
                     + control_note,
                     "Set the project's data_retention mode, or the bedrock-mantle "
                     "account mode (PUT /v1/data_retention), to none.",

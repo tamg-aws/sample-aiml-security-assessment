@@ -869,6 +869,30 @@ MUTATIONS = [
         "replace": "            for next_owner, next_name in []\n",
     },
     {
+        "name": "BR-20 skips the Data Catalog tables of a SQL knowledge base",
+        "file": BEDROCK,
+        "defect": "BR-20 ignores the Glue Data Catalog tables a SQL knowledge base "
+        "reads, so a table whose S3 bucket has no customer managed key passes",
+        "find": "    buckets, unread = _data_catalog_table_buckets(table_names, region)\n",
+        "replace": "    buckets, unread = {}, []\n",
+    },
+    {
+        "name": "BR-20 reads no Data Catalog partition locations",
+        "file": BEDROCK,
+        "defect": "BR-20 judges a partitioned table by its table location only, so "
+        "a partition in a plaintext bucket passes",
+        "find": "                    locations.extend(\n",
+        "replace": "                    list(\n",
+    },
+    {
+        "name": "BR-20 reads Data Catalog partitions past its page cap",
+        "file": BEDROCK,
+        "defect": "BR-20 stops at the partition page cap and judges the pages it "
+        "read, so a partition past the cap goes unjudged in a Passed result",
+        "find": "                    if count > DATA_CATALOG_PARTITION_PAGES:\n",
+        "replace": "                    if False:\n",
+    },
+    {
         "name": "BR-33 drops a task with no task role",
         "file": BEDROCK,
         "defect": "BR-33 skips an ECS task with no task role, so an EC2 task whose "
@@ -2593,6 +2617,15 @@ GROUPS: dict[str, str] = {
         "in the Bedrock AI role chains"
     ),
     "BR-51 follows one role hop only": ("in the Bedrock AI role chains"),
+    "BR-20 skips the Data Catalog tables of a SQL knowledge base": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 reads no Data Catalog partition locations": (
+        "in the Bedrock knowledge base stores"
+    ),
+    "BR-20 reads Data Catalog partitions past its page cap": (
+        "in the Bedrock knowledge base stores"
+    ),
     "BR-42 credits an IfExists or ForAllValues bound on an open training grant": (
         "in the Bedrock training bucket policies"
     ),

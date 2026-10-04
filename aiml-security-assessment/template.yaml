@@ -439,11 +439,18 @@ Resources:
           - Sid: SSOPermissionSetPolicyList
             # BR-51 lists the AWS managed and customer managed policies of each
             # permission set. The service authorization reference gives both
-            # actions the Instance and PermissionSet resource types.
+            # actions the Instance and PermissionSet resource types. BR-51 also
+            # reads the attributes for access control that set the
+            # aws:PrincipalTag key a permission set's Deny tests;
+            # DescribeInstanceAccessControlAttributeConfiguration has the
+            # Instance resource type only, so the PermissionSet ARN grants it
+            # nothing. It was Sid IdentityCenterAttributeRead, folded in to keep
+            # this policy under its 5,500-character budget.
             Effect: Allow
             Action:
               - sso:ListManagedPoliciesInPermissionSet # BR-51
               - sso:ListCustomerManagedPolicyReferencesInPermissionSet # BR-51
+              - sso:DescribeInstanceAccessControlAttributeConfiguration # BR-51
             Resource:
               - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
               - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
@@ -480,21 +487,18 @@ Resources:
             Action:
               - kendra:DescribeIndex # BR-20
             Resource: !Sub 'arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*'
-          - Sid: InvocationLogStreamRead
+          - Sid: InvocationLogRead
             # BR-04 reads the most recently written stream of the invocation log
-            # group, with no event content. The service authorization reference
-            # gives DescribeLogStreams the log-group resource type.
+            # group, with no event content. BR-27 and BR-34 read the last 24
+            # hours of invocation log records that match a guardrail field, and
+            # report request IDs and scores, never a body. The service
+            # authorization reference gives DescribeLogStreams and
+            # FilterLogEvents the log-group resource type. Former Sids
+            # InvocationLogStreamRead and InvocationLogEventRead, merged to keep
+            # this policy under its 5,500-character budget.
             Effect: Allow
             Action:
               - logs:DescribeLogStreams # BR-04
-            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
-          - Sid: InvocationLogEventRead
-            # BR-27 and BR-34 read the last 24 hours of invocation log records
-            # that match a guardrail field, and report request IDs and scores,
-            # never a body. The service authorization reference gives
-            # FilterLogEvents the log-group resource type.
-            Effect: Allow
-            Action:
               - logs:FilterLogEvents # BR-27, BR-34
             Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
           - Sid: RedshiftQueryEngineRead
@@ -541,14 +545,20 @@ Resources:
             Resource:
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail/*'
               - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail-profile/*'
-          - Sid: IdentityCenterAttributeRead
-            # BR-51 reads the attributes for access control that set the
-            # aws:PrincipalTag key a permission set's Deny tests. The service
-            # authorization reference gives the action the Instance resource type.
+          - Sid: GlueTableLocationRead
+            # BR-20 resolves the S3 location of each AWS Glue Data Catalog table,
+            # and of each partition, a SQL knowledge base reads. The service
+            # authorization reference gives all three actions the catalog,
+            # database and table resource types.
             Effect: Allow
             Action:
-              - sso:DescribeInstanceAccessControlAttributeConfiguration # BR-51
-            Resource: !Sub 'arn:${AWS::Partition}:sso:::instance/*'
+              - glue:GetTable # BR-20
+              - glue:GetTables # BR-20
+              - glue:GetPartitions # BR-20
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:glue:*:${AWS::AccountId}:catalog'
+              - !Sub 'arn:${AWS::Partition}:glue:*:${AWS::AccountId}:database/*'
+              - !Sub 'arn:${AWS::Partition}:glue:*:${AWS::AccountId}:table/*/*'
           - Sid: InvocationLogAndSidecarObjectRead
             # BR-27 and BR-34 read the invocation log records of an S3-only
             # destination, and BR-04 reads ReplicationStatus with HeadObject,

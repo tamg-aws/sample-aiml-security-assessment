@@ -95,7 +95,9 @@ AI_SUBJECT_ROWS = [
         "bedrock-mantle account mode plus every mantle project's data_retention mode "
         "over SigV4-signed HTTPS; the mantle account mode is judged on its own row "
         "even with no project listed, each project's effective mode is judged, and "
-        "only none passes. Each model's allowed_modes are not read",
+        "only none passes. Each model's allowed_modes are not read: GET /v1/models "
+        "returns them, but bedrock-mantle:ListModels is not granted, a missing "
+        "grant held for approval and not an API limit, and every row says so",
         [],
         3,
     ),
@@ -1343,7 +1345,10 @@ AI_SUBJECT_ROWS = [
         "index of a KENDRA knowledge base (kendra:DescribeIndex KmsKeyId; none named "
         "fails), and the Redshift engine of a SQL knowledge base (a provisioned "
         "cluster's KmsKeyId, failing when Encrypted is false, or a Serverless "
-        "namespace's kmsKeyId, failing on AWS_OWNED_KMS_KEY), each judged by "
+        "namespace's kmsKeyId, failing on AWS_OWNED_KMS_KEY), and the default "
+        "encryption of each S3 bucket behind the AWS Glue Data Catalog tables and "
+        "partitions a SQL knowledge base reads (glue:GetTable, GetTables and "
+        "GetPartitions; an unresolved table is N/A), each judged by "
         "DescribeKey as customer managed and Enabled, plus the default encryption of each "
         "data source bucket, which is where the ingested objects sit before any index "
         "exists, and each data source's transient data key; BR-11 the custom model's "

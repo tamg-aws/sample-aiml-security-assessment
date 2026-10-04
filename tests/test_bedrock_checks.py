@@ -36089,14 +36089,22 @@ class TestBR20ValueDepth:
     WORKGROUP = f"arn:aws:redshift-serverless:us-west-2:{ACCOUNT}:workgroup/wg-1"
 
     @classmethod
-    def _sql_body(cls, engine, storage=("REDSHIFT",)):
+    def _sql_body(cls, engine, storage=("REDSHIFT",), tables=None):
         return {
             "knowledgeBaseConfiguration": {
                 "type": "SQL",
                 "sqlKnowledgeBaseConfiguration": {
                     "type": "REDSHIFT",
                     "redshiftConfiguration": {
-                        "storageConfigurations": [{"type": s} for s in storage],
+                        "storageConfigurations": [
+                            {"type": s}
+                            if s != "AWS_DATA_CATALOG" or tables is None
+                            else {
+                                "type": s,
+                                "awsDataCatalogConfiguration": {"tableNames": tables},
+                            }
+                            for s in storage
+                        ],
                         "queryEngineConfiguration": engine,
                     },
                 },
@@ -36290,6 +36298,183 @@ class TestBR20ValueDepth:
         )
         assert [r["Status"] for r in rows] == ["N/A", "Passed"]
         assert "AWS Glue Data Catalog" in rows[0]["Finding_Details"]
+
+    # DAT-01: a SQL knowledge base reading AWS Glue Data Catalog tables was
+    # always N/A, though glue:GetTable returns each table's S3 location.
+    @staticmethod
+    def _glue(tables, partitions=None, error=None):
+        glue = MagicMock()
+
+        def get_table(DatabaseName, Name):
+            if error is not None:
+                raise error
+            return {"Table": tables[f"{DatabaseName}.{Name}"]}
+
+        glue.get_table.side_effect = get_table
+
+        def paginator(name):
+            pager = MagicMock()
+            if name == "get_tables":
+                pager.paginate.side_effect = lambda DatabaseName: [
+                    {
+                        "TableList": [
+                            table
+                            for key, table in tables.items()
+                            if key.startswith(f"{DatabaseName}.")
+                        ]
+                    }
+                ]
+            else:
+                pager.paginate.side_effect = lambda DatabaseName, TableName, **_: (
+                    partitions or {}
+                )[f"{DatabaseName}.{TableName}"]
+            return pager
+
+        glue.get_paginator.side_effect = paginator
+        return glue
+
+    @staticmethod
+    def _table(database, name, location, partitioned=False, table_type=None):
+        table = {
+            "DatabaseName": database,
+            "Name": name,
+            "StorageDescriptor": {"Location": location} if location else {},
+        }
+        if partitioned:
+            table["PartitionKeys"] = [{"Name": "dt"}]
+        if table_type:
+            table["TableType"] = table_type
+        return table
+
+    def _catalog_run(self, glue, encryption, tables=("sales.orders", "sales.ev*")):
+        cluster = self._cluster(
+            [{"PubliclyAccessible": False, "Encrypted": True, "KmsKeyId": self.CMK}]
+        )
+        return self._run(
+            {
+                "kb1": self._sql_body(
+                    self._provisioned_engine(),
+                    storage=("REDSHIFT", "AWS_DATA_CATALOG"),
+                    tables=list(tables),
+                )
+            },
+            clients={"redshift": cluster, "glue": glue},
+            bucket_encryption=encryption,
+        )
+
+    @staticmethod
+    def _catalog_sse(algorithm, key=None):
+        default = {"SSEAlgorithm": algorithm}
+        if key:
+            default["KMSMasterKeyID"] = key
+        return {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [{"ApplyServerSideEncryptionByDefault": default}]
+            }
+        }
+
+    @pytest.mark.parametrize("partition_key", [None, "AWS"])
+    def test_sql_data_catalog_tables_are_judged_by_their_buckets(self, partition_key):
+        glue = self._glue(
+            {
+                "sales.orders": self._table("sales", "orders", "s3://cmk-data/orders/"),
+                "sales.events": self._table(
+                    "sales", "events", "s3://cmk-data/events/", partitioned=True
+                ),
+                "other.events": self._table("other", "events", "s3://ignored/"),
+            },
+            partitions={
+                "sales.events": [
+                    {
+                        "Partitions": [
+                            {"StorageDescriptor": {"Location": "s3://cmk-data/e/1/"}}
+                        ]
+                    },
+                    {
+                        "Partitions": [
+                            {"StorageDescriptor": {"Location": "s3://part-data/e/2/"}}
+                        ]
+                    },
+                ]
+            },
+        )
+        part_key = self.AWS_KEY if partition_key else self.CMK
+        rows = self._catalog_run(
+            glue,
+            {
+                "cmk-data": self._catalog_sse("aws:kms", self.CMK),
+                "part-data": self._catalog_sse("aws:kms", part_key),
+            },
+        )
+        status = "Failed" if partition_key else "Passed"
+        assert [r["Status"] for r in rows] == [status]
+        details = rows[0]["Finding_Details"]
+        assert "It reads 2 AWS Glue Data Catalog table name(s)" in details
+        assert "ignored" not in details
+        if partition_key:
+            assert (
+                "Default encryption is not a customer managed key: S3 bucket "
+                "'part-data' "
+                "(table(s) sales.events) uses aws:kms with KMS key"
+            ) in details
+            assert (
+                "Default encryption is a customer managed key: S3 bucket 'cmk-data'"
+            ) in details
+        else:
+            assert "S3 bucket 'part-data' (table(s) sales.events)" in details
+            assert "is not a customer managed key" not in details
+            assert "not the key of each object already written" in details
+
+    def test_sql_data_catalog_plaintext_bucket_fails(self):
+        glue = self._glue(
+            {"sales.orders": self._table("sales", "orders", "s3://plain-data/o/")}
+        )
+        rows = self._catalog_run(
+            glue, {"plain-data": self._catalog_sse("AES256")}, tables=("sales.orders",)
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "S3 bucket 'plain-data' (table(s) sales.orders) uses AES256, not a "
+            "customer managed KMS key"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tables, glue_kwargs, phrase",
+        [
+            (
+                ("sales.orders",),
+                {"error": _client_error("AccessDeniedException", "d", "GetTable")},
+                "glue:GetTable",
+            ),
+            (("sales.nothing*",), {}, "matches no table GetTables returns"),
+            (("*.orders",), {}, "names no single database"),
+            (("sales.view",), {}, "names no storage location"),
+            (("sales.remote",), {}, "which is not an S3 location"),
+            (("sales.big",), {}, "more than 20 pages of partitions"),
+        ],
+    )
+    def test_sql_data_catalog_unread_tables_withhold_the_pass(
+        self, tables, glue_kwargs, phrase
+    ):
+        glue = self._glue(
+            {
+                "sales.orders": self._table("sales", "orders", "s3://cmk-data/o/"),
+                "sales.view": self._table(
+                    "sales", "view", None, table_type="VIRTUAL_VIEW"
+                ),
+                "sales.remote": self._table("sales", "remote", "hdfs://x/y"),
+                "sales.big": self._table(
+                    "sales", "big", "s3://cmk-data/b/", partitioned=True
+                ),
+            },
+            partitions={"sales.big": [{"Partitions": []}] * 21},
+            **glue_kwargs,
+        )
+        rows = self._catalog_run(
+            glue, {"cmk-data": self._catalog_sse("aws:kms", self.CMK)}, tables=tables
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
 
     def test_sql_data_catalog_storage_does_not_soften_a_failure(self):
         client = self._cluster(
@@ -38165,7 +38350,11 @@ class TestBR37MantleDataRetention:
         assert row["Check_ID"] == "BR-37"
         if status != "N/A":
             assert f"mode in us-east-1 is {account}" in row["Finding_Details"]
-            assert "allowed_modes are not read" in row["Finding_Details"]
+            assert (
+                "allowed_modes are not read: GET /v1/models returns them, but "
+                "bedrock-mantle:ListModels is not granted to the Bedrock assessment "
+                "role, so they are a missing grant, not an API limit."
+            ) in row["Finding_Details"]
 
     def test_an_unread_mantle_account_mode_is_na(self):
         account_rows = []
@@ -38247,7 +38436,11 @@ class TestBR37MantleDataRetention:
         [project] = projects
         assert project["Status"] == "Failed"
         assert "effective mode model default" in project["Finding_Details"]
-        assert "allowed_modes are not read" in project["Finding_Details"]
+        assert (
+            "per-model allowed_modes are not read, because "
+            "bedrock-mantle:ListModels (GET /v1/models), which returns them, is not "
+            "granted to the Bedrock assessment role."
+        ) in project["Finding_Details"]
 
     def test_provider_data_share_fails(self):
         _, projects = self._run(

@@ -162,6 +162,9 @@ _EXPECTED_ACTIONS = {
         "eks:ListClusters",
         "eks:ListPodIdentityAssociations",
         "events:ListTargetsByRule",
+        "glue:GetPartitions",
+        "glue:GetTable",
+        "glue:GetTables",
         "iam:GetAccountSummary",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
@@ -932,10 +935,6 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 ),
             ),
             scoped(
-                "sso:DescribeInstanceAccessControlAttributeConfiguration",
-                "sso:::instance/*",
-            ),
-            scoped(
                 "bedrock-agentcore:GetBrowser",
                 "bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*",
             ),
@@ -1032,7 +1031,31 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 for action in (
                     "sso:ListManagedPoliciesInPermissionSet",
                     "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
+                    "sso:DescribeInstanceAccessControlAttributeConfiguration",
                 )
+            ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:catalog"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:database/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:glue:*:"
+                                "${AWS::AccountId}:table/*/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in ("glue:GetTable", "glue:GetTables", "glue:GetPartitions")
             ),
             scoped("iam:GetPolicy", "iam::aws:policy/*"),
             scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
