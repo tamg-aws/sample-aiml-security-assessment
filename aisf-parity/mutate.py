@@ -2803,6 +2803,13 @@ MUTATIONS = [
         "replace": '    elif False and any(\n        leg["state"] in INVOKE_SOURCE_SCP_UNDETERMINED',
     },
     {
+        "name": "SM-11 identity Deny on one invoke action holds the principal",
+        "file": SAGEMAKER,
+        "defect": "a Deny on InvokeEndpoint alone leaves InvokeEndpointAsync and InvokeEndpointWithResponseStream callable from any network, so the principal is not held to the private path",
+        "find": "            open_actions = unpinned_actions - denied_actions\n",
+        "replace": "            open_actions = set() if denied_actions else unpinned_actions\n",
+    },
+    {
         "name": "SM-11 invoke leg ignores an attached SCP",
         "file": SAGEMAKER,
         "defect": "an attached SCP Deny binds every principal, the root user included, so ignoring it fails a compliant account",
@@ -6768,6 +6775,7 @@ GROUPS: dict[str, str] = {
     "SM-11 invoke leg credits an SCP that misses an invoke action": "in the SageMaker verdict legs",
     "SM-11 invoke leg fails the root user on an unread SCP": "in the SageMaker verdict legs",
     "SM-11 invoke leg ignores an attached SCP": "in the SageMaker verdict legs",
+    "SM-11 identity Deny on one invoke action holds the principal": "in the SageMaker verdict legs",
     "SM-37 reads only the latest AgentCore runtime version": "in the SageMaker verdict legs",
     "SM-37 ignores an endpoint's targetVersion": "in the SageMaker verdict legs",
     "SM-37 passes on unlisted AgentCore runtime endpoints": "in the SageMaker verdict legs",

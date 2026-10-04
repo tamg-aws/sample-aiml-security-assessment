@@ -17449,7 +17449,9 @@ class TestSM11InvokeSourceNetwork:
     INVENTORY = {"endpoints": [{"name": "ep-1"}]}
     PINNED = {"StringEquals": {"aws:SourceVpce": "vpce-1"}}
     ROOT_OPEN = "the root user can call the public runtime endpoint from any network"
-    PRINCIPALS_OPEN = "can call sagemaker:InvokeEndpoint from any network"
+    PRINCIPALS_OPEN = (
+        "can call the endpoint invoke actions named beside each from any network"
+    )
 
     def _rows(self, cache, inventory=None, scp=None):
         return _rows(
@@ -17484,7 +17486,10 @@ class TestSM11InvokeSourceNetwork:
         )
         assert [r["Status"] for r in rows] == ["Failed"]
         assert rows[0]["Check_ID"] == "SM-11"
-        assert "Role 'Open' (policy 'OpenInvoke')" in rows[0]["Finding_Details"]
+        assert (
+            "Role 'Open' (policy 'OpenInvoke'; open: sagemaker:InvokeEndpoint)"
+            in rows[0]["Finding_Details"]
+        )
         assert "Pinned" not in rows[0]["Finding_Details"]
         assert self.PRINCIPALS_OPEN in rows[0]["Finding_Details"]
 
@@ -17515,7 +17520,7 @@ class TestSM11InvokeSourceNetwork:
     def test_allow_that_admits_a_public_call_fails(self, condition):
         rows = self._rows(_v2_cache({"R": [("P", _invoke_allow(condition))]}))
         assert [r["Status"] for r in rows] == ["Failed"]
-        assert "Role 'R' (policy 'P')" in rows[0]["Finding_Details"]
+        assert "Role 'R' (policy 'P'; open: " in rows[0]["Finding_Details"]
         assert self.PRINCIPALS_OPEN in rows[0]["Finding_Details"]
 
     def test_second_unpinned_statement_fails_the_principal(self):
@@ -17573,12 +17578,46 @@ class TestSM11InvokeSourceNetwork:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert self.PRINCIPALS_OPEN in rows[0]["Finding_Details"]
 
+    def test_a_deny_on_one_action_leaves_the_wildcard_grant_open(self):
+        """Round 10 grader probe: Allow sagemaker:InvokeEndpoint*, Deny on
+        InvokeEndpoint alone. InvokeEndpointAsync and
+        InvokeEndpointWithResponseStream stay callable from any network."""
+        policy = _identity_policy("sagemaker:InvokeEndpoint*", "*")
+        policy["Statement"].append(_invoke_deny("StringNotEquals"))
+        rows = self._rows(_v2_cache({"R": [("P", policy)]}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert self.PRINCIPALS_OPEN in details
+        assert (
+            "Role 'R' (policy 'P'; open: sagemaker:InvokeEndpointAsync, "
+            "sagemaker:InvokeEndpointWithResponseStream)"
+        ) in details
+        assert "held to a named VPC endpoint" not in details
+
+    def test_deny_statements_together_covering_every_granted_action_hold(self):
+        policy = _identity_policy("sagemaker:InvokeEndpoint*", "*")
+        policy["Statement"].append(_invoke_deny("StringNotEquals"))
+        second = _invoke_deny("StringNotEquals")
+        second["Action"] = [
+            "sagemaker:InvokeEndpointAsync",
+            "sagemaker:InvokeEndpointWith*",
+        ]
+        policy["Statement"].append(second)
+        held = self._rows(_v2_cache({"R": [("P", policy)]}))
+        self._held_but_root_open(held, "Role 'R'")
+        policy["Statement"][-1]["Action"] = ["sagemaker:InvokeEndpointAsync"]
+        rows = self._rows(_v2_cache({"R": [("P", policy)]}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "Role 'R' (policy 'P'; open: sagemaker:InvokeEndpointWithResponseStream)"
+        ) in rows[0]["Finding_Details"]
+
     def test_group_grant_is_read(self):
         rows = self._rows(
             _v2_cache({}, users={"G": _group_user("GroupInvoke", _invoke_allow())})
         )
         assert [r["Status"] for r in rows] == ["Failed"]
-        assert "User 'G' (policy 'GroupInvoke')" in rows[0]["Finding_Details"]
+        assert "User 'G' (policy 'GroupInvoke'; open: " in rows[0]["Finding_Details"]
 
     def test_pinning_boundary_passes_and_a_boundary_without_invoke_is_skipped(self):
         cache = _v2_cache(

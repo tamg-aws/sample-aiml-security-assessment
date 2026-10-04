@@ -6182,35 +6182,37 @@ def _allow_pins_invoke_source(statement: Dict[str, Any]) -> bool:
     return False
 
 
-def _deny_pins_invoke_source(statement: Dict[str, Any]) -> bool:
+def _deny_pinned_invoke_actions(statement: Dict[str, Any]) -> set:
     """
-    Return whether a Deny refuses every InvokeEndpoint call from outside a
-    named VPC endpoint or VPC.
+    Return the invoke actions a Deny refuses on every endpoint for a call from
+    outside a named VPC endpoint or VPC.
 
     The statement must cover every endpoint and hold only the source-network
     condition: another key makes the Deny fire only when both hold. A negated
     operator is true for a call that carries no key, except under ForAnyValue.
     """
     if str(statement.get("Effect", "")).upper() != "DENY":
-        return False
-    if not any(
-        _statement_names_action(statement, action) for action in ENDPOINT_INVOKE_ACTIONS
-    ):
-        return False
+        return set()
     if not _deny_covers_every_resource(statement, "endpoint"):
-        return False
+        return set()
     entries = _condition_entries(statement)
     if len(entries) != 1:
-        return False
+        return set()
     operator, key, values = entries[0]
     prefix, base, _ = _condition_operator_parts(operator)
-    return (
+    if not (
         key in INVOKE_SOURCE_NETWORK_KEYS
         and bool(values)
         and base in ("stringnotequals", "stringnotlike")
         and prefix != "foranyvalue"
         and not _like_values_unbounded(base, values)
-    )
+    ):
+        return set()
+    return {
+        action
+        for action in ENDPOINT_INVOKE_ACTIONS
+        if _statement_names_action(statement, action)
+    }
 
 
 def _invoke_source_network_findings(
@@ -6316,6 +6318,7 @@ def _invoke_source_network_findings(
             ):
                 continue
             unpinned = []
+            unpinned_actions = set()
             granted = False
             statements = []
             for policy in [
@@ -6325,11 +6328,13 @@ def _invoke_source_network_findings(
             ]:
                 for statement in _sm_policy_statements(policy.get("document")):
                     statements.append(statement)
-                    if not _statement_invoke_actions(statement):
+                    actions = _statement_invoke_actions(statement)
+                    if not actions:
                         continue
                     granted = True
                     if not _allow_pins_invoke_source(statement):
                         unpinned.append(policy.get("name") or "inline policy")
+                        unpinned_actions.update(actions)
             if not granted:
                 continue
             boundary_pins = boundary is not None and all(
@@ -6337,13 +6342,29 @@ def _invoke_source_network_findings(
                 for st in boundary_statements
                 if _statement_invoke_actions(st)
             )
-            denied = any(_deny_pins_invoke_source(st) for st in statements)
-            if not unpinned or boundary_pins or denied:
+            # Deny statements hold the principal only when together they cover
+            # every invoke action an unconditioned Allow grants: a Deny on
+            # InvokeEndpoint alone leaves InvokeEndpointAsync open.
+            denied_actions = set()
+            for st in statements:
+                denied_actions |= _deny_pinned_invoke_actions(st)
+            open_actions = unpinned_actions - denied_actions
+            if not unpinned or boundary_pins or not open_actions:
                 pinned.append(label)
             elif boundary is None and (identity_type.lower(), name) in boundary_unread:
                 unread.append(f"{label} (permissions boundary not read)")
             else:
-                open_principals.append(f"{label} (policy '{sorted(set(unpinned))[0]}')")
+                open_principals.append(
+                    f"{label} (policy '{sorted(set(unpinned))[0]}'; open: "
+                    + ", ".join(
+                        named
+                        for a, named in zip(
+                            ENDPOINT_INVOKE_ACTIONS, INVOKE_SOURCE_SCP_ACTIONS
+                        )
+                        if a in open_actions
+                    )
+                    + ")"
+                )
 
     rows = []
     if open_principals:
@@ -6352,10 +6373,11 @@ def _invoke_source_network_findings(
             shown += f"; and {len(open_principals) - 10} more"
         rows.append(
             _row(
-                f"{len(open_principals)} principal(s) can call "
-                "sagemaker:InvokeEndpoint from any network: no Allow condition "
-                "on aws:SourceVpce or aws:SourceVpc and no identity Deny holds the "
-                f"call to a VPC endpoint or VPC: {shown}. No attached service "
+                f"{len(open_principals)} principal(s) can call the endpoint "
+                "invoke actions named beside each from any network: no Allow "
+                "condition on aws:SourceVpce or aws:SourceVpc and no identity "
+                "Deny holds those calls to a VPC endpoint or VPC: "
+                f"{shown}. No attached service "
                 f"control policy holds every invoke action to it ({scp_text}).",
                 INVOKE_SOURCE_NETWORK_RESOLUTION,
                 "Medium",
