@@ -49710,6 +49710,7 @@ class TestAC46CostAnomalyAlerting:
     _SERVICES = "arn:aws:ce::111122223333:anomalymonitor/services"
     _CUSTOM = "arn:aws:ce::111122223333:anomalymonitor/custom"
     _ACCOUNT = "arn:aws:ce::111122223333:anomalymonitor/account"
+    _BEDROCK = "arn:aws:ce::111122223333:anomalymonitor/bedrock"
 
     _MONITORS = {
         _SERVICES: {
@@ -49728,6 +49729,14 @@ class TestAC46CostAnomalyAlerting:
             "MonitorName": "linked",
             "MonitorType": "DIMENSIONAL",
             "MonitorDimension": "LINKED_ACCOUNT",
+        },
+        _BEDROCK: {
+            "MonitorArn": _BEDROCK,
+            "MonitorName": "bedrock-only",
+            "MonitorType": "CUSTOM",
+            "MonitorSpecification": {
+                "Dimensions": {"Key": "SERVICE", "Values": ["Amazon Bedrock"]}
+            },
         },
     }
 
@@ -49818,12 +49827,19 @@ class TestAC46CostAnomalyAlerting:
 
     @patch("agentcore_app.ce_client")
     @patch("agentcore_app.agentcore_client")
-    def test_a_monitor_on_another_dimension_fails(self, mock_ac, mock_ce):
+    def test_an_aws_managed_linked_account_monitor_passes(self, mock_ac, mock_ce):
         (finding,) = self._run(
-            mock_ac, mock_ce, [self._subscription("linked", [self._ACCOUNT])]
+            mock_ac,
+            mock_ce,
+            [
+                self._subscription("bedrock", [self._BEDROCK]),
+                self._subscription("linked", [self._ACCOUNT]),
+            ],
         )
-        assert finding["Status"] == "Failed"
-        assert "no monitor for every AWS service" in finding["Finding_Details"]
+        assert finding["Status"] == "Passed"
+        assert "subscription linked notifies" in finding["Finding_Details"]
+        assert "LINKED_ACCOUNT dimension" in finding["Finding_Details"]
+        assert "bedrock" not in finding["Finding_Details"]
 
     @patch("agentcore_app.ce_client")
     @patch("agentcore_app.agentcore_client")
@@ -49885,9 +49901,10 @@ class TestAC46CostAnomalyAlerting:
         )
         assert finding["Status"] == "Failed"
         assert (
-            "CUSTOM monitor(s) elsewhere track only linked accounts other than "
-            "123456789012"
+            "elsewhere, whose LINKED_ACCOUNT specification names only accounts "
+            "other than 123456789012, so none of them watches AgentCore spend"
         ) in finding["Finding_Details"]
+        assert "not alerted on" not in finding["Finding_Details"]
 
     @pytest.mark.parametrize(
         "monitor",
@@ -49943,10 +49960,98 @@ class TestAC46CostAnomalyAlerting:
             mock_ce,
             [
                 self._subscription("dead", [self._SERVICES], ("DECLINED",)),
-                self._subscription("linked", [self._ACCOUNT]),
+                self._subscription("bedrock", [self._BEDROCK]),
             ],
         )
         assert finding["Status"] == "Failed"
+        assert (
+            "bedrock-only, whose SERVICE specification names only services other "
+            "than Amazon Bedrock AgentCore"
+        ) in finding["Finding_Details"]
+
+    @staticmethod
+    def _service(name, values, match=None):
+        dimensions = {"Key": "SERVICE", "Values": list(values)}
+        if match:
+            dimensions["MatchOptions"] = match
+        return {
+            "MonitorArn": f"arn:aws:ce::111122223333:anomalymonitor/{name}",
+            "MonitorName": name,
+            "MonitorType": "CUSTOM",
+            "MonitorSpecification": {"Dimensions": dimensions},
+        }
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_service_monitor_naming_agentcore_passes(self, mock_ac, mock_ce):
+        finding = self._run_linked(
+            mock_ac,
+            mock_ce,
+            [
+                self._service("bedrock", ["Amazon Bedrock"]),
+                self._service("agents", ["Amazon Bedrock", "Amazon Bedrock AgentCore"]),
+            ],
+        )
+        assert finding["Status"] == "Passed"
+        assert (
+            "agents, whose SERVICE specification names Amazon Bedrock AgentCore"
+            in finding["Finding_Details"]
+        )
+        assert "bedrock, whose" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_service_monitor_matching_loosely_is_na(self, mock_ac, mock_ce):
+        finding = self._run_linked(
+            mock_ac,
+            mock_ce,
+            [self._service("contains", ["AgentCore"], ["CONTAINS"])],
+        )
+        assert finding["Status"] == "N/A"
+        assert "contains (CUSTOM specification)" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize("dimension", ["TAG", "COST_CATEGORY"])
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_tag_or_cost_category_monitor_is_na_not_failed(
+        self, mock_ac, mock_ce, dimension
+    ):
+        """Beside a monitor resolved as not covering AgentCore, the unresolved
+        one still holds the row at N/A and is named with its dimension."""
+        finding = self._run_linked(
+            mock_ac,
+            mock_ce,
+            [
+                self._service("bedrock", ["Amazon Bedrock"]),
+                {
+                    "MonitorArn": "arn:aws:ce::111122223333:anomalymonitor/keyed",
+                    "MonitorName": "keyed",
+                    "MonitorType": "DIMENSIONAL",
+                    "MonitorDimension": dimension,
+                },
+            ],
+        )
+        assert finding["Status"] == "N/A"
+        assert f"keyed (DIMENSIONAL {dimension})" in finding["Finding_Details"]
+        assert "not alerted on" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_subscription_naming_no_monitor_is_not_alerted_on(self, mock_ac, mock_ce):
+        (finding,) = self._run(
+            mock_ac,
+            mock_ce,
+            [
+                self._subscription(
+                    "gone", ["arn:aws:ce::111122223333:anomalymonitor/deleted"]
+                )
+            ],
+        )
+        assert finding["Status"] == "Failed"
+        assert (
+            "name no monitor, so anomalous AgentCore spend is not alerted on"
+            in finding["Finding_Details"]
+        )
 
     @pytest.mark.parametrize(
         "operation,action",
@@ -52420,6 +52525,7 @@ class TestAC53CoordinationAnomalyAlarms:
         band_of="m1",
         expression=None,
         actions=True,
+        stat="Sum",
     ):
         return {
             "AlarmName": alarm_name,
@@ -52439,7 +52545,7 @@ class TestAC53CoordinationAnomalyAlarms:
                             "Dimensions": metric["Dimensions"],
                         },
                         "Period": 300,
-                        "Stat": "Sum",
+                        "Stat": stat,
                     },
                     "ReturnData": True,
                 },
@@ -52455,6 +52561,9 @@ class TestAC53CoordinationAnomalyAlarms:
         return self._band_alarm(
             alarm_name, dict(metric, MetricName="Latency"), **kwargs
         )
+
+    def _rate_band(self, alarm_name, metric, **kwargs):
+        return self._latency_band(alarm_name, metric, stat="SampleCount", **kwargs)
 
     def _run(
         self, metrics, alarms, runtimes=None, gateways=None, engines=None, composites=()
@@ -52512,9 +52621,14 @@ class TestAC53CoordinationAnomalyAlarms:
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
         findings, cloudwatch = self._run(
             [edge],
-            [self._band_alarm("a-to-b", edge), self._latency_band("a-to-b-lat", edge)],
+            [
+                self._band_alarm("a-to-b", edge),
+                self._latency_band("a-to-b-lat", edge),
+                self._rate_band("a-to-b-rate", edge),
+            ],
         )
         assert [f["Status"] for f in findings] == ["Passed"]
+        assert "a-to-b-rate on Latency SampleCount" in findings[0]["Finding_Details"]
         assert "a-to-b on Fault" in findings[0]["Finding_Details"]
         assert "a-to-b-lat on Latency" in findings[0]["Finding_Details"]
         called = {
@@ -52531,6 +52645,7 @@ class TestAC53CoordinationAnomalyAlarms:
             [first, second],
             [
                 self._band_alarm("a-to-g", second),
+                self._rate_band("a-to-g-rate", second),
                 self._band_alarm("a-to-g-err", dict(second, MetricName="Error")),
             ],
         )
@@ -52545,6 +52660,7 @@ class TestAC53CoordinationAnomalyAlarms:
             [first, second],
             [
                 self._band_alarm("a-to-b", first),
+                self._rate_band("a-to-b-rate", first),
                 self._band_alarm("a-to-b-err", dict(first, MetricName="Error")),
             ],
         )
@@ -52569,8 +52685,10 @@ class TestAC53CoordinationAnomalyAlarms:
             [
                 self._band_alarm("one", first),
                 self._latency_band("one-lat", first),
+                self._rate_band("one-rate", first),
                 self._band_alarm("two", second),
                 self._latency_band("two-lat", second),
+                self._rate_band("two-rate", second),
             ],
         )
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -52627,12 +52745,20 @@ class TestAC53CoordinationAnomalyAlarms:
                 dimension["Value"] += "-staging"
         findings, _ = self._run(
             [edge],
-            [self._band_alarm("other", other), self._latency_band("other-lat", other)],
+            [
+                self._band_alarm("other", other),
+                self._latency_band("other-lat", other),
+                self._rate_band("other-rate", other),
+            ],
         )
         assert [f["Status"] for f in findings] == ["Failed"]
         findings, _ = self._run(
             [edge],
-            [self._band_alarm("same", edge), self._latency_band("same-lat", edge)],
+            [
+                self._band_alarm("same", edge),
+                self._latency_band("same-lat", edge),
+                self._rate_band("same-rate", edge),
+            ],
         )
         assert [f["Status"] for f in findings] == ["Passed"]
 
@@ -52716,7 +52842,11 @@ class TestAC53CoordinationAnomalyAlarms:
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
         findings, _ = self._run(
             [edge, self._metric("Fault", "gamma.DEFAULT", "UnknownRemoteService")],
-            [self._band_alarm("a-to-b", edge), self._latency_band("a-to-b-lat", edge)],
+            [
+                self._band_alarm("a-to-b", edge),
+                self._latency_band("a-to-b-lat", edge),
+                self._rate_band("a-to-b-rate", edge),
+            ],
         )
         assert [f["Status"] for f in findings] == ["N/A", "Passed"]
         assert "'gamma.DEFAULT'" in findings[0]["Finding_Details"]
@@ -52836,27 +52966,38 @@ class TestAC53CoordinationAnomalyAlarms:
 
     def test_a_latency_band_alone_leaves_the_error_rate_unwatched(self):
         edge = self._metric("Latency", "alpha.DEFAULT", "beta.DEFAULT")
-        findings, _ = self._run([edge], [self._band_alarm("lat-only", edge)])
+        findings, _ = self._run(
+            [edge],
+            [self._band_alarm("lat-only", edge), self._rate_band("rate", edge)],
+        )
         assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
         assert "lat-only on Latency" in details
-        assert "no alarm with actions watches its Error or Fault metric" in details
+        assert "has a band over its Error or Fault, so a change in how" in details
         assert "Error or Fault" in findings[0]["Resolution"]
 
     def test_an_error_band_alone_leaves_the_latency_unwatched(self):
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
-        findings, _ = self._run([edge], [self._band_alarm("fault-only", edge)])
+        findings, _ = self._run(
+            [edge],
+            [self._band_alarm("fault-only", edge), self._rate_band("rate", edge)],
+        )
         assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
         assert "fault-only on Fault" in details
-        assert "no alarm with actions watches its Latency metric" in details
+        assert "has a band over its Latency, so a change in how long" in details
         assert "Latency" in findings[0]["Resolution"]
 
     @pytest.mark.parametrize("error_metric", ["Error", "Fault"])
     def test_either_error_metric_with_latency_passes(self, error_metric):
         edge = self._metric(error_metric, "alpha.DEFAULT", "beta.DEFAULT")
         findings, _ = self._run(
-            [edge], [self._band_alarm("err", edge), self._latency_band("lat", edge)]
+            [edge],
+            [
+                self._band_alarm("err", edge),
+                self._latency_band("lat", edge),
+                self._rate_band("rate", edge),
+            ],
         )
         assert [f["Status"] for f in findings] == ["Passed"]
 
@@ -52867,10 +53008,11 @@ class TestAC53CoordinationAnomalyAlarms:
             [
                 self._band_alarm("fault", edge),
                 self._band_alarm("error", dict(edge, MetricName="Error")),
+                self._rate_band("rate", edge),
             ],
         )
         assert [f["Status"] for f in findings] == ["Failed"]
-        assert "watches its Latency metric" in findings[0]["Finding_Details"]
+        assert "has a band over its Latency, so" in findings[0]["Finding_Details"]
 
     def test_each_pair_needs_both_kinds_of_its_own(self):
         full = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
@@ -52880,7 +53022,9 @@ class TestAC53CoordinationAnomalyAlarms:
             [
                 self._band_alarm("full-err", full),
                 self._latency_band("full-lat", full),
+                self._rate_band("full-rate", full),
                 self._band_alarm("half-err", half),
+                self._rate_band("half-rate", half),
                 # a Latency band on the other pair does not cover this one
                 self._latency_band("elsewhere", full),
             ],
@@ -52888,14 +53032,19 @@ class TestAC53CoordinationAnomalyAlarms:
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "gamma-CCCCCCCCCC" in findings[0]["Finding_Details"]
         assert "beta-BBBBBBBBBB" not in findings[0]["Finding_Details"]
-        assert "watches its Latency metric" in findings[0]["Finding_Details"]
+        assert "has a band over its Latency, so" in findings[0]["Finding_Details"]
 
     def test_the_hidden_direction_latency_elsewhere_and_error_here(self):
         here = self._metric("Error", "alpha.DEFAULT", "beta.DEFAULT")
         there = self._metric("Latency", "alpha.DEFAULT", "gamma.DEFAULT")
         findings, _ = self._run(
             [here, there],
-            [self._band_alarm("here-err", here), self._band_alarm("there-lat", there)],
+            [
+                self._band_alarm("here-err", here),
+                self._rate_band("here-rate", here),
+                self._band_alarm("there-lat", there),
+                self._rate_band("there-rate", there),
+            ],
         )
         assert [f["Status"] for f in findings] == ["Failed", "Failed"]
         by_callee = {
@@ -52906,10 +53055,60 @@ class TestAC53CoordinationAnomalyAlarms:
                 f for f in findings if "gamma-CCCCCCCCCC" in f["Finding_Details"]
             ),
         }
-        assert "watches its Latency metric" in by_callee["beta"]["Finding_Details"]
+        assert "band over its Latency, so" in by_callee["beta"]["Finding_Details"]
         assert (
-            "watches its Error or Fault metric" in by_callee["gamma"]["Finding_Details"]
+            "band over its Error or Fault, so" in by_callee["gamma"]["Finding_Details"]
         )
+
+    def test_a_latency_band_on_any_other_stat_leaves_the_rate_unwatched(self):
+        """Two pairs: the one whose Latency bands use Average and p99 fails on
+        the message rate, the one with a SampleCount band passes, and the
+        failing row names its own pair only."""
+        rated = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        unrated = self._metric("Fault", "alpha.DEFAULT", "gamma.DEFAULT")
+        findings, _ = self._run(
+            [rated, unrated],
+            [
+                self._band_alarm("b-err", rated),
+                self._latency_band("b-lat", rated),
+                self._rate_band("b-rate", rated),
+                self._band_alarm("g-err", unrated),
+                self._latency_band("g-avg", unrated, stat="Average"),
+                self._latency_band("g-p99", unrated, stat="p99"),
+            ],
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "gamma-CCCCCCCCCC" in details
+        assert "beta-BBBBBBBBBB" not in details
+        assert "g-avg on Latency" in details
+        assert (
+            "has a band over its Latency SampleCount, so a change in how often "
+            "that pair calls notifies nobody"
+        ) in details
+        assert "Latency SampleCount" in findings[0]["Resolution"]
+
+    def test_a_sample_count_band_credits_the_rate_and_not_the_latency(self):
+        edge = self._metric("Error", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run(
+            [edge], [self._band_alarm("err", edge), self._rate_band("rate", edge)]
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "rate on Latency SampleCount" in details
+        assert "has a band over its Latency, so a change in how long" in details
+
+    def test_a_sample_count_band_on_the_error_metric_is_not_the_rate(self):
+        edge = self._metric("Error", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run(
+            [edge],
+            [
+                self._band_alarm("err", edge, stat="SampleCount"),
+                self._latency_band("lat", edge),
+            ],
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "band over its Latency SampleCount, so" in findings[0]["Finding_Details"]
 
 
 class TestAC53Registration:
@@ -53119,15 +53318,22 @@ class TestAgentCoreCompositeAlarmCredit:
             [first, second],
             [
                 suite._band_alarm("a-to-b", first, actions=False),
+                suite._rate_band("a-to-b-rate", first, actions=False),
                 suite._band_alarm(
                     "a-to-b-err", dict(first, MetricName="Error"), actions=False
                 ),
                 suite._band_alarm("a-to-g", second, actions=False),
+                suite._rate_band("a-to-g-rate", second, actions=False),
                 suite._band_alarm(
                     "a-to-g-err", dict(second, MetricName="Error"), actions=False
                 ),
             ],
-            composites=[_composite("rollup", 'ALARM("a-to-b") OR ALARM("a-to-b-err")')],
+            composites=[
+                _composite(
+                    "rollup",
+                    'ALARM("a-to-b") OR ALARM("a-to-b-err") OR ALARM("a-to-b-rate")',
+                )
+            ],
         )
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "gamma-CCCCCCCCCC" in findings[0]["Finding_Details"]
@@ -53141,8 +53347,14 @@ class TestAgentCoreCompositeAlarmCredit:
             [
                 suite._band_alarm("a-to-b", edge, actions=False),
                 suite._latency_band("a-to-b-lat", edge, actions=False),
+                suite._rate_band("a-to-b-rate", edge, actions=False),
             ],
-            composites=[_composite("rollup", 'ALARM("a-to-b") OR ALARM("a-to-b-lat")')],
+            composites=[
+                _composite(
+                    "rollup",
+                    'ALARM("a-to-b") OR ALARM("a-to-b-lat") OR ALARM("a-to-b-rate")',
+                )
+            ],
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert (

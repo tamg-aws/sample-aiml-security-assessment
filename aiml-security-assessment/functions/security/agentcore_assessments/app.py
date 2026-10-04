@@ -34815,28 +34815,65 @@ def _agentcore_session_count_alarms() -> List[str]:
     )
 
 
-def _custom_monitor_tracks_accounts(
+# AgentCore's value on the Cost Explorer SERVICE dimension, read with
+# ce:GetDimensionValues SERVICE on account 178113193057 in us-east-1 on
+# 2026-10-04. A CUSTOM monitor naming it tracks AgentCore spend.
+AGENTCORE_COST_EXPLORER_SERVICE = "Amazon Bedrock AgentCore"
+
+
+def _custom_monitor_covers_agentcore(
     monitor: Dict[str, Any], accounts: Set[str]
 ) -> Optional[bool]:
-    """Whether a CUSTOM monitor's specification takes in one of `accounts`.
+    """Whether a CUSTOM monitor's specification takes in AgentCore spend.
 
     A customer managed monitor tracks linked accounts with
     {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [...]}}, and its
     anomalies are on those accounts' total spend, every service included
-    (MonitorSpecification in the Cost Explorer API reference). Returns None
-    for a tag or cost category specification, any other expression, or no
-    known account, whose coverage of AgentCore spend is not judged.
+    (MonitorSpecification in the Cost Explorer API reference), so it covers
+    AgentCore when it names one of `accounts`. A SERVICE specification covers
+    AgentCore when it names AGENTCORE_COST_EXPLORER_SERVICE. Returns None for
+    a tag or cost category specification, any other expression or match
+    option, or a LINKED_ACCOUNT specification with no known account, whose
+    coverage of AgentCore spend the API does not resolve.
     """
     specification = monitor.get("MonitorSpecification") or {}
     dimensions = specification.get("Dimensions") or {}
-    if (
-        not accounts
-        or set(specification) != {"Dimensions"}
-        or dimensions.get("Key") != "LINKED_ACCOUNT"
-        or set(dimensions.get("MatchOptions") or ["EQUALS"]) != {"EQUALS"}
-    ):
+    if set(specification) != {"Dimensions"} or set(
+        dimensions.get("MatchOptions") or ["EQUALS"]
+    ) != {"EQUALS"}:
+        return None
+    if dimensions.get("Key") == "SERVICE":
+        return AGENTCORE_COST_EXPLORER_SERVICE in (dimensions.get("Values") or [])
+    if not accounts or dimensions.get("Key") != "LINKED_ACCOUNT":
         return None
     return bool(accounts & set(dimensions.get("Values") or []))
+
+
+def _custom_monitor_scope(monitor: Dict[str, Any], accounts: Set[str]) -> str:
+    """Describe what a CUSTOM monitor the API resolves covers, by its name."""
+    name = monitor.get("MonitorName") or monitor.get("MonitorArn", "")
+    dimensions = (monitor.get("MonitorSpecification") or {}).get("Dimensions") or {}
+    if dimensions.get("Key") == "SERVICE":
+        if _custom_monitor_covers_agentcore(monitor, accounts):
+            return (
+                f"{name}, whose SERVICE specification names "
+                f"{AGENTCORE_COST_EXPLORER_SERVICE}"
+            )
+        return (
+            f"{name}, whose SERVICE specification names only services other than "
+            f"{AGENTCORE_COST_EXPLORER_SERVICE}"
+        )
+    if _custom_monitor_covers_agentcore(monitor, accounts):
+        return (
+            f"{name}, whose LINKED_ACCOUNT specification names account "
+            f"{', '.join(sorted(accounts & set(dimensions.get('Values') or [])))}, "
+            "where the runtimes run, so it watches that account's total spend, "
+            "AgentCore included"
+        )
+    return (
+        f"{name}, whose LINKED_ACCOUNT specification names only accounts other "
+        f"than {', '.join(sorted(accounts))}"
+    )
 
 
 def _agentcore_cost_anomaly_finding(accounts: Set[str]) -> Dict[str, Any]:
@@ -34844,9 +34881,11 @@ def _agentcore_cost_anomaly_finding(accounts: Set[str]) -> Dict[str, Any]:
 
     The control plane carries no per-session cost limit, so the account must
     hold a Cost Anomaly Detection subscription with a subscriber that has not
-    declined, on a monitor that watches every AWS service or a CUSTOM monitor
-    that tracks the total spend of an account in `accounts`, the accounts the
-    runtimes run in. Any other CUSTOM specification withholds Passed.
+    declined, on an AWS managed SERVICE or LINKED_ACCOUNT monitor, or a CUSTOM
+    monitor that tracks the total spend of an account in `accounts`, the
+    accounts the runtimes run in, or names AgentCore's service. A TAG or
+    COST_CATEGORY monitor, or any other CUSTOM specification, is N/A: the API
+    does not resolve it to AgentCore spend.
     """
     retry = "Grant ce:GetAnomalySubscriptions and ce:GetAnomalyMonitors and retry."
 
@@ -34955,18 +34994,16 @@ def _agentcore_cost_anomaly_finding(accounts: Set[str]) -> Dict[str, Any]:
             severity=SeverityEnum.MEDIUM,
             status=StatusEnum.PASSED,
         )
-    custom_monitors = [
-        monitor for monitor in monitors if monitor.get("MonitorType") == "CUSTOM"
-    ]
-    tracking = {
+    linked = {
         monitor.get("MonitorArn")
-        for monitor in custom_monitors
-        if _custom_monitor_tracks_accounts(monitor, accounts) is True
+        for monitor in monitors
+        if monitor.get("MonitorType") == "DIMENSIONAL"
+        and monitor.get("MonitorDimension") == "LINKED_ACCOUNT"
     }
     covering = sorted(
         subscription.get("SubscriptionName") or subscription.get("SubscriptionArn", "")
         for subscription in live
-        if tracking & set(subscription.get("MonitorArnList") or [])
+        if linked & set(subscription.get("MonitorArnList") or [])
     )
     if covering:
         return create_finding(
@@ -34974,11 +35011,10 @@ def _agentcore_cost_anomaly_finding(accounts: Set[str]) -> Dict[str, Any]:
             finding_name=AGENTCORE_COST_ANOMALY_FINDING,
             finding_details=(
                 f"Cost Anomaly Detection subscription {', '.join(covering)} "
-                "notifies a subscriber that has not declined about a CUSTOM "
-                "monitor whose LINKED_ACCOUNT specification names account "
-                f"{', '.join(sorted(accounts))}, where the runtimes run, so it "
-                "watches that account's total spend, AgentCore included. Its "
-                "alert threshold is not judged."
+                "notifies a subscriber that has not declined about an AWS managed "
+                "monitor on the LINKED_ACCOUNT dimension, which watches each "
+                "account's total spend, AgentCore included. Its alert threshold "
+                "is not judged."
             ),
             resolution=(
                 "No action required for this check. Confirm the threshold is low "
@@ -34988,38 +35024,78 @@ def _agentcore_cost_anomaly_finding(accounts: Set[str]) -> Dict[str, Any]:
             severity=SeverityEnum.MEDIUM,
             status=StatusEnum.PASSED,
         )
-    custom = sorted(
-        monitor.get("MonitorName") or monitor.get("MonitorArn", "")
+    custom_monitors = [
+        monitor for monitor in monitors if monitor.get("MonitorType") == "CUSTOM"
+    ]
+    tracking = {
+        monitor.get("MonitorArn"): _custom_monitor_scope(monitor, accounts)
         for monitor in custom_monitors
-        if _custom_monitor_tracks_accounts(monitor, accounts) is None
+        if _custom_monitor_covers_agentcore(monitor, accounts) is True
+    }
+    covering = sorted(
+        subscription.get("SubscriptionName") or subscription.get("SubscriptionArn", "")
+        for subscription in live
+        if set(tracking) & set(subscription.get("MonitorArnList") or [])
     )
-    if custom:
-        return unread(
-            f"the subscribed monitors watching more than one service are CUSTOM "
-            f"monitor(s) {', '.join(custom)}, whose tag, cost category or other "
-            "specification is not judged",
+    if covering:
+        return create_finding(
+            check_id="AC-46",
+            finding_name=AGENTCORE_COST_ANOMALY_FINDING,
+            finding_details=(
+                f"Cost Anomaly Detection subscription {', '.join(covering)} "
+                "notifies a subscriber that has not declined about CUSTOM "
+                f"monitor {'; '.join(sorted(tracking.values()))}. Its alert "
+                "threshold is not judged."
+            ),
             resolution=(
-                "Confirm the custom monitor covers AgentCore spend, or subscribe "
-                "to a monitor for AWS services."
+                "No action required for this check. Confirm the threshold is low "
+                "enough to catch one runaway session."
+            ),
+            reference=COST_ANOMALY_DETECTION_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+    unresolved = sorted(
+        f"{monitor.get('MonitorName') or monitor.get('MonitorArn', '')} "
+        f"({monitor.get('MonitorType')} "
+        f"{monitor.get('MonitorDimension') or 'specification'})"
+        for monitor in monitors
+        if (
+            monitor.get("MonitorType") == "CUSTOM"
+            and _custom_monitor_covers_agentcore(monitor, accounts) is None
+        )
+        or (
+            monitor.get("MonitorType") != "CUSTOM"
+            and monitor.get("MonitorDimension") not in {"SERVICE", "LINKED_ACCOUNT"}
+        )
+    )
+    if unresolved:
+        return unread(
+            "no subscribed monitor watches every AWS service, each linked account "
+            "or AgentCore by name, and monitor(s) "
+            f"{', '.join(unresolved)} track a tag, a cost category or another "
+            "specification the Cost Explorer API does not resolve to AgentCore "
+            "spend",
+            resolution=(
+                "Confirm the monitor covers AgentCore spend, or subscribe to a "
+                "monitor for AWS services."
             ),
         )
     elsewhere = sorted(
-        monitor.get("MonitorName") or monitor.get("MonitorArn", "")
-        for monitor in custom_monitors
+        _custom_monitor_scope(monitor, accounts) for monitor in custom_monitors
     )
     return create_finding(
         check_id="AC-46",
         finding_name=AGENTCORE_COST_ANOMALY_FINDING,
         finding_details=(
             f"The {len(live)} Cost Anomaly Detection subscription(s) with a live "
-            "subscriber watch no monitor for every AWS service"
             + (
-                f", and CUSTOM monitor(s) {', '.join(elsewhere)} track only "
-                f"linked accounts other than {', '.join(sorted(accounts))}"
+                "subscriber watch only CUSTOM monitor(s) "
+                f"{'; '.join(elsewhere)}, so none of them watches AgentCore spend."
                 if elsewhere
-                else ""
+                else "subscriber name no monitor, so anomalous AgentCore spend is "
+                "not alerted on."
             )
-            + ", so anomalous AgentCore spend is not alerted on."
         ),
         resolution=("Subscribe to a Cost Anomaly Detection monitor for AWS services."),
         reference=COST_ANOMALY_DETECTION_REFERENCE_URL,
@@ -41752,6 +41828,8 @@ APPLICATION_SIGNALS_NAMESPACE = "ApplicationSignals"
 AGENTCORE_APPLICATION_SIGNALS_ENVIRONMENT_PREFIX = "bedrock-agentcore:"
 # The dependency metrics Application Signals publishes per caller and callee.
 APPLICATION_SIGNALS_EDGE_METRIC_NAMES = ("Error", "Fault", "Latency")
+# How a band over the pair's Latency SampleCount, its message rate, is named.
+APPLICATION_SIGNALS_RATE_LABEL = "Latency SampleCount"
 # The RemoteService value Application Signals records when it cannot name the
 # callee, so the call may or may not reach another agent.
 APPLICATION_SIGNALS_UNKNOWN_REMOTE_SERVICE = "UnknownRemoteService"
@@ -41790,15 +41868,17 @@ def _agentcore_signal_identity(
     return None
 
 
-def _anomaly_band_edge_keys(alarm: Dict[str, Any]) -> List[Tuple[str, frozenset]]:
-    """Return the metric keys one alarm judges against an anomaly detection band.
+def _anomaly_band_edge_keys(
+    alarm: Dict[str, Any],
+) -> List[Tuple[str, frozenset, str]]:
+    """Return the metric keys and stat one alarm judges against an anomaly band.
 
     Only a band the alarm's ThresholdMetricId names is its threshold, and only
     the MetricStat the band's first argument names is what it watches.
     """
     queries = [query for query in alarm.get("Metrics") or [] if isinstance(query, dict)]
     by_id = {query.get("Id"): query for query in queries}
-    keys: List[Tuple[str, frozenset]] = []
+    keys: List[Tuple[str, frozenset, str]] = []
     for query in queries:
         if query.get("Id") != alarm.get("ThresholdMetricId"):
             continue
@@ -41816,6 +41896,7 @@ def _anomaly_band_edge_keys(alarm: Dict[str, Any]) -> List[Tuple[str, frozenset]
                     (dimension.get("Name"), dimension.get("Value"))
                     for dimension in metric.get("Dimensions") or []
                 ),
+                str((watched.get("MetricStat") or {}).get("Stat")),
             )
         )
     return keys
@@ -41982,11 +42063,13 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     decides tool access and is not an agent.
 
     Each edge needs metric alarms with actions whose threshold is an
-    ANOMALY_DETECTION_BAND over the edge's Latency metric and over its Error or
-    Fault metric, with the edge's Service and RemoteService and an Environment
-    the edge publishes, and no Operation or RemoteOperation dimension that
-    narrows it to part of the pair. One band watches either how long the pair takes or
-    how often it fails, and DET-10 asks for both.
+    ANOMALY_DETECTION_BAND over the edge's Latency metric, over its Latency
+    SampleCount (the pair's message rate) and over its Error or Fault metric,
+    with the edge's Service and RemoteService and an Environment the edge
+    publishes, and no Operation or RemoteOperation dimension that narrows it to
+    part of the pair. One band watches how long the pair takes, how often it
+    calls or how often it fails, and DET-10 asks for all three. A SampleCount
+    band credits the rate only, and any other Latency stat the latency only.
     A pair whose RemoteService is UnknownRemoteService is N/A by name, never
     Passed. A runtime not instrumented with Application Signals publishes no
     edge, so it cannot be assessed.
@@ -42146,9 +42229,13 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
 
     alarmed: Dict[Tuple[str, str], List[str]] = {}
     for alarm, composite in alarms:
-        for metric_name, dimension_set in _anomaly_band_edge_keys(alarm):
+        for metric_name, dimension_set, stat in _anomaly_band_edge_keys(alarm):
             if metric_name not in APPLICATION_SIGNALS_EDGE_METRIC_NAMES:
                 continue
+            # Latency carries one sample per call, so its SampleCount is the
+            # pair's message rate; any other Latency stat watches latency only.
+            if metric_name == "Latency" and stat == "SampleCount":
+                metric_name = APPLICATION_SIGNALS_RATE_LABEL
             dimensions = dict(dimension_set)
             edge = (dimensions.get("Service"), dimensions.get("RemoteService"))
             # An alarm on another Environment watches another deployment's
@@ -42166,25 +42253,38 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     for (service, remote), (kind, callee_id) in sorted(edges.items()):
         labels = alarmed.get((service, remote), [])
         watched = {label.rsplit(" on ", 1)[1] for label in labels}
-        has_error = bool(watched & {"Error", "Fault"})
-        has_latency = "Latency" in watched
-        if has_error and has_latency:
-            continue
-        if labels:
-            missing, effect = (
-                ("Latency", "how long that pair takes")
-                if has_error
-                else ("Error or Fault", "how often that pair fails")
+        missing = [
+            (metric, effect)
+            for metric, effect, present in (
+                ("Latency", "how long that pair takes", "Latency" in watched),
+                (
+                    APPLICATION_SIGNALS_RATE_LABEL,
+                    "how often that pair calls",
+                    APPLICATION_SIGNALS_RATE_LABEL in watched,
+                ),
+                (
+                    "Error or Fault",
+                    "how often that pair fails",
+                    bool(watched & {"Error", "Fault"}),
+                ),
             )
+            if not present
+        ]
+        if not missing:
+            continue
+        absent = " or ".join(metric for metric, _ in missing)
+        effects = " or ".join(effect for _, effect in missing)
+        if labels:
             findings.append(
                 finding(
                     f"Calls from '{service}' to {kind} {callee_id} (RemoteService "
                     f"'{remote}') are alarmed on an anomaly detection band by "
                     f"{', '.join(sorted(labels))}, but no alarm with actions "
-                    f"watches its {missing} metric, so a change in {effect} "
+                    f"has a band over its {absent}, so a change in {effects} "
                     "notifies nobody.",
                     "Create a CloudWatch alarm with an anomaly detection band on "
-                    f"the {APPLICATION_SIGNALS_NAMESPACE} {missing} metric with "
+                    f"the {APPLICATION_SIGNALS_NAMESPACE} "
+                    f"{' and the '.join(metric for metric, _ in missing)} with "
                     "this pair's Environment, Service and RemoteService "
                     "dimensions, and give it an alarm action.",
                     SeverityEnum.MEDIUM,
@@ -42197,11 +42297,11 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                 f"Calls from '{service}' to {kind} {callee_id} (RemoteService "
                 f"'{remote}') have no alarm with actions whose threshold is an "
                 "ANOMALY_DETECTION_BAND over the pair's Error, Fault or Latency "
-                "metric, so a change in how often that pair fails or how long it "
-                "takes notifies nobody.",
+                "metric, so a change in how often that pair fails, how often it "
+                "calls or how long it takes notifies nobody.",
                 "Create CloudWatch alarms with anomaly detection bands on the "
-                f"{APPLICATION_SIGNALS_NAMESPACE} Latency metric and the Error or "
-                "Fault metric "
+                f"{APPLICATION_SIGNALS_NAMESPACE} Latency metric, the "
+                f"{APPLICATION_SIGNALS_RATE_LABEL} and the Error or Fault metric "
                 "with this pair's Environment, Service and RemoteService "
                 "dimensions, and give it an alarm action.",
                 SeverityEnum.MEDIUM,
@@ -42218,8 +42318,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
         finding(
             f"Every one of the {len(edges)} AgentCore caller and callee pair(s) "
             "Application Signals records has alarms with actions on anomaly "
-            "detection bands over its Latency metric and its Error or Fault "
-            f"metric: {covered}.",
+            "detection bands over its Latency metric, its "
+            f"{APPLICATION_SIGNALS_RATE_LABEL} and its Error or Fault metric: "
+            f"{covered}.",
             "No action required.",
             SeverityEnum.MEDIUM,
             StatusEnum.PASSED,
