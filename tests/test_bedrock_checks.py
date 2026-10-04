@@ -46540,16 +46540,22 @@ class TestInvocationLogGuardrailEvidence:
         assert "Every one of the 1 guarded InvokeModel call(s)" in detail
         assert "every one of the 1 guarded Converse call(s)" in detail
 
-    def test_the_s3_object_cap_is_na_not_passed(self, monkeypatch):
+    # S3_HOUR is read once, at collection, so the run can fall in a later hour.
+    # The stamp comes from the folder the objects sit in, and hours_before=1
+    # puts that folder an hour before the run on every run.
+    @pytest.mark.parametrize("hours_before", [0, 1])
+    def test_the_s3_object_cap_is_na_not_passed(self, monkeypatch, hours_before):
         monkeypatch.setattr(bedrock_app, "INVOCATION_LOG_S3_MAX_OBJECTS", 1)
+        hour = _dt.strptime(self.S3_HOUR, "%Y/%m/%d/%H/") - _td(hours=hours_before)
+        folder = hour.strftime("%Y/%m/%d/%H/")
         rows = self._prompt(
             {},
             config=self.S3_CONFIG,
             s3_objects={
-                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                self.S3_ROOT + folder + "a.json.gz": self._s3_body(
                     [self._catch("req-catch"), self._guarded("req-ok", True)]
                 ),
-                self.S3_ROOT + self.S3_HOUR + "b.json.gz": self._s3_body(
+                self.S3_ROOT + folder + "b.json.gz": self._s3_body(
                     [self._guarded("req-ok-2", True)]
                 ),
             },
@@ -46558,7 +46564,7 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["N/A"]
         assert (
             "past the first 1 (object cap; those logged from "
-            + _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:00:00Z")
+            + hour.strftime("%Y-%m-%dT%H:00:00Z")
             + " on were not all read)"
         ) in rows[0]["Finding_Details"]
 
