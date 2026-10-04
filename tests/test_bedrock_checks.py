@@ -977,6 +977,8 @@ def _empty_ecs_and_sagemaker():
     sagemaker = MagicMock()
     sagemaker.list_notebook_instances.return_value = {"NotebookInstances": []}
     sagemaker.list_endpoints.return_value = {"Endpoints": []}
+    sagemaker.list_training_jobs.return_value = {"TrainingJobSummaries": []}
+    sagemaker.list_processing_jobs.return_value = {"ProcessingJobSummaries": []}
     eks = MagicMock()
     eks.list_clusters.return_value = {"clusters": []}
     agentcore = MagicMock()
@@ -1204,8 +1206,11 @@ class TestBR02WorkloadConnectivity:
         detail = rows[0]["Finding_Details"]
         assert (
             "Lambda functions, EC2 instances, ECS services and standalone tasks, "
-            "SageMaker notebook instances and endpoints, EKS pod identity "
-            "associations and VPC-mode AgentCore runtime versions are read." in detail
+            "SageMaker notebook instances and endpoints, running SageMaker "
+            "training and processing jobs, EKS pod identity associations and "
+            "VPC-mode AgentCore runtime versions are read. A training or "
+            "processing job with no VPC configuration runs in a network SageMaker "
+            "manages, not in this account's subnets, and is out of scope." in detail
         )
         assert (
             "A role an EKS pod takes through IAM roles for service accounts is read "
@@ -1856,8 +1861,15 @@ class TestBR02WorkloadConnectivity:
         iam_roles=None,
         lambda_pages=None,
         describe_instances_error=None,
+        training_jobs=None,
+        processing_jobs=None,
+        job_details=None,
     ):
         """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired.
+
+        `training_jobs` and `processing_jobs` are the ListTrainingJobs and
+        ListProcessingJobs pages (or an error), and `job_details` maps a job
+        name to its Describe response (or an error).
 
         `container_instances` maps a container instance ARN to (EC2 instance id,
         subnet), `iam_roles` is what iam:ListRoles returns (or an error), and
@@ -2048,6 +2060,37 @@ class TestBR02WorkloadConnectivity:
             return outcome
 
         sagemaker.describe_model.side_effect = describe_model
+        self.job_list_calls = []
+        for operation, key, pages in (
+            ("list_training_jobs", "TrainingJobSummaries", training_jobs),
+            ("list_processing_jobs", "ProcessingJobSummaries", processing_jobs),
+        ):
+            if isinstance(pages, Exception):
+                getattr(sagemaker, operation).side_effect = pages
+                continue
+            by_token = {
+                page.get("token"): {
+                    key: page["jobs"],
+                    **({"NextToken": page["next"]} if page.get("next") else {}),
+                }
+                for page in pages or [{"jobs": []}]
+            }
+
+            def list_jobs(operation=operation, by_token=by_token, **kwargs):
+                self.job_list_calls.append((operation, kwargs))
+                return by_token[kwargs.get("NextToken")]
+
+            getattr(sagemaker, operation).side_effect = list_jobs
+        job_details = job_details or {}
+
+        def describe_job(**kwargs):
+            outcome = job_details[next(iter(kwargs.values()))]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        sagemaker.describe_training_job.side_effect = describe_job
+        sagemaker.describe_processing_job.side_effect = describe_job
         eks = MagicMock()
         eks_clusters = eks_clusters if eks_clusters is not None else {}
         if isinstance(eks_clusters, Exception):
@@ -2894,6 +2937,178 @@ class TestBR02WorkloadConnectivity:
             "SageMaker notebook instance 'denied' was not described with "
             "sagemaker:DescribeNotebookInstance (AccessDeniedException)"
         ]
+
+    JOB_ROLE = "arn:aws:iam::123456789012:role/service-role/JobRole"
+
+    def test_br02_running_jobs_on_every_page_carry_their_vpc_and_role(self):
+        inventory = self._inventory(
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "train-a"}], "next": "t2"},
+                {"token": "t2", "jobs": [{"TrainingJobName": "train-b"}]},
+            ],
+            processing_jobs=[
+                {"jobs": [{"ProcessingJobName": "proc-a"}], "next": "p2"},
+                {"token": "p2", "jobs": [{"ProcessingJobName": "proc-b"}]},
+            ],
+            job_details={
+                "train-a": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1"], "SecurityGroupIds": []},
+                },
+                "train-b": {"RoleArn": self.JOB_ROLE},
+                "proc-a": {
+                    "RoleArn": self.JOB_ROLE,
+                    "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-2"]}},
+                },
+                "proc-b": {"RoleArn": self.JOB_ROLE, "NetworkConfig": {}},
+            },
+        )
+        assert inventory["errors"] == []
+        jobs = [w for w in inventory["workloads"] if "job" in w["kind"]]
+        assert jobs == [
+            {
+                "kind": "SageMaker training job",
+                "name": "train-a",
+                "vpc_id": "vpc-1",
+                "role": "JobRole",
+                "subnets": ["subnet-1"],
+            },
+            {
+                "kind": "SageMaker processing job",
+                "name": "proc-a",
+                "vpc_id": "vpc-2",
+                "role": "JobRole",
+                "subnets": ["subnet-2"],
+            },
+        ]
+        assert [
+            (operation, kwargs.get("StatusEquals"), kwargs.get("NextToken"))
+            for operation, kwargs in self.job_list_calls
+        ] == [
+            ("list_training_jobs", "InProgress", None),
+            ("list_training_jobs", "InProgress", "t2"),
+            ("list_processing_jobs", "InProgress", None),
+            ("list_processing_jobs", "InProgress", "p2"),
+        ]
+
+    def test_br02_unlisted_training_jobs_are_named_and_processing_still_read(self):
+        inventory = self._inventory(
+            training_jobs=_make_client_error("AccessDeniedException"),
+            processing_jobs=[{"jobs": [{"ProcessingJobName": "proc-a"}]}],
+            job_details={
+                "proc-a": {
+                    "RoleArn": self.JOB_ROLE,
+                    "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-1"]}},
+                }
+            },
+        )
+        assert inventory["errors"] == [
+            "running SageMaker training jobs were not listed with "
+            "sagemaker:ListTrainingJobs (AccessDeniedException)"
+        ]
+        assert ("SageMaker processing job", "proc-a", "vpc-1", "JobRole") in (
+            self._names(inventory)
+        )
+
+    def test_br02_an_undescribed_job_is_named_and_the_next_kept(self):
+        inventory = self._inventory(
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "denied"}, {"TrainingJobName": "ok"}]}
+            ],
+            job_details={
+                "denied": _make_client_error("AccessDeniedException"),
+                "ok": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1"]},
+                },
+            },
+        )
+        assert inventory["errors"] == [
+            "SageMaker training job 'denied' was not described with "
+            "sagemaker:DescribeTrainingJob (AccessDeniedException)"
+        ]
+        assert ("SageMaker training job", "ok", "vpc-1", "JobRole") in self._names(
+            inventory
+        )
+
+    def test_br02_a_job_subnet_ec2_does_not_return_is_named(self):
+        inventory = self._inventory(
+            training_jobs=[{"jobs": [{"TrainingJobName": "lost"}]}],
+            job_details={
+                "lost": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1", "subnet-gone"]},
+                }
+            },
+        )
+        assert inventory["errors"] == [
+            "subnet(s) subnet-gone of SageMaker training job 'lost' were not "
+            "returned by ec2:DescribeSubnets"
+        ]
+        assert not [w for w in inventory["workloads"] if "job" in w["kind"]]
+
+    def test_br02_job_descriptions_stop_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        inventory = self._inventory(
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "one"}, {"TrainingJobName": "two"}]}
+            ],
+        )
+        self.sagemaker.describe_training_job.assert_not_called()
+        assert (
+            "2 running SageMaker training job(s) from 'one' on were not described, "
+            f"{bedrock_app.DEADLINE_STOP}" in inventory["errors"]
+        )
+
+    def test_br02_only_the_training_job_off_the_s3_gateway_route_fails(self):
+        """Two running jobs in one VPC: the one whose subnet's route table the
+        S3 gateway endpoint does not name fails, the other is covered."""
+        inventory = self._inventory(
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-1"},
+            training_jobs=[
+                {"jobs": [{"TrainingJobName": "routed"}, {"TrainingJobName": "off"}]}
+            ],
+            job_details={
+                "routed": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-1"]},
+                },
+                "off": {
+                    "RoleArn": self.JOB_ROLE,
+                    "VpcConfig": {"Subnets": ["subnet-2"]},
+                },
+            },
+        )
+        gateway = {
+            **self._endpoint("s3", endpoint_id="vpce-s3"),
+            "type": "Gateway",
+            "route_tables": ["rtb-1"],
+        }
+        rows = self._run(
+            self._cache(
+                {"JobRole": self._role(["sagemaker:InvokeEndpoint", "s3:GetObject"])}
+            ),
+            [self._endpoint("sagemaker.runtime"), gateway],
+            inventory["workloads"],
+            inventory["errors"],
+            route_tables={
+                "vpc-1": {
+                    "subnets": {"subnet-1": "rtb-1", "subnet-2": "rtb-2"},
+                    "main": "rtb-1",
+                    "all": {"rtb-1", "rtb-2"},
+                }
+            },
+        )
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert (
+            "SageMaker training job 'off' in vpc-1 (role 'JobRole') reaches s3 "
+            "through a gateway endpoint its subnets do not route to: s3: the "
+            "gateway endpoint names no route table of subnet(s) subnet-2 (rtb-2)"
+            in rows[0]["Finding_Details"]
+        )
+        assert "'routed'" not in rows[0]["Finding_Details"]
+        assert "SageMaker training job 'routed' in vpc-1" in rows[1]["Finding_Details"]
 
     def test_br02_only_the_second_notebook_fails(self):
         inventory = self._inventory(

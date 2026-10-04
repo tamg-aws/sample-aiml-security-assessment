@@ -338,9 +338,9 @@ Resources:
               - aoss:ListSecurityPolicies # BR-20
               - aoss:GetSecurityPolicy # BR-20
               - sagemaker:Search # BR-42, BR-46, BR-47, BR-52
-              - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
+              - sagemaker:ListTrainingJobs # BR-02, BR-46, BR-47, BR-52
               - sagemaker:ListTransformJobs # BR-47
-              - sagemaker:ListProcessingJobs # BR-47, BR-53
+              - sagemaker:ListProcessingJobs # BR-02, BR-47, BR-53
               - sagemaker:ListInferenceComponents # BR-02, BR-53
               - sagemaker:ListPipelines # BR-53
               - eks:ListClusters # BR-02
@@ -403,7 +403,8 @@ Resources:
             # BR-47 resolves the S3 input and output of each SageMaker
             # transform and processing job and each Bedrock evaluation job.
             # BR-53 reads the owner tag of each Bedrock batch inference, model
-            # customization and evaluation job. The service authorization
+            # customization and evaluation job. BR-02 reads the VPC subnets of
+            # each running training and processing job. The service authorization
             # reference gives each Describe and Get action its own job resource
             # type, and ListTagsForResource all three Bedrock job resource types
             # and none of the SageMaker ones, so no action is granted on
@@ -411,9 +412,9 @@ Resources:
             # merged to keep this policy under its 5,500-character budget.
             Effect: Allow
             Action:
-              - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
+              - sagemaker:DescribeTrainingJob # BR-02, BR-46, BR-47, BR-52
               - sagemaker:DescribeTransformJob # BR-47
-              - sagemaker:DescribeProcessingJob # BR-47
+              - sagemaker:DescribeProcessingJob # BR-02, BR-47
               - bedrock:GetEvaluationJob # BR-47
               - bedrock:ListTagsForResource # BR-53
             Resource:

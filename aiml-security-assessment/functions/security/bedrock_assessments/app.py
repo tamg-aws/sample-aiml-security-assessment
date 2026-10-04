@@ -2675,8 +2675,11 @@ WORKLOAD_CONNECTIVITY_FINDING = "Bedrock Workload Private Connectivity"
 
 WORKLOAD_CONNECTIVITY_CEILING = (
     "Lambda functions, EC2 instances, ECS services and standalone tasks, "
-    "SageMaker notebook instances and endpoints, EKS pod identity associations "
-    "and VPC-mode AgentCore runtime versions are read. A PUBLIC-mode AgentCore "
+    "SageMaker notebook instances and endpoints, running SageMaker training and "
+    "processing jobs, EKS pod identity associations and VPC-mode AgentCore "
+    "runtime versions are read. A training or processing job with no VPC "
+    "configuration runs in a network SageMaker manages, not in this account's "
+    "subnets, and is out of scope. A PUBLIC-mode AgentCore "
     "runtime is judged by AC-01. A role an EKS pod takes through IAM roles for "
     "service accounts is read as every role whose trust policy allows "
     "sts:AssumeRoleWithWebIdentity to the cluster's OIDC provider, in the "
@@ -3045,6 +3048,128 @@ def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
                 "subnets": [subnet] if subnet else None,
             }
         )
+
+
+# (kind, list operation, summaries key, name key, describe operation,
+# describe name parameter, path to the VpcConfig in the describe response)
+SAGEMAKER_JOB_WORKLOAD_SOURCES = (
+    (
+        "SageMaker training job",
+        "list_training_jobs",
+        "TrainingJobSummaries",
+        "TrainingJobName",
+        "describe_training_job",
+        "TrainingJobName",
+        ("VpcConfig",),
+    ),
+    (
+        "SageMaker processing job",
+        "list_processing_jobs",
+        "ProcessingJobSummaries",
+        "ProcessingJobName",
+        "describe_processing_job",
+        "ProcessingJobName",
+        ("NetworkConfig", "VpcConfig"),
+    ),
+)
+
+
+def _sagemaker_job_workloads(region: str, inventory: Dict[str, Any]) -> None:
+    """
+    Add every running (InProgress) SageMaker training and processing job that
+    runs in a VPC, with the VPC of its subnets and its execution role, to
+    ``inventory``. A job with no VPC configuration runs in a network SageMaker
+    manages, not in the account's subnets, so it is not added.
+    """
+    sagemaker_client = boto3.client(
+        "sagemaker", config=boto3_config, region_name=region
+    )
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    subnet_cache: Dict[str, Optional[str]] = {}
+    for (
+        kind,
+        list_operation,
+        summaries_key,
+        name_key,
+        describe_operation,
+        describe_param,
+        vpc_path,
+    ) in SAGEMAKER_JOB_WORKLOAD_SOURCES:
+        api = "".join(part.title() for part in list_operation.split("_"))
+        try:
+            jobs = _list_all_items(
+                sagemaker_client,
+                list_operation,
+                summaries_key,
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                StatusEquals="InProgress",
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"running {kind}s were not listed with sagemaker:{api} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        names = [str(job.get(name_key) or "unnamed") for job in jobs]
+        for index, name in enumerate(names):
+            label = f"{kind} '{name}'"
+            if _deadline_reached():
+                inventory["errors"].append(
+                    "{} running {}(s) from '{}' on were not described, {}".format(
+                        len(names) - index, kind, name, DEADLINE_STOP
+                    )
+                )
+                break
+            try:
+                detail = getattr(sagemaker_client, describe_operation)(
+                    **{describe_param: name}
+                )
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"{label} was not described with sagemaker:"
+                    + "".join(part.title() for part in describe_operation.split("_"))
+                    + f" ({get_assessment_error_label(error)})"
+                )
+                continue
+            vpc_config = detail
+            for key in vpc_path:
+                vpc_config = (vpc_config or {}).get(key)
+            subnets = sorted(
+                subnet for subnet in (vpc_config or {}).get("Subnets") or [] if subnet
+            )
+            if not subnets:
+                continue
+            try:
+                vpcs = _subnet_vpcs(ec2_client, subnets, subnet_cache)
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"the subnets of {label} were not read with "
+                    f"ec2:DescribeSubnets ({get_assessment_error_label(error)})"
+                )
+                continue
+            missing = sorted(subnet for subnet, vpc in vpcs.items() if not vpc)
+            if missing:
+                inventory["errors"].append(
+                    "subnet(s) {} of {} were not returned by ec2:DescribeSubnets".format(
+                        ", ".join(missing), label
+                    )
+                )
+                continue
+            role_arn = str(detail.get("RoleArn") or "")
+            for vpc_id in sorted(set(vpcs.values())):
+                inventory["workloads"].append(
+                    {
+                        "kind": kind,
+                        "name": name,
+                        "vpc_id": vpc_id,
+                        "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                        "subnets": sorted(
+                            subnet for subnet, vpc in vpcs.items() if vpc == vpc_id
+                        ),
+                    }
+                )
 
 
 def _sagemaker_endpoint_workloads(region: str, inventory: Dict[str, Any]) -> None:
@@ -3462,9 +3587,9 @@ def _agentcore_runtime_workloads(region: str, inventory: Dict[str, Any]) -> None
 def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     """
     List Lambda functions, ECS services and standalone tasks, SageMaker
-    notebook instances and endpoint models, EKS pod identity associations,
-    VPC-mode AgentCore runtime versions and EC2 instances with the VPC and
-    role each runs as.
+    notebook instances, endpoint models and running training and processing
+    jobs in a VPC, EKS pod identity associations, VPC-mode AgentCore runtime
+    versions and EC2 instances with the VPC and role each runs as.
 
     A listing that fails is named in ``errors`` so the population is never
     reported complete without it.
@@ -3502,6 +3627,7 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     _ecs_service_workloads(region, inventory)
     _notebook_workloads(region, inventory)
     _sagemaker_endpoint_workloads(region, inventory)
+    _sagemaker_job_workloads(region, inventory)
     _eks_pod_identity_workloads(region, inventory)
     _agentcore_runtime_workloads(region, inventory)
 
@@ -28661,9 +28787,9 @@ def check_ai_workload_subnet_privacy(
     internet gateway.
 
     The population is BR-02's workload inventory: every Lambda function, ECS
-    service and standalone task, EC2 instance, SageMaker notebook instance and
-    endpoint, EKS pod identity association and VPC-mode AgentCore runtime
-    version. A workload is AI compute when its role is granted one of those
+    service and standalone task, EC2 instance, SageMaker notebook instance,
+    endpoint and running training or processing job in a VPC, EKS pod identity
+    association and VPC-mode AgentCore runtime version. A workload is AI compute when its role is granted one of those
     surfaces, the test BR-02 applies.
     """
     findings = {"csv_data": []}
@@ -28806,7 +28932,8 @@ def check_ai_workload_subnet_privacy(
             findings["csv_data"].append(
                 row(
                     "No Lambda function, ECS service or task, EC2 instance, "
-                    "SageMaker notebook instance or endpoint, EKS pod identity "
+                    "SageMaker notebook instance, endpoint or running training or "
+                    "processing job in a VPC, EKS pod identity "
                     "association or AgentCore runtime in "
                     f"{region or 'this Region'} runs as a role granted a Bedrock, "
                     "AgentCore or SageMaker runtime surface.",
