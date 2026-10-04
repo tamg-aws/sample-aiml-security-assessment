@@ -1937,7 +1937,7 @@ MUTATIONS = [
         "whose encryption nobody read. Without the unread row the first 1,000 "
         "listed objects stand for the whole prefix and the endpoint passes",
         "find": (
-            "        if more:\n"
+            "        if skipped:\n"
             "            unreads.append(\n"
             '                f"{where} {uri} holds more objects than the "\n'
         ),
@@ -2107,6 +2107,27 @@ MUTATIONS = [
         "defect": "an endpoint config with only Input or only Output then reads as capturing requests and responses",
         "find": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} <= modes)\n',
         "replace": '                    and not ("InputAndOutput" in modes or {"Input", "Output"} & modes)\n',
+    },
+    {
+        "name": "SM-43 stops counting at the page that hit the cap",
+        "file": SAGEMAKER,
+        "defect": "the objects on later listing pages are past the cap too, so a count of the first page understates what was not read",
+        "find": "                    if count_pages[0] <= 0:\n",
+        "replace": "                    if True:\n",
+    },
+    {
+        "name": "SM-43 reports a stopped count as exact",
+        "file": SAGEMAKER,
+        "defect": "a count the page budget stopped is a lower bound, so stating it as exact claims what was not listed",
+        "find": "                        uncounted = True\n                        break\n",
+        "replace": "                        uncounted = False\n                        break\n",
+    },
+    {
+        "name": "SM-43 never spends the counting page budget",
+        "file": SAGEMAKER,
+        "defect": "an unbounded count over a prefix of millions of objects outruns the 600 s Lambda timeout",
+        "find": "                    count_pages[0] -= 1\n",
+        "replace": "                    pass\n",
     },
     {
         "name": "SM-11 invoke leg passes with the root user unbound",
@@ -5337,6 +5358,9 @@ GROUPS: dict[str, str] = {
     "SM-31 passes a capture that records one direction": "in the SageMaker verdict legs",
     "SM-31 takes either capture direction for both": "in the SageMaker verdict legs",
     "SM-31 passes an endpoint whose config was not read": "in the SageMaker verdict legs",
+    "SM-43 stops counting at the page that hit the cap": "in the SageMaker verdict legs",
+    "SM-43 reports a stopped count as exact": "in the SageMaker verdict legs",
+    "SM-43 never spends the counting page budget": "in the SageMaker verdict legs",
     "SM-11 invoke leg passes with the root user unbound": "in the SageMaker verdict legs",
     "SM-11 invoke leg credits an SCP that misses an invoke action": "in the SageMaker verdict legs",
     "SM-11 invoke leg fails the root user on an unread SCP": "in the SageMaker verdict legs",

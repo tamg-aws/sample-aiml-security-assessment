@@ -490,6 +490,11 @@ section.
   every role and user is held by an identity condition, because the account
   root user is bound by no identity policy. It passed on roles and users
   before. An SCP the check could not read holds the row at `N/A`.
+- `SM-43` counts the objects under a prefix past its 1,000-object
+  `HeadObject` cap with further `ListObjectsV2` pages and names that count in
+  its not-read row, as a lower bound when the run's 50-page counting budget
+  ends first. The code comment records the live latency both caps were set
+  from (account 178113193057, us-east-1, 2026-10-04).
 - `SM-23` judges a schedule whose latest execution is `Pending` or
   `InProgress` by the newest finished execution, read with
   `sagemaker:ListMonitoringExecutions`. It was `N/A` before. A schedule

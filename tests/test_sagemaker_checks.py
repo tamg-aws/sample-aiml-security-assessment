@@ -21992,7 +21992,14 @@ def _sm43_rows(
         )
         if isinstance(pages, Exception):
             raise pages
-        return [{"Contents": [{"Key": key} for key in page]} for page in pages]
+        # As the API does: every page but the last is truncated.
+        return [
+            {
+                "Contents": [{"Key": key} for key in page],
+                "IsTruncated": n < len(pages) - 1,
+            }
+            for n, page in enumerate(pages)
+        ]
 
     s3.get_paginator.side_effect = _pager({"list_objects_v2": list_objects})
     keys = keys or {}
@@ -23256,7 +23263,7 @@ class TestSM43PrefixObjects:
         assert _sm43_rows.head_calls == ["s3://artifacts/m/a", "s3://artifacts/m/b"]
         assert (
             "model 'm-1' container 1 ModelDataSource s3://artifacts/m/ holds more "
-            "objects than the 2 this run reads with HeadObject, so the objects "
+            "objects than the 2 this run reads with HeadObject, so the 1 object(s) "
             "after the first 2 listed were not read"
         ) in rows[0]["Finding_Details"]
 
@@ -23275,8 +23282,52 @@ class TestSM43PrefixObjects:
         assert _sm43_statuses(rows) == ["N/A"]
         details = rows[0]["Finding_Details"]
         assert "s3://artifacts/two/ holds more objects than the 2" in details
-        assert "after the first 0 listed were not read" in details
+        assert "so the 1 object(s) after the first 0 listed were not read" in details
         assert "s3://artifacts/two/a" not in _sm43_rows.head_calls
+
+    def test_objects_past_the_cap_are_counted_across_pages(self):
+        # AIR-SLF-CMP-08 round 9: the rest of the page that hit the cap and
+        # each later page are counted, not read.
+        with patch.object(sagemaker_app, "SM43_PREFIX_OBJECT_CAP", 2):
+            rows = _sm43_rows(
+                endpoints={"ep-1": {"models": ["m-1"]}},
+                models={"m-1": _sm43_prefix_model()},
+                listings={
+                    "s3://artifacts/m/": [
+                        ["m/a", "m/b", "m/c"],
+                        ["m/d", "m/e"],
+                        ["m/f"],
+                    ]
+                },
+            )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert _sm43_rows.head_calls == ["s3://artifacts/m/a", "s3://artifacts/m/b"]
+        details = rows[0]["Finding_Details"]
+        assert "so the 4 object(s) after the first 2 listed were not read" in details
+        assert "or more" not in details
+
+    def test_a_count_stopped_by_the_page_cap_is_a_lower_bound(self):
+        with (
+            patch.object(sagemaker_app, "SM43_PREFIX_OBJECT_CAP", 2),
+            patch.object(sagemaker_app, "SM43_PREFIX_COUNT_PAGE_CAP", 1),
+        ):
+            rows = _sm43_rows(
+                endpoints={"ep-1": {"models": ["m-1"]}},
+                models={"m-1": _sm43_prefix_model()},
+                listings={
+                    "s3://artifacts/m/": [
+                        ["m/a", "m/b", "m/c"],
+                        ["m/d", "m/e"],
+                        ["m/f"],
+                    ]
+                },
+            )
+        assert _sm43_statuses(rows) == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "so the 3 or more object(s) after the first 2 listed were not read "
+            "(the count stopped at the 1 listing pages"
+        ) in details
 
     def test_an_exactly_full_cap_with_nothing_left_passes(self):
         with patch.object(sagemaker_app, "SM43_PREFIX_OBJECT_CAP", 2):

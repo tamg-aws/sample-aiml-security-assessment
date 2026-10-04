@@ -17426,7 +17426,17 @@ MODEL_ARTIFACT_INSTANCE_RESOLUTION = (
     "move the model read to the workload's own role, such as an ECS task role "
     "or an EKS Pod Identity role, so the instance role cannot read the weights."
 )
+# AIR-SLF-CMP-08 read caps, measured on account 178113193057 in us-east-1 on
+# 2026-10-04 from outside AWS, so in-Region calls from the Lambda are at most
+# this slow: 1,000 sequential HeadObject calls took 60.4 s (median 53 ms, p95
+# 91 ms, slowest 1.8 s), and 10 ListObjectsV2 pages of 1,000 keys took a
+# median 171 ms each (slowest 1.0 s). The function's timeout is 600 s, so the
+# HeadObject cap holds about a tenth of it and the counting pages past it
+# about 9 s at the median (51 s at the slowest page seen). Objects past the
+# HeadObject cap are counted and reported as not read, which holds Passed at
+# N/A; a count stopped by the page cap is reported as a lower bound.
 SM43_PREFIX_OBJECT_CAP = 1000
+SM43_PREFIX_COUNT_PAGE_CAP = 50
 MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "A recorded ETag, ManifestEtag or ModelDataETag means an expected value is "
     "recorded; whether SageMaker or the container compared it to the object at "
@@ -17436,7 +17446,8 @@ MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "own server-side encryption is judged. Each object under an S3Prefix source "
     "or a multi-model prefix is listed and read with HeadObject for its "
     "server-side encryption, up to "
-    f"{SM43_PREFIX_OBJECT_CAP} objects per run. No SageMaker field records a "
+    f"{SM43_PREFIX_OBJECT_CAP} objects per run; objects past that are counted "
+    "and reported as not read. No SageMaker field records a "
     "SHA256 digest to compare. The execution role's s3:GetObject reach is judged "
     "per bucket from its Allow statements and permissions boundary, not against "
     "the artifact prefix; a Deny narrower than every resource, and SCPs, are not "
@@ -17652,6 +17663,7 @@ def check_sagemaker_model_artifact_integrity(
     model_roles = {}
     role_reach = {}
     prefix_budget = [SM43_PREFIX_OBJECT_CAP]
+    count_pages = [SM43_PREFIX_COUNT_PAGE_CAP]
     s3_client = boto3.client("s3", config=boto3_config, region_name=region)
 
     def _ecr(image_region):
@@ -17892,23 +17904,27 @@ def check_sagemaker_model_artifact_integrity(
 
     def _prefix_keys(uri):
         """The keys under a prefix up to the run's remaining HeadObject budget,
-        with whether more were left, or the error label of a failed listing."""
+        the count of keys past it, and whether that count stopped at the run's
+        page budget; or the error label of a failed listing."""
         if uri not in listings:
             bucket, _, prefix = uri[len("s3://") :].partition("/")
-            keys, more = [], False
+            keys, skipped, uncounted = [], 0, False
             try:
                 for page in s3_client.get_paginator("list_objects_v2").paginate(
                     Bucket=bucket, Prefix=prefix
                 ):
-                    for item in page.get("Contents") or []:
-                        if len(keys) >= prefix_budget[0]:
-                            more = True
-                            break
-                        keys.append(item["Key"])
-                    if more:
+                    contents = page.get("Contents") or []
+                    room = max(prefix_budget[0] - len(keys), 0)
+                    keys.extend(item["Key"] for item in contents[:room])
+                    skipped += max(len(contents) - room, 0)
+                    if not skipped or not page.get("IsTruncated"):
+                        continue
+                    if count_pages[0] <= 0:
+                        uncounted = True
                         break
+                    count_pages[0] -= 1
                 prefix_budget[0] -= len(keys)
-                listings[uri] = (bucket, keys, more)
+                listings[uri] = (bucket, keys, (skipped, uncounted))
             except Exception as error:
                 listings[uri] = get_assessment_error_label(error)
         return listings[uri]
@@ -17921,8 +17937,8 @@ def check_sagemaker_model_artifact_integrity(
                 f"{where} {uri} objects were not listed (s3:ListBucket: {listing})"
             )
             return problems, unreads
-        bucket, keys, more = listing
-        if not keys and not more:
+        bucket, keys, (skipped, uncounted) = listing
+        if not keys and not skipped:
             problems.append(
                 f"{where} {uri} lists no objects, so no object holds the model data"
             )
@@ -17932,11 +17948,18 @@ def check_sagemaker_model_artifact_integrity(
             )
             problems += object_problems
             unreads += object_unreads
-        if more:
+        if skipped:
             unreads.append(
                 f"{where} {uri} holds more objects than the "
                 f"{SM43_PREFIX_OBJECT_CAP} this run reads with HeadObject, so the "
-                f"objects after the first {len(keys)} listed were not read"
+                f"{skipped}{' or more' if uncounted else ''} object(s) after the "
+                f"first {len(keys)} listed were not read"
+                + (
+                    f" (the count stopped at the {SM43_PREFIX_COUNT_PAGE_CAP} "
+                    "listing pages this run spends on objects past that cap)"
+                    if uncounted
+                    else ""
+                )
             )
         return problems, unreads
 
