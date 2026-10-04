@@ -124,10 +124,20 @@ AI_SUBJECT_ROWS = [
         "(embeddingModelType, embeddingModelArn, embeddingModelConfiguration, "
         "serverSideEncryptionConfiguration and supplementalDataStorageConfiguration"
         " only), so who can read a MANAGED store is not compared with who reads its"
-        " source data. The Aurora, OpenSearch domain, Neptune Analytics, Kendra and"
-        " Redshift stores are not compared with the source bucket either, because "
-        "their readers are database users, fine-grained access control users or IAM"
-        " grants, not principals a resource policy names",
+        " source data. A Neptune Analytics graph or a Kendra index has no resource "
+        "policy, so its readers are the IAM roles and users (exact ARNs from "
+        "iam:ListRoles and iam:ListUsers) whose identity policies allow "
+        "neptune-graph:ReadDataViaQuery, or kendra:Query or kendra:Retrieve, on it "
+        "without a Condition, within any permissions boundary; they are compared "
+        "with the source bucket as above, and a conditioned grant, a principal the "
+        "cache failed to read or an unread listing is N/A. A Kendra index's source "
+        "buckets are its own S3 data sources (kendra:ListDataSources, "
+        "kendra:DescribeDataSource), a TEMPLATE connector is N/A, and an index whose"
+        " UserContextPolicy is USER_TOKEN holds its readers at N/A. Service control "
+        "policies over the store read are not evaluated. The Aurora, OpenSearch "
+        "domain and Redshift stores are not compared with the source bucket, "
+        "because their readers are database users or fine-grained access control "
+        "users, not principals a resource policy or an IAM grant names",
         [],
         3,
     ),

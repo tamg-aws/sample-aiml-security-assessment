@@ -42520,6 +42520,7 @@ class TestBR20ValueDepth:
 
     def _kendra_run(self, index=None, error=None, body=None):
         kendra = MagicMock()
+        kendra.list_data_sources.return_value = {"SummaryItems": []}
         if error is not None:
             kendra.describe_index.side_effect = error
         else:
@@ -42582,6 +42583,298 @@ class TestBR20ValueDepth:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "no readable kendraIndexArn" in rows[0]["Finding_Details"]
         kendra.describe_index.assert_not_called()
+
+    # --- KB-03: Neptune Analytics and Kendra readers against the source -----
+
+    GRAPH = f"arn:aws:neptune-graph:us-east-1:{ACCOUNT}:graph/g-1"
+    # The cache keys a role by name; its ARN carries a path the bucket names.
+    READER = f"arn:aws:iam::{ACCOUNT}:role/team/reader"
+
+    @classmethod
+    def _reader_role(cls, actions, resource, condition=None, deny=None, boundary=None):
+        statements = [
+            {"Effect": "Allow", "Action": actions, "Resource": resource},
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::corpus/*",
+            },
+            {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": cls.CMK},
+        ]
+        if condition:
+            statements[0]["Condition"] = condition
+        if deny:
+            statements.append(deny)
+        role = {
+            "attached_policies": [
+                {"policy_name": "reads", "document": {"Statement": statements}}
+            ]
+        }
+        if boundary is not None:
+            role["permissions_boundary"] = {"document": {"Statement": boundary}}
+        return role
+
+    def _iam(self, roles=None, error=None):
+        iam = MagicMock()
+        listed = roles or {
+            "kb-role": self.ROLE,
+            "reader": self.READER,
+        }
+
+        def paginator(operation):
+            pager = MagicMock()
+            if error is not None and operation == "list_roles":
+                pager.paginate.side_effect = error
+            elif operation == "list_roles":
+                pager.paginate.return_value = [
+                    {"Roles": [{"RoleName": n, "Arn": a} for n, a in listed.items()]}
+                ]
+            else:
+                pager.paginate.return_value = [{"Users": []}]
+            return pager
+
+        iam.get_paginator.side_effect = paginator
+        return iam
+
+    def _graph_run(self, reader, allowed=None, iam=None, cache=None):
+        graph = MagicMock()
+        graph.get_graph.return_value = {
+            "kmsKeyIdentifier": self.CMK,
+            "publicConnectivity": False,
+        }
+        if cache is None:
+            cache = self._cache(roles={"reader": reader} if reader else None)
+        return self._source_access(
+            self._run(
+                {
+                    "kb1": self._store_body(
+                        "NEPTUNE_ANALYTICS",
+                        "neptuneAnalyticsConfiguration",
+                        {"graphArn": self.GRAPH},
+                    )
+                },
+                clients={"neptune-graph": graph, "iam": iam or self._iam()},
+                sources={"kb1": [("ds1", "corpus", self.CMK)]},
+                bucket_encryption={"corpus": self._sse(self.CMK)},
+                bucket_policies={
+                    "corpus": self._source_deny(allowed=allowed or [self.ROLE])
+                },
+                permission_cache=cache,
+            )
+        )
+
+    def test_a_neptune_graph_reader_the_source_bucket_denies_fails(self):
+        rows = self._graph_run(
+            self._reader_role("neptune-graph:ReadDataViaQuery", self.GRAPH)
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "1 of the 1 principal(s) admitted to the vector index of knowledge "
+            "base(s) 'KB-kb1' are denied s3:GetObject on the documents of source "
+            f"bucket 'corpus' by its bucket policy, so they read through the index "
+            f"content the bucket keeps from them: {self.READER}."
+        ) in details
+        assert (
+            f"The principals that read the Neptune Analytics graph '{self.GRAPH}' "
+            "behind 'KB-kb1' are the IAM roles and users whose identity policies "
+            "allow neptune-graph:ReadDataViaQuery on it without a Condition"
+        ) in details
+        assert self.ROLE not in details.split("keeps from them:")[1]
+
+    def test_a_neptune_graph_reader_the_source_bucket_admits_by_path_passes(self):
+        rows = self._graph_run(
+            self._reader_role("neptune-graph:*", "*"), allowed=[self.READER]
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "None of the 1 principal(s)" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            # A grant on another graph, an identity Deny and a boundary without
+            # the action each leave the role unable to read this graph.
+            "other graph",
+            "denied",
+            "bounded",
+            "write only",
+        ],
+    )
+    def test_a_role_that_cannot_read_the_graph_is_not_a_reader(self, reader):
+        other = f"arn:aws:neptune-graph:us-east-1:{self.ACCOUNT}:graph/g-2"
+        role = {
+            "other graph": self._reader_role("neptune-graph:ReadDataViaQuery", other),
+            "denied": self._reader_role(
+                "*",
+                "*",
+                deny={
+                    "Effect": "Deny",
+                    "Action": "neptune-graph:ReadDataViaQuery",
+                    "Resource": "*",
+                },
+            ),
+            "bounded": self._reader_role(
+                "neptune-graph:*",
+                "*",
+                boundary=[{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+            ),
+            "write only": self._reader_role(
+                "neptune-graph:WriteDataViaQuery", self.GRAPH
+            ),
+        }[reader]
+        rows = self._graph_run(role)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert self.READER not in rows[0]["Finding_Details"]
+
+    def test_a_conditioned_graph_read_is_held_not_passed(self):
+        rows = self._graph_run(
+            self._reader_role(
+                "neptune-graph:ReadDataViaQuery",
+                self.GRAPH,
+                condition={"Bool": {"aws:SecureTransport": "true"}},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            f"for 'KB-kb1', {self.READER}: attached policy 'reads' allows the read "
+            "under a Condition"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_unread_principal_holds_the_graph_comparison(self):
+        cache = self._cache()
+        cache["principal_errors"] = [{"type": "role", "name": "ghost", "stage": "x"}]
+        rows = self._graph_run(None, cache=cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "1 IAM principal(s) had a policy read fail in the IAM permissions "
+            "cache, so whether they hold neptune-graph:ReadDataViaQuery is not "
+            "known: role ghost"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_unlisted_role_holds_the_graph_comparison(self):
+        rows = self._graph_run(
+            self._reader_role("neptune-graph:ReadDataViaQuery", self.GRAPH),
+            iam=self._iam(error=_client_error("AccessDenied", "denied", "ListRoles")),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "the IAM roles were not listed with iam:ListRoles (AccessDenied)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_the_iam_listing_stops_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        iam = self._iam()
+        with patch("bedrock_app.boto3.client", return_value=iam):
+            listing = bedrock_app._iam_principal_arns()
+        assert listing == {
+            "arns": {},
+            "error": "the IAM roles were not all listed with iam:ListRoles "
+            f"{bedrock_app.DEADLINE_STOP}",
+        }
+
+    def _kendra_reader_run(self, policy="ATTRIBUTE_FILTER", sources=None, allowed=None):
+        kendra = MagicMock()
+        kendra.describe_index.return_value = {
+            "ServerSideEncryptionConfiguration": {"KmsKeyId": self.CMK},
+            "UserContextPolicy": policy,
+        }
+        sources = sources or {"ds-1": ("S3", "corpus")}
+        kendra.list_data_sources.return_value = {
+            "SummaryItems": [{"Id": i, "Name": f"n-{i}"} for i in sources]
+        }
+
+        def describe_data_source(Id, IndexId):
+            kind, bucket = sources[Id]
+            detail = {"Type": kind}
+            if bucket:
+                detail["Configuration"] = {"S3Configuration": {"BucketName": bucket}}
+            return detail
+
+        kendra.describe_data_source.side_effect = describe_data_source
+        self.kendra = kendra
+        findings = self._run(
+            {
+                "kb1": {
+                    "knowledgeBaseConfiguration": {
+                        "type": "KENDRA",
+                        "kendraKnowledgeBaseConfiguration": {
+                            "kendraIndexArn": self.KENDRA_INDEX
+                        },
+                    }
+                }
+            },
+            clients={"kendra": kendra, "iam": self._iam()},
+            bucket_encryption={"corpus": self._sse(self.CMK)},
+            bucket_policies={
+                "corpus": self._source_deny(allowed=allowed or [self.ROLE])
+            },
+            permission_cache=self._cache(
+                roles={"reader": self._reader_role("kendra:Query", self.KENDRA_INDEX)}
+            ),
+        )
+        return findings, self._source_access(findings)
+
+    def test_a_kendra_index_reader_the_source_bucket_denies_fails(self):
+        findings, rows = self._kendra_reader_run()
+        self.kendra.list_data_sources.assert_called_once_with(
+            IndexId="idx-1", MaxResults=100
+        )
+        self.kendra.describe_data_source.assert_called_once_with(
+            Id="ds-1", IndexId="idx-1"
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert f"keeps from them: {self.READER}." in details
+        assert (
+            f"Kendra data source 'n-ds-1' of index '{self.KENDRA_INDEX}' behind "
+            "knowledge base 'KB-kb1'"
+        ) in details
+        assert "allow kendra:Query or kendra:Retrieve on it" in details
+
+    def test_a_kendra_index_reader_the_source_bucket_admits_passes(self):
+        _, rows = self._kendra_reader_run(allowed=[self.READER])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_user_token_kendra_index_holds_its_readers(self):
+        _, rows = self._kendra_reader_run(policy="USER_TOKEN")
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "the index's UserContextPolicy is USER_TOKEN, so each caller sees only "
+            "the documents its token admits, which is not read"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_template_kendra_source_is_named_not_judged(self):
+        findings, rows = self._kendra_reader_run(
+            sources={"ds-1": ("S3", "corpus"), "ds-2": ("TEMPLATE", None)}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert any(
+            f"Kendra data source 'n-ds-2' of index '{self.KENDRA_INDEX}' behind "
+            "knowledge base 'KB-kb1' is a TEMPLATE connector, whose repository is "
+            "not read, so an S3 bucket behind it is not judged"
+            in f["Finding_Details"]
+            and f["Status"] == "N/A"
+            for f in findings
+        )
+
+    def test_kendra_data_source_reads_stop_at_the_deadline(self, monkeypatch):
+        kendra = MagicMock()
+        kendra.list_data_sources.return_value = {
+            "SummaryItems": [{"Id": "ds-1"}, {"Id": "ds-2"}]
+        }
+        monkeypatch.setattr(bedrock_app, "_DEADLINE", 0.0)
+        corpus = bedrock_app._kendra_index_s3_sources(
+            kendra, "idx-1", self.KENDRA_INDEX, "kb1", "KB-kb1"
+        )
+        kendra.describe_data_source.assert_not_called()
+        assert corpus == {
+            "sources": [],
+            "errors": [
+                f"2 data source(s) of Kendra index '{self.KENDRA_INDEX}' were not "
+                f"read with kendra:DescribeDataSource {bedrock_app.DEADLINE_STOP}"
+            ],
+        }
 
     WORKGROUP = f"arn:aws:redshift-serverless:us-west-2:{ACCOUNT}:workgroup/wg-1"
 

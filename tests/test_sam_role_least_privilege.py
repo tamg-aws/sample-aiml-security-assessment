@@ -151,6 +151,9 @@ _EXPECTED_ACTIONS = {
         "bedrock:ListPromptRouters",
         "bedrock:ListTagsForResource",
         "iam:ListRoles",
+        "iam:ListUsers",
+        "kendra:DescribeDataSource",
+        "kendra:ListDataSources",
         "lambda:GetMicrovm",
         "lambda:ListMicrovms",
         "s3:ListBucketVersions",
@@ -1319,6 +1322,20 @@ def test_bedrock_second_managed_policy_renders_within_its_budget(template, parti
     )
 
 
+# ListDataSources authorizes on the Kendra index, DescribeDataSource on the
+# data-source and index resource types.
+KENDRA_SOURCE_ARNS = json.dumps(
+    [
+        {"Fn::Sub": "arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:index/*"},
+        {
+            "Fn::Sub": "arn:${AWS::Partition}:kendra:*:${AWS::AccountId}:"
+            "index/*/data-source/*"
+        },
+    ],
+    sort_keys=True,
+)
+
+
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
 def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(template):
     with open(template, encoding="utf-8") as template_file:
@@ -1371,6 +1388,19 @@ def test_bedrock_second_managed_policy_holds_exactly_the_approved_grants(templat
                 '"*"',
             ),
             ("AIOwnerTagRead", "Allow", "sagemaker:ListTags", owner_tag_arns),
+            ("ManagedReadsOnWildcard2", "Allow", "iam:ListUsers", '"*"'),
+            (
+                "KendraDataSourceRead",
+                "Allow",
+                "kendra:ListDataSources",
+                KENDRA_SOURCE_ARNS,
+            ),
+            (
+                "KendraDataSourceRead",
+                "Allow",
+                "kendra:DescribeDataSource",
+                KENDRA_SOURCE_ARNS,
+            ),
             # A guardrail another account owns, such as an organization-enforced
             # guardrail in the administrator account, needs the account segment
             # open; the owner's resource policy must also allow the read.

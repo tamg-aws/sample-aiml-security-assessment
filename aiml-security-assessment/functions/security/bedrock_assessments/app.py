@@ -16389,12 +16389,96 @@ def _assess_storage_layer_encryption(
     )
 
 
+def _kendra_index_s3_sources(
+    client: Any, index_id: str, arn: str, kb_id: str, kb_name: str
+) -> Dict[str, List]:
+    """
+    Read the S3 buckets a Kendra index ingests from, for BR-20: a KENDRA
+    knowledge base has no Bedrock data source, so the index's own Kendra data
+    sources are its corpus. Returns {"sources": [...], "errors": [...]}.
+    """
+    sources: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    try:
+        summaries = _list_all_items(
+            client,
+            "list_data_sources",
+            "SummaryItems",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            IndexId=index_id,
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "sources": [],
+            "errors": [
+                f"the data sources of Kendra index '{arn}' behind knowledge base "
+                f"'{kb_name}' were not read with kendra:ListDataSources "
+                f"({get_assessment_error_label(error)})"
+            ],
+        }
+    for position, summary in enumerate(summaries):
+        if _deadline_reached():
+            errors.append(
+                f"{len(summaries) - position} data source(s) of Kendra index "
+                f"'{arn}' were not read with kendra:DescribeDataSource "
+                f"{DEADLINE_STOP}"
+            )
+            break
+        source_id = summary.get("Id")
+        if not source_id:
+            continue
+        label = (
+            f"Kendra data source '{summary.get('Name') or source_id}' of index "
+            f"'{arn}' behind knowledge base '{kb_name}'"
+        )
+        try:
+            detail = client.describe_data_source(Id=source_id, IndexId=index_id)
+        except (ClientError, BotoCoreError) as error:
+            errors.append(
+                f"{label} was not read with kendra:DescribeDataSource "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        kind = str(detail.get("Type") or "")
+        if kind == "TEMPLATE":
+            errors.append(
+                f"{label} is a TEMPLATE connector, whose repository is not read, "
+                "so an S3 bucket behind it is not judged"
+            )
+        elif kind == "S3":
+            bucket = str(
+                ((detail.get("Configuration") or {}).get("S3Configuration") or {}).get(
+                    "BucketName"
+                )
+                or ""
+            )
+            if bucket:
+                sources.append(
+                    {
+                        "label": label,
+                        "bucket": bucket,
+                        "knowledge_base_id": kb_id,
+                        "owner_account": "",
+                    }
+                )
+            else:
+                errors.append(f"{label} names no S3 bucket")
+    return {"sources": sources, "errors": errors}
+
+
 def _assess_kendra_index_encryption(
-    kb_configuration: Dict[str, Any], region: str
-) -> Dict[str, str]:
+    kb_configuration: Dict[str, Any],
+    region: str,
+    kb_id: str = "",
+    kb_name: str = "",
+) -> Dict[str, Any]:
     """
     Judge the key on the Kendra index behind a KENDRA knowledge base, read
-    from DescribeIndex ServerSideEncryptionConfiguration.KmsKeyId.
+    from DescribeIndex ServerSideEncryptionConfiguration.KmsKeyId. The verdict
+    also carries the index's S3 sources and, for BR-20's source comparison, a
+    reader spec: an index whose UserContextPolicy is USER_TOKEN filters results
+    by the caller's token, so its IAM readers are held.
     """
     arn = str(
         (kb_configuration.get("kendraKnowledgeBaseConfiguration") or {}).get(
@@ -16411,28 +16495,52 @@ def _assess_kendra_index_encryption(
             "so the index key could not be read.",
         )
     located = f"Kendra index '{arn}'"
+    client = boto3.client("kendra", config=boto3_config, region_name=store_region)
+    readers = {
+        "actions": STORE_READ_ACTIONS["kendra"],
+        "arn": arn,
+        "store": located,
+        "held": [],
+    }
     try:
-        response = boto3.client(
-            "kendra", config=boto3_config, region_name=store_region
-        ).describe_index(Id=index_id)
+        response = client.describe_index(Id=index_id)
     except (ClientError, BotoCoreError) as error:
-        return _store_verdict(
+        verdict = _store_verdict(
             "N/A",
             f"uses {located}. Its encryption key could not be read: "
             f"{_store_read_error(error, 'kendra:DescribeIndex', store_region)}.",
         )
-    key = str(
-        (response.get("ServerSideEncryptionConfiguration") or {}).get("KmsKeyId") or ""
-    )
-    if not key:
-        return _store_verdict(
-            "Failed",
-            f"uses {located}. DescribeIndex reports no "
-            "ServerSideEncryptionConfiguration.KmsKeyId, so the index names no "
-            "customer managed KMS key.",
+        readers["held"].append(
+            "the index was not read with kendra:DescribeIndex, so whether it "
+            "filters results by user token is not known"
         )
-    status, observed = _kms_key_verdict(key, store_region)
-    return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+    else:
+        if str(response.get("UserContextPolicy") or "") == "USER_TOKEN":
+            readers["held"].append(
+                "the index's UserContextPolicy is USER_TOKEN, so each caller sees "
+                "only the documents its token admits, which is not read"
+            )
+        key = str(
+            (response.get("ServerSideEncryptionConfiguration") or {}).get("KmsKeyId")
+            or ""
+        )
+        if not key:
+            verdict = _store_verdict(
+                "Failed",
+                f"uses {located}. DescribeIndex reports no "
+                "ServerSideEncryptionConfiguration.KmsKeyId, so the index names no "
+                "customer managed KMS key.",
+            )
+        else:
+            status, observed = _kms_key_verdict(key, store_region)
+            verdict = _store_verdict(
+                status, f"uses {located}, encrypted with {observed}."
+            )
+    corpus = _kendra_index_s3_sources(client, index_id, arn, kb_id, kb_name)
+    verdict["readers"] = readers
+    verdict["kendra_sources"] = corpus["sources"]
+    verdict["kendra_errors"] = corpus["errors"]
+    return verdict
 
 
 def _redshift_serverless_engine(arn: str, store_region: str) -> Tuple[str, str]:
@@ -17399,6 +17507,193 @@ def _source_key_read(
     )
 
 
+# A Neptune Analytics graph and a Kendra index have no resource policy, so
+# BR-20 reads who can query them from their callers' IAM policies. These are the
+# data-read actions the service authorization reference gives each.
+STORE_READ_ACTIONS = {
+    "neptune-graph": ("neptune-graph:ReadDataViaQuery",),
+    "kendra": ("kendra:Query", "kendra:Retrieve"),
+}
+
+
+def _iam_principal_arns() -> Dict[str, Any]:
+    """
+    Read the ARN, path included, of every IAM role and user, for BR-20. The
+    IAM permissions cache keys principals by name alone, and a source bucket
+    policy names them by full ARN.
+    """
+    arns: Dict[tuple, str] = {}
+    client = boto3.client("iam", config=boto3_config)
+    for operation, key, kind, field in (
+        ("list_roles", "Roles", "role", "RoleName"),
+        ("list_users", "Users", "user", "UserName"),
+    ):
+        try:
+            for page in client.get_paginator(operation).paginate():
+                if _deadline_reached():
+                    return {
+                        "arns": arns,
+                        "error": f"the IAM {kind}s were not all listed with "
+                        f"iam:List{key} {DEADLINE_STOP}",
+                    }
+                for item in page.get(key) or []:
+                    if item.get(field) and item.get("Arn"):
+                        arns[(kind, item[field])] = item["Arn"]
+        except (ClientError, BotoCoreError) as error:
+            return {
+                "arns": arns,
+                "error": f"the IAM {kind}s were not listed with iam:List{key} "
+                f"({get_assessment_error_label(error)})",
+            }
+    return {"arns": arns, "error": ""}
+
+
+def _identity_store_read(
+    permissions: Dict[str, Any], actions: Tuple[str, ...], arn: str
+) -> Tuple[str, str]:
+    """
+    Say whether one principal's IAM policies let it read a store, for BR-20:
+    ("reads", ""), ("held", why) or ("none", "").
+
+    It reads when an identity Allow of one of ``actions`` without a Condition
+    matches ``arn``, no identity Deny of it does, and a permissions boundary,
+    if set, allows it there without a Condition. A Condition on a matching
+    statement is not judged, so it holds the principal.
+    """
+    lowered = [action.lower() for action in actions]
+
+    def matching(document: Any, label: str, held: List[str]) -> List[Dict[str, Any]]:
+        try:
+            statements = _policy_statements(document)
+        except (ValueError, TypeError) as error:
+            held.append(
+                f"{label} could not be parsed ({get_assessment_error_label(error)})"
+            )
+            return []
+        found = []
+        for statement in statements:
+            if not any(_statement_matches_action(statement, a) for a in lowered):
+                continue
+            if "NotResource" in statement:
+                reaches = not any(
+                    _wildcard_matches(str(r), arn)
+                    for r in _as_list(statement.get("NotResource"))
+                )
+            else:
+                reaches = any(
+                    _wildcard_matches(str(r), arn)
+                    for r in _as_list(statement.get("Resource"))
+                )
+            if reaches:
+                found.append(statement)
+        return found
+
+    allowed, allow_held, deny_held = False, [], []
+    for source, policy in _cached_identity_policies(permissions):
+        label = (
+            f"{source} '{policy.get('policy_name') or policy.get('name') or 'unnamed'}'"
+        )
+        for statement in matching(policy.get("document"), label, deny_held):
+            if str(statement.get("Effect", "")).upper() == "ALLOW":
+                if statement.get("Condition"):
+                    allow_held.append(f"{label} allows the read under a Condition")
+                else:
+                    allowed = True
+            elif statement.get("Condition"):
+                deny_held.append(f"{label} denies the read under a Condition")
+            else:
+                return "none", ""
+    if deny_held:
+        return "held", "; ".join(deny_held)
+    if not allowed:
+        return ("held", "; ".join(allow_held)) if allow_held else ("none", "")
+    boundary = _boundary_document(permissions)
+    if boundary is None:
+        return "reads", ""
+    bounded, boundary_held = False, []
+    for statement in matching(boundary, "permissions boundary", boundary_held):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            if not statement.get("Condition"):
+                return "none", ""
+            boundary_held.append(
+                "permissions boundary denies the read under a Condition"
+            )
+        elif statement.get("Condition"):
+            boundary_held.append(
+                "permissions boundary allows the read under a Condition"
+            )
+        else:
+            bounded = True
+    if boundary_held:
+        return "held", "; ".join(boundary_held)
+    return ("reads", "") if bounded else ("none", "")
+
+
+def _store_readers(
+    spec: Dict[str, Any],
+    permission_cache: Optional[Dict[str, Any]],
+    arn_cache: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Resolve a store reader spec ({"actions", "arn", "held"}) to the IAM roles
+    and users _identity_store_read finds reading it, for BR-20. Returns
+    {"principals": [...], "held": [...]}; a principal the cache failed to read,
+    or one holding the read that iam:ListRoles or iam:ListUsers did not return,
+    is held. A hold on the store itself establishes no principal's read.
+    """
+    held = list(spec.get("held") or [])
+    if held:
+        return {"principals": [], "held": held}
+    if permission_cache is None:
+        return {
+            "principals": [],
+            "held": held + ["the IAM permissions cache was not available"],
+        }
+    unread = sorted(
+        {
+            (str(error.get("type")), str(error.get("name")))
+            for error in permission_cache.get("principal_errors") or []
+            if isinstance(error, dict)
+        }
+    )
+    if unread:
+        held.append(
+            "{} IAM principal(s) had a policy read fail in the IAM permissions "
+            "cache, so whether they hold {} is not known: {}".format(
+                len(unread),
+                " or ".join(spec["actions"]),
+                ", ".join(f"{kind} {name}" for kind, name in unread[:5]),
+            )
+        )
+    if "listing" not in arn_cache:
+        arn_cache["listing"] = _iam_principal_arns()
+    listing = arn_cache["listing"]
+    if listing["error"]:
+        return {"principals": [], "held": held + [listing["error"]]}
+    readers = []
+    for kind in ("role", "user"):
+        cached = permission_cache.get(f"{kind}_permissions") or {}
+        for name in sorted(cached):
+            if (kind, name) in unread or not isinstance(cached[name], dict):
+                continue
+            verdict, why = _identity_store_read(
+                cached[name], spec["actions"], spec["arn"]
+            )
+            if verdict == "none":
+                continue
+            principal = listing["arns"].get((kind, name))
+            if principal is None:
+                held.append(
+                    f"{kind} '{name}' can read it but was not returned by "
+                    f"iam:List{kind.title()}s"
+                )
+            elif verdict == "held":
+                held.append(f"{principal}: {why}")
+            else:
+                readers.append(principal)
+    return {"principals": readers, "held": held}
+
+
 def _knowledge_base_source_access_findings(
     buckets: Dict[str, List[str]],
     bucket_kbs: Dict[str, set],
@@ -17425,6 +17720,13 @@ def _knowledge_base_source_access_findings(
     s3_client = None
     scp_inventory: Optional[Dict[str, Any]] = None
     key_cache: Dict[str, Any] = {}
+    arn_cache: Dict[str, Any] = {}
+    for kb_id, entry in vector_principals.items():
+        if entry.get("readers") and entry.get("principals") is None:
+            if any(kb_id in kbs for kbs in bucket_kbs.values()):
+                entry.update(
+                    _store_readers(entry["readers"], permission_cache, arn_cache)
+                )
     for bucket, labels in buckets.items():
         reaching = [
             (kb_id, vector_principals[kb_id])
@@ -17437,6 +17739,20 @@ def _knowledge_base_source_access_findings(
         unread = [entry["name"] for _, entry in reaching if entry["principals"] is None]
         principals = sorted(
             {p for _, entry in reaching for p in entry["principals"] or []}
+        )
+        readers_held = [
+            f"for '{entry['name']}', {why}"
+            for _, entry in reaching
+            for why in entry.get("held") or []
+        ]
+        readers_note = "".join(
+            f" The principals that read the {entry['readers']['store']} behind "
+            f"'{entry['name']}' are the IAM roles and users whose identity "
+            f"policies allow {' or '.join(entry['readers']['actions'])} on it "
+            "without a Condition, within any permissions boundary; service "
+            "control policies over that read are not evaluated."
+            for _, entry in reaching
+            if entry.get("readers")
         )
         if s3_client is None:
             s3_client = boto3.client("s3", config=boto3_config, region_name=region)
@@ -17574,7 +17890,7 @@ def _knowledge_base_source_access_findings(
                     f"{'; '.join(identity_denied[:5])}."
                 )
             detail = " ".join(parts) + f" The bucket is ingested by {served}."
-        elif restrictions["held"] or unread or identity_held:
+        elif restrictions["held"] or unread or identity_held or readers_held:
             status = "N/A"
             reasons = (
                 list(restrictions["held"])
@@ -17583,6 +17899,7 @@ def _knowledge_base_source_access_findings(
                     "all read"
                     for name in unread
                 ]
+                + readers_held
                 + identity_held
             )
             detail = (
@@ -17619,7 +17936,7 @@ def _knowledge_base_source_access_findings(
                 + "Conditions on identity-policy Allow statements are not "
                 "evaluated, and the key of each object already written is not read."
             )
-        rows.append((status, detail))
+        rows.append((status, detail + readers_note))
     return [
         create_finding(
             check_id="BR-20",
@@ -17780,6 +18097,8 @@ def _knowledge_base_source_encryption_findings(
     region: str,
     vector_principals: Optional[Dict[str, Dict[str, Any]]] = None,
     permission_cache: Optional[Dict[str, Any]] = None,
+    kendra_sources: Optional[List[Dict[str, Any]]] = None,
+    kendra_errors: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Assess encryption at rest on every S3 bucket a knowledge base ingests from.
 
@@ -17825,7 +18144,8 @@ def _knowledge_base_source_encryption_findings(
     buckets: Dict[str, List[str]] = {}
     owners: Dict[str, str] = {}
     bucket_kbs: Dict[str, set] = {}
-    for source in inventory["s3_sources"]:
+    inventory["errors"] = list(inventory["errors"]) + list(kendra_errors or [])
+    for source in list(inventory["s3_sources"]) + list(kendra_sources or []):
         buckets.setdefault(source["bucket"], []).append(source["label"])
         bucket_kbs.setdefault(source["bucket"], set()).add(
             source.get("knowledge_base_id")
@@ -18173,7 +18493,7 @@ def check_bedrock_knowledge_base_kms_encryption(
                         kbs_store_assessments.append(assessment)
                     elif kb_type == "KENDRA":
                         assessment = _assess_kendra_index_encryption(
-                            kb_configuration, region
+                            kb_configuration, region, kb_id, kb_name
                         )
                         assessment.update({"name": kb_name, "id": kb_id})
                         kbs_store_assessments.append(assessment)
@@ -18189,6 +18509,23 @@ def check_bedrock_knowledge_base_kms_encryption(
                         assessment = _assess_storage_layer_encryption(
                             storage_config, storage_type, region, permission_cache
                         )
+                        graph_arn = str(
+                            (
+                                storage_config.get("neptuneAnalyticsConfiguration")
+                                or {}
+                            ).get("graphArn")
+                            or ""
+                        )
+                        if (
+                            storage_type == "NEPTUNE_ANALYTICS"
+                            and "graph/" in graph_arn
+                        ):
+                            assessment["readers"] = {
+                                "actions": STORE_READ_ACTIONS["neptune-graph"],
+                                "arn": graph_arn,
+                                "store": f"Neptune Analytics graph '{graph_arn}'",
+                                "held": [],
+                            }
                         assessment.update({"name": kb_name, "id": kb_id})
                         kbs_store_assessments.append(assessment)
 
@@ -18332,11 +18669,25 @@ def check_bedrock_knowledge_base_kms_encryption(
             source_encryption = _knowledge_base_source_encryption_findings(
                 region,
                 {
-                    kb["id"]: {"name": kb["name"], "principals": kb["principals"]}
+                    kb["id"]: {
+                        "name": kb["name"],
+                        "principals": kb.get("principals"),
+                        "readers": kb.get("readers"),
+                    }
                     for kb in kbs_store_assessments
-                    if "principals" in kb
+                    if "principals" in kb or "readers" in kb
                 },
                 permission_cache,
+                [
+                    s
+                    for kb in kbs_store_assessments
+                    for s in kb.get("kendra_sources", [])
+                ],
+                [
+                    e
+                    for kb in kbs_store_assessments
+                    for e in kb.get("kendra_errors", [])
+                ],
             )
             if any(row["Status"] == "Failed" for row in source_encryption):
                 findings["status"] = "WARN"
