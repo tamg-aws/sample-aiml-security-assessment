@@ -24396,6 +24396,7 @@ class TestSM39WorkloadEgress:
         tgw_truncated=(),
         sagemaker=None,
         versions=(),
+        bedrock=None,
     ):
         """associations: {vpc: [associations]}; rules: {group: [rules] or pages};
         tables: {vpc: [route tables]}; firewalls: {vpc: {name: endpoint id}};
@@ -24411,10 +24412,13 @@ class TestSM39WorkloadEgress:
         "config"}], "models": {name: DescribeModel}, "training" and
         "processing": {status: [Describe*Job entries]}, "notebooks":
         [DescribeNotebookInstance entries], "studio": [DescribeDomain
-        entries]}; versions: published Lambda versions, which ListFunctions
-        returns only with FunctionVersion ALL, as it then qualifies the
-        $LATEST ARN."""
+        entries], "hyperpod": [DescribeCluster entries]}; versions: published
+        Lambda versions, which ListFunctions returns only with FunctionVersion
+        ALL, as it then qualifies the $LATEST ARN; bedrock: {"customization":
+        {status: [GetModelCustomizationJob entries]}, "invocation": {status:
+        [ListModelInvocationJobs summaries]}}."""
         sagemaker = sagemaker or {}
+        bedrock = bedrock or {}
         tgw_attachments = tgw_attachments or []
         tgw_routes = tgw_routes or {}
         tgw_vpc_attachments = tgw_vpc_attachments or {}
@@ -24857,7 +24861,24 @@ class TestSM39WorkloadEgress:
                                 }
                             ],
                         ),
+                        # One cluster per page, so a first-page reader misses
+                        # the rest.
+                        "list_clusters": guarded(
+                            "sm_clusters",
+                            [
+                                {
+                                    "ClusterSummaries": [
+                                        {"ClusterName": c["ClusterName"]}
+                                    ]
+                                }
+                                for c in sagemaker.get("hyperpod", [])
+                            ],
+                        ),
                     }
+                )
+                hyperpod = {c["ClusterName"]: c for c in sagemaker.get("hyperpod", [])}
+                client.describe_cluster.side_effect = guarded(
+                    "sm_cluster", lambda ClusterName: hyperpod[ClusterName]
                 )
                 client.describe_endpoint.side_effect = lambda EndpointName: {
                     "EndpointName": EndpointName,
@@ -24885,6 +24906,48 @@ class TestSM39WorkloadEgress:
                 studio = {d["DomainId"]: d for d in sagemaker.get("studio", [])}
                 client.describe_domain.side_effect = guarded(
                     "sm_domain", lambda DomainId: studio[DomainId]
+                )
+            elif service == "bedrock":
+                customization = {
+                    j["jobName"]: j
+                    for found in bedrock.get("customization", {}).values()
+                    for j in found
+                }
+
+                def bedrock_pages(kind, key, summary):
+                    # One job per page, so a first-page reader misses the rest.
+                    def pages(statusEquals):
+                        return [
+                            {key: [summary(j)]}
+                            for j in bedrock.get(kind, {}).get(statusEquals, [])
+                        ]
+
+                    return pages
+
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_model_customization_jobs": guarded(
+                            "br_customization",
+                            bedrock_pages(
+                                "customization",
+                                "modelCustomizationJobSummaries",
+                                lambda j: {
+                                    "jobName": j["jobName"],
+                                    "jobArn": f"arn:job/{j['jobName']}",
+                                },
+                            ),
+                        ),
+                        "list_model_invocation_jobs": guarded(
+                            "br_invocation",
+                            bedrock_pages("invocation", "invocationJobSummaries", dict),
+                        ),
+                    }
+                )
+                client.get_model_customization_job.side_effect = guarded(
+                    "br_customization_job",
+                    lambda jobIdentifier: customization[
+                        jobIdentifier.rsplit("/", 1)[-1]
+                    ],
                 )
             else:
                 raise AssertionError(f"unexpected boto3 client: {service}")
@@ -27927,6 +27990,202 @@ class TestRound9SM39SageMakerWorkloads:
                     "AppNetworkAccessType": "VpcOnly",
                 }
             ],
+            errors={key: _make_client_error("AccessDeniedException")},
+        )
+        incomplete = [r for r in rows if r["Finding"].endswith("Incomplete")]
+        assert len(incomplete) == 2
+        assert all(r["Status"] == "N/A" for r in incomplete)
+        assert all(text in r["Finding_Details"] for r in incomplete)
+
+
+class TestRound10SM39HyperPodAndBedrockJobs:
+    """AIR-FND-NET-03 round 10: SageMaker HyperPod clusters and active Bedrock
+    model customization and batch inference jobs join SM-39's workload
+    population, and one outside a customer VPC fails both legs."""
+
+    suite = TestSM39WorkloadEgress()
+
+    def _run(self, hyperpod=None, bedrock=None, errors=None):
+        return self.suite._run(
+            sagemaker={"hyperpod": hyperpod or []}, bedrock=bedrock, errors=errors
+        )
+
+    def _vpc_row(self, rows, vpc_id):
+        found = [
+            r for r in self.suite._dns(rows) if f"VPC {vpc_id}," in r["Finding_Details"]
+        ]
+        assert len(found) == 1
+        return found[0]["Finding_Details"]
+
+    def test_each_instance_group_is_judged_on_the_subnets_it_runs_in(self):
+        rows = self._run(
+            hyperpod=[
+                {
+                    "ClusterName": "hp1",
+                    "VpcConfig": {"Subnets": ["subnet-a1"]},
+                    "InstanceGroups": [{"InstanceGroupName": "g1"}],
+                },
+                {
+                    "ClusterName": "hp2",
+                    "VpcConfig": {"Subnets": ["subnet-a1"]},
+                    "InstanceGroups": [
+                        {
+                            "InstanceGroupName": "g2",
+                            "OverrideVpcConfig": {"Subnets": ["subnet-b1"]},
+                        }
+                    ],
+                },
+                {
+                    "ClusterName": "hp3",
+                    "VpcConfig": {"Subnets": ["subnet-a1"]},
+                    "InstanceGroups": [{"InstanceGroupName": "g3"}],
+                    "RestrictedInstanceGroups": [
+                        {
+                            "InstanceGroupName": "r3",
+                            "OverrideVpcConfig": {"Subnets": ["subnet-b1"]},
+                        }
+                    ],
+                },
+            ]
+        )
+        vpc_a = self._vpc_row(rows, "vpc-a")
+        vpc_b = self._vpc_row(rows, "vpc-b")
+        assert "SageMaker HyperPod cluster 'hp1'" in vpc_a
+        assert "SageMaker HyperPod cluster 'hp3'" in vpc_a
+        # Every hp2 group overrides, so no instance runs in its cluster subnets.
+        assert "hp2" not in vpc_a
+        assert "instance group 'g2' of SageMaker HyperPod cluster 'hp2'" in vpc_b
+        assert "instance group 'r3' of SageMaker HyperPod cluster 'hp3'" in vpc_b
+        assert "no VpcConfig" not in " | ".join(r["Finding_Details"] for r in rows)
+
+    def test_a_cluster_without_a_vpcconfig_fails_both_legs(self):
+        rows = self._run(
+            hyperpod=[
+                {
+                    "ClusterName": "hp1",
+                    "VpcConfig": {"Subnets": ["subnet-a1"]},
+                    "InstanceGroups": [{"InstanceGroupName": "g1"}],
+                },
+                {"ClusterName": "hp2", "InstanceGroups": [{"InstanceGroupName": "g"}]},
+            ]
+        )
+        opened = [r for r in rows if "has no VpcConfig" in r["Finding_Details"]]
+        assert [(r["Finding"], r["Status"]) for r in opened] == [
+            ("Agent Workload DNS Egress Control", "Failed"),
+            ("Agent Workload Network Firewall Egress", "Failed"),
+        ]
+        assert opened[0]["Finding_Details"].startswith(
+            "SageMaker HyperPod cluster 'hp2' has no VpcConfig, so HyperPod runs "
+            "its instance groups without an OverrideVpcConfig in a subnet of the "
+            "SageMaker platform VPC"
+        )
+
+    def test_every_active_bedrock_job_is_judged_and_an_ended_one_is_not(self):
+        # The two kinds sit in two VPCs, as a row names at most five workloads.
+        vpc = {"vpcConfig": {"subnetIds": ["subnet-a1"]}}
+        vpc_b = {"vpcConfig": {"subnetIds": ["subnet-b1"]}}
+        rows = self._run(
+            bedrock={
+                "customization": {
+                    "InProgress": [
+                        {"jobName": "c1", **vpc},
+                        {"jobName": "c2", **vpc},
+                    ],
+                    "Stopping": [{"jobName": "c3", **vpc}],
+                    "Completed": [{"jobName": "c4", **vpc}],
+                },
+                "invocation": {
+                    status: [{"jobName": f"b-{status}", **vpc_b}]
+                    for status in (
+                        "Submitted",
+                        "Validating",
+                        "Scheduled",
+                        "InProgress",
+                        "Stopping",
+                        "Completed",
+                        "Expired",
+                    )
+                },
+            }
+        )
+        vpc_a = self._vpc_row(rows, "vpc-a")
+        in_b = self._vpc_row(rows, "vpc-b")
+        details = " | ".join(r["Finding_Details"] for r in rows)
+        for name in ("c1", "c2", "c3"):
+            assert f"Bedrock model customization job '{name}'" in vpc_a
+        for status in (
+            "Submitted",
+            "Validating",
+            "Scheduled",
+            "InProgress",
+            "Stopping",
+        ):
+            assert f"Bedrock batch inference job 'b-{status}'" in in_b
+        assert "c4" not in details
+        assert "b-Completed" not in details
+        assert "b-Expired" not in details
+
+    @pytest.mark.parametrize(
+        "bedrock, label",
+        [
+            (
+                {"customization": {"InProgress": [{"jobName": "c"}]}},
+                "Bedrock model customization job 'c'",
+            ),
+            (
+                {"invocation": {"Scheduled": [{"jobName": "b"}]}},
+                "Bedrock batch inference job 'b'",
+            ),
+        ],
+    )
+    def test_a_bedrock_job_without_a_vpcconfig_fails_both_legs(self, bedrock, label):
+        rows = self._run(bedrock=bedrock)
+        assert [(r["Finding"], r["Status"]) for r in rows] == [
+            ("Agent Workload DNS Egress Control", "Failed"),
+            ("Agent Workload Network Firewall Egress", "Failed"),
+        ]
+        assert rows[0]["Finding_Details"] == (
+            f"{label} has no vpcConfig, so Bedrock reaches its S3 data over the "
+            "service's own network, where no DNS Firewall rule group or Network "
+            "Firewall route of this account applies."
+        )
+
+    @pytest.mark.parametrize(
+        "key, text",
+        [
+            ("sm_clusters", "sagemaker:ListClusters (AccessDeniedException)"),
+            (
+                "sm_cluster",
+                "SageMaker HyperPod cluster 'hp' (AccessDeniedException)",
+            ),
+            (
+                "br_customization",
+                "InProgress Bedrock model customization jobs (AccessDeniedException)",
+            ),
+            (
+                "br_customization_job",
+                "Bedrock model customization job 'c' (AccessDeniedException)",
+            ),
+            (
+                "br_invocation",
+                "Submitted Bedrock batch inference jobs (AccessDeniedException)",
+            ),
+        ],
+    )
+    def test_an_unread_job_or_cluster_withholds_the_pass(self, key, text):
+        vpc = {"vpcConfig": {"subnetIds": ["subnet-a1"]}}
+        rows = self._run(
+            hyperpod=[
+                {
+                    "ClusterName": "hp",
+                    "VpcConfig": {"Subnets": ["subnet-a1"]},
+                    "InstanceGroups": [{"InstanceGroupName": "g"}],
+                }
+            ],
+            bedrock={
+                "customization": {"InProgress": [{"jobName": "c", **vpc}]},
+                "invocation": {"Submitted": [{"jobName": "b", **vpc}]},
+            },
             errors={key: _make_client_error("AccessDeniedException")},
         )
         incomplete = [r for r in rows if r["Finding"].endswith("Incomplete")]

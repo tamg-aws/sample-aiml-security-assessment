@@ -447,6 +447,9 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:ListEventDataStores",
         "cloudtrail:GetEventDataStore",
         "account:ListRegions",
+        "bedrock:ListModelCustomizationJobs",
+        "bedrock:ListModelInvocationJobs",
+        "bedrock:GetModelCustomizationJob",
     },
     "SagemakerSecurityAssessmentFunction": {
         "cloudtrail:LookupEvents",
@@ -1793,6 +1796,17 @@ def _sagemaker_policy2_arn(suffix):
 _SAGEMAKER_MANAGED_GRANTS_2 = [
     ("Allow", "lambda:ListMicrovms", '"*"', None),
     ("Allow", "ec2:DescribeNetworkInterfaces", '"*"', None),
+    # SM-39's Bedrock job population. Both List actions have no resource type
+    # in the service authorization reference (2026-10-04);
+    # GetModelCustomizationJob takes model-customization-job.
+    ("Allow", "bedrock:ListModelCustomizationJobs", '"*"', None),
+    ("Allow", "bedrock:ListModelInvocationJobs", '"*"', None),
+    (
+        "Allow",
+        "bedrock:GetModelCustomizationJob",
+        _sagemaker_policy2_arn("bedrock:*:ACCOUNT:model-customization-job/*"),
+        None,
+    ),
     # SM-39's transit gateway hop. The two Describe actions have no resource
     # type in the service authorization reference (2026-10-04);
     # SearchTransitGatewayRoutes takes transit-gateway-route-table.

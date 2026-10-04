@@ -21099,6 +21099,137 @@ def _sagemaker_egress_workloads(
                 f"{detail.get('AppNetworkAccessType') or 'not returned'}, so its "
                 "apps' traffic " + outside
             )
+    # A HyperPod instance group runs in its OverrideVpcConfig subnets, or else
+    # in the cluster's VpcConfig. With neither, HyperPod places the cluster in
+    # a subnet of the SageMaker platform VPC (sagemaker-hyperpod-prerequisites
+    # .html, "Default behavior").
+    try:
+        clusters = [
+            cluster["ClusterName"]
+            for cluster in _paged(client, "list_clusters", "ClusterSummaries")
+            if cluster.get("ClusterName")
+        ]
+    except Exception as error:
+        clusters = []
+        unread.append(f"sagemaker:ListClusters ({get_assessment_error_label(error)})")
+    for cluster_name in clusters:
+        label = f"SageMaker HyperPod cluster '{cluster_name}'"
+        try:
+            detail = client.describe_cluster(ClusterName=cluster_name)
+        except Exception as error:
+            unread.append(f"{label} ({get_assessment_error_label(error)})")
+            continue
+        cluster_subnets = (detail.get("VpcConfig") or {}).get("Subnets") or []
+        groups = [
+            *(detail.get("InstanceGroups") or []),
+            *(detail.get("RestrictedInstanceGroups") or []),
+        ]
+        inherit = not groups
+        for group in groups:
+            override = (group.get("OverrideVpcConfig") or {}).get("Subnets") or []
+            if not override:
+                inherit = True
+                continue
+            group_label = (
+                f"instance group '{group.get('InstanceGroupName')}' of {label}"
+            )
+            references.extend((group_label, subnet) for subnet in override)
+        if not inherit:
+            continue
+        references.extend((label, subnet) for subnet in cluster_subnets)
+        if not cluster_subnets:
+            open_paths.append(
+                f"{label} has no VpcConfig, so HyperPod runs its instance groups "
+                "without an OverrideVpcConfig in a subnet of the SageMaker "
+                "platform VPC, where no DNS Firewall rule group or Network "
+                "Firewall route of this account applies to their egress."
+            )
+    return references, open_paths, unread
+
+
+# Bedrock jobs that are running or queued to run, so their vpcConfig is the
+# network their egress will use. Every other status has ended.
+BEDROCK_CUSTOMIZATION_ACTIVE_STATUSES = ("InProgress", "Stopping")
+BEDROCK_INVOCATION_ACTIVE_STATUSES = (
+    "Submitted",
+    "Validating",
+    "Scheduled",
+    "InProgress",
+    "Stopping",
+)
+
+
+def _bedrock_job_egress_workloads(
+    region: str,
+) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+    """
+    (workload label, subnet id) for each active Bedrock model customization
+    and batch inference job with a vpcConfig, the jobs without one, and the
+    unread lists. A batch inference job summary carries its vpcConfig, so only
+    a customization job is read with GetModelCustomizationJob.
+    """
+    references: List[Tuple[str, str]] = []
+    open_paths: List[str] = []
+    unread: List[str] = []
+    outside = (
+        "has no vpcConfig, so Bedrock reaches its S3 data over the service's own "
+        "network, where no DNS Firewall rule group or Network Firewall route of "
+        "this account applies."
+    )
+    client = boto3.client("bedrock", config=boto3_config, region_name=region)
+    for status in BEDROCK_CUSTOMIZATION_ACTIVE_STATUSES:
+        try:
+            summaries = _paged(
+                client,
+                "list_model_customization_jobs",
+                "modelCustomizationJobSummaries",
+                statusEquals=status,
+            )
+        except Exception as error:
+            unread.append(
+                f"{status} Bedrock model customization jobs "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for summary in summaries:
+            name = summary.get("jobName") or summary.get("jobArn")
+            if not name:
+                continue
+            label = f"Bedrock model customization job '{name}'"
+            try:
+                detail = client.get_model_customization_job(
+                    jobIdentifier=summary.get("jobArn") or name
+                )
+            except Exception as error:
+                unread.append(f"{label} ({get_assessment_error_label(error)})")
+                continue
+            subnets = (detail.get("vpcConfig") or {}).get("subnetIds") or []
+            references.extend((label, subnet) for subnet in subnets)
+            if not subnets:
+                open_paths.append(f"{label} {outside}")
+    for status in BEDROCK_INVOCATION_ACTIVE_STATUSES:
+        try:
+            summaries = _paged(
+                client,
+                "list_model_invocation_jobs",
+                "invocationJobSummaries",
+                statusEquals=status,
+            )
+        except Exception as error:
+            unread.append(
+                f"{status} Bedrock batch inference jobs "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for summary in summaries:
+            name = summary.get("jobName") or summary.get("jobArn")
+            if not name:
+                continue
+            label = f"Bedrock batch inference job '{name}'"
+            subnets = (summary.get("vpcConfig") or {}).get("subnetIds") or []
+            references.extend((label, subnet) for subnet in subnets)
+            if not subnets:
+                open_paths.append(f"{label} {outside}")
     return references, open_paths, unread
 
 
@@ -22745,8 +22876,9 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     """
     SM-39 (AIR-SLF-RT-02): judge DNS Firewall and Network Firewall egress for
     every VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS
-    cluster, an EC2 instance, or a SageMaker endpoint, running training or
-    processing job, notebook instance or Studio domain runs in.
+    cluster, an EC2 instance, a SageMaker endpoint, running training or
+    processing job, HyperPod cluster, notebook instance or Studio domain, or an
+    active Bedrock model customization or batch inference job runs in.
 
     One DNS row and one Network Firewall row per VPC. An unread workload list
     or subnet description is reported N/A by name, never Passed. A Lambda
@@ -22779,6 +22911,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
         )
         references.extend(sagemaker_references)
         unread.extend(sagemaker_unread)
+        bedrock_references, open_bedrock, bedrock_unread = (
+            _bedrock_job_egress_workloads(region)
+        )
+        references.extend(bedrock_references)
+        unread.extend(bedrock_unread)
         named, named_unread = _ai_lambda_references(region)
         unread.extend(named_unread)
         # A MicroVM egresses through its VPC egress connector's subnets. AWS
@@ -22858,14 +22995,29 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 "SM-39",
                 name,
                 open_sagemaker,
-                "Place each SageMaker endpoint, job, notebook instance and Studio "
-                "domain in private VPC subnets (VpcOnly for a domain, "
-                "DirectInternetAccess Disabled for a notebook) whose DNS Firewall "
-                "and Network Firewall filter its egress.",
+                "Place each SageMaker endpoint, job, HyperPod cluster, notebook "
+                "instance and Studio domain in private VPC subnets (VpcOnly for "
+                "a domain, DirectInternetAccess Disabled for a notebook, a "
+                "VpcConfig for a HyperPod cluster) whose DNS Firewall and "
+                "Network Firewall filter its egress.",
                 reference,
                 "Medium",
                 region,
-                "SageMaker workloads with an internet path outside the VPC",
+                "SageMaker workloads with an egress path outside the customer VPC",
+            )
+        )
+        findings["csv_data"].extend(
+            _capped_problem_rows(
+                "SM-39",
+                name,
+                open_bedrock,
+                "Create each Bedrock model customization and batch inference job "
+                "with a vpcConfig on private VPC subnets whose DNS Firewall and "
+                "Network Firewall filter its egress.",
+                reference,
+                "Medium",
+                region,
+                "Bedrock jobs without a vpcConfig",
             )
         )
         if name == WORKLOAD_FIREWALL_EGRESS_FINDING:
@@ -22908,7 +23060,12 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 )
             )
     if not firewall_references:
-        if not unread and not open_functions and not open_sagemaker:
+        if (
+            not unread
+            and not open_functions
+            and not open_sagemaker
+            and not open_bedrock
+        ):
             for name, reference in legs:
                 if open_microvms and name == WORKLOAD_FIREWALL_EGRESS_FINDING:
                     continue
@@ -22917,10 +23074,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                         name,
                         "No ECS awsvpc service or task, VPC-attached Lambda "
                         "function, EKS cluster or Fargate profile, EC2 instance, "
-                        "SageMaker endpoint, running job, notebook instance or "
-                        "Studio domain, or Lambda MicroVM egress connector in this "
-                        "Region runs in a VPC, so no workload VPC's egress was "
-                        "judged.",
+                        "SageMaker endpoint, running job, HyperPod cluster, "
+                        "notebook instance or Studio domain, active Bedrock model "
+                        "customization or batch inference job, or Lambda MicroVM "
+                        "egress connector in this Region runs in a VPC, so no "
+                        "workload VPC's egress was judged.",
                         "No action required",
                         reference,
                     )
