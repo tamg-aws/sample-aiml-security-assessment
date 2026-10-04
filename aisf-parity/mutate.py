@@ -3649,6 +3649,17 @@ MUTATIONS = [
         "find": "                        row[j] = below[j + 1]\n",
         "replace": "                        row[j] = 0\n",
     },
+    {
+        "name": "AC-08 data path: a tools-only Region is not judged",
+        "file": AGENTCORE,
+        "defect": (
+            "a Region holding only VPC-mode Code Interpreter or Browser tools "
+            "reported no AgentCore resources and never judged the data-path "
+            "endpoints in their VPCs"
+        ),
+        "find": "            if not hosting_references and not hosting_errors:\n",
+        "replace": "            if True:\n",
+    },
     # ------------------------------------- end of the AgentCore verdict legs
 ]
 
@@ -4445,6 +4456,7 @@ GROUPS: dict[str, str] = {
     "AC-08 data path: a hosting VPC's endpoints are not judged": "in the AgentCore verdict legs",
     "AC-08 data path: an unresolved hosting VPC is not reported": "in the AgentCore verdict legs",
     "AC-45 shell: a matching character pair ends the pattern overlap": "in the AgentCore verdict legs",
+    "AC-08 data path: a tools-only Region is not judged": "in the AgentCore verdict legs",
 }
 
 

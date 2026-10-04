@@ -35884,6 +35884,65 @@ class TestAC08DataPathEndpointScope:
         assert hosted[0]["Status"] == "Failed"
         assert not self._naming(findings, "vpce-s3-other")
 
+    def _wire_tools_only(
+        self, mock_ac, mock_ec2, network_mode="VPC", groups=("sg-tool",)
+    ):
+        """No runtime or gateway; Code Interpreter ci-1 runs in subnet-tool of
+        vpc-2, which holds an S3 endpoint; vpc-3 hosts nothing and holds
+        another."""
+        self._wire_hosted(mock_ac, mock_ec2)
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_ac.list_gateways.return_value = {"items": []}
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(network_mode=network_mode, security_groups=groups)
+            ],
+        )
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [{"SubnetId": "subnet-tool", "VpcId": "vpc-2"}]
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_tools_only_vpc_has_its_data_path_endpoints_judged(
+        self, mock_ac, mock_ec2
+    ):
+        # A VPC-mode Code Interpreter reaches S3 through its own VPC's endpoint
+        # even when the region holds no runtime or gateway to call through an
+        # AgentCore endpoint, so the presence legs stay N/A and the data path
+        # is still judged.
+        self._wire_tools_only(mock_ac, mock_ec2)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        hosted = self._naming(findings, "vpce-s3-hosted")
+
+        assert [finding["Finding"] for finding in hosted] == [
+            "AgentCore VPC Endpoint Policy Unrestricted"
+        ]
+        assert hosted[0]["Status"] == "Failed"
+        assert not self._naming(findings, "vpce-s3-other")
+        presence = [
+            f for f in findings if f["Finding"] == "AgentCore VPC Endpoints Check"
+        ]
+        assert [f["Status"] for f in presence] == ["N/A"]
+        assert "no AgentCore endpoint is required" in presence[0]["Finding_Details"]
+        assert not [f for f in findings if "Missing" in f["Finding"]]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_tools_outside_a_vpc_still_find_no_agentcore_resources(
+        self, mock_ac, mock_ec2
+    ):
+        # A PUBLIC tool reports no vpcConfig.
+        self._wire_tools_only(mock_ac, mock_ec2, network_mode="PUBLIC", groups=None)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding_Details"] == "No AgentCore resources found"
+
     @pytest.mark.parametrize(
         "denied, action",
         [

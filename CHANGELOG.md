@@ -363,6 +363,11 @@ section.
     raised RecursionError out of `AC-45` and every other caller. It now fills
     the same table iteratively; two 2,001-character patterns take under half a
     second.
+  - `AC-08` judges the data-path endpoints of a Region that holds VPC-mode
+    Code Interpreter or Browser tools and no runtime or gateway. It used to
+    stop at `No AgentCore resources found`, so the S3, DynamoDB and SageMaker
+    endpoint policies those tools reach went unjudged. The presence legs stay
+    `N/A`, since no AgentCore endpoint is required there.
 
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.

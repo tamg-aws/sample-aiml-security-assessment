@@ -11390,19 +11390,43 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             "control": len(runtimes) + len(gateways),
         }
 
-        if not runtimes and not gateways:
+        # A VPC-mode Code Interpreter or Browser reaches S3, DynamoDB and
+        # SageMaker through the endpoints of its own VPC, so a Region that holds
+        # only such tools still has data-path endpoints to judge, while the
+        # presence legs, which ask for an endpoint that runtime and gateway calls
+        # travel through, have nothing to require.
+        tools_only = not runtimes and not gateways
+        if tools_only:
+            hosting_references, hosting_errors = _agentcore_hosting_subnets()
+            if not hosting_references and not hosting_errors:
+                findings.append(
+                    create_finding(
+                        check_id="AC-08",
+                        finding_name="AgentCore VPC Endpoints Check",
+                        finding_details="No AgentCore resources found",
+                        resolution="No action required",
+                        reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                return findings
             findings.append(
                 create_finding(
                     check_id="AC-08",
                     finding_name="AgentCore VPC Endpoints Check",
-                    finding_details="No AgentCore resources found",
+                    finding_details=(
+                        "No AgentCore runtime or gateway exists in this Region, so "
+                        "no AgentCore endpoint is required; the data-path endpoints "
+                        "in the VPCs that host Code Interpreter or Browser tools are "
+                        "judged below."
+                    ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
             )
-            return findings
 
         vpcs = _paginate_aws_list(
             ec2_client,
@@ -11412,6 +11436,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             token_response_key="NextToken",
         )
 
+        if not vpcs and tools_only:
+            return findings
         if not vpcs:
             # A VPC endpoint lives in a VPC, so with none in the Region every
             # call to the runtimes and gateways listed above reaches the public
@@ -11477,7 +11503,10 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             elif _is_agentcore_data_path_endpoint(service_name):
                 data_path_candidates.append(entry)
 
-        if not found_agentcore_endpoints:
+        if tools_only:
+            # The presence and health legs stay at the N/A row above.
+            pass
+        elif not found_agentcore_endpoints:
             findings.append(
                 create_finding(
                     check_id="AC-08",
@@ -11581,7 +11610,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
         agentcore_vpc_ids = {
             entry["vpc_id"] for entry in found_agentcore_endpoints if entry["vpc_id"]
         }
-        hosting_references, hosting_errors = _agentcore_hosting_subnets()
+        if not tools_only:
+            hosting_references, hosting_errors = _agentcore_hosting_subnets()
         hosting_subnet_ids = sorted({subnet for _, subnet in hosting_references})
         if hosting_subnet_ids:
             try:
