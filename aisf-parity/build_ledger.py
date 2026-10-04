@@ -2816,9 +2816,13 @@ FOUNDATION_ROWS = [
         "not a configured attribute and comes only from the identity provider's SAML "
         "assertion; whether that source reflects MFA is not judged. A permission "
         "set whose AWS managed policy is unread is N/A. Customer managed policy "
-        "references resolve in each target account, so they are named and not "
-        "read, and that permission set is not judged; the attributes for access "
-        "control that set the tag are not read",
+        "references resolve in each target account, so a permission set that has "
+        "one is judged through the AWSReservedSSO_<name>_<suffix> role it is "
+        "provisioned as in this account (its name read with "
+        "sso:DescribePermissionSet), whose cached policies carry the AI write "
+        "grant and PrincipalTag Deny tests as for any permission set; a set whose "
+        "role is absent from the IAM permissions cache or unread there is named "
+        "and not judged, and the role in each other account is not read",
         [],
         6,
     ),

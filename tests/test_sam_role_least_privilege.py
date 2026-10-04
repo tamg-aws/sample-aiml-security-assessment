@@ -221,6 +221,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListTransformJobs",
         "sagemaker:Search",
         "sso:DescribeInstanceAccessControlAttributeConfiguration",
+        "sso:DescribePermissionSet",
         "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
         "sso:ListManagedPoliciesInPermissionSet",
     },
@@ -1175,6 +1176,7 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "sso:ListManagedPoliciesInPermissionSet",
                     "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
                     "sso:DescribeInstanceAccessControlAttributeConfiguration",
+                    "sso:DescribePermissionSet",
                 )
             ),
             *(

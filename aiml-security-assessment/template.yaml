@@ -525,12 +525,16 @@ Resources:
             # DescribeInstanceAccessControlAttributeConfiguration has the
             # Instance resource type only, so the PermissionSet ARN grants it
             # nothing. It was Sid IdentityCenterAttributeRead, folded in to keep
-            # this policy under its 5,500-character budget.
+            # this policy under its 5,500-character budget. DescribePermissionSet,
+            # with the Instance and PermissionSet resource types, names the
+            # AWSReservedSSO_ role a set with a customer managed policy is
+            # provisioned as.
             Effect: Allow
             Action:
               - sso:ListManagedPoliciesInPermissionSet # BR-51
               - sso:ListCustomerManagedPolicyReferencesInPermissionSet # BR-51
               - sso:DescribeInstanceAccessControlAttributeConfiguration # BR-51
+              - sso:DescribePermissionSet # BR-51
             Resource:
               - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
               - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'

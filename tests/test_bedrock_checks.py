@@ -33480,8 +33480,11 @@ class TestBR51AIUserConsoleMFA:
         aws_policies=None,
         role_trust=None,
         abac=None,
+        set_names=None,
     ):
-        """`abac` is the DescribeInstanceAccessControlAttributeConfiguration
+        """`set_names` maps a permission set to the Name DescribePermissionSet
+        returns, or an exception it raises; by default the ARN's last segment.
+        `abac` is the DescribeInstanceAccessControlAttributeConfiguration
         response, or an exception it raises. `managed` maps a permission set to the AWS managed policy ARNs
         ListManagedPoliciesInPermissionSet returns (a dict of pages keyed by
         NextToken, or an exception), `customer` to its customer managed
@@ -33565,6 +33568,17 @@ class TestBR51AIUserConsoleMFA:
                 }
             )
         iam.get_inline_policy_for_permission_set.side_effect = get_inline_policy
+
+        def describe_permission_set(InstanceArn, PermissionSetArn):
+            outcome = (set_names or {}).get(
+                PermissionSetArn, PermissionSetArn.rsplit("/", 1)[-1]
+            )
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"PermissionSet": {"Name": outcome}}
+
+        self.described = iam.describe_permission_set
+        iam.describe_permission_set.side_effect = describe_permission_set
         if isinstance(instances, Exception):
             iam.list_instances.side_effect = instances
         else:
@@ -34280,7 +34294,9 @@ class TestBR51AIUserConsoleMFA:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert named in rows[0]["Finding_Details"]
 
-    def test_br51_customer_managed_references_are_named_not_read(self):
+    def test_br51_customer_managed_references_are_named_when_no_role_is_provisioned(
+        self,
+    ):
         _, rows = self._run_sets(
             permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
             inline={
@@ -34295,14 +34311,142 @@ class TestBR51AIUserConsoleMFA:
         assert [r["Status"] for r in rows] == ["N/A"]
         details = rows[0]["Finding_Details"]
         assert (
-            f"2 permission set(s) reference customer managed policies, which "
+            "2 permission set(s) reference customer managed policies, which "
             "resolve to a policy of that name in each account the permission set "
-            "is provisioned to and are not read, so these are not judged: "
-            f"{self.PS_WRITE} (/guard/MfaDeny); {self.PS_LATE} (/Extra)" in details
+            "is provisioned to, and no role it is provisioned as in this account "
+            f"was judged, so these are not judged: {self.PS_WRITE} (/guard/MfaDeny): "
+            "no role AWSReservedSSO_ps-write_* is in this account's IAM permissions "
+            f"cache, so the permission set is not provisioned here or its role was "
+            f"not read; {self.PS_LATE} (/Extra): no role AWSReservedSSO_ps-late_*"
+            in details
         )
         assert "0 of them carry" in details
         customer_sentence = details.split("reference customer managed")[1]
         assert "ceiling" not in customer_sentence.split(". ")[0]
+
+    ROLE_WRITE = "AWSReservedSSO_write_0123456789abcdef"
+    ROLE_LATE = "AWSReservedSSO_late_fedcba9876543210"
+    # Provisioned for a set named "write_extra": the "write" pattern must not
+    # take it, or its unguarded grant would be pinned on the wrong set.
+    ROLE_DECOY = "AWSReservedSSO_write_extra_00112233aabbccdd"
+
+    def _provisioned_cache(self, roles):
+        cache = _ai_user_cache()
+        for role, statements in roles.items():
+            cache["role_permissions"][role] = _identity(
+                attached=[_customer_policy(f"cmp-{role[-4:]}", *statements)]
+            )
+        return cache
+
+    def _federated_trusts(self, roles):
+        return {
+            role: _policy(
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Federated": "arn:aws:iam::123456789012:saml-provider/"
+                        "AWSSSO_0123_DO_NOT_DELETE"
+                    },
+                    "Action": "sts:AssumeRoleWithSAML",
+                }
+            )
+            for role in roles
+        }
+
+    def _run_provisioned(self, roles, **kwargs):
+        return self._run(
+            self._provisioned_cache(roles),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+            role_trust=self._federated_trusts(roles),
+            **kwargs,
+        )
+
+    GRANT = {"Effect": "Allow", "Action": "bedrock:CreateGuardrail", "Resource": "*"}
+
+    def test_br51_customer_managed_set_is_judged_through_its_provisioned_role(self):
+        """IAM-02: two sets referencing customer managed policies are judged by
+        their provisioned roles; only the one with no PrincipalTag Deny fails."""
+        _, rows = self._run_provisioned(
+            {
+                self.ROLE_WRITE: [self.GRANT],
+                self.ROLE_LATE: [self.GRANT, self._tag_deny()],
+                self.ROLE_DECOY: [self.GRANT],
+            },
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            set_names={self.PS_WRITE: "write", self.PS_LATE: "late"},
+            customer={
+                self.PS_WRITE: [{"Name": "cmp-cdef"}],
+                self.PS_LATE: [{"Name": "cmp-3210", "Path": "/guard/"}],
+            },
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            f"permission set {self.PS_WRITE} as provisioned in this account as "
+            f"role {self.ROLE_WRITE} grants AI writes (bedrock) in attached policy "
+            f"'cmp-cdef' of its provisioned role {self.ROLE_WRITE}" in failed[0]
+        )
+        assert "It references the customer managed policies /cmp-cdef" in failed[0]
+        assert self.ROLE_DECOY not in failed[0]
+        summary = next(r["Finding_Details"] for r in rows if r["Status"] == "N/A")
+        assert (
+            f"{self.PS_LATE} as provisioned in this account as role "
+            f"{self.ROLE_LATE} (customer managed /guard/cmp-3210) (bedrock): "
+            "StringNotEquals aws:PrincipalTag/authn mfa" in summary
+        )
+        assert "1 of them carry" in summary
+        assert "reference customer managed policies, which" not in summary
+
+    def test_br51_an_unread_provisioned_role_is_named_not_judged(self):
+        cache = self._provisioned_cache({})
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "role",
+                "name": self.ROLE_WRITE,
+                "stage": "attached_policies",
+                "error": "AccessDenied",
+            }
+        ]
+        _, rows = self._run(
+            cache,
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            set_names={self.PS_WRITE: "write"},
+            customer={self.PS_WRITE: [{"Name": "cmp"}]},
+        )
+        assert not [r for r in rows if r["Status"] in ("Failed", "Passed")]
+        assert any(
+            f"{self.PS_WRITE} (/cmp): its provisioned role {self.ROLE_WRITE} was "
+            "not read into the IAM permissions cache (AccessDenied)"
+            in r["Finding_Details"]
+            for r in rows
+        )
+
+    def test_br51_an_unread_permission_set_name_is_named_not_judged(self):
+        _, rows = self._run_provisioned(
+            {self.ROLE_WRITE: [self.GRANT]},
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            set_names={self.PS_WRITE: _make_client_error("AccessDeniedException")},
+            customer={self.PS_WRITE: [{"Name": "cmp"}]},
+        )
+        assert not [r for r in rows if r["Status"] == "Failed"]
+        (summary,) = [r["Finding_Details"] for r in rows]
+        assert (
+            f"{self.PS_WRITE} (/cmp): its name was not read with "
+            "sso:DescribePermissionSet (AccessDeniedException)" in summary
+        )
+
+    def test_br51_a_set_without_customer_managed_policies_is_not_described(self):
+        self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={self.PS_WRITE: self._grant_with()},
+        )
+        self.described.assert_not_called()
 
     def test_br51_scope_note_names_the_managed_policy_reads(self):
         assert "not granted" not in bedrock_app.AI_USER_MFA_SCOPE_NOTE
@@ -34311,8 +34455,8 @@ class TestBR51AIUserConsoleMFA:
             in bedrock_app.AI_USER_MFA_SCOPE_NOTE
         )
         assert (
-            "customer managed policy references are named and not read"
-            in bedrock_app.AI_USER_MFA_SCOPE_NOTE
+            "judged through the AWSReservedSSO_ role it is provisioned as in this "
+            "account" in bedrock_app.AI_USER_MFA_SCOPE_NOTE
         )
 
     def test_br51_denied_permission_set_list_is_named(self):

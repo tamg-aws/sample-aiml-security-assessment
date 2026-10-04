@@ -34031,9 +34031,11 @@ AI_USER_MFA_SCOPE_NOTE = (
     "through IAM Identity Center are not covered: the sso-admin API publishes no "
     "operation that returns an instance's MFA settings. Permission-set inline "
     "policies and the AWS managed policies attached to a permission set are read "
-    "to name the permission sets that grant AI writes; customer managed policy "
-    "references are named and not read, because each resolves to a policy of "
-    "that name in every account the permission set is provisioned to."
+    "to name the permission sets that grant AI writes. A customer managed policy "
+    "reference resolves to a policy of that name in every account the permission "
+    "set is provisioned to, so a permission set that has one is judged through "
+    "the AWSReservedSSO_ role it is provisioned as in this account, and named "
+    "and not judged when that role is absent."
 )
 
 IDENTITY_CENTER_MFA_REFERENCE = (
@@ -34183,8 +34185,86 @@ def _access_control_attribute_note(abac: Dict[str, Any], tag: str) -> str:
     )
 
 
+def _provisioned_permission_set_roles(
+    client: Any,
+    instance_arn: str,
+    permission_set_arn: str,
+    permission_cache: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Find the roles a permission set is provisioned as in this account in the
+    IAM permissions cache: AWSReservedSSO_<permission set name>_<suffix>, the
+    suffix holding no underscore so that a set whose name extends another's is
+    not matched. Returns {"roles": [(name, permissions)], "reason"}, the reason
+    saying why no role was judged.
+    """
+    if permission_cache is None:
+        return {
+            "roles": [],
+            "reason": "the IAM permissions cache was unavailable, so its "
+            "provisioned role was not read",
+        }
+    try:
+        name = (
+            client.describe_permission_set(
+                InstanceArn=instance_arn, PermissionSetArn=permission_set_arn
+            )
+            .get("PermissionSet", {})
+            .get("Name")
+        )
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "roles": [],
+            "reason": "its name was not read with sso:DescribePermissionSet "
+            f"({get_assessment_error_label(error)}), so its provisioned role was "
+            "not found",
+        }
+    if not isinstance(name, str) or not name:
+        return {
+            "roles": [],
+            "reason": "sso:DescribePermissionSet returned no name, so its "
+            "provisioned role was not found",
+        }
+    pattern = re.compile(rf"AWSReservedSSO_{re.escape(name)}_[0-9A-Za-z]+")
+    errored = [
+        error
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("type") == "role"
+        and pattern.fullmatch(str(error.get("name") or ""))
+    ]
+    if errored:
+        return {
+            "roles": [],
+            "reason": "its provisioned role {} was not read into the IAM "
+            "permissions cache ({})".format(
+                ", ".join(str(error.get("name")) for error in errored),
+                "; ".join(
+                    str(error.get("error") or "unknown error") for error in errored
+                ),
+            ),
+        }
+    roles = sorted(
+        (role_name, permissions)
+        for role_name, permissions in (
+            permission_cache.get("role_permissions") or {}
+        ).items()
+        if pattern.fullmatch(role_name)
+    )
+    return {
+        "roles": roles,
+        "reason": ""
+        if roles
+        else f"no role AWSReservedSSO_{name}_* is in this account's IAM "
+        "permissions cache, so the permission set is not provisioned here or its "
+        "role was not read",
+    }
+
+
 def _identity_center_ai_permission_sets(
-    instance_arns: List[str], region: str
+    instance_arns: List[str],
+    region: str,
+    permission_cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[str]]:
     """
     Name each permission set whose inline policy or attached AWS managed
@@ -34194,9 +34274,11 @@ def _identity_center_ai_permission_sets(
     grant.
 
     A customer managed policy reference resolves to a policy of that name in
-    each account the permission set is provisioned to, so it is not read, and a
-    permission set that has one is named as not judged. So is one whose inline
-    or AWS managed policies were not read.
+    each account the permission set is provisioned to, so a permission set that
+    has one is judged through the AWSReservedSSO_ role it is provisioned as in
+    this account, from the IAM permissions cache, and is named as not judged
+    when that role is absent or unread. So is one whose inline or AWS managed
+    policies were not read.
     """
     client = boto3.client("sso-admin", config=boto3_config, region_name=region)
     iam_client = boto3.client("iam", config=boto3_config)
@@ -34279,81 +34361,131 @@ def _identity_center_ai_permission_sets(
             if failed_reads:
                 unread.extend(failed_reads)
                 continue
-            documents = [
-                (source, document) for source, document in documents if document
-            ]
-            try:
-                services_by_source = [
-                    (
-                        source,
-                        _ai_write_services(
-                            {"inline_policies": [{"document": document}]}
-                        ),
-                    )
-                    for source, document in documents
-                ]
-                services = sorted(
-                    {
-                        service
-                        for _, granted in services_by_source
-                        for service in granted
-                    }
-                )
-                denies = [
-                    _principal_tag_deny_statement(statement)
-                    for _, document in (documents if services else [])
-                    for statement in _policy_statements(document)
-                ]
-            except (TypeError, ValueError) as error:
-                unread.append(
-                    f"a policy of {permission_set_arn} could not be "
-                    f"parsed ({get_assessment_error_label(error)})"
-                )
-                continue
-            label = "{} ({})".format(permission_set_arn, ", ".join(services))
-            if services:
-                granting.append(label)
+            # A customer managed policy resolves in each account the set is
+            # provisioned to, so a set that references one is judged through
+            # the role it is provisioned as here, whose policies hold the
+            # inline, AWS managed and customer managed policies together.
+            judged = [("", documents)]
             if references:
-                customer_managed.append(
-                    "{} ({})".format(
-                        permission_set_arn,
-                        ", ".join(
-                            "{}{}".format(
-                                reference.get("Path") or "/", reference.get("Name")
+                reference_names = ", ".join(
+                    "{}{}".format(reference.get("Path") or "/", reference.get("Name"))
+                    for reference in references
+                )
+                provisioned = _provisioned_permission_set_roles(
+                    client, instance_arn, permission_set_arn, permission_cache
+                )
+                if not provisioned["roles"]:
+                    try:
+                        own = sorted(
+                            {
+                                service
+                                for _, document in documents
+                                if document
+                                for service in _ai_write_services(
+                                    {"inline_policies": [{"document": document}]}
+                                )
+                            }
+                        )
+                    except (TypeError, ValueError):
+                        own = []
+                    if own:
+                        granting.append(
+                            "{} ({})".format(permission_set_arn, ", ".join(own))
+                        )
+                    customer_managed.append(
+                        "{} ({}): {}".format(
+                            permission_set_arn, reference_names, provisioned["reason"]
+                        )
+                    )
+                    continue
+                judged = [
+                    (
+                        role_name,
+                        [
+                            (
+                                f"{source} '{policy.get('name') or 'unnamed'}' of its "
+                                f"provisioned role {role_name}",
+                                policy.get("document"),
                             )
-                            for reference in references
-                        ),
-                    )
-                )
-                continue
-            if not services:
-                continue
-            covered = {service for deny in denies for service in deny["services"]}
-            tests = [deny["test"] for deny in denies if deny["services"]]
-            uncovered = [service for service in services if service not in covered]
-            if uncovered:
-                unguarded.append(
-                    {
-                        "arn": permission_set_arn,
-                        "services": services,
-                        "uncovered": uncovered,
-                        "tests": tests,
-                        "sources": [
-                            source for source, granted in services_by_source if granted
+                            for source, policy in _cached_identity_policies(permissions)
                         ],
-                    }
-                )
-            else:
-                tags = sorted({deny["tag"] for deny in denies if deny["services"]})
-                guarded.append(
-                    "{}: {} ({})".format(
-                        label,
-                        "; ".join(tests),
-                        "; ".join(
-                            _access_control_attribute_note(abac, t) for t in tags
-                        ),
                     )
+                    for role_name, permissions in provisioned["roles"]
+                ]
+            for role_name, judged_documents in judged:
+                judged_documents = [
+                    (source, document)
+                    for source, document in judged_documents
+                    if document
+                ]
+                subject = (
+                    f"{permission_set_arn} as provisioned in this account as role "
+                    f"{role_name} (customer managed {reference_names})"
+                    if role_name
+                    else permission_set_arn
                 )
+                try:
+                    services_by_source = [
+                        (
+                            source,
+                            _ai_write_services(
+                                {"inline_policies": [{"document": document}]}
+                            ),
+                        )
+                        for source, document in judged_documents
+                    ]
+                    services = sorted(
+                        {
+                            service
+                            for _, granted in services_by_source
+                            for service in granted
+                        }
+                    )
+                    denies = [
+                        _principal_tag_deny_statement(statement)
+                        for _, document in (judged_documents if services else [])
+                        for statement in _policy_statements(document)
+                    ]
+                except (TypeError, ValueError) as error:
+                    unread.append(
+                        f"a policy of {subject} could not be "
+                        f"parsed ({get_assessment_error_label(error)})"
+                    )
+                    continue
+                label = "{} ({})".format(subject, ", ".join(services))
+                if not services:
+                    continue
+                granting.append(label)
+                covered = {service for deny in denies for service in deny["services"]}
+                tests = [deny["test"] for deny in denies if deny["services"]]
+                uncovered = [service for service in services if service not in covered]
+                if uncovered:
+                    unguarded.append(
+                        {
+                            "arn": permission_set_arn,
+                            "role": role_name,
+                            "references": reference_names if role_name else "",
+                            "services": services,
+                            "uncovered": uncovered,
+                            "tests": tests,
+                            "sources": [
+                                source
+                                for source, granted in services_by_source
+                                if granted
+                            ],
+                        }
+                    )
+                else:
+                    tags = sorted({deny["tag"] for deny in denies if deny["services"]})
+                    guarded.append(
+                        "{}: {} ({})".format(
+                            label,
+                            "; ".join(tests),
+                            "; ".join(
+                                _access_control_attribute_note(abac, t) for t in tags
+                            ),
+                        )
+                    )
     return {
         "granting": granting,
         "guarded": guarded,
@@ -34363,7 +34495,9 @@ def _identity_center_ai_permission_sets(
     }
 
 
-def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
+def _identity_center_leg(
+    sso_region: str, permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Read the IAM Identity Center leg of BR-51: the instances visible in every
     Region enabled for this account and, for each, the permission sets that
@@ -34436,13 +34570,14 @@ def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
     }
     for region, result in sorted(found.items()):
         for key, values in _identity_center_ai_permission_sets(
-            result["arns"], region
+            result["arns"], region, permission_cache
         ).items():
             permission_sets[key].extend(values)
     if permission_sets["granting"]:
         sets_note = (
             " {} permission set(s) grant AI writes in their inline or AWS managed "
-            "policies: {}.".format(
+            "policies, or in the policies of the role a set that references a "
+            "customer managed policy is provisioned as here: {}.".format(
                 len(permission_sets["granting"]),
                 "; ".join(permission_sets["granting"][:10]),
             )
@@ -34469,7 +34604,8 @@ def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
         sets_note += (
             " {} permission set(s) reference customer managed policies, which "
             "resolve to a policy of that name in each account the permission "
-            "set is provisioned to and are not read, so these are not judged: "
+            "set is provisioned to, and no role it is provisioned as in this "
+            "account was judged, so these are not judged: "
             "{}.".format(
                 len(permission_sets["customer_managed"]),
                 "; ".join(permission_sets["customer_managed"][:10]),
@@ -34896,7 +35032,8 @@ def check_bedrock_ai_user_console_mfa(
             )
         )
         identity_center = _identity_center_leg(
-            identity_center_region or os.environ.get("AWS_REGION", "us-east-1")
+            identity_center_region or os.environ.get("AWS_REGION", "us-east-1"),
+            permission_cache,
         )
 
         def add_permission_set_failures():
@@ -34910,9 +35047,14 @@ def check_bedrock_ai_user_console_mfa(
                         "over {}{}, so a session that did not complete MFA is not "
                         "denied those writes. A Deny on aws:MultiFactorAuthPresent "
                         "does not hold federated sessions to MFA, because the key "
-                        "is not present for them. It references no customer "
-                        "managed policy.".format(
-                            permission_set["arn"],
+                        "is not present for them. {}".format(
+                            permission_set["arn"]
+                            + (
+                                " as provisioned in this account as role "
+                                f"{permission_set['role']}"
+                                if permission_set.get("role")
+                                else ""
+                            ),
                             ", ".join(permission_set["services"]),
                             " and ".join(permission_set["sources"]),
                             ", ".join(permission_set["uncovered"]),
@@ -34920,6 +35062,12 @@ def check_bedrock_ai_user_console_mfa(
                             "other services)".format("; ".join(permission_set["tests"]))
                             if permission_set["tests"]
                             else "",
+                            "It references the customer managed policies {}, read "
+                            "from the role's policies in the IAM permissions cache; "
+                            "the role in each other account it is provisioned to "
+                            "is not read.".format(permission_set["references"])
+                            if permission_set.get("role")
+                            else "It references no customer managed policy.",
                         ),
                         "Pass the authentication method from the identity source "
                         "as a session tag (attributes for access control), and add "
