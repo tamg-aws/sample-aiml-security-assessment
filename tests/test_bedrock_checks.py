@@ -8523,6 +8523,7 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_guardrail_contextual_grounding": "BR-27",
         "check_guardrail_grounding_score_evidence": "BR-27",
         "check_guardrail_prompt_attack_invocation_evidence": "BR-34",
+        "check_guardduty_prompt_injection_detection": "BR-34",
         "check_bedrock_agent_guardrail_association": "BR-28",
         "check_bedrock_agent_idle_session_ttl": "BR-29",
         "check_bedrock_imported_model_kms_encryption": "BR-30",
@@ -42127,3 +42128,202 @@ class TestBR04SageMakerInferenceRetention:
         assert located["uris"] == [
             ("s3://cap/on", "the data capture destination of SageMaker endpoint 'on'")
         ]
+
+
+class TestBR34GuardDutyPromptInjection:
+    """AIR-FND-DET-04: GuardDuty AI Protection raises prompt injection findings."""
+
+    INJECTION = "Impact:IAMUser/PromptInjection.Direct"
+
+    @staticmethod
+    def _finding(finding_id, kind, updated, api="ApplyGuardrail"):
+        return {
+            "Id": finding_id,
+            "Type": kind,
+            "Severity": 2.0,
+            "UpdatedAt": updated,
+            "Service": {"Action": {"AwsApiCallAction": {"Api": api}}},
+        }
+
+    def _run(
+        self,
+        detector_pages=(["det-1"],),
+        detector=None,
+        finding_pages=None,
+        findings=(),
+        errors=None,
+    ):
+        errors = errors or {}
+        client = MagicMock()
+        self.calls = {"list_detectors": [], "list_findings": [], "get_findings": []}
+
+        def paged(name, key, pages):
+            def call(**kwargs):
+                self.calls[name].append(kwargs)
+                if name in errors:
+                    raise errors[name]
+                index = int(kwargs.get("NextToken") or 0)
+                response = {key: list(pages[index])}
+                if index + 1 < len(pages):
+                    response["NextToken"] = str(index + 1)
+                return response
+
+            return call
+
+        client.list_detectors.side_effect = paged(
+            "list_detectors", "DetectorIds", detector_pages
+        )
+        if "get_detector" in errors:
+            client.get_detector.side_effect = errors["get_detector"]
+        else:
+            client.get_detector.return_value = (
+                detector
+                if detector is not None
+                else {
+                    "Status": "ENABLED",
+                    "Features": [
+                        {"Name": "CLOUD_TRAIL", "Status": "ENABLED"},
+                        {"Name": "AI_PROTECTION", "Status": "ENABLED"},
+                    ],
+                }
+            )
+        by_id = {finding["Id"]: finding for finding in findings}
+        client.list_findings.side_effect = paged(
+            "list_findings",
+            "FindingIds",
+            finding_pages if finding_pages is not None else [list(by_id)],
+        )
+
+        def get_findings(DetectorId, FindingIds):
+            self.calls["get_findings"].append(list(FindingIds))
+            if "get_findings" in errors:
+                raise errors["get_findings"]
+            return {"Findings": [by_id[i] for i in FindingIds]}
+
+        client.get_findings.side_effect = get_findings
+        with patch("bedrock_app.boto3.client", return_value=client):
+            return extract_csv_data(
+                bedrock_app.check_guardduty_prompt_injection_detection(
+                    region="us-east-1"
+                )
+            )
+
+    def test_enabled_ai_protection_passes_and_names_only_injection_findings(self):
+        findings = [
+            self._finding("f-old", self.INJECTION, "2026-09-01T00:00:00Z"),
+            self._finding(
+                "f-anom",
+                "Impact:IAMUser/AnomalousModelInvocation",
+                "2026-10-02T00:00:00Z",
+                api="InvokeModel",
+            ),
+            self._finding("f-new", self.INJECTION, "2026-10-01T00:00:00Z"),
+        ]
+        rows = self._run(findings=findings)
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert rows[0]["Check_ID"] == "BR-34"
+        detail = rows[0]["Finding_Details"]
+        assert "AI_PROTECTION ENABLED" in detail
+        assert "3 unarchived finding(s)" in detail
+        assert f"2 {self.INJECTION}" in detail
+        assert "1 Impact:IAMUser/AnomalousModelInvocation" in detail
+        assert detail.index("f-new") < detail.index("f-old")
+        assert "f-anom" not in detail
+        assert "Which Bedrock APIs AI Protection analyzes is not judged" in detail
+        criterion = self.calls["list_findings"][0]["FindingCriteria"]["Criterion"]
+        assert criterion["service.action.awsApiCallAction.serviceName"] == {
+            "Eq": ["bedrock.amazonaws.com"]
+        }
+        assert criterion["service.archived"] == {"Eq": ["false"]}
+
+    def test_no_injection_finding_still_passes_and_says_so(self):
+        rows = self._run(findings=[])
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "none is a prompt injection finding" in rows[0]["Finding_Details"]
+        assert self.calls["get_findings"] == []
+
+    @pytest.mark.parametrize(
+        "detector, named",
+        [
+            (
+                {
+                    "Status": "ENABLED",
+                    "Features": [
+                        {"Name": "CLOUD_TRAIL", "Status": "ENABLED"},
+                        {"Name": "AI_PROTECTION", "Status": "DISABLED"},
+                    ],
+                },
+                "AI_PROTECTION DISABLED",
+            ),
+            (
+                {
+                    "Status": "ENABLED",
+                    "Features": [{"Name": "CLOUD_TRAIL", "Status": "ENABLED"}],
+                },
+                "AI_PROTECTION not listed among its Features",
+            ),
+            (
+                {
+                    "Status": "DISABLED",
+                    "Features": [{"Name": "AI_PROTECTION", "Status": "ENABLED"}],
+                },
+                "Status DISABLED",
+            ),
+        ],
+    )
+    def test_a_detector_without_enabled_ai_protection_fails(self, detector, named):
+        rows = self._run(detector=detector)
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert named in rows[0]["Finding_Details"]
+        assert self.calls["list_findings"] == []
+
+    def test_no_detector_fails(self):
+        rows = self._run(detector_pages=([],))
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "No GuardDuty detector exists in us-east-1" in rows[0]["Finding_Details"]
+
+    def test_a_detector_on_a_later_page_is_read(self):
+        rows = self._run(detector_pages=([], ["det-2"]))
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "det-2" in rows[0]["Finding_Details"]
+        assert self.calls["list_detectors"][1]["NextToken"] == "1"
+        assert self.calls["list_detectors"][0]["MaxResults"] == 50
+
+    def test_every_findings_page_and_batch_is_read(self):
+        findings = [
+            self._finding(
+                f"f-{index:03d}", self.INJECTION, f"2026-09-{index % 28 + 1:02d}"
+            )
+            for index in range(120)
+        ]
+        ids = [finding["Id"] for finding in findings]
+        rows = self._run(findings=findings, finding_pages=[ids[:50], ids[50:]])
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "120 unarchived finding(s)" in rows[0]["Finding_Details"]
+        assert [len(batch) for batch in self.calls["get_findings"]] == [50, 50, 20]
+        assert self.calls["list_findings"][1]["NextToken"] == "1"
+
+    @pytest.mark.parametrize(
+        "failed",
+        ["list_detectors", "get_detector", "list_findings", "get_findings"],
+    )
+    def test_a_failed_read_is_never_passed(self, failed):
+        findings = [self._finding("f-1", self.INJECTION, "2026-10-01T00:00:00Z")]
+        rows = self._run(
+            findings=findings,
+            errors={
+                failed: ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    failed,
+                )
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "AccessDenied" in rows[0]["Finding_Details"]

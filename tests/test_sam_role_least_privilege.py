@@ -171,6 +171,10 @@ _EXPECTED_ACTIONS = {
         "glue:GetPartitions",
         "glue:GetTable",
         "glue:GetTables",
+        "guardduty:GetDetector",
+        "guardduty:GetFindings",
+        "guardduty:ListDetectors",
+        "guardduty:ListFindings",
         "iam:GetAccountSummary",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
@@ -1012,12 +1016,27 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                                 "Fn::Sub": "arn:${AWS::Partition}:firehose:*:"
                                 "${AWS::AccountId}:deliverystream/*"
                             },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:account::"
+                                "${AWS::AccountId}:account"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:events:*:"
+                                "${AWS::AccountId}:rule/*"
+                            },
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:guardduty:*:"
+                                "${AWS::AccountId}:detector/*"
+                            },
                         ]
                     ),
                 )
                 for action in (
                     "cloudtrail:GetEventDataStore",
                     "firehose:DescribeDeliveryStream",
+                    "account:ListRegions",
+                    "events:ListTargetsByRule",
+                    "guardduty:GetDetector",
                 )
             ),
             (
@@ -1071,26 +1090,6 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     "bedrock:ListTagsForResource",
                 )
             ),
-            (
-                "Allow",
-                "account:ListRegions",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:account::"
-                        "${AWS::AccountId}:account"
-                    }
-                ),
-            ),
-            (
-                "Allow",
-                "events:ListTargetsByRule",
-                json.dumps(
-                    {
-                        "Fn::Sub": "arn:${AWS::Partition}:events:*:"
-                        "${AWS::AccountId}:rule/*"
-                    }
-                ),
-            ),
             *(
                 (
                     "Allow",
@@ -1143,6 +1142,9 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                 )
             ),
             ("Allow", "glue:GetJobs", '"*"'),
+            ("Allow", "guardduty:ListDetectors", '"*"'),
+            ("Allow", "guardduty:ListFindings", '"*"'),
+            ("Allow", "guardduty:GetFindings", '"*"'),
             scoped("iam:GetPolicy", "iam::aws:policy/*"),
             scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
             ("Allow", "bedrock-mantle:GetAccountDataRetention", '"*"'),
@@ -2467,18 +2469,13 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "sso:ListPermissionSets",
             "sso:::instance/*",
         ),
-        ("BedrockAssessmentReadsPolicy", "EventDataStoreAndArchiveStreamRead"): (
+        ("BedrockAssessmentReadsPolicy", "ScopedReadsAcrossServices"): (
             "cloudtrail:GetEventDataStore",
             "firehose:DescribeDeliveryStream",
-            "firehose:*:${AWS::AccountId}:deliverystream/*",
-        ),
-        ("BedrockAssessmentReadsPolicy", "AccountListRegions"): (
             "account:ListRegions",
-            "account::${AWS::AccountId}:account",
-        ),
-        ("BedrockAssessmentReadsPolicy", "EventBridgeRuleTargetList"): (
             "events:ListTargetsByRule",
-            "events:*:${AWS::AccountId}:rule/*",
+            "guardduty:GetDetector",
+            "guardduty:*:${AWS::AccountId}:detector/*",
         ),
         ("BedrockAssessmentReadsPolicy", "SageMakerEndpointPathRead"): (
             "sagemaker:DescribeEndpoint",

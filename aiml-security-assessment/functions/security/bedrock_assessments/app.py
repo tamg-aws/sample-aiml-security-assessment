@@ -18575,6 +18575,204 @@ def _invocation_log_source(region: str) -> Dict[str, Any]:
     }
 
 
+GUARDDUTY_PROMPT_INJECTION_FINDING = (
+    "GuardDuty AI Protection Prompt Injection Detection"
+)
+
+GUARDDUTY_PROMPT_INJECTION_TYPE = "Impact:IAMUser/PromptInjection.Direct"
+
+GUARDDUTY_FINDINGS_BATCH = 50
+
+
+def check_guardduty_prompt_injection_detection(region: str = "") -> Dict[str, Any]:
+    """
+    BR-34: Require a GuardDuty detector in the Region with the AI_PROTECTION
+    feature ENABLED, which raises Impact:IAMUser/PromptInjection.Direct, and
+    name the unarchived findings it holds on bedrock.amazonaws.com calls as
+    the example flagged events.
+    """
+    reference = "https://docs.aws.amazon.com/guardduty/latest/ug/what-is-guardduty.html"
+    findings = {
+        "check_name": GUARDDUTY_PROMPT_INJECTION_FINDING,
+        "status": "PASS",
+        "details": "",
+        "csv_data": [],
+    }
+
+    def row(details, resolution, severity, status):
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-34",
+                finding_name=GUARDDUTY_PROMPT_INJECTION_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
+        if status == "Failed":
+            findings["status"] = "WARN"
+        return findings
+
+    resolution = (
+        "Enable GuardDuty in this Region and turn on its AI Protection feature, "
+        f"so prompt injection against Bedrock raises {GUARDDUTY_PROMPT_INJECTION_TYPE} "
+        "findings."
+    )
+    client = boto3.client("guardduty", config=boto3_config, region_name=region)
+    try:
+        detector_ids = _list_all_items(
+            client,
+            "list_detectors",
+            "DetectorIds",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+            max_results=GUARDDUTY_FINDINGS_BATCH,
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return row(
+            "GuardDuty detectors were not read with guardduty:ListDetectors "
+            f"({get_assessment_error_label(error)}), so whether AI Protection "
+            "detects prompt injection here is not known.",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    if not detector_ids:
+        return row(
+            f"No GuardDuty detector exists in {region or 'this Region'}, so no "
+            f"{GUARDDUTY_PROMPT_INJECTION_TYPE} finding is raised for Bedrock calls "
+            "made here.",
+            resolution,
+            "Medium",
+            "Failed",
+        )
+    for detector_id in detector_ids:
+        try:
+            detector = client.get_detector(DetectorId=detector_id)
+        except (ClientError, BotoCoreError) as error:
+            return row(
+                f"GuardDuty detector {detector_id} was not read with "
+                f"guardduty:GetDetector ({get_assessment_error_label(error)}), so "
+                "whether its AI Protection feature is on is not known.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        ai_protection = next(
+            (
+                feature.get("Status")
+                for feature in detector.get("Features") or []
+                if feature.get("Name") == "AI_PROTECTION"
+            ),
+            None,
+        )
+        if detector.get("Status") != "ENABLED" or ai_protection != "ENABLED":
+            return row(
+                f"GuardDuty detector {detector_id} has Status "
+                f"{detector.get('Status') or 'unset'} and AI_PROTECTION "
+                f"{ai_protection or 'not listed among its Features'}, so it raises "
+                f"no {GUARDDUTY_PROMPT_INJECTION_TYPE} finding.",
+                resolution,
+                "Medium",
+                "Failed",
+            )
+        try:
+            finding_ids = _list_all_items(
+                client,
+                "list_findings",
+                "FindingIds",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                max_results=GUARDDUTY_FINDINGS_BATCH,
+                DetectorId=detector_id,
+                FindingCriteria={
+                    "Criterion": {
+                        "service.action.awsApiCallAction.serviceName": {
+                            "Eq": ["bedrock.amazonaws.com"]
+                        },
+                        "service.archived": {"Eq": ["false"]},
+                    }
+                },
+            )
+            details = []
+            for start in range(0, len(finding_ids), GUARDDUTY_FINDINGS_BATCH):
+                details.extend(
+                    client.get_findings(
+                        DetectorId=detector_id,
+                        FindingIds=finding_ids[
+                            start : start + GUARDDUTY_FINDINGS_BATCH
+                        ],
+                    ).get("Findings")
+                    or []
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            return row(
+                f"GuardDuty detector {detector_id} is ENABLED with AI_PROTECTION "
+                "ENABLED, but its findings on Bedrock calls were not read "
+                f"({get_assessment_error_label(error)}), so no example flagged event "
+                "is named.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        counts: Dict[str, int] = {}
+        for finding in details:
+            counts[str(finding.get("Type"))] = (
+                counts.get(str(finding.get("Type")), 0) + 1
+            )
+        injections = sorted(
+            (
+                finding
+                for finding in details
+                if finding.get("Type") == GUARDDUTY_PROMPT_INJECTION_TYPE
+            ),
+            key=lambda finding: str(finding.get("UpdatedAt") or ""),
+            reverse=True,
+        )
+        examples = "; ".join(
+            "{} on {} (severity {}, updated {})".format(
+                finding.get("Id"),
+                ((finding.get("Service") or {}).get("Action") or {})
+                .get("AwsApiCallAction", {})
+                .get("Api")
+                or "an unnamed API",
+                finding.get("Severity"),
+                finding.get("UpdatedAt"),
+            )
+            for finding in injections[:3]
+        )
+        row(
+            f"GuardDuty detector {detector_id} is ENABLED with AI_PROTECTION "
+            f"ENABLED, the GuardDuty feature whose findings include "
+            f"{GUARDDUTY_PROMPT_INJECTION_TYPE}. It holds {len(details)} unarchived "
+            "finding(s) on bedrock.amazonaws.com calls"
+            + (
+                " ({})".format(
+                    ", ".join(
+                        f"{count} {kind}" for kind, count in sorted(counts.items())
+                    )
+                )
+                if counts
+                else ""
+            )
+            + (
+                f"; the newest prompt injection findings are {examples}"
+                if examples
+                else "; none is a prompt injection finding"
+            )
+            + ". Which Bedrock APIs AI Protection analyzes is not judged.",
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    return findings
+
+
 def check_guardrail_prompt_attack_invocation_evidence(
     region: str = "",
 ) -> Dict[str, Any]:
@@ -38459,6 +38657,7 @@ def lambda_handler(event, context):
         all_findings.append(
             check_guardrail_prompt_attack_invocation_evidence(region=region)
         )
+        all_findings.append(check_guardduty_prompt_injection_detection(region=region))
 
         logger.info("Running guardrail image content filter advisory (BR-35)")
         all_findings.append(

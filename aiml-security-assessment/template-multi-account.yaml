@@ -315,24 +315,41 @@ Resources:
               - iam:GetAccountSummary # BR-50
               - redshift-serverless:ListWorkgroups # BR-20
               - glue:GetJobs # BR-26
+              - guardduty:ListDetectors # BR-34
+              - guardduty:ListFindings # BR-34
+              - guardduty:GetFindings # BR-34
             Resource: '*'
-          - Sid: EventDataStoreAndArchiveStreamRead
+          - Sid: ScopedReadsAcrossServices
             # BR-06 reads each event data store's Status and
             # AdvancedEventSelectors. ListEventDataStores has no resource
             # type and is granted on '*' in the function's inline policy.
             # BR-12 follows a subscription filter on the invocation log group
             # to a Firehose stream of this account and its archive bucket.
+            # BR-51 lists the Regions enabled for this account. BR-33 names the
+            # targets of each default-bus rule that matches Inspector findings.
+            # BR-34 reads whether each GuardDuty detector has AI Protection on.
             # The service authorization reference gives GetEventDataStore the
-            # eventdatastore resource type and DescribeDeliveryStream the
-            # deliverystream resource type, so neither is granted on the
-            # other's ARN. It holds the former Sid CloudTrailEventDataStoreRead.
+            # eventdatastore resource type, DescribeDeliveryStream the
+            # deliverystream type, ListRegions the account type,
+            # ListTargetsByRule the rule type and GetDetector the detector
+            # type. An action matches only ARNs of its own service, so none is
+            # granted on another's ARN. It holds the former Sids
+            # CloudTrailEventDataStoreRead, EventDataStoreAndArchiveStreamRead,
+            # AccountListRegions and EventBridgeRuleTargetList, merged to keep
+            # this policy under its 5,500-character budget.
             Effect: Allow
             Action:
               - cloudtrail:GetEventDataStore # BR-06, BR-32
               - firehose:DescribeDeliveryStream # BR-12
+              - account:ListRegions # BR-51
+              - events:ListTargetsByRule # BR-33
+              - guardduty:GetDetector # BR-34
             Resource:
               - !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
               - !Sub 'arn:${AWS::Partition}:firehose:*:${AWS::AccountId}:deliverystream/*'
+              - !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
+              - !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
+              - !Sub 'arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*'
           - Sid: BedrockIngestionJobList
             # BR-46 reads when each knowledge base data source last ingested.
             Effect: Allow
@@ -391,20 +408,6 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:memory/*'
               - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
               - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:workload-identity-directory/*'
-          - Sid: AccountListRegions
-            # BR-51 lists the Regions enabled for this account and sweeps each
-            # for an IAM Identity Center instance.
-            Effect: Allow
-            Action:
-              - account:ListRegions # BR-51
-            Resource: !Sub 'arn:${AWS::Partition}:account::${AWS::AccountId}:account'
-          - Sid: EventBridgeRuleTargetList
-            # BR-33 names the targets of each default-bus rule that matches
-            # Inspector findings.
-            Effect: Allow
-            Action:
-              - events:ListTargetsByRule # BR-33
-            Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
           - Sid: SageMakerEndpointPathRead
             # BR-02 reads the configuration behind each SageMaker endpoint, the
             # variants, execution role and VPC of each endpoint configuration,
