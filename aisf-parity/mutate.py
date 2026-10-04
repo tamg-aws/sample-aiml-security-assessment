@@ -667,6 +667,27 @@ MUTATIONS = [
         "replace": "    fronts_screen_chunks: bool = True,\n",
     },
     {
+        "name": "BR-26 credits a credential type as the PII redaction layer",
+        "file": BEDROCK,
+        "defect": "an agent guardrail that masks only AWS keys and passwords is credited as the PII/PHI defense-in-depth layer",
+        "find": '\n        and entity.get("type") not in CREDENTIAL_PII_ENTITY_TYPES\n',
+        "replace": "\n",
+    },
+    {
+        "name": "BR-26 drops the regex from the PII redaction layer",
+        "file": BEDROCK,
+        "defect": "an agent guardrail with PII entities and no custom regex is credited as the defense-in-depth layer",
+        "find": '\n    ) and any(masks(regex) for regex in policy.get("regexes") or [])\n',
+        "replace": "\n    )\n",
+    },
+    {
+        "name": "BR-26 reads the input side for the PII redaction layer",
+        "file": BEDROCK,
+        "defect": "a PII type masked on the input only is credited as masking the generated response",
+        "find": '\n            and _sensitive_information_action(element, "output")\n',
+        "replace": '\n            and _sensitive_information_action(element, "input")\n',
+    },
+    {
         "name": "an object written after the redaction job passes BR-26 again",
         "file": BEDROCK,
         "defect": "BR-26 stops comparing each ingested object with the redaction "
@@ -1314,8 +1335,8 @@ MUTATIONS = [
         "name": "BR-20 credits a conditioned store read",
         "file": BEDROCK,
         "defect": "an Allow under a Condition counts as an established store read",
-        "find": '\n                if statement.get("Condition"):\n                    allow_held.append(f"{label} allows the read under a Condition")\n',
-        "replace": '\n                if False:\n                    allow_held.append(f"{label} allows the read under a Condition")\n',
+        "find": '\n                if statement.get("Condition"):\n                    allow_held.append(f"{label} allows {action} under a Condition")\n',
+        "replace": '\n                if False:\n                    allow_held.append(f"{label} allows {action} under a Condition")\n',
     },
     {
         "name": "BR-20 ignores the permissions boundary on the store read",
@@ -1330,6 +1351,41 @@ MUTATIONS = [
         "defect": "an Allow on another graph or index counts as a read of this one",
         "find": "\n            if reaches:\n                found.append(statement)\n",
         "replace": "\n            if True:\n                found.append(statement)\n",
+    },
+    {
+        "name": "BR-20 needs every store read action to survive",
+        "file": BEDROCK,
+        "defect": "a Deny or boundary of one Kendra read action drops a role that still reads the index with the other",
+        "find": '\n            if any(verdict == "reads" for verdict, _ in verdicts):\n',
+        "replace": '\n            if all(verdict == "reads" for verdict, _ in verdicts):\n',
+    },
+    {
+        "name": "BR-20 ignores an SCP Deny of the store read",
+        "file": BEDROCK,
+        "defect": "a role an attached SCP keeps from every store read action is still counted as a reader",
+        "find": '\n                    if scp_verdict == "denied":\n',
+        "replace": "\n                    if False:\n",
+    },
+    {
+        "name": "BR-20 ignores an SCP that cannot judge the store read",
+        "file": BEDROCK,
+        "defect": "an unread SCP inventory or a conditioned SCP Deny leaves a store reader counted as established",
+        "find": '\n                    elif scp_verdict == "held":\n',
+        "replace": "\n                    elif False:\n",
+    },
+    {
+        "name": "BR-20 applies SCPs to a service-linked store reader",
+        "file": BEDROCK,
+        "defect": "an SCP Deny drops a service-linked role from the store readers, though SCPs do not restrict it",
+        "find": '\n                if verdict != "none" and ":role/aws-service-role/" not in principal:\n',
+        "replace": '\n                if verdict != "none":\n',
+    },
+    {
+        "name": "BR-20 judges every store action by the first action's SCP",
+        "file": BEDROCK,
+        "defect": "an SCP Deny of kendra:Query also drops a role that reads the index with kendra:Retrieve",
+        "find": "\n                    scp_verdict, scp_why = scps[action]\n",
+        "replace": '\n                    scp_verdict, scp_why = scps[spec["actions"][0]]\n',
     },
     {
         "name": "BR-20 ignores principals the cache failed to read",
@@ -6936,6 +6992,15 @@ GROUPS: dict[str, str] = {
     "an agent guardrail screens retrieved chunks for BR-26 again": (
         "in the Bedrock knowledge base redaction"
     ),
+    "BR-26 credits a credential type as the PII redaction layer": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 drops the regex from the PII redaction layer": (
+        "in the Bedrock knowledge base redaction"
+    ),
+    "BR-26 reads the input side for the PII redaction layer": (
+        "in the Bedrock knowledge base redaction"
+    ),
     "an object written after the redaction job passes BR-26 again": (
         "in the Bedrock knowledge base redaction"
     ),
@@ -7890,6 +7955,11 @@ GROUPS: dict[str, str] = {
     "BR-20 drops the Kendra source read errors": "in the Bedrock knowledge base stores",
     "BR-20 builds a store reader's ARN without its path": "in the Bedrock knowledge base stores",
     "BR-20 ignores an identity Deny of the store read": "in the Bedrock knowledge base stores",
+    "BR-20 needs every store read action to survive": "in the Bedrock knowledge base stores",
+    "BR-20 ignores an SCP Deny of the store read": "in the Bedrock knowledge base stores",
+    "BR-20 ignores an SCP that cannot judge the store read": "in the Bedrock knowledge base stores",
+    "BR-20 applies SCPs to a service-linked store reader": "in the Bedrock knowledge base stores",
+    "BR-20 judges every store action by the first action's SCP": "in the Bedrock knowledge base stores",
     "BR-20 credits a conditioned store read": "in the Bedrock knowledge base stores",
     "BR-20 ignores the permissions boundary on the store read": "in the Bedrock knowledge base stores",
     "BR-20 counts a grant on another store as a read": "in the Bedrock knowledge base stores",

@@ -21455,7 +21455,8 @@ class TestKnowledgeBaseScreening:
         assert [r["Status"] for r in rows] == ["N/A", "Failed", "Failed", "N/A", "N/A"]
         assert "is not failed" in rows[0]["Finding_Details"]
         assert (
-            "agent 'g' 1 applies a guardrail that blocks or masks AWS_ACCESS_KEY"
+            "agent 'g' 1 applies a guardrail that blocks or masks on the output a "
+            "PII entity type other than the credential types"
             in rows[0]["Finding_Details"]
         )
         assert "agent 'b' DRAFT generates from it" in rows[1]["Finding_Details"]
@@ -21472,6 +21473,100 @@ class TestKnowledgeBaseScreening:
         assert (
             "No agent version or flow node retrieves from it"
             in rows[4]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "policy, screened",
+        [
+            # KB-08 round 11: the layer is judged on PII entity types, not the
+            # credential types. EMAIL and a regex masked on the output credit it.
+            (
+                {
+                    "piiEntities": [{"type": "EMAIL", "outputAction": "ANONYMIZE"}],
+                    "regexes": [{"name": "k", "pattern": "k", "outputAction": "BLOCK"}],
+                },
+                True,
+            ),
+            # Credentials and a regex on both sides are not PII redaction.
+            (
+                {
+                    "piiEntities": [
+                        {"type": t, "inputAction": "BLOCK", "outputAction": "BLOCK"}
+                        for t in ("AWS_ACCESS_KEY", "AWS_SECRET_KEY", "PASSWORD")
+                    ],
+                    "regexes": [
+                        {
+                            "name": "k",
+                            "pattern": "k",
+                            "inputAction": "BLOCK",
+                            "outputAction": "BLOCK",
+                        }
+                    ],
+                },
+                False,
+            ),
+            # A PII type masked on the input only leaves the response open.
+            (
+                {
+                    "piiEntities": [
+                        {
+                            "type": "EMAIL",
+                            "inputAction": "ANONYMIZE",
+                            "outputAction": "NONE",
+                        }
+                    ],
+                    "regexes": [{"name": "k", "pattern": "k", "outputAction": "BLOCK"}],
+                },
+                False,
+            ),
+            # A PII type with its output disabled leaves the response open.
+            (
+                {
+                    "piiEntities": [
+                        {
+                            "type": "NAME",
+                            "outputAction": "ANONYMIZE",
+                            "outputEnabled": False,
+                        }
+                    ],
+                    "regexes": [{"name": "k", "pattern": "k", "outputAction": "BLOCK"}],
+                },
+                False,
+            ),
+            # The control asks for a custom regex beside the entities, on the
+            # output only.
+            ({"piiEntities": [{"type": "EMAIL", "action": "BLOCK"}]}, False),
+            (
+                {
+                    "piiEntities": [{"type": "EMAIL", "action": "BLOCK"}],
+                    "regexes": [
+                        {"name": "k", "pattern": "k", "inputAction": "BLOCK"},
+                        {"name": "j", "pattern": "j", "outputAction": "ANONYMIZE"},
+                    ],
+                },
+                True,
+            ),
+        ],
+    )
+    def test_br26_the_front_layer_is_judged_on_pii_entity_types(self, policy, screened):
+        clean = [self._source("clean", kind="WEB", lambdas=["arn:aws:lambda:fn:r"])]
+        rows = self._br26(
+            self._inventory(
+                [self._kb("kb", clean, [self._front("agent 'g' 1")])],
+                {("gr-1", "1"): {"sensitiveInformationPolicy": policy}},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A" if screened else "Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "guardrail that blocks or masks on the output a PII entity type other "
+            "than the credential types AWS_ACCESS_KEY, AWS_SECRET_KEY and PASSWORD, "
+            "and a custom regex (the control names no list of PII or PHI types, so "
+            "any one such type is credited)"
+        ) in details
+        assert ("agent 'g' 1 applies a guardrail" in details) is screened
+        assert ("agent 'g' 1 generates from it with no guardrail" in details) is (
+            not screened
         )
 
     def test_br26_a_redacted_knowledge_base_beside_unread_agents_is_unread(self):
@@ -42736,8 +42831,8 @@ class TestBR20ValueDepth:
         )
         assert [r["Status"] for r in rows] == ["N/A"]
         assert (
-            f"for 'KB-kb1', {self.READER}: attached policy 'reads' allows the read "
-            "under a Condition"
+            f"for 'KB-kb1', {self.READER}: attached policy 'reads' allows "
+            "neptune-graph:ReadDataViaQuery under a Condition"
         ) in rows[0]["Finding_Details"]
 
     def test_an_unread_principal_holds_the_graph_comparison(self):
@@ -42773,7 +42868,15 @@ class TestBR20ValueDepth:
             f"{bedrock_app.DEADLINE_STOP}",
         }
 
-    def _kendra_reader_run(self, policy="ATTRIBUTE_FILTER", sources=None, allowed=None):
+    def _kendra_reader_run(
+        self,
+        policy="ATTRIBUTE_FILTER",
+        sources=None,
+        allowed=None,
+        reader=None,
+        scp_inventory=None,
+        iam=None,
+    ):
         kendra = MagicMock()
         kendra.describe_index.return_value = {
             "ServerSideEncryptionConfiguration": {"KmsKeyId": self.CMK},
@@ -42804,14 +42907,18 @@ class TestBR20ValueDepth:
                     }
                 }
             },
-            clients={"kendra": kendra, "iam": self._iam()},
+            clients={"kendra": kendra, "iam": iam or self._iam()},
             bucket_encryption={"corpus": self._sse(self.CMK)},
             bucket_policies={
                 "corpus": self._source_deny(allowed=allowed or [self.ROLE])
             },
             permission_cache=self._cache(
-                roles={"reader": self._reader_role("kendra:Query", self.KENDRA_INDEX)}
+                roles={
+                    "reader": reader
+                    or self._reader_role("kendra:Query", self.KENDRA_INDEX)
+                }
             ),
+            scp_inventory=scp_inventory,
         )
         return findings, self._source_access(findings)
 
@@ -42857,6 +42964,155 @@ class TestBR20ValueDepth:
             and f["Status"] == "N/A"
             for f in findings
         )
+
+    # KB-03 round 11: readers are judged per action. A Deny or a boundary of
+    # one Kendra read action used to decide both, and SCPs were not read.
+
+    @pytest.mark.parametrize(
+        "denied, status",
+        [
+            # kendra:Retrieve survives a Deny of kendra:Query, so the role
+            # still reads the index the source bucket keeps from it.
+            ("kendra:Query", "Failed"),
+            (["kendra:Query", "kendra:Retrieve"], "Passed"),
+        ],
+    )
+    def test_a_deny_of_one_kendra_action_leaves_the_other_a_read(self, denied, status):
+        reader = self._reader_role(
+            "kendra:*",
+            self.KENDRA_INDEX,
+            deny={"Effect": "Deny", "Action": denied, "Resource": "*"},
+        )
+        _, rows = self._kendra_reader_run(reader=reader)
+        assert [r["Status"] for r in rows] == [status]
+        assert (f"keeps from them: {self.READER}." in rows[0]["Finding_Details"]) is (
+            status == "Failed"
+        )
+
+    @pytest.mark.parametrize(
+        "bounded, status",
+        [
+            # A boundary allowing kendra:Query does not let a role that holds
+            # only kendra:Retrieve read the index.
+            ("kendra:Query", "Passed"),
+            ("kendra:Retrieve", "Failed"),
+        ],
+    )
+    def test_a_boundary_of_one_kendra_action_credits_only_that_action(
+        self, bounded, status
+    ):
+        reader = self._reader_role(
+            "kendra:Retrieve",
+            self.KENDRA_INDEX,
+            boundary=[
+                {"Effect": "Allow", "Action": bounded, "Resource": "*"},
+                {"Effect": "Allow", "Action": ["s3:*", "kms:*"], "Resource": "*"},
+            ],
+        )
+        _, rows = self._kendra_reader_run(reader=reader)
+        assert [r["Status"] for r in rows] == [status]
+        assert (self.READER in rows[0]["Finding_Details"]) is (status == "Failed")
+
+    @pytest.mark.parametrize(
+        "identity, denied, status",
+        [
+            ("kendra:*", ["kendra:Query", "kendra:Retrieve"], "Passed"),
+            # An SCP Deny of one action leaves the other.
+            ("kendra:*", "kendra:Query", "Failed"),
+            ("kendra:Query", "kendra:Query", "Passed"),
+            # A Deny on another index leaves this one.
+            ("kendra:*", "kendra:*", "Failed"),
+        ],
+    )
+    def test_an_attached_scp_deny_of_the_kendra_read_is_applied_per_action(
+        self, identity, denied, status
+    ):
+        resource = (
+            self.KENDRA_INDEX.replace("idx-1", "idx-2") if denied == "kendra:*" else "*"
+        )
+        statement = {"Effect": "Deny", "Action": denied, "Resource": resource}
+        _, rows = self._kendra_reader_run(
+            reader=self._reader_role(identity, self.KENDRA_INDEX),
+            scp_inventory=self._scps(("NoKendra", [statement], ["root r-ab12"])),
+        )
+        assert [r["Status"] for r in rows] == [status]
+        assert (self.READER in rows[0]["Finding_Details"]) is (status == "Failed")
+
+    def test_an_allow_list_scp_without_the_held_action_drops_the_reader(self):
+        # FullAWSAccess stays on the account and the root, and the OU between
+        # them allows kendra:Query but not kendra:Retrieve.
+        allow = {
+            "Effect": "Allow",
+            "Action": ["kendra:Query", "s3:*", "kms:*"],
+            "Resource": "*",
+        }
+        inventory = self._scps(
+            ("OuAllowList", [allow], ["organizational unit ou-ab12-cdef3456"])
+        )
+        inventory["items"][0]["attached_to"] = [
+            f"account {self.ACCOUNT}",
+            "root r-ab12",
+        ]
+        rows = {}
+        for action in ("kendra:Retrieve", "kendra:Query"):
+            _, rows[action] = self._kendra_reader_run(
+                reader=self._reader_role(action, self.KENDRA_INDEX),
+                scp_inventory=inventory,
+            )
+        assert [r["Status"] for r in rows["kendra:Retrieve"]] == ["Passed"]
+        assert [r["Status"] for r in rows["kendra:Query"]] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "statement, overrides, expected",
+        [
+            (
+                {
+                    "Effect": "Deny",
+                    "Action": "kendra:Query",
+                    "Resource": "*",
+                    "Condition": {"StringNotEquals": {"aws:PrincipalTag/t": "x"}},
+                },
+                {},
+                "service control policy 'NoKendra' denies kendra:Query on Kendra index",
+            ),
+            (None, {"list_error": "AccessDenied"}, "were not read: AccessDenied"),
+        ],
+    )
+    def test_an_scp_that_cannot_judge_the_kendra_read_holds_the_reader(
+        self, statement, overrides, expected
+    ):
+        policies = [("NoKendra", [statement], ["root r-ab12"])] if statement else []
+        _, rows = self._kendra_reader_run(
+            scp_inventory=self._scps(*policies, **overrides)
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert f"for 'KB-kb1', {self.READER}: " in details
+        assert expected in details
+
+    def test_an_scp_deny_does_not_drop_a_service_linked_reader(self):
+        linked = (
+            f"arn:aws:iam::{self.ACCOUNT}:role/aws-service-role/"
+            "kendra.amazonaws.com/reader"
+        )
+        statement = {"Effect": "Deny", "Action": "kendra:*", "Resource": "*"}
+        _, rows = self._kendra_reader_run(
+            scp_inventory=self._scps(("NoKendra", [statement], ["root r-ab12"])),
+            iam=self._iam(roles={"kb-role": self.ROLE, "reader": linked}),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert f"keeps from them: {linked}." in rows[0]["Finding_Details"]
+
+    def test_the_reader_note_names_the_scp_scope(self):
+        _, rows = self._kendra_reader_run(
+            scp_inventory=self._scps(management_account=True, items=[])
+        )
+        assert (
+            "the service control policies attached over the account allow it and "
+            "do not deny it (this is the management account, which service control "
+            "policies never restrict); service control policies do not restrict a "
+            "service-linked role."
+        ) in rows[0]["Finding_Details"]
 
     def test_kendra_data_source_reads_stop_at_the_deadline(self, monkeypatch):
         kendra = MagicMock()

@@ -17549,18 +17549,18 @@ def _iam_principal_arns() -> Dict[str, Any]:
 
 
 def _identity_store_read(
-    permissions: Dict[str, Any], actions: Tuple[str, ...], arn: str
+    permissions: Dict[str, Any], action: str, arn: str
 ) -> Tuple[str, str]:
     """
-    Say whether one principal's IAM policies let it read a store, for BR-20:
-    ("reads", ""), ("held", why) or ("none", "").
+    Say whether one principal's IAM policies let it perform one store read
+    action on ``arn``, for BR-20: ("reads", ""), ("held", why) or ("none", "").
 
-    It reads when an identity Allow of one of ``actions`` without a Condition
-    matches ``arn``, no identity Deny of it does, and a permissions boundary,
-    if set, allows it there without a Condition. A Condition on a matching
-    statement is not judged, so it holds the principal.
+    It reads when an identity Allow of ``action`` without a Condition matches
+    ``arn``, no identity Deny of that action does, and a permissions boundary,
+    if set, allows that action there without a Condition. A Condition on a
+    matching statement is not judged, so it holds the principal.
     """
-    lowered = [action.lower() for action in actions]
+    lowered = action.lower()
 
     def matching(document: Any, label: str, held: List[str]) -> List[Dict[str, Any]]:
         try:
@@ -17572,7 +17572,7 @@ def _identity_store_read(
             return []
         found = []
         for statement in statements:
-            if not any(_statement_matches_action(statement, a) for a in lowered):
+            if not _statement_matches_action(statement, lowered):
                 continue
             if "NotResource" in statement:
                 reaches = not any(
@@ -17596,11 +17596,11 @@ def _identity_store_read(
         for statement in matching(policy.get("document"), label, deny_held):
             if str(statement.get("Effect", "")).upper() == "ALLOW":
                 if statement.get("Condition"):
-                    allow_held.append(f"{label} allows the read under a Condition")
+                    allow_held.append(f"{label} allows {action} under a Condition")
                 else:
                     allowed = True
             elif statement.get("Condition"):
-                deny_held.append(f"{label} denies the read under a Condition")
+                deny_held.append(f"{label} denies {action} under a Condition")
             else:
                 return "none", ""
     if deny_held:
@@ -17616,11 +17616,11 @@ def _identity_store_read(
             if not statement.get("Condition"):
                 return "none", ""
             boundary_held.append(
-                "permissions boundary denies the read under a Condition"
+                f"permissions boundary denies {action} under a Condition"
             )
         elif statement.get("Condition"):
             boundary_held.append(
-                "permissions boundary allows the read under a Condition"
+                f"permissions boundary allows {action} under a Condition"
             )
         else:
             bounded = True
@@ -17633,13 +17633,19 @@ def _store_readers(
     spec: Dict[str, Any],
     permission_cache: Optional[Dict[str, Any]],
     arn_cache: Dict[str, Any],
+    scp_inventory: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
     Resolve a store reader spec ({"actions", "arn", "held"}) to the IAM roles
-    and users _identity_store_read finds reading it, for BR-20. Returns
-    {"principals": [...], "held": [...]}; a principal the cache failed to read,
-    or one holding the read that iam:ListRoles or iam:ListUsers did not return,
-    is held. A hold on the store itself establishes no principal's read.
+    and users that read it, for BR-20. Returns {"principals", "held",
+    "scp_note"}. Each action is judged on its own: a principal reads the store
+    when, for one of the actions, _identity_store_read finds it reading and
+    _scp_read_verdict finds the attached service control policies letting it,
+    so a Deny or a boundary of one action never decides another. Service
+    control policies do not restrict a service-linked role. A principal the
+    cache failed to read, one an action is held for and none reads, or one
+    holding the read that iam:ListRoles or iam:ListUsers did not return, is
+    held. A hold on the store itself establishes no principal's read.
     """
     held = list(spec.get("held") or [])
     if held:
@@ -17670,16 +17676,28 @@ def _store_readers(
     listing = arn_cache["listing"]
     if listing["error"]:
         return {"principals": [], "held": held + [listing["error"]]}
+    store_arn = partial(_wildcard_matches, text=spec["arn"])
+    scps = {
+        action: _scp_read_verdict(
+            scp_inventory,
+            action.lower(),
+            f"{action} on {spec['store']}",
+            store_arn,
+            store_arn,
+        )
+        for action in spec["actions"]
+    }
     readers = []
     for kind in ("role", "user"):
         cached = permission_cache.get(f"{kind}_permissions") or {}
         for name in sorted(cached):
             if (kind, name) in unread or not isinstance(cached[name], dict):
                 continue
-            verdict, why = _identity_store_read(
-                cached[name], spec["actions"], spec["arn"]
-            )
-            if verdict == "none":
+            identity = [
+                (action, *_identity_store_read(cached[name], action, spec["arn"]))
+                for action in spec["actions"]
+            ]
+            if all(verdict == "none" for _, verdict, _ in identity):
                 continue
             principal = listing["arns"].get((kind, name))
             if principal is None:
@@ -17687,11 +17705,30 @@ def _store_readers(
                     f"{kind} '{name}' can read it but was not returned by "
                     f"iam:List{kind.title()}s"
                 )
-            elif verdict == "held":
-                held.append(f"{principal}: {why}")
-            else:
+                continue
+            verdicts = []
+            for action, verdict, why in identity:
+                if verdict != "none" and ":role/aws-service-role/" not in principal:
+                    scp_verdict, scp_why = scps[action]
+                    if scp_verdict == "denied":
+                        verdict = "none"
+                    elif scp_verdict == "held":
+                        verdict = "held"
+                        why = "; ".join(w for w in (why, scp_why) if w)
+                verdicts.append((verdict, why))
+            if any(verdict == "reads" for verdict, _ in verdicts):
                 readers.append(principal)
-    return {"principals": readers, "held": held}
+            elif any(verdict == "held" for verdict, _ in verdicts):
+                held.append(
+                    "{}: {}".format(
+                        principal,
+                        "; ".join(
+                            why for verdict, why in verdicts if verdict == "held"
+                        ),
+                    )
+                )
+    scp_note = next((why for verdict, why in scps.values() if verdict == "reads"), "")
+    return {"principals": readers, "held": held, "scp_note": scp_note}
 
 
 def _knowledge_base_source_access_findings(
@@ -17724,8 +17761,12 @@ def _knowledge_base_source_access_findings(
     for kb_id, entry in vector_principals.items():
         if entry.get("readers") and entry.get("principals") is None:
             if any(kb_id in kbs for kbs in bucket_kbs.values()):
+                if scp_inventory is None:
+                    scp_inventory = get_service_control_policy_inventory()
                 entry.update(
-                    _store_readers(entry["readers"], permission_cache, arn_cache)
+                    _store_readers(
+                        entry["readers"], permission_cache, arn_cache, scp_inventory
+                    )
                 )
     for bucket, labels in buckets.items():
         reaching = [
@@ -17749,8 +17790,12 @@ def _knowledge_base_source_access_findings(
             f" The principals that read the {entry['readers']['store']} behind "
             f"'{entry['name']}' are the IAM roles and users whose identity "
             f"policies allow {' or '.join(entry['readers']['actions'])} on it "
-            "without a Condition, within any permissions boundary; service "
-            "control policies over that read are not evaluated."
+            "without a Condition, judged per action: an action counts only when "
+            "no identity-policy Deny of it applies without a Condition, a "
+            "permissions boundary, if set, allows it, and the service control "
+            "policies attached over the account allow it and do not deny it"
+            + (f" ({entry['scp_note']})" if entry.get("scp_note") else "")
+            + "; service control policies do not restrict a service-linked role."
             for _, entry in reaching
             if entry.get("readers")
         )
@@ -21269,11 +21314,27 @@ def _comprehend_detection_inputs(region: str) -> Tuple[List[Dict[str, str]], str
 
 def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
     """
-    True when the guardrail version passes _sensitive_information_verdict:
-    each credential PII entity type blocks or masks on the input and the
-    output, and a custom regex blocks or masks on the output.
+    True when the guardrail version's sensitive-information policy blocks or
+    masks on the output at least one PII entity type other than the credential
+    types (CREDENTIAL_PII_ENTITY_TYPES), and at least one custom regex, for
+    BR-26's defense-in-depth layer on the generated response. The control
+    names no list of PII or PHI types, so no particular type is required.
     """
-    return _sensitive_information_verdict(detail)[0] == "Passed"
+    policy = detail.get("sensitiveInformationPolicy") or {}
+
+    def masks(element: Any) -> bool:
+        return (
+            isinstance(element, dict)
+            and _sensitive_information_action(element, "output")
+            in SENSITIVE_INFORMATION_ACTING
+        )
+
+    return any(
+        masks(entity)
+        and entity.get("type")
+        and entity.get("type") not in CREDENTIAL_PII_ENTITY_TYPES
+        for entity in policy.get("piiEntities") or []
+    ) and any(masks(regex) for regex in policy.get("regexes") or [])
 
 
 # ListObjectsV2 returns 1,000 keys a page, so a source is listed up to 100,000
@@ -21678,8 +21739,10 @@ def check_bedrock_guardrail_pii_filters(
                 region,
                 knowledge_base_inventory,
                 _pii_entity_masks,
-                "that blocks or masks AWS_ACCESS_KEY, AWS_SECRET_KEY and PASSWORD "
-                "on the input and the output and a custom regex on the output",
+                "that blocks or masks on the output a PII entity type other than "
+                "the credential types AWS_ACCESS_KEY, AWS_SECRET_KEY and PASSWORD, "
+                "and a custom regex (the control names no list of PII or PHI "
+                "types, so any one such type is credited)",
                 redaction_credit,
                 "; ".join(source_unread),
                 "Redact PII before ingestion with a Comprehend PII redaction job that "
@@ -21688,16 +21751,16 @@ def check_bedrock_guardrail_pii_filters(
                 "the next ingestion job, an AWS Glue visual job whose PIIDetection "
                 "node masks or hashes what it detects before the S3 target the data "
                 "source ingests, or a POST_CHUNKING transformation Lambda. "
-                "An agent or flow guardrail that sets AWS_ACCESS_KEY, AWS_SECRET_KEY "
-                "and PASSWORD to BLOCK or ANONYMIZE screens user messages and model "
-                "responses as defense in depth, but is not credited for the "
-                "retrieved chunks.",
+                "An agent or flow guardrail that sets the PII and PHI entity types "
+                "the content holds, and a custom regex, to BLOCK or ANONYMIZE on the "
+                "output screens model responses as defense in depth, but is not "
+                "credited for the retrieved chunks.",
                 "High",
                 source_note=redaction_note,
                 front_layer_resolution=(
-                    "Associate a guardrail that blocks or masks AWS_ACCESS_KEY, "
-                    "AWS_SECRET_KEY and PASSWORD on the input and the output, with "
-                    "a custom regex on the output, with each agent version and "
+                    "Associate a guardrail that blocks or masks on the output the "
+                    "PII and PHI entity types the content holds, with a custom "
+                    "regex on the output, with each agent version and "
                     "flow knowledge base node that generates from the knowledge "
                     "base, so sensitive data the redaction step missed is masked "
                     "in the generated response."
