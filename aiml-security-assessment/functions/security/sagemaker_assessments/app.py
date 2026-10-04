@@ -6182,35 +6182,37 @@ def _allow_pins_invoke_source(statement: Dict[str, Any]) -> bool:
     return False
 
 
-def _deny_pins_invoke_source(statement: Dict[str, Any]) -> bool:
+def _deny_pinned_invoke_actions(statement: Dict[str, Any]) -> set:
     """
-    Return whether a Deny refuses every InvokeEndpoint call from outside a
-    named VPC endpoint or VPC.
+    Return the invoke actions a Deny refuses on every endpoint for a call from
+    outside a named VPC endpoint or VPC.
 
     The statement must cover every endpoint and hold only the source-network
     condition: another key makes the Deny fire only when both hold. A negated
     operator is true for a call that carries no key, except under ForAnyValue.
     """
     if str(statement.get("Effect", "")).upper() != "DENY":
-        return False
-    if not any(
-        _statement_names_action(statement, action) for action in ENDPOINT_INVOKE_ACTIONS
-    ):
-        return False
+        return set()
     if not _deny_covers_every_resource(statement, "endpoint"):
-        return False
+        return set()
     entries = _condition_entries(statement)
     if len(entries) != 1:
-        return False
+        return set()
     operator, key, values = entries[0]
     prefix, base, _ = _condition_operator_parts(operator)
-    return (
+    if not (
         key in INVOKE_SOURCE_NETWORK_KEYS
         and bool(values)
         and base in ("stringnotequals", "stringnotlike")
         and prefix != "foranyvalue"
         and not _like_values_unbounded(base, values)
-    )
+    ):
+        return set()
+    return {
+        action
+        for action in ENDPOINT_INVOKE_ACTIONS
+        if _statement_names_action(statement, action)
+    }
 
 
 def _invoke_source_network_findings(
@@ -6316,6 +6318,7 @@ def _invoke_source_network_findings(
             ):
                 continue
             unpinned = []
+            unpinned_actions = set()
             granted = False
             statements = []
             for policy in [
@@ -6325,11 +6328,13 @@ def _invoke_source_network_findings(
             ]:
                 for statement in _sm_policy_statements(policy.get("document")):
                     statements.append(statement)
-                    if not _statement_invoke_actions(statement):
+                    actions = _statement_invoke_actions(statement)
+                    if not actions:
                         continue
                     granted = True
                     if not _allow_pins_invoke_source(statement):
                         unpinned.append(policy.get("name") or "inline policy")
+                        unpinned_actions.update(actions)
             if not granted:
                 continue
             boundary_pins = boundary is not None and all(
@@ -6337,13 +6342,29 @@ def _invoke_source_network_findings(
                 for st in boundary_statements
                 if _statement_invoke_actions(st)
             )
-            denied = any(_deny_pins_invoke_source(st) for st in statements)
-            if not unpinned or boundary_pins or denied:
+            # Deny statements hold the principal only when together they cover
+            # every invoke action an unconditioned Allow grants: a Deny on
+            # InvokeEndpoint alone leaves InvokeEndpointAsync open.
+            denied_actions = set()
+            for st in statements:
+                denied_actions |= _deny_pinned_invoke_actions(st)
+            open_actions = unpinned_actions - denied_actions
+            if not unpinned or boundary_pins or not open_actions:
                 pinned.append(label)
             elif boundary is None and (identity_type.lower(), name) in boundary_unread:
                 unread.append(f"{label} (permissions boundary not read)")
             else:
-                open_principals.append(f"{label} (policy '{sorted(set(unpinned))[0]}')")
+                open_principals.append(
+                    f"{label} (policy '{sorted(set(unpinned))[0]}'; open: "
+                    + ", ".join(
+                        named
+                        for a, named in zip(
+                            ENDPOINT_INVOKE_ACTIONS, INVOKE_SOURCE_SCP_ACTIONS
+                        )
+                        if a in open_actions
+                    )
+                    + ")"
+                )
 
     rows = []
     if open_principals:
@@ -6352,10 +6373,11 @@ def _invoke_source_network_findings(
             shown += f"; and {len(open_principals) - 10} more"
         rows.append(
             _row(
-                f"{len(open_principals)} principal(s) can call "
-                "sagemaker:InvokeEndpoint from any network: no Allow condition "
-                "on aws:SourceVpce or aws:SourceVpc and no identity Deny holds the "
-                f"call to a VPC endpoint or VPC: {shown}. No attached service "
+                f"{len(open_principals)} principal(s) can call the endpoint "
+                "invoke actions named beside each from any network: no Allow "
+                "condition on aws:SourceVpce or aws:SourceVpc and no identity "
+                "Deny holds those calls to a VPC endpoint or VPC: "
+                f"{shown}. No attached service "
                 f"control policy holds every invoke action to it ({scp_text}).",
                 INVOKE_SOURCE_NETWORK_RESOLUTION,
                 "Medium",
@@ -19374,11 +19396,95 @@ def _microvm_data_event_coverage(region: str) -> Dict[str, List[str]]:
     return coverage
 
 
+# RunMicrovm takes its own logging, which overrides the image version's, and
+# GetMicrovm returns no logging member (lambda-microvms service-2.json,
+# GetMicrovmResponse), so only the image version's setting is readable.
+MICROVM_RUN_LOGGING_OVERRIDE = (
+    "a RunMicrovm call can set its own logging for one MicroVM, which GetMicrovm "
+    "does not return"
+)
+MICROVM_RUN_LOGGING_NOTE = (
+    f"{MICROVM_RUN_LOGGING_OVERRIDE[0].upper()}{MICROVM_RUN_LOGGING_OVERRIDE[1:]}, "
+    "so the image version's setting is the one read."
+)
+
+
+def _microvm_image_logging(
+    region: str, microvms: List[Dict[str, Any]]
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Read the logging of the image version each MicroVM runs from
+    ListMicrovmImageVersions. Return the problems (logging disabled, or no
+    CloudWatch Logs log group named), one "image version: log group" entry
+    per logged version, and the failed reads.
+    """
+    users: Dict[Tuple[str, str], List[str]] = {}
+    unread: List[str] = []
+    for microvm in microvms:
+        if not microvm.get("image_arn") or not microvm.get("image_version"):
+            unread.append(
+                f"the image version of MicroVM {microvm['id']} (GetMicrovm "
+                "returned no imageArn or imageVersion)"
+            )
+            continue
+        users.setdefault((microvm["image_arn"], microvm["image_version"]), []).append(
+            microvm["id"]
+        )
+    if not users:
+        return [], [], unread
+    client = boto3.client("lambda-microvms", config=boto3_config, region_name=region)
+    problems: List[str] = []
+    logged: List[str] = []
+    versions: Dict[str, Dict[str, Any]] = {}
+    for image_arn in sorted({arn for arn, _ in users}):
+        name = image_arn.rsplit(":", 1)[-1]
+        try:
+            for page in client.get_paginator("list_microvm_image_versions").paginate(
+                imageIdentifier=image_arn
+            ):
+                for item in page.get("items") or []:
+                    versions[f"{image_arn}|{item.get('imageVersion')}"] = item
+        except Exception as error:
+            unread.append(
+                f"Lambda MicroVM image {name} versions "
+                f"(lambda:ListMicrovmImageVersions: {get_assessment_error_label(error)})"
+            )
+            for key in [key for key in users if key[0] == image_arn]:
+                users.pop(key)
+    for (image_arn, version), ids in sorted(users.items()):
+        label = (
+            f"image {image_arn.rsplit(':', 1)[-1]} version {version}, which "
+            f"MicroVM(s) {', '.join(sorted(ids))} run"
+        )
+        item = versions.get(f"{image_arn}|{version}")
+        if item is None:
+            unread.append(
+                f"{label} (ListMicrovmImageVersions did not return the version)"
+            )
+            continue
+        logging_config = item.get("logging") or {}
+        group = (logging_config.get("cloudWatch") or {}).get("logGroup")
+        if "disabled" in logging_config:
+            problems.append(
+                f"{label}, has logging disabled; {MICROVM_RUN_LOGGING_OVERRIDE}"
+            )
+        elif not group:
+            problems.append(
+                f"{label}, names no CloudWatch Logs log group in its logging "
+                f"configuration; {MICROVM_RUN_LOGGING_OVERRIDE}"
+            )
+        else:
+            logged.append(f"{image_arn.rsplit(':', 1)[-1]} version {version}: {group}")
+    return problems, logged, unread
+
+
 def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
     """
     Runtime Monitoring does not cover Lambda MicroVMs, so their tier is VPC Flow
-    Logs on every egress connector subnet plus CloudTrail data events on the
-    AWS::Lambda::MicrovmImage resource type.
+    Logs on every egress connector subnet, the image version's application
+    logging to CloudWatch Logs, and CloudTrail data events on the
+    AWS::Lambda::MicrovmImage resource type. A MicroVM with no egress
+    connector has no network telemetry, so it fails.
     """
     microvms, connectors, unread = _microvm_networks(region)
     if not microvms and not unread:
@@ -19435,6 +19541,17 @@ def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
                     f"egress subnet {subnet} of MicroVM(s) {users} has no ACTIVE "
                     f"flow log recording ALL traffic on it or on {subnet_vpc[subnet]}"
                 )
+    if no_egress:
+        problems.append(
+            f"MicroVM(s) {', '.join(no_egress)} have no egress network connector, "
+            "so they leave on the default internet egress, where no VPC Flow Log "
+            "records their network calls"
+        )
+    logging_problems, logged_groups, logging_unread = _microvm_image_logging(
+        region, microvms
+    )
+    problems.extend(logging_problems)
+    unread.extend(logging_unread)
     events = _microvm_data_event_coverage(region)
     unread.extend(events["unread"])
     if not events["credited"] and not events["unread"]:
@@ -19445,12 +19562,6 @@ def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
             "field but eventCategory and resources.type"
             + (f" ({'; '.join(events['gaps'][:5])})" if events["gaps"] else "")
         )
-    no_egress_note = (
-        f" MicroVM(s) {', '.join(no_egress)} have no egress network connector, so "
-        "no VPC Flow Log is expected for them."
-        if no_egress
-        else ""
-    )
     rows = []
     for problem in problems:
         rows.append(
@@ -19459,15 +19570,17 @@ def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
                 finding_name=MICROVM_RUNTIME_TIER_FINDING,
                 finding_details=(
                     f"Lambda MicroVM runtime tier: {problem}. Runtime Monitoring "
-                    "does not cover MicroVMs, so flow logs and data events are "
-                    "their detection tier."
+                    "does not cover MicroVMs, so flow logs, application logs and "
+                    "data events are their detection tier."
                 ),
                 resolution=(
-                    "Create an ACTIVE VPC Flow Log with TrafficType ALL on each "
-                    "egress connector subnet or its VPC, and add an advanced event "
-                    "selector with eventCategory Equals Data and resources.type "
-                    f"Equals {MICROVM_DATA_EVENT_TYPE}, and no other field, to a "
-                    "logging trail or event data store."
+                    "Run each MicroVM with a VPC egress network connector and "
+                    "create an ACTIVE VPC Flow Log with TrafficType ALL on each "
+                    "egress connector subnet or its VPC, set each MicroVM image "
+                    "version's logging to a CloudWatch Logs log group, and add an "
+                    "advanced event selector with eventCategory Equals Data and "
+                    f"resources.type Equals {MICROVM_DATA_EVENT_TYPE}, and no "
+                    "other field, to a logging trail or event data store."
                 ),
                 reference=MICROVM_RUNTIME_TIER_REFERENCE,
                 severity="Medium",
@@ -19481,7 +19594,7 @@ def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
                 "SM-38",
                 MICROVM_RUNTIME_TIER_FINDING,
                 unread,
-                f"{len(microvms)} running MicroVM(s) were read.{no_egress_note}",
+                f"{len(microvms)} running MicroVM(s) were read.",
                 MICROVM_RUNTIME_TIER_REFERENCE,
                 region,
             )
@@ -19492,11 +19605,19 @@ def _microvm_runtime_tier_findings(region: str) -> List[Dict[str, Any]]:
                 check_id="SM-38",
                 finding_name=MICROVM_RUNTIME_TIER_FINDING,
                 finding_details=(
-                    f"All {len(subnet_users)} egress connector subnet(s) of the "
-                    f"{len(microvms)} MicroVM(s) that have not ended have an ACTIVE "
-                    "flow log recording ALL traffic on the subnet or its VPC, and "
-                    f"{', '.join(events['credited'])} record(s) every "
-                    f"{MICROVM_DATA_EVENT_TYPE} data event.{no_egress_note}"
+                    f"Each of the {len(microvms)} MicroVM(s) that have not ended "
+                    "has an egress network connector, and all "
+                    f"{len(subnet_users)} egress connector subnet(s) have an "
+                    "ACTIVE flow log recording ALL traffic on the subnet or its "
+                    "VPC. The image version each runs sends its logs to CloudWatch "
+                    f"Logs ({'; '.join(logged_groups[:5])}"
+                    + (
+                        f"; and {len(logged_groups) - 5} more"
+                        if len(logged_groups) > 5
+                        else ""
+                    )
+                    + f"), and {', '.join(events['credited'])} record(s) every "
+                    f"{MICROVM_DATA_EVENT_TYPE} data event. " + MICROVM_RUN_LOGGING_NOTE
                 ),
                 resolution="No action required",
                 reference=MICROVM_RUNTIME_TIER_REFERENCE,
@@ -20183,6 +20304,8 @@ def _microvm_networks(
                 "image": str(
                     detail.get("imageArn") or item.get("imageArn") or ""
                 ).rsplit(":", 1)[-1],
+                "image_arn": str(detail.get("imageArn") or item.get("imageArn") or ""),
+                "image_version": str(detail.get("imageVersion") or ""),
                 "state": detail.get("state") or item.get("state"),
                 "ingress": [
                     str(c) for c in detail.get("ingressNetworkConnectors") or []
@@ -21077,6 +21200,137 @@ def _sagemaker_egress_workloads(
                 f"{detail.get('AppNetworkAccessType') or 'not returned'}, so its "
                 "apps' traffic " + outside
             )
+    # A HyperPod instance group runs in its OverrideVpcConfig subnets, or else
+    # in the cluster's VpcConfig. With neither, HyperPod places the cluster in
+    # a subnet of the SageMaker platform VPC (sagemaker-hyperpod-prerequisites
+    # .html, "Default behavior").
+    try:
+        clusters = [
+            cluster["ClusterName"]
+            for cluster in _paged(client, "list_clusters", "ClusterSummaries")
+            if cluster.get("ClusterName")
+        ]
+    except Exception as error:
+        clusters = []
+        unread.append(f"sagemaker:ListClusters ({get_assessment_error_label(error)})")
+    for cluster_name in clusters:
+        label = f"SageMaker HyperPod cluster '{cluster_name}'"
+        try:
+            detail = client.describe_cluster(ClusterName=cluster_name)
+        except Exception as error:
+            unread.append(f"{label} ({get_assessment_error_label(error)})")
+            continue
+        cluster_subnets = (detail.get("VpcConfig") or {}).get("Subnets") or []
+        groups = [
+            *(detail.get("InstanceGroups") or []),
+            *(detail.get("RestrictedInstanceGroups") or []),
+        ]
+        inherit = not groups
+        for group in groups:
+            override = (group.get("OverrideVpcConfig") or {}).get("Subnets") or []
+            if not override:
+                inherit = True
+                continue
+            group_label = (
+                f"instance group '{group.get('InstanceGroupName')}' of {label}"
+            )
+            references.extend((group_label, subnet) for subnet in override)
+        if not inherit:
+            continue
+        references.extend((label, subnet) for subnet in cluster_subnets)
+        if not cluster_subnets:
+            open_paths.append(
+                f"{label} has no VpcConfig, so HyperPod runs its instance groups "
+                "without an OverrideVpcConfig in a subnet of the SageMaker "
+                "platform VPC, where no DNS Firewall rule group or Network "
+                "Firewall route of this account applies to their egress."
+            )
+    return references, open_paths, unread
+
+
+# Bedrock jobs that are running or queued to run, so their vpcConfig is the
+# network their egress will use. Every other status has ended.
+BEDROCK_CUSTOMIZATION_ACTIVE_STATUSES = ("InProgress", "Stopping")
+BEDROCK_INVOCATION_ACTIVE_STATUSES = (
+    "Submitted",
+    "Validating",
+    "Scheduled",
+    "InProgress",
+    "Stopping",
+)
+
+
+def _bedrock_job_egress_workloads(
+    region: str,
+) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+    """
+    (workload label, subnet id) for each active Bedrock model customization
+    and batch inference job with a vpcConfig, the jobs without one, and the
+    unread lists. A batch inference job summary carries its vpcConfig, so only
+    a customization job is read with GetModelCustomizationJob.
+    """
+    references: List[Tuple[str, str]] = []
+    open_paths: List[str] = []
+    unread: List[str] = []
+    outside = (
+        "has no vpcConfig, so Bedrock reaches its S3 data over the service's own "
+        "network, where no DNS Firewall rule group or Network Firewall route of "
+        "this account applies."
+    )
+    client = boto3.client("bedrock", config=boto3_config, region_name=region)
+    for status in BEDROCK_CUSTOMIZATION_ACTIVE_STATUSES:
+        try:
+            summaries = _paged(
+                client,
+                "list_model_customization_jobs",
+                "modelCustomizationJobSummaries",
+                statusEquals=status,
+            )
+        except Exception as error:
+            unread.append(
+                f"{status} Bedrock model customization jobs "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for summary in summaries:
+            name = summary.get("jobName") or summary.get("jobArn")
+            if not name:
+                continue
+            label = f"Bedrock model customization job '{name}'"
+            try:
+                detail = client.get_model_customization_job(
+                    jobIdentifier=summary.get("jobArn") or name
+                )
+            except Exception as error:
+                unread.append(f"{label} ({get_assessment_error_label(error)})")
+                continue
+            subnets = (detail.get("vpcConfig") or {}).get("subnetIds") or []
+            references.extend((label, subnet) for subnet in subnets)
+            if not subnets:
+                open_paths.append(f"{label} {outside}")
+    for status in BEDROCK_INVOCATION_ACTIVE_STATUSES:
+        try:
+            summaries = _paged(
+                client,
+                "list_model_invocation_jobs",
+                "invocationJobSummaries",
+                statusEquals=status,
+            )
+        except Exception as error:
+            unread.append(
+                f"{status} Bedrock batch inference jobs "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for summary in summaries:
+            name = summary.get("jobName") or summary.get("jobArn")
+            if not name:
+                continue
+            label = f"Bedrock batch inference job '{name}'"
+            subnets = (summary.get("vpcConfig") or {}).get("subnetIds") or []
+            references.extend((label, subnet) for subnet in subnets)
+            if not subnets:
+                open_paths.append(f"{label} {outside}")
     return references, open_paths, unread
 
 
@@ -22723,8 +22977,9 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
     """
     SM-39 (AIR-SLF-RT-02): judge DNS Firewall and Network Firewall egress for
     every VPC an ECS awsvpc service, a VPC-attached Lambda function, an EKS
-    cluster, an EC2 instance, or a SageMaker endpoint, running training or
-    processing job, notebook instance or Studio domain runs in.
+    cluster, an EC2 instance, a SageMaker endpoint, running training or
+    processing job, HyperPod cluster, notebook instance or Studio domain, or an
+    active Bedrock model customization or batch inference job runs in.
 
     One DNS row and one Network Firewall row per VPC. An unread workload list
     or subnet description is reported N/A by name, never Passed. A Lambda
@@ -22757,6 +23012,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
         )
         references.extend(sagemaker_references)
         unread.extend(sagemaker_unread)
+        bedrock_references, open_bedrock, bedrock_unread = (
+            _bedrock_job_egress_workloads(region)
+        )
+        references.extend(bedrock_references)
+        unread.extend(bedrock_unread)
         named, named_unread = _ai_lambda_references(region)
         unread.extend(named_unread)
         # A MicroVM egresses through its VPC egress connector's subnets. AWS
@@ -22836,14 +23096,29 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 "SM-39",
                 name,
                 open_sagemaker,
-                "Place each SageMaker endpoint, job, notebook instance and Studio "
-                "domain in private VPC subnets (VpcOnly for a domain, "
-                "DirectInternetAccess Disabled for a notebook) whose DNS Firewall "
-                "and Network Firewall filter its egress.",
+                "Place each SageMaker endpoint, job, HyperPod cluster, notebook "
+                "instance and Studio domain in private VPC subnets (VpcOnly for "
+                "a domain, DirectInternetAccess Disabled for a notebook, a "
+                "VpcConfig for a HyperPod cluster) whose DNS Firewall and "
+                "Network Firewall filter its egress.",
                 reference,
                 "Medium",
                 region,
-                "SageMaker workloads with an internet path outside the VPC",
+                "SageMaker workloads with an egress path outside the customer VPC",
+            )
+        )
+        findings["csv_data"].extend(
+            _capped_problem_rows(
+                "SM-39",
+                name,
+                open_bedrock,
+                "Create each Bedrock model customization and batch inference job "
+                "with a vpcConfig on private VPC subnets whose DNS Firewall and "
+                "Network Firewall filter its egress.",
+                reference,
+                "Medium",
+                region,
+                "Bedrock jobs without a vpcConfig",
             )
         )
         if name == WORKLOAD_FIREWALL_EGRESS_FINDING:
@@ -22886,7 +23161,12 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                 )
             )
     if not firewall_references:
-        if not unread and not open_functions and not open_sagemaker:
+        if (
+            not unread
+            and not open_functions
+            and not open_sagemaker
+            and not open_bedrock
+        ):
             for name, reference in legs:
                 if open_microvms and name == WORKLOAD_FIREWALL_EGRESS_FINDING:
                     continue
@@ -22895,10 +23175,11 @@ def check_workload_egress_control(region: str = "") -> Dict[str, Any]:
                         name,
                         "No ECS awsvpc service or task, VPC-attached Lambda "
                         "function, EKS cluster or Fargate profile, EC2 instance, "
-                        "SageMaker endpoint, running job, notebook instance or "
-                        "Studio domain, or Lambda MicroVM egress connector in this "
-                        "Region runs in a VPC, so no workload VPC's egress was "
-                        "judged.",
+                        "SageMaker endpoint, running job, HyperPod cluster, "
+                        "notebook instance or Studio domain, active Bedrock model "
+                        "customization or batch inference job, or Lambda MicroVM "
+                        "egress connector in this Region runs in a VPC, so no "
+                        "workload VPC's egress was judged.",
                         "No action required",
                         reference,
                     )
