@@ -378,6 +378,11 @@ section.
     `BLOCK` on `*.example.com` refuses each subdomain and not `example.com`.
     Before, only an identical entry was withdrawn, so a subdomain the BLOCK
     refuses was counted as allowed and a firewall missing it failed the row.
+  - `AC-49`'s sync row subtracts from an allowed wildcard the part an earlier
+    DNS Firewall `BLOCK` refuses. After `BLOCK a.example.com`, an allowed
+    `*.example.com` was counted whole, so a firewall target admitting
+    `a.example.com` read as in sync, a false `Passed`. A refused part that an
+    `ALLOW` ahead of the `BLOCK` answers still counts as answered.
 
 - Preserve default-enabled artifact completeness checks when an older CodeBuild
   project has not yet received service-selection environment variables.

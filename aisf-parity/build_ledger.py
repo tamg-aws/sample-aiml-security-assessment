@@ -2114,7 +2114,8 @@ FOUNDATION_ROWS = [
         'Firewall ".example.com" as example.com and its subdomains and a DNS '
         'Firewall "*.example.com" as the subdomains only, and fails a name one '
         "list admits and the other does not, after withdrawing each name an "
-        "earlier BLOCK covers under that matching; a DNS Firewall that is not an "
+        "earlier BLOCK covers under that matching and subtracting the part of an "
+        "allowed wildcard an earlier BLOCK refuses; a DNS Firewall that is not an "
         "allow-list, one allowing an AWS managed list, or an unread list is N/A. "
         "AC-49 asserts an egress allow-list by destination name on each VPC that "
         "hosts an AgentCore runtime, at any version ListAgentRuntimeVersions "

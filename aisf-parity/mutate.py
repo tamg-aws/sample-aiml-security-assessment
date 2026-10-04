@@ -3896,15 +3896,15 @@ MUTATIONS = [
         "name": "AC-49 sync: an earlier BLOCK does not withdraw a name",
         "file": AGENTCORE,
         "defect": "a name an earlier DNS Firewall BLOCK refuses counted as allowed",
-        "find": "                    if not _domain_patterns_cover(\n",
-        "replace": "                    if True or not _domain_patterns_cover(\n",
+        "find": "                    if domain in allowed or _domain_patterns_cover(\n",
+        "replace": "                    if domain in allowed or False and _domain_patterns_cover(\n",
     },
     {
         "name": "AC-49 sync: a DNS Firewall answering every name is compared",
         "file": AGENTCORE,
         "defect": 'a DNS Firewall whose ALERT over "*" answers every name was compared as an allow-list',
-        "find": '                if action == "BLOCK":\n                    return list(dict.fromkeys(allowed)), "", None\n',
-        "replace": '                if True:\n                    return list(dict.fromkeys(allowed)), "", None\n',
+        "find": '                if action == "BLOCK":\n                    return allowed, "", None\n',
+        "replace": '                if True:\n                    return allowed, "", None\n',
     },
     {
         "name": "AC-49 sync: an allowed AWS managed list is skipped",
@@ -4050,6 +4050,41 @@ MUTATIONS = [
         "replace": (
             "                blocked.extend((domain, True, False) for domain in domains)\n"
         ),
+    },
+    {
+        "name": "AC-49 sync: an allowed wildcard is compared whole",
+        "file": AGENTCORE,
+        "defect": (
+            "an allowed *.example.com counted every subdomain as answered, so a "
+            "firewall target a.example.com that an earlier BLOCK refuses read as "
+            "in sync"
+        ),
+        "find": "                if not _dns_allow_list_covers(names, pattern)\n",
+        "replace": "                if not _domain_patterns_cover(dns_patterns, pattern)\n",
+    },
+    {
+        "name": "AC-49 sync: a BLOCK inside an allowed wildcard is not recorded",
+        "file": AGENTCORE,
+        "defect": (
+            "an earlier BLOCK on a name under an allowed wildcard was dropped, so "
+            "the refused name counted as answered"
+        ),
+        "find": (
+            '                        if subdomains and pattern[0].endswith("." + base)\n'
+        ),
+        "replace": "                        if False\n",
+    },
+    {
+        "name": "AC-49 sync: a refused part another ALLOW answers is not rescued",
+        "file": AGENTCORE,
+        "defect": (
+            "a name an earlier ALLOW answers ahead of the BLOCK was read as "
+            "refused, failing an allow-list that is in sync"
+        ),
+        "find": (
+            "                    answered(part) if exact else subdomains_answered(part)\n"
+        ),
+        "replace": "                    False\n",
     },
     # ------------------------------------- end of the AgentCore verdict legs
     {
@@ -5306,6 +5341,9 @@ GROUPS: dict[str, str] = {
     "AC-34 image: a digest already read is downloaded again": "in the AgentCore verdict legs",
     "AC-34 image: a digest that failed is downloaded again": "in the AgentCore verdict legs",
     "AC-49 sync: a wildcard BLOCK is matched literally": "in the AgentCore verdict legs",
+    "AC-49 sync: an allowed wildcard is compared whole": "in the AgentCore verdict legs",
+    "AC-49 sync: a BLOCK inside an allowed wildcard is not recorded": "in the AgentCore verdict legs",
+    "AC-49 sync: a refused part another ALLOW answers is not rescued": "in the AgentCore verdict legs",
 }
 
 
