@@ -10647,10 +10647,45 @@ class TestAC22OwnOrganization:
 # ===================================================================
 # AC-23: check_agentcore_memory_record_access_scope
 # ===================================================================
+def _session_tag_trust_client(*tag_keys):
+    """An IAM client whose every role trust policy requires the named session
+    tags, so ${aws:PrincipalTag/<key>} resolves per session (AC-23)."""
+    client = MagicMock()
+    client.get_role.return_value = {
+        "Role": {
+            "AssumeRolePolicyDocument": {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Federated": "arn:aws:iam::123456789012:saml-provider/idp"
+                        },
+                        "Action": ["sts:AssumeRoleWithSAML", "sts:TagSession"],
+                        "Condition": {
+                            "Null": {
+                                f"aws:RequestTag/{key}": "false" for key in tag_keys
+                            }
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    return client
+
+
 class TestAC23MemoryRecordAccessScope:
     """AC-23: Who can read memory records across every actor."""
 
     _MEMORY_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-1"
+
+    @pytest.fixture(autouse=True)
+    def _trust_requires_session_tags(self):
+        with patch(
+            "agentcore_app.iam_client",
+            _session_tag_trust_client("actorId", "tenantId"),
+        ):
+            yield
 
     @staticmethod
     def _cache(
@@ -21323,6 +21358,267 @@ class TestAC34RuntimeImages:
 
         assert len(rows) == 1
         assert "(rt-a)" in rows[0]["Finding_Details"]
+
+
+class TestAC34UnreadServedVersionHoldsArtifactRows:
+    """AIR-ACR-ID-05: a served version whose definition was not read may run
+    another image or archive, so the runtime's code and image rows never say
+    'runs code X' or 'runs image(s) X' as if X were all it runs."""
+
+    _URI = f"{TestAC34RuntimeImages._ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/agents/rt"
+
+    @staticmethod
+    def _code(key, version):
+        return {
+            "agentRuntimeVersion": version,
+            "agentRuntimeArtifact": {
+                "codeConfiguration": {
+                    "code": {"s3": {"bucket": "code-bucket", "prefix": key}}
+                }
+            },
+        }
+
+    def _run_code(self, endpoints_by_runtime, deny_version=None):
+        mock_ac = MagicMock()
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": rid, "agentRuntimeName": rid}
+                for rid in ("rt-a", "rt-b")
+            ]
+        }
+
+        def get_agent_runtime(agentRuntimeId, agentRuntimeVersion=None):
+            if agentRuntimeVersion is not None and agentRuntimeVersion == deny_version:
+                raise _make_client_error("AccessDeniedException", "denied")
+            return self._code(f"{agentRuntimeId}.zip", agentRuntimeVersion or "3")
+
+        def list_endpoints(agentRuntimeId, **_):
+            endpoints = endpoints_by_runtime[agentRuntimeId]
+            if isinstance(endpoints, Exception):
+                raise endpoints
+            return {"runtimeEndpoints": endpoints}
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+        mock_ac.list_agent_runtime_endpoints.side_effect = list_endpoints
+        clean = TestAC34RuntimeCode._zip({"main.py": "print('ok')\n"})
+        s3 = _s3_objects_client(
+            {"code-bucket/rt-a.zip": clean, "code-bucket/rt-b.zip": clean}
+        )
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.s3_client", s3),
+        ):
+            findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+        return [f for f in findings if f["Finding"] == agentcore_app.AC34_CODE_FINDING]
+
+    def test_an_unlisted_endpoint_set_holds_only_that_runtimes_code_row(self):
+        rows = self._run_code(
+            {
+                "rt-a": _make_client_error("AccessDeniedException", "denied"),
+                "rt-b": [{"name": "DEFAULT", "liveVersion": "3"}],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert "Runtime 'rt-a' (rt-a)" in rows[0]["Finding_Details"]
+        assert "runs code" not in rows[0]["Finding_Details"]
+        assert (
+            "ListAgentRuntimeEndpoints AccessDeniedException"
+            in (rows[0]["Finding_Details"])
+        )
+        assert (
+            "Scanned with none found: s3://code-bucket/rt-a.zip"
+            in (rows[0]["Finding_Details"])
+        )
+        assert "rt-b" in rows[1]["Finding_Details"]
+        assert "runs code" in rows[1]["Finding_Details"]
+
+    def test_an_unread_served_version_holds_the_code_row_and_names_it(self):
+        rows = self._run_code(
+            {
+                "rt-a": [{"name": "prod", "liveVersion": "1"}],
+                "rt-b": [{"name": "prod", "liveVersion": "2"}],
+            },
+            deny_version="1",
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "version 1, served by endpoint(s) prod, whose definition" in details
+        assert "GetAgentRuntime AccessDeniedException" in details
+        assert "runs code" not in details
+        # rt-b's served version 2 was read, so its archive was scanned too.
+        assert "version 1" not in rows[1]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_served_version_holds_the_image_row_and_names_it(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        images = TestAC34RuntimeImages()
+        images._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:clean", "rt-b": f"{self._URI}:clean"},
+            {"cfg-clean": images._config(env=["LOG_LEVEL=INFO"])},
+        )
+
+        def get_agent_runtime(agentRuntimeId, agentRuntimeVersion=None):
+            if agentRuntimeId == "rt-a" and agentRuntimeVersion == "1":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return images._detail(
+                agentRuntimeId, f"{self._URI}:clean", agentRuntimeVersion or "3"
+            )
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+        mock_ac.list_agent_runtime_endpoints.return_value = {
+            "runtimeEndpoints": [{"name": "prod", "liveVersion": "1"}]
+        }
+
+        rows = images._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert "runs image(s)" not in rows[0]["Finding_Details"]
+        assert "version 1, served by endpoint(s) prod" in rows[0]["Finding_Details"]
+        assert "GetAgentRuntime" in rows[0]["Resolution"]
+        assert "runs image(s)" in rows[1]["Finding_Details"]
+
+    def test_a_credential_beside_an_unread_version_still_fails(self):
+        mock_ac = MagicMock()
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-a", "agentRuntimeName": "rt-a"}]
+        }
+        mock_ac.get_agent_runtime.return_value = self._code("rt-a.zip", "3")
+        mock_ac.list_agent_runtime_endpoints.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        s3 = _s3_objects_client(
+            {
+                "code-bucket/rt-a.zip": TestAC34RuntimeCode._zip(
+                    {"cfg.py": f"K = '{_FAKE_ACCESS_KEY_ID}'"}
+                )
+            }
+        )
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.s3_client", s3),
+        ):
+            findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+        rows = [f for f in findings if f["Finding"] == agentcore_app.AC34_CODE_FINDING]
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "Not read: the versions its endpoints serve" in (rows[0]["Finding_Details"])
+        )
+
+
+class TestAC34GatewayTargetS3Schemas:
+    """AIR-ACR-ID-05: a gateway tool schema held in S3 is scanned like an
+    inline one, through _s3_schema_text."""
+
+    @staticmethod
+    def _target(kind, uri):
+        locations = {
+            "openApiSchema": {"mcp": {"openApiSchema": {"s3": {"uri": uri}}}},
+            "smithyModel": {"mcp": {"smithyModel": {"s3": {"uri": uri}}}},
+            "lambda": {
+                "mcp": {
+                    "lambda": {
+                        "lambdaArn": "arn:aws:lambda:us-east-1:123456789012:function:f",
+                        "toolSchema": {"s3": {"uri": uri}},
+                    }
+                }
+            },
+            "mcpServer": {
+                "mcp": {
+                    "mcpServer": {
+                        "endpoint": "https://mcp.example",
+                        "mcpToolSchema": {"s3": {"uri": uri}},
+                    }
+                }
+            },
+            "agentcoreRuntime": {
+                "http": {
+                    "agentcoreRuntime": {"schema": {"source": {"s3": {"uri": uri}}}}
+                }
+            },
+        }
+        return {"targetConfiguration": locations[kind]}
+
+    def _run(self, details, objects):
+        mock_ac = MagicMock()
+        _ac34_gateways(mock_ac, {"gw-1": sorted(details)}, details)
+        s3 = _s3_objects_client(objects)
+        with (
+            patch("agentcore_app.agentcore_client", mock_ac),
+            patch("agentcore_app.s3_client", s3),
+        ):
+            findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+        return findings, s3
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["openApiSchema", "smithyModel", "lambda", "mcpServer", "agentcoreRuntime"],
+    )
+    def test_a_credential_in_an_s3_schema_fails_and_the_clean_one_passes(self, kind):
+        findings, s3 = self._run(
+            {
+                "tg-a": self._target(kind, "s3://schemas/clean.json"),
+                "tg-b": self._target(kind, "s3://schemas/leak.json"),
+            },
+            {
+                "schemas/clean.json": b'{"openapi": "3.0.0"}',
+                "schemas/leak.json": f'{{"auth": "{_ACCESS_KEY_ID}"}}'.encode(),
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "tg-a" in findings[0]["Finding_Details"]
+        assert "schemas held in S3" in findings[0]["Finding_Details"]
+        assert "tg-b" in findings[1]["Finding_Details"]
+        assert ".s3" in findings[1]["Finding_Details"]
+        assert "the S3 schema at targetConfiguration." in findings[1]["Finding_Details"]
+        assert _ACCESS_KEY_ID not in json.dumps(findings)
+        assert sorted(c.kwargs["Key"] for c in s3.get_object.call_args_list) == [
+            "clean.json",
+            "leak.json",
+        ]
+        assert not [c for c in s3.method_calls if c[0].startswith("list")]
+
+    def test_an_unread_s3_schema_is_na_and_named(self):
+        findings, _ = self._run(
+            {
+                "tg-a": self._target("openApiSchema", "s3://schemas/clean.json"),
+                "tg-b": self._target("openApiSchema", "s3://schemas/denied.json"),
+            },
+            {"schemas/clean.json": b'{"openapi": "3.0.0"}'},
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        details = findings[1]["Finding_Details"]
+        assert "tg-b" in details
+        assert "not judged" in details
+        assert (
+            "its schema at targetConfiguration.mcp.openApiSchema.s3 in S3 was not "
+            "read (AccessDenied)"
+        ) in details
+        assert "s3:GetObject" in findings[1]["Resolution"]
+
+    def test_an_oversized_s3_schema_is_na_never_passed(self):
+        big = b" " * (agentcore_app.AC35_SCHEMA_MAX_BYTES + 1)
+        findings, _ = self._run(
+            {"tg-a": self._target("lambda", "s3://schemas/big.json")},
+            {"schemas/big.json": big},
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_a_credential_beside_an_unread_schema_still_fails(self):
+        detail = self._target("openApiSchema", "s3://schemas/denied.json")
+        detail["targetConfiguration"]["mcp"]["smithyModel"] = {
+            "inlinePayload": f'{{"auth": "{_ACCESS_KEY_ID}"}}'
+        }
+        findings, _ = self._run({"tg-a": detail}, {})
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Not read: its schema at" in findings[0]["Finding_Details"]
 
 
 class TestAC34CheckRegistration:
@@ -41405,6 +41701,11 @@ class TestAC21PrefixWideUnmask:
 class TestAC23WholePopulation:
     """AC-23 judges each read by the partition key that action carries."""
 
+    @pytest.fixture(autouse=True)
+    def _trust_requires_session_tags(self):
+        with patch("agentcore_app.iam_client", _session_tag_trust_client("actorId")):
+            yield
+
     _RETRIEVE = "bedrock-agentcore:RetrieveMemoryRecords"
     _BOUND = {
         "StringLike": {
@@ -41652,6 +41953,205 @@ class TestAC23WholePopulation:
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC23SessionVariables:
+    """AIR-ACR-MEM-01: a partition variable is per caller only when it resolves
+    per session for the principal, not because the value holds `${`."""
+
+    _RETRIEVE = "bedrock-agentcore:RetrieveMemoryRecords"
+
+    @staticmethod
+    def _trust(*statements):
+        client = MagicMock()
+        client.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": {"Statement": list(statements)}}
+        }
+        return client
+
+    @staticmethod
+    def _assume(condition=None, action="sts:AssumeRole"):
+        statement = {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+            "Action": [action, "sts:TagSession"],
+        }
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    @classmethod
+    def _cache(cls, namespace, kind="role", name="reader"):
+        permissions = {
+            "attached_policies": [
+                {
+                    "name": "p",
+                    "document": {
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": cls._RETRIEVE,
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringLike": {
+                                        "bedrock-agentcore:namespace": namespace
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+            "inline_policies": [],
+        }
+        return {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": {name: permissions} if kind == "role" else {},
+            "user_permissions": {name: permissions} if kind == "user" else {},
+        }
+
+    def _run(self, cache, iam=None):
+        with patch("agentcore_app.iam_client", iam or self._trust(self._assume())):
+            return agentcore_app.check_agentcore_memory_record_access_scope(cache)
+
+    @pytest.mark.parametrize(
+        "variable",
+        [
+            "${aws:PrincipalArn}",
+            "${aws:PrincipalAccount}",
+            "${aws:username}",
+            "${aws:PrincipalOrgID}",
+            "${aws:SourceIdentity}",
+        ],
+    )
+    def test_a_variable_shared_by_every_session_of_a_role_is_na(self, variable):
+        findings = self._run(self._cache(f"/actors/{variable}/*"))
+        assert [f["Status"] for f in findings] == ["N/A"]
+        details = findings[0]["Finding_Details"]
+        assert f"role reader ({variable}, which every caller of the role shares)" in (
+            details
+        )
+        assert "resolves per caller" not in details
+
+    def test_userid_resolves_per_session_on_a_role_but_not_on_a_user(self):
+        role = self._run(self._cache("/actors/${aws:userid}/*"))
+        user = self._run(self._cache("/actors/${aws:userid}/*", kind="user"))
+        assert [f["Status"] for f in role] == ["Passed"]
+        assert "role reader (${aws:userid})" in role[0]["Finding_Details"]
+        assert [f["Status"] for f in user] == ["N/A"]
+        assert (
+            "user reader (${aws:userid}, which every caller of the user shares)"
+            in user[0]["Finding_Details"]
+        )
+
+    def test_every_variable_of_a_value_must_resolve_per_session(self):
+        findings = self._run(
+            self._cache("/actors/${aws:userid}/${aws:PrincipalAccount}/*")
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "${aws:PrincipalAccount}, which every caller"
+            in (findings[0]["Finding_Details"])
+        )
+
+    def test_a_literal_character_variable_is_a_literal(self):
+        # ${*} is a literal asterisk, so the value names one fixed partition.
+        findings = self._run(self._cache("/actors/a-1/${*}"))
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "role reader (a fixed literal)" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("statements", "status"),
+        [
+            ([{"Null": {"aws:RequestTag/actorId": "false"}}], "Passed"),
+            ([{"StringLike": {"aws:RequestTag/actorId": "*"}}], "Passed"),
+            ([{"StringEquals": {"aws:RequestTag/actorId": "${saml:sub}"}}], "Passed"),
+            ([None], "N/A"),
+            ([{"StringEquals": {"aws:RequestTag/actorId": "alice"}}], "N/A"),
+            ([{"StringLikeIfExists": {"aws:RequestTag/actorId": "*"}}], "N/A"),
+            ([{"ForAllValues:StringLike": {"aws:RequestTag/actorId": "*"}}], "N/A"),
+            ([{"Null": {"aws:RequestTag/actorId": "true"}}], "N/A"),
+            ([{"Null": {"aws:RequestTag/teamId": "false"}}], "N/A"),
+            (
+                [
+                    {"Null": {"aws:RequestTag/actorId": "false"}},
+                    None,
+                ],
+                "N/A",
+            ),
+            (
+                [
+                    {"Null": {"aws:RequestTag/actorId": "false"}},
+                    {"StringLike": {"aws:RequestTag/actorId": "u-*"}},
+                ],
+                "Passed",
+            ),
+        ],
+        ids=[
+            "null-false",
+            "stringlike-wildcard",
+            "stringequals-variable",
+            "no-condition",
+            "literal-value",
+            "if-exists",
+            "for-all-values",
+            "null-true",
+            "another-tag",
+            "second-statement-unconditioned",
+            "both-statements-require",
+        ],
+    )
+    def test_a_principal_tag_is_per_session_only_when_the_trust_requires_it(
+        self, statements, status
+    ):
+        iam = self._trust(*(self._assume(condition) for condition in statements))
+        findings = self._run(
+            self._cache("/actors/${aws:PrincipalTag/actorId}/*"), iam=iam
+        )
+        assert [f["Status"] for f in findings] == [status]
+        if status == "N/A":
+            assert (
+                "${aws:PrincipalTag/actorId}, which every caller of the role shares"
+                in findings[0]["Finding_Details"]
+            )
+        iam.get_role.assert_called_once_with(RoleName="reader")
+
+    def test_a_principal_tag_on_a_user_is_the_users_own_tag(self):
+        findings = self._run(
+            self._cache("/actors/${aws:PrincipalTag/actorId}/*", kind="user"),
+            iam=self._trust(
+                self._assume({"Null": {"aws:RequestTag/actorId": "false"}})
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_an_unread_trust_policy_is_na_and_named(self):
+        iam = MagicMock()
+        iam.get_role.side_effect = _make_client_error("AccessDenied", "no")
+        findings = self._run(
+            self._cache("/actors/${aws:PrincipalTag/actorId}/*"), iam=iam
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        details = findings[0]["Finding_Details"]
+        assert "${aws:PrincipalTag/actorId} (trust policy not read: iam:GetRole" in (
+            details
+        )
+        assert "AccessDenied" in details
+
+    def test_two_roles_are_split_by_their_own_variables(self):
+        cache = self._cache("/actors/${aws:userid}/*", name="per-session")
+        cache["role_permissions"].update(
+            self._cache("/actors/${aws:PrincipalArn}/*", name="shared")[
+                "role_permissions"
+            ]
+        )
+        findings = self._run(cache)
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "role shared (" in findings[0]["Finding_Details"]
+        assert "per-session" not in findings[0]["Finding_Details"]
+        assert "role per-session (${aws:userid})" in findings[1]["Finding_Details"]
+        assert "role shared" not in findings[1]["Finding_Details"]
 
 
 def _principal_with(statements, boundary=None, key="attached_policies"):
@@ -58671,6 +59171,7 @@ class TestAC41EvaluationPersonalData:
         config_desc="scores tone",
         errors=None,
         safety_name="safety",
+        batches=None,
     ):
         errors = errors or {}
         mock_ac = MagicMock()
@@ -58748,6 +59249,8 @@ class TestAC41EvaluationPersonalData:
         mock_data = MagicMock()
         mock_data.list_batch_evaluations.return_value = {
             "batchEvaluations": [{"batchEvaluationId": "b-1"}]
+            if batches is None
+            else batches
         }
         mock_data.get_batch_evaluation.return_value = {
             "batchEvaluationName": "nightly",
@@ -58811,6 +59314,29 @@ class TestAC41EvaluationPersonalData:
             "arn:aws:logs:us-east-1:123456789012:log-group:/aws/bedrock-agentcore/evaluations/batch",
             "arn:aws:logs:us-east-1:123456789012:log-group:/custom/results",
         }
+
+    def test_passed_text_names_the_fields_read_per_kind(self):
+        # A batch evaluation has no tags member, so its count must not sit
+        # under a claim that its tags were read.
+        findings, _, _ = self._run()
+        details = findings[0]["Finding_Details"]
+        assert "No tag or free-form field" not in details
+        assert "the name and description of 1 batch evaluation(s)" in details
+        assert (
+            "the tags, name, description and evaluatorConfig of 2 evaluator(s)"
+            in details
+        )
+        assert "the tags of 2 results log group(s)" in details
+        assert (
+            "Batch evaluation tags are not readable: GetBatchEvaluationResponse "
+            "and BatchEvaluationSummary have no tags member"
+        ) in details
+
+    def test_no_batch_caveat_without_batch_evaluations(self):
+        findings, _, _ = self._run(batches=[])
+        details = findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "batch evaluation" not in details.lower()
 
     @pytest.mark.parametrize(
         "tags, field, kind",

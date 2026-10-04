@@ -16006,7 +16006,7 @@ def _memory_value_widens(value: str) -> bool:
     return all(part in MEMORY_COLLECTION_SEGMENTS for part in named)
 
 
-def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
+def _memory_read_scope(statement: Dict[str, Any], action: str) -> Tuple[str, List[str]]:
     """Return how one Allow statement scopes one memory read action.
 
     The result is "none" when the statement never grants the action, because a
@@ -16014,14 +16014,17 @@ def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
     Otherwise it is "unscoped" unless a partition key for the action sits under
     a binding operator with every value naming something narrower than a
     wildcard. A scoped read is "bound" when every such value carries a policy
-    variable, which resolves per caller, and "fixed" when a value is a literal
-    that every caller of the principal shares. Under StringLike a `*` or `?`
-    ahead of the last policy variable, or in a value with none, matches other
-    actors' partitions (`/users/*` reads every user's), so it is "unscoped".
+    variable other than the literal-character variables `${*}`, `${?}` and
+    `${$}`, and "fixed" when a value is a literal that every caller of the
+    principal shares. A bound read returns its values beside the scope, because
+    whether each variable resolves per session depends on the principal
+    (_memory_shared_variables). Under StringLike a `*` or `?` ahead of the last
+    policy variable, or in a value with none, matches other actors' partitions
+    (`/users/*` reads every user's), so it is "unscoped".
     """
     conditions = statement.get("Condition")
     if not isinstance(conditions, dict):
-        return "unscoped"
+        return "unscoped", []
     partition_values: List[str] = []
     widened = False
     for operator, block in conditions.items():
@@ -16039,27 +16042,181 @@ def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
                 _memory_partition_key(key_name, action)
             )
             if binding and not known:
-                return "none"
+                return "none", []
             if binding and _memory_partition_key(key_name, action):
                 if isinstance(values, str):
                     values = [values]
                 if not isinstance(values, list) or not values:
-                    return "unscoped"
+                    return "unscoped", []
                 partition_values.extend(str(value) for value in values)
                 if operator_name == "stringlike":
                     widened = widened or any(
                         _memory_value_widens(str(value)) for value in values
                     )
     if not partition_values or widened:
-        return "unscoped"
+        return "unscoped", []
     if any(
         set(value.replace("/", "")) <= {"*", "?"} or not value
         for value in partition_values
     ):
-        return "unscoped"
-    if all("${" in value for value in partition_values):
-        return "bound"
-    return "fixed"
+        return "unscoped", []
+    if all(_memory_value_variables(value) for value in partition_values):
+        return "bound", partition_values
+    return "fixed", []
+
+
+# The predefined variables that stand for one literal character
+# (reference_policies_variables.html, "Special characters").
+MEMORY_LITERAL_CHARACTER_VARIABLES = {"*", "?", "$"}
+
+# aws:userid is role-id:caller-specified-role-name on an assumed-role session,
+# so it differs per session. On an IAM user it is the user's unique ID, the
+# same for every call (reference_policies_variables.html, "Principal key
+# values"), and aws:username, aws:PrincipalArn and aws:PrincipalAccount name
+# the principal itself, so every caller of the principal shares them.
+MEMORY_ROLE_SESSION_VARIABLES = {"aws:userid"}
+
+MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX = "aws:principaltag/"
+
+MEMORY_SESSION_VARIABLE_RULE = (
+    "A variable is credited as per session only on a role: ${aws:userid}, and "
+    "${aws:PrincipalTag/<key>} when every trust policy statement granting an "
+    "AssumeRole action requires session tag <key> with a wildcard or variable "
+    "value; any other variable, and any variable on an IAM user, names "
+    "something every caller of the principal shares."
+)
+
+MEMORY_ASSUME_ROLE_ACTIONS = (
+    "sts:AssumeRole",
+    "sts:AssumeRoleWithSAML",
+    "sts:AssumeRoleWithWebIdentity",
+)
+
+
+def _memory_value_variables(value: str) -> List[str]:
+    """Return the policy variables in one partition value, as written.
+
+    A default (`${aws:PrincipalTag/team, 'shared'}`) is dropped from the name,
+    and the literal-character variables stand for no caller.
+    """
+    names = [
+        name.split(",", 1)[0].strip() for name in re.findall(r"\$\{([^}]*)\}", value)
+    ]
+    return [
+        name
+        for name in names
+        if name and name not in MEMORY_LITERAL_CHARACTER_VARIABLES
+    ]
+
+
+def _trust_requires_session_tag(document: Any, tag_key: str) -> bool:
+    """Whether every Allow statement of a trust policy that grants an AssumeRole
+    action requires session tag `tag_key` with a value that differs per session.
+
+    A tag the trust policy does not require falls back to the role's own tag,
+    or is absent, and every session shares either. The requirement is a Null
+    `false` test on aws:RequestTag/<key>, or a StringLike or StringEquals test
+    on it whose every value carries a wildcard (StringLike) or a policy
+    variable: a literal value would hand every session the same tag. The
+    IfExists form and the ForAllValues prefix hold for a request without the
+    key, so neither requires it. A NotAction statement counts as granting.
+    """
+    request_key = f"aws:requesttag/{tag_key.lower()}"
+    granting = [
+        statement
+        for statement in _allow_statements({"document": document})
+        if ("Action" not in statement and "NotAction" in statement)
+        or any(
+            _action_patterns_overlap(pattern, action)
+            for pattern in _statement_actions(statement)
+            for action in MEMORY_ASSUME_ROLE_ACTIONS
+        )
+    ]
+    for statement in granting:
+        conditions = statement.get("Condition")
+        required = False
+        for operator, block in (
+            conditions.items() if isinstance(conditions, dict) else []
+        ):
+            if not isinstance(block, dict) or _operator_admits_an_absent_key(operator):
+                continue
+            name = _normalized_condition_operator(operator)
+            for key, raw in block.items():
+                if str(key).strip().lower() != request_key:
+                    continue
+                values = _condition_values(raw)
+                if not values:
+                    continue
+                if name == "null":
+                    required = required or all(
+                        value.strip().lower() == "false" for value in values
+                    )
+                elif name in CONDITION_EQUALS_OPERATORS:
+                    required = required or all(
+                        bool(_memory_value_variables(value))
+                        or (name == "stringlike" and ("*" in value or "?" in value))
+                        for value in values
+                    )
+        if not required:
+            return False
+    return True
+
+
+def _memory_shared_variables(
+    values: List[str],
+    principal_kind: str,
+    principal_name: str,
+    trust_cache: Dict[str, Any],
+) -> Tuple[List[str], List[str]]:
+    """Return the variables of bound partition values that every caller of the
+    principal shares, and those whose trust policy could not be judged.
+
+    A variable resolves per session only on a role: aws:userid always, and
+    aws:PrincipalTag/<key> when the role's trust policy requires session tag
+    <key> on every statement that grants an AssumeRole action
+    (_trust_requires_session_tag). Every other variable, and every variable on
+    an IAM user, names something every caller of the principal shares.
+    """
+    shared: List[str] = []
+    unread: List[str] = []
+    for variable in sorted(
+        {name for value in values for name in _memory_value_variables(value)}
+    ):
+        name = variable.lower()
+        if principal_kind != "role" or not (
+            name in MEMORY_ROLE_SESSION_VARIABLES
+            or name.startswith(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX)
+        ):
+            shared.append(f"${{{variable}}}")
+            continue
+        if name in MEMORY_ROLE_SESSION_VARIABLES:
+            continue
+        if principal_name not in trust_cache:
+            if iam_client is None:
+                trust_cache[principal_name] = RuntimeError("no IAM client")
+            else:
+                try:
+                    trust_cache[principal_name] = iam_client.get_role(
+                        RoleName=principal_name
+                    )["Role"]["AssumeRolePolicyDocument"]
+                except (BotoCoreError, ClientError) as error:
+                    trust_cache[principal_name] = RuntimeError(
+                        f"iam:GetRole {_assessment_error_label(error)}"
+                    )
+        document = trust_cache[principal_name]
+        if isinstance(document, Exception):
+            unread.append(f"${{{variable}}} (trust policy not read: {document})")
+            continue
+        try:
+            requires = _trust_requires_session_tag(
+                document, variable[len(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX) :]
+            )
+        except (TypeError, ValueError) as error:
+            unread.append(f"${{{variable}}} (trust policy not parsed: {error})")
+            continue
+        if not requires:
+            shared.append(f"${{{variable}}}")
+    return shared, unread
 
 
 def _statement_reached_actions(
@@ -16098,6 +16255,7 @@ def _statement_memory_reads(statement: Dict[str, Any]) -> List[str]:
 def _principals_reading_memory_records(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
+    trust_cache: Dict[str, Any],
 ) -> Tuple[List[str], List[str], List[str], List[str]]:
     """Split principals reading memory records by how the read is partitioned.
 
@@ -16108,7 +16266,9 @@ def _principals_reading_memory_records(
     reaching a read counts, a bare `Action: "*"` included, and a read counts
     only if it survives the principal's own unconditioned Deny statements and
     permissions boundary. The lists are unscoped, fixed-value, caller-bound and
-    unreadable principals.
+    unreadable principals. A bound read whose variable every caller shares, or
+    whose role trust policy could not be judged, is fixed-value, and the label
+    names the variable; a caller-bound label names its variables.
     """
     unscoped: List[str] = []
     fixed: List[str] = []
@@ -16120,6 +16280,7 @@ def _principals_reading_memory_records(
             continue
         label = f"{principal_kind} {principal_name}"
         scopes: set = set()
+        bound_values: List[str] = []
 
         for policy in _principal_policies(permissions):
             try:
@@ -16132,14 +16293,30 @@ def _principals_reading_memory_records(
                 for read in _statement_memory_reads(statement):
                     if not _grant_survives(permissions, f"bedrock-agentcore:{read}"):
                         continue
-                    scopes.add(_memory_read_scope(statement, read))
+                    scope, values = _memory_read_scope(statement, read)
+                    scopes.add(scope)
+                    bound_values.extend(values)
 
+        shared, trust_unread = _memory_shared_variables(
+            bound_values, principal_kind, principal_name, trust_cache
+        )
         if "unscoped" in scopes:
             unscoped.append(label)
-        elif "fixed" in scopes:
-            fixed.append(label)
+        elif "fixed" in scopes or shared or trust_unread:
+            notes = (["a fixed literal"] if "fixed" in scopes else []) + [
+                f"{variable}, which every caller of the {principal_kind} shares"
+                for variable in shared
+            ]
+            fixed.append(f"{label} ({'; '.join(notes + trust_unread)})")
         elif "bound" in scopes:
-            bound.append(label)
+            variables = sorted(
+                {
+                    f"${{{name}}}"
+                    for value in bound_values
+                    for name in _memory_value_variables(value)
+                }
+            )
+            bound.append(f"{label} ({', '.join(variables)})")
 
     return unscoped, fixed, bound, unreadable
 
@@ -16185,11 +16362,14 @@ def check_agentcore_memory_record_access_scope(
         fixed: List[str] = []
         bound: List[str] = []
         unreadable: List[str] = []
+        trust_cache: Dict[str, Any] = {}
         for kind, permissions_by_name in (
             ("role", role_permissions),
             ("user", user_permissions),
         ):
-            split = _principals_reading_memory_records(permissions_by_name, kind)
+            split = _principals_reading_memory_records(
+                permissions_by_name, kind, trust_cache
+            )
             for target, labels in zip((unscoped, fixed, bound, unreadable), split):
                 target.extend(labels)
         unscoped.sort()
@@ -16256,8 +16436,10 @@ def check_agentcore_memory_record_access_scope(
                     finding_details=(
                         "The following principals read memory records only under a "
                         "partition condition, and at least one value is a fixed "
-                        "literal with no policy variable, so every caller of the "
-                        "principal reads the same partition. The assessment cannot "
+                        "literal with no policy variable, or carries a policy "
+                        "variable that does not resolve per session, so every "
+                        "caller of the principal may read the same partition. "
+                        f"{MEMORY_SESSION_VARIABLE_RULE} The assessment cannot "
                         "tell whether one actor or many use the principal: "
                         f"{', '.join(fixed)}."
                     ),
@@ -16280,9 +16462,10 @@ def check_agentcore_memory_record_access_scope(
                     finding_name="AgentCore Memory Record Access Scope",
                     finding_details=(
                         "The following principals read memory records only under a "
-                        "partition condition whose every value carries a policy "
-                        "variable, so the partition resolves per caller: "
-                        f"{', '.join(bound)}."
+                        "partition condition whose every policy variable resolves "
+                        "per session, so the partition resolves per caller. "
+                        f"{MEMORY_SESSION_VARIABLE_RULE} Principals, with the "
+                        f"variables they are bound by: {', '.join(bound)}."
                     ),
                     resolution=(
                         "No action required. Confirm the variable carries the end "
@@ -24930,18 +25113,40 @@ def _inline_payloads(node: Any, path: str) -> Iterable[Tuple[str, str]]:
             yield from _inline_payloads(value, f"{path}[{index}]")
 
 
+def _s3_schema_locations(node: Any, path: str) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    """Yield the path and S3Configuration of every schema held in S3 under a
+    target configuration.
+
+    Every `s3` member under targetConfiguration is a schema source (OpenAPI,
+    Smithy, Lambda and MCP server tool schemas, and the HTTP runtime schema);
+    the certificate locations sit outside it.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            if key == "s3" and isinstance(value, dict):
+                yield child, value
+            else:
+                yield from _s3_schema_locations(value, child)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _s3_schema_locations(value, f"{path}[{index}]")
+
+
 def _gateway_target_inline_credentials(
     detail: Dict[str, Any],
-) -> Tuple[List[str], int]:
+) -> Tuple[List[str], int, List[str]]:
     """Name each place a gateway target's definition holds a credential inline.
 
     Reads every field GetGatewayTarget models as sensitive: the passthrough
     target's staticQueryParameters, each OAuth provider's customParameters, and
-    each inlinePayload schema. Returns the places found and how many fields were
-    scanned.
+    each inlinePayload schema, plus each schema the target holds in S3, read by
+    its exact key within AC35_SCHEMA_MAX_BYTES. Returns the places found, how
+    many fields were scanned, and each S3 schema that could not be read.
     """
     found: List[str] = []
     scanned = 0
+    unread: List[str] = []
     configuration = detail.get("targetConfiguration") or {}
 
     passthrough = (configuration.get("http") or {}).get("passthrough") or {}
@@ -24973,7 +25178,19 @@ def _gateway_target_inline_credentials(
         if _text_holds_a_credential(text):
             found.append(f"the inline payload at {payload_path}")
 
-    return found, scanned
+    for schema_path, location in _s3_schema_locations(
+        configuration, "targetConfiguration"
+    ):
+        try:
+            text = _s3_schema_text(location)
+        except (BotoCoreError, ClientError, ValueError) as error:
+            unread.append(_s3_schema_unread(f"schema at {schema_path}", error))
+            continue
+        scanned += 1
+        if _text_holds_a_credential(text):
+            found.append(f"the S3 schema at {schema_path}")
+
+    return found, scanned, unread
 
 
 def _harness_inline_credentials(harness: Dict[str, Any]) -> Tuple[List[str], int]:
@@ -25050,6 +25267,7 @@ def _harness_inline_credentials(harness: Dict[str, Any]) -> Tuple[List[str], int
 def _agentcore_runtime_credential_findings(
     images: Optional[Dict[str, Tuple[str, Set[str]]]] = None,
     codes: Optional[Dict[str, Set[Tuple[str, str, str]]]] = None,
+    unread_versions: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """AC-34's runtime leg: one finding per runtime version's environment variables.
 
@@ -25060,10 +25278,13 @@ def _agentcore_runtime_credential_findings(
     AC-30 does for the inbound authorizer. When images is given, the container
     image URI of each version read is recorded in it, keyed by runtime label,
     for the image leg, and codes gets each version's S3 code location for the
-    code leg.
+    code leg. unread_versions gets, keyed by runtime label, each served version
+    whose definition was not read, so those legs never call the image or code
+    they did read the whole of what the runtime runs.
     """
     images = {} if images is None else images
     codes = {} if codes is None else codes
+    unread_versions = {} if unread_versions is None else unread_versions
 
     def record_image(label: str, details: Dict[str, Any]) -> None:
         uri = (
@@ -25201,6 +25422,11 @@ def _agentcore_runtime_credential_findings(
                 agentRuntimeId=runtime_id,
             )
         except (BotoCoreError, ClientError) as error:
+            unread_versions.setdefault(label, []).append(
+                "the versions its endpoints serve, which could not be listed "
+                f"(ListAgentRuntimeEndpoints {_assessment_error_label(error)}), so "
+                "a served version may run another image or code archive"
+            )
             unread = (
                 " The versions its endpoints serve could not be listed: "
                 "ListAgentRuntimeEndpoints failed with "
@@ -25248,6 +25474,12 @@ def _agentcore_runtime_credential_findings(
                 )
             except (BotoCoreError, ClientError) as error:
                 findings.append(unread_finding(version_label, error))
+                unread_versions.setdefault(label, []).append(
+                    f"version {version}, served by endpoint(s) "
+                    f"{', '.join(sorted(served[version]))}, whose definition could "
+                    f"not be read (GetAgentRuntime {_assessment_error_label(error)}), "
+                    "so the image or code archive it runs is unknown"
+                )
                 continue
             findings.append(judge(version_label, version_details))
             record_image(label, version_details)
@@ -25412,6 +25644,7 @@ def _streamed_file_credentials(
 
 def _agentcore_runtime_code_credential_findings(
     codes: Dict[str, Set[Tuple[str, str, str]]],
+    unread_versions: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """AC-34's code leg: scan each runtime's code archive in S3.
 
@@ -25420,8 +25653,10 @@ def _agentcore_runtime_code_credential_findings(
     bucket is listed. codes holds the locations of every version the runtime
     leg read, keyed by runtime label. Each file is matched for an AWS access
     key ID or a private key block, and a .env file's variables are judged as
-    the environment variable row judges them.
+    the environment variable row judges them. A served version unread_versions
+    names holds the runtime's row at N/A, because it may run another archive.
     """
+    unread_versions = unread_versions or {}
 
     def finding(details, resolution, severity, status):
         return create_finding(
@@ -25442,7 +25677,7 @@ def _agentcore_runtime_code_credential_findings(
     findings: List[Dict[str, Any]] = []
     for label, locations in codes.items():
         found: List[str] = []
-        unread: List[str] = []
+        unread: List[str] = list(unread_versions.get(label, []))
         scanned: List[str] = []
         for bucket, key, version_id in sorted(locations):
             where = f"s3://{bucket}/{key}" + (
@@ -25489,7 +25724,8 @@ def _agentcore_runtime_code_credential_findings(
                     )
                     + f" {bounds}",
                     "Grant s3:GetObject on the code object, or reduce the archive "
-                    "below the bound, and retry.",
+                    "below the bound, grant bedrock-agentcore:GetAgentRuntime and "
+                    "ListAgentRuntimeEndpoints for an unread version, and retry.",
                     SeverityEnum.INFORMATIONAL,
                     StatusEnum.NA,
                 )
@@ -25722,6 +25958,7 @@ def _image_contents_credentials(
 
 def _agentcore_runtime_image_credential_findings(
     images: Dict[str, Tuple[str, Set[str]]],
+    unread_versions: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """AC-34's image leg: scan each runtime's container image configuration
     and file system layers.
@@ -25731,10 +25968,13 @@ def _agentcore_runtime_image_credential_findings(
     configuration carries the Env, Entrypoint and Cmd every process in the
     microVM starts with, while its layers hold the agent's code. images holds
     the URIs of every version the runtime leg read, keyed by runtime label; a
-    version whose definition could not be read is already reported N/A on the
-    runtime leg's row. An image in another account's registry is not read,
-    because the role's ECR reads are scoped to this account.
+    version whose definition could not be read is reported N/A on the runtime
+    leg's row, and unread_versions names it here, holding the image row at
+    N/A, because it may run another image. An image in another account's
+    registry is not read, because the role's ECR reads are scoped to this
+    account.
     """
+    unread_versions = unread_versions or {}
 
     def finding(details, resolution, severity, status):
         return create_finding(
@@ -25757,7 +25997,7 @@ def _agentcore_runtime_image_credential_findings(
     scans: Dict[Tuple[str, str, str], Any] = {}
     for label, (account, uris) in images.items():
         found: List[str] = []
-        unread: List[str] = []
+        unread: List[str] = list(unread_versions.get(label, []))
         scanned: List[str] = []
         for uri in sorted(uris):
             match = ECR_IMAGE_URI_PATTERN.match(uri)
@@ -25826,8 +26066,9 @@ def _agentcore_runtime_image_credential_findings(
                     )
                     + f" {layer_bounds}",
                     "Grant ecr:BatchGetImage and ecr:GetDownloadUrlForLayer on "
-                    "the repository, and let the function reach the ECR layer "
-                    "URL over HTTPS, then retry.",
+                    "the repository, let the function reach the ECR layer URL "
+                    "over HTTPS, grant bedrock-agentcore:GetAgentRuntime and "
+                    "ListAgentRuntimeEndpoints for an unread version, then retry.",
                     SeverityEnum.INFORMATIONAL,
                     StatusEnum.NA,
                 )
@@ -25928,7 +26169,8 @@ def _agentcore_gateway_target_credential_findings() -> List[Dict[str, Any]]:
                 )
                 continue
 
-            found, scanned = _gateway_target_inline_credentials(detail)
+            found, scanned, unread = _gateway_target_inline_credentials(detail)
+            not_read = f" Not read: {'; '.join(unread)}." if unread else ""
             if found:
                 findings.append(
                     create_finding(
@@ -25937,8 +26179,9 @@ def _agentcore_gateway_target_credential_findings() -> List[Dict[str, Any]]:
                         finding_details=(
                             f"{label} holds credential material inline in "
                             f"{', '.join(found)}, which every principal allowed "
-                            "GetGatewayTarget reads. The values are withheld from "
-                            "this report."
+                            "GetGatewayTarget, or s3:GetObject on a schema held "
+                            "in S3, reads. The values are withheld from this "
+                            f"report.{not_read}"
                         ),
                         resolution=(
                             "Store the credential in an AgentCore Identity "
@@ -25953,18 +26196,46 @@ def _agentcore_gateway_target_credential_findings() -> List[Dict[str, Any]]:
                 )
                 continue
 
+            if unread:
+                findings.append(
+                    create_finding(
+                        check_id="AC-34",
+                        finding_name=f"{finding_name} Incomplete",
+                        finding_details=(
+                            f"{label}: whether its definition holds an inline "
+                            f"credential was not judged: {'; '.join(unread)}. "
+                            f"Scanned with none found: {scanned} sensitive "
+                            "field(s) (static query parameters, OAuth custom "
+                            "parameters, inline schema payloads and schemas held "
+                            "in S3)."
+                        ),
+                        resolution=(
+                            "Grant s3:GetObject on the schema object, or reduce "
+                            "it below "
+                            f"{AC35_SCHEMA_MAX_BYTES // (1024 * 1024)} MiB, and "
+                            "retry."
+                        ),
+                        reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+
             findings.append(
                 create_finding(
                     check_id="AC-34",
                     finding_name=finding_name,
                     finding_details=(
                         f"{label} was scanned across {scanned} sensitive field(s) "
-                        "(static query parameters, OAuth custom parameters and "
-                        "inline schema payloads), and none holds credential "
-                        "material inline."
+                        "(static query parameters, OAuth custom parameters, "
+                        "inline schema payloads and schemas held in S3, each "
+                        "read by its exact key within "
+                        f"{AC35_SCHEMA_MAX_BYTES // (1024 * 1024)} MiB), and none "
+                        "holds credential material inline."
                     ),
                     resolution=(
-                        "No action required. An inline schema is searched only "
+                        "No action required. A schema is searched only "
                         "for access key ids and PEM private keys. "
                         f"{AC34_CODE_CEILING}"
                     ),
@@ -26094,10 +26365,11 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
 
     images: Dict[str, Tuple[str, Set[str]]] = {}
     codes: Dict[str, Set[Tuple[str, str, str]]] = {}
+    unread_versions: Dict[str, List[str]] = {}
     findings = (
-        _agentcore_runtime_credential_findings(images, codes)
-        + _agentcore_runtime_code_credential_findings(codes)
-        + _agentcore_runtime_image_credential_findings(images)
+        _agentcore_runtime_credential_findings(images, codes, unread_versions)
+        + _agentcore_runtime_code_credential_findings(codes, unread_versions)
+        + _agentcore_runtime_image_credential_findings(images, unread_versions)
         + _agentcore_gateway_target_credential_findings()
         + _agentcore_harness_credential_findings()
     )
@@ -31879,7 +32151,22 @@ def check_agentcore_evaluation_personal_data() -> List[Dict[str, Any]]:
                     f"{_assessment_error_label(error)})"
                 )
 
-    population = ", ".join(f"{n} {kind}(s)" for kind, n in sorted(counts.items()))
+    # Each kind is named with the fields actually read, so a count never
+    # implies a read the code did not make.
+    fields_read = {
+        "batch evaluation": "the name and description",
+        "evaluator": "the tags, name, description and evaluatorConfig",
+        "online evaluation configuration": "the tags, name and description",
+        "results log group": "the tags",
+    }
+    population = "; ".join(
+        f"{fields_read[kind]} of {n} {kind}(s)" for kind, n in sorted(counts.items())
+    )
+    if "batch evaluation" in counts:
+        population += (
+            ". Batch evaluation tags are not readable: GetBatchEvaluationResponse "
+            "and BatchEvaluationSummary have no tags member"
+        )
     if matches:
         return [
             finding(
@@ -31896,7 +32183,11 @@ def check_agentcore_evaluation_personal_data() -> List[Dict[str, Any]]:
             finding(
                 "Whether evaluation tags and free-form fields hold personal data "
                 f"was not judged: not read were {'; '.join(unread)}."
-                + (f" Read with no match: {population}." if population else ""),
+                + (
+                    f" The reads that succeeded matched nothing, over {population}."
+                    if population
+                    else ""
+                ),
                 "Grant the actions named and retry.",
                 SeverityEnum.INFORMATIONAL,
                 StatusEnum.NA,
@@ -31906,7 +32197,7 @@ def check_agentcore_evaluation_personal_data() -> List[Dict[str, Any]]:
         return []
     return [
         finding(
-            f"No tag or free-form field of {population} matched. {PERSONAL_DATA_RULE}",
+            f"No personal data matched in {population}. {PERSONAL_DATA_RULE}",
             "No action required.",
             SeverityEnum.MEDIUM,
             StatusEnum.PASSED,
