@@ -423,18 +423,24 @@ AI_SUBJECT_ROWS = [
         "Each KMSMasterKeyID the bucket encrypts with is resolved by kms:DescribeKey and its "
         "policy read by kms:GetKeyPolicy: a decrypt grant to a principal no condition binds "
         "fails, and an unreadable key is N/A. The execution role must also be able to use each "
-        "such key for kms:GenerateDataKey: granted by the key policy to the role, to * bound "
+        "such key for kms:GenerateDataKey and, for a multipart upload, kms:Decrypt: granted "
+        "by the key policy to the role, to * bound "
         "only by kms:CallerAccount and kms:ViaService naming the account and S3, or to the "
         "account root with the role's identity policy granting it, allowed by the boundary, "
         "and reached by no Deny; any other condition is N/A. A separate Browser Recording "
         "Write SCP row per recording browser fails when a service control policy attached to "
         "the account, an OU above it or the root denies the role s3:PutObject on the prefix "
-        "or kms:GenerateDataKey on the bucket's key, or when a level of that chain has no "
-        "attached SCP allowing either; aws:PrincipalArn, aws:PrincipalAccount and "
-        "aws:SecureTransport are evaluated with IfExists suffixes and ForAllValues:/"
-        "ForAnyValue: prefixes stripped, any other key is N/A, and the management account "
-        "and an account in no organization are not bound. The multipart kms:Decrypt and "
-        "resource control policies are not judged, so a Passed write can still be refused. "
+        "or kms:GenerateDataKey or kms:Decrypt on the bucket's key, or when a level of that "
+        "chain has no attached SCP allowing each, and when a resource control policy "
+        "attached to the same levels denies one of them; aws:PrincipalArn, "
+        "aws:PrincipalAccount and aws:SecureTransport, and for a resource control policy "
+        "aws:ResourceAccount and aws:PrincipalOrgID, are evaluated with IfExists suffixes "
+        "and ForAllValues:/ForAnyValue: prefixes stripped, any other key is N/A, an "
+        "unlisted resource control policy set is N/A, and the management account and an "
+        "account in no organization are not bound. Live View is not judged: GetBrowser "
+        "returns no live-view member in the pinned botocore, and the liveViewStream "
+        "GetBrowserSession returns carries only a streamEndpoint, so no setting "
+        "records whether anyone watches a session. "
         "The AWS managed browser has no recording configuration and is "
         "outside the population",
         [],
@@ -542,7 +548,14 @@ AI_SUBJECT_ROWS = [
         "more than one AgentCore resource names. The shell-connection alarm leg of "
         "AC-45 runs in every assessed Region that holds a runtime, because metric "
         "filters and alarms are regional, and fails a Region with no acting alarm "
-        "counting shell connections",
+        "counting shell connections. AC-48's Execution Role Access Analyzer row, on "
+        "the primary Region, lists the IAM Access Analyzer analyzers of every "
+        "assessed Region and passes when an ACTIVE ACCOUNT_UNUSED_ACCESS or "
+        "ORGANIZATION_UNUSED_ACCESS analyzer excludes neither the account nor a "
+        "resource tag. An account outside any organization with none fails; in an "
+        "organization, whose analyzer the member account cannot list, it is N/A, as "
+        "is a tag exclusion or an unlisted Region. Whether each role holds equal or "
+        "fewer privileges than the principals that invoke it is not judged",
         [],
         4,
     ),
@@ -575,9 +588,13 @@ AI_SUBJECT_ROWS = [
         ["AC-17", "AC-40"],
         "AC-40 classifies the evaluators each configuration attaches against the account's own "
         "catalogue, which marks a service-authored evaluator's category in its description, and "
-        "fails a configuration that attaches no safety evaluator, attaches neither "
+        "fails a configuration that does not attach both Builtin.Harmfulness and "
+        "Builtin.Stereotyping, since another safety evaluator does not score the same "
+        "harm, attaches neither "
         "Builtin.ToolSelectionAccuracy nor Builtin.ToolParameterAccuracy, or has no CloudWatch "
-        "alarm with actions on a metric in the namespace its scores are published to. "
+        "alarm with actions on a metric in the namespace its scores are published to, "
+        "with each named safety evaluator needing its own alarmed metric. A catalogue "
+        "that no longer marks both named evaluators as safety metrics is N/A. "
         "A configuration that is not ACTIVE and ENABLED fails, because it scores nothing. "
         "The namespace is the configuration's metricsNamespace when set, read through the "
         "pinned botocore 1.43.108, and the two documented default spellings otherwise. An "
@@ -608,7 +625,10 @@ AI_SUBJECT_ROWS = [
         "reads each consent portal's executionRoleArn with GetConsentPortal and fails "
         "a trust statement with no guard naming the account, or whose aws:SourceArn "
         "does not name a consent-portal resource, because the setup guide lets the "
-        "role be created without its Condition. IfExists, "
+        "role be created without its Condition. On a CUSTOM_JWT gateway, whose caller "
+        "has no IAM identity to name, a Principal '*' statement passes when an Allow "
+        "condition or a restricting Deny bounds the caller to aws:SourceVpc or "
+        "aws:SourceVpce with an equals operator and no wildcard value. IfExists, "
         "ForAllValues and wildcard values do not count",
         [],
         4,
@@ -639,6 +659,11 @@ AI_SUBJECT_ROWS = [
         "naming the Region. AC-08 requires an available bedrock-agentcore endpoint "
         "when runtimes exist, fails an interface endpoint with private DNS off, and "
         "fails a security group set whose inbound ranges together cover the internet. "
+        "When a runtime authenticates with CUSTOM_JWT, AC-08 also fails an available "
+        "bedrock-agentcore interface endpoint whose policy does not allow "
+        "GetRuntimeProtectedResourceMetadata to Principal '*' on that runtime with only "
+        "network conditions, because the OAuth discovery call carries no SigV4 "
+        "identity, and a Deny reaching it on any non-network key blocks it. "
         "AC-10 fails an Allow that opens the runtime to any principal without binding "
         "the caller's account or organization",
         [],
@@ -694,9 +719,17 @@ AI_SUBJECT_ROWS = [
         "system prompt, model parameters). A value holding a slash reads as a secret name "
         "unless it is a base64 string of 40 or more characters. No API reads the rest: there "
         "is no ListTokenVaults, so a vault no provider names and that is not configured is not "
-        "read. The agent's code and container image are not scanned: GetAgentRuntime "
-        "names them in agentRuntimeArtifact, but the role is not granted s3:GetObject or "
-        "the ECR image reads that fetch them. The vault key policy's trust is not graded, "
+        "read. AC-34 also reads the configuration of the container image each read "
+        "runtime version names, every platform of an image index, from this account's ECR "
+        "registry: an Env variable holding a credential, or an AWS access key ID or private "
+        "key block in Entrypoint or Cmd, fails, and an image in another account's registry "
+        "or one whose configuration cannot be fetched is N/A. The image's file system "
+        "layers are not scanned. AC-34 reads the code archive agentRuntimeArtifact names "
+        "in S3 by its exact key and version, never listing a bucket: a file holding an "
+        "AWS access key ID or a private key block, or a .env file holding a credential, "
+        "fails. An archive over 64 MiB or unpacking to over 256 MiB, one that is not a "
+        "zip, or one that cannot be read is N/A, and files over 4 MiB are counted as "
+        "not scanned. The vault key policy's trust is not graded, "
         "and a denied bedrock-agentcore:ListHarnesses makes the harness leg N/A",
         [],
         4,
@@ -737,10 +770,10 @@ AI_SUBJECT_ROWS = [
         "as customer managed and Enabled, AC-36 asserts the key policy names who may "
         "decrypt with it and who may disable it or schedule it for deletion, scopes "
         "CreateGrant, Decrypt and GenerateDataKey by ViaService, grant constraint and "
-        "source context as the policy encryption guide shows, with Decrypt and "
-        "GenerateDataKey needing both aws:SourceAccount and aws:SourceArn naming the "
-        "account (DescribeKey is scoped by ViaService alone, as the guide's complete "
-        "policy shows), and that the key carries the engine's management and "
+        "source context as the policy encryption guide shows, with Decrypt, "
+        "GenerateDataKey and DescribeKey each needing both aws:SourceAccount and "
+        "aws:SourceArn naming the account, and the encryption context held to Decrypt "
+        "and GenerateDataKey alone, and that the key carries the engine's management and "
         "evaluation grants; the key cannot be added to or changed on an existing "
         "engine, so the key policy is the whole guard. AC-36 reads an EventBridge rule "
         "or a metric-filter alarm on DisableKey and ScheduleKeyDeletion, crediting a "
@@ -767,13 +800,22 @@ AI_SUBJECT_ROWS = [
         "fails as Gateway Scope Unbounded. A policy with no readable text, or a head "
         "without three scope positions, withholds the gateway's Passed. An AC-35 Policy "
         "Input Guard row per enforcing gateway fails a forbid that reads "
-        "context.input.<field> for a tool whose inline Lambda inputSchema does not list "
-        "the field as required, unless a has() test Cedar's short-circuit evaluates "
-        "first guards it, because Cedar skips a policy whose evaluation errors and a "
-        "missing attribute is an error, so the forbid fails open. A bare action reaches "
-        "every tool; a tool schema in S3, a non-Lambda target, an unreadable target or an "
-        "action group is N/A. Permits are not judged, since an erroring permit denies, "
-        "and fields nested below a top-level input are not judged. Default-deny "
+        "a context.input path, nested paths included, for a tool whose Lambda "
+        "inputSchema does not list that path and every path above it as required, "
+        "unless a has() test Cedar's short-circuit evaluates first guards it, because "
+        "Cedar skips a policy whose evaluation errors and a missing attribute is an "
+        "error, so the forbid fails open. A Lambda tool schema held in S3 is read by the "
+        "exact key its URI names, within 2 MiB and held to bucketOwnerAccountId, and "
+        "judged as an inline one. A JSON OpenAPI target's operations (by operationId) "
+        "and a Smithy JSON AST target's operations, inline or in S3, are read "
+        "too: a read the schema does not mark required fails, and a read of a field it "
+        "marks required is N/A, because how the gateway places those inputs in "
+        "context.input is not documented. A bare action reaches every tool; an S3 "
+        "schema that cannot be fetched or is over 2 MiB, a YAML or unparsable schema, "
+        "an MCP server, API Gateway "
+        "or connector target, an operation the schema does not define, an unreadable "
+        "target or an action group is N/A. Permits are not judged, since an erroring "
+        "permit denies. Default-deny "
         "and forbid-wins are engine behaviour and not a setting to read",
         [],
         4,
@@ -796,7 +838,14 @@ AI_SUBJECT_ROWS = [
         "bedrock-agentcore:GetWorkloadAccessToken grant from the IAM cache on the "
         "gateway's workload identity and its directory, and fails a role with no "
         "surviving unconditioned grant, because the Gateway mints the token that "
-        "carries the session identity with that role. SCPs are not read",
+        "carries the session identity with that role. Because a prior action is "
+        "recorded as a response only when it was permitted, AC-38 also reads each "
+        "tool a temporal predicate matches as a prior response and fails the "
+        "gateway when no enforcing permit without a temporal condition reaches that "
+        "tool on it, a permit naming another gateway not counting, or when an "
+        "unconditioned forbid names it; a tool only an action-group permit may reach "
+        "is N/A, and the crediting permit's own when and unless conditions are not "
+        "evaluated. SCPs are not read",
         [],
         4,
     ),
@@ -838,7 +887,10 @@ AI_SUBJECT_ROWS = [
         "runtime, code interpreter or browser and fails a resource whose groups "
         "together permit 0.0.0.0/0 or ::/0 egress, so 0.0.0.0/1 plus 128.0.0.0/1 fails "
         "as 0.0.0.0/0 does, and fails a rule naming a public range of /16 (IPv6 /48) "
-        "or wider, so 0.0.0.0/1 alone fails; ports are not judged. A tool in PUBLIC network mode fails without a describe "
+        "or wider, so 0.0.0.0/1 alone fails. A rule naming an IP range or prefix "
+        "list that allows every protocol, or TCP or UDP ports 1 (or lower) through "
+        "65535, fails as Egress Ports Unrestricted, and a passing row lists the ports "
+        "it read. A tool in PUBLIC network mode fails without a describe "
         "call, because the service grants it open internet egress by configuration, "
         "and a tool in SANDBOX fails at Medium, because no customer security group "
         "names what it reaches. A group the describe did not return and a denied "
@@ -944,9 +996,16 @@ AI_SUBJECT_ROWS = [
         "unreadable key policy is N/A. A configuration writing to SOURCE_LOG_GROUP "
         "names no results group and is N/A, with AC-20 and AC-26 named as the checks "
         "that judge the input groups. Retention length is reported and not judged, "
-        "because no API field states the workload's schedule. Tag values and the "
-        "configuration's own description are free-form text AC-41 discloses without "
-        "judging. The keys of custom evaluators and batch evaluations are credited "
+        "because no API field states the workload's schedule. AC-41's Evaluation "
+        "Personal Data row reads the tags of every evaluator the account defines, "
+        "every online evaluation configuration and every log group under "
+        "/aws/bedrock-agentcore/evaluations/ or named by an outputConfig, and the "
+        "name and description of those and of every batch evaluation plus each "
+        "evaluator's evaluatorConfig, and fails one that holds an email address, a "
+        "phone number, a US social security number in NNN-NN-NNNN form or a "
+        "Luhn-valid 13 to 19 digit number, naming the field and never the value. "
+        "Personal data in other forms is not detected, and an unread tag or field "
+        "makes the row N/A. The keys of custom evaluators and batch evaluations are credited "
         "only when DescribeKey reports them customer managed and enabled and the key "
         "policy allows kms:Decrypt with an encryption context naming that evaluator "
         "or batch evaluation in one account, with kms:ViaService for an evaluator, "
@@ -1049,7 +1108,11 @@ AI_SUBJECT_ROWS = [
         "user. The same statement must also deny a type the key does not list, "
         "because AWS publishes no list of the values it takes: StringNotEquals "
         "CUSTOM_JWT passes, and a StringEquals deny-list of AWS_IAM fails as "
-        "Deny-List. IfExists operators read as their plain form. The policy counts only "
+        "Deny-List. The authorizer configuration is optional on both writes in the "
+        "pinned botocore, so the Deny must also fire when the key is absent: a "
+        "ForAnyValue allow-list or a Null test set to false fails as Absent Key, and a "
+        "Null true test or an IfExists or ForAllValues operator passes that leg. IfExists "
+        "operators otherwise read as their plain form. The policy counts only "
         "when it is attached to the assessed account, to an organizational unit above "
         "it or to the root, read with organizations:ListParents and "
         "organizations:ListTargetsForPolicy: a guard attached elsewhere fails as "
@@ -1256,8 +1319,16 @@ AI_SUBJECT_ROWS = [
         "count. Each sink's attached links fail when the source account is not an "
         "ACTIVE member of the organization; a failed ListAttachedLinks or "
         "ListAccounts read is N/A. No OAM field records a link's last use, so an "
-        "unused link from an active member is not found, and the monitoring "
-        "account's viewing IAM and the data-protection policies are not read",
+        "unused link from an active member is not found. In an account that owns a "
+        "sink, AC-22 fails an account-wide data-protection policy that masks no "
+        "credentials or no personal or health identifier, AC-20 judging the source "
+        "accounts' AgentCore log groups, and reads each cached role or user that "
+        "can view shared log events, Logs Insights results, traces or metrics: a "
+        "statement granting a view action fails on NotAction, an Action wildcard, a "
+        "named create, put, update, delete, tag, untag, associate or disassociate "
+        "action of logs, cloudwatch, xray or oam, or a log read on Resource '*', "
+        "NotResource or a wildcard-only log-group name. Service-linked roles are not "
+        "judged, and an unparsable policy is N/A",
         [],
         4,
     ),
@@ -1633,8 +1704,11 @@ AI_SUBJECT_ROWS = [
         "AC-49's AgentCore Network Firewall Threat Inspection row is the egress IPS leg: "
         "each AWS Network Firewall a VPC hosting AgentCore reaches by its default route "
         "must run the AWS managed ThreatSignatures rule group and a malware or botnet "
-        "domain group, neither overridden to DROP_TO_ALERT. VPCs hosting no AgentCore "
-        "resource are not read, and no check reads recent detections",
+        "domain group, neither overridden to DROP_TO_ALERT, and must send its ALERT "
+        "log, which records each detection, to a destination; a firewall whose "
+        "logging configuration is not read makes the row Not Applicable. The "
+        "detections in that log are not read, and VPCs hosting no AgentCore "
+        "resource are not read",
         [],
         5,
     ),
@@ -1643,7 +1717,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-01", "AC-15", "AC-49"],
+        ["AC-01", "AC-15", "AC-49", "AG-25", "AC-35"],
         "AC-01 fails a runtime or built-in tool whose security groups together allow "
         "egress to 0.0.0.0/0 or ::/0, unioning the ranges so 0.0.0.0/1 plus "
         "128.0.0.0/1 fails, fails a rule naming a public range of /16 (IPv6 /48) or "
@@ -1670,7 +1744,14 @@ AI_SUBJECT_ROWS = [
         "the value named. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
         "does not substitute for this: the devguide lists those keys while the "
         "machine-readable IAM reference lists none for CreateGatewayTarget or "
-        "UpdateGatewayTarget, so such a Deny can fail open",
+        "UpdateGatewayTarget, so such a Deny can fail open. The tool-level allow-list "
+        "is judged at the gateway: AG-25 asserts each gateway's policy engine is "
+        "attached in ENFORCE mode with status and enforcementMode ACTIVE, and fails a "
+        "permit over every action with no condition as Allows All; AC-35 fails an "
+        "enforcing permit that leaves the action position unconstrained, a bare "
+        "principal no condition reads, and a resource named by type alone or not at "
+        "all, so a gateway passes only when its enforcing permits name the tools, "
+        "callers and gateway they authorize",
         [],
         5,
     ),
@@ -1737,7 +1818,16 @@ FOUNDATION_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-49"],
+        ["AC-49", "AC-01"],
+        "AC-01 is the security-group port leg: on each VPC-mode AgentCore runtime, "
+        "code interpreter and browser it fails an outbound rule naming an IP range or "
+        "prefix list that allows every protocol, or TCP or UDP ports 1 (or lower) "
+        "through 65535, and a passing row lists the protocol and ports each such rule "
+        "allows. The control names no port list, so a named port is reported and not "
+        "graded. A rule naming only a security group is not judged on ports. "
+        "The population of both checks is AgentCore's hosting VPCs. ECS services "
+        "and VPC Lambda functions are judged by the SageMaker module's SM-39 under "
+        "AIR-SLF-RT-02, not in this row, and other AI workloads are not read here. "
         "AC-49 asserts an egress allow-list by destination name on each VPC that "
         "hosts an AgentCore runtime, at any version ListAgentRuntimeVersions "
         "returns, browser or code interpreter. It passes only "
@@ -1859,15 +1949,21 @@ FOUNDATION_ROWS = [
         "aws:PrincipalArn with no wildcard in its name, and fails a trail that "
         "records the Region with log file validation off. An unreadable trail is "
         "N/A. AC-26 also reads each judged group's subscription filters, aws/spans "
-        "included, and passes a group only when one filter with an empty filter "
+        "and the Region's Bedrock model invocation log group included, an unread "
+        "invocation logging configuration being N/A, and passes a group only when one filter with an empty filter "
         "pattern, no field selection criteria and not applied on transformed logs "
         "sends to an ACTIVE Firehose stream of this account whose S3 destination "
         "runs no Lambda record processor and whose bucket has Object Lock default "
         "retention in COMPLIANCE mode. No filter, a narrowed filter, a non-S3 "
         "destination, GOVERNANCE mode or no default retention fails. A CloudWatch "
         "Logs destination, a Kinesis or Lambda target, another account's stream or "
-        "a failed read is N/A naming it, so the cross-account Log Archive pattern "
-        "the control prescribes reads N/A from the member account. Each trail "
+        "a failed read is N/A naming it, and a CloudWatch Logs destination's row "
+        "names the account that owns it. In that account, the Log Archive account "
+        "of the cross-account pattern the control prescribes, AC-26 follows each "
+        "destination listed by logs:DescribeDestinations to its Firehose stream "
+        "and bucket under the same rules, so the WORM copy is judged where it "
+        "lives; which source groups subscribe to it is read in each source "
+        "account, and an unlisted destination set is N/A. Each trail "
         "recording the Region gets a row on its S3BucketName's Object Lock, judged "
         "the same way, and an unread trail or bucket is N/A",
         [],
@@ -2255,7 +2351,14 @@ FOUNDATION_ROWS = [
         "Medium; with no active subscription the row is Not Applicable, because "
         "the control asks for Shield Advanced where availability is "
         "business-critical. A distribution fronting no gateway gives no row. "
-        "AG-39 is the request-rate leg: it fails "
+        "AC-51's Gateway Firewall Manager Enrollment row fails a gateway with no "
+        "web ACL, or whose web ACL GetWebACL reports with neither "
+        "ManagedByFirewallManager nor RetrofittedByFirewallManager true; the "
+        "Firewall Manager policy is readable only from its administrator account "
+        "and its scope is not judged. AC-51's Shield Proactive Engagement row, in a "
+        "Region that holds a gateway, fails an ACTIVE Shield Advanced subscription "
+        "whose ProactiveEngagementStatus is not ENABLED and is Not Applicable with "
+        "no active subscription. AG-39 is the request-rate leg: it fails "
         "a gateway web ACL with no rate-based rule whose action is Block",
         [],
         6,

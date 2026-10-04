@@ -314,12 +314,21 @@ _EXPECTED_ACTIONS = {
         "tag:GetResources",
     },
     "AgentCoreAssessmentReadsPolicy": {
+        "access-analyzer:ListAnalyzers",
+        "bedrock-agentcore:ListTagsForResource",
         "cloudfront:ListDistributions",
+        "ecr:BatchGetImage",
         "ecr:DescribeImages",
+        "ecr:GetDownloadUrlForLayer",
         "firehose:DescribeDeliveryStream",
+        "logs:DescribeDestinations",
         "logs:DescribeSubscriptionFilters",
+        "logs:ListTagsForResource",
+        "network-firewall:DescribeLoggingConfiguration",
         "s3:GetBucketObjectLockConfiguration",
         "s3:GetBucketOwnershipControls",
+        "s3:GetObject",
+        "shield:DescribeSubscription",
         "shield:GetSubscriptionState",
         "shield:ListProtections",
     },
@@ -566,7 +575,6 @@ _EXPECTED_ACTIONS = {
         "s3:GetBucketVersioning",
         "s3:GetEncryptionConfiguration",
         "s3:GetLifecycleConfiguration",
-        "s3:GetObject",
         "s3:PutObject",
         "wafv2:GetWebACL",
         "bedrock-agentcore:GetBatchEvaluation",
@@ -1418,6 +1426,7 @@ _AGENTCORE_MANAGED_GRANTS = [
     ),
     # No resource type in the service authorization reference (2026-10-03).
     ("Allow", "cloudfront:ListDistributions", json.dumps("*")),
+    ("Allow", "shield:DescribeSubscription", json.dumps("*")),
     ("Allow", "shield:GetSubscriptionState", json.dumps("*")),
     ("Allow", "shield:ListProtections", json.dumps("*")),
     (
@@ -1426,6 +1435,75 @@ _AGENTCORE_MANAGED_GRANTS = [
         json.dumps(
             {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
         ),
+    ),
+    # No resource type in the service authorization reference (2026-10-03).
+    ("Allow", "logs:DescribeDestinations", json.dumps("*")),
+    (
+        "Allow",
+        "network-firewall:DescribeLoggingConfiguration",
+        json.dumps(
+            {
+                "Fn::Sub": (
+                    "arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:"
+                    "firewall/*"
+                )
+            }
+        ),
+    ),
+    # No resource type in the service authorization reference (2026-10-03).
+    ("Allow", "access-analyzer:ListAnalyzers", json.dumps("*")),
+    (
+        "Allow",
+        "bedrock-agentcore:ListTagsForResource",
+        json.dumps(
+            [
+                {
+                    "Fn::Sub": (
+                        "arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:"
+                        "evaluator/*"
+                    )
+                },
+                {
+                    "Fn::Sub": (
+                        "arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:"
+                        "online-evaluation-config/*"
+                    )
+                },
+            ]
+        ),
+    ),
+    (
+        "Allow",
+        "logs:ListTagsForResource",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*"}
+        ),
+    ),
+    (
+        "Allow",
+        "ecr:BatchGetImage",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "ecr:GetDownloadUrlForLayer",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*"}
+        ),
+    ),
+    # Moved intact from the inline policy, prefix scope unchanged.
+    (
+        "Allow",
+        "s3:GetObject",
+        json.dumps({"Fn::Sub": "${AIMLAssessmentBucket.Arn}/permissions_cache_*.json"}),
+    ),
+    # AC-34 code archives and AC-35 tool schemas, read by exact key.
+    (
+        "Allow",
+        "s3:GetObject",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*/*"}),
     ),
 ]
 
@@ -1554,10 +1632,20 @@ _ARTIFACT_PREFIXES = {
 }
 
 
+_ARTIFACT_MANAGED_POLICIES = {
+    "AgentCoreSecurityAssessmentFunction": ("AgentCoreAssessmentReadsPolicy",),
+}
+
+
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
 @pytest.mark.parametrize("logical_id", sorted(_ARTIFACT_PREFIXES))
 def test_assessment_artifact_access_is_prefix_scoped(template, logical_id):
-    block = _resource_block(template, logical_id)
+    # A function's grants on the assessment bucket include those of the
+    # managed policy attached to it.
+    block = _resource_block(template, logical_id) + "".join(
+        _resource_block(template, policy)
+        for policy in _ARTIFACT_MANAGED_POLICIES.get(logical_id, ())
+    )
     assert "${AIMLAssessmentBucket.Arn}/*" not in block
     for prefix in _ARTIFACT_PREFIXES[logical_id]:
         assert f"${{AIMLAssessmentBucket.Arn}}/{prefix}" in block
