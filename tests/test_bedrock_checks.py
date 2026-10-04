@@ -8634,6 +8634,45 @@ def _make_client_error(code, message="error"):
     return ClientError({"Error": {"Code": code, "Message": message}}, "operation")
 
 
+def _sagemaker_search(training_jobs, training_error=None, trial_components=None):
+    """
+    A SageMaker Search side effect. Resource TrainingJob returns each
+    {name: detail} of ``training_jobs`` as one page, or raises
+    ``training_error``. Resource ExperimentTrialComponent returns
+    ``trial_components`` ({kind: {name: detail}}) for the kind its Source.SourceArn
+    filter names.
+    """
+
+    def search(**kwargs):
+        if kwargs["Resource"] == "TrainingJob":
+            if training_error:
+                raise training_error
+            return {
+                "Results": [
+                    {"TrainingJob": {"TrainingJobName": name, **detail}}
+                    for name, detail in (training_jobs or {}).items()
+                ]
+            }
+        assert kwargs["Resource"] == "ExperimentTrialComponent"
+        (test,) = kwargs["SearchExpression"]["Filters"]
+        assert (test["Name"], test["Operator"]) == ("Source.SourceArn", "Contains")
+        kind = test["Value"].strip(":/").rsplit("-job", 1)[0]
+        key = {"transform": "TransformJob", "processing": "ProcessingJob"}[kind]
+        return {
+            "Results": [
+                {
+                    "TrialComponent": {
+                        "TrialComponentName": f"{name}-aws-{kind}-job",
+                        "SourceDetail": {key: {f"{key}Name": name, **detail}},
+                    }
+                }
+                for name, detail in ((trial_components or {}).get(kind) or {}).items()
+            ]
+        }
+
+    return search
+
+
 def _bedrock_event(region="us-east-1", region_index=0):
     return {
         "Region": region,
@@ -15896,6 +15935,7 @@ class TestBR46KnowledgeBaseSourceClassification:
         ingestion_error=None,
         training_jobs=None,
         training_error=None,
+        trial_components=None,
         ingestion_pages=None,
         pii_jobs=(),
         pii_jobs_error=None,
@@ -16042,6 +16082,9 @@ class TestBR46KnowledgeBaseSourceClassification:
             }
         sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
             training_jobs[TrainingJobName]
+        )
+        sagemaker_client.search.side_effect = _sagemaker_search(
+            training_jobs, training_error, trial_components
         )
         self.sagemaker_client = sagemaker_client
 
@@ -17334,12 +17377,11 @@ class TestBR46ClassificationJobCoverage:
         unread = [
             f
             for f in findings
-            if f["Status"] == "N/A"
-            and "sagemaker:ListTrainingJobs" in f["Finding_Details"]
+            if f["Status"] == "N/A" and "sagemaker:Search" in f["Finding_Details"]
         ]
         assert len(unread) == 1, [f["Finding_Details"] for f in findings]
 
-    def test_br46_training_jobs_past_the_read_cap_are_named(self):
+    def test_br46_training_jobs_past_the_describe_cap_are_all_read(self):
         estate = TestBR46KnowledgeBaseSourceClassification()
         jobs = {
             f"tj-{index}": self._training_job("s3://support-bucket/data/")
@@ -17354,10 +17396,9 @@ class TestBR46ClassificationJobCoverage:
                 ],
                 training_jobs=jobs,
             )
-        assert estate.sagemaker_client.describe_training_job.call_count == 2
-        assert "1 older SageMaker training job(s) past the newest 2" in " ".join(
-            f["Finding_Details"] for f in findings if f["Status"] == "N/A"
-        )
+        estate.sagemaker_client.describe_training_job.assert_not_called()
+        assert "past the newest" not in " ".join(f["Finding_Details"] for f in findings)
+        assert estate.sagemaker_client.search.call_count >= 1
 
     def test_br46_job_naming_another_bucket_does_not_clear_this_one(self):
         findings = self._run([self._job("nightly-other", ["unrelated-bucket"])])
@@ -26232,6 +26273,7 @@ class TestBR47DataPathBucketTLS:
         batch_error=None,
         training_jobs=None,
         training_error=None,
+        trial_components=None,
         runtimes=None,
         browsers=None,
         agentcore_error=None,
@@ -26325,6 +26367,9 @@ class TestBR47DataPathBucketTLS:
         sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
             training_jobs[TrainingJobName]
         )
+        sagemaker_client.search.side_effect = _sagemaker_search(
+            training_jobs, training_error, trial_components
+        )
         # transform_jobs and processing_jobs map a name to its Describe
         # response; endpoints map a name to (DescribeEndpoint,
         # DescribeEndpointConfig); evaluation_jobs map a name to its Get
@@ -26405,8 +26450,23 @@ class TestBR47DataPathBucketTLS:
                     for browser_id in browsers
                 ]
             }
+        # A runtime spec may carry "endpoints" (its ListAgentRuntimeEndpoints
+        # page) and "versions" ({version: Get response}).
         agentcore_client.get_agent_runtime.side_effect = (
-            lambda agentRuntimeId, agentRuntimeVersion: runtimes[agentRuntimeId]
+            lambda agentRuntimeId, agentRuntimeVersion: answer(
+                runtimes[agentRuntimeId]["versions"][agentRuntimeVersion]
+                if "versions" in runtimes[agentRuntimeId]
+                else runtimes[agentRuntimeId]
+            )
+        )
+        agentcore_client.list_agent_runtime_endpoints.side_effect = (
+            lambda agentRuntimeId, **kwargs: answer(
+                runtimes[agentRuntimeId].get(
+                    "endpoints_error", {"runtimeEndpoints": []}
+                )
+                if "endpoints_error" in runtimes[agentRuntimeId]
+                else {"runtimeEndpoints": runtimes[agentRuntimeId].get("endpoints", [])}
+            )
         )
         agentcore_client.get_browser.side_effect = lambda browserId: browsers[browserId]
         self.agentcore_client = agentcore_client
@@ -26811,6 +26871,60 @@ class TestBR47DataPathBucketTLS:
         passed = [f for f in findings if f["Status"] == "Passed"]
         assert "2 of 3 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
 
+    @staticmethod
+    def _code(bucket):
+        return {
+            "agentRuntimeArtifact": {
+                "codeConfiguration": {"code": {"s3": {"bucket": bucket, "prefix": "a"}}}
+            }
+        }
+
+    def test_br47_code_buckets_of_every_endpoint_version_are_read(self):
+        findings = self._run(
+            runtimes={
+                "rt-1": {
+                    "endpoints": [
+                        {"liveVersion": "2", "targetVersion": "1"},
+                        {"liveVersion": "3"},
+                    ],
+                    "versions": {
+                        "1": self._code("code-v1"),
+                        "2": self._code("code-v2"),
+                        "3": self._code("code-v3"),
+                    },
+                }
+            },
+            bucket_policies=self._enforced("code-v1", "code-v3"),
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert "Bucket code-v2" in failed[0]["Finding_Details"]
+        assert (
+            "the code artifact of AgentCore runtime 'rt-1' version 2"
+            in failed[0]["Finding_Details"]
+        )
+        assert [
+            c.kwargs["agentRuntimeVersion"]
+            for c in self.agentcore_client.get_agent_runtime.call_args_list
+        ] == ["1", "2", "3"]
+
+    def test_br47_unlisted_runtime_endpoints_withhold_the_pass(self):
+        findings = self._run(
+            runtimes={
+                "rt-1": dict(
+                    self._code("code-v3"),
+                    endpoints_error=_client_error(
+                        "AccessDeniedException", "no", "ListAgentRuntimeEndpoints"
+                    ),
+                )
+            },
+            bucket_policies=self._enforced("code-v3"),
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert "bedrock-agentcore:ListAgentRuntimeEndpoints" in " ".join(
+            f["Finding_Details"] for f in findings
+        )
+
     def test_br47_agentcore_code_and_recording_buckets_are_on_the_data_path(self):
         """A browser with recording off adds no bucket."""
         findings = self._run(
@@ -26860,7 +26974,7 @@ class TestBR47DataPathBucketTLS:
         "unread, action",
         [
             ("batch_error", "bedrock:ListModelInvocationJobs"),
-            ("training_error", "sagemaker:ListTrainingJobs"),
+            ("training_error", "sagemaker:Search"),
             ("agentcore_error", "bedrock-agentcore:ListAgentRuntimes"),
             ("agentcore_error", "bedrock-agentcore:ListBrowsers"),
         ],
@@ -27209,6 +27323,82 @@ class TestBR47DataPathBucketTLS:
         assert action in " ".join(
             f["Finding_Details"] for f in findings if f["Status"] == "N/A"
         )
+
+    def test_br47_training_jobs_past_the_describe_cap_are_judged(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                training_jobs={
+                    "tj-new": {"OutputDataConfig": {"S3OutputPath": "s3://tls-ok/"}},
+                    "tj-old": {"OutputDataConfig": {"S3OutputPath": "s3://no-tls/"}},
+                },
+                bucket_policies=self._enforced("tls-ok"),
+            )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "no-tls" in failed[0]["Finding_Details"]
+        assert "past the newest" not in " ".join(f["Finding_Details"] for f in findings)
+        self.sagemaker_client.describe_training_job.assert_not_called()
+
+    def test_br47_batch_jobs_a_trial_component_holds_need_no_describe(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                transform_jobs={
+                    "tj-a": {},
+                    "tj-b": {},
+                    "tj-c": {"TransformOutput": {"S3OutputPath": "s3://tf-c/"}},
+                },
+                processing_jobs={"pj": {}},
+                trial_components={
+                    "transform": {
+                        "tj-a": {"TransformOutput": {"S3OutputPath": "s3://tf-a/"}},
+                        "tj-b": {"TransformOutput": {"S3OutputPath": "s3://tf-b/"}},
+                    },
+                    "processing": {
+                        "pj": {
+                            "ProcessingOutputConfig": {
+                                "Outputs": [
+                                    {
+                                        "OutputName": "out",
+                                        "S3Output": {"S3Uri": "s3://pj-out/"},
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                },
+                bucket_policies=self._enforced("tf-a", "tf-b", "tf-c"),
+            )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1 and "pj-out" in failed[0]["Finding_Details"]
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "past the newest" not in details
+        assert [
+            c.kwargs
+            for c in self.sagemaker_client.describe_transform_job.call_args_list
+        ] == [{"TransformJobName": "tj-c"}]
+        self.sagemaker_client.describe_processing_job.assert_not_called()
+
+    def test_br47_batch_jobs_no_trial_component_holds_past_the_cap_are_named(self):
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 1):
+            findings = self._run(
+                transform_jobs={
+                    "tj-a": {},
+                    "tj-b": {"TransformOutput": {"S3OutputPath": "s3://tf-b/"}},
+                    "tj-c": {},
+                },
+                trial_components={
+                    "transform": {
+                        "tj-a": {"TransformOutput": {"S3OutputPath": "s3://tf-a/"}}
+                    }
+                },
+                bucket_policies=self._enforced("tf-a", "tf-b"),
+            )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert (
+            "1 older transform job(s) past the newest 1 were not read with "
+            "sagemaker:DescribeTransformJob, and no trial component holds them"
+        ) in " ".join(f["Finding_Details"] for f in findings)
+        assert self.sagemaker_client.describe_transform_job.call_count == 1
 
     def test_br47_transform_jobs_past_the_read_cap_withhold_the_pass(self):
         cap = bedrock_app.MAX_SAGEMAKER_TRAINING_JOB_READS
@@ -33209,25 +33399,25 @@ class TestBR52DataPathObjectLock:
         training jobs alone. ``pages`` is a list of pages of {name: detail}.
         """
 
-        def list_training_jobs(**kwargs):
+        def search(**kwargs):
+            if kwargs["Resource"] == "ExperimentTrialComponent":
+                return {"Results": []}
+            assert kwargs["Resource"] == "TrainingJob"
             if list_error:
                 raise list_error
             index = int(kwargs.get("NextToken", "page-0").split("-")[1])
             response = {
-                "TrainingJobSummaries": [
-                    {"TrainingJobName": name} for name in pages[index]
+                "Results": [
+                    {"TrainingJob": {"TrainingJobName": name, **job}}
+                    for name, job in pages[index].items()
                 ]
             }
             if index + 1 < len(pages):
                 response["NextToken"] = f"page-{index + 1}"
             return response
 
-        details = {name: job for page in pages for name, job in page.items()}
         sagemaker = MagicMock()
-        sagemaker.list_training_jobs.side_effect = list_training_jobs
-        sagemaker.describe_training_job.side_effect = lambda TrainingJobName: details[
-            TrainingJobName
-        ]
+        sagemaker.search.side_effect = search
         sagemaker.list_transform_jobs.return_value = {"TransformJobSummaries": []}
         sagemaker.list_processing_jobs.return_value = {"ProcessingJobSummaries": []}
         sagemaker.list_endpoints.return_value = {"Endpoints": []}
@@ -33280,7 +33470,12 @@ class TestBR52DataPathObjectLock:
             ]
         )
         assert inventory["errors"] == []
-        assert sagemaker.describe_training_job.call_count == 2
+        assert [
+            c.kwargs.get("NextToken")
+            for c in sagemaker.search.call_args_list
+            if c.kwargs["Resource"] == "TrainingJob"
+        ] == [None, "page-1"]
+        sagemaker.describe_training_job.assert_not_called()
         _, rows = self._run(
             inventory["buckets"],
             {
@@ -33306,9 +33501,7 @@ class TestBR52DataPathObjectLock:
             {"lock-a": ["kb"]}, {"lock-a": self.COMPLIANT}, errors=inventory["errors"]
         )
         assert [r["Status"] for r in rows] == ["N/A", "N/A"]
-        assert "sagemaker:ListTrainingJobs" in " ".join(
-            r["Finding_Details"] for r in rows
-        )
+        assert "sagemaker:Search" in " ".join(r["Finding_Details"] for r in rows)
 
     def test_br52_no_data_path_bucket_is_na(self):
         _, rows = self._run({}, {})

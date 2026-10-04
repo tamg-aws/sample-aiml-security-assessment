@@ -33278,8 +33278,8 @@ def _customization_job_locations(region: str = "") -> Dict[str, Any]:
     return {"locations": locations, "errors": errors}
 
 
-# DescribeTrainingJob is one call per job, so the most recent jobs are read and
-# the rest are named as unread.
+# Describe and Get calls are one per job, so the most recent jobs a bulk read
+# does not return are read and the rest are named as unread.
 MAX_SAGEMAKER_TRAINING_JOB_READS = 200
 
 
@@ -33287,23 +33287,22 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 locations of the SageMaker training jobs in ``region``.
 
-    ListTrainingJobs summaries carry no S3 location, so each job takes one
-    DescribeTrainingJob call: every InputDataConfig channel's S3Uri is training
-    data, OutputDataConfig.S3OutputPath is output and
-    ModelArtifacts.S3ModelArtifacts is a model artifact. Every page is listed,
-    newest first, and jobs past MAX_SAGEMAKER_TRAINING_JOB_READS are named in
-    ``errors``. Each location is {"role", "uri", "job", "started"}.
+    Search with Resource TrainingJob returns each job's full description, 100
+    to a page, so every page is read and no job is capped: every
+    InputDataConfig channel's S3Uri is training data,
+    OutputDataConfig.S3OutputPath is output and ModelArtifacts.S3ModelArtifacts
+    is a model artifact. Each location is {"role", "uri", "job", "started"}.
     """
     locations = []
-    errors = []
     client = boto3.client("sagemaker", config=boto3_config, region_name=region)
     try:
-        jobs = _list_all_items(
+        results = _list_all_items(
             client,
-            "list_training_jobs",
-            "TrainingJobSummaries",
+            "search",
+            "Results",
             max_results_param="MaxResults",
             token_param="NextToken",
+            Resource="TrainingJob",
             SortBy="CreationTime",
             SortOrder="Descending",
         )
@@ -33312,27 +33311,12 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
             "locations": [],
             "errors": [
                 "SageMaker training jobs were not read with "
-                f"sagemaker:ListTrainingJobs ({get_assessment_error_label(error)})"
+                f"sagemaker:Search ({get_assessment_error_label(error)})"
             ],
         }
-    if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
-        errors.append(
-            "{} older SageMaker training job(s) past the newest {} were not read "
-            "with sagemaker:DescribeTrainingJob".format(
-                len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
-                MAX_SAGEMAKER_TRAINING_JOB_READS,
-            )
-        )
-    for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
-        name = job.get("TrainingJobName") or "unnamed"
-        try:
-            detail = client.describe_training_job(TrainingJobName=name)
-        except (ClientError, BotoCoreError) as error:
-            errors.append(
-                f"SageMaker training job '{name}' was not read with "
-                f"sagemaker:DescribeTrainingJob ({get_assessment_error_label(error)})"
-            )
-            continue
+    for result in results:
+        detail = result.get("TrainingJob") or {}
+        name = detail.get("TrainingJobName") or "unnamed"
         pairs = [
             (
                 f"training data channel '{channel.get('ChannelName') or 'unnamed'}'",
@@ -33358,14 +33342,57 @@ def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
                         "started": detail.get("CreationTime"),
                     }
                 )
-    return {"locations": locations, "errors": errors}
+    return {"locations": locations, "errors": []}
+
+
+def _trial_component_job_details(client, kind: str) -> Dict[str, Any]:
+    """
+    Map each SageMaker {kind} job name to its description, from the trial
+    component SageMaker records for it: Search with Resource
+    ExperimentTrialComponent returns SourceDetail.TransformJob or
+    SourceDetail.ProcessingJob in full, 100 to a page. A job with no trial
+    component is absent, and a failed search returns {}, so each such job is
+    left to its Describe call.
+    """
+    detail_key = {"transform": "TransformJob", "processing": "ProcessingJob"}[kind]
+    name_key = f"{detail_key}Name"
+    try:
+        results = _list_all_items(
+            client,
+            "search",
+            "Results",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            Resource="ExperimentTrialComponent",
+            SearchExpression={
+                "Filters": [
+                    {
+                        "Name": "Source.SourceArn",
+                        "Operator": "Contains",
+                        "Value": f":{kind}-job/",
+                    }
+                ]
+            },
+        )
+    except (ClientError, BotoCoreError, TypeError):
+        return {}
+    details = {}
+    for result in results:
+        detail = ((result.get("TrialComponent") or {}).get("SourceDetail") or {}).get(
+            detail_key
+        )
+        if isinstance(detail, dict) and detail.get(name_key):
+            details[detail[name_key]] = detail
+    return details
 
 
 def _sagemaker_batch_job_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 input and output of the SageMaker transform and processing
-    jobs in ``region``, newest first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs
-    of each kind; older jobs are named in ``errors``. A transform job reads
+    jobs in ``region``. Every job is listed; a job whose trial component holds
+    its description is read from that, and the rest are described, newest
+    first, to MAX_SAGEMAKER_TRAINING_JOB_READS jobs of each kind, with older
+    ones named in ``errors``. A transform job reads
     TransformInput.DataSource.S3DataSource.S3Uri and writes
     TransformOutput.S3OutputPath; a processing job reads each
     ProcessingInputs[].S3Input.S3Uri and writes each
@@ -33409,20 +33436,23 @@ def _sagemaker_batch_job_locations(region: str = "") -> Dict[str, Any]:
                 f"({get_assessment_error_label(error)})"
             )
             continue
-        if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
+        held = _trial_component_job_details(client, kind)
+        undescribed = [job for job in jobs if job.get(name_key) not in held]
+        if len(undescribed) > MAX_SAGEMAKER_TRAINING_JOB_READS:
             errors.append(
                 "{} older {} job(s) past the newest {} were not read with "
-                "sagemaker:{}".format(
-                    len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
+                "sagemaker:{}, and no trial component holds them".format(
+                    len(undescribed) - MAX_SAGEMAKER_TRAINING_JOB_READS,
                     kind,
                     MAX_SAGEMAKER_TRAINING_JOB_READS,
                     actions[1],
                 )
             )
-        for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
+        read = undescribed[:MAX_SAGEMAKER_TRAINING_JOB_READS]
+        for job in [job for job in jobs if job.get(name_key) in held] + read:
             name = job.get(name_key) or "unnamed"
             try:
-                detail = getattr(client, describe)(**{name_key: name})
+                detail = held.get(name) or getattr(client, describe)(**{name_key: name})
             except (ClientError, BotoCoreError) as error:
                 errors.append(
                     f"{kind} job '{name}' was not read with sagemaker:{actions[1]} "
@@ -33730,7 +33760,8 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
 def _agentcore_s3_locations(region: str = "") -> Dict[str, Any]:
     """
     Read the S3 buckets AgentCore reads code from or writes recordings to: the
-    code artifact of every runtime's listed version and the session recording
+    code artifact of every runtime version that is listed or that an endpoint
+    serves as its live or target version, and the session recording
     destination of every browser with recording enabled. Every page is read.
     Returns {"locations": [(bucket, label)], "errors"}.
     """
@@ -33749,32 +33780,53 @@ def _agentcore_s3_locations(region: str = "") -> Dict[str, Any]:
         )
     for runtime in runtimes:
         name = runtime.get("agentRuntimeName") or runtime.get("agentRuntimeId")
+        versions = {str(runtime.get("agentRuntimeVersion") or "")}
         try:
-            detail = client.get_agent_runtime(
+            endpoints = _list_all_items(
+                client,
+                "list_agent_runtime_endpoints",
+                "runtimeEndpoints",
                 agentRuntimeId=runtime.get("agentRuntimeId"),
-                agentRuntimeVersion=str(runtime.get("agentRuntimeVersion") or ""),
             )
-        except (ClientError, BotoCoreError) as error:
+        except (ClientError, BotoCoreError, TypeError) as error:
+            endpoints = []
             errors.append(
-                f"AgentCore runtime '{name}' was not read with "
-                f"bedrock-agentcore:GetAgentRuntime ({get_assessment_error_label(error)})"
+                f"the endpoints of AgentCore runtime '{name}' were not listed with "
+                "bedrock-agentcore:ListAgentRuntimeEndpoints, so only its listed "
+                f"version was read ({get_assessment_error_label(error)})"
             )
-            continue
-        code = (
-            (
-                (detail.get("agentRuntimeArtifact") or {}).get("codeConfiguration")
-                or {}
-            ).get("code")
-            or {}
-        ).get("s3") or {}
-        if code.get("bucket"):
-            locations.append(
-                (
-                    str(code["bucket"]),
-                    f"the code artifact of AgentCore runtime '{name}' version "
-                    f"{runtime.get('agentRuntimeVersion')}",
+        for endpoint in endpoints:
+            for field in ("liveVersion", "targetVersion"):
+                if endpoint.get(field):
+                    versions.add(str(endpoint[field]))
+        for version in sorted(version for version in versions if version):
+            try:
+                detail = client.get_agent_runtime(
+                    agentRuntimeId=runtime.get("agentRuntimeId"),
+                    agentRuntimeVersion=version,
                 )
-            )
+            except (ClientError, BotoCoreError) as error:
+                errors.append(
+                    f"AgentCore runtime '{name}' version {version} was not read with "
+                    "bedrock-agentcore:GetAgentRuntime "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            code = (
+                (
+                    (detail.get("agentRuntimeArtifact") or {}).get("codeConfiguration")
+                    or {}
+                ).get("code")
+                or {}
+            ).get("s3") or {}
+            if code.get("bucket"):
+                locations.append(
+                    (
+                        str(code["bucket"]),
+                        f"the code artifact of AgentCore runtime '{name}' version "
+                        f"{version}",
+                    )
+                )
     try:
         browsers = _list_all_items(
             client, "list_browsers", "browserSummaries", type="CUSTOM"

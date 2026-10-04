@@ -652,11 +652,12 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Sid: ManagedReadsOnWildcard2
-            # ListMicrovms has no resource type in the service authorization
+            # Neither action has a resource type in the service authorization
             # reference.
             Effect: Allow
             Action:
               - lambda:ListMicrovms # BR-57
+              - sagemaker:Search # BR-46, BR-47, BR-52
             Resource: '*'
           - Sid: MicrovmRead
             # GetMicrovm authorizes on the microvmImage resource type. A
