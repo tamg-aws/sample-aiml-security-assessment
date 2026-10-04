@@ -1657,16 +1657,25 @@ MUTATIONS = [
         "file": BEDROCK,
         "defect": "BR-34 accepts any content block as a mark, so a guarded Converse "
         "call that sent plain text passes",
-        "find": '                isinstance(block, dict) and "guardContent" in block for block in turn\n',
-        "replace": "                isinstance(block, dict) for block in turn\n",
+        "find": '                        isinstance(block, dict) and "guardContent" in block\n'
+        "                        for block in turn\n",
+        "replace": "                        isinstance(block, dict)\n"
+        "                        for block in turn\n",
     },
     {
         "name": "BR-27 and BR-34 read nothing from an S3-only log destination",
         "file": BEDROCK,
         "defect": "the S3 reader returns an empty read, so an untagged call or a "
         "grounding score in an S3-only invocation log is never seen",
-        "find": '    return _scan_invocation_log_s3(region, source["s3"], match, visit)\n',
-        "replace": '    return {"read": 0, "capped": False, "error": None, "action": "s3:GetObject"}\n',
+        "find": (
+            "    return _scan_invocation_log_s3(\n"
+            '        region, source["s3"], [(match, visit) for _, match, visit in legs]\n'
+            "    )\n"
+        ),
+        "replace": (
+            '    return [{"read": 0, "capped": False, "error": None, '
+            '"action": "s3:GetObject"} for _ in legs]\n'
+        ),
     },
     {
         "name": "BR-34 reads a large-data body as an invocation log record",
@@ -1790,7 +1799,7 @@ MUTATIONS = [
         "name": "BR-34 Converse: an earlier untagged turn not judged",
         "file": BEDROCK,
         "defect": "a Converse call tagging only its latest user turn passed",
-        "find": "            elif _untagged_user_turns(body):\n",
+        "find": '            elif call["earlier"]:\n',
         "replace": "            elif False:\n",
     },
     {
@@ -1804,7 +1813,7 @@ MUTATIONS = [
         "name": "BR-27 grounding: Converse qualifiers not read",
         "file": BEDROCK,
         "defect": "a guarded Converse call with no grounding_source qualifier passed",
-        "find": '            if not {"grounding_source", "query"} <= qualifiers:\n',
+        "find": '            if not call["qualified"]:\n',
         "replace": "            if False:\n",
     },
     {
@@ -1890,6 +1899,88 @@ MUTATIONS = [
         "defect": "the LookupEvents window missed the events of every call after the first",
         "find": '            "EndTime": max(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,\n',
         "replace": '            "EndTime": min(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,\n',
+    },
+    # ------------------------------------------- Bedrock round-9 Converse join
+    # GRD-02, GRD-09 and DET-04: a Converse call's guardrail is read from its
+    # CloudTrail event, and the scans and joins of one region run share reads.
+    {
+        "name": "Converse join: the event's guardrailConfig is ignored",
+        "file": BEDROCK,
+        "defect": "a Converse event carries its guardrail under "
+        "requestParameters.guardrailConfig, so reading only the top level calls "
+        "every guarded Converse call unguarded and an untagged one passes",
+        "find": "                    if isinstance(config, dict):\n"
+        "                        parameters = config\n",
+        "replace": "                    if False:\n"
+        "                        parameters = config\n",
+    },
+    {
+        "name": "BR-34 Converse: a CloudTrail-guarded call is not judged",
+        "file": BEDROCK,
+        "defect": "the logged request never names its guardrail, so a guarded, "
+        "untraced Converse call that sent untagged input passes",
+        "find": '            if not call["log_guarded"] and call["request_id"] not in joined["guarded"]:\n',
+        "replace": '            if not call["log_guarded"]:\n',
+    },
+    {
+        "name": "BR-27 Converse: the joined guardrail version is ignored",
+        "file": BEDROCK,
+        "defect": "a call through a version without grounding filters is judged "
+        "as if it ran through another, so an unqualified call is missed or "
+        "a call outside the population fails",
+        "find": '                or not grounds(version["guardrail"], version["version"])\n',
+        "replace": '                or not grounds(version["guardrail"], "1")\n',
+    },
+    {
+        "name": "Converse join: an old call with no event reads as recent",
+        "file": BEDROCK,
+        "defect": "a Converse call older than the event-history lag with no "
+        "CloudTrail event is counted as too recent, so its unknown guardrail no "
+        "longer holds the row at N/A",
+        "find": "            >= settled\n",
+        "replace": "            >= settled - timedelta(days=1)\n",
+    },
+    {
+        "name": "Converse join: an unguarded event reads as unread",
+        "file": BEDROCK,
+        "defect": "a Converse event that names no guardrail is reported as not "
+        "read, so every unguarded call in the account holds the row at N/A",
+        "find": '        elif entry.get("unguarded"):\n',
+        "replace": "        elif False:\n",
+    },
+    {
+        "name": "Join: the region run's page budget is not shared",
+        "file": BEDROCK,
+        "defect": "each join reads its own 50 pages per operation, so BR-27 and "
+        "BR-34 together read past the 100 pages the timeout was measured for",
+        "find": '                        GROUNDING_JOIN_BUDGET_PAGES - joins["pages"],\n',
+        "replace": "                        GROUNDING_JOIN_BUDGET_PAGES,\n",
+    },
+    {
+        "name": "Join: a call BR-27 joined is looked up again",
+        "file": BEDROCK,
+        "defect": "BR-34 rereads every Converse event BR-27 already joined, "
+        "doubling the LookupEvents pages of a region run",
+        "find": '        known = joins["resolved"].get(call["request_id"])\n',
+        "replace": "        known = None\n",
+    },
+    {
+        "name": "S3 scan: only the first leg sees each record",
+        "file": BEDROCK,
+        "defect": "one read of each S3 object serves every leg, so passing a "
+        "record to the first leg alone drops the untagged calls and Converse "
+        "calls of an S3-only destination",
+        "find": "                            if match(line, record):\n",
+        "replace": "                            if index == 0 and match(line, record):\n",
+    },
+    {
+        "name": "Capped log scan names the start of the window",
+        "file": BEDROCK,
+        "defect": "a capped scan must name the time from which matching records "
+        "were not read; without the last record's time it names the window "
+        "start and overstates what was not read",
+        "find": '                    last = max(last, event["timestamp"])\n',
+        "replace": "                    pass\n",
     },
     # ------------------------------------------- SageMaker round-6 check logic
     # SM-39's egress legs for ECS and Lambda VPCs (AIR-SLF-RT-02) and SM-43's
@@ -4648,6 +4739,33 @@ GROUPS: dict[str, str] = {
         "in the Bedrock invocation log guardrail evidence"
     ),
     "BR-27 InvokeModel: the window ends at the earliest call": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Converse join: the event's guardrailConfig is ignored": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-34 Converse: a CloudTrail-guarded call is not judged": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "BR-27 Converse: the joined guardrail version is ignored": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Converse join: an old call with no event reads as recent": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Converse join: an unguarded event reads as unread": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Join: the region run's page budget is not shared": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Join: a call BR-27 joined is looked up again": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "S3 scan: only the first leg sees each record": (
+        "in the Bedrock invocation log guardrail evidence"
+    ),
+    "Capped log scan names the start of the window": (
         "in the Bedrock invocation log guardrail evidence"
     ),
     DERIVED_PARTIAL_QUALIFIER_NAME: "in the tag column",

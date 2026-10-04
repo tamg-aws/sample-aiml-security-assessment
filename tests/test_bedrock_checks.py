@@ -44238,15 +44238,42 @@ class TestInvocationLogGuardrailEvidence:
         }
     }
 
+    # An hour old: inside the 24-hour scan and past the 15 minutes event
+    # history may lag the call.
+    RECORD_TIME = (_dt.now(_tz.utc) - _td(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _converse_event(self, request_id, guardrail=None, version="1"):
+        """
+        Record the CloudTrail event of a Converse call as event history holds
+        it: the guardrail sits under requestParameters.guardrailConfig (live
+        event f5561a4b, account 178113193057, us-east-1), never in the logged
+        request body.
+        """
+        parameters = {"modelId": "anthropic.test", "inferenceConfig": {}}
+        if guardrail:
+            parameters["guardrailConfig"] = {
+                "guardrailIdentifier": guardrail,
+                "guardrailVersion": version,
+                "trace": "enabled",
+            }
+        self.__dict__.setdefault("converse_events", {})[request_id] = {
+            "eventName": "Converse",
+            "requestID": request_id,
+            "requestParameters": parameters,
+        }
+
     def _record(self, request_id, operation="InvokeModel", inp=None, out=None):
         record = {
             "schemaType": "ModelInvocationLog",
             "requestId": request_id,
             "operation": operation,
             "modelId": "anthropic.test",
+            "timestamp": self.RECORD_TIME,
             "input": {},
             "output": {"outputBodyJson": out if out is not None else {}},
         }
+        if operation == "Converse":
+            self._converse_event(request_id)
         if inp is not ...:
             record["input"]["inputBodyJson"] = (
                 inp if inp is not None else {"prompt": self.BODY_TEXT}
@@ -44326,6 +44353,7 @@ class TestInvocationLogGuardrailEvidence:
         s3_error=None,
         guardrails=None,
         trail=None,
+        joins=None,
     ):
         """
         ``pages`` maps a filter pattern to a list of pages of records.
@@ -44333,7 +44361,13 @@ class TestInvocationLogGuardrailEvidence:
         ``guardrails`` maps (identifier, version) to a GetGuardrail detail or an
         exception. ``trail`` maps an event name to the pages LookupEvents
         returns for it, each one event or a list of events, or to an exception.
+        Unless ``trail`` names Converse, its one page holds the event of every
+        Converse record the test built.
         """
+        trail = dict(trail or {})
+        trail.setdefault(
+            "Converse", [list(self.__dict__.get("converse_events", {}).values())]
+        )
         bedrock = MagicMock()
         self.guardrail_reads = []
 
@@ -44373,7 +44407,16 @@ class TestInvocationLogGuardrailEvidence:
             index = int(nextToken or 0)
             response = {
                 "events": [
-                    {"message": json.dumps(record), "logStreamName": "s"}
+                    {
+                        "message": json.dumps(record),
+                        "logStreamName": "s",
+                        "timestamp": int(
+                            _dt.strptime(record["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+                            .replace(tzinfo=_tz.utc)
+                            .timestamp()
+                            * 1000
+                        ),
+                    }
                     for record in listed[index]
                 ]
             }
@@ -44444,7 +44487,11 @@ class TestInvocationLogGuardrailEvidence:
             "bedrock_app.boto3.client",
             side_effect=lambda service, *a, **k: clients.get(service, MagicMock()),
         ):
-            rows = extract_csv_data(check(region="us-east-1"))
+            rows = extract_csv_data(
+                check(region="us-east-1", joins=joins)
+                if joins is not None
+                else check(region="us-east-1")
+            )
         for row in rows:
             assert self.BODY_TEXT not in row["Finding_Details"]
         return rows
@@ -44551,7 +44598,10 @@ class TestInvocationLogGuardrailEvidence:
                 {"logs_error": _make_client_error("AccessDeniedException")},
                 "(logs:FilterLogEvents, AccessDeniedException)",
             ),
-            ({"endless": True}, "(page cap)"),
+            (
+                {"endless": True},
+                "past the first 0 (page cap; those logged from ",
+            ),
             (
                 {
                     "config": {
@@ -44687,10 +44737,11 @@ class TestInvocationLogGuardrailEvidence:
         body = {
             "messages": [{"role": role, "content": content} for role, content in turns]
         }
-        if guarded:
-            body["guardrailConfig"] = {"guardrailIdentifier": "g1"}
         out = {"stopReason": "guardrail_intervened" if intervened else "end_turn"}
-        return self._record(request_id, "Converse", inp=body, out=out)
+        record = self._record(request_id, "Converse", inp=body, out=out)
+        if guarded:
+            self._converse_event(request_id, "g1")
+        return record
 
     CONVERSE = '{ ($.operation = "Converse") || ($.operation = "ConverseStream") }'
     TEXT_BLOCK = {"text": "SECRET-PROMPT-TEXT"}
@@ -44776,7 +44827,12 @@ class TestInvocationLogGuardrailEvidence:
 
         assert [row["Status"] for row in rows] == ["Failed"]
         detail = rows[0]["Finding_Details"]
-        assert "2 of the 3 guarded Converse call(s)" in detail
+        assert (
+            "2 of the 3 guarded Converse call(s) logged in "
+            "/aws/bedrock/model-invocation-logs in the last 24 hours sent their "
+            "latest user turn with no guardContent block"
+        ) in detail
+        assert "but sent an earlier user turn with text" not in detail
         assert "req-c-late (Converse anthropic.test)" in detail
         assert "req-c-blocked (Converse anthropic.test)" in detail
         for other in ("req-c-ok", "req-c-unguarded", "InvokeModel call(s)"):
@@ -44847,7 +44903,11 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["Passed"]
         detail = rows[0]["Finding_Details"]
         assert "every one of the 1 guarded Converse call(s)" in detail
-        assert "counts as guarded only when" in detail
+        assert (
+            "A Converse call counts as guarded when its CloudTrail event, joined by "
+            "requestID, names a guardrailConfig, or its logged response carries a "
+            "guardrail trace or intervention."
+        ) in detail
         assert "0 user turn(s) of the guarded Converse calls held only toolResult" in (
             detail
         )
@@ -44966,7 +45026,11 @@ class TestInvocationLogGuardrailEvidence:
         )
 
         assert [row["Status"] for row in rows] == ["N/A"]
-        assert "(object cap)" in rows[0]["Finding_Details"]
+        assert (
+            "past the first 1 (object cap; those logged from "
+            + _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:00:00Z")
+            + " on were not all read)"
+        ) in rows[0]["Finding_Details"]
 
     def test_s3_only_grounding_scores_are_read(self):
         rows = self._grounding(
@@ -45006,14 +45070,11 @@ class TestInvocationLogGuardrailEvidence:
             for qualifier in qualifiers
         ]
         body = {"messages": [{"role": "user", "content": blocks or [self.TEXT_BLOCK]}]}
-        if guardrail:
-            body["guardrailConfig"] = {
-                "guardrailIdentifier": guardrail,
-                "guardrailVersion": version,
-            }
-        return self._record(
+        record = self._record(
             request_id, "Converse", inp=body, out={"stopReason": "end_turn"}
         )
+        self._converse_event(request_id, guardrail, version)
+        return record
 
     def _grounding_guardrails(self, **overrides):
         return {
@@ -45079,9 +45140,10 @@ class TestInvocationLogGuardrailEvidence:
                 "(AccessDeniedException)",
             ),
             (
-                "no-config",
-                "names no guardrailConfig, so which guardrail version ran is not "
-                "logged",
+                "no-event",
+                "req-u (Converse anthropic.test), which has no CloudTrail event with "
+                "its requestID in cloudtrail:LookupEvents within 5 minutes of the "
+                "logged calls, so which guardrail ran is not known",
             ),
         ],
     )
@@ -45091,8 +45153,11 @@ class TestInvocationLogGuardrailEvidence:
             guardrails[("gr-g", "1")] = _make_client_error("AccessDeniedException")
             call = self._qualified("req-u", ["grounding_source", "query"])
         else:
+            # An intervened call with no event in event history: which
+            # guardrail version ran is not known.
             call = self._converse("req-u", [("user", [self.TEXT_BLOCK])], guarded=False)
             call["output"]["outputBodyJson"]["stopReason"] = "guardrail_intervened"
+            del self.converse_events["req-u"]
         rows = self._grounding(
             {
                 self.GROUNDING: [[self._scored("req-s", 0.4)]],
@@ -45193,9 +45258,9 @@ class TestInvocationLogGuardrailEvidence:
         [
             (
                 "bare",
-                "which sent no grounding tag and has no CloudTrail event with its "
-                "requestID in cloudtrail:LookupEvents within 5 minutes of the "
-                "logged calls, so which guardrail ran is not known",
+                "which has no CloudTrail event with its requestID in "
+                "cloudtrail:LookupEvents within 5 minutes of the logged calls, so "
+                "which guardrail ran is not known",
             ),
             (
                 "no-suffix",
@@ -45344,8 +45409,9 @@ class TestInvocationLogGuardrailEvidence:
         assert "20 of the 20 guarded InvokeModel call(s)" in detail
         assert (
             "10 untagged guarded InvokeModel call(s) were not matched to CloudTrail "
-            "within the first 2 LookupEvents pages of their window, so their "
-            "guardrail is not known: req-20 (InvokeModel anthropic.test)"
+            "within the LookupEvents page cap (2 pages per operation, 100 per "
+            "region run), so their guardrail is not known: req-20 (InvokeModel "
+            "anthropic.test)"
         ) in detail
         assert len(self.trail_requests) == 2
 
@@ -45407,6 +45473,255 @@ class TestInvocationLogGuardrailEvidence:
         )
 
         assert [row["Status"] for row in rows] == ["N/A"]
+
+    # GRD-02, GRD-09, DET-04: Bedrock logs no guardrailConfig in a Converse
+    # request body; the call's CloudTrail event carries it, joined by requestID.
+    def test_a_converse_call_guarded_only_in_cloudtrail_is_judged(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse("req-c-g", [("user", [self.TEXT_BLOCK])]),
+                        self._converse(
+                            "req-c-u", [("user", [self.TEXT_BLOCK])], guarded=False
+                        ),
+                    ]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 1 guarded Converse call(s)" in detail
+        assert "req-c-g (Converse anthropic.test)" in detail
+        assert "req-c-u" not in detail
+        assert {request["name"] for request in self.trail_requests} == {"Converse"}
+
+    def test_a_converse_stream_call_is_joined_on_its_own_event_name(self):
+        record = self._converse("req-s-g", [("user", [self.TEXT_BLOCK])])
+        record["operation"] = "ConverseStream"
+        event = self.converse_events.pop("req-s-g")
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [[record]],
+            },
+            trail={"Converse": [], "ConverseStream": [[event]]},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "req-s-g (ConverseStream anthropic.test)" in rows[0]["Finding_Details"]
+        assert [request["name"] for request in self.trail_requests] == [
+            "ConverseStream"
+        ]
+
+    def test_a_logged_intervention_needs_no_join(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse(
+                            "req-c-i",
+                            [("user", [self.GUARD_BLOCK])],
+                            guarded=False,
+                            intervened=True,
+                        )
+                    ]
+                ],
+            },
+            trail={"Converse": _make_client_error("AccessDeniedException")},
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "every one of the 1 guarded Converse call(s)"
+            in (rows[0]["Finding_Details"])
+        )
+        assert self.trail_requests == []
+
+    def test_a_converse_call_without_an_event_withholds_the_pass(self):
+        old = self._converse("req-c-old", [("user", [self.GUARD_BLOCK])])
+        recent = self._converse("req-c-new", [("user", [self.TEXT_BLOCK])])
+        recent["timestamp"] = (_dt.now(_tz.utc) - _td(minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        del self.converse_events["req-c-old"], self.converse_events["req-c-new"]
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [[old, recent]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "req-c-old (Converse anthropic.test), which has no CloudTrail event "
+            "with its requestID in cloudtrail:LookupEvents within 5 minutes"
+        ) in detail
+        assert (
+            "1 Converse call(s) logged within the last 15 minutes have no "
+            "CloudTrail event in event history yet, which lags the call, and were "
+            "not judged: req-c-new (Converse anthropic.test)."
+        ) in detail
+
+    def test_a_recent_unjoined_converse_call_is_counted_not_withheld(self):
+        recent = self._converse("req-c-new", [("user", [self.TEXT_BLOCK])])
+        recent["timestamp"] = (_dt.now(_tz.utc) - _td(minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        del self.converse_events["req-c-new"]
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])]), recent]
+                ],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "every one of the 1 guarded Converse call(s)" in detail
+        assert "1 Converse call(s) logged within the last 15 minutes" in detail
+
+    def test_a_converse_call_past_the_join_budget_is_na_with_a_count(self):
+        joins = {"resolved": {}, "pages": bedrock_app.GROUNDING_JOIN_BUDGET_PAGES}
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [
+                        self._converse("req-c-a", [("user", [self.GUARD_BLOCK])]),
+                        self._converse("req-c-b", [("user", [self.GUARD_BLOCK])]),
+                    ]
+                ],
+            },
+            joins=joins,
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "2 Converse call(s) not matched to CloudTrail within the LookupEvents "
+            "page cap (50 pages per operation, 100 per region run), so whether a "
+            "guardrail ran is not known: req-c-a (Converse anthropic.test), "
+            "req-c-b (Converse anthropic.test)"
+        ) in rows[0]["Finding_Details"]
+        assert self.trail_requests == []
+
+    def test_br34_reuses_the_events_br27_joined(self):
+        joins = {"resolved": {}, "pages": 0}
+        pages = {
+            self.GROUNDING: [[self._scored("req-s", 0.4)]],
+            self.CONVERSE: [
+                [
+                    self._converse("req-c-g", [("user", [self.TEXT_BLOCK])]),
+                    self._converse(
+                        "req-c-u", [("user", [self.TEXT_BLOCK])], guarded=False
+                    ),
+                ]
+            ],
+        }
+        self._grounding(pages, guardrails={("g1", "1"): {"guardrail": {}}}, joins=joins)
+        first = len(self.trail_requests)
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                **pages,
+            },
+            joins=joins,
+        )
+
+        assert first == 1
+        assert self.trail_requests == []
+        assert joins["pages"] == 1
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "req-c-g (Converse anthropic.test)" in detail
+        assert "req-c-u" not in detail
+
+    def test_the_converse_guardrail_version_comes_from_the_event(self):
+        guardrails = self._grounding_guardrails()
+        guardrails[("gr-g", "3")] = {"guardrail": {"contentPolicy": {"filters": []}}}
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.CONVERSE: [
+                    [
+                        self._qualified("req-v3", [], version="3"),
+                        self._qualified("req-v1", [], version="1"),
+                    ]
+                ],
+            },
+            guardrails=guardrails,
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 1 guarded Converse call(s)" in detail
+        assert "req-v1 (Converse anthropic.test)" in detail
+        assert "req-v3" not in detail
+        assert sorted(set(self.guardrail_reads)) == [("gr-g", "1"), ("gr-g", "3")]
+
+    def test_an_s3_object_is_read_once_for_every_leg(self):
+        rows = self._prompt(
+            {},
+            config=self.S3_CONFIG,
+            s3_objects={
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz": self._s3_body(
+                    [
+                        self._catch("req-catch"),
+                        self._guarded("req-ok", True),
+                        self._converse("req-c-ok", [("user", [self.GUARD_BLOCK])]),
+                    ]
+                ),
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz": self._s3_body(
+                    [self._guarded("req-untagged", False)]
+                ),
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "1 of the 2 guarded InvokeModel call(s)" in detail
+        assert "req-untagged" in detail
+        assert "1 prompt attack block(s)" in detail
+        assert sorted(self.s3_gets) == sorted(
+            [
+                self.S3_ROOT + self.S3_HOUR + "a.json.gz",
+                self.S3_ROOT + self.S3_HOUR + "b.json.gz",
+            ]
+        )
+
+    def test_a_capped_log_scan_names_the_time_it_stopped_at(self, monkeypatch):
+        monkeypatch.setattr(bedrock_app, "INVOCATION_LOG_SCAN_MAX_PAGES", 1)
+        early = self._guarded("req-a", True)
+        early["timestamp"] = "2026-10-04T13:40:00Z"
+        late = self._guarded("req-b", True)
+        late["timestamp"] = "2026-10-04T13:45:07Z"
+        unread = self._guarded("req-c", False)
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[early, late], [unread]],
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "records matching amazon-bedrock-guardrailAction in "
+            "/aws/bedrock/model-invocation-logs past the first 2 (page cap; those logged from 2026-10-04T13:45:07Z on "
+            "were not all read)"
+        ) in rows[0]["Finding_Details"]
 
 
 class TestBR04AgentMemoryRetention:

@@ -20352,6 +20352,14 @@ CONTEXTUAL_GROUNDING_CEILING = (
 # to 100 KB each, so the page size bounds the memory one page takes.
 INVOCATION_LOG_SCAN_PAGE_SIZE = 25
 
+# Measured on /aws/bedrock/model-invocation-logs (account 178113193057,
+# us-east-1, 2026-10-04): 72 filtered pages over the last 24 hours took 0.55 s
+# on average, 0.96 s at the 90th percentile and 1.69 s at most, and the first
+# call of a cold client 3.24 s. That group logged 8,454 records in those 24
+# hours, and each pattern read all of them in 8 pages, mostly empty. Ten pages
+# cost at most about 17 s per pattern; BR-34 and BR-27 read six patterns, about
+# 101 s of the function's 600 s timeout. A capped read names the time from
+# which matching records were not read, and holds the row at N/A.
 INVOCATION_LOG_SCAN_MAX_PAGES = 10
 
 INVOCATION_LOG_SCAN_LOOKBACK = timedelta(hours=24)
@@ -20390,8 +20398,10 @@ def _scan_invocation_log(
     """
     Pass each invocation log record of the last 24 hours that matches
     ``pattern`` to ``visit``, one page at a time, so no page is kept. Returns
-    the count read, whether the page cap stopped the read, and the error label
-    of a failed read.
+    the count read, whether the page cap stopped the read, the error label of a
+    failed read, and, for a capped read, ``unread_from``: the time of the last
+    record read, or the start of the window, from which on matching records
+    were not all read. FilterLogEvents returns events in timestamp order.
     """
     client = boto3.client("logs", config=boto3_config, region_name=region)
     start = int(
@@ -20404,10 +20414,13 @@ def _scan_invocation_log(
         "limit": INVOCATION_LOG_SCAN_PAGE_SIZE,
     }
     read = 0
+    last = start
     try:
         for _ in range(INVOCATION_LOG_SCAN_MAX_PAGES):
             response = client.filter_log_events(**request)
             for event in response.get("events") or []:
+                if isinstance(event.get("timestamp"), int):
+                    last = max(last, event["timestamp"])
                 try:
                     record = json.loads(event.get("message") or "")
                 except ValueError:
@@ -20425,36 +20438,60 @@ def _scan_invocation_log(
             "capped": False,
             "error": get_assessment_error_label(error),
         }
-    return {"read": read, "capped": True, "error": None}
+    return {
+        "read": read,
+        "capped": True,
+        "error": None,
+        "unread_from": datetime.fromtimestamp(last / 1000, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    }
 
 
 # An S3-only invocation log destination is read through at most this many
 # record objects, each a gzip file of JSON lines under the hour folder of
 # AWSLogs/<account>/BedrockModelInvocationLogs/<region>/YYYY/MM/DD/HH/.
+# Measured on the large-data objects under that layout in
+# soc-cloudtrail-logs-178113193057-useast1 (account 178113193057, us-east-1,
+# 2026-10-04; the account delivers no record objects to S3): ListObjectsV2 of
+# an hour folder took 0.12 s on average and 0.97 s at most (30 calls), and
+# GetObject plus gunzip of a 100 KB object 0.15 s on average and 0.61 s at most
+# (30 calls), 0.29 s to 0.40 s for a 1.9 MB one (10 calls). The 25 hour folders
+# and 40 objects cost at most about 49 s per check, because each object is read
+# once for every leg of the check, so BR-34 and BR-27 take about 97 s of the
+# function's 600 s timeout. A capped read names the hour from which records
+# were not all read, and holds the row at N/A.
 INVOCATION_LOG_S3_MAX_OBJECTS = 40
 
 
 def _scan_invocation_log_s3(
     region: str,
     target: Dict[str, str],
-    match: Callable[[str, Dict[str, Any]], bool],
-    visit: Callable[[Dict[str, Any]], None],
-) -> Dict[str, Any]:
+    legs: List[tuple],
+) -> List[Dict[str, Any]]:
     """
     Pass each record of the last 24 hours in the S3 invocation log destination
-    that ``match`` accepts to ``visit``. The hour folders are UTC. Large-data
-    bodies under data/ are not records and are skipped. Returns the same
-    summary as _scan_invocation_log, with the action a failed read needed.
+    to the visit of every (match, visit) leg whose match accepts it, so each
+    object is read once for all legs. The hour folders are UTC. Large-data
+    bodies under data/ are not records and are skipped. Returns one summary
+    per leg, as _scan_invocation_log does, with the action a failed read
+    needed; ``unread_from`` of a capped read is the start of the hour folder
+    the cap stopped in.
     """
     client = boto3.client("s3", config=boto3_config, region_name=region)
     now = datetime.now(timezone.utc)
     start = now - INVOCATION_LOG_SCAN_LOOKBACK
     hour = start.replace(minute=0, second=0, microsecond=0)
-    read = 0
+    reads = [0] * len(legs)
     objects = 0
     action = "s3:ListBucket"
+
+    def summaries(**state):
+        return [{"read": read, "action": action, **state} for read in reads]
+
     try:
         while hour <= now:
+            folder = hour
             request = {
                 "Bucket": target["bucket"],
                 "Prefix": target["root"] + hour.strftime("%Y/%m/%d/%H/"),
@@ -20468,12 +20505,11 @@ def _scan_invocation_log_s3(
                     if "/data/" in key[len(request["Prefix"]) - 1 :]:
                         continue
                     if objects >= INVOCATION_LOG_S3_MAX_OBJECTS:
-                        return {
-                            "read": read,
-                            "capped": True,
-                            "error": None,
-                            "action": action,
-                        }
+                        return summaries(
+                            capped=True,
+                            error=None,
+                            unread_from=folder.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        )
                     objects += 1
                     action = "s3:GetObject"
                     raw = client.get_object(Bucket=target["bucket"], Key=key)[
@@ -20486,7 +20522,7 @@ def _scan_invocation_log_s3(
                             record = json.loads(line)
                         except ValueError:
                             continue
-                        if not isinstance(record, dict) or not match(line, record):
+                        if not isinstance(record, dict):
                             continue
                         stamp = record.get("timestamp")
                         try:
@@ -20495,8 +20531,10 @@ def _scan_invocation_log_s3(
                             when = None
                         if when and when.replace(tzinfo=timezone.utc) < start:
                             continue
-                        read += 1
-                        visit(record)
+                        for index, (match, visit) in enumerate(legs):
+                            if match(line, record):
+                                reads[index] += 1
+                                visit(record)
                 token = response.get("NextContinuationToken")
                 if response.get("IsTruncated") is not True or not isinstance(
                     token, str
@@ -20504,13 +20542,30 @@ def _scan_invocation_log_s3(
                     break
                 request["ContinuationToken"] = token
     except (ClientError, BotoCoreError, OSError, EOFError) as error:
-        return {
-            "read": read,
-            "capped": False,
-            "error": get_assessment_error_label(error),
-            "action": action,
-        }
-    return {"read": read, "capped": False, "error": None, "action": action}
+        return summaries(capped=False, error=get_assessment_error_label(error))
+    return summaries(capped=False, error=None)
+
+
+def _scan_invocation_legs(
+    region: str, source: Dict[str, Any], legs: List[tuple]
+) -> List[Dict[str, Any]]:
+    """
+    Read the invocation log records of the last 24 hours for each
+    (pattern, match, visit) leg, from the CloudWatch Logs group when one is
+    configured, one filtered read per pattern, or else from the S3
+    destination, one read of each object for every leg's match. Returns one
+    summary per leg.
+    """
+    if source["log_group"]:
+        scans = []
+        for pattern, _, visit in legs:
+            scan = _scan_invocation_log(region, source["log_group"], pattern, visit)
+            scan["action"] = "logs:FilterLogEvents"
+            scans.append(scan)
+        return scans
+    return _scan_invocation_log_s3(
+        region, source["s3"], [(match, visit) for _, match, visit in legs]
+    )
 
 
 def _scan_invocation_records(
@@ -20525,11 +20580,7 @@ def _scan_invocation_records(
     Logs group when one is configured, or else from the S3 destination.
     ``pattern`` filters the log group and ``match`` filters S3 records.
     """
-    if source["log_group"]:
-        scan = _scan_invocation_log(region, source["log_group"], pattern, visit)
-        scan["action"] = "logs:FilterLogEvents"
-        return scan
-    return _scan_invocation_log_s3(region, source["s3"], match, visit)
+    return _scan_invocation_legs(region, source, [(pattern, match, visit)])[0]
 
 
 def _nested_dicts(value: Any):
@@ -20595,7 +20646,11 @@ def _invoke_grounding_tags(body: Any) -> Optional[Set[str]]:
 # An InvokeModel call names its guardrail in request headers, which the
 # invocation log omits and CloudTrail's requestParameters record, so untagged
 # calls are joined to their events by requestID: one LookupEvents stream per
-# operation name, over the span of the calls widened by this window.
+# operation name, over the span of the calls widened by this window. A Converse
+# call's guardrailConfig is absent from its logged request body too, and its
+# event carries it as requestParameters.guardrailConfig (record and event
+# f5561a4b, account 178113193057, us-east-1, read 2026-10-04), so Converse and
+# ConverseStream calls are joined the same way.
 GROUNDING_JOIN_WINDOW = timedelta(minutes=5)
 
 # A live LookupEvents page of 50 events took 0.30 s to 0.60 s warm and 1.06 s
@@ -20605,21 +20660,46 @@ GROUNDING_JOIN_WINDOW = timedelta(minutes=5)
 # per operation.
 GROUNDING_JOIN_MAX_PAGES = 50
 
+# Every join of one region's run, BR-27's and BR-34's, draws on this many
+# pages, so joining Converse calls keeps the run at the 100 pages BR-27 alone
+# could read before. Measured again with this function's adaptive retry config
+# (account 178113193057, us-east-1, 2026-10-04): 57 back-to-back pages over the
+# four runtime operations took 0.41 s on average and 1.6 s at most, so 100
+# pages cost about 41 s and at most about 160 s of the 600 s timeout. One page
+# of 13 in an earlier run with the default retry config took 17.7 s.
+GROUNDING_JOIN_BUDGET_PAGES = 100
 
-def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+
+def _invoke_call_guardrails(
+    region: str,
+    calls: List[Dict[str, Any]],
+    joins: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Join each call {"label", "request_id", "operation", "time"} to the
     CloudTrail event with its requestID. Each operation is one LookupEvents
     stream by EventName, from GROUNDING_JOIN_WINDOW before its earliest call to
     GROUNDING_JOIN_WINDOW after its latest, paged until every call is matched,
-    the stream ends or GROUNDING_JOIN_MAX_PAGES pages are read. Returns
-    {"resolved": {request_id: {"guardrail", "version"} or {"reason"}},
-    "capped": [labels unmatched when the page cap stopped the stream]}.
+    the stream ends, GROUNDING_JOIN_MAX_PAGES pages are read or the run's
+    GROUNDING_JOIN_BUDGET_PAGES are spent. ``joins`` ({"resolved", "pages"})
+    is shared by every join of one region's run, so a call joined before is not
+    looked up again. Returns {"resolved": {request_id: {"guardrail",
+    "version"} or {"reason"}}, "capped": [labels unmatched when a page cap
+    stopped the stream]}. A reason carries "unguarded" when the event names no
+    guardrail, and "missing" when the stream holds no event for the call.
     """
-    resolved: Dict[str, Dict[str, str]] = {}
+    joins = joins if joins is not None else {"resolved": {}, "pages": 0}
+    resolved: Dict[str, Dict[str, Any]] = {}
     capped = []
     by_operation: Dict[str, List[tuple]] = {}
     for call in calls:
+        known = joins["resolved"].get(call["request_id"])
+        if known is not None:
+            if known.get("capped"):
+                capped.append(call["label"])
+            else:
+                resolved[call["request_id"]] = known
+            continue
         try:
             when = datetime.strptime(call["time"], "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc
@@ -20641,14 +20721,24 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
             "EndTime": max(when for when, _ in timed) + GROUNDING_JOIN_WINDOW,
             "MaxResults": 50,
         }
-        unmatched = (
-            "which sent no grounding tag and has no CloudTrail event with its "
-            "requestID in cloudtrail:LookupEvents within "
+        unmatched = {
+            "reason": "which has no CloudTrail event with its requestID in "
+            "cloudtrail:LookupEvents within "
             f"{int(GROUNDING_JOIN_WINDOW.total_seconds() // 60)} minutes of the "
-            "logged calls, so which guardrail ran is not known"
-        )
+            "logged calls, so which guardrail ran is not known",
+            "missing": True,
+        }
         try:
-            for _ in range(GROUNDING_JOIN_MAX_PAGES):
+            for _ in range(
+                max(
+                    0,
+                    min(
+                        GROUNDING_JOIN_MAX_PAGES,
+                        GROUNDING_JOIN_BUDGET_PAGES - joins["pages"],
+                    ),
+                )
+            ):
+                joins["pages"] += 1
                 response = client.lookup_events(**request)
                 if not isinstance(response, dict):
                     raise TypeError("LookupEvents returned no response object")
@@ -20664,6 +20754,9 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
                         continue
                     pending.discard(request_id)
                     parameters = detail.get("requestParameters") or {}
+                    config = parameters.get("guardrailConfig")
+                    if isinstance(config, dict):
+                        parameters = config
                     guardrail = parameters.get("guardrailIdentifier")
                     resolved[request_id] = (
                         {
@@ -20676,7 +20769,8 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
                         if guardrail
                         else {
                             "reason": "whose CloudTrail event names no "
-                            "guardrailIdentifier"
+                            "guardrailIdentifier",
+                            "unguarded": True,
                         }
                     )
                 next_token = response.get("NextToken")
@@ -20684,24 +20778,28 @@ def _invoke_call_guardrails(region: str, calls: List[Dict[str, Any]]) -> Dict[st
                     break
                 request["NextToken"] = next_token
             else:
-                capped.extend(
-                    call["label"] for _, call in timed if call["request_id"] in pending
-                )
+                for _, call in timed:
+                    if call["request_id"] in pending:
+                        capped.append(call["label"])
+                        joins["resolved"][call["request_id"]] = {"capped": True}
                 pending = set()
         except (ClientError, BotoCoreError, TypeError) as error:
-            unmatched = (
-                "whose CloudTrail event was not read (cloudtrail:LookupEvents, "
+            unmatched = {
+                "reason": "whose CloudTrail event was not read "
+                "(cloudtrail:LookupEvents, "
                 f"{get_assessment_error_label(error)})"
-            )
+            }
         for request_id in pending:
-            resolved[request_id] = {"reason": unmatched}
+            resolved[request_id] = dict(unmatched)
+    joins["resolved"].update(resolved)
     return {"resolved": resolved, "capped": capped}
 
 
-def _converse_guarded(body: Any, output: Any) -> bool:
-    """Whether a logged Converse call names or reports a guardrail."""
-    if isinstance(body, dict) and body.get("guardrailConfig"):
-        return True
+def _converse_guarded(output: Any) -> bool:
+    """
+    Whether a logged Converse response reports a guardrail: a guardrail trace
+    or an intervention. The logged request never names its guardrailConfig.
+    """
     for item in _nested_dicts(output):
         trace = item.get("trace")
         if item.get("stopReason") == "guardrail_intervened" or (
@@ -20709,6 +20807,96 @@ def _converse_guarded(body: Any, output: Any) -> bool:
         ):
             return True
     return False
+
+
+def _converse_call_guardrails(
+    region: str, calls: List[Dict[str, Any]], joins: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Join logged Converse calls {"label", "request_id", "operation", "time"} to
+    their CloudTrail events and sort them: "guarded" maps a request ID to its
+    {"guardrail", "version"}, "unguarded" holds the request IDs whose event
+    names no guardrailConfig, "recent" the labels of calls logged within
+    INFERENCE_TRACE_SETTLE whose event is not in event history yet, "unread"
+    the label and reason of every other call whose guardrail is not known, and
+    "capped" the labels a LookupEvents page cap left unmatched.
+    """
+    settled = datetime.now(timezone.utc) - INFERENCE_TRACE_SETTLE
+    sorted_calls = {
+        "guarded": {},
+        "unguarded": set(),
+        "recent": [],
+        "unread": [],
+        "capped": [],
+    }
+    joinable = []
+    for call in calls:
+        if call["request_id"]:
+            joinable.append(call)
+        else:
+            sorted_calls["unread"].append(
+                f"{call['label']}, which logs no request ID to join to CloudTrail"
+            )
+    if not joinable:
+        return sorted_calls
+    joined = _invoke_call_guardrails(region, joinable, joins)
+    sorted_calls["capped"] = joined["capped"]
+    for call in joinable:
+        entry = joined["resolved"].get(call["request_id"])
+        if entry is None:
+            continue
+        if "guardrail" in entry:
+            sorted_calls["guarded"][call["request_id"]] = entry
+        elif entry.get("unguarded"):
+            sorted_calls["unguarded"].add(call["request_id"])
+        elif (
+            entry.get("missing")
+            and datetime.strptime(call["time"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            >= settled
+        ):
+            sorted_calls["recent"].append(call["label"])
+        else:
+            sorted_calls["unread"].append(f"{call['label']}, {entry['reason']}")
+    return sorted_calls
+
+
+def _converse_join_notes(
+    sorted_calls: Dict[str, Any], what: str
+) -> Tuple[List[str], str]:
+    """
+    Return the not-read entries for Converse calls whose guardrail the join did
+    not establish, and the sentence counting the calls too recent to judge.
+    ``what`` names what an unmatched call leaves unknown.
+    """
+    unread = list(sorted_calls["unread"])
+    if sorted_calls["capped"]:
+        unread.insert(
+            0,
+            "{} Converse call(s) not matched to CloudTrail within the LookupEvents "
+            "page cap ({} pages per operation, {} per region run), so {} is not "
+            "known: {}".format(
+                len(sorted_calls["capped"]),
+                GROUNDING_JOIN_MAX_PAGES,
+                GROUNDING_JOIN_BUDGET_PAGES,
+                what,
+                ", ".join(sorted_calls["capped"][:5]),
+            ),
+        )
+    recent = sorted_calls["recent"]
+    note = (
+        " {} Converse call(s) logged within the last {} minutes have no CloudTrail "
+        "event in event history yet, which lags the call, and were not judged: "
+        "{}.".format(
+            len(recent),
+            int(INFERENCE_TRACE_SETTLE.total_seconds() // 60),
+            ", ".join(recent[:5]),
+        )
+        if recent
+        else ""
+    )
+    return unread, note
 
 
 def _tool_result_only(content: Any) -> bool:
@@ -21050,12 +21238,16 @@ def check_guardduty_prompt_injection_detection(region: str = "") -> Dict[str, An
 
 def check_guardrail_prompt_attack_invocation_evidence(
     region: str = "",
+    joins: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-34: Read the last 24 hours of invocation log records for a prompt attack
     the guardrail blocked, and for guarded InvokeModel calls whose input carries
     no guardrail input tag, which the prompt attack filter does not evaluate.
-    Only request IDs, operations and model IDs are reported, never a body.
+    A Converse call is guarded when its CloudTrail event names a guardrailConfig
+    or its response reports a guardrail. ``joins`` is the region run's shared
+    CloudTrail join state. Only request IDs, operations and model IDs are
+    reported, never a body.
     """
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html"
     findings = {
@@ -21095,6 +21287,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
         catches = []
         guarded = []
         untagged = []
+        converse_calls = []
         converse_guarded = []
         converse_untagged = []
         converse_partial = []
@@ -21139,54 +21332,79 @@ def check_guardrail_prompt_attack_invocation_evidence(
                     "amazon-bedrock-guardrailConfig to match its input tag against"
                 )
 
+        # The logged request never names its guardrailConfig, so each call's
+        # turn verdict is kept and its guardrail is read from CloudTrail below.
         def visit_converse(record):
             if record.get("operation") not in CONVERSE_OPERATIONS:
                 return
             body = (record.get("input") or {}).get("inputBodyJson")
             output = (record.get("output") or {}).get("outputBodyJson")
-            if not _converse_guarded(body, output):
-                return
-            label = label_of(record)
-            converse_guarded.append(label)
-            tool_result_turns[0] += _tool_result_only_turns(body)
             turn = _latest_user_turn(body)
-            if turn is None:
+            converse_calls.append(
+                {
+                    "label": label_of(record),
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                    "log_guarded": _converse_guarded(output),
+                    "tool_turns": _tool_result_only_turns(body),
+                    "turn": None
+                    if turn is None
+                    else any(
+                        isinstance(block, dict) and "guardContent" in block
+                        for block in turn
+                    ),
+                    "earlier": _untagged_user_turns(body),
+                }
+            )
+
+        catch_scan, tag_scan, converse_scan = _scan_invocation_legs(
+            region,
+            source,
+            [
+                (
+                    '"PROMPT_ATTACK"',
+                    lambda line, record: "PROMPT_ATTACK" in line,
+                    visit_catch,
+                ),
+                (
+                    f'"{GUARDRAIL_ACTION_FIELD}"',
+                    lambda line, record: GUARDRAIL_ACTION_FIELD in line,
+                    visit_guarded,
+                ),
+                (
+                    CONVERSE_LOG_PATTERN,
+                    lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
+                    visit_converse,
+                ),
+            ],
+        )
+        joined = _converse_call_guardrails(
+            region, [call for call in converse_calls if not call["log_guarded"]], joins
+        )
+        for call in converse_calls:
+            if not call["log_guarded"] and call["request_id"] not in joined["guarded"]:
+                continue
+            label = call["label"]
+            converse_guarded.append(label)
+            tool_result_turns[0] += call["tool_turns"]
+            if call["turn"] is None:
                 unread.append(
                     f"{label}, whose logged request holds no user turn other than "
                     "tool results"
                 )
-            elif not any(
-                isinstance(block, dict) and "guardContent" in block for block in turn
-            ):
+            elif not call["turn"]:
                 converse_untagged.append(label)
-            elif _untagged_user_turns(body):
+            elif call["earlier"]:
                 converse_partial.append(
                     "{}, message(s) {}".format(
-                        label, ", ".join(str(n) for n in _untagged_user_turns(body))
+                        label, ", ".join(str(n) for n in call["earlier"])
                     )
                 )
-
-        catch_scan = _scan_invocation_records(
-            region,
-            source,
-            '"PROMPT_ATTACK"',
-            lambda line, record: "PROMPT_ATTACK" in line,
-            visit_catch,
+        join_unread, recent_note = _converse_join_notes(
+            joined, "whether a guardrail ran"
         )
-        tag_scan = _scan_invocation_records(
-            region,
-            source,
-            f'"{GUARDRAIL_ACTION_FIELD}"',
-            lambda line, record: GUARDRAIL_ACTION_FIELD in line,
-            visit_guarded,
-        )
-        converse_scan = _scan_invocation_records(
-            region,
-            source,
-            CONVERSE_LOG_PATTERN,
-            lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
-            visit_converse,
-        )
+        unread.extend(join_unread)
         where = source["where"]
         cap = "page cap" if source["log_group"] else "object cap"
         for scan, what in (
@@ -21202,7 +21420,8 @@ def check_guardrail_prompt_attack_invocation_evidence(
             elif scan["capped"]:
                 unread.append(
                     f"records matching {what} in {where} past the first "
-                    f"{scan['read']} ({cap})"
+                    f"{scan['read']} ({cap}; those logged from "
+                    f"{scan['unread_from']} on were not all read)"
                 )
         unread_note = " Not read: {}.".format("; ".join(unread[:5])) if unread else ""
         catch_note = (
@@ -21213,16 +21432,16 @@ def check_guardrail_prompt_attack_invocation_evidence(
             else "No PROMPT_ATTACK block was logged in the last 24 hours."
         )
         guarded_scope = (
-            "A Converse call counts as guarded only when its logged request "
-            "names guardrailConfig or its response carries a guardrail trace or "
-            "intervention."
+            "A Converse call counts as guarded when its CloudTrail event, joined "
+            "by requestID, names a guardrailConfig, or its logged response "
+            "carries a guardrail trace or intervention."
         )
         tool_result_note = (
             " {} user turn(s) of the guarded Converse calls held only toolResult "
             "blocks and were not judged, because a guardContent block cannot wrap "
             "a tool result. Per-turn InvokeGuardrailChecks calls are not judged, "
-            "because CloudTrail does not record them as management events.".format(
-                tool_result_turns[0]
+            "because CloudTrail does not record them as management events.{}".format(
+                tool_result_turns[0], recent_note
             )
         )
         if untagged or converse_untagged or converse_partial:
@@ -21345,11 +21564,14 @@ def check_guardrail_prompt_attack_invocation_evidence(
         return findings
 
 
-def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]:
+def check_guardrail_grounding_score_evidence(
+    region: str = "", joins: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     BR-27: Confirm invocation logging captures response bodies, where a traced
     guardrail response carries its contextual grounding scores, and read the
     last 24 hours of records for a scored GROUNDING or RELEVANCE assessment.
+    ``joins`` is the region run's shared CloudTrail join state.
     """
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-contextual-grounding-check.html"
     findings = {
@@ -21415,13 +21637,6 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     )
 
         log_group = source["where"]
-        scan = _scan_invocation_records(
-            region,
-            source,
-            '"contextualGroundingPolicy"',
-            lambda line, record: "contextualGroundingPolicy" in line,
-            visit,
-        )
 
         # The grounding filter scores a Converse call only when the caller
         # qualifies a grounding_source and a query, so each guarded call through
@@ -21460,38 +21675,16 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     )
             return grounding_versions[key]
 
+        # The logged request never names its guardrailConfig, so a call whose
+        # response shows no grounding assessment is joined to its CloudTrail
+        # event for the guardrail version that ran.
+        converse_calls = []
+
         def visit_converse(record):
             if record.get("operation") not in CONVERSE_OPERATIONS:
                 return
             body = (record.get("input") or {}).get("inputBodyJson")
             output = (record.get("output") or {}).get("outputBodyJson")
-            if not _converse_guarded(body, output):
-                return
-            label = "{} ({} {})".format(
-                record.get("requestId") or "no request ID",
-                record.get("operation"),
-                record.get("modelId") or "no model ID",
-            )
-            config = body.get("guardrailConfig") if isinstance(body, dict) else None
-            identifier = (
-                config.get("guardrailIdentifier") if isinstance(config, dict) else None
-            )
-            if not identifier:
-                if not any(
-                    "contextualGroundingPolicy" in item
-                    for item in _nested_dicts(output)
-                ):
-                    unjudged.append(
-                        f"{label}, which names no guardrailConfig, so which "
-                        "guardrail version ran is not logged"
-                    )
-                return
-            if not grounds(
-                str(identifier),
-                str(config.get("guardrailVersion") or GUARDRAIL_DRAFT_VERSION),
-            ):
-                return
-            grounded_calls.append(label)
             qualifiers = {
                 qualifier
                 for item in _nested_dicts(body)
@@ -21499,27 +21692,24 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 and isinstance(item["guardContent"].get("text"), dict)
                 for qualifier in item["guardContent"]["text"].get("qualifiers") or []
             }
-            if not {"grounding_source", "query"} <= qualifiers:
-                unqualified.append(label)
+            converse_calls.append(
+                {
+                    "label": "{} ({} {})".format(
+                        record.get("requestId") or "no request ID",
+                        record.get("operation"),
+                        record.get("modelId") or "no model ID",
+                    ),
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                    "assessed": any(
+                        "contextualGroundingPolicy" in item
+                        for item in _nested_dicts(output)
+                    ),
+                    "qualified": {"grounding_source", "query"} <= qualifiers,
+                }
+            )
 
-        converse_scan = _scan_invocation_records(
-            region,
-            source,
-            CONVERSE_LOG_PATTERN,
-            lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
-            visit_converse,
-        )
-        if converse_scan["error"]:
-            unjudged.append(
-                f"records matching a Converse operation in {log_group} "
-                f"({converse_scan['action']}, {converse_scan['error']})"
-            )
-        elif converse_scan["capped"]:
-            unjudged.append(
-                f"records matching a Converse operation in {log_group} past the "
-                f"first {converse_scan['read']} "
-                f"({'page cap' if source['log_group'] else 'object cap'})"
-            )
         # A guarded InvokeModel call names its guardrail only in request
         # headers, which the log does not record, so it is judged when it sends
         # one grounding tag without the other, or when its response shows the
@@ -21568,27 +21758,68 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
             if len(tags) < 2:
                 invoke_unqualified.append(label)
 
-        invoke_scan = _scan_invocation_records(
+        scan, converse_scan, invoke_scan = _scan_invocation_legs(
             region,
             source,
-            f'"{GUARDRAIL_ACTION_FIELD}"',
-            lambda line, record: GUARDRAIL_ACTION_FIELD in line,
-            visit_invoke,
+            [
+                (
+                    '"contextualGroundingPolicy"',
+                    lambda line, record: "contextualGroundingPolicy" in line,
+                    visit,
+                ),
+                (
+                    CONVERSE_LOG_PATTERN,
+                    lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
+                    visit_converse,
+                ),
+                (
+                    f'"{GUARDRAIL_ACTION_FIELD}"',
+                    lambda line, record: GUARDRAIL_ACTION_FIELD in line,
+                    visit_invoke,
+                ),
+            ],
         )
-        if invoke_scan["error"]:
-            unjudged.append(
-                f"records carrying {GUARDRAIL_ACTION_FIELD} in {log_group} "
-                f"({invoke_scan['action']}, {invoke_scan['error']})"
-            )
-        elif invoke_scan["capped"]:
-            unjudged.append(
-                f"records carrying {GUARDRAIL_ACTION_FIELD} in {log_group} past the "
-                f"first {invoke_scan['read']} "
-                f"({'page cap' if source['log_group'] else 'object cap'})"
-            )
-        joins = (
+        cap = "page cap" if source["log_group"] else "object cap"
+        for leg_scan, what in (
+            (converse_scan, "matching a Converse operation"),
+            (invoke_scan, f"carrying {GUARDRAIL_ACTION_FIELD}"),
+        ):
+            if leg_scan["error"]:
+                unjudged.append(
+                    f"records {what} in {log_group} "
+                    f"({leg_scan['action']}, {leg_scan['error']})"
+                )
+            elif leg_scan["capped"]:
+                unjudged.append(
+                    f"records {what} in {log_group} past the first "
+                    f"{leg_scan['read']} ({cap}; those logged from "
+                    f"{leg_scan['unread_from']} on were not all read)"
+                )
+        joined = _converse_call_guardrails(
+            region, [call for call in converse_calls if not call["assessed"]], joins
+        )
+        # A call whose response carries a grounding assessment was scored, so
+        # only the others are judged for their qualifiers.
+        for call in converse_calls:
+            version = joined["guarded"].get(call["request_id"])
+            if (
+                call["assessed"]
+                or version is None
+                or not grounds(version["guardrail"], version["version"])
+            ):
+                continue
+            grounded_calls.append(call["label"])
+            if not call["qualified"]:
+                unqualified.append(call["label"])
+        join_unread, recent_note = _converse_join_notes(
+            joined, "which guardrail version ran"
+        )
+        unjudged.extend(join_unread)
+        invoke_joins = (
             _invoke_call_guardrails(
-                region, [call for call in invoke_untagged if call["request_id"]]
+                region,
+                [call for call in invoke_untagged if call["request_id"]],
+                joins,
             )
             if invoke_untagged
             else {"resolved": {}, "capped": []}
@@ -21599,7 +21830,7 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     f"{call['label']}, which logs no request ID to join to CloudTrail"
                 )
                 continue
-            joined = joins["resolved"].get(call["request_id"])
+            joined = invoke_joins["resolved"].get(call["request_id"])
             if joined is None:
                 continue
             if "reason" in joined:
@@ -21613,15 +21844,17 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     call["label"], joined["guardrail"], joined["version"]
                 )
             )
-        if joins["capped"]:
+        if invoke_joins["capped"]:
             unjudged.insert(
                 0,
                 "{} untagged guarded InvokeModel call(s) were not matched to "
-                "CloudTrail within the first {} LookupEvents pages of their "
-                "window, so their guardrail is not known: {}".format(
-                    len(joins["capped"]),
+                "CloudTrail within the LookupEvents page cap ({} pages per "
+                "operation, {} per region run), so their guardrail is not "
+                "known: {}".format(
+                    len(invoke_joins["capped"]),
                     GROUNDING_JOIN_MAX_PAGES,
-                    ", ".join(joins["capped"][:5]),
+                    GROUNDING_JOIN_BUDGET_PAGES,
+                    ", ".join(invoke_joins["capped"][:5]),
                 ),
             )
         if unqualified or invoke_unqualified:
@@ -21658,8 +21891,9 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                     )
                 )
             row(
-                "{}{}".format(
+                "{}{}{}".format(
                     " ".join(failures),
+                    recent_note,
                     " Not read: {}.".format("; ".join(unjudged[:5]))
                     if unjudged
                     else "",
@@ -21677,7 +21911,7 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
             row(
                 "No guarded Converse or InvokeModel call read in {} omitted a "
                 "grounding source or query, but not every guarded call was judged: "
-                "{}.".format(log_group, "; ".join(unjudged[:5])),
+                "{}.{}".format(log_group, "; ".join(unjudged[:5]), recent_note),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
                 "N/A",
@@ -21693,12 +21927,14 @@ def check_guardrail_grounding_score_evidence(region: str = "") -> Dict[str, Any]
                 "every one of the {} guarded InvokeModel call(s) that sent a "
                 "grounding tag or ran through a guardrail version with contextual "
                 "grounding filters wrapped both a groundingSource and a query "
-                "tag.".format(
+                "tag. A Converse call's guardrail version is read from its "
+                "CloudTrail event, joined by requestID.{}".format(
                     log_group,
                     len(scored),
                     "; ".join(scored[:5]),
                     len(grounded_calls),
                     len(invoke_calls),
+                    recent_note,
                 ),
                 "No action required.",
                 "Medium",
@@ -42620,7 +42856,14 @@ def lambda_handler(event, context):
             region=region, attachment_inventory=guardrail_attachments
         )
         all_findings.append(guardrail_grounding_findings)
-        all_findings.append(check_guardrail_grounding_score_evidence(region=region))
+        # BR-27 and BR-34 join invocation log records to CloudTrail through one
+        # shared cache and LookupEvents page budget.
+        guardrail_joins = {"resolved": {}, "pages": 0}
+        all_findings.append(
+            check_guardrail_grounding_score_evidence(
+                region=region, joins=guardrail_joins
+            )
+        )
 
         logger.info("Running agent guardrail association check (BR-28)")
         agent_guardrail_findings = check_bedrock_agent_guardrail_association(
@@ -42674,7 +42917,9 @@ def lambda_handler(event, context):
         )
         all_findings.append(check_guardrail_intervention_logging(region=region))
         all_findings.append(
-            check_guardrail_prompt_attack_invocation_evidence(region=region)
+            check_guardrail_prompt_attack_invocation_evidence(
+                region=region, joins=guardrail_joins
+            )
         )
         all_findings.append(check_guardduty_prompt_injection_detection(region=region))
 
