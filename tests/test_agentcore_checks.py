@@ -6158,8 +6158,19 @@ class TestAC12GatewayKeyScope:
             "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*",
             "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-?",
             "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-x*",
+            # This gateway's ARN beside a pattern: the key still serves every
+            # gateway the pattern matches.
+            [
+                "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-x",
+                "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*",
+            ],
         ],
-        ids=["every-gateway", "one-character", "name-prefix"],
+        ids=[
+            "every-gateway",
+            "one-character",
+            "name-prefix",
+            "own-arn-beside-a-pattern",
+        ],
     )
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
@@ -11380,6 +11391,7 @@ class TestGW04EndpointPathsByValue:
         policy["Statement"][1]["Condition"] = {
             "StringNotEquals": {"aws:SourceVpc": "vpc-1"}
         }
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
         network = self._network(
             mock_ac, mock_iam, mock_ec2, {"gw-a": json.dumps(policy)}, []
         )
@@ -13526,6 +13538,12 @@ class TestAC27ConsentPortalRoleTrust:
             (_portal_trust(_PORTAL_PREFIX + "*"), "Source ARN Not Scoped"),
             (_portal_trust(_PORTAL_PREFIX + "cp-ope?"), "Source ARN Not Scoped"),
             (_portal_trust(_PORTAL_PREFIX + "cp-other"), "Source ARN Not Scoped"),
+            # The portal's own ARN beside a pattern still admits every portal
+            # the pattern matches, so naming it does not bind the statement.
+            (
+                _portal_trust([_PORTAL_PREFIX + "cp-open", _PORTAL_PREFIX + "*"]),
+                "Source ARN Not Scoped",
+            ),
         ],
         ids=[
             "no-condition",
@@ -13535,6 +13553,7 @@ class TestAC27ConsentPortalRoleTrust:
             "every-portal",
             "one-character",
             "other-portal",
+            "own-arn-beside-a-pattern",
         ],
     )
     @patch("agentcore_app.iam_client")

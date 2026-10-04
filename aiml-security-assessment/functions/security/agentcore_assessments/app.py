@@ -19922,7 +19922,7 @@ def _gateway_resource_policy_findings(
                 status=StatusEnum.PASSED,
             )
         )
-    else:
+    elif not unmatched_vpcs:
         gap_text = (
             f" The policy does name a network key, but {'; '.join(network_gaps)}."
             if network_gaps
