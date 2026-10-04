@@ -44172,6 +44172,22 @@ class TestAC45WholePopulation:
                 False,
             ),
             ("arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-*", True),
+            # The rest of the cases BR-57's port of this rule is tested with.
+            ("arn:aws:logs:us-east-1:123456789012:log-group:app/prod/*", True),
+            ("arn:aws:kms:us-east-1:123456789012:alias/aws/*", True),
+            (
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/*/object/report.csv",
+                True,
+            ),
+            ("arn:aws:secretsmanager:us-east-1:123456789012:secret:*", True),
+            (
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/d?-??????",
+                True,
+            ),
+            ("arn:aws:bedrock:us-east-1:123456789012:agent-alias/AGENT1234/*", False),
+            ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/app/tool:*", False),
+            ("arn:aws:s3:::kb-docs/team/*", False),
+            ("arn:aws:s3:us-east-1:123456789012:accesspoint/kb/object/*", False),
             (
                 "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db-?????",
                 True,
