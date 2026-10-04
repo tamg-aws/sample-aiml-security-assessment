@@ -6045,14 +6045,14 @@ MUTATIONS = [
         "file": BEDROCK,
         "defect": "BR-46's prompt leg drops logged calls whose guardrail is unknown, so it fails an estate it has not read",
         "find": '\n            elif not resolved.get("unguarded"):\n                joins_unread += 1\n',
-        "replace": '\n            elif False:\n                joins_unread += 1\n',
+        "replace": "\n            elif False:\n                joins_unread += 1\n",
     },
     {
         "name": "BR-46 prompt reads a joined guardrail at its working draft",
         "file": BEDROCK,
         "defect": "BR-46's prompt leg reads a CloudTrail-joined guardrail without its version, so the draft is judged in place of the version that ran",
-        "find": '\n                response = clients[target].get_guardrail(\n                    guardrailIdentifier=identifier, guardrailVersion=version\n                )\n',
-        "replace": '\n                response = clients[target].get_guardrail(\n                    guardrailIdentifier=identifier\n                )\n',
+        "find": "\n                response = clients[target].get_guardrail(\n                    guardrailIdentifier=identifier, guardrailVersion=version\n                )\n",
+        "replace": "\n                response = clients[target].get_guardrail(\n                    guardrailIdentifier=identifier\n                )\n",
     },
     {
         "name": "BR-46 prompt passes beside an unread guardrail",
@@ -6072,8 +6072,8 @@ MUTATIONS = [
         "name": "BR-46 prompt version reads ignore the invocation deadline",
         "file": BEDROCK,
         "defect": "BR-46's prompt leg keeps reading used guardrail versions past the deadline",
-        "find": "\n            if _deadline_reached():\n                entry[\"error\"] = DEADLINE_STOP\n",
-        "replace": "\n            if False:\n                entry[\"error\"] = DEADLINE_STOP\n",
+        "find": '\n            if _deadline_reached():\n                entry["error"] = DEADLINE_STOP\n',
+        "replace": '\n            if False:\n                entry["error"] = DEADLINE_STOP\n',
     },
 ]
 
