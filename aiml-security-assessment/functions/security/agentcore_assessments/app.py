@@ -39928,9 +39928,13 @@ def _gateway_waf_rule_findings(
             finding_name="Agentic AI Gateway WAF Rule Coverage",
             finding_details=(
                 f"{label} is filtered by web ACL {acl_name}, which applies "
-                f"all five request filters this check reads: {applied}. The "
-                "gateway's wafConfiguration failureMode is FAIL_CLOSE, so a "
-                "request is blocked when AWS WAF cannot be evaluated."
+                f"all five request filters this check reads: {applied}."
+                + (
+                    " The gateway's wafConfiguration failureMode is FAIL_CLOSE, "
+                    "so a request is blocked when AWS WAF cannot be evaluated."
+                    if failure_mode is not None
+                    else ""
+                )
             ),
             resolution="No action required",
             reference=WAF_RULE_ACTION_REFERENCE_URL,
@@ -39977,7 +39981,7 @@ AC51_OUT_OF_SCOPE_FRONT_DOORS = (
     "not read: finding them takes the AWS WAF association reads wafv2:ListWebACLs "
     "and wafv2:ListResourcesForWebACL, whose grant was declined for this "
     "assessment. CloudFront distributions are judged only where an origin is an "
-    "AgentCore gateway, in the AgentCore Front Door Shield Protection row."
+    "AgentCore gateway, in the AgentCore Front Door rows."
 )
 AC51_SHIELD_NOT_JUDGED = (
     "Shield Advanced enrollment of the gateway itself is not judged, because "
@@ -40277,6 +40281,135 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
     return findings
 
 
+AGENTCORE_FRONT_DOOR_ANTI_DDOS_FINDING = "AgentCore Front Door Anti-DDoS Protection"
+AGENTCORE_FRONT_DOOR_WAF_FINDING = "AgentCore Front Door WAF Rule Coverage"
+WAF_CLOUDFRONT_RESOURCE_TYPE = "CLOUDFRONT"
+
+
+def _wafv2_client_for_region(region: str) -> Any:
+    """Return a WAF client for `region`: a CloudFront web ACL is read in the
+    Region its ARN names, us-east-1 in the commercial partition."""
+    if wafv2_client is not None and wafv2_client.meta.region_name == region:
+        return wafv2_client
+    return boto3.client("wafv2", config=boto3_config, region_name=region)
+
+
+def _front_door_web_acl_findings(
+    fronting: List[Tuple[str, Any]],
+) -> List[Dict[str, Any]]:
+    """AC-51 and AG-39: judge the web ACL on each distribution fronting a gateway.
+
+    A request that reaches the gateway through CloudFront meets the
+    distribution's web ACL first, so it is judged by the rules the gateway's
+    own ACL is: the Anti-DDoS group and a blocking rate rule (AC-51), and the
+    five request filters, with the body inspection limit set for CLOUDFRONT
+    (AG-39). A distribution has no wafConfiguration, so no failure mode is
+    judged. `fronting` pairs each distribution's label with the WebACLId
+    ListDistributions reports: an AWS WAF web ACL ARN, an AWS WAF Classic id,
+    or empty.
+    """
+
+    def anti_ddos(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-51",
+            finding_name=AGENTCORE_FRONT_DOOR_ANTI_DDOS_FINDING,
+            finding_details=f"{details} {AC51_OUT_OF_SCOPE_FRONT_DOORS}",
+            resolution=resolution,
+            reference=WAF_ANTI_DDOS_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    def rules(details, resolution, severity, status):
+        return create_finding(
+            check_id="AG-39",
+            finding_name=AGENTCORE_FRONT_DOOR_WAF_FINDING,
+            finding_details=f"{details} {GATEWAY_WAF_UNREAD_FRONT_DOORS}",
+            resolution=resolution,
+            reference=WAF_RULE_ACTION_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    findings: List[Dict[str, Any]] = []
+    clients: Dict[str, Any] = {}
+    for label, web_acl_id in fronting:
+        web_acl_id = str(web_acl_id or "")
+        if not web_acl_id:
+            findings.append(
+                anti_ddos(
+                    f"{label}, and the distribution has no web ACL, so nothing "
+                    "mitigates a request flood that reaches the gateway through it.",
+                    "Associate a web ACL with the distribution, add the AWS managed "
+                    f"rule group {WAF_ANTI_DDOS_RULE_GROUP} to it, and add a "
+                    "rate-based rule whose action is Block.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+            findings.append(
+                rules(
+                    f"{label}, and the distribution has no web ACL, so no rule "
+                    "filters a request that reaches the gateway through it.",
+                    "Associate a web ACL with the distribution that blocks, "
+                    "inspects for SQL injection and cross-site scripting, applies "
+                    "a rate-based rule whose action is Block, and raises the "
+                    "CLOUDFRONT body inspection limit above KB_16.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+            continue
+        if not web_acl_id.startswith("arn:") or ":global/webacl/" not in web_acl_id:
+            for build in (anti_ddos, rules):
+                findings.append(
+                    build(
+                        f"{label}, and the distribution names web ACL {web_acl_id}, "
+                        "which is not an AWS WAF global web ACL ARN, such as an "
+                        "AWS WAF Classic web ACL id, so its rules were not read.",
+                        "Migrate the distribution to an AWS WAF web ACL and rerun "
+                        "the assessment.",
+                        SeverityEnum.INFORMATIONAL,
+                        StatusEnum.NA,
+                    )
+                )
+            continue
+        region = web_acl_id.split(":")[3]
+        try:
+            if region not in clients:
+                clients[region] = _wafv2_client_for_region(region)
+            web_acl = (clients[region].get_web_acl(ARN=web_acl_id) or {}).get(
+                "WebACL"
+            ) or {}
+        except (BotoCoreError, ClientError) as error:
+            for build in (anti_ddos, rules):
+                findings.append(
+                    build(
+                        f"{label}, and the distribution is associated with web ACL "
+                        f"{web_acl_id}, whose rules could not be read: "
+                        f"{_assessment_error_label(error)}.",
+                        "Grant wafv2:GetWebACL on the global web ACL, then rerun "
+                        "the assessment.",
+                        SeverityEnum.INFORMATIONAL,
+                        StatusEnum.NA,
+                    )
+                )
+            continue
+        acl_label = f"{label}, and the distribution"
+        findings.append(
+            _anti_ddos_web_acl_finding(acl_label, web_acl_id, web_acl, anti_ddos)
+        )
+        for row in _gateway_waf_rule_findings(
+            acl_label, web_acl_id, web_acl, None, WAF_CLOUDFRONT_RESOURCE_TYPE
+        ):
+            row["Finding"] = AGENTCORE_FRONT_DOOR_WAF_FINDING
+            row["Finding_Details"] = (
+                f"{row['Finding_Details']} {GATEWAY_WAF_UNREAD_FRONT_DOORS}"
+            )
+            findings.append(row)
+    return findings
+
+
 def check_agentcore_front_door_shield() -> List[Dict[str, Any]]:
     """AC-51: Require Shield Advanced on CloudFront distributions fronting a gateway.
 
@@ -40376,6 +40509,7 @@ def check_agentcore_front_door_shield() -> List[Dict[str, Any]]:
         )
 
     fronting = []
+    fronting_acls: List[Tuple[str, Any]] = []
     for distribution in distributions:
         origins = sorted(
             {
@@ -40395,8 +40529,10 @@ def check_agentcore_front_door_shield() -> List[Dict[str, Any]]:
                 )
             )
             fronting.append((distribution.get("ARN"), label))
+            fronting_acls.append((label, distribution.get("WebACLId")))
     if not fronting:
         return findings
+    findings.extend(_front_door_web_acl_findings(fronting_acls))
 
     try:
         state = shield_client.get_subscription_state().get("SubscriptionState")
@@ -41710,10 +41846,12 @@ def _gateway_jwt_authorization_finding(
 # not AgentCore gateways are found through their web ACL associations, and that
 # grant was declined, so each gateway WAF row says what it leaves out.
 GATEWAY_WAF_UNREAD_FRONT_DOORS = (
-    "API Gateway APIs, Application Load Balancers and CloudFront distributions "
-    "that front an AI workload are not read: finding them and their web ACLs "
-    "takes the AWS WAF association reads wafv2:ListWebACLs and "
-    "wafv2:ListResourcesForWebACL, whose grant was declined for this assessment."
+    "API Gateway APIs and Application Load Balancers that front an AI workload "
+    "are not read: finding them and their web ACLs takes the AWS WAF association "
+    "reads wafv2:ListWebACLs and wafv2:ListResourcesForWebACL, whose grant was "
+    "declined for this assessment. A CloudFront distribution is judged where an "
+    "origin is an AgentCore gateway, in the AgentCore Front Door WAF Rule "
+    "Coverage row."
 )
 
 
@@ -43077,8 +43215,8 @@ def lambda_handler(event, context):
                 check_agentcore_web_acl_anti_ddos,
             ),
             (
-                ["AC-51"],
-                "Front Door Shield Protection",
+                ["AC-51", "AG-39"],
+                "Front Door Shield and WAF",
                 check_agentcore_front_door_shield,
             ),
             (

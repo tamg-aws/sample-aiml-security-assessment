@@ -37526,7 +37526,7 @@ class TestAC51GatewayAntiDdos:
                 "reads wafv2:ListWebACLs and wafv2:ListResourcesForWebACL, whose "
                 "grant was declined for this assessment. CloudFront distributions "
                 "are judged only where an origin is an AgentCore gateway, in the "
-                "AgentCore Front Door Shield Protection row."
+                "AgentCore Front Door rows."
             )
             assert "not identifiable" not in finding["Finding_Details"]
 
@@ -38001,6 +38001,15 @@ def _front_door_stub(
     )
 
 
+def _shield_rows(findings):
+    """Keep the Shield enrollment rows; the web ACL rows are judged on their own."""
+    return [
+        f
+        for f in findings
+        if f["Finding"] == agentcore_app.AGENTCORE_FRONT_DOOR_SHIELD_FINDING
+    ]
+
+
 def _distribution_arn(dist_id):
     return f"arn:aws:cloudfront::123456789012:distribution/{dist_id}"
 
@@ -38034,7 +38043,7 @@ class TestAC51FrontDoorShield:
             ],
         )
 
-        findings = agentcore_app.check_agentcore_front_door_shield()
+        findings = _shield_rows(agentcore_app.check_agentcore_front_door_shield())
 
         assert [f["Status"] for f in findings] == ["Passed", "Failed"]
         assert [f["Severity"] for f in findings] == ["Medium", "Medium"]
@@ -38066,7 +38075,7 @@ class TestAC51FrontDoorShield:
             state="INACTIVE",
         )
 
-        findings = agentcore_app.check_agentcore_front_door_shield()
+        findings = _shield_rows(agentcore_app.check_agentcore_front_door_shield())
 
         assert [(f["Status"], f["Severity"]) for f in findings] == [
             ("N/A", "Informational"),
@@ -38106,7 +38115,7 @@ class TestAC51FrontDoorShield:
             _make_client_error("AccessDenied", "no"),
         )
 
-        findings = agentcore_app.check_agentcore_front_door_shield()
+        findings = _shield_rows(agentcore_app.check_agentcore_front_door_shield())
 
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "cloudfront:ListDistributions" in findings[0]["Resolution"]
@@ -38123,7 +38132,7 @@ class TestAC51FrontDoorShield:
             protection_pages=[[_distribution_arn("ETWO")]],
         )
 
-        findings = agentcore_app.check_agentcore_front_door_shield()
+        findings = _shield_rows(agentcore_app.check_agentcore_front_door_shield())
 
         assert [f["Status"] for f in findings] == ["N/A", "Passed"]
         assert "(gw-1)" in findings[0]["Finding_Details"]
@@ -38149,7 +38158,7 @@ class TestAC51FrontDoorShield:
             protection_pages=error if failing == "protections" else None,
         )
 
-        findings = agentcore_app.check_agentcore_front_door_shield()
+        findings = _shield_rows(agentcore_app.check_agentcore_front_door_shield())
 
         assert [f["Status"] for f in findings] == ["N/A", "N/A"]
         action = (
@@ -38178,7 +38187,7 @@ class TestAC51FrontDoorShield:
             protection_pages=[[_distribution_arn("EONE")], [_distribution_arn("ETWO")]],
         )
 
-        findings = agentcore_app.check_agentcore_front_door_shield()
+        findings = _shield_rows(agentcore_app.check_agentcore_front_door_shield())
 
         assert [f["Status"] for f in findings] == ["Passed", "Passed"]
         mock_cf.get_paginator.assert_called_once_with("list_distributions")
@@ -38195,7 +38204,7 @@ class TestAC51FrontDoorShield:
             [[_distribution("ETWO", _gateway_host("gw-2"))]],
         )
 
-        findings = agentcore_app.check_agentcore_front_door_shield()
+        findings = _shield_rows(agentcore_app.check_agentcore_front_door_shield())
 
         assert [f["Status"] for f in findings] == ["N/A", "Failed"]
         for finding in findings:
@@ -56751,8 +56760,8 @@ class TestGatewayWafUnreadFrontDoors:
     names the front doors it leaves out and why."""
 
     _SENTENCE = (
-        "API Gateway APIs, Application Load Balancers and CloudFront "
-        "distributions that front an AI workload are not read"
+        "API Gateway APIs and Application Load Balancers that front an AI "
+        "workload are not read"
     )
 
     @patch("agentcore_app.wafv2_client", None)
@@ -57910,3 +57919,199 @@ class TestAC41EvaluationPersonalData:
         details = findings[0]["Finding_Details"]
         assert "evaluator ev-2 (whose name is withheld) name holds an email" in details
         assert "jane.doe" not in details
+
+
+def _global_acl_arn(acl_name):
+    return f"arn:aws:wafv2:us-east-1:123456789012:global/webacl/{acl_name}/id"
+
+
+def _cloudfront_acl(name, rules, body_limit="KB_64", resource_type="CLOUDFRONT"):
+    acl = {"Name": name, "DefaultAction": {"Allow": {}}, "Rules": rules}
+    if body_limit:
+        acl["AssociationConfig"] = {
+            "RequestBody": {resource_type: {"DefaultSizeInspectionLimit": body_limit}}
+        }
+    return acl
+
+
+_FULL_FRONT_DOOR_RULES = [
+    _anti_ddos_rule(),
+    _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+    _rate_rule(),
+]
+
+
+@patch("agentcore_app.shield_client")
+@patch("agentcore_app.cloudfront_client")
+@patch("agentcore_app.agentcore_client")
+class TestAC51FrontDoorWebAcl:
+    """AIR-FND-NET-08 and NET-04: a CloudFront distribution fronting a gateway
+    is an internet-facing entry point, so its own web ACL is judged for the
+    Anti-DDoS group and rate rule (AC-51) and the request filters (AG-39)."""
+
+    def _run(self, mock_ac, mock_cf, mock_sh, distributions, web_acls, state="ACTIVE"):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None, "gw-2": None},
+            [distributions],
+            state=state,
+        )
+        waf = MagicMock()
+        waf.meta.region_name = "us-east-1"
+
+        def get_web_acl(ARN):
+            answer = web_acls[ARN]
+            if isinstance(answer, Exception):
+                raise answer
+            return {"WebACL": answer}
+
+        waf.get_web_acl.side_effect = get_web_acl
+        with patch("agentcore_app.wafv2_client", waf):
+            findings = agentcore_app.check_agentcore_front_door_shield()
+        return {
+            (f["Check_ID"], f["Finding_Details"].split(" ")[2]): f
+            for f in findings
+            if f["Finding"]
+            in (
+                agentcore_app.AGENTCORE_FRONT_DOOR_ANTI_DDOS_FINDING,
+                agentcore_app.AGENTCORE_FRONT_DOOR_WAF_FINDING,
+            )
+        }, waf
+
+    @staticmethod
+    def _with_acl(dist_id, gateway_id, acl_arn):
+        distribution = _distribution(dist_id, _gateway_host(gateway_id))
+        distribution["WebACLId"] = acl_arn
+        return distribution
+
+    def test_each_distribution_is_judged_by_its_own_acl(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        rows, _ = self._run(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            [
+                self._with_acl("EFULL", "gw-1", _global_acl_arn("full")),
+                self._with_acl("EBARE", "gw-2", _global_acl_arn("bare")),
+                _distribution("ENONE", _gateway_host("gw-1")),
+            ],
+            {
+                _global_acl_arn("full"): _cloudfront_acl(
+                    "full", _FULL_FRONT_DOOR_RULES
+                ),
+                _global_acl_arn("bare"): _cloudfront_acl(
+                    "bare", _FULL_FRONT_DOOR_RULES[1:]
+                ),
+            },
+        )
+
+        assert rows[("AC-51", "EFULL")]["Status"] == "Passed"
+        assert rows[("AG-39", "EFULL")]["Status"] == "Passed"
+        # A distribution has no wafConfiguration, so no failure mode is claimed.
+        assert "FAIL_CLOSE" not in rows[("AG-39", "EFULL")]["Finding_Details"]
+        assert rows[("AC-51", "EBARE")]["Status"] == "Failed"
+        assert (
+            "AWSManagedRulesAntiDDoSRuleSet"
+            in (rows[("AC-51", "EBARE")]["Finding_Details"])
+        )
+        assert rows[("AG-39", "EBARE")]["Status"] == "Passed"
+        assert rows[("AC-51", "ENONE")]["Status"] == "Failed"
+        assert rows[("AG-39", "ENONE")]["Status"] == "Failed"
+        assert "has no web ACL" in rows[("AG-39", "ENONE")]["Finding_Details"]
+        for row in rows.values():
+            assert "whose grant was declined" in row["Finding_Details"]
+            assert_finding_schema(row)
+
+    def test_the_body_limit_is_read_for_cloudfront_not_the_gateway(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        rows, _ = self._run(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            [self._with_acl("EGW", "gw-1", _global_acl_arn("gw"))],
+            {
+                _global_acl_arn("gw"): _cloudfront_acl(
+                    "gw", _FULL_FRONT_DOOR_RULES, resource_type="AGENTCORE_GATEWAY"
+                )
+            },
+        )
+
+        assert rows[("AG-39", "EGW")]["Status"] == "Failed"
+        assert "body inspection limit" in rows[("AG-39", "EGW")]["Finding_Details"]
+        assert "CLOUDFRONT association" in rows[("AG-39", "EGW")]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "answer, reason",
+        [
+            (_make_client_error("AccessDeniedException", "no"), "AccessDenied"),
+            ("classic", "not an AWS WAF global web ACL ARN"),
+        ],
+    )
+    def test_an_unread_acl_is_never_passed(
+        self, mock_ac, mock_cf, mock_sh, answer, reason
+    ):
+        acl_id = "1234-abcd" if answer == "classic" else _global_acl_arn("denied")
+        rows, _ = self._run(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            [self._with_acl("EDENY", "gw-1", acl_id)],
+            {} if answer == "classic" else {acl_id: answer},
+        )
+
+        assert [rows[(c, "EDENY")]["Status"] for c in ("AC-51", "AG-39")] == [
+            "N/A",
+            "N/A",
+        ]
+        assert reason in rows[("AC-51", "EDENY")]["Finding_Details"]
+
+    def test_the_acl_rows_survive_an_inactive_shield_subscription(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        rows, _ = self._run(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            [_distribution("ENONE", _gateway_host("gw-1"))],
+            {},
+            state="INACTIVE",
+        )
+
+        assert rows[("AC-51", "ENONE")]["Status"] == "Failed"
+        assert rows[("AG-39", "ENONE")]["Status"] == "Failed"
+
+    def test_the_acl_is_read_in_the_region_its_arn_names(
+        self, mock_ac, mock_cf, mock_sh
+    ):
+        _front_door_stub(
+            mock_ac,
+            mock_cf,
+            mock_sh,
+            {"gw-1": None},
+            [[self._with_acl("EFULL", "gw-1", _global_acl_arn("full"))]],
+        )
+        regional = MagicMock()
+        regional.meta.region_name = "us-west-2"
+        global_waf = MagicMock()
+        global_waf.get_web_acl.return_value = {
+            "WebACL": _cloudfront_acl("full", _FULL_FRONT_DOOR_RULES)
+        }
+        with (
+            patch("agentcore_app.wafv2_client", regional),
+            patch("agentcore_app.boto3.client", return_value=global_waf) as make,
+        ):
+            findings = agentcore_app.check_agentcore_front_door_shield()
+
+        assert make.call_args.args == ("wafv2",)
+        assert make.call_args.kwargs["region_name"] == "us-east-1"
+        regional.get_web_acl.assert_not_called()
+        assert {
+            f["Status"]
+            for f in findings
+            if f["Finding"] == agentcore_app.AGENTCORE_FRONT_DOOR_WAF_FINDING
+        } == {"Passed"}
