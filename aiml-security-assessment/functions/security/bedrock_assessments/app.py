@@ -7391,6 +7391,183 @@ def _invocation_log_s3_root(region: str) -> Dict[str, Any]:
     }
 
 
+def _invocation_log_group_central_paths(
+    log_group: Optional[str],
+    tables: Dict[str, Any],
+    regions: List[str],
+    region: str,
+) -> Dict[str, List[str]]:
+    """
+    For BR-06, follow invocation logs delivered only to CloudWatch Logs to a
+    store Athena can query, and return {"met", "gaps", "held"}.
+
+    A subscription filter on the log group is followed when it forwards every
+    event as logged (no filter pattern, field selection or transformed logs)
+    to an ACTIVE Firehose stream of this account whose S3 destination runs no
+    Lambda record processor. The destination's prefix, up to its first !{...}
+    expression, is met when a Glue table's location is at or above it. With
+    nothing met, an Athena data catalog of type LAMBDA, or FEDERATED with no
+    ConnectionType, could be a CloudWatch Logs connector over the group, so it
+    holds the verdict, as does any read that fails.
+    """
+    found: Dict[str, List[str]] = {"met": [], "gaps": [], "held": []}
+    where = f"CloudWatch Logs group {log_group or 'unnamed'}"
+    if not log_group:
+        found["held"].append(
+            "the invocation logs go only to CloudWatch Logs, and the log group "
+            "name was not read"
+        )
+        return found
+    try:
+        account = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+        subscriptions = _list_all_items(
+            boto3.client("logs", config=boto3_config, region_name=region),
+            "describe_subscription_filters",
+            "subscriptionFilters",
+            max_results_param=None,
+            logGroupName=log_group,
+        )
+    except (ClientError, BotoCoreError, TypeError, KeyError) as error:
+        found["held"].append(
+            f"the invocation logs go only to {where}, whose subscription filters "
+            "were not read with logs:DescribeSubscriptionFilters "
+            f"({get_assessment_error_label(error)})"
+        )
+        return found
+    missed: List[str] = []
+    for subscription in subscriptions:
+        label = f"subscription filter '{subscription.get('filterName') or '?'}'"
+        pattern = str(subscription.get("filterPattern") or "").strip()
+        criteria = str(subscription.get("fieldSelectionCriteria") or "").strip()
+        if pattern:
+            missed.append(f"{label} forwards only the events matching '{pattern}'")
+            continue
+        if criteria:
+            missed.append(f"{label} forwards only the events '{criteria}' selects")
+            continue
+        if subscription.get("applyOnTransformedLogs") is True:
+            missed.append(f"{label} forwards the transformed events, not the records")
+            continue
+        destination = str(subscription.get("destinationArn") or "")
+        parts = destination.split(":", 5)
+        if (
+            len(parts) != 6
+            or parts[2] != "firehose"
+            or not parts[5].startswith("deliverystream/")
+        ):
+            found["held"].append(
+                f"{label} sends to {destination or 'no destination'}, which this "
+                "check does not follow to a queryable store"
+            )
+            continue
+        if parts[4] != account:
+            found["held"].append(
+                f"{label} sends to Firehose stream {destination} in account "
+                f"{parts[4]}, whose destination is not read"
+            )
+            continue
+        stream_name = parts[5].split("/", 1)[1]
+        try:
+            stream = boto3.client(
+                "firehose", config=boto3_config, region_name=parts[3]
+            ).describe_delivery_stream(DeliveryStreamName=stream_name)[
+                "DeliveryStreamDescription"
+            ]
+        except (ClientError, BotoCoreError, KeyError, TypeError) as error:
+            found["held"].append(
+                f"{label} sends to {destination}, which was not read with "
+                f"firehose:DescribeDeliveryStream ({get_assessment_error_label(error)})"
+            )
+            continue
+        stream_label = f"{label} through Firehose stream '{stream_name}'"
+        status = stream.get("DeliveryStreamStatus")
+        if status != "ACTIVE":
+            missed.append(f"{stream_label} is {status or 'of unknown status'}")
+            continue
+        for target in stream.get("Destinations") or []:
+            s3_target = target.get("ExtendedS3DestinationDescription") or target.get(
+                "S3DestinationDescription"
+            )
+            if not s3_target:
+                missed.append(f"{stream_label} delivers to a destination other than S3")
+                continue
+            processing = s3_target.get("ProcessingConfiguration") or {}
+            if processing.get("Enabled") is True and any(
+                processor.get("Type") == "Lambda"
+                for processor in processing.get("Processors") or []
+            ):
+                found["held"].append(
+                    f"{stream_label} runs a Lambda record processor, whose output "
+                    "is not read"
+                )
+                continue
+            bucket = str(s3_target.get("BucketARN") or "").rsplit(":", 1)[-1]
+            prefix = str(s3_target.get("Prefix") or "").split("!{", 1)[0]
+            root = f"s3://{bucket}/{prefix}"
+            covering = [
+                table["label"]
+                for table in tables["tables"]
+                if root.startswith(table["location"].rstrip("/") + "/")
+            ]
+            if covering:
+                found["met"].append(
+                    "Glue table(s) {} sit over {}, where {} delivers every event "
+                    "of {}".format("; ".join(covering[:5]), root, stream_label, where)
+                )
+            else:
+                missed.append(
+                    f"{stream_label} delivers to {root}, which no Glue table in "
+                    f"{', '.join(regions)} sits over"
+                )
+    if found["met"]:
+        return {"met": found["met"], "gaps": [], "held": []}
+    if not subscriptions:
+        missed.append(f"{where} has no subscription filter")
+    found["held"].extend(tables["errors"][:5])
+    for catalog_region in regions:
+        try:
+            catalogs = _list_all_items(
+                boto3.client("athena", config=boto3_config, region_name=catalog_region),
+                "list_data_catalogs",
+                "DataCatalogsSummary",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                max_results=50,
+            )
+        except (ClientError, BotoCoreError, TypeError, KeyError) as error:
+            found["held"].append(
+                f"Athena data catalogs in {catalog_region} were not listed with "
+                f"athena:ListDataCatalogs ({get_assessment_error_label(error)})"
+            )
+            continue
+        for catalog in catalogs:
+            kind = str(catalog.get("Type") or "")
+            if kind == "LAMBDA" or (
+                kind == "FEDERATED" and not catalog.get("ConnectionType")
+            ):
+                found["held"].append(
+                    f"Athena data catalog '{catalog.get('CatalogName')}' in "
+                    f"{catalog_region} is a {kind} connector whose source is not "
+                    f"read, so it may query {where}"
+                )
+    if found["held"]:
+        found["held"] = [
+            f"the invocation logs go only to {where}, and no path to a queryable "
+            "store was established: {}".format("; ".join(missed + found["held"]))
+        ]
+        return found
+    found["gaps"].append(
+        "the invocation logs go only to {}, and none of its events reach a Glue "
+        "table: {}; no Athena data catalog in {} is a LAMBDA or FEDERATED "
+        "connector that could query the group".format(
+            where, "; ".join(missed), ", ".join(regions)
+        )
+    )
+    return found
+
+
 def check_bedrock_inference_trace(region: str = "") -> Dict[str, Any]:
     """BR-06 MDL-07 legs; see _inference_trace_findings."""
     try:
@@ -7424,7 +7601,9 @@ def _inference_trace_findings(region: str) -> Dict[str, Any]:
     centrally: the CloudTrail events in a CloudTrail Lake event data store
     recording Bedrock management events, or in a Glue table under the S3 log
     root of a logging trail that records them in this Region, and the
-    invocation log records in a Glue table over their S3 path.
+    invocation log records in a Glue table over their S3 path, or over the S3
+    path a CloudWatch Logs subscription delivers them to
+    (_invocation_log_group_central_paths).
     """
     findings = {"check_name": INFERENCE_TRACE_FINDING, "status": "PASS", "csv_data": []}
 
@@ -7674,16 +7853,18 @@ def _inference_trace_findings(region: str) -> Dict[str, Any]:
                     else "",
                 )
             )
+    chain_met: List[str] = []
     if invocation["error"]:
         held.append(invocation["error"])
     elif source["logging"] is False and not invocation["root"]:
         gaps.append(f"no invocation log record can be centralized: {source['reason']}")
     elif not invocation["root"]:
-        held.append(
-            "the invocation logs go only to CloudWatch Logs group {}, and whether a "
-            "subscription carries them to a central Athena or CloudTrail Lake store "
-            "is not read".format(invocation["log_group"] or "unnamed")
+        chain = _invocation_log_group_central_paths(
+            invocation["log_group"], tables, regions, region
         )
+        chain_met = chain["met"]
+        gaps += chain["gaps"]
+        held += chain["held"]
     elif not invocation_tables and tables["errors"]:
         held.append(
             "no Glue table over the invocation log path {} was found, but {}".format(
@@ -7699,6 +7880,7 @@ def _inference_trace_findings(region: str) -> Dict[str, Any]:
     met = []
     if trail_text:
         met.append(trail_text)
+    met += chain_met
     if invocation_tables:
         met.append(
             "Glue table(s) {} sit over the invocation log path {}, so Athena can "

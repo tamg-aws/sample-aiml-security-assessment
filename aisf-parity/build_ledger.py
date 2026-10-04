@@ -266,10 +266,16 @@ AI_SUBJECT_ROWS = [
         "where a Security Lake CLOUD_TRAIL_MGMT table or a table under no such root"
         " is not credited; and the invocation log records, from a Glue table whose "
         "location holds BedrockModelInvocationLogs/ and is a prefix of this "
-        "Region's S3 invocation log root. A missing half fails. Invocation logs "
-        "delivered only to CloudWatch Logs are N/A, since whether a subscription "
-        "carries them to a central store is not read, and whether each table's "
-        "schema parses the records is not judged",
+        "Region's S3 invocation log root, or for logs delivered only to "
+        "CloudWatch Logs, from a Glue table at or above the S3 prefix of an ACTIVE "
+        "Firehose stream of this account that a subscription filter with no "
+        "pattern, field selection or transformed logs feeds, with no Lambda "
+        "record processor (logs:DescribeSubscriptionFilters, "
+        "firehose:DescribeDeliveryStream). A missing half fails; with no such path,"
+        " an Athena LAMBDA or FEDERATED data catalog with no ConnectionType "
+        "(athena:ListDataCatalogs) that could query the group, another destination"
+        " or account, or an unread part is N/A. Whether each table's schema parses"
+        " the records is not judged",
         [],
         3,
     ),

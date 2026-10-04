@@ -653,11 +653,14 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Sid: ManagedReadsOnWildcard2
-            # The action has no resource type in the service authorization
-            # reference.
+            # Neither action has a resource type in the service authorization
+            # reference. BR-06 lists Athena data catalogs to find a LAMBDA or
+            # FEDERATED connector that could query a CloudWatch Logs-only
+            # invocation log group.
             Effect: Allow
             Action:
               - lambda:ListMicrovms # BR-57
+              - athena:ListDataCatalogs # BR-06
             Resource: '*'
           - Sid: MicrovmRead
             # GetMicrovm authorizes on the microvmImage resource type. A

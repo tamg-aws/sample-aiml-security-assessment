@@ -47230,6 +47230,11 @@ class TestBR06InferenceTrace:
         home=None,
         trails=(),
         invocation=None,
+        subscriptions=(),
+        subscription_error=None,
+        streams=None,
+        catalogs=None,
+        catalog_error=None,
     ):
         events = events or {}
         cloudtrail = MagicMock()
@@ -47280,6 +47285,37 @@ class TestBR06InferenceTrace:
             return {"events": [{"message": json.dumps(r)} for r in records]}
 
         logs.filter_log_events.side_effect = filter_log_events
+        if subscription_error:
+            logs.describe_subscription_filters.side_effect = subscription_error
+        else:
+            logs.describe_subscription_filters.return_value = {
+                "subscriptionFilters": list(subscriptions)
+            }
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        def firehose_client(region):
+            client = MagicMock()
+
+            def describe(DeliveryStreamName):
+                stream = (streams or {})[DeliveryStreamName]
+                if isinstance(stream, Exception):
+                    raise stream
+                return {"DeliveryStreamDescription": stream}
+
+            client.describe_delivery_stream.side_effect = describe
+            return client
+
+        def athena_client(region):
+            client = MagicMock()
+            if catalog_error:
+                client.list_data_catalogs.side_effect = catalog_error
+            else:
+                client.list_data_catalogs.return_value = {
+                    "DataCatalogsSummary": (catalogs or {}).get(region, [])
+                }
+            return client
+
         glue_clients = {}
 
         def glue_client(region):
@@ -47313,7 +47349,11 @@ class TestBR06InferenceTrace:
         def client(service, region_name=None, **_):
             if service == "glue":
                 return glue_client(region_name)
-            return {"cloudtrail": cloudtrail, "logs": logs}[service]
+            if service == "firehose":
+                return firehose_client(region_name)
+            if service == "athena":
+                return athena_client(region_name)
+            return {"cloudtrail": cloudtrail, "logs": logs, "sts": sts}[service]
 
         coverage = {
             "names": [],
@@ -47481,7 +47521,9 @@ class TestBR06InferenceTrace:
         """
         Round 8 (MDL-07): this test passed on the Lake store alone. The
         invocation log records must be centralized too, so it gives them a
-        Glue table, and the CloudWatch-only shape is held.
+        Glue table. Round 9: the CloudWatch-only shape, held at N/A before, is
+        now followed, and a log group with no subscription and no Athena
+        connector fails.
         """
         rows, _ = self._run(
             stores={"management": ["event data store lake"]},
@@ -47494,11 +47536,14 @@ class TestBR06InferenceTrace:
             "bedrock.invocations in us-east-1" in rows[self.CENTRAL]["Finding_Details"]
         )
         rows, _ = self._run(stores={"management": ["event data store lake"]})
-        assert rows[self.CENTRAL]["Status"] == "N/A"
+        assert rows[self.CENTRAL]["Status"] == "Failed"
         assert (
-            f"the invocation logs go only to CloudWatch Logs group {self.GROUP}"
-            in rows[self.CENTRAL]["Finding_Details"]
-        )
+            f"the invocation logs go only to CloudWatch Logs group {self.GROUP}, "
+            "and none of its events reach a Glue table: CloudWatch Logs group "
+            f"{self.GROUP} has no subscription filter; no Athena data catalog in "
+            "eu-west-1, us-east-1 is a LAMBDA or FEDERATED connector that could "
+            "query the group"
+        ) in rows[self.CENTRAL]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "location, trail, status, text",
@@ -47612,6 +47657,8 @@ class TestBR06InferenceTrace:
     @pytest.mark.parametrize("unread", ["glue", "stores", "regions"])
     def test_an_unread_part_withholds_the_centralization_verdict(self, unread):
         rows, _ = self._run(
+            invocation=self.S3_INVOCATION,
+            glue={"us-east-1": self.INVOCATION_TABLE},
             glue_error=ClientError(
                 {"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetDatabases"
             )
@@ -47626,3 +47673,245 @@ class TestBR06InferenceTrace:
         )
         assert rows[self.CENTRAL]["Status"] == "N/A"
         assert "AccessDenied" in rows[self.CENTRAL]["Finding_Details"]
+
+    ARCHIVE_STREAM = "arn:aws:firehose:us-east-1:123456789012:deliverystream/inv"
+    ARCHIVE_ROOT = "s3://cw-archive/bedrock/"
+
+    @staticmethod
+    def _subscription(name="all", destination=None, **extra):
+        return {
+            "filterName": name,
+            "filterPattern": "",
+            "destinationArn": destination or TestBR06InferenceTrace.ARCHIVE_STREAM,
+            **extra,
+        }
+
+    @staticmethod
+    def _stream(status="ACTIVE", prefix="bedrock/!{timestamp:yyyy}/", **s3):
+        return {
+            "DeliveryStreamStatus": status,
+            "Destinations": [
+                {
+                    "ExtendedS3DestinationDescription": {
+                        "BucketARN": "arn:aws:s3:::cw-archive",
+                        "Prefix": prefix,
+                        **s3,
+                    }
+                }
+            ],
+        }
+
+    def _chain(self, location="s3://cw-archive/bedrock/", **kwargs):
+        kwargs.setdefault("subscriptions", [self._subscription()])
+        kwargs.setdefault("streams", {"inv": self._stream()})
+        rows, _ = self._run(
+            stores={"management": ["event data store lake"]},
+            glue={"us-east-1": {"arch": {"inv": location}}},
+            **kwargs,
+        )
+        return rows[self.CENTRAL]
+
+    @pytest.mark.parametrize(
+        "location",
+        ["s3://cw-archive/bedrock/", "s3://cw-archive/bedrock", "s3://cw-archive/"],
+    )
+    def test_a_subscription_to_a_glue_covered_firehose_path_is_central(self, location):
+        row = self._chain(location)
+        assert row["Status"] == "Passed"
+        assert (
+            f"Glue table(s) arch.inv in us-east-1 ({location}) sit over "
+            f"{self.ARCHIVE_ROOT}, where subscription filter 'all' through Firehose "
+            "stream 'inv' delivers every event of CloudWatch Logs group "
+            f"{self.GROUP}"
+        ) in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "location",
+        ["s3://cw-archive/bedrock/2026/", "s3://cw-archive/bed", "s3://other/"],
+    )
+    def test_a_glue_table_not_over_the_firehose_prefix_fails(self, location):
+        row = self._chain(location)
+        assert row["Status"] == "Failed"
+        assert (
+            "subscription filter 'all' through Firehose stream 'inv' delivers to "
+            f"{self.ARCHIVE_ROOT}, which no Glue table in eu-west-1, us-east-1 sits "
+            "over"
+        ) in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "subscription, stream, text",
+        [
+            (
+                {"filterPattern": "ERROR"},
+                None,
+                "subscription filter 'all' forwards only the events matching 'ERROR'",
+            ),
+            (
+                {"fieldSelectionCriteria": "$.modelId"},
+                None,
+                "subscription filter 'all' forwards only the events '$.modelId' "
+                "selects",
+            ),
+            (
+                {"applyOnTransformedLogs": True},
+                None,
+                "subscription filter 'all' forwards the transformed events",
+            ),
+            (
+                {},
+                {"status": "CREATING"},
+                "Firehose stream 'inv' is CREATING",
+            ),
+        ],
+    )
+    def test_a_chain_that_drops_or_rewrites_events_fails(
+        self, subscription, stream, text
+    ):
+        row = self._chain(
+            subscriptions=[self._subscription(**subscription)],
+            streams={"inv": self._stream(**(stream or {}))},
+        )
+        assert row["Status"] == "Failed"
+        assert text in row["Finding_Details"]
+
+    def test_one_full_subscription_beside_a_filtered_one_is_central(self):
+        row = self._chain(
+            subscriptions=[
+                self._subscription("errors", filterPattern="ERROR"),
+                self._subscription("all"),
+            ]
+        )
+        assert row["Status"] == "Passed"
+        assert "subscription filter 'all'" in row["Finding_Details"]
+
+    def test_a_non_s3_firehose_destination_fails(self):
+        row = self._chain(
+            streams={
+                "inv": {
+                    "DeliveryStreamStatus": "ACTIVE",
+                    "Destinations": [{"SplunkDestinationDescription": {}}],
+                }
+            }
+        )
+        assert row["Status"] == "Failed"
+        assert "delivers to a destination other than S3" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "kwargs, text",
+        [
+            (
+                {
+                    "subscriptions": [
+                        {
+                            "filterName": "fn",
+                            "destinationArn": "arn:aws:lambda:us-east-1:"
+                            "123456789012:function:ship",
+                        }
+                    ]
+                },
+                "subscription filter 'fn' sends to arn:aws:lambda:us-east-1:"
+                "123456789012:function:ship, which this check does not follow",
+            ),
+            (
+                {
+                    "subscriptions": [
+                        {
+                            "filterName": "x",
+                            "destinationArn": "arn:aws:firehose:us-east-1:"
+                            "210987654321:deliverystream/inv",
+                        }
+                    ]
+                },
+                "in account 210987654321, whose destination is not read",
+            ),
+            (
+                {
+                    "streams": {
+                        "inv": ClientError(
+                            {"Error": {"Code": "AccessDenied", "Message": "x"}},
+                            "DescribeDeliveryStream",
+                        )
+                    }
+                },
+                "was not read with firehose:DescribeDeliveryStream",
+            ),
+            (
+                {
+                    "streams": {
+                        "inv": {
+                            "DeliveryStreamStatus": "ACTIVE",
+                            "Destinations": [
+                                {
+                                    "ExtendedS3DestinationDescription": {
+                                        "BucketARN": "arn:aws:s3:::cw-archive",
+                                        "Prefix": "bedrock/",
+                                        "ProcessingConfiguration": {
+                                            "Enabled": True,
+                                            "Processors": [{"Type": "Lambda"}],
+                                        },
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                },
+                "runs a Lambda record processor, whose output is not read",
+            ),
+            (
+                {
+                    "subscription_error": ClientError(
+                        {"Error": {"Code": "AccessDenied", "Message": "x"}},
+                        "DescribeSubscriptionFilters",
+                    )
+                },
+                "whose subscription filters were not read with "
+                "logs:DescribeSubscriptionFilters",
+            ),
+            (
+                {
+                    "subscriptions": [],
+                    "catalog_error": ClientError(
+                        {"Error": {"Code": "AccessDenied", "Message": "x"}},
+                        "ListDataCatalogs",
+                    ),
+                },
+                "Athena data catalogs in eu-west-1 were not listed with "
+                "athena:ListDataCatalogs",
+            ),
+        ],
+    )
+    def test_an_unfollowed_chain_is_not_judged(self, kwargs, text):
+        row = self._chain(**kwargs)
+        assert row["Status"] == "N/A"
+        assert (
+            f"the invocation logs go only to CloudWatch Logs group {self.GROUP}, "
+        ) in row["Finding_Details"]
+        assert text in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "catalog, status",
+        [
+            ({"CatalogName": "cw", "Type": "LAMBDA"}, "N/A"),
+            ({"CatalogName": "fed", "Type": "FEDERATED"}, "N/A"),
+            (
+                {
+                    "CatalogName": "ddb",
+                    "Type": "FEDERATED",
+                    "ConnectionType": "DYNAMODB",
+                },
+                "Failed",
+            ),
+            ({"CatalogName": "AwsDataCatalog", "Type": "GLUE"}, "Failed"),
+        ],
+    )
+    def test_an_athena_connector_in_any_region_holds_a_missing_subscription(
+        self, catalog, status
+    ):
+        row = self._chain(subscriptions=[], catalogs={"eu-west-1": [catalog]})
+        assert row["Status"] == status
+        if status == "N/A":
+            assert (
+                f"Athena data catalog '{catalog['CatalogName']}' in eu-west-1 is a "
+                f"{catalog['Type']} connector whose source is not read, so it may "
+                f"query CloudWatch Logs group {self.GROUP}"
+            ) in row["Finding_Details"]
