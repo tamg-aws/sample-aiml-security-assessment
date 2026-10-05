@@ -12064,8 +12064,38 @@ def _capture_disk_alarm_findings(
                 region,
             )
         ]
+    # An alarm written as Metrics queries evaluates the one query whose
+    # ReturnData is true (the default). When that query is a MetricStat of this
+    # account it is the alarmed metric, so the threshold applies to it. When it
+    # is an expression or another account's metric, the threshold applies to a
+    # value derived from DiskUtilization, which is not judged.
     covered = set()
+    unjudged = {}
     for alarm in alarms:
+        evaluated = [
+            query
+            for query in alarm.get("Metrics") or []
+            if query.get("ReturnData", True)
+        ]
+        if alarm.get("MetricName"):
+            judged = _alarm_metric_dimensions(alarm)
+        elif (
+            len(evaluated) == 1
+            and evaluated[0].get("MetricStat")
+            and not evaluated[0].get("AccountId")
+        ):
+            judged = _alarm_metric_dimensions({"Metrics": evaluated})
+        else:
+            for namespace, metric_name, dimensions in _alarm_metric_dimensions(alarm):
+                if (
+                    namespace == ENDPOINT_METRIC_NAMESPACE
+                    and metric_name == "DiskUtilization"
+                ):
+                    unjudged.setdefault(
+                        (dimensions.get("EndpointName"), dimensions.get("VariantName")),
+                        alarm.get("AlarmName"),
+                    )
+            continue
         if alarm.get("ComparisonOperator") not in RISING_COMPARISONS:
             continue
         threshold = alarm.get("Threshold")
@@ -12073,16 +12103,15 @@ def _capture_disk_alarm_findings(
             threshold > CAPTURE_DISK_ALARM_MAX_THRESHOLD
         ):
             continue
-        if alarm.get("Namespace") != ENDPOINT_METRIC_NAMESPACE:
-            continue
-        if alarm.get("MetricName") != "DiskUtilization":
-            continue
-        dimensions = {
-            d.get("Name"): d.get("Value") for d in alarm.get("Dimensions") or []
-        }
-        covered.add((dimensions.get("EndpointName"), dimensions.get("VariantName")))
+        for namespace, metric_name, dimensions in judged:
+            if namespace != ENDPOINT_METRIC_NAMESPACE:
+                continue
+            if metric_name != "DiskUtilization":
+                continue
+            covered.add((dimensions.get("EndpointName"), dimensions.get("VariantName")))
 
     uncovered = []
+    not_judged = []
     no_variants = []
     checked = 0
     for entry in capturing:
@@ -12098,7 +12127,14 @@ def _capture_disk_alarm_findings(
             continue
         for variant in variants:
             checked += 1
-            if (entry["name"], variant) not in covered:
+            if (entry["name"], variant) in covered:
+                continue
+            if (entry["name"], variant) in unjudged:
+                not_judged.append(
+                    f"{entry['name']}/{variant} (alarm "
+                    f"{unjudged[(entry['name'], variant)]})"
+                )
+            else:
                 uncovered.append(f"{entry['name']}/{variant}")
     rows = []
     for label in uncovered[:20]:
@@ -12124,6 +12160,37 @@ def _capture_disk_alarm_findings(
                 region=region,
             )
         )
+    if not_judged:
+        shown = "; ".join(not_judged[:10])
+        if len(not_judged) > 10:
+            shown += f"; and {len(not_judged) - 10} more"
+        rows.append(
+            create_finding(
+                check_id="SM-31",
+                finding_name=f"{CAPTURE_DISK_ALARM_FINDING} Not Judged",
+                finding_details=(
+                    f"{len(not_judged)} capturing variant(s) have no alarm on "
+                    "DiskUtilization itself at "
+                    f"{CAPTURE_DISK_ALARM_MAX_THRESHOLD:g}% or lower whose ALARM "
+                    "state reaches an enabled action, but have an alarm whose "
+                    "ALARM state reaches an enabled action and whose evaluated "
+                    "query is a metric math expression or "
+                    "another account's metric over their DiskUtilization: "
+                    f"{shown}. Whether that value crosses its threshold when "
+                    f"disk usage reaches {CAPTURE_DISK_ALARM_MAX_THRESHOLD:g}% "
+                    "was not judged."
+                ),
+                resolution=(
+                    "Create a CloudWatch alarm on DiskUtilization for each variant "
+                    "(EndpointName and VariantName dimensions) at 75% or lower with "
+                    "an alarm action."
+                ),
+                reference=CAPTURE_DISK_ALARM_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
     if no_variants:
         rows.append(
             _unread_resources_finding(
@@ -12135,7 +12202,7 @@ def _capture_disk_alarm_findings(
                 region,
             )
         )
-    elif not uncovered and checked:
+    elif not uncovered and not not_judged and checked:
         rows.append(
             create_finding(
                 check_id="SM-31",

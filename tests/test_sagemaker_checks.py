@@ -5673,6 +5673,169 @@ class TestSM31CaptureDiskAlarm:
         assert rows == []
 
 
+class TestRound12SM31DiskAlarmMetricsQueries:
+    """AIR-SGM-EP-06: a DiskUtilization alarm written as a Metrics MetricStat
+    query is the same alarm as one written with top-level MetricName, and an
+    alarm that evaluates an expression over DiskUtilization is not judged."""
+
+    @staticmethod
+    def _stat(query_id, endpoint, variant, **overrides):
+        query = {
+            "Id": query_id,
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "/aws/sagemaker/Endpoints",
+                    "MetricName": "DiskUtilization",
+                    "Dimensions": [
+                        {"Name": "EndpointName", "Value": endpoint},
+                        {"Name": "VariantName", "Value": variant},
+                    ],
+                },
+                "Period": 300,
+                "Stat": "Maximum",
+            },
+        }
+        query.update(overrides)
+        return query
+
+    @staticmethod
+    def _query_alarm(name, queries, **overrides):
+        alarm = TestSM31EndpointDataCapture._disk_alarm("ep")
+        for key in ("Namespace", "MetricName", "Dimensions"):
+            alarm.pop(key)
+        alarm.update(AlarmName=name, Metrics=queries)
+        alarm.update(overrides)
+        return alarm
+
+    def _rows(self, mock_client, alarms):
+        return TestSM31CaptureDiskAlarm()._rows(
+            mock_client,
+            TestSM31CaptureDiskAlarm()._two_variant_endpoint(),
+            alarms=alarms,
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_metric_stat_alarms_on_every_variant_pass(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            [
+                self._query_alarm("a", [self._stat("m1", "ep", "a")]),
+                self._query_alarm("b", [self._stat("m1", "ep", "b", ReturnData=True)]),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 2" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_only_the_variant_without_a_metric_stat_alarm_fails(self, mock_client):
+        rows = self._rows(
+            mock_client, [self._query_alarm("a", [self._stat("m1", "ep", "a")])]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'ep/b'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_metric_stat_alarm_above_75_percent_does_not_count(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            [
+                self._query_alarm("a", [self._stat("m1", "ep", "a")]),
+                self._query_alarm("b", [self._stat("m1", "ep", "b")], Threshold=90.0),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'ep/b'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_query_the_alarm_does_not_evaluate_does_not_count(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            [
+                self._query_alarm(
+                    "both",
+                    [
+                        self._stat("m1", "ep", "a"),
+                        self._stat("m2", "ep", "b", ReturnData=False),
+                    ],
+                )
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'ep/b'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "queries",
+        [
+            [
+                {"Id": "m1", "ReturnData": False},
+                {"Id": "e1", "Expression": "m1 * 2", "ReturnData": True},
+            ],
+            [{"Id": "m1", "AccountId": "111122223333"}],
+        ],
+        ids=["expression", "other_account"],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_derived_disk_alarm_is_not_judged(self, mock_client, queries):
+        stat = self._stat("m1", "ep", "b")
+        queries = [
+            {**stat, **query} if query["Id"] == "m1" else query for query in queries
+        ]
+        rows = self._rows(
+            mock_client,
+            [
+                self._query_alarm("a", [self._stat("m1", "ep", "a")]),
+                self._query_alarm("derived-b", queries),
+            ],
+        )
+        assert [(r["Finding"], r["Status"]) for r in rows] == [
+            (f"{sagemaker_app.CAPTURE_DISK_ALARM_FINDING} Not Judged", "N/A")
+        ]
+        details = rows[0]["Finding_Details"]
+        assert "ep/b (alarm derived-b)" in details
+        assert "ep/a" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_derived_alarm_beside_a_late_direct_one_is_not_judged(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            [
+                self._query_alarm("a", [self._stat("m1", "ep", "a")]),
+                TestSM31EndpointDataCapture._disk_alarm("ep", "b", Threshold=90.0),
+                self._query_alarm(
+                    "derived-b",
+                    [
+                        self._stat("m1", "ep", "b", ReturnData=False),
+                        {"Id": "e1", "Expression": "m1 * 2", "ReturnData": True},
+                    ],
+                ),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "no alarm on DiskUtilization itself at 75% or lower"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_direct_alarm_outranks_a_derived_one(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            [
+                self._query_alarm(
+                    "derived-b",
+                    [
+                        self._stat("m1", "ep", "b", ReturnData=False),
+                        {"Id": "e1", "Expression": "m1 * 2", "ReturnData": True},
+                    ],
+                ),
+                self._query_alarm("a", [self._stat("m1", "ep", "a")]),
+                TestSM31EndpointDataCapture._disk_alarm("ep", "b"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 2" in rows[0]["Finding_Details"]
+
+
 class TestSM23MonitorReportAndAlarm:
     """AIR-SGM-EP-06: each Model Monitor schedule needs a current report and an
     alarm with an action on its metrics; an unread list is never a pass."""
