@@ -10501,7 +10501,7 @@ class TestBR41CentralGuardrailEnforcement:
     ):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
-            "Organization": {"MasterAccountId": "123456789012"}
+            "Organization": {"MasterAccountId": "123456789012", "Id": "o-a1b2c3d4e5"}
         }
         # The account sits directly under the root, so a policy attached to
         # r-abc123 or to the account applies and one on an OU does not.
@@ -10805,7 +10805,7 @@ class TestBR41CentralGuardrailEnforcement:
     def test_br41_reads_policies_from_all_pages(self):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
-            "Organization": {"MasterAccountId": "123456789012"}
+            "Organization": {"MasterAccountId": "123456789012", "Id": "o-a1b2c3d4e5"}
         }
         org_client.list_policies.side_effect = [
             {
@@ -11292,6 +11292,102 @@ class TestBR41CentralGuardrailEnforcement:
         details = findings[0]["Finding_Details"]
         assert "scoped by aws:PrincipalOrgID o-a1b2c3d4e5" in details
         assert "111122223333" not in details
+
+    # GRD-10 round 12: an org key counts only when its value limits the share
+    # to this organization (o-a1b2c3d4e5 in the harness).
+    @pytest.mark.parametrize(
+        "condition, passed",
+        [
+            ({"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}, True),
+            ({"StringLike": {"aws:PrincipalOrgID": "*"}}, False),
+            ({"StringLike": {"aws:PrincipalOrgID": "o-*"}}, False),
+            ({"StringEquals": {"aws:PrincipalOrgID": "o-zzzzzzzzzz"}}, False),
+            # One value naming another organization opens the share to it.
+            (
+                {
+                    "StringEquals": {
+                        "aws:PrincipalOrgID": ["o-a1b2c3d4e5", "o-zzzzzzzzzz"]
+                    }
+                },
+                False,
+            ),
+            # IfExists also admits a principal in no organization.
+            ({"StringEqualsIfExists": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}, False),
+            (
+                {
+                    "ForAnyValue:StringLike": {
+                        "aws:PrincipalOrgPaths": "o-a1b2c3d4e5/r-ab12/ou-ab12-*"
+                    }
+                },
+                True,
+            ),
+            (
+                {"ForAnyValue:StringLike": {"aws:PrincipalOrgPaths": "o-*/r-ab12/*"}},
+                False,
+            ),
+            # ForAllValues: is true when the key is absent.
+            (
+                {
+                    "ForAllValues:StringLike": {
+                        "aws:PrincipalOrgPaths": "o-a1b2c3d4e5/*"
+                    }
+                },
+                False,
+            ),
+        ],
+    )
+    def test_br41_an_org_key_must_name_this_organization(self, condition, passed):
+        findings, share = self._share_rows(self._share("*", condition))
+        if passed:
+            assert share == []
+            assert [f["Status"] for f in findings] == ["Passed"]
+            assert (
+                "member accounts of organization o-a1b2c3d4e5"
+                in (findings[0]["Finding_Details"])
+            )
+            return
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert [f["Status"] for f in share] == ["Failed"]
+        assert (
+            "which does not limit it to organization o-a1b2c3d4e5"
+            in share[0]["Finding_Details"]
+        )
+        assert "outside the organization" in share[0]["Finding_Details"]
+
+    def test_br41_a_named_share_under_another_org_id_is_not_an_org_share(self):
+        findings, share = self._share_rows(
+            self._share(
+                "arn:aws:iam::111122223333:root",
+                {"StringEquals": {"aws:PrincipalOrgID": "o-zzzzzzzzzz"}},
+            )
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert [f["Status"] for f in share] == ["Failed"]
+        details = share[0]["Finding_Details"]
+        assert (
+            "an Allow of bedrock:ApplyGuardrail to arn:aws:iam::111122223333:root "
+            "scoped by aws:PrincipalOrgID o-zzzzzzzzzz, which does not limit it to "
+            "organization o-a1b2c3d4e5"
+        ) in details
+        assert (
+            "with no aws:PrincipalOrgID or aws:PrincipalOrgPaths condition limiting "
+            "it to the organization"
+        ) in details
+
+    def test_br41_an_org_share_without_the_org_id_is_held(self):
+        client = MagicMock()
+        client.get_resource_policy.return_value = {
+            "resourcePolicy": json.dumps(self.ORG_SHARE_POLICY)
+        }
+        with patch("bedrock_app.boto3.client", return_value=client):
+            row = bedrock_app._guardrail_share_finding(
+                self.GUARDRAIL_ARN, "123456789012", "https://example.com", "us-east-1"
+            )
+        assert row["Status"] == "N/A"
+        assert (
+            "whose value was not compared with the organization id, which "
+            "organizations:DescribeOrganization did not return"
+        ) in row["Finding_Details"]
 
     def test_br41_share_of_a_guardrail_owned_elsewhere_is_not_read(self):
         foreign = "arn:aws:bedrock:us-east-1:999988887777:guardrail/central0001"
@@ -17358,6 +17454,26 @@ class TestBR46KnowledgeBaseSourceClassification:
             "buckets MONITORED" in passed[0]["Finding_Details"]
         )
 
+    def test_br46_the_pass_names_the_run_events_it_did_not_read(self):
+        """
+        KB-01 round 12: Macie logs a SCHEDULED_RUN_COMPLETED event for every
+        run, so the Passed text says the check read only lastRunTime and not
+        that Macie returns nothing more.
+        """
+        findings = self._two_bucket_estate(
+            macie_buckets=[self._bucket("support-bucket"), self._bucket("hr-bucket")],
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
+        )
+
+        details = self._status(findings, "Passed")[0]["Finding_Details"]
+        assert (
+            "because this check reads only the job's lastRunTime "
+            "(macie2:DescribeClassificationJob) and not the SCHEDULED_RUN_COMPLETED "
+            "event Macie logs for each run to the /aws/macie/classificationjobs log "
+            "group."
+        ) in details
+        assert "Macie returns only lastRunTime" not in details
+
     @pytest.mark.parametrize(
         "overrides, text",
         [
@@ -22843,6 +22959,64 @@ class TestDeployedGuardrailVersions:
         assert (
             bedrock_app.GUARDRAIL_DEPLOYMENT_CEILING in deployed[1]["Finding_Details"]
         )
+
+    def test_the_deployed_ceiling_names_the_row_that_judges_event_named_versions(
+        self,
+    ):
+        """
+        GRD-02 and GRD-09: an InvokeModel or Converse event names the guardrail
+        and version, so the deployed rows of BR-34 and BR-27 point at the row
+        that judges them, and BR-26, which judges none, says so.
+        """
+        attachments = self._attachments(
+            {
+                ("gr-d", "1"): (
+                    ["agent 'a' version 1"],
+                    {
+                        **self._content([self.PREVENTIVE]),
+                        **self._grounding(),
+                        "sensitiveInformationPolicy": self.GOOD_PII,
+                    },
+                )
+            }
+        )
+        prompt = self._rows(
+            self._prompt_attack(
+                self._draft(self._content([self.PREVENTIVE])), attachments
+            ),
+            "Deployed Guardrail Prompt Attack Filter",
+        )
+        with patch("bedrock_app.boto3.client") as client:
+            client.return_value.list_guardrails.return_value = {"guardrails": []}
+            grounding = self._rows(
+                bedrock_app.check_bedrock_guardrail_contextual_grounding(
+                    region=self.REGION, attachment_inventory=attachments
+                ),
+                "Deployed Guardrail Contextual Grounding",
+            )
+        pii = self._rows(
+            self._pii({"Good": self.GOOD_PII}, attachments),
+            "Deployed Guardrail Sensitive Information Filter",
+        )
+
+        assert [row["Status"] for row in prompt + grounding + pii] == ["Passed"] * 3
+        for row in prompt + grounding + pii:
+            assert "is recorded by no configuration API" in row["Finding_Details"]
+            assert (
+                "The CloudTrail management event of an InvokeModel, "
+                "InvokeModelWithResponseStream or Converse call does name the "
+                "guardrail and version in requestParameters."
+            ) in row["Finding_Details"]
+        assert (
+            "The 'Guardrail Prompt Attack Invocation Evidence' row of BR-34 judges "
+            "each version such an event names, for the calls logged in the last 24 "
+            "hours."
+        ) in prompt[0]["Finding_Details"]
+        assert (
+            "The 'Guardrail Contextual Grounding Score Evidence' row of BR-27 judges "
+            "each version such an event names"
+        ) in grounding[0]["Finding_Details"]
+        assert "That version is not judged by this check." in pii[0]["Finding_Details"]
 
     def test_br34_unread_deployed_version_blocks_a_clean_pass(self):
         result = self._prompt_attack(
@@ -47672,7 +47846,48 @@ class TestInvocationLogGuardrailEvidence:
             )
         return record
 
-    def _guarded(self, request_id, tagged, operation="InvokeModel"):
+    # A guarded InvokeModel call's CloudTrail event names its guardrail in
+    # requestParameters (live events at 14:19:19Z and 14:38:51Z, account
+    # 178113193057, us-east-1, 2026-10-04). By default it names PASSING, a
+    # version that passes both the prompt attack and the grounding test.
+    PASSING = ("gr-pass", "1")
+    PASSING_DETAIL = {
+        "contentPolicy": {
+            "filters": [
+                {
+                    "type": "PROMPT_ATTACK",
+                    "inputEnabled": True,
+                    "inputAction": "BLOCK",
+                    "inputStrength": "HIGH",
+                }
+            ],
+            "tier": {"tierName": "STANDARD"},
+        },
+        "contextualGroundingPolicy": {
+            "filters": [
+                {"type": "GROUNDING", "threshold": 0.75, "action": "BLOCK"},
+                {"type": "RELEVANCE", "threshold": 0.75, "action": "BLOCK"},
+            ]
+        },
+    }
+
+    def _invoke_event(self, request_id, operation, guardrail, version):
+        parameters = {"modelId": "anthropic.test"}
+        if guardrail:
+            parameters.update(
+                {"guardrailIdentifier": guardrail, "guardrailVersion": version}
+            )
+        self.__dict__.setdefault("invoke_events", {}).setdefault(operation, []).append(
+            {
+                "eventName": operation,
+                "requestID": request_id,
+                "requestParameters": parameters,
+            }
+        )
+
+    def _guarded(self, request_id, tagged, operation="InvokeModel", guardrail=PASSING):
+        if guardrail:
+            self._invoke_event(request_id, operation, *guardrail)
         prompt = (
             f"<{self.TAG}_xyz>{self.BODY_TEXT}</{self.TAG}_xyz>"
             if tagged
@@ -47689,7 +47904,9 @@ class TestInvocationLogGuardrailEvidence:
         )
 
     def _catch(self, request_id, action="BLOCKED"):
-        return self._record(
+        # The trace keys the assessment by guardrail g1, which the call's
+        # CloudTrail event names.
+        record = self._record(
             request_id,
             "Converse",
             out={
@@ -47713,12 +47930,14 @@ class TestInvocationLogGuardrailEvidence:
                 },
             },
         )
+        self._converse_event(request_id, "g1")
+        return record
 
     def _scored(self, request_id, score=0.31, filter_type="GROUNDING"):
         item = {"type": filter_type, "threshold": 0.75, "action": "BLOCKED"}
         if score is not None:
             item["score"] = score
-        return self._record(
+        record = self._record(
             request_id,
             "Converse",
             out={
@@ -47731,6 +47950,8 @@ class TestInvocationLogGuardrailEvidence:
                 }
             },
         )
+        self._converse_event(request_id, "g1")
+        return record
 
     def _run(
         self,
@@ -47760,12 +47981,23 @@ class TestInvocationLogGuardrailEvidence:
         trail.setdefault(
             "Converse", [list(self.__dict__.get("converse_events", {}).values())]
         )
+        for operation, events in self.__dict__.get("invoke_events", {}).items():
+            trail.setdefault(operation, [events])
+        guardrails = {
+            self.PASSING: {"guardrail": self.PASSING_DETAIL},
+            **(guardrails or {}),
+        }
         bedrock = MagicMock()
         self.guardrail_reads = []
 
         def get_guardrail(guardrailIdentifier, guardrailVersion):
             self.guardrail_reads.append((guardrailIdentifier, guardrailVersion))
-            answer = (guardrails or {})[(guardrailIdentifier, guardrailVersion)]
+            # A version the test does not name reads as PASSING, so a test of
+            # another leg is not decided by the per-call version leg.
+            answer = guardrails.get(
+                (guardrailIdentifier, guardrailVersion),
+                {"guardrail": self.PASSING_DETAIL},
+            )
             if isinstance(answer, Exception):
                 raise answer
             return answer
@@ -48502,8 +48734,13 @@ class TestInvocationLogGuardrailEvidence:
         assert "2 of the 3 guarded Converse call(s)" in detail
         assert "req-bare (Converse anthropic.test)" in detail
         assert "req-half (Converse anthropic.test)" in detail
+        # GRD-09 ruling: a version a CloudTrail event names is given the full grounding verdict, so gr-p, which has no grounding
+        # filter, fails, and its call is not counted for qualifiers.
+        versions, qualifiers = detail.split("2 of the 3 guarded Converse call(s)")
+        assert "guardrail gr-p version 1 (1 call(s): req-pii" in versions
         for other in ("req-q", "req-pii"):
-            assert other not in detail
+            assert other not in qualifiers
+        assert "req-q" not in versions
         assert rows[0]["Severity"] == "Medium"
         assert sorted(set(self.guardrail_reads)) == [("gr-g", "1"), ("gr-p", "1")]
 
@@ -48514,7 +48751,8 @@ class TestInvocationLogGuardrailEvidence:
                 self.CONVERSE: [
                     [
                         self._qualified("req-q", ["query", "grounding_source"]),
-                        self._qualified("req-pii", [], guardrail="gr-p"),
+                        # No call through gr-p: under the GRD-09 ruling its
+                        # version, with no grounding filter, fails the row.
                         self._scored("req-s", 0.4),
                     ]
                 ],
@@ -48615,6 +48853,8 @@ class TestInvocationLogGuardrailEvidence:
             out=out,
         )
         record["timestamp"] = self.CALL_TIME
+        # Its CloudTrail event names gr-g, unless the test's trail says otherwise.
+        self._invoke_event(request_id, "InvokeModel", "gr-g", "1")
         return record
 
     CALL_TIME = "2026-10-04T14:19:18Z"
@@ -48702,6 +48942,8 @@ class TestInvocationLogGuardrailEvidence:
                 self.GROUNDING: [[self._scored("req-s", 0.4)]],
                 self.GUARDED: [[record]],
             },
+            # The bare call has no CloudTrail event.
+            trail={"InvokeModel": [[]]} if call == "bare" else None,
         )
 
         assert [row["Status"] for row in rows] == ["N/A"]
@@ -48740,7 +48982,11 @@ class TestInvocationLogGuardrailEvidence:
             "req-g (InvokeModel anthropic.test) through guardrail gr-g version 1"
             in detail
         )
-        assert "req-p" not in detail
+        # GRD-09 ruling: gr-p, named by req-p's event, has no grounding filter
+        # and fails; req-p is not counted for grounding tags.
+        versions, tags = detail.split("1 of the 1 guarded InvokeModel call(s)")
+        assert "guardrail gr-p version 1 (1 call(s): req-p" in versions
+        assert "req-p" not in tags
         assert sorted(set(self.guardrail_reads)) == [("gr-g", "1"), ("gr-p", "1")]
         assert {request["name"] for request in self.trail_requests} == {"InvokeModel"}
         assert all(
@@ -48750,9 +48996,13 @@ class TestInvocationLogGuardrailEvidence:
             for request in self.trail_requests
         )
 
-    def test_an_untagged_invoke_call_through_a_guardrail_without_grounding_is_excluded(
+    def test_an_untagged_invoke_call_through_a_guardrail_without_grounding_fails(
         self,
     ):
+        """
+        GRD-09 ruling: a version a CloudTrail event names that has no grounding
+        filter fails. Its call is still not judged for grounding tags.
+        """
         rows = self._grounding(
             {
                 self.GROUNDING: [[self._scored("req-s", 0.4)]],
@@ -48764,17 +49014,27 @@ class TestInvocationLogGuardrailEvidence:
                 ],
             },
             guardrails=self._grounding_guardrails(),
-            trail={"InvokeModel": [self._trail_event("req-p", guardrail="gr-p")]},
+            trail={
+                "InvokeModel": [
+                    [
+                        self._trail_event("req-p", guardrail="gr-p"),
+                        self._trail_event("req-a"),
+                    ]
+                ]
+            },
         )
 
-        assert [row["Status"] for row in rows] == ["Passed"]
+        assert [row["Status"] for row in rows] == ["Failed"]
         detail = rows[0]["Finding_Details"]
         assert (
-            "every one of the 1 guarded InvokeModel call(s) that sent a grounding "
-            "tag or ran through a guardrail version with contextual grounding "
-            "filters wrapped both a groundingSource and a query tag"
+            "1 guardrail version(s) named by the CloudTrail event of a guarded call "
+            "logged in /aws/bedrock/model-invocation-logs in the last 24 hours fail "
+            "the contextual grounding test: guardrail gr-p version 1 (1 call(s): "
+            "req-p (InvokeModel anthropic.test)): contextual grounding checks are "
+            "not enabled"
         ) in detail
-        assert "req-p" not in detail
+        assert "guarded InvokeModel call(s) logged" not in detail
+        assert "req-a" not in detail
 
     def _spread_calls(self, count):
         """``count`` untagged guarded calls, one a minute from 13:00 UTC."""
@@ -48919,7 +49179,11 @@ class TestInvocationLogGuardrailEvidence:
         assert "1 of the 1 guarded Converse call(s)" in detail
         assert "req-c-g (Converse anthropic.test)" in detail
         assert "req-c-u" not in detail
-        assert {request["name"] for request in self.trail_requests} == {"Converse"}
+        # The guarded InvokeModel call is joined too, to read its version.
+        assert {request["name"] for request in self.trail_requests} == {
+            "Converse",
+            "InvokeModel",
+        }
 
     def test_a_converse_stream_call_is_joined_on_its_own_event_name(self):
         record = self._converse("req-s-g", [("user", [self.TEXT_BLOCK])])
@@ -48937,10 +49201,18 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["Failed"]
         assert "req-s-g (ConverseStream anthropic.test)" in rows[0]["Finding_Details"]
         assert [request["name"] for request in self.trail_requests] == [
-            "ConverseStream"
+            "ConverseStream",
+            "InvokeModel",
         ]
 
-    def test_a_logged_intervention_needs_no_join(self):
+    def test_a_logged_intervention_without_its_event_leaves_its_version_unjudged(
+        self,
+    ):
+        """
+        GRD-02 ruling: the version a guarded call ran through is judged, and only
+        its CloudTrail event names it, so an intervention logged with an unread
+        event is held at N/A, not credited.
+        """
         rows = self._prompt(
             {
                 self.PROMPT: [[self._catch("req-catch")]],
@@ -48959,12 +49231,12 @@ class TestInvocationLogGuardrailEvidence:
             trail={"Converse": _make_client_error("AccessDeniedException")},
         )
 
-        assert [row["Status"] for row in rows] == ["Passed"]
+        assert [row["Status"] for row in rows] == ["N/A"]
         assert (
-            "every one of the 1 guarded Converse call(s)"
-            in (rows[0]["Finding_Details"])
-        )
-        assert self.trail_requests == []
+            "req-c-i (Converse anthropic.test), whose CloudTrail event was not read "
+            "(cloudtrail:LookupEvents, AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+        assert "Converse" in {request["name"] for request in self.trail_requests}
 
     def test_a_converse_call_without_an_event_withholds_the_pass(self):
         old = self._converse("req-c-old", [("user", [self.GUARD_BLOCK])])
@@ -49065,8 +49337,9 @@ class TestInvocationLogGuardrailEvidence:
         )
 
         assert first == 1
-        assert self.trail_requests == []
-        assert joins["pages"] == 1
+        # Only req-1, which BR-27 did not join, is looked up again.
+        assert [request["name"] for request in self.trail_requests] == ["InvokeModel"]
+        assert joins["pages"] == 2
         assert [row["Status"] for row in rows] == ["Failed"]
         detail = rows[0]["Finding_Details"]
         assert "req-c-g (Converse anthropic.test)" in detail
@@ -49092,8 +49365,193 @@ class TestInvocationLogGuardrailEvidence:
         detail = rows[0]["Finding_Details"]
         assert "1 of the 1 guarded Converse call(s)" in detail
         assert "req-v1 (Converse anthropic.test)" in detail
-        assert "req-v3" not in detail
+        # GRD-09 ruling: a version a CloudTrail event names is given the full grounding verdict, so version 3, which has no
+        # grounding filter, fails, and its call is not counted for qualifiers.
+        versions, qualifiers = detail.split("1 of the 1 guarded Converse call(s)")
+        assert "guardrail gr-g version 3 (1 call(s): req-v3" in versions
+        assert "req-v3" not in qualifiers
         assert sorted(set(self.guardrail_reads)) == [("gr-g", "1"), ("gr-g", "3")]
+
+    # GRD-02: the version a guarded call's CloudTrail event names is judged for
+    # its PROMPT_ATTACK filter, so a version passed per request without one fails.
+    NO_PROMPT_ATTACK = {
+        "contentPolicy": {
+            "filters": [{"type": "HATE", "inputStrength": "HIGH"}],
+            "tier": {"tierName": "STANDARD"},
+        }
+    }
+    CLASSIC_PROMPT_ATTACK = {
+        "contentPolicy": {
+            "filters": [
+                {
+                    "type": "PROMPT_ATTACK",
+                    "inputEnabled": True,
+                    "inputAction": "BLOCK",
+                    "inputStrength": "HIGH",
+                }
+            ],
+            "tier": {"tierName": "CLASSIC"},
+        }
+    }
+
+    @pytest.mark.parametrize(
+        "detail, reason",
+        [
+            (NO_PROMPT_ATTACK, "no PROMPT_ATTACK filter is configured"),
+            (CLASSIC_PROMPT_ATTACK, "the content-filter tier is CLASSIC"),
+        ],
+    )
+    def test_br34_fails_the_version_an_invoke_event_names(self, detail, reason):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [
+                    [
+                        self._guarded("req-good", True),
+                        self._guarded("req-bad", True, guardrail=("gr-bad", "2")),
+                    ]
+                ],
+            },
+            guardrails={("gr-bad", "2"): {"guardrail": detail}},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail_text = rows[0]["Finding_Details"]
+        assert (
+            "1 guardrail version(s) named by the CloudTrail event of a guarded call "
+            "logged in /aws/bedrock/model-invocation-logs in the last 24 hours fail "
+            "the prompt attack filter test: guardrail gr-bad version 2 (1 call(s): "
+            "req-bad (InvokeModel anthropic.test))"
+        ) in detail_text
+        assert reason in detail_text
+        assert "req-good" not in detail_text
+        assert "guardrail gr-pass version 1 (1 call(s))" in detail_text
+        assert ("gr-bad", "2") in self.guardrail_reads
+
+    def test_br34_fails_the_version_a_converse_event_names(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+                self.CONVERSE: [
+                    [self._converse("req-c", [("user", [self.GUARD_BLOCK])])]
+                ],
+            },
+            guardrails={("g1", "1"): {"guardrail": self.NO_PROMPT_ATTACK}},
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "fail the prompt attack filter test: guardrail g1 version 1 (1 call(s): "
+            "req-c (Converse anthropic.test)): it does not have a preventive "
+            "PROMPT_ATTACK input filter"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "answer, phrase",
+        [
+            (
+                _make_client_error("AccessDeniedException"),
+                "guardrail gr-pass version 1 was not read with bedrock:GetGuardrail "
+                "(AccessDeniedException)",
+            ),
+            (
+                {
+                    "guardrail": {
+                        "contentPolicy": {
+                            "filters": CLASSIC_PROMPT_ATTACK["contentPolicy"]["filters"]
+                        }
+                    }
+                },
+                "guardrail gr-pass version 1 (1 call(s): req-1 (InvokeModel "
+                "anthropic.test)) could not be judged",
+            ),
+        ],
+    )
+    def test_br34_an_unjudged_named_version_withholds_the_pass(self, answer, phrase):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True)]],
+            },
+            guardrails={self.PASSING: answer},
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert phrase in rows[0]["Finding_Details"]
+
+    def test_br34_a_call_whose_event_names_no_guardrail_is_noted_not_held(self):
+        rows = self._prompt(
+            {
+                self.PROMPT: [[self._catch("req-catch")]],
+                self.GUARDED: [[self._guarded("req-1", True, guardrail=None)]],
+            },
+            trail={"InvokeModel": [[self._trail_event("req-1", guardrail=None)]]},
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "1 guarded call(s) have a CloudTrail event that names no guardrail, as "
+            "with an account-enforced guardrail, which the deployed guardrail row "
+            "judges, so no per-call version was judged for them: req-1 "
+            "(InvokeModel anthropic.test)."
+        ) in rows[0]["Finding_Details"]
+
+    # GRD-09: a version a call's CloudTrail event names fails unless GROUNDING and
+    # RELEVANCE both block with a threshold in the 0-0.99 range.
+    @pytest.mark.parametrize(
+        "filters, reason",
+        [
+            (
+                [{"type": "GROUNDING", "threshold": 0.7, "action": "BLOCK"}],
+                "does not block on RELEVANCE",
+            ),
+            (
+                [
+                    {"type": "GROUNDING", "threshold": 0.7, "action": "NONE"},
+                    {"type": "RELEVANCE", "threshold": 0.7, "action": "BLOCK"},
+                ],
+                "does not block on GROUNDING",
+            ),
+            (
+                [
+                    {"type": "GROUNDING", "threshold": 0.7, "action": "BLOCK"},
+                    {"type": "RELEVANCE", "threshold": 0, "action": "BLOCK"},
+                ],
+                "does not block on RELEVANCE",
+            ),
+        ],
+    )
+    def test_br27_fails_a_named_version_without_full_grounding(self, filters, reason):
+        rows = self._grounding(
+            {
+                self.GROUNDING: [[self._scored("req-s", 0.4)]],
+                self.CONVERSE: [
+                    [
+                        self._qualified("req-ok", ["grounding_source", "query"]),
+                        self._qualified(
+                            "req-weak", ["grounding_source", "query"], guardrail="gr-w"
+                        ),
+                    ]
+                ],
+            },
+            guardrails={
+                **self._grounding_guardrails(),
+                ("gr-w", "1"): {
+                    "guardrail": {"contextualGroundingPolicy": {"filters": filters}}
+                },
+            },
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "fail the contextual grounding test: guardrail gr-w version 1 (1 "
+            "call(s): req-weak (Converse anthropic.test)): contextual grounding "
+            f"{reason}"
+        ) in detail
+        assert "req-ok" not in detail
+        assert "No Automated Reasoning" not in detail
 
     def test_an_s3_object_is_read_once_for_every_leg(self):
         rows = self._prompt(
