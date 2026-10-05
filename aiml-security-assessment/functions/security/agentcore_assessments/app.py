@@ -9255,8 +9255,9 @@ def _positive_condition_values(statement: Dict[str, Any], key: str) -> List[List
 
 def _statement_binds_token_vault(
     statement: Dict[str, Any], vault_id: str, region: str
-) -> bool:
-    """Return whether one statement limits key use to this vault via Identity.
+) -> str:
+    """Return the Region segment through which one statement limits key use to
+    this vault via Identity, or an empty string when it does not.
 
     kms:ViaService has to name bedrock-agentcore-identity in the key's region;
     the documented `bedrock-agentcore-identity.*.amazonaws.com` is accepted
@@ -9264,11 +9265,13 @@ def _statement_binds_token_vault(
     The vault context has to name the bedrock-agentcore service and this
     vault's `token-vault/<id>` resource written out with no wildcard, as AC-12
     requires of a gateway context: `token-vault/*` lets every vault in the
-    account use the key. The Region has to be the key's own, written out: a
-    vault in another Region is another vault, and `*` names this vault id in
-    every Region. The account has to be either literal or held to the
-    caller's own account by aws:ResourceAccount equal to ${aws:PrincipalAccount}
-    in the same statement.
+    account use the key. The Region segment has to match the key's Region as
+    an ArnLike pattern: a vault in another Region is another vault, and an
+    empty segment matches no vault ARN. A wildcard segment such as the
+    guide's `*` binds, and is returned so the finding can say the context
+    names this vault id in every Region it matches. The account has to be
+    either literal or held to the caller's own account by aws:ResourceAccount
+    equal to ${aws:PrincipalAccount} in the same statement.
     """
     via_service = f"bedrock-agentcore-identity.{region}.amazonaws.com"
     if not any(
@@ -9278,7 +9281,7 @@ def _statement_binds_token_vault(
         )
         for values in _positive_condition_values(statement, "kms:viaservice")
     ):
-        return False
+        return ""
     account_held = _condition_pins_value(
         statement,
         "aws:resourceaccount",
@@ -9290,6 +9293,7 @@ def _statement_binds_token_vault(
         statement, TOKEN_VAULT_ENCRYPTION_CONTEXT_KEY
     ):
         bound = True
+        segments = set()
         for value in values:
             parts = value.split(":", 5)
             if len(parts) != 6:
@@ -9305,16 +9309,17 @@ def _statement_binds_token_vault(
                 parts[0] != "arn"
                 or any(wildcard in partition for wildcard in "*?")
                 or service != "bedrock-agentcore"
-                or parts[3] != region.lower()
+                or not fnmatchcase(region.lower(), parts[3])
                 or not resource.startswith("token-vault/")
                 or resource != target
                 or not (account.isdigit() and len(account) == 12 or account_held)
             ):
                 bound = False
                 break
+            segments.add(parts[3])
         if bound:
-            return True
-    return False
+            return ", ".join(sorted(segments))
+    return ""
 
 
 def _token_vault_key_policy_gaps(
@@ -9336,7 +9341,8 @@ def _token_vault_key_policy_gaps(
             "has no statement allowing kms:Decrypt only with kms:ViaService "
             f"bedrock-agentcore-identity.{region}.amazonaws.com and "
             "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
-            f"token-vault-arn naming token-vault/{vault_id} in {region} in one account"
+            f"token-vault-arn naming token-vault/{vault_id} in a Region matching "
+            f"{region} in one account"
         )
     if _kms_key_policy_allows_open_decrypt(policy_document):
         gaps.append(
@@ -9586,6 +9592,20 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
                 )
             )
             continue
+        bound_regions = {
+            _statement_binds_token_vault(statement, vault_id, _arn_region(key_arn))
+            for statement in _document_statements(key_policy, effect="Allow")
+            if _statement_matches_action(statement, "kms:decrypt")
+        } - {""}
+        if any(not re.search(r"[*?]", segment) for segment in bound_regions):
+            vault_scope = "for this vault"
+        else:
+            vault_scope = (
+                f"with a token-vault-arn context naming token-vault/{vault_id} "
+                f"in any Region matching {' or '.join(sorted(bound_regions))} "
+                "of one account, the form of the AgentCore Identity guide's "
+                "example key policy"
+            )
         findings.append(
             create_finding(
                 check_id="AC-14",
@@ -9593,8 +9613,8 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
                 finding_details=(
                     f"{label} uses customer-managed KMS key {key_arn}, which "
                     "kms:DescribeKey reports as Enabled and whose key policy "
-                    "allows kms:Decrypt through AgentCore Identity for this "
-                    "vault. A statement granting kms:Decrypt with no condition, "
+                    "allows kms:Decrypt through AgentCore Identity "
+                    f"{vault_scope}. A statement granting kms:Decrypt with no condition, "
                     "such as the account-root kms:* statement, is not "
                     "subtracted."
                 ),

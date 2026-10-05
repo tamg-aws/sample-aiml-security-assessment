@@ -6718,7 +6718,7 @@ def _provider(name, vault="default", kind="oauth2credentialprovider"):
 
 
 def _ac14_key_policy(
-    context="arn:aws:bedrock-agentcore:us-east-1:*:token-vault/default",
+    context="arn:aws:bedrock-agentcore:*:*:token-vault/default",
     via="bedrock-agentcore-identity.*.amazonaws.com",
     via_operator="StringLike",
     account_held=True,
@@ -7239,7 +7239,7 @@ class TestAC14VaultKeyPolicy:
         assert [f["Status"] for f in findings] == [status]
         if status == "Failed":
             assert (
-                "naming token-vault/default in us-east-1 in one account"
+                "naming token-vault/default in a Region matching us-east-1 in one account"
                 in (findings[0]["Finding_Details"])
             )
 
@@ -7247,20 +7247,21 @@ class TestAC14VaultKeyPolicy:
         ("region", "status"),
         [
             ("us-east-1", "Passed"),
+            ("*", "Wildcard"),
+            ("us-*", "Wildcard"),
+            ("us-east-?", "Wildcard"),
             ("eu-west-1", "Failed"),
-            ("*", "Failed"),
-            ("us-*", "Failed"),
-            ("us-east-?", "Failed"),
             ("", "Failed"),
         ],
     )
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
-    def test_a_vault_context_in_another_region_does_not_bind_this_vault(
+    def test_a_vault_context_binds_this_vault_only_in_a_matching_region(
         self, mock_ac, mock_kms, region, status
     ):
-        # AIR-ACR-ID-05: token-vault/default in eu-west-1 is another vault, and
-        # a wildcard Region names this vault id in every Region.
+        # AIR-ACR-ID-05: the Region segment is an ArnLike pattern. eu-west-1
+        # names another Region's vault and an empty segment matches no vault,
+        # while a wildcard binds and the text names every Region it matches.
         self._wire(
             mock_ac,
             mock_kms,
@@ -7276,12 +7277,71 @@ class TestAC14VaultKeyPolicy:
 
         findings = agentcore_app.check_agentcore_token_vault_encryption()
 
-        assert [f["Status"] for f in findings] == [status]
+        details = findings[0]["Finding_Details"]
         if status == "Failed":
+            assert [f["Status"] for f in findings] == ["Failed"]
             assert (
-                "naming token-vault/default in us-east-1 in one account"
-                in (findings[0]["Finding_Details"])
+                "naming token-vault/default in a Region matching us-east-1 in one "
+                "account" in details
             )
+            return
+        assert [f["Status"] for f in findings] == ["Passed"]
+        if status == "Passed":
+            assert "through AgentCore Identity for this vault." in details
+            assert "any Region matching" not in details
+        else:
+            assert "for this vault" not in details
+            assert (
+                "context naming token-vault/default in any Region matching "
+                f"{region} of one account" in details
+            )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_identity_guide_example_key_policy_passes(self, mock_ac, mock_kms):
+        # kms-key-policy-configuration.html, "Set customer managed key policy".
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "BedrockAgentCoreIdentityKMSAccess",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                    "Action": [
+                        "kms:Encrypt",
+                        "kms:Decrypt",
+                        "kms:GenerateDataKeyWithoutPlaintext",
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringLike": {
+                            "kms:ViaService": (
+                                "bedrock-agentcore-identity.*.amazonaws.com"
+                            )
+                        },
+                        "ArnLike": {
+                            "kms:EncryptionContext:aws-crypto-ec:aws:"
+                            "bedrock-agentcore-identity:token-vault-arn": (
+                                "arn:aws:bedrock-agentcore:*:*:token-vault/default"
+                            )
+                        },
+                        "StringEquals": {
+                            "aws:ResourceAccount": "${aws:PrincipalAccount}"
+                        },
+                    },
+                }
+            ],
+        }
+        self._wire(mock_ac, mock_kms, {self._KEYS["default"]: json.dumps(policy)})
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "context naming token-vault/default in any Region matching * of one "
+            "account, the form of the AgentCore Identity guide's example key policy"
+            in findings[0]["Finding_Details"]
+        )
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
