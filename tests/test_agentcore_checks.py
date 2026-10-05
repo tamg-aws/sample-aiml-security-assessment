@@ -13888,6 +13888,46 @@ class TestAC27ConsentPortalRoleTrust:
         assert "Consent portal 'cp-open' (cp-open)" in rows[1]["Finding_Details"]
         assert "runs as cp-open-role" in rows[1]["Finding_Details"]
 
+    @pytest.mark.parametrize(
+        "resource, says, denies",
+        [
+            (
+                "gateway/*",
+                "for another AgentCore resource in the account",
+                "does not list this portal's ARN",
+            ),
+            (
+                "consent-portal/*",
+                "does not list this portal's ARN",
+                "for another AgentCore resource in the account",
+            ),
+        ],
+        ids=["gateway-type", "portal-type"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_arn_of_another_type_is_told_from_an_unpinned_portal(
+        self, mock_ac, mock_iam, resource, says, denies
+    ):
+        # Both rows are named Source ARN Not Scoped, so only the text tells a
+        # gateway/* value, which is not a consent-portal resource at all, from a
+        # consent-portal/* pattern that misses this portal's ARN.
+        rows = self._run(
+            mock_ac,
+            mock_iam,
+            {
+                "cp-open": _portal_trust(
+                    f"arn:aws:bedrock-agentcore:us-east-1:123456789012:{resource}"
+                )
+            },
+        )
+
+        assert [(row["Status"], row["Finding"]) for row in rows] == [
+            ("Failed", f"{self._NAME} Source ARN Not Scoped")
+        ]
+        assert says in rows[0]["Finding_Details"]
+        assert denies not in rows[0]["Finding_Details"]
+
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
     def test_a_role_shared_by_two_portals_naming_both_passes(self, mock_ac, mock_iam):
