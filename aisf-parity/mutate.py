@@ -3713,6 +3713,20 @@ MUTATIONS = [
         "replace": '            if (entry["name"], variant) in covered and (entry["name"], variant) not in unjudged:\n                continue\n',
     },
     {
+        "name": "SM-31 drops the sampling percentage from the capture text",
+        "file": SAGEMAKER,
+        "defect": "DescribeEndpoint returns CurrentSamplingPercentage, so a Passed row that omits it withholds a value the check read",
+        "find": "                    f\"a CurrentSamplingPercentage of {entry['sampling']}%\"\n",
+        "replace": '                    "a CurrentSamplingPercentage"\n',
+    },
+    {
+        "name": "SM-31 reads a zero sampling percentage as not reported",
+        "file": SAGEMAKER,
+        "defect": "a CurrentSamplingPercentage of 0 is a reported value, so naming it not reported states the opposite of what DescribeEndpoint returned",
+        "find": '                    if isinstance(entry["sampling"], int)\n',
+        "replace": '                    if entry["sampling"]\n',
+    },
+    {
         "name": "SM-09 holds no Studio domain or update action",
         "file": SAGEMAKER,
         "defect": "UpdateNotebookInstance can turn RootAccess back on and "
@@ -8392,6 +8406,8 @@ GROUPS: dict[str, str] = {
     "SM-31 fails a derived disk alarm as no alarm": "in the SageMaker verdict legs",
     "SM-31 passes beside a variant not judged": "in the SageMaker verdict legs",
     "SM-31 lets a derived disk alarm outrank a direct one": "in the SageMaker verdict legs",
+    "SM-31 drops the sampling percentage from the capture text": "in the SageMaker verdict legs",
+    "SM-31 reads a zero sampling percentage as not reported": "in the SageMaker verdict legs",
     "SM-43 stops counting at the page that hit the cap": "in the SageMaker verdict legs",
     "SM-43 reports a stopped count as exact": "in the SageMaker verdict legs",
     "SM-43 never spends the counting page budget": "in the SageMaker verdict legs",
