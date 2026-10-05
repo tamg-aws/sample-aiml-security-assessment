@@ -12409,7 +12409,13 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
 
         if capturing:
             described = "; ".join(
-                "{} to {}".format(entry["name"], entry["destination"] or "S3")
+                "{} to {} at {}".format(
+                    entry["name"],
+                    entry["destination"] or "S3",
+                    f"a CurrentSamplingPercentage of {entry['sampling']}%"
+                    if isinstance(entry["sampling"], int)
+                    else "a CurrentSamplingPercentage not reported",
+                )
                 for entry in capturing[:3]
             )
             findings["csv_data"].append(
@@ -12420,9 +12426,9 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                         f"{len(capturing)} of {endpoints_seen} endpoint(s) report "
                         "CaptureStatus Started and capture both requests and "
                         "responses (endpoint config CaptureOptions): "
-                        f"{described}. Whether the captured "
-                        "records are reviewed, and at what sampling percentage, is "
-                        "not readable from the endpoint."
+                        f"{described}. The control names no sampling "
+                        "percentage, so none is judged. Whether the captured "
+                        "records are reviewed is not readable from the endpoint."
                     ),
                     resolution=(
                         "No action required on capture. Confirm a Model Monitor "

@@ -5564,6 +5564,65 @@ class TestSM31EndpointDataCapture:
         assert_could_not_assess_finding(findings[0])
 
 
+class TestRound12bSM31SamplingPercentage:
+    """AIR-SGM-EP-06: DescribeEndpoint returns CurrentSamplingPercentage, so
+    the capture Passed text reports it per endpoint and judges no bound."""
+
+    @staticmethod
+    def _capture(sampling=None):
+        config = {
+            "EnableCapture": True,
+            "CaptureStatus": "Started",
+            "DestinationS3Uri": "s3://audit/capture",
+        }
+        if sampling is not None:
+            config["CurrentSamplingPercentage"] = sampling
+        return {"DataCaptureConfig": config}
+
+    def _passed(self, mock_client, endpoints):
+        TestSM31EndpointDataCapture._endpoints(mock_client, endpoints)
+        rows = extract_csv_data(
+            sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+        )
+        return [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.ENDPOINT_DATA_CAPTURE_FINDING
+            and r["Status"] == "Passed"
+        ]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_endpoint_reports_its_own_sampling_percentage(self, mock_client):
+        rows = self._passed(
+            mock_client, {"low": self._capture(20), "full": self._capture(100)}
+        )
+        assert len(rows) == 1
+        details = rows[0]["Finding_Details"]
+        assert (
+            "low to s3://audit/capture at a CurrentSamplingPercentage of 20%"
+        ) in details
+        assert (
+            "full to s3://audit/capture at a CurrentSamplingPercentage of 100%"
+        ) in details
+        assert "names no sampling percentage, so none is judged" in details
+        assert "at what sampling percentage" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_zero_percentage_is_reported_and_a_missing_one_is_named(
+        self, mock_client
+    ):
+        rows = self._passed(
+            mock_client, {"zero": self._capture(0), "unset": self._capture()}
+        )
+        details = rows[0]["Finding_Details"]
+        assert "zero to s3://audit/capture at a CurrentSamplingPercentage of 0%" in (
+            details
+        )
+        assert (
+            "unset to s3://audit/capture at a CurrentSamplingPercentage not reported"
+        ) in details
+
+
 class TestSM31CaptureDiskAlarm:
     """AIR-SGM-EP-06: a capturing variant needs a DiskUtilization alarm at 75%
     or lower, because Data Capture stops at high disk usage."""
