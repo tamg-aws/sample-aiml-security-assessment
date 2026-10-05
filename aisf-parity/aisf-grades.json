@@ -7,20 +7,14 @@
       "grade": "full",
       "checks": [
         "AC-02"
-      ],
-      "reason": "_evaluation_admin_wildcard_principals (app.py:3801) fails a wildcard pattern, bare * or NotAction that reaches any of the six evaluation writes, but only when the write survives the principal's Deny statements and permissions boundary. _evaluator_duty_split (app.py:3874) fails authors when no principal only reads evaluators, and the full-access marker and unbounded-wildcard legs (app.py:5015-5050) catch BedrockAgentCoreFullAccess and bedrock-agentcore:*. Passed (app.py:5325) is emitted only when no row exists, and _hold_passed_for_unread_principals withholds it when a principal is unread.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-EVAL-02",
       "grade": "full",
       "checks": [
         "AC-42"
-      ],
-      "reason": "_evaluation_pass_role_grants (app.py:32917) judges the widest PassRole statement reaching any execution role an online configuration names. It checks Resource width against the cached role names, treats NotResource as reaching every unlisted role, and requires iam:PassedToService to name bedrock-agentcore.amazonaws.com alone. Botocore shows Evaluate and StartBatchEvaluation carry no role member, so online configurations are the whole population. The writer leg runs in the primary Region from the handler (app.py:44429), and the population-wide Passed is withheld on a configuration read error, a cache gap or an unparsed policy (app.py:33255-33262).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-EVAL-03",
@@ -28,20 +22,14 @@
       "checks": [
         "AC-43",
         "AC-44"
-      ],
-      "reason": "check_agentcore_evaluation_role_trust (app.py:33313) fails a service or * trust whose aws:SourceAccount or aws:SourceArn values do not all name the account. It then fails any statement whose aws:SourceArn does not name the account, a Region and the evaluator or online-evaluation-config type (_statements_without_scoped_source_arn, app.py:19810), and an unread trust is N/A. _evaluation_role_extra_grants (app.py:33739) fails NotAction, any action beyond the documented log reads, log writes outside /aws/bedrock-agentcore/evaluations/, and PutIndexPolicy outside aws/spans.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-EVAL-04",
       "grade": "full",
       "checks": [
         "AC-44"
-      ],
-      "reason": "_bedrock_model_resource_is_unbounded (app.py:33519) fails *, /* and segment wildcards on both the foundation-model and inference-profile forms, and NotResource fails as unbounded (app.py:34015). Bounded patterns must reach a judge model GetEvaluator reports, a wildcard in a model id fails, and a role whose configurations attach only built-in evaluators fails as an unused grant. An unread role, evaluator or evaluator list is N/A (app.py:33890-34200).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-EVAL-05",
@@ -49,10 +37,7 @@
       "checks": [
         "AC-17",
         "AC-39"
-      ],
-      "reason": "_online_evaluation_problems (app.py:31025-31073) fails a configuration that is not ACTIVE and ENABLED, that samples at or below zero, or that has no input, output or evaluator. AC-17 (app.py:9873) requires every runtime and every listed endpoint's log group and service name to be read by a running configuration, and an unread endpoint list or configuration is N/A. The control names no sampling bound, so any rate above zero is reported and not judged.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-EVAL-06",
@@ -60,10 +45,7 @@
       "checks": [
         "AC-17",
         "AC-40"
-      ],
-      "reason": "check_agentcore_evaluation_safety_coverage (app.py:31284) requires both Builtin.Harmfulness and Builtin.Stereotyping plus a tool-choice evaluator on a running configuration. Each safety score needs its own actioned alarm on a series ListMetrics lists, and the tool-choice score needs one too. An unlisted score, an untied alarm, or a failed ListMetrics or DescribeAlarms is N/A (app.py:31440-31780). The control names no score threshold.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-EVAL-07",
@@ -73,15 +55,7 @@
         "AC-20",
         "AC-26"
       ],
-      "reason": "The key, results-group and retention legs hold: _evaluation_results_group_findings (app.py:31801) judges retention, the log-group CMK's key policy and the prefix, and evaluator and batch keys are judged by key policy. The round-9 text gap is closed, because the Passed text now names the fields read per kind and states that batch evaluation tags are not readable (app.py:32590-32606). Batch evaluation tags remain unreadable, which is the ceiling.",
-      "missing_field": "Batch evaluation tags: GetBatchEvaluationResponse and BatchEvaluationSummary have no tags member (bedrock-agentcore service-2.json; only StartBatchEvaluation takes tags as input), and a live ListTagsForResource on a batch-evaluation ARN returned AccessDenied to an admin role",
-      "unverified": [
-        "Whether the AgentCore service reference lists a batch-evaluation resource on ListTagsForResource"
-      ],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      "missing_field": "Batch evaluation tags: GetBatchEvaluationResponse and BatchEvaluationSummary have no tags member (bedrock-agentcore service-2.json; only StartBatchEvaluation takes tags as input), and a live ListTagsForResource on a batch-evaluation ARN returned AccessDenied to an admin role"
     },
     {
       "control_id": "AIR-ACR-GW-01",
@@ -90,20 +64,13 @@
         "AG-24",
         "AG-25"
       ],
-      "reason": "AG-24 fails NONE. It fails AUTHENTICATE_ONLY unless AG-25 passes an ENFORCE engine, and it requires CUSTOM_JWT to use an https issuer and pin an audience or client (app.py:43074-43146). A REQUEST interceptor naming a Lambda is required (app.py:43365), AWS_IAM and CUSTOM_JWT gateways are held to a passing AG-25 engine, and an unread engine is N/A (app.py:43572-43620). Whether the interceptor denies on error has no API field.",
-      "missing_field": "Interceptor deny-on-error: GatewayInterceptorConfiguration has only interceptor, interceptionPoints and inputConfiguration, and LambdaInterceptorConfiguration has only arn (bedrock-agentcore-control service-2.json)",
-      "unverified": []
+      "missing_field": "Interceptor deny-on-error: GatewayInterceptorConfiguration has only interceptor, interceptionPoints and inputConfiguration, and LambdaInterceptorConfiguration has only arn (bedrock-agentcore-control service-2.json)"
     },
     {
       "control_id": "AIR-ACR-GW-02",
       "grade": "full",
       "checks": [
         "AC-28"
-      ],
-      "reason": "The prior gap is closed. When DescribePolicy cannot read a policy, every Failed verdict (Missing, Partial, Unattached, Ineffective) is now held at N/A, and the text names the unread policy and counts only the policies that were read (app.py:21737-21766; the Missing count at app.py:21845 also excludes unread policies). The rest is unchanged. A Deny must cover CreateGateway and UpdateGateway for NONE on every gateway resource, and any second condition key voids it (app.py:21196-21298). Attachment is read with ListParents and ListTargetsForPolicy, the management account fails as Not Enforced, and an unread target list is N/A when it would change the verdict.",
-      "missing_field": "",
-      "unverified": [
-        "That GatewayAuthorizerType is evaluated on CreateGateway and UpdateGateway. The live service reference (fetched 2026-10-04) lists only aws:RequestTag/${TagKey} and aws:TagKeys on CreateGateway and no key on UpdateGateway; the devguide wiring was not read."
       ]
     },
     {
@@ -113,13 +80,6 @@
         "AC-10",
         "AC-27"
       ],
-      "reason": "The prior unread-gateway gap is closed: with any gateway unread, a trust Passed now needs every aws:SourceArn value to be the literal ARN of a gateway that was read, and anything else is N/A (app.py:21006-21046). One fixable gap remains. _source_arn_names_resource_type requires a wildcard-free Region but not the gateway's own Region (app.py:19743), and `others` holds only this Region's gateways (app.py:20010-20018). So a trust whose aws:SourceArn lists this gateway plus arn:aws:bedrock-agentcore:us-west-2:<account>:gateway/* passes (probe: Passed at app.py:21054), although it admits every us-west-2 gateway, including ones that run with another role. Compare other-Region values against that Region's gateways, as AC-47 already reads every assessed Region, or hold them at N/A.",
-      "missing_field": "",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED-WITH-NEW-DEFECT",
-        "new_defect": null
-      },
       "remaining_gap": "An aws:SourceArn value naming another Region is held at N/A: gateways in other Regions are not compared, so whether that value admits a gateway that runs with another role is not judged."
     },
     {
@@ -128,10 +88,7 @@
       "checks": [
         "AC-08",
         "AC-27"
-      ],
-      "reason": "Round 12 left these legs unchanged. AC-08 requires an available bedrock-agentcore.gateway endpoint when gateways exist (app.py:12086-12123). For each endpoint it judges the policy against the default allow-all document, Private DNS, and inbound ranges covering 0.0.0.0/0, ::/0 or the VPC CIDR. It fails ports other than TCP 443 and holds unread groups, VPCs or prefix lists at N/A (app.py:11276-11575). AC-27 passes the network leg only on a restricting Deny keyed on aws:SourceVpc or aws:SourceVpce whose values match this account's VPCs or gateway endpoints in the Region, and a failed EC2 read is N/A (app.py:20601-20796).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-GW-05",
@@ -140,20 +97,14 @@
         "AG-27",
         "AC-24",
         "AG-39"
-      ],
-      "reason": "AC-24 requires an ACTIVE limit with a requests, tokens or connections rate, keyed on an allow-listed stable dimension the gateway's authorizerType supplies, with a * entry covering every caller (app.py:17013-17036). ListGatewayRateLimits is paginated and a failed read is N/A (app.py:17420-17445). AG-27 reads webAclArn and passes only FAIL_CLOSE (app.py:43647-43698), and check_agentcore_gateway_metric_alarms (app.py:17316) requires actioned Throttles and WAF metric alarms on listed series.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-GW-08",
       "grade": "full",
       "checks": [
         "AC-25"
-      ],
-      "reason": "AC-25 is unchanged. Every target is read with GetGatewayTarget. A target with no credential provider fails, a TOKEN_EXCHANGE grant on a gateway that is not CUSTOM_JWT fails, and an AUTHORIZATION_CODE target on a portal-served gateway fails unless defaultReturnUrl is exactly <portalUrl>/connect/callback. An unread portal list or authorizer type is N/A (app.py:17588-17905). The gateway role is judged with the AC-45 rules (app.py:17908). The control names no bound for the CLIENT_CREDENTIALS user-data leg or the name review, and the code invents none.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-GW-10",
@@ -164,20 +115,14 @@
         "AC-19",
         "AC-20",
         "AC-26"
-      ],
-      "reason": "None of the five checks changed in round 11. AC-12 requires kms:Decrypt and kms:GenerateDataKey under kms:ViaService with an encryption context that names this gateway's ARN with no wildcard, and kms:CreateGrant under EncryptionContextSubset; an unread key or policy is N/A (app.py:12963-13060, 13110-13345). AC-18 needs an unnarrowed Gateway data selector, and AC-19 needs APPLICATION_LOGS plus TRACES for each gateway. AC-26 judges retention by presence because the control names no bound.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-ID-04",
       "grade": "full",
       "checks": [
         "AC-29"
-      ],
-      "reason": "AC-29 is unchanged. The runtime leg needs one attached SCP Deny on both CreateAgentRuntime and UpdateAgentRuntime that fires on AWS_IAM, on an unlisted value and on an absent key. A deny-list, a ForAnyValue allow-list and a Null false test each fail on their own row, and only attachments found through ListTargetsForPolicy and ListParents count (app.py:21907). The gateway leg must fire on AWS_IAM, AUTHENTICATE_ONLY and NONE, and on any value other than CUSTOM_JWT (app.py:23029-23075).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-ID-05",
@@ -185,16 +130,7 @@
       "checks": [
         "AC-14",
         "AC-34"
-      ],
-      "reason": "Both prior gaps are closed: the vault context must now name token-vault/<id> exactly (app.py:9307), and s3:GetObjectVersion is granted for pinned archives (template.yaml:2018). One fixable gap remains. _statement_binds_token_vault checks the context ARN's partition, service, account and resource but never its Region segment (app.py:9292-9308). A probe credits arn:aws:bedrock-agentcore:eu-west-1:<account>:token-vault/default as binding the us-east-1 vault, and the Passed text at app.py:9591-9596 then claims the key policy allows Decrypt 'for this vault', which is false. A `*` Region is also credited, which widens the binding to that vault id in every Region. Require the key's Region (or reject the wildcard) in parts[3].",
-      "missing_field": "",
-      "unverified": [
-        "Whether AWS's documented token-vault key policy example (kms-key-policy-configuration.html, not read) writes the Region in the context ARN literally or as a wildcard"
-      ],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      ]
     },
     {
       "control_id": "AIR-ACR-ID-08",
@@ -202,11 +138,6 @@
       "checks": [
         "AC-30",
         "AC-31"
-      ],
-      "reason": "Neither check changed. AC-30 judges the default version and each version an endpoint serves on their own rows. A failed endpoint list or an unread version is N/A (app.py:23289-23476). A JWT authorizer passes only with an https discoveryUrl and an allowedAudience or allowedClients list that holds no blank or * value. AC-31 applies the same test to gateways, fails NONE and treats an unknown type as N/A (app.py:23479).",
-      "missing_field": "",
-      "unverified": [
-        "That AUTHENTICATE_ONLY authenticates a SigV4 caller: botocore AuthorizerType lists the value without documenting it (app.py:23473-23475)"
       ]
     },
     {
@@ -214,10 +145,7 @@
       "grade": "full",
       "checks": [
         "AC-33"
-      ],
-      "reason": "AC-33 is unchanged. It judges all five issuance actions (app.py:24274-24280). A NotResource, a trailing wildcard, a wildcard in any ARN segment, or a wildcard inside the identity name counts as unbounded (app.py:24301-24325). A grant that names only the directory is reported at Medium, and a Passed requires the named identities to belong to the role's own runtimes or gateways. The ForUserId and InvokeAgentRuntimeForUser legs are read on JWT runtimes in every assessed Region (app.py:24869).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-ID-11",
@@ -227,9 +155,6 @@
         "AC-31",
         "AC-32"
       ],
-      "reason": "AC-30, AC-31 and AC-32's iss, aud or client_id, and SourceVpc or SourceVpce legs, plus the DiscoveryUrl SCP leg, are unchanged and sound. The control also asks for bedrock-agentcore:userid on GetWorkloadAccessTokenForUserId (the service reference lists that key on the action), but AC-32 reads only CompleteResourceTokenAuth and GetWorkloadAccessTokenForJWT (app.py:23716-23719), and no check reads a userid condition. A principal that mints user tokens with no IdP at all is therefore judged only by AC-33, and only when it is a JWT runtime's role. This is fixable.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "No check reads a bedrock-agentcore:userid condition on GetWorkloadAccessTokenForUserId, so a principal that mints user tokens without an identity provider is judged only through the JWT runtime role check."
     },
     {
@@ -239,22 +164,12 @@
         "AC-07",
         "AC-23"
       ],
-      "reason": "The ${aws:userid} gap is closed: it is now credited only when every AssumeRole statement names no service principal and binds sts:RoleSessionName to the caller (app.py:16576-16629). Three fixable gaps remain. (1) A ${aws:PrincipalTag/<key>} partition is credited when the trust requires the session tag with a wildcard value (app.py:16664-16669). For sts:AssumeRole by an IAM principal the caller chooses that value, so StringLike aws:RequestTag/userId '*' is reported Passed with 'the partition resolves per caller' (probe; app.py:16972-16993), the same flaw just fixed for userid. (2) No check reads an SCP denying CreateMemory when bedrock-agentcore:KmsKeyArn is null, although the live service reference lists that key on CreateMemory. (3) The row maps only AC-07 and AC-23 (aisf-parity/build_ledger.py:1033), so the sibling Gateway and Policy Engine CMK step, which AC-12 and AC-11 already check, is not carried.",
-      "missing_field": "",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      },
       "remaining_gap": "No check reads an SCP that denies CreateMemory when bedrock-agentcore:KmsKeyArn is null, and the Gateway and Policy Engine customer managed key checks are not mapped to this control."
     },
     {
       "control_id": "AIR-ACR-MEM-07",
       "grade": "not_implementable",
-      "checks": [],
-      "reason": "The rationale holds. In botocore, Memory and CreateMemoryInput carry eventExpiryDuration, which bounds raw short-term events, and namespaceKeys, which narrows where records are written. No member and no shape bounds how many long-term records accumulate or how long they are kept: the only expiry shapes are the EventExpiryDuration integers (aisf-parity/build_ledger.py:1463-1500). Namespace partitioning is judged under MEM-01, and BR-04 reports the event period under DAT-08.",
-      "missing_field": "",
-      "unverified": []
+      "checks": []
     },
     {
       "control_id": "AIR-ACR-MEM-12",
@@ -263,9 +178,6 @@
         "AC-18",
         "AC-19"
       ],
-      "reason": "The audit-trail legs are sound and unchanged. AC-18 credits a resources.ARN selector only when it names every listed memory, and a failed relist leaves the type missing (app.py:13970-14000). AC-19 requires APPLICATION_LOGS and TRACES on each memory ARN. The control also says to alarm on the Memory Errors, System Errors, User Errors and Throttles metrics, but no check reads alarms for memory, although the gateway alarm check shows the pattern (app.py:17316) and cloudwatch:DescribeAlarms is already granted (template.yaml:2199). That is fixable, and per the control any threshold would do.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "No check reads CloudWatch alarms on the Memory Errors, System Errors, User Errors and Throttles metrics."
     },
     {
@@ -273,11 +185,6 @@
       "grade": "full",
       "checks": [
         "AC-18"
-      ],
-      "reason": "AGENTCORE_DATA_EVENT_FAMILIES (app.py:649-781) covers every resources.type the control lists, with Evaluator excluding Builtin. ListPolicies is walked per engine (app.py:_agentcore_family_inventory). A type in use counts only through an unnarrowed Data selector on a logging trail, or on an ENABLED store, that records the Region. A failed inventory or an unreadable trail is N/A (app.py:13879-14000).",
-      "missing_field": "",
-      "unverified": [
-        "Whether ListCodeInterpreters and ListBrowsers with type SYSTEM return the AWS-managed tools in every account (over-strict if they do, not fail-open)"
       ]
     },
     {
@@ -285,11 +192,6 @@
       "grade": "full",
       "checks": [
         "AC-19"
-      ],
-      "reason": "AC-19 is unchanged. Both delivery lists are paginated, and an INACTIVE source or one with no delivery does not count. Runtimes need TRACES; gateways and memories need APPLICATION_LOGS plus TRACES; custom code interpreters and browsers need APPLICATION_LOGS; workload identities and credential providers need TRACES on the exact ARN (app.py:14326). A failed resource list is N/A, and Transaction Search is read by value.",
-      "missing_field": "",
-      "unverified": [
-        "Whether a memory's TRACES delivery equals the console's memory Tracing toggle, and whether a workload identity can be a TRACES delivery source"
       ]
     },
     {
@@ -298,10 +200,7 @@
       "checks": [
         "AC-20",
         "AC-21"
-      ],
-      "reason": "Unchanged in round 11. AC-20 (agentcore_assessments/app.py:14761) reads account and per-group data-protection policies across the AgentCore log-group prefixes and the delivery-destination groups, requires credential and PII/PHI identifiers and an Enabled customer-managed key, and returns N/A on a failed read. AC-21 (app.py:15159) fails any logs:Unmask whose resource reaches a whole AgentCore log-group kind, treats NotAction/NotResource as unbounded, and holds the row at N/A on cache read gaps.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-OBS-06",
@@ -309,19 +208,14 @@
       "checks": [
         "AC-22"
       ],
-      "reason": "AC-22 (check_agentcore_telemetry_sink_scope app.py:15678, check_agentcore_monitoring_account_controls app.py:16102) is unchanged. It judges sink-policy aws:PrincipalOrgID binding, links from non-member accounts, ResourceTypes, data protection in the sink account and, under the accepted rule (the control names no numeric bound), the viewing-IAM leg. Only the scheduled review of stale source-account links is left, and no OAM response carries a usage or last-activity field.",
-      "missing_field": "oam ListAttachedLinksItem has only Label, LinkArn, ResourceTypes; GetLink returns Arn, Id, Label, LabelTemplate, LinkConfiguration, ResourceTypes, SinkArn, Tags; no last-activity or usage member (botocore oam service-2.json)",
-      "unverified": []
+      "missing_field": "oam ListAttachedLinksItem has only Label, LinkArn, ResourceTypes; GetLink returns Arn, Id, Label, LabelTemplate, LinkConfiguration, ResourceTypes, SinkArn, Tags; no last-activity or usage member (botocore oam service-2.json)"
     },
     {
       "control_id": "AIR-ACR-PAY-01",
       "grade": "full",
       "checks": [
         "AC-02"
-      ],
-      "reason": "Unchanged in round 11. The AC-02 payment legs (_payment_duty_collisions app.py:4050, _payment_managers_without_deny app.py:4080, _payment_retrieval_trust_gaps app.py:4232, _payment_writer_literal_pass_roles app.py:4273, check_agentcore_payment_retrieval_role_trust app.py:4316) fail a principal that can both write a session, budget or instrument and call ProcessPayment, and fail a writer with no unconditioned Deny on ProcessPayment. They also pin iam:PassRole to the retrieval role with iam:PassedToService, and require a retrieval-role trust naming only bedrock-agentcore.amazonaws.com with aws:SourceAccount and the payment manager's literal aws:SourceArn.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-POL-01",
@@ -330,10 +224,7 @@
         "AG-25",
         "AC-19",
         "AC-35"
-      ],
-      "reason": "Unchanged in round 11. AG-25 (check_agentcore_gateway_agentic_security app.py:43172) judges the ENFORCE-mode engine association. AC-35 (check_agentcore_policy_tool_scope app.py:27250, check_agentcore_policy_input_guards app.py:28128) fails a permit with no named action, bounded principal or named gateway, and checks guards on optional context.input fields against tools read from OpenAPI, Smithy, API Gateway GetExport and static MCP schemas. A dynamic MCP target is N/A and never Passed, because bedrock-agentcore-control models no control-plane tool listing.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-POL-04",
@@ -342,19 +233,14 @@
         "AC-11",
         "AC-36"
       ],
-      "reason": "AC-11 (check_agentcore_policy_engine_encryption app.py:12709) and AC-36 (check_agentcore_policy_engine_key_scope app.py:29086) are unchanged. They judge the engine CMK, key-policy kms:ViaService, the EncryptionContextSubset grant constraint, source-context keys kept off kms:CreateGrant, both FAS grants and a DisableKey/ScheduleKeyDeletion alarm. Only the documented break-glass key-recovery procedure is left; no API returns a runbook, and the Passed text says so.",
-      "missing_field": "break-glass key-recovery runbook: an operational document no AWS API returns",
-      "unverified": []
+      "missing_field": "break-glass key-recovery runbook: an operational document no AWS API returns"
     },
     {
       "control_id": "AIR-ACR-POL-06",
       "grade": "full",
       "checks": [
         "AC-37"
-      ],
-      "reason": "AC-37 (check_agentcore_policy_guardrail_wiring app.py:29738) is unchanged. It reads the gateway role's bedrock:InvokeGuardrailChecks after the role's own Deny and boundary, and applies SCPs that ListTargetsForPolicy and ListParents show attached. It judges each guardrails block by category, dataPath, unreachable scores and the strict greaterThan default band. The control names no bound on which gateways need a guardrail.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-POL-07",
@@ -362,10 +248,7 @@
       "checks": [
         "AG-25",
         "AC-38"
-      ],
-      "reason": "Unchanged in round 11. AC-38 (check_agentcore_policy_session_binding app.py:30487, check_agentcore_temporal_prerequisite_permits app.py:30805) and AG-25 (app.py:43172) judge an ACTIVE temporal policy, eventResource in every predicate, CUSTOM_JWT or AWS_IAM inbound auth and the gateway role's GetWorkloadAccessToken grant. They resolve prerequisite permits and return N/A on unread input. The Passed text states that permit when/unless clauses are not evaluated.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-REG-02",
@@ -374,10 +257,7 @@
         "AR-03",
         "AR-09",
         "AR-10"
-      ],
-      "reason": "agent_registry_assessments/app.py has no diff from 702e56f to b4ab330. AR-03 (app.py:1287) fails a non-empty autoApprovalRules. AR-09 (app.py:1075) fails a principal whose post-Deny actions include both a publish action and UpdateRegistryRecordStatus, and holds Passed on an incomplete cache. AR-10 (app.py:2374) requires an enabled rule with a target on the aws.agent-registry record state-change detail types.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-RT-03",
@@ -386,10 +266,7 @@
         "AC-02",
         "AC-45",
         "AC-48"
-      ],
-      "reason": "The prior gap is closed. A conditioned invoker Deny that overlaps a grant the tool role holds now returns N/A, naming each policy and its condition keys (agentcore_assessments/app.py:35466-35481, test tests/test_agentcore_checks.py:31444). An unconditioned overlapping Deny or a boundary gap still fails, and the Passed text (app.py:35492) claims only grants that no Deny reaches. Resource scoping, per-tool role reuse and trust, Access Analyzer, and the shell grant and alarm legs are unchanged (check_agentcore_tool_execution_role_scope app.py:35027, check_agentcore_execution_role_trust_and_sharing app.py:37583, check_agentcore_execution_role_access_analyzer app.py:37372).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-ACR-RT-04",
@@ -397,11 +274,7 @@
       "checks": [
         "AC-46"
       ],
-      "reason": "AC-46 (check_agentcore_runtime_session_limits app.py:35850, cost-monitor resolution app.py:35573-35812) is unchanged. It credits a DIMENSIONAL or LINKED_ACCOUNT monitor covering the account and a CUSTOM SERVICE monitor naming AgentCore, fails a resolved monitor that covers only other services or accounts, and holds TAG, COST_CATEGORY and unresolved CUSTOM monitors at N/A, per the RT-04 ruling. Two ceilings remain: whether lifecycle values were set on purpose rather than left at the defaults, and the per-user concurrent-session cap in the application backend. The control names no lower bound on lifetimes.",
-      "missing_field": "bedrock-agentcore-control LifecycleConfiguration carries only idleRuntimeSessionTimeout and maxLifetime with documented defaults 900 and 28800, so an explicit setting equal to the default is indistinguishable; no API exposes an application-side per-user session cap",
-      "unverified": [
-        "that GetAgentRuntime returns the defaulted values when the caller omitted lifecycleConfiguration"
-      ]
+      "missing_field": "bedrock-agentcore-control LifecycleConfiguration carries only idleRuntimeSessionTimeout and maxLifetime with documented defaults 900 and 28800, so an explicit setting equal to the default is indistinguishable; no API exposes an application-side per-user session cap"
     },
     {
       "control_id": "AIR-ACR-RT-08",
@@ -409,11 +282,6 @@
       "checks": [
         "AC-01",
         "AC-49"
-      ],
-      "reason": "The round-12 change is correct under the ruling. A managed tool with no networkConfiguration now fails at Medium as 'Not Customer Filtered', its text says it 'reports no networkConfiguration', and PUBLIC alone fails at High (app.py:2397-2436). Holders are cached roles and users whose Allow, read without its condition, reaches the start action after unconditioned Denies and the boundary, and the text says so. Unread caches or principals are N/A (app.py:2256-2336, 2438-2457). The PUBLIC/SANDBOX/VPC, security-group egress, SCP Null and DNS Firewall legs are unchanged.",
-      "missing_field": "",
-      "unverified": [
-        "The managed tools' actual network mode: GetBrowser and GetCodeInterpreter return no networkConfiguration (live, per the code comment at app.py:2353-2357), so the Medium label rests on the absent field"
       ]
     },
     {
@@ -422,9 +290,7 @@
       "checks": [
         "AC-06"
       ],
-      "reason": "The managed-browser gap is closed. _managed_browser_recording_findings (agentcore_assessments/app.py:8172, merged into AC-06 at 8315) fails each cached principal that can start a session on aws.browser.v1, whose GetBrowser returns no recording (live). Passed is given only when nobody holds it and the cache is complete. Custom-browser recording and its bucket legs (KMS, Block Public Access, TLS deny, expiry, cross-account read, role write, named readers) are unchanged; the control names no bound on who counts as a responder. Live View remains a ceiling: it is a stream every session returns, not a browser setting, and whether anyone monitors it is not readable.",
-      "missing_field": "CreateBrowser and GetBrowser (bedrock-agentcore-control) carry no Live View member; Live View exists only as BrowserSessionStream.liveViewStream.streamEndpoint on StartBrowserSession/GetBrowserSession output (bedrock-agentcore service-2.json), with no record of whether it is watched",
-      "unverified": []
+      "missing_field": "CreateBrowser and GetBrowser (bedrock-agentcore-control) carry no Live View member; Live View exists only as BrowserSessionStream.liveViewStream.streamEndpoint on StartBrowserSession/GetBrowserSession output (bedrock-agentcore service-2.json), with no record of whether it is watched"
     },
     {
       "control_id": "AIR-ACR-RT-13",
@@ -437,13 +303,6 @@
         "AC-27",
         "AC-48"
       ],
-      "reason": "The network, caller, endpoint, OAuth discovery and SCP legs are unchanged and hold (AC-47, AC-08 app.py:11898, AC-10, AC-01). The gateway-role trust hardening this control requires, 'so the role cannot be assumed by anything else', has the same fixable gap as GW-03. AC-27 compares aws:SourceArn only with this Region's gateways (app.py:20010-20018), and _source_arn_names_resource_type accepts a value in another Region (app.py:19743). A trust adding arn:aws:bedrock-agentcore:us-west-2:<account>:gateway/* passes (app.py:21054), so another Region's gateway can run as the role the runtime admits and bypass the fronting gateway. AC-48 accepts any aws:SourceArn naming the account and does not catch it.",
-      "missing_field": "",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED-WITH-NEW-DEFECT",
-        "new_defect": null
-      },
       "remaining_gap": "The gateway-role trust leg holds an aws:SourceArn naming another Region at N/A: gateways in other Regions are not compared."
     },
     {
@@ -452,9 +311,7 @@
       "checks": [
         "BR-10"
       ],
-      "reason": "The prior mislabel is fixed: when a cross-account pin names no version, the ListGuardrails refusal has its own text, GUARDRAIL_CROSS_ACCOUNT_LIST_CEILING (app.py:10243-10249, 10276-10294), and the N/A row tells the reader to pin a version (app.py:10756-10769). Identity Allows, identity and boundary Denies, attached SCPs, and the account-enforced and Organizations guardrails are judged on blocked input and output categories (app.py:10208-10237, 10449-10840). The self-hosted or third-party ApplyGuardrail leg (source=INPUT and source=OUTPUT) remains, because no AWS read ties those calls to a model.",
-      "missing_field": "bedrock-runtime ApplyGuardrailRequest has only guardrailIdentifier, guardrailVersion, source, content and outputScope, with no model or application member. Another account's guardrail versions cannot be listed (ListGuardrails refused 'from a different account', round-11 ruling).",
-      "unverified": []
+      "missing_field": "bedrock-runtime ApplyGuardrailRequest has only guardrailIdentifier, guardrailVersion, source, content and outputScope, with no model or application member. Another account's guardrail versions cannot be listed: ListGuardrails refuses a guardrail from a different account."
     },
     {
       "control_id": "AIR-BDR-GRD-02",
@@ -462,15 +319,7 @@
       "checks": [
         "BR-34"
       ],
-      "reason": "The prior gap is closed. _event_named_version_leg (app.py:22933) joins each guarded InvokeModel, InvokeModelWithResponseStream and Converse call to its CloudTrail event and judges the named version with _prompt_attack_verdict, failing it at app.py:23665, and GUARDRAIL_DEPLOYMENT_CEILING (app.py:425-432) now says the event names the version. A rule-7 defect remains: _event_named_version_notes (app.py:23003-23013) writes 'Each guardrail version named by the CloudTrail event of a guarded call was read with bedrock:GetGuardrail and has a preventive PROMPT_ATTACK input filter on the STANDARD tier: <passed list>', and BR-34 appends it (app.py:23622) to its Failed and N/A rows too. So a row that also lists a failing or unread named version says every named version passed, and the list stops at five with no total. Per-turn InvokeGuardrailChecks (no management event, live evidence), tool-payload screening and strength tuning are ceilings that the rows state.",
-      "missing_field": "Per-turn InvokeGuardrailChecks records no management event, and tool-payload screening and filter strength tuning are not readable from any API.",
-      "unverified": [
-        "That every guarded InvokeModelWithResponseStream log record carries amazon-bedrock-guardrailAction, which BR-34 uses to pick the guarded calls it joins"
-      ],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      "missing_field": "Per-turn InvokeGuardrailChecks records no management event, and tool-payload screening and filter strength tuning are not readable from any API."
     },
     {
       "control_id": "AIR-BDR-GRD-03",
@@ -478,9 +327,6 @@
       "checks": [
         "BR-26"
       ],
-      "reason": "BR-26 judges working drafts and deployed versions (app.py:21865) and probes each passing deployed version with ApplyGuardrail source=OUTPUT (app.py:21875). A version a caller passes per request is not judged: the deployed rows say 'That version is not judged by this check' (app.py:860-864). Yet the InvokeModel, InvokeModelWithResponseStream and Converse CloudTrail event names it (live evidence), and the same function already judges such versions for BR-34 and BR-27 through _event_named_version_leg (app.py:22933) with cloudtrail:LookupEvents granted (template.yaml:864). So the sensitive-information verdict could run on them too. The toolUse, toolResult and toolSpec fields are a stated ceiling.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "A guardrail version a caller passes per request is not judged for sensitive-information filters, although the CloudTrail event names it."
     },
     {
@@ -489,12 +335,7 @@
       "checks": [
         "BR-32"
       ],
-      "reason": "An intervention alarm is credited only as an acting spike alarm on InvocationsIntervened (under Operation=ApplyGuardrail, or per version for every defined or applied version) or on an INTERVENED metric filter. Passed also needs a subscription-filter or S3-notification forward and a trail or event data store recording AWS::Bedrock::Guardrail data events in full, with N/A on unread legs (app.py:25590-26080). What remains is stated in GUARDRAIL_SIGNAL_CEILING (app.py:24907-24912): caller-side records of detect-mode decisions, and interventions raised by InvokeGuardrailChecks.",
-      "missing_field": "No AWS API records whether a caller logs the detect-mode decisions it acted on. InvokeGuardrailChecks produced no CloudTrail management event and has no data-event resource type (live evidence, 2026-10-04).",
-      "unverified": [
-        "Whether InvocationsIntervened under Operation=ApplyGuardrail counts InvokeGuardrailChecks interventions.",
-        "Whether metrics for another account's or an org-enforced guardrail are emitted in this account (GUARDRAIL_METRIC_ACCOUNT_EDGE, app.py:24929)."
-      ]
+      "missing_field": "No AWS API records whether a caller logs the detect-mode decisions it acted on. InvokeGuardrailChecks produced no CloudTrail management event and has no data-event resource type (live evidence, 2026-10-04)."
     },
     {
       "control_id": "AIR-BDR-GRD-09",
@@ -502,24 +343,13 @@
       "checks": [
         "BR-27"
       ],
-      "reason": "The prior gap is closed. Each version named by a guarded call's CloudTrail event now gets the full GROUNDING and RELEVANCE BLOCK and 0-0.99 threshold verdict (app.py:24040-24062), and failing it fails the row (app.py:24106). The shared rule-7 defect remains: _event_named_version_notes (app.py:23003-23013), appended at app.py:24058 to the Failed and N/A rows, says 'Each guardrail version named by the CloudTrail event of a guarded call was read ... and has GROUNDING and RELEVANCE filters that both block' even when the same row lists a failing or unread named version, and it truncates at five with no total. RetrieveAndGenerate grounding-source plumbing is a ceiling: botocore bedrock-agent-runtime GenerationConfiguration has only additionalModelRequestFields, guardrailConfiguration (guardrailId, guardrailVersion), inferenceConfig, performanceConfig and promptTemplate.",
-      "missing_field": "RetrieveAndGenerate's GenerationConfiguration has no grounding-source member (additionalModelRequestFields, guardrailConfiguration, inferenceConfig, performanceConfig, promptTemplate only).",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      "missing_field": "RetrieveAndGenerate's GenerationConfiguration has no grounding-source member (additionalModelRequestFields, guardrailConfiguration, inferenceConfig, performanceConfig, promptTemplate only)."
     },
     {
       "control_id": "AIR-BDR-GRD-10",
       "grade": "full",
       "checks": [
         "BR-41"
-      ],
-      "reason": "An organization share now counts only by value. _org_condition_binds (app.py:13162) requires StringEquals or StringLike, with ForAnyValue: allowed and IfExists and ForAllValues: excluded; every aws:PrincipalOrgID value must equal the DescribeOrganization Id, and every aws:PrincipalOrgPaths value must start with it and a slash. A wildcard or another organization fails as unbounded, an unread id is held at N/A, and the Passed text names the organization. The account-enforced, effective Bedrock policy, DRAFT, narrowed-scope, Automated Reasoning and attached-SCP legs are judged by value with N/A on unread reads. Reading the share from outside the owner account is the round-10 ceiling, stated in the row.",
-      "missing_field": "",
-      "unverified": [
-        "Whether an Organizations Bedrock policy applies to the management account, so that a run in the guardrail's owner account reaches the share row"
       ]
     },
     {
@@ -528,9 +358,6 @@
       "checks": [
         "BR-46"
       ],
-      "reason": "The rule-7 defect is fixed: the Passed text (app.py:38264-38271) now says the check reads only the job's lastRunTime (macie2:DescribeClassificationJob) and not the SCHEDULED_RUN_COMPLETED events. By the round-12 ruling that leg is a fixable coverage gap. Macie logs one SCHEDULED_RUN_COMPLETED event per run to /aws/macie/classificationjobs, and the Bedrock role already holds logs:FilterLogEvents on log-group:* (template.yaml:589-590). So an object written before the last run could be ordered against each earlier ingestion. Non-S3 sources held at N/A are a correct Macie ceiling.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "The Macie ordering reads only the classification job's lastRunTime, not each SCHEDULED_RUN_COMPLETED event, so an object written before an earlier run is not ordered against each ingestion."
     },
     {
@@ -538,10 +365,7 @@
       "grade": "full",
       "checks": [
         "BR-20"
-      ],
-      "reason": "Both prior defects are closed. _identity_store_read (app.py:17708) judges one action at a time, so a Deny or boundary on kendra:Query no longer decides kendra:Retrieve, and _store_readers (app.py:17789-17888) counts a principal as a reader when any single action is allowed by its identity policy, boundary and attached SCPs (_scp_read_verdict, app.py:17394-17473). The SCP inventory is read for the store comparison (app.py:17918-17926), and the row text states the per-action and SCP rule (app.py:17946-17957). Not re-audited in full beyond the round-11 changes.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-BDR-KB-05",
@@ -549,9 +373,7 @@
       "checks": [
         "BR-34"
       ],
-      "reason": "BR-34 reads every data source's POST_CHUNKING step and each agent version and flow node that retrieves from the knowledge base. It fails an unscreened source reached through managed retrieval, or through nothing, and never passes (app.py:20014-20278, call at app.py:20380). A transformation Lambda or an un-narrowed account-enforced PROMPT_ATTACK guardrail is held at N/A, and KNOWLEDGE_BASE_SCREENING_CEILING (app.py:20005-20011) states why. Round 12 did not change this leg. A Lambda's screening logic is not recorded by any API, and managed RetrieveAndGenerate cannot tag retrieved chunks: GenerationConfiguration carries only guardrailId and guardrailVersion.",
-      "missing_field": "No API records what a POST_CHUNKING transformation Lambda screens. bedrock-agent-runtime GenerationConfiguration.guardrailConfiguration has only guardrailId and guardrailVersion, with no member to tag retrieved chunks as guardContent.",
-      "unverified": []
+      "missing_field": "No API records what a POST_CHUNKING transformation Lambda screens. bedrock-agent-runtime GenerationConfiguration.guardrailConfiguration has only guardrailId and guardrailVersion, with no member to tag retrieved chunks as guardContent."
     },
     {
       "control_id": "AIR-BDR-KB-06",
@@ -559,11 +381,7 @@
       "checks": [
         "BR-06"
       ],
-      "reason": "Passed requires an un-narrowed AWS::Bedrock::KnowledgeBase data-event trail or event data store, invocation logging with text delivery, and S3 versioning Enabled on every source, with N/A on any unread input (app.py:7409-7436, 7449-7500). The citations that tie a response to a source chunk are returned only in the RetrieveAndGenerate response, and the Passed text says so (app.py:7432). Non-S3 sources keep versions with their provider and are not judged (app.py:7403-7408).",
-      "missing_field": "RetrieveAndGenerate citations exist only in the API response; no Bedrock or CloudTrail configuration API exposes them.",
-      "unverified": [
-        "CloudTrail Retrieve and RetrieveAndGenerate data events do not carry the response citations."
-      ]
+      "missing_field": "RetrieveAndGenerate citations exist only in the API response; no Bedrock or CloudTrail configuration API exposes them."
     },
     {
       "control_id": "AIR-BDR-KB-08",
@@ -571,29 +389,14 @@
       "checks": [
         "BR-26"
       ],
-      "reason": "credited_job (app.py:21932) credits a Comprehend ONLY_REDACTION job only when RedactionConfig.PiiEntityTypes contains ALL. The control names no entity list, and the Glue leg and the guardrail layer credit any types. So a completed job that names specific types, even all 36 named ones, leaves its source unscreened, and the Failed row says the knowledge base 'ingests <source> with no screening step' (app.py:20241, 20253), which is false. Otherwise the source leg never passes and reaches the stated ceiling: a transformation Lambda's logic is not recorded, a Glue script job has no CodeGenConfigurationNodes, no API records that a Comprehend job wrote each object, and no configuration API records a guardrail passed per request to RetrieveAndGenerate.",
-      "missing_field": "A transformation Lambda's logic is not recorded, a Glue script job has no CodeGenConfigurationNodes, no API records that a Comprehend job wrote each object, and no configuration API records a guardrail passed per request to RetrieveAndGenerate.",
-      "unverified": [
-        "Whether RetrieveAndGenerate is a CloudTrail data event (not readable through LookupEvents) whose requestParameters name generationConfiguration.guardrailConfiguration"
-      ],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      "missing_field": "A transformation Lambda's logic is not recorded, a Glue script job has no CodeGenConfigurationNodes, no API records that a Comprehend job wrote each object, and no configuration API records a guardrail passed per request to RetrieveAndGenerate."
     },
     {
       "control_id": "AIR-BDR-MDL-01",
       "grade": "full",
       "checks": [
         "BR-42"
-      ],
-      "reason": "The agent-alias/knowledge-base defect is fixed: a Resource that cannot match a model ARN is no longer a model grant (bedrock_assessments/app.py:30103-30108). A NotResource Allow is still counted as unscoped without testing whether its values exclude every model resource type (app.py:30103, 30136-30142), so an Allow of * with NotResource arn:aws:bedrock:* (everything except Bedrock) is Failed as 'can invoke models not named one by one ... every model it does not exclude can be invoked' (app.py:30607-30608, 30740), a grant that statement does not make (confirmed in memory; _invocation_resources_uncovered at app.py:13004 over the NotResource values would settle it). The identity leg, the boundary and Deny handling, bedrock-mantle and the attached-SCP leg (which fails the management account) are otherwise judged by value.",
-      "missing_field": "",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      ]
     },
     {
       "control_id": "AIR-BDR-MDL-02",
@@ -601,10 +404,7 @@
       "checks": [
         "BR-04",
         "BR-12"
-      ],
-      "reason": "The logging configuration, all five modality delivery flags, and largeDataDeliveryS3Config on CloudWatch delivery are judged by value (app.py:6468-6622, 6695-6880). Retention is judged per destination, with deletion evidence, the S3 lifecycle, Object Lock and replica lifecycles, and N/A on unread reads (app.py:5632-5951). A CMK verified with DescribeKey is required on the bucket, the large-data bucket and the log group (app.py:11429-11600, 11972-12108). The control names no retention bound, and the Passed text tells the reader to compare the stated period with their own policy.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-BDR-MDL-03",
@@ -612,14 +412,7 @@
       "checks": [
         "BR-43",
         "BR-42"
-      ],
-      "reason": "BR-43 judges attached Region-deny SCPs by value: negated aws:RequestedRegion allow-lists on Resource *, 'unspecified' beside global profiles, omitted geographic destinations and the management account. The IAM profile-scoping step is carried by BR-42, which now ignores non-model Resources but still fails a NotResource Allow whose values exclude every model ARN, such as Action * NotResource arn:aws:bedrock:*, as able to invoke models (app.py:30103, 30136-30142, 30607-30608), a rule-7 overclaim.",
-      "missing_field": "",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      ]
     },
     {
       "control_id": "AIR-BDR-MDL-04",
@@ -628,24 +421,14 @@
         "BR-44",
         "BR-42",
         "BR-43"
-      ],
-      "reason": "The invocation gate still reads BR-42's invocation_open, which includes a role whose only Bedrock reach is a NotResource Allow excluding every model ARN (app.py:30607, 33348-33351). BR-44 also emits Failed with 'No attached service control policy bounds the action by product' while its own text says SCP documents could not all be read (app.py:33578, 33612-33617; confirmed in memory), where rule 3 calls for N/A. In the management account, or when an SCP model list covers only one invoke action, the gate text says 'no attached service control policy denies invoking a model outside a named list' although one is attached (app.py:33369-33373).",
-      "missing_field": "",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      ]
     },
     {
       "control_id": "AIR-BDR-MDL-07",
       "grade": "full",
       "checks": [
         "BR-06"
-      ],
-      "reason": "BR-06 requires the AWS::Bedrock::Model, AsyncInvoke, AgentAlias and InlineAgent data-event types and all six AWS::BedrockMantle types (app.py:6881-6905), plus a management selector admitting both bedrock.amazonaws.com and bedrock-mantle.amazonaws.com. The CloudTrail-to-invocation-log join supplies the single-invocation trace, with N/A on unread trails or stores. Not re-audited in full this round.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-BDR-MDL-08",
@@ -653,25 +436,14 @@
       "checks": [
         "BR-07"
       ],
-      "reason": "Numbered versions and the CMK of each, verified by DescribeKey (app.py:8686-9135), flow pins in drafts and alias-routed versions, including inline prompt nodes (app.py:8750-8886, 9331-9474), runtime prompt-ARN calls with a measured LookupEvents cap held at N/A (app.py:9136-9330), and write and RenderPrompt scope (app.py:9496-9675) are all judged by value. The catalog row passes when any prompt exists (app.py:9717), and no AWS read shows whether a production call with a foundation-model modelId took its prompt from the catalog or from application code, which the control contrasts with a catalog. The ledger row says the same ('Partial, ceiling reached') while marking the control COVERED.",
-      "missing_field": "InvokeModel and Converse CloudTrail requestParameters carry modelId but no prompt provenance, and RenderPrompt is a separate data event, so no field ties a call made with a foundation-model modelId to a catalog prompt. No AWS field names the role approved to release a version.",
-      "unverified": []
+      "missing_field": "InvokeModel and Converse CloudTrail requestParameters carry modelId but no prompt provenance, and RenderPrompt is a separate data event, so no field ties a call made with a foundation-model modelId to a catalog prompt. No AWS field names the role approved to release a version."
     },
     {
       "control_id": "AIR-BDR-MDL-09",
       "grade": "full",
       "checks": [
         "BR-45"
-      ],
-      "reason": "The prior gap is closed: the LONG_TERM token Deny is now read from each active key holder's own policies and boundary (app.py:34119-34171, 34442-34482). _bedrock_api_key_iam_token_denies never checks whether a holder is granted bedrock:CallWithBearerToken, so a holder with no such Allow is Failed with 'so the long-term keys of those user(s) can be used' (app.py:34573-34578), which _granted_actions (app.py:1858) could rule out. The SCP and per-holder legs are not combined per action: an SCP denying one endpoint plus each holder's own Deny on the other is Failed with the same claim (app.py:34157-34165, 34456-34462).",
-      "missing_field": "",
-      "unverified": [
-        "That a long-term key cannot be used without an Allow of bedrock:CallWithBearerToken (api-keys.html; the catalog text calls it a required action)"
-      ],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      ]
     },
     {
       "control_id": "AIR-BDR-MDL-10",
@@ -679,9 +451,6 @@
       "checks": [
         "BR-37"
       ],
-      "reason": "The control-plane mode, the bedrock-mantle account mode and every mantle project's effective mode are judged per Region, and only none passes (app.py:27620-28010). The four-action SCP pin is credited only as StringNotEquals on each endpoint's own key with none alone, from attached SCPs, and fails the management account (app.py:28013-28175). Each model's allowed_modes is not read because bedrock-mantle:ListModels is not granted, and every row states this: grant declined by user.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "Not asserted: needs bedrock-mantle:ListModels, which this deployment does not grant, so each model's allowed_modes is not read."
     },
     {
@@ -689,20 +458,14 @@
       "grade": "full",
       "checks": [
         "BR-43"
-      ],
-      "reason": "No round-11 change reaches BR-43 (bedrock_assessments/app.py:31150-31511, 31804-31955, 32420-32640). Only attached SCPs count, and a read failure with no credited control is N/A. The Region allow-list must cover the Bedrock invoke actions and the SageMaker, knowledge base, AgentCore, S3, S3 Vectors and OpenSearch Serverless create actions. The model leg needs a named-list Deny on InvokeModel, InvokeModelWithResponseStream and bedrock-mantle CreateInference, and the management account fails. The control names no approved service, model or Region list, so the check invents none.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-ACC-09",
       "grade": "full",
       "checks": [
         "SM-35"
-      ],
-      "reason": "SM-35 is unchanged in round 11 (sagemaker_assessments/app.py:15501-15774, 15949-16140). Twelve service principals are read by value, with paginated ListDelegatedAdministrators and trusted access from ListAWSServiceAccessForOrganization. A management-account-only admin fails, admins split across accounts fail, and an unread service holds consolidation at N/A. The Passed text says that whether the one admin account hosts no AI workload is not recorded by any Organizations API.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DAT-01",
@@ -712,20 +475,14 @@
         "BR-11",
         "BR-17",
         "SM-03"
-      ],
-      "reason": "Round 11 changes BR-20 only in its access leg: per-action reader resolution with attached SCPs (bedrock_assessments/app.py:17789 onward). The source-bucket encryption rows (18298-18517) are untouched. BR-11 (10870-10984) passes a training, validation or output bucket only on SSE-KMS under an Enabled customer managed key; aws/s3 or no default encryption fails, and a failed read is N/A. BR-17 and SM-03 are unchanged.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DAT-02",
       "grade": "full",
       "checks": [
         "BR-47"
-      ],
-      "reason": "BR-47 is unchanged in round 11 (bedrock_assessments/app.py:39022-39323). A bucket passes only on one Deny with Bool or BoolIfExists aws:SecureTransport false that reaches every principal, covers s3:*, and names both the bucket and its objects. Exemptions are credited only as prefix-free negated aws:PrincipalArn tests with wildcard-free ARNs, or Bool aws:ViaAWSService false, each named in the Passed text (38023), per the BR-47 ruling. MAX_SAGEMAKER_TRAINING_JOB_READS (38326) and MAX_EVALUATION_JOB_READS (38693) record measurements and hold Passed.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DAT-03",
@@ -733,16 +490,6 @@
       "checks": [
         "BR-46"
       ],
-      "reason": "Round 12 closes the prior gaps: every logged InvokeModel, InvokeModelWithResponseStream, Converse and ConverseStream call is now joined, and a capped or failed log read, a missing request ID or a capped join holds Passed at N/A (bedrock_assessments/app.py:38464-38520). Fixable gaps remain. With textDataDeliveryEnabled not true the prompt leg still emits Passed and only notes that unlogged calls are not seen (38475, 38671), although the InvokeModel and Converse CloudTrail events it already pages name guardrailIdentifier. An agent or flow node with no guardrail is never recorded or failed (492), and the Macie ordering reads only lastRunTime and not SCHEDULED_RUN_COMPLETED (38266), which the KB-01 ruling treats as a fixable gap. The no-source N/A text also says that no knowledge base ingests from S3 even when the source reads failed (37897).",
-      "missing_field": "",
-      "unverified": [
-        "whether Bedrock Agents' internal model calls appear in the model invocation log and as CloudTrail management events",
-        "whether a ConverseStream call produces a CloudTrail management event naming guardrailConfig"
-      ],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      },
       "remaining_gap": "With text delivery off, calls whose text is not logged are not judged from their CloudTrail guardrail field; an agent or flow node with no guardrail is not failed; the Macie ordering reads only lastRunTime."
     },
     {
@@ -750,10 +497,7 @@
       "grade": "full",
       "checks": [
         "BR-43"
-      ],
-      "reason": "BR-43 is unchanged in round 11. Profile destinations in every assessed Region are judged against the attached allow-list, and global routing must be closed by excluding 'unspecified'; an inference-profile listing error is N/A (bedrock_assessments/app.py:31150-31511). The served-Region leg reads additionalEventData.inferenceRegion, and a LookupEvents name that is capped (measured, 42000-42011) or stopped by the deadline holds the Region at N/A (31542-31760). The control names no approved Region list.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DAT-05",
@@ -761,9 +505,6 @@
       "checks": [
         "BR-52"
       ],
-      "reason": "Vault Lock mode, grace period, minimum retention and S3 Object Lock COMPLIANCE default retention are judged by value (bedrock_assessments/app.py:39336-39380, 39557-39583). The recovery-point leg still needs backup:ListRecoveryPointsByResource and backup:DescribeRecoveryPoint (39444, 39511). template.yaml grants only backup:ListBackupVaults and backup:DescribeBackupVault (854, 1105). Grant declined by user.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "Not asserted: needs backup:ListRecoveryPointsByResource and backup:DescribeRecoveryPoint, which this deployment does not grant."
     },
     {
@@ -771,20 +512,14 @@
       "grade": "full",
       "checks": [
         "BR-04"
-      ],
-      "reason": "BR-04 is unchanged in round 11. Deletion is evidenced, not inferred from the rule: the oldest object, and on a versioned bucket the oldest noncurrent version, is judged against the shortest rule plus two days, and the same test runs on replicas (bedrock_assessments/app.py:5500-5630, 5632-5800). A FAILED ReplicationStatus or an Object Lock default beside the rule fails. OLDEST_OBJECT_LIST_CAP (5323) records its measurement and makes a capped search N/A, and CloudWatch groups are judged from FilterLogEvents against retention.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DAT-09",
       "grade": "full",
       "checks": [
         "BR-48"
-      ],
-      "reason": "BR-48 is unchanged in round 11 (bedrock_assessments/app.py:44369-44827). The account's DescribeEffectivePolicy must resolve to optOut exactly, accepting both the effective and the @@assign form, and an absent effective policy fails. All three @@none placements are required on an attached policy in the account's path, and an unread path or policy is N/A.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DAT-10",
@@ -792,9 +527,7 @@
       "checks": [
         "BR-55"
       ],
-      "reason": "BR-55 is unchanged in round 11 (bedrock_assessments/app.py:41710-41955). For every customer managed key whose policy uses RecipientAttestation, it judges exact pinning, unconditioned or account-root bypass Allows, grants, PCR3/PCR4 deployment binding, image binding (ImageSha384, PCR0 or PCR8) and all-zero debug digests in CloudTrail. ENCLAVE_EVENT_MAX_PAGES records its measurement (41635). What no API returns is the per-workload determination of which data must be host-inaccessible, and the PCR values a release pipeline published.",
-      "missing_field": "No KMS, EC2 or Nitro Enclaves operation in botocore returns a per-workload data-classification determination or the enclave measurements a release pipeline published",
-      "unverified": []
+      "missing_field": "No KMS, EC2 or Nitro Enclaves operation in botocore returns a per-workload data-classification determination or the enclave measurements a release pipeline published"
     },
     {
       "control_id": "AIR-FND-DET-01",
@@ -803,10 +536,7 @@
         "BR-04",
         "BR-12",
         "BR-06"
-      ],
-      "reason": "No round-11 change reaches these checks. BR-04 judges all LoggingConfig modality flags and fails a CloudWatch destination without largeDataDeliveryS3Config (bedrock_assessments/app.py:6695-6878). BR-12 judges the CMK on both destinations (11972-12107). BR-06 requires Bedrock and bedrock-mantle management and data event coverage (8422-8669).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DET-02",
@@ -815,10 +545,7 @@
         "SM-26",
         "SM-04",
         "SM-36"
-      ],
-      "reason": "SM-04, SM-26 and SM-36 are unchanged in round 11 (sagemaker_assessments/app.py:889-1261, 1267-1433, 16295-16484). GuardDuty, AI_PROTECTION, organization auto-enable, Security Hub routing and both Security Hub standards are judged by value. GetConfigurationPolicy outside the delegated administrator is N/A naming the account, which is the ruled ceiling, and the control names no review cadence.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DET-04",
@@ -829,9 +556,7 @@
         "BR-49",
         "SM-26"
       ],
-      "reason": "Round 12 adds a leg to BR-34 that joins each guarded call to its CloudTrail event and fails a named guardrail version that has no STANDARD-tier PROMPT_ATTACK filter. An unread version, unmatched event or capped join holds the row at N/A, and its texts claim only what was read (bedrock_assessments/app.py:23548-23565, 22928-23030). The filter, tier, input tagging, guardContent, logging and GuardDuty PromptInjection legs, and the enforcement surfaces in BR-41 and BR-49, are unchanged. What remains is whether the application runs ApplyGuardrail over retrieved or tool-returned content and validates tool arguments, and no API records either.",
-      "missing_field": "bedrock-runtime ApplyGuardrailRequest has members guardrailIdentifier, guardrailVersion, source (INPUT|OUTPUT), content, outputScope; none names a tool result or a retrieved document",
-      "unverified": []
+      "missing_field": "bedrock-runtime ApplyGuardrailRequest has members guardrailIdentifier, guardrailVersion, source (INPUT|OUTPUT), content, outputScope; none names a tool result or a retrieved document"
     },
     {
       "control_id": "AIR-FND-DET-09",
@@ -839,10 +564,7 @@
       "checks": [
         "AC-26",
         "BR-12"
-      ],
-      "reason": "Round 11 changes neither AC-26 nor BR-12. They require an attached-SCP Deny of the five log actions, with :log-stream:* on DeleteLogStream (agentcore_assessments/app.py:22776-22863), and deletion protection and a CMK (18340-18559). They also require Firehose forwarding to a COMPLIANCE Object Lock bucket in another account, proven with ExpectedBucketOwner (18772-19043), plus trail log-file validation and trail-bucket Object Lock (19049-19300).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-DET-10",
@@ -850,29 +572,19 @@
       "checks": [
         "AC-53"
       ],
-      "reason": "AC-53 is unchanged in round 11 (agentcore_assessments/app.py:42665-43071). Each Application Signals caller and callee pair between AgentCore runtimes or gateways needs an alarm with actions on an anomaly band over Latency, over Latency SampleCount (the message rate), and over Error or Fault. An UnknownRemoteService pair is N/A. What no AWS record holds, as the note at 42590 states: which custom metrics belong to a workflow, how often each workflow runs, and divergence from a documented trust-boundary topology.",
-      "missing_field": "bedrock-agentcore and bedrock-agentcore-control (botocore) have no workflow or topology operation, and CloudWatch ListMetrics returns no field naming which metrics belong to a workflow",
-      "unverified": []
+      "missing_field": "bedrock-agentcore and bedrock-agentcore-control (botocore) have no workflow or topology operation, and CloudWatch ListMetrics returns no field naming which metrics belong to a workflow"
     },
     {
       "control_id": "AIR-FND-GOV-02",
       "grade": "full",
       "checks": [
         "BR-53"
-      ],
-      "reason": "Round 11 did not touch BR-53 and nothing regressed. Each inventoried Bedrock ARN, and each SageMaker and AgentCore resource from the sweep and the list APIs, is judged on the value of its owner tag. HyperPod clusters and AgentCore harnesses have their tags read directly, and a tag read that fails holds the summary at N/A.",
-      "missing_field": "",
-      "unverified": [
-        "Whether tag:GetResources returns HyperPod clusters or AgentCore harnesses (the code reads their tags directly either way)"
       ]
     },
     {
       "control_id": "AIR-FND-GOV-12",
       "grade": "not_implementable",
-      "checks": [],
-      "reason": "The rationale holds against botocore. sagemaker HumanLoopConfig has no priority member, sagemaker-a2i-runtime DescribeHumanLoopResponse has no reviewer or review-quality member, and a customer-built SQS and DynamoDB review queue has no AWS identity that marks it as holding agent decisions (aisf-parity/build_ledger.py:3208).",
-      "missing_field": "",
-      "unverified": []
+      "checks": []
     },
     {
       "control_id": "AIR-FND-IAM-01",
@@ -880,14 +592,7 @@
       "checks": [
         "BR-42",
         "SM-02"
-      ],
-      "reason": "SM-02 and the BR-42 model-ARN, inert-key, bedrock-mantle and training-bucket legs are judged by value, and Resources that cannot be a model are now excluded. BR-42 still fails a NotResource Allow that excludes every model ARN, such as Action * NotResource arn:aws:bedrock:*, claiming the identity can invoke models not named one by one (app.py:30103, 30136-30142, 30607-30608; confirmed in memory), a grant that statement does not make (rule 7).",
-      "missing_field": "",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      ]
     },
     {
       "control_id": "AIR-FND-IAM-02",
@@ -895,15 +600,7 @@
       "checks": [
         "BR-51"
       ],
-      "reason": "Both prior gaps are closed: the IfExists negated operators are credited (app.py:35982-35989) and attached SCPs are read as Deny sources, with N/A while they are unread (app.py:36036-36080, 36398-36416). The role-trust leg still fails a role whose trust statement lacks Bool aws:MultiFactorAuthPresent true, directly or through a chain (app.py:36696-36727), without checking for a BoolIfExists aws:MultiFactorAuthPresent false Deny over its AI writes in the role's own policies, boundary or attached SCPs. _mfa_deny_source (app.py:36083) is applied to users but not to roles, and such a Deny holds every AssumeRole session made without MFA. The Identity Center MFA-mode leg is a ceiling: no sso-admin operation or shape in botocore carries an MFA member.",
-      "missing_field": "No sso-admin operation or shape carries the Identity Center MFA mode.",
-      "unverified": [
-        "That AssumeRole sessions made without MFA carry aws:MultiFactorAuthPresent false, so a BoolIfExists false Deny in the role's policies fires for them (IAM global condition keys page)"
-      ],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      "missing_field": "No sso-admin operation or shape carries the Identity Center MFA mode."
     },
     {
       "control_id": "AIR-FND-IAM-03",
@@ -911,10 +608,7 @@
       "checks": [
         "BR-45",
         "BR-50"
-      ],
-      "reason": "The BR-45 inventory rows are unchanged in round 12. ListServiceSpecificCredentials with AllUsers (a member in botocore) is paged by Marker, falls back to the cache with the population named, and fails each active long-term Bedrock API key. BR-50 pages ListAccessKeys for every user granted an AI action directly or through assumable roles, fails each Active key and a present root key, and holds Passed behind the cache population gaps.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-IAM-05",
@@ -925,10 +619,7 @@
         "AC-02",
         "AC-48",
         "BR-57"
-      ],
-      "reason": "No regression. The round-11 AC-45 change (_conditioned_denies_on_grant, _tool_role_invoker_finding) holds the part of a grant that a conditioned invoker Deny overlaps at N/A, which the round-11 RT-03 ruling makes correct. The per-workload role, confused-deputy trust and ARN wildcard legs are unchanged.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-IAM-09",
@@ -938,10 +629,7 @@
         "SM-02",
         "AC-02",
         "AR-01"
-      ],
-      "reason": "Round 11 touched none of the four checks and nothing regressed. The IAM read/write split leg and the API integration Lambda leg are as previously graded full.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-NET-01",
@@ -953,10 +641,7 @@
         "SM-28",
         "SM-33",
         "BR-39"
-      ],
-      "reason": "No regression. The only round-12 change in AC-01 gives an AWS managed tool with no networkConfiguration the SANDBOX treatment, Failed at Medium with text saying no networkConfiguration was returned (agentcore_assessments/app.py:2396-2433), which the team lead ruled correct. The private-placement legs of the other five checks are unchanged.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-NET-02",
@@ -965,9 +650,6 @@
         "AC-08",
         "BR-02"
       ],
-      "reason": "The prior gap is partly closed: running training and processing jobs in a VPC are now BR-02 workloads (bedrock_assessments/app.py:3055-3172). Two fixable gaps remain. Every workload, including these jobs, notebooks and endpoints that are AI compute by kind, is dropped at 3788 when its role is granted no Bedrock, AgentCore or SageMaker runtime action, so a training job whose role grants only S3 has its S3 path never judged. Running transform jobs, which run in their model's VpcConfig, are still absent, although the role holds sagemaker:ListTransformJobs and DescribeTransformJob (template.yaml:342, 416).",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "Workloads whose role grants no Bedrock, AgentCore or SageMaker runtime action are not judged, and running transform jobs are not read."
     },
     {
@@ -978,9 +660,6 @@
         "AC-01",
         "SM-39"
       ],
-      "reason": "Round 12 did not touch SM-39. The control names no port list, so judging all-protocol egress to 0.0.0.0/0 or ::/0 follows the accepted round-11 rule. The fixable gap remains: Studio domains add only their subnets (sagemaker_assessments/app.py:21736), and the group leg never reads the DefaultUserSettings.SecurityGroups or DomainSettings.SecurityGroupIds that DescribeDomain returns (botocore DescribeDomainResponse, UserSettings, DomainSettings), although the role holds sagemaker:DescribeDomain (template.yaml:1599). The Passed text at 23671 lists its population without Studio domains, so the text itself is accurate.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "Studio domain security groups (DefaultUserSettings.SecurityGroups and DomainSettings.SecurityGroupIds) are not read."
     },
     {
@@ -991,9 +670,6 @@
         "AG-39",
         "AC-49"
       ],
-      "reason": "API Gateway and ALB front doors are unread because the user declined the grant (wafv2:ListWebACLs, ListResourcesForWebACL; agentcore_assessments/app.py:43152). A fixable gap also remains: the egress threat-signature and reputation-group leg judges only AgentCore hosting VPCs (check_agentcore_network_firewall_egress, 39914-39957), and SM-39 reads no ThreatSignatures reference. No check judges egress IPS for a SageMaker or Bedrock workload VPC.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "Egress IPS is judged only for AgentCore hosting VPCs, not SageMaker or Bedrock workload VPCs. Not asserted: needs wafv2:ListWebACLs and wafv2:ListResourcesForWebACL, which this deployment does not grant."
     },
     {
@@ -1005,10 +681,7 @@
         "AC-49",
         "AG-25",
         "AC-35"
-      ],
-      "reason": "No regression. Round 12 changed only the AC-01 managed-tool rows: an absent networkConfiguration now fails at Medium as Not Customer Filtered and PUBLIC stays High (agentcore_assessments/app.py:2396-2433), as ruled. The network mode, security-group egress, attached-SCP, HOME_NET, DNS Firewall first-match and tool allow-list legs are unchanged.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-NET-07",
@@ -1016,10 +689,7 @@
       "checks": [
         "SM-04",
         "SM-37"
-      ],
-      "reason": "Round 11 did not change SM-04 or SM-37 and nothing regressed. The Lambda Protection, DHCP resolver, EventBridge routing and flow-log alarm legs are still judged by value.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-FND-NET-08",
@@ -1028,9 +698,6 @@
         "AC-51",
         "AG-39"
       ],
-      "reason": "API Gateway and ALB front doors are unread because the user declined the grant (wafv2:ListWebACLs and ListResourcesForWebACL; agentcore_assessments/app.py:41258). Each CloudFront distribution that fronts a gateway still has its global web ACL judged for the Anti-DDoS group and a blocking rate rule, and an unread or Classic ACL is N/A.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "Not asserted: needs wafv2:ListWebACLs and wafv2:ListResourcesForWebACL, which this deployment does not grant, so API Gateway and Application Load Balancer front doors are not read."
     },
     {
@@ -1038,30 +705,21 @@
       "grade": "full",
       "checks": [
         "SM-41"
-      ],
-      "reason": "_iot_requires_attached_thing (sagemaker_assessments/app.py:24903) credits only a non-negated, non-IfExists, non-ForAllValues test requiring true. _iot_resource_bounded_to_thing (:24871) requires the thing variable to fill a whole segment with no wildcard before it. Only attached policies are read, along with per-certificate thing counts, role-alias scoping and a scheduled Device Defender audit, and unread parts give N/A.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-EP-01",
       "grade": "full",
       "checks": [
         "SM-11"
-      ],
-      "reason": "_invoke_source_network_findings (sagemaker_assessments/app.py:6222) holds a principal only when every invoke action its unconditioned Allows grant is also pinned by its Deny statements (_deny_pinned_invoke_actions :6189, open_actions :6355-6357), which the round-10 ruling accepts. The private-DNS runtime endpoint and each served model's isolation and VpcConfig are judged by value (_endpoint_model_network_findings :5552). Code unchanged since 702e56f.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-EP-02",
       "grade": "full",
       "checks": [
         "SM-02"
-      ],
-      "reason": "_endpoint_invocation_scoping_findings (sagemaker_assessments/app.py:1590) applies the permissions boundary and fails an Allow that reaches every endpoint: an ARN wildcard in any segment (:1493), NotResource, or a tag condition that is IfExists, ForAllValues, negated or wildcard-only (:1511). A conditioned Deny is never subtracted, so a TargetContainerHostname Deny earns no credit. check_sagemaker_runtime_endpoint_policy (:5855) judges the runtime VPC endpoint policy, and _hold_passed_for_unread_principals (:2376) keeps an unread principal from producing Passed.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-EP-03",
@@ -1070,9 +728,7 @@
         "SM-11",
         "SM-14"
       ],
-      "reason": "Each bounding control the recommendation names is judged by value: KmsKeyId resolved with kms:DescribeKey (_endpoint_config_kms_findings, sagemaker_assessments/app.py:5716), isolation and VpcConfig on every served model and inference component (:5552), and RepositoryAccessMode Vpc (check_sagemaker_model_container_repository :8009). The rows say the co-located inter-container hop was not read, because no endpoint API exposes an encryption setting for it.",
-      "missing_field": "EnableInterContainerTrafficEncryption: botocore sagemaker 2017-07-24 defines it only on AutoMLSecurityConfig, CreateTrainingJobRequest, DescribeTrainingJobResponse, HyperParameterTrainingJobDefinition, MonitoringNetworkConfig, NetworkConfig and TrainingJob (re-listed this round). DescribeEndpointConfig, DescribeModel, DescribeEndpoint and DescribeInferenceComponent have no such member",
-      "unverified": []
+      "missing_field": "EnableInterContainerTrafficEncryption: botocore sagemaker 2017-07-24 defines it only on AutoMLSecurityConfig, CreateTrainingJobRequest, DescribeTrainingJobResponse, HyperParameterTrainingJobDefinition, MonitoringNetworkConfig, NetworkConfig and TrainingJob. DescribeEndpointConfig, DescribeModel, DescribeEndpoint and DescribeInferenceComponent have no such member"
     },
     {
       "control_id": "AIR-SGM-EP-06",
@@ -1081,13 +737,7 @@
         "SM-23",
         "SM-31"
       ],
-      "reason": "Round 12 closes the prior gap: a DiskUtilization alarm whose single evaluated query is this account's MetricStat is now credited, and an expression or another account's metric holds the variant at N/A with text naming it (sagemaker_assessments/app.py:12067-12193). A rule-7 defect remains: the SM-31 capture Passed text says the sampling percentage is not readable from the endpoint (12424), but DescribeEndpoint's DataCaptureConfigSummary returns CurrentSamplingPercentage, which the code reads (12329) and never reports. The control names no sampling bound, so the fix is to report the value. The MLflow and Evidently replacement path is stated as not read (10812), and that part is a ceiling: botocore DescribeMlflowApp and DescribeMlflowTrackingServer outputs have no endpoint or model member.",
-      "missing_field": "DescribeMlflowApp and DescribeMlflowTrackingServer return no endpoint or model member, so the MLflow and Evidently replacement path is not readable.",
-      "unverified": [],
-      "verify12b": {
-        "verdict": "FIXED",
-        "new_defect": null
-      }
+      "missing_field": "DescribeMlflowApp and DescribeMlflowTrackingServer return no endpoint or model member, so the MLflow and Evidently replacement path is not readable."
     },
     {
       "control_id": "AIR-SGM-EP-08",
@@ -1095,30 +745,21 @@
       "checks": [
         "SM-18",
         "SM-42"
-      ],
-      "reason": "_transform_job_boundary_findings (sagemaker_assessments/app.py:8612) resolves each job's model VpcConfig and isolation, and requires customer-managed VolumeKmsKeyId and TransformOutput.KmsKeyId through kms:DescribeKey. It also judges subnet exposure, the S3 gateway endpoint and its policy (:8800), and SSE-KMS plus SecureTransport on the input and output buckets (:8816). Any unread item gives N/A. SM-42 credits the keys only through an attached SCP Deny, using _deny_guard_strength (:14583).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-GOV-01",
       "grade": "full",
       "checks": [
         "SM-22"
-      ],
-      "reason": "The approver comes from LastModifiedBy and ModelLifeCycle on each package (_approval_attribution_findings, sagemaker_assessments/app.py:9465). A failed ListModelPackages, ListModelPackageGroups or DescribeModelPackage read turns Passed into N/A naming the failed reads (_versions_unread_clause :9547). The RAM sharing leg is unchanged.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-GOV-10",
       "grade": "full",
       "checks": [
         "SM-32"
-      ],
-      "reason": "_managed_rule_problems (sagemaker_assessments/app.py:4611) requires all three managed rules ACTIVE and unscoped, with kmsKeyArns pinned. Recorder scope and recording state are read, the conformance-pack leg requires all three rules, compliance is paged, and an unevaluated or unread rule withholds Passed. The text excludes jobs, which Config does not record. Unchanged since 702e56f.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-TRN-01",
@@ -1126,10 +767,7 @@
       "checks": [
         "SM-33",
         "SM-34"
-      ],
-      "reason": "check_sagemaker_training_job_network_boundary (sagemaker_assessments/app.py:13793) and _training_vpc_endpoint_findings (:13217) judge each job's VPC, isolation, IGW route and private-DNS endpoints. SAGEMAKER_GUARDED_ACTION_KEYS (:14069) guards each action on VpcSubnets, VpcSecurityGroupIds and NetworkIsolation, credited only through an attached SCP Deny (_deny_guard_strength :14583, which strips set prefixes and handles IfExists and ForAnyValue on an absent key).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-TRN-02",
@@ -1137,10 +775,7 @@
       "checks": [
         "SM-03",
         "SM-34"
-      ],
-      "reason": "_guardrail_requirements (sagemaker_assessments/app.py:14209) requires VolumeKmsKeyArn, OutputKmsKeyArn and InterContainerTrafficEncryption, through attached SCPs, on every action that defines them. check_sagemaker_data_protection (:3290) checks job KMS keys, inter-container encryption on multi-instance jobs, and bucket SSE-KMS and SecureTransport by value, with N/A on unread items.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-TRN-05",
@@ -1149,20 +784,14 @@
         "SM-09",
         "SM-01",
         "SM-03"
-      ],
-      "reason": "NOTEBOOK_ACCESS_GUARDRAILS (sagemaker_assessments/app.py:14301) requires the domain, user-profile and notebook keys (subnets, security groups, volume KMS, AppNetworkAccessType, RootAccess, DirectInternetAccess) and a presigned-URL SourceIp or SourceVpce Deny, all credited only through an attached SCP. The execution-role leg (_environment_role_findings :4335), the CloudTrail-to-CloudWatch leg and the Config-rule legs are unchanged.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SGM-TRN-08",
       "grade": "full",
       "checks": [
         "SM-34"
-      ],
-      "reason": "check_sagemaker_creation_guardrails (sagemaker_assessments/app.py:15173) guards every create or update action that defines a guardrail key (:14069). It credits only attached SCPs (ListTargetsForPolicy plus ListParents) and the ARN-suffixed KMS keys, and handles IfExists, set prefixes and Null pairing (_deny_guard_strength :14583, _deny_pair_enforces :14642).",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SLF-AGT-05",
@@ -1170,9 +799,7 @@
       "checks": [
         "BR-57"
       ],
-      "reason": "check_agent_handoff_source_identity (bedrock_assessments/app.py:42791) and check_bedrock_agent_workload_identity (:43241) judge collaborator and shared roles, sts:SourceIdentity pinning on trust edges, runtime JWT and resource-policy gates, and MicroVM SHELL_INGRESS by value, and an unread item gives N/A. AGENT_HANDOFF_CEILING (:42257-42267) states what no API reads: which ECS task or Lambda roles host an agent, a cross-account trusting role, and MicroVM token ports. Code unchanged since 702e56f.",
-      "missing_field": "botocore lambda-microvms 2025-09-09 has no Get or List operation for issued auth tokens (operations re-listed this round), and CreateMicrovmAuthTokenResponse holds only authToken, so allowedPorts and expiry are request-only. No ECS or Lambda member marks a role as an agent's",
-      "unverified": []
+      "missing_field": "botocore lambda-microvms 2025-09-09 has no Get or List operation for issued auth tokens, and CreateMicrovmAuthTokenResponse holds only authToken, so allowedPorts and expiry are request-only. No ECS or Lambda member marks a role as an agent's"
     },
     {
       "control_id": "AIR-SLF-CMP-01",
@@ -1181,9 +808,6 @@
         "BR-33",
         "AC-50"
       ],
-      "reason": "check_agentcore_image_scan_gate (agentcore_assessments/app.py:6528) credits a deploy gate only as an EventBridge rule with a target (:6774) and says what the target does is not read. No leg reads CodePipeline: its AWS-owned InspectorScan invoke action carries CriticalThreshold, HighThreshold, MediumThreshold and LowThreshold (live list-action-types, 178113193057 us-east-1, 2026-10-04), and GetPipeline returns them in ActionDeclaration.configuration (botocore codepipeline 2015-07-09). That leg needs grants codepipeline:ListPipelines and codepipeline:GetPipeline, which template.yaml does not hold. The rest stands: check_inspector_lambda_code_scanning (bedrock_assessments/app.py:26573) and check_bedrock_container_image_scanning (:27313) judge by value, EKS pod images are not readable through botocore eks, and a MicroVM base image is a microvm-image ARN.",
-      "missing_field": "",
-      "unverified": [],
       "remaining_gap": "No check reads a CodePipeline InspectorScan action's thresholds. Not asserted: needs codepipeline:ListPipelines and codepipeline:GetPipeline, which this deployment does not grant."
     },
     {
@@ -1192,11 +816,7 @@
       "checks": [
         "SM-43"
       ],
-      "reason": "check_sagemaker_model_artifact_integrity (sagemaker_assessments/app.py:17625) checks digest or immutable-tag pinning, signing status, ETag recording, CMKs, role reach and IMDSv2 by value. SM43_PREFIX_OBJECT_CAP (:17469) records a workstation measurement on 178113193057 and meets the round-8 and round-9 cap rulings. Code unchanged since 702e56f.",
-      "missing_field": "No SageMaker field records a SHA256 digest of model data (botocore S3ModelDataSource members re-listed: S3Uri, S3DataType, CompressionType, ModelAccessConfig, HubAccessConfig, ManifestS3Uri, ETag, ManifestEtag), and no API reports a load-time digest comparison or which artifact an ECS, EKS or EC2 workload loads",
-      "unverified": [
-        "that no ECS, EKS or EC2 API reports the artifact a workload loads (carried from prior rounds, not re-read)"
-      ]
+      "missing_field": "No SageMaker field records a SHA256 digest of model data (botocore S3ModelDataSource members re-listed: S3Uri, S3DataType, CompressionType, ModelAccessConfig, HubAccessConfig, ManifestS3Uri, ETag, ManifestEtag), and no API reports a load-time digest comparison or which artifact an ECS, EKS or EC2 workload loads"
     },
     {
       "control_id": "AIR-SLF-RT-02",
@@ -1204,10 +824,7 @@
       "checks": [
         "AC-01",
         "SM-39"
-      ],
-      "reason": "No regression. SM-39 is unchanged in round 12, and the AC-01 change gives a managed browser or Code Interpreter with no networkConfiguration the SANDBOX treatment at Medium (agentcore_assessments/app.py:2396-2433), which was ruled correct. The DNS Firewall, Network Firewall, security-group egress and attached-SCP legs on lambda:VpcIds, SubnetIds, SecurityGroupIds and CreateNetworkConnector still cover the self-hosted population.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SLF-RT-04",
@@ -1215,10 +832,7 @@
       "checks": [
         "SM-04",
         "SM-38"
-      ],
-      "reason": "Both round-10 gaps are closed. _lambda_runtime_tier_findings (sagemaker_assessments/app.py:19408) now fails a Region where no logging trail or ENABLED event data store records every AWS::Lambda::Function data event (:19488, _lambda_invoke_selectors :19613). An uncovered ECS cluster whose tasks all run on ECS Managed Instances capacity is no longer failed as uncovered (:19206). Instead, _ecs_managed_instances_tier_findings (:18801) judges each such task on its fallback: an ACTIVE ALL-traffic flow log on the ENI, subnet or VPC, awslogs on every container, and recorded ECS management events, as the round-11 ruling accepts. Unread reads give N/A, and 90 narrowed SM-38/SM-39 tests pass.",
-      "missing_field": "",
-      "unverified": []
+      ]
     },
     {
       "control_id": "AIR-SLF-RT-05",
@@ -1226,9 +840,7 @@
       "checks": [
         "SM-39"
       ],
-      "reason": "_workload_segmentation_findings (sagemaker_assessments/app.py:20908) fails shared or default groups and wide CIDRs on ECS, Lambda, EC2 and MicroVM connector security groups. The control names no CIDR bound, and the /16 and /48 rule is stated in the text. _microvm_ingress_findings (:21175) fails SHELL_INGRESS and states that token port scope is not judged (:21199). check_eks_vpc_cni_network_policy (:20100) reads enableNetworkPolicy and strict mode.",
-      "missing_field": "botocore eks 2017-11-01 has no operation returning Kubernetes NetworkPolicy or SecurityGroupPolicy objects (its only policy operations are AssociateAccessPolicy and DisassociateAccessPolicy, re-listed this round). CreateMicrovmAuthToken allowedPorts is request-only: GetMicrovm returns only ingressNetworkConnectors and egressNetworkConnectors, and lambda-microvms has no token Get or List",
-      "unverified": []
+      "missing_field": "botocore eks 2017-11-01 has no operation returning Kubernetes NetworkPolicy or SecurityGroupPolicy objects (its only policy operations are AssociateAccessPolicy and DisassociateAccessPolicy). CreateMicrovmAuthToken allowedPorts is request-only: GetMicrovm returns only ingressNetworkConnectors and egressNetworkConnectors, and lambda-microvms has no token Get or List"
     },
     {
       "control_id": "AIR-SLF-RT-06",
@@ -1236,21 +848,14 @@
       "checks": [
         "SM-40"
       ],
-      "reason": "check_secrets_manager_rotation (sagemaker_assessments/app.py:24071) fails rotation that is off, a secret that never rotated, a gap over 90 days (the control gives 30 days only as an e.g., so it names no bound) and a missed schedule. _propagation_and_plaintext_findings (:24506) judges ECS redeploy rules, Parameter Store injection, plaintext variables, the Lambda extension layer and the MicroVM /resume hook. A rule with a target is N/A, and the text says the target's behavior is not read (:24731-24736).",
-      "missing_field": "Whether workload code re-fetches a rotated secret: Lambda GetFunction returns only an archive URL, and EventBridge ListTargetsByRule returns only a target ARN and input",
-      "unverified": [
-        "ListTargetsByRule member list carried from prior rounds, not re-read"
-      ]
+      "missing_field": "Whether workload code re-fetches a rotated secret: Lambda GetFunction returns only an archive URL, and EventBridge ListTargetsByRule returns only a target ARN and input"
     },
     {
       "control_id": "AIR-SLF-RT-08",
       "grade": "full",
       "checks": [
         "BR-54"
-      ],
-      "reason": "check_lambda_public_invoke_configuration (bedrock_assessments/app.py:41074) pages every function, alias and version. It fails AuthType NONE and a wildcard CORS origin, and clears a '*' grant only on a positive test naming one account, organization or wildcard-free source. A read error gives N/A, and the attached-SCP Deny on lambda:FunctionUrlAuthType is judged by value. Unchanged since 702e56f.",
-      "missing_field": "",
-      "unverified": []
+      ]
     }
   ]
 }

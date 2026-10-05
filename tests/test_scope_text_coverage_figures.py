@@ -21,7 +21,13 @@ _spec = importlib.util.spec_from_file_location("check_ledger", LEDGER)
 check_ledger = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(check_ledger)
 
-LABELS = ("covered", "covered_in_scope", "covered_without_row")
+LABELS = (
+    "covered",
+    "covered_in_scope",
+    "covered_without_row",
+    "tighten",
+    "not_implementable",
+)
 
 
 def scope_text():
@@ -57,7 +63,8 @@ def test_shipped_sentence_is_found_once_per_figure_and_agrees():
     values, found, computed, problems = drift(scope_text())
     assert problems == []
     assert tuple(found) == LABELS
-    assert [len(found[label]) for label in LABELS] == [1, 1, 1]
+    # tighten is published twice: in the coverage claim and beside the tag column.
+    assert [len(found[label]) for label in LABELS] == [1, 1, 1, 2, 1]
     assert values == computed
 
 
@@ -67,6 +74,7 @@ def test_each_figure_raised_by_one_is_named_against_the_ledger():
         "covered": r"(\d+) of the \d+ are covered by checks",
         "covered_in_scope": r"\d+ of the (\d+) are covered by checks",
         "covered_without_row": r"the (\d+) covered controls without a row",
+        "not_implementable": r"(\d+) are not implementable",
     }
     for label, pattern in patterns.items():
         _, _, computed, problems = drift(bump(text, pattern))
@@ -74,6 +82,17 @@ def test_each_figure_raised_by_one_is_named_against_the_ledger():
             f"the report section's scope_text publishes {label}="
             f"{computed[label] + 1}, the ledger computes {computed[label]}"
         ], label
+
+
+def test_either_tighten_copy_raised_alone_is_a_disagreement():
+    text = scope_text()
+    for pattern in (r"(\d+) are asserted in part", r"the (\d+) asserted in part"):
+        values, found, computed, problems = drift(bump(text, pattern))
+        assert values["tighten"] is None, pattern
+        assert problems == [
+            "the report section's scope_text publishes 2 copies of tighten that "
+            f"disagree: {found['tighten']}; the ledger computes {computed['tighten']}"
+        ], pattern
 
 
 def test_a_deleted_sentence_reports_every_figure_absent():

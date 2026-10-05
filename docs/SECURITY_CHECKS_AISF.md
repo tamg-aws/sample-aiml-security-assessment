@@ -25,6 +25,9 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   `unassessed`. Each `not_implementable` control asks about evidence no AWS
   API returns, and the ledger names the reason for each. The parity analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
+  [`aisf-parity/aisf-grades.json`](../aisf-parity/aisf-grades.json) holds each
+  control's grade and, for a partial control, its gap; it is written by hand,
+  not generated.
   Five ids, `AISF-01`, `AISF-02`, `AISF-03`, `AISF-04` and `AISF-06`, are
   retired: each restated a check that asserts only part of its control, so the
   view no longer derives them, and the ids are never reallocated.

@@ -293,11 +293,15 @@ def scope_coverage_drift(text, summary, mapped_controls):
     labels to scope_figures() would read them as absent from the doc, and gate
     12's doc-versus-template comparison would then fail on a correct pair.
 
-    Three figures, and the middle one is not a restatement of the scope
+    Of the first three figures, the middle one is not a restatement of the scope
     sentence's in-scope total. It is a second copy, published inside the
     coverage claim, and a copy nothing reads is free to go stale while the one
     beside it stays gated. `covered_without_row` is counted over distinct
-    controls for the reason gate 21 records at its own copy.
+    controls for the reason gate 21 records at its own copy. `tighten` and
+    `not_implementable` are the rest of the 105: the sentence published both
+    with no gate reading either. `tighten` is published twice, once in the
+    coverage claim and once beside the tag column it names, and the pattern
+    reads both, so a bump to one copy resolves to None.
 
     Returns the published values, every copy found, the computed side, and one
     message per figure that is absent, disagrees with itself, or with the ledger.
@@ -308,6 +312,8 @@ def scope_coverage_drift(text, summary, mapped_controls):
             ("covered", r"(?<![-\w])(\d+) of the \d+ are covered by checks"),
             ("covered_in_scope", r"\d+ of the (\d+) are covered by checks"),
             ("covered_without_row", r"the (\d+) covered controls without a row"),
+            ("tighten", r"(?<![-\w])(\d+) (?:are )?asserted in part"),
+            ("not_implementable", r"(?<![-\w])(\d+) are not implementable"),
         ),
     )
     values = {label: agreed_figure(hits) for label, hits in found.items()}
@@ -315,6 +321,8 @@ def scope_coverage_drift(text, summary, mapped_controls):
         "covered": summary["covered"],
         "covered_in_scope": summary["total"],
         "covered_without_row": summary["covered"] - len(mapped_controls),
+        "tighten": summary["tighten"],
+        "not_implementable": summary["not_implementable"],
     }
     problems = figure_drift("the report section's scope_text", values, found, computed)
     return values, found, computed, problems
