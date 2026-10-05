@@ -140,7 +140,7 @@ sample-aiml-security-assessment/
 ├── aiml-security-assessment/
 │   ├── functions/security/
 │   │   ├── bedrock_assessments/      # Bedrock security checks (57)
-│   │   ├── sagemaker_assessments/    # SageMaker checks (40; SM-29 reserved)
+│   │   ├── sagemaker_assessments/    # SageMaker checks (42; SM-29 reserved)
 │   │   ├── agentcore_assessments/    # AgentCore security checks (53)
 │   │   ├── agent_registry_assessments/  # AWS Agent Registry checks (10)
 │   │   ├── responsible_ai_grc_assessments/  # Optional Responsible AI GRC checks (64)
@@ -869,7 +869,7 @@ To update report styling, layout, or features:
 
 ## Extending or Adding Lenses
 
-The Agentic AI Security lens (AG-01 through AG-38) is **synthesized at runtime**, not produced by a separate scanner. It re-uses findings from the core Bedrock, AgentCore, and AWS Agent Registry assessments plus a small number of native gateway checks.
+The Agentic AI Security lens (AG-01 through AG-39) is **synthesized at runtime**, not produced by a separate scanner. It re-uses findings from the core Bedrock, AgentCore, and AWS Agent Registry assessments plus a small number of native gateway checks.
 
 - Mapping dictionaries live in three places:
   - `bedrock_assessments/app.py` → `AGENTIC_BEDROCK_CHECK_MAPPINGS`
