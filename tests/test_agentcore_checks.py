@@ -6725,13 +6725,11 @@ def _ac14_key_policy(
     context_operator="ArnLike",
 ):
     """Return the AgentCore Identity guide's example vault key policy."""
-    condition = {
-        via_operator: {"kms:ViaService": via},
-        context_operator: {
-            "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
-            "token-vault-arn": context
-        },
-    }
+    condition = {via_operator: {"kms:ViaService": via}}
+    condition.setdefault(context_operator, {})[
+        "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
+        "token-vault-arn"
+    ] = context
     if account_held:
         condition.setdefault("StringEquals", {})["aws:ResourceAccount"] = (
             "${aws:PrincipalAccount}"
@@ -7295,6 +7293,64 @@ class TestAC14VaultKeyPolicy:
                 "context naming token-vault/default in any Region matching "
                 f"{region} of one account" in details
             )
+
+    @pytest.mark.parametrize(
+        ("context", "context_operator", "via", "via_operator", "status"),
+        [
+            ("*:*", "ArnLike", "*", "StringLike", "Passed"),
+            ("*:*", "StringLike", "*", "StringLike", "Passed"),
+            ("*:*", "StringEquals", "*", "StringLike", "Failed"),
+            ("*:*", "ArnEquals", "*", "StringLike", "Failed"),
+            ("*:*", "StringEqualsIgnoreCase", "*", "StringLike", "Failed"),
+            ("us-east-1:*", "ArnEquals", "*", "StringLike", "Failed"),
+            ("us-east-?:123456789012", "ArnEquals", "*", "StringLike", "Failed"),
+            ("us-east-1:123456789012", "ArnEquals", "*", "StringLike", "Passed"),
+            ("us-east-1:123456789012", "StringEquals", "*", "StringEquals", "Failed"),
+            (
+                "us-east-1:123456789012",
+                "StringEquals",
+                "us-east-1",
+                "StringEquals",
+                "Passed",
+            ),
+        ],
+        ids=[
+            "arnlike-wildcards",
+            "stringlike-wildcards",
+            "stringequals-wildcards",
+            "arnequals-wildcards",
+            "stringequalsignorecase-wildcards",
+            "arnequals-account-wildcard",
+            "arnequals-region-question-mark",
+            "arnequals-literal",
+            "stringequals-viaservice-wildcard",
+            "stringequals-literal",
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_equality_operator_reads_a_wildcard_as_a_literal_character(
+        self, mock_ac, mock_kms, context, context_operator, via, via_operator, status
+    ):
+        # AIR-ACR-ID-05: under StringEquals or ArnEquals a * or ? is a literal
+        # character, so the condition never equals the vault's real context and
+        # KMS denies Decrypt to the vault; only ArnLike and StringLike match.
+        self._wire(
+            mock_ac,
+            mock_kms,
+            {
+                self._KEYS["default"]: _ac14_key_policy(
+                    context=f"arn:aws:bedrock-agentcore:{context}:token-vault/default",
+                    context_operator=context_operator,
+                    via=f"bedrock-agentcore-identity.{via}.amazonaws.com",
+                    via_operator=via_operator,
+                )
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == [status]
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")

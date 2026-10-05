@@ -9226,9 +9226,22 @@ TOKEN_VAULT_CONTEXT_OPERATORS = (
     "stringlike",
 )
 
+# Under the equality operators a `*` or `?` is a literal character, not a
+# wildcard (reference_policies_elements_condition_operators.html).
+TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS = (
+    "arnequals",
+    "stringequals",
+    "stringequalsignorecase",
+)
 
-def _positive_condition_values(statement: Dict[str, Any], key: str) -> List[List[str]]:
-    """Return the lowercased value lists of each binding condition on `key`.
+
+def _positive_condition_values(
+    statement: Dict[str, Any],
+    key: str,
+    operators: Iterable[str] = TOKEN_VAULT_CONTEXT_OPERATORS,
+) -> List[List[str]]:
+    """Return the lowercased value lists of each binding condition on `key`
+    under one of `operators`.
 
     IfExists and ForAllValues forms are true when the key is absent, so they
     bind nothing and are left out.
@@ -9243,7 +9256,7 @@ def _positive_condition_values(statement: Dict[str, Any], key: str) -> List[List
         name = str(operator).strip().lower()
         if name.startswith("forallvalues:") or name.endswith("ifexists"):
             continue
-        if _normalized_condition_operator(name) not in TOKEN_VAULT_CONTEXT_OPERATORS:
+        if _normalized_condition_operator(name) not in operators:
             continue
         for entry_key, raw in entries.items():
             if str(entry_key).strip().lower() == key:
@@ -9271,7 +9284,12 @@ def _statement_binds_token_vault(
     guide's `*` binds, and is returned so the finding can say the context
     names this vault id in every Region it matches. The account has to be
     either literal or held to the caller's own account by aws:ResourceAccount
-    equal to ${aws:PrincipalAccount} in the same statement.
+    equal to ${aws:PrincipalAccount} in the same statement. Under StringEquals
+    or ArnEquals every segment is compared literally, so a `*` or `?` in any
+    of them never equals the vault's context and binds nothing: only
+    StringLike and ArnLike match patterns. The same holds for the
+    kms:ViaService value. Conditions are ANDed, so such a value makes the
+    whole statement bind nothing.
     """
     via_service = f"bedrock-agentcore-identity.{region}.amazonaws.com"
     if not any(
@@ -9289,6 +9307,16 @@ def _statement_binds_token_vault(
         if_exists_counts=False,
     )
     target = f"token-vault/{vault_id}".lower()
+    if any(
+        wildcard in value
+        for key in (TOKEN_VAULT_ENCRYPTION_CONTEXT_KEY, "kms:viaservice")
+        for values in _positive_condition_values(
+            statement, key, TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS
+        )
+        for value in values
+        for wildcard in "*?"
+    ):
+        return ""
     for values in _positive_condition_values(
         statement, TOKEN_VAULT_ENCRYPTION_CONTEXT_KEY
     ):
