@@ -19,10 +19,13 @@ import sys
 import json
 import inspect
 import os
+import re
 import importlib.util
 import io
 import tarfile
 import textwrap
+import threading
+import time
 import zipfile
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -21109,6 +21112,59 @@ class TestAC34RuntimeCode:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "main.py in s3://code-bucket/old.zip" in rows[0]["Finding_Details"]
 
+    def test_an_archive_two_runtimes_name_is_read_once(self):
+        rows = self._run(
+            {"rt-a": "a.zip", "rt-b": "a.zip", "rt-c": "c.zip"},
+            {
+                "code-bucket/a.zip": self._zip({"main.py": "x = 1\n"}),
+                "code-bucket/c.zip": self._zip({"cfg.py": f"K = '{self._ACCESS_KEY}'"}),
+            },
+        )
+        statuses = {
+            label: row["Status"]
+            for row in rows
+            for label in ("rt-a", "rt-b", "rt-c")
+            if f"({label})" in row["Finding_Details"]
+        }
+        assert statuses == {"rt-a": "Passed", "rt-b": "Passed", "rt-c": "Failed"}
+        assert sorted(c.kwargs["Key"] for c in self.s3.get_object.call_args_list) == [
+            "a.zip",
+            "c.zip",
+        ]
+
+    def test_a_failed_read_holds_only_the_runtime_that_names_it(self):
+        rows = self._run(
+            {"rt-a": "a.zip", "rt-b": "denied.zip"},
+            {"code-bucket/a.zip": self._zip({"main.py": "x = 1\n"})},
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "s3://code-bucket/denied.zip" in rows[1]["Finding_Details"]
+
+    def test_distinct_archives_are_read_at_once(self):
+        """Three reads that each wait for the other two finish only if they
+        run together; one at a time, the first breaks the barrier."""
+        objects = {
+            f"code-bucket/{name}.zip": self._zip({"main.py": "x = 1\n"})
+            for name in "abc"
+        }
+        served = _s3_objects_client(objects).get_object.side_effect
+        barrier = threading.Barrier(agentcore_app.AC34_PARALLEL_READS, timeout=5)
+        first = set()
+
+        def get_object(Bucket, Key, **kwargs):
+            if Key not in first:
+                first.add(Key)
+                barrier.wait()
+            return served(Bucket=Bucket, Key=Key, **kwargs)
+
+        with patch("tests.test_agentcore_checks._s3_objects_client") as fake:
+            fake.return_value.get_object.side_effect = get_object
+            rows = self._run(
+                {"rt-a": "a.zip", "rt-b": "b.zip", "rt-c": "c.zip"}, objects
+            )
+        assert agentcore_app.AC34_PARALLEL_READS == 3
+        assert [r["Status"] for r in rows] == ["Passed"] * 3
+
 
 class TestAC34RuntimeImages:
     """AC-34: a credential baked into a runtime's container image configuration."""
@@ -21893,6 +21949,35 @@ class TestAC34RuntimeImages:
 
         assert len(rows) == 1
         assert "(rt-a)" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.urlopen")
+    @patch("agentcore_app.ecr_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_two_tags_of_one_image_read_at_once_download_it_once(
+        self, mock_ac, mock_ecr, mock_open
+    ):
+        self._wire(
+            mock_ac,
+            mock_ecr,
+            mock_open,
+            {"rt-a": f"{self._URI}:one", "rt-b": f"{self._URI}:two"},
+            {"cfg-one": self._config(), "cfg-two": self._config()},
+            digests={"one": "sha256:same", "two": "sha256:same"},
+        )
+        served = mock_open.side_effect
+
+        def slow_open(url, timeout):
+            # Long enough that both reads pass their digest lookup first.
+            time.sleep(0.2)
+            return served(url, timeout)
+
+        mock_open.side_effect = slow_open
+        rows = self._image_rows(
+            agentcore_app.check_agentcore_runtime_inline_credentials()
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+        configs = [c.args[0] for c in mock_open.call_args_list if "/cfg-" in c.args[0]]
+        assert len(configs) == 1
 
 
 class TestAC34UnreadServedVersionHoldsArtifactRows:
@@ -61494,3 +61579,89 @@ class TestAC51FrontDoorWebAcl:
             for f in findings
             if f["Finding"] == agentcore_app.AGENTCORE_FRONT_DOOR_WAF_FINDING
         } == {"Passed"}
+
+
+class TestReadEachOnce:
+    """AC-34 reads each distinct code archive or image once, several at a time."""
+
+    def test_each_distinct_key_is_read_once_and_an_error_is_returned(self):
+        calls = []
+        failure = ValueError("too large")
+
+        def read(key):
+            calls.append(key)
+            if key == "c":
+                raise failure
+            return key.upper()
+
+        reads = agentcore_app._read_each_once(read, iter(["b", "a", "b", "c"]))
+        assert list(reads) == ["b", "a", "c"]
+        assert reads == {"b": "B", "a": "A", "c": failure}
+        assert sorted(calls) == ["a", "b", "c"]
+
+    def test_reads_run_together_up_to_the_bound(self):
+        barrier = threading.Barrier(agentcore_app.AC34_PARALLEL_READS, timeout=5)
+        reads = agentcore_app._read_each_once(
+            lambda key: barrier.wait() is not None,
+            range(agentcore_app.AC34_PARALLEL_READS),
+        )
+        assert list(reads.values()) == [True] * agentcore_app.AC34_PARALLEL_READS
+
+
+class TestInvocationBudget:
+    """check_timeout warns 120 s and stops 60 s before the invocation's budget,
+    which lambda_handler takes from the Lambda context."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        saved = (agentcore_app.start_time, agentcore_app.lambda_budget_seconds)
+        yield
+        agentcore_app.start_time, agentcore_app.lambda_budget_seconds = saved
+
+    @pytest.mark.parametrize("budget", [600, 900])
+    def test_the_guard_warns_and_stops_before_the_budget(self, budget):
+        agentcore_app.start_time = 1000.0
+        agentcore_app.lambda_budget_seconds = budget
+        with patch.object(agentcore_app.logger, "warning") as warning:
+            for elapsed, runs, warns in [
+                (budget - 120, True, False),
+                (budget - 119, True, True),
+                (budget - 61, True, True),
+                (budget - 60, False, True),
+            ]:
+                warning.reset_mock()
+                with patch.object(
+                    agentcore_app.time, "time", return_value=1000.0 + elapsed
+                ):
+                    assert agentcore_app.check_timeout() is runs, elapsed
+                assert warning.called is warns, elapsed
+
+    @pytest.mark.parametrize(
+        "context, budget",
+        [(123_000, 123.0), (None, agentcore_app.LAMBDA_TIMEOUT_SECONDS)],
+        ids=["context", "no-context"],
+    )
+    def test_the_handler_takes_the_budget_from_the_context(self, context, budget):
+        agentcore_app.lambda_budget_seconds = 1
+        if context is not None:
+            remaining = context
+            context = MagicMock()
+            context.get_remaining_time_in_millis.return_value = remaining
+        # An event that is not a mapping fails on its first read, after the
+        # budget is set and before any client is made.
+        with pytest.raises(AttributeError):
+            agentcore_app.lambda_handler(None, context)
+        assert agentcore_app.lambda_budget_seconds == budget
+
+    @pytest.mark.parametrize(
+        "template", ["template.yaml", "template-multi-account.yaml"]
+    )
+    def test_the_configured_timeout_is_the_functions_timeout(self, template):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "aiml-security-assessment", template
+        )
+        with open(path) as handle:
+            text = handle.read()
+        block = text[text.index("\n  AgentCoreSecurityAssessmentFunction:\n") :]
+        timeout = re.search(r"\n      Timeout: (\d+)", block)
+        assert int(timeout.group(1)) == agentcore_app.LAMBDA_TIMEOUT_SECONDS == 900

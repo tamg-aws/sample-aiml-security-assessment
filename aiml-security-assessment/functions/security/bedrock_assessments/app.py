@@ -46,17 +46,17 @@ GLOBAL_REGION_LABEL = "Global"
 
 # The Bedrock function's Timeout in template.yaml and template-multi-account.yaml,
 # the deadline's base when lambda_handler is called with no Lambda context.
-LAMBDA_TIMEOUT_SECONDS = 600
+LAMBDA_TIMEOUT_SECONDS = 900
 
 # Every capped or budgeted read loop also stops once less than this many seconds
 # of the invocation remain. Each cap was measured alone against the deployed
-# function's slowest run, 420 s of its 600 s timeout, but the caps one region
-# run reaches can together pass 600 s, and an invocation that times out writes
-# no report at all. 60 s is botocore's default read timeout, so it covers one
-# call left stalled in flight when the deadline passes, then the CSV build and
-# the one S3 PutObject of the report. Calls outside these loops are not stopped.
-# A read the deadline stops is reported as a read past its cap is: named or
-# counted, and the row held at N/A.
+# function's slowest run, 420 s of the 600 s timeout it then had, but the caps
+# one region run reaches can together pass the timeout, and an invocation that
+# times out writes no report at all. 60 s is botocore's default read timeout, so
+# it covers one call left stalled in flight when the deadline passes, then the
+# CSV build and the one S3 PutObject of the report. Calls outside these loops
+# are not stopped. A read the deadline stops is reported as a read past its cap
+# is: named or counted, and the row held at N/A.
 DEADLINE_MARGIN_SECONDS = 60
 
 # Where a read the deadline stopped says it stopped.

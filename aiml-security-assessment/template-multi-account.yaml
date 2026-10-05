@@ -761,7 +761,7 @@ Resources:
       Runtime: python3.12
       Architectures:
         - x86_64
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1024
       Environment:
         Variables:
@@ -2102,7 +2102,7 @@ Resources:
       Runtime: python3.12
       Architectures:
         - x86_64
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1024
       Environment:
         Variables:
