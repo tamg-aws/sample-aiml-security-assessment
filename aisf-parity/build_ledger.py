@@ -1010,7 +1010,14 @@ AI_SUBJECT_ROWS = [
         "must be customer managed and Enabled by kms:DescribeKey. Its key policy, read by "
         "kms:GetKeyPolicy, must hold a statement allowing kms:Decrypt only with "
         "kms:ViaService bedrock-agentcore-identity and the token-vault-arn encryption "
-        "context naming that vault exactly, a wildcard context binding no vault, and "
+        "context naming that vault exactly, its Region segment matching the "
+        "key's Region as an ArnLike pattern: a wildcard resource or another "
+        "Region binds no vault, and a wildcard Region, as in the guide's "
+        "example, binds with the row naming every Region it matches. Under "
+        "StringEquals or ArnEquals a * or ? in the context or kms:ViaService "
+        "value is a literal character: a condition whose every value holds one "
+        "makes the statement bind nothing, and such a value beside a literal "
+        "one is dropped. The policy "
         "must not let every principal decrypt with no "
         "caller condition; an unread key policy is N/A. AC-34 adds the secret-scan "
         "leg over every definition that can carry a credential: GetAgentRuntime."
@@ -1067,7 +1074,9 @@ AI_SUBJECT_ROWS = [
         "whose every AssumeRole trust statement names no service principal and "
         "requires sts:RoleSessionName to equal the caller's ${aws:username} or "
         "${aws:userid}, and ${aws:PrincipalTag/<key>} on a role whose trust policy "
-        "requires session tag <key> on every AssumeRole statement, are credited, an "
+        "requires session tag <key> on every AssumeRole statement and, on every "
+        "sts:AssumeRole statement to a principal that is not federated, holds it to "
+        "the caller's ${aws:username} or ${aws:userid}, are credited, an "
         "unread trust policy is N/A, and the row names the "
         "variable. A bare Action "
         '"*", a NotAction and group policies count, a grant the principal\'s own Deny '
@@ -1337,7 +1346,12 @@ AI_SUBJECT_ROWS = [
         "policy allows kms:Decrypt with an encryption context naming that evaluator "
         "or batch evaluation in one account, with kms:ViaService for an evaluator, "
         "while a grant to the AgentCore service principal needs aws:SourceArn and an "
-        "open decrypt grant fails",
+        "open decrypt grant fails. Under StringEquals or ArnEquals a * or ? in the "
+        "context, kms:ViaService or aws:SourceArn value is a literal character: a "
+        "condition whose every value holds one makes the statement grant nothing, "
+        "such a value beside a literal one is dropped, and a service grant that "
+        "grants nothing is named as such and fails only when no other service "
+        "grant exists",
         [],
         4,
     ),

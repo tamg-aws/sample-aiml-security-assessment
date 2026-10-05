@@ -9226,9 +9226,42 @@ TOKEN_VAULT_CONTEXT_OPERATORS = (
     "stringlike",
 )
 
+# Under the equality operators a `*` or `?` is a literal character, not a
+# wildcard (reference_policies_elements_condition_operators.html).
+TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS = (
+    "arnequals",
+    "stringequals",
+    "stringequalsignorecase",
+)
+TOKEN_VAULT_CONTEXT_PATTERN_OPERATORS = ("arnlike", "stringlike")
 
-def _positive_condition_values(statement: Dict[str, Any], key: str) -> List[List[str]]:
-    """Return the lowercased value lists of each binding condition on `key`.
+
+def _matchable_condition_values(statement: Dict[str, Any], key: str) -> List[List[str]]:
+    """Return the lowercased value lists on `key` that can match a request:
+    each ArnLike or StringLike list whole, and each equality list without its
+    values holding a `*` or `?`, which are literal characters there and
+    equal no ARN. A list left empty is dropped; _equality_wildcard_conditions
+    names the statement such a list makes match nothing.
+    """
+    lists = _positive_condition_values(
+        statement, key, TOKEN_VAULT_CONTEXT_PATTERN_OPERATORS
+    )
+    for values in _positive_condition_values(
+        statement, key, TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS
+    ):
+        literal = [value for value in values if "*" not in value and "?" not in value]
+        if literal:
+            lists.append(literal)
+    return lists
+
+
+def _positive_condition_values(
+    statement: Dict[str, Any],
+    key: str,
+    operators: Iterable[str] = TOKEN_VAULT_CONTEXT_OPERATORS,
+) -> List[List[str]]:
+    """Return the lowercased value lists of each binding condition on `key`
+    under one of `operators`.
 
     IfExists and ForAllValues forms are true when the key is absent, so they
     bind nothing and are left out.
@@ -9243,7 +9276,7 @@ def _positive_condition_values(statement: Dict[str, Any], key: str) -> List[List
         name = str(operator).strip().lower()
         if name.startswith("forallvalues:") or name.endswith("ifexists"):
             continue
-        if _normalized_condition_operator(name) not in TOKEN_VAULT_CONTEXT_OPERATORS:
+        if _normalized_condition_operator(name) not in operators:
             continue
         for entry_key, raw in entries.items():
             if str(entry_key).strip().lower() == key:
@@ -9255,8 +9288,9 @@ def _positive_condition_values(statement: Dict[str, Any], key: str) -> List[List
 
 def _statement_binds_token_vault(
     statement: Dict[str, Any], vault_id: str, region: str
-) -> bool:
-    """Return whether one statement limits key use to this vault via Identity.
+) -> str:
+    """Return the Region segment through which one statement limits key use to
+    this vault via Identity, or an empty string when it does not.
 
     kms:ViaService has to name bedrock-agentcore-identity in the key's region;
     the documented `bedrock-agentcore-identity.*.amazonaws.com` is accepted
@@ -9264,9 +9298,19 @@ def _statement_binds_token_vault(
     The vault context has to name the bedrock-agentcore service and this
     vault's `token-vault/<id>` resource written out with no wildcard, as AC-12
     requires of a gateway context: `token-vault/*` lets every vault in the
-    account use the key. The account has to be either literal or held to the
-    caller's own account by aws:ResourceAccount equal to ${aws:PrincipalAccount}
-    in the same statement.
+    account use the key. The Region segment has to match the key's Region as
+    an ArnLike pattern: a vault in another Region is another vault, and an
+    empty segment matches no vault ARN. A wildcard segment such as the
+    guide's `*` binds, and is returned so the finding can say the context
+    names this vault id in every Region it matches. The account has to be
+    either literal or held to the caller's own account by aws:ResourceAccount
+    equal to ${aws:PrincipalAccount} in the same statement. Under StringEquals
+    or ArnEquals every segment is compared literally, so a `*` or `?` in any
+    of them never equals the vault's context and binds nothing: only
+    StringLike and ArnLike match patterns. The same holds for the
+    kms:ViaService value. Conditions are ANDed, so an equality condition whose
+    every value holds one makes the whole statement bind nothing, and a
+    wildcard value beside a literal one is dropped.
     """
     via_service = f"bedrock-agentcore-identity.{region}.amazonaws.com"
     if not any(
@@ -9276,7 +9320,7 @@ def _statement_binds_token_vault(
         )
         for values in _positive_condition_values(statement, "kms:viaservice")
     ):
-        return False
+        return ""
     account_held = _condition_pins_value(
         statement,
         "aws:resourceaccount",
@@ -9284,10 +9328,16 @@ def _statement_binds_token_vault(
         if_exists_counts=False,
     )
     target = f"token-vault/{vault_id}".lower()
-    for values in _positive_condition_values(
+    if any(
+        _equality_wildcard_conditions(statement, key)
+        for key in (TOKEN_VAULT_ENCRYPTION_CONTEXT_KEY, "kms:viaservice")
+    ):
+        return ""
+    for values in _matchable_condition_values(
         statement, TOKEN_VAULT_ENCRYPTION_CONTEXT_KEY
     ):
         bound = True
+        segments = set()
         for value in values:
             parts = value.split(":", 5)
             if len(parts) != 6:
@@ -9303,15 +9353,17 @@ def _statement_binds_token_vault(
                 parts[0] != "arn"
                 or any(wildcard in partition for wildcard in "*?")
                 or service != "bedrock-agentcore"
+                or not fnmatchcase(region.lower(), parts[3])
                 or not resource.startswith("token-vault/")
                 or resource != target
                 or not (account.isdigit() and len(account) == 12 or account_held)
             ):
                 bound = False
                 break
+            segments.add(parts[3])
         if bound:
-            return True
-    return False
+            return ", ".join(sorted(segments))
+    return ""
 
 
 def _token_vault_key_policy_gaps(
@@ -9333,7 +9385,8 @@ def _token_vault_key_policy_gaps(
             "has no statement allowing kms:Decrypt only with kms:ViaService "
             f"bedrock-agentcore-identity.{region}.amazonaws.com and "
             "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
-            f"token-vault-arn naming token-vault/{vault_id} in one account"
+            f"token-vault-arn naming token-vault/{vault_id} in a Region matching "
+            f"{region} in one account"
         )
     if _kms_key_policy_allows_open_decrypt(policy_document):
         gaps.append(
@@ -9583,6 +9636,20 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
                 )
             )
             continue
+        bound_regions = {
+            _statement_binds_token_vault(statement, vault_id, _arn_region(key_arn))
+            for statement in _document_statements(key_policy, effect="Allow")
+            if _statement_matches_action(statement, "kms:decrypt")
+        } - {""}
+        if any(not re.search(r"[*?]", segment) for segment in bound_regions):
+            vault_scope = "for this vault"
+        else:
+            vault_scope = (
+                f"with a token-vault-arn context naming token-vault/{vault_id} "
+                f"in any Region matching {' or '.join(sorted(bound_regions))} "
+                "of one account, the form of the AgentCore Identity guide's "
+                "example key policy"
+            )
         findings.append(
             create_finding(
                 check_id="AC-14",
@@ -9590,8 +9657,8 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
                 finding_details=(
                     f"{label} uses customer-managed KMS key {key_arn}, which "
                     "kms:DescribeKey reports as Enabled and whose key policy "
-                    "allows kms:Decrypt through AgentCore Identity for this "
-                    "vault. A statement granting kms:Decrypt with no condition, "
+                    "allows kms:Decrypt through AgentCore Identity "
+                    f"{vault_scope}. A statement granting kms:Decrypt with no condition, "
                     "such as the account-root kms:* statement, is not "
                     "subtracted."
                 ),
@@ -16530,9 +16597,12 @@ MEMORY_SESSION_VARIABLE_RULE = (
     "service principal and requires sts:RoleSessionName to equal "
     "${aws:username} or ${aws:userid} of the caller, and "
     "${aws:PrincipalTag/<key>} when every such statement requires session tag "
-    "<key> with a wildcard or variable value; any other variable, and any "
-    "variable on an IAM user, names something every caller of the principal "
-    "shares."
+    "<key> with a wildcard or variable value and every statement granting "
+    "sts:AssumeRole to a principal that is not federated, which passes its "
+    "own tags, requires the tag value to carry ${aws:username} or "
+    "${aws:userid} of the caller with no wildcard; any other variable, and "
+    "any variable on an IAM user, names something every caller of the "
+    "principal shares."
 )
 
 MEMORY_ASSUME_ROLE_ACTIONS = (
@@ -16629,6 +16699,69 @@ def _trust_binds_session_name(document: Any) -> str:
     return ""
 
 
+def _trust_lets_caller_choose_session_tag(document: Any, tag_key: str) -> bool:
+    """Whether a statement granting sts:AssumeRole to a principal that is not
+    federated leaves the value of session tag `tag_key` to the caller.
+
+    On sts:AssumeRole the caller passes its own session tags, so a Null
+    `false` test or a wildcard value lets it pick any value, another caller's
+    included. Only a StringEquals or StringLike test (no IfExists form, no
+    ForAllValues prefix) whose every value carries ${aws:username} or
+    ${aws:userid}, with no `*` or `?` outside the variable under StringLike,
+    holds the tag to that caller. A SAML or web identity provider sets the
+    tags of the federated calls, which _trust_requires_session_tag judges.
+    """
+    request_key = f"aws:requesttag/{tag_key.lower()}"
+    for statement in _trust_granting_statements(document):
+        principal = statement.get("Principal")
+        if isinstance(principal, dict) and set(principal) == {"Federated"}:
+            continue
+        if not (
+            ("Action" not in statement and "NotAction" in statement)
+            or any(
+                _action_patterns_overlap(pattern, "sts:AssumeRole")
+                for pattern in _statement_actions(statement)
+            )
+        ):
+            continue
+        conditions = statement.get("Condition")
+        held = False
+        for operator, block in (
+            conditions.items() if isinstance(conditions, dict) else []
+        ):
+            if _operator_admits_an_absent_key(operator):
+                continue
+            name = _normalized_condition_operator(operator)
+            if name not in CONDITION_EQUALS_OPERATORS or not isinstance(block, dict):
+                continue
+            for key, raw in block.items():
+                if str(key).strip().lower() != request_key:
+                    continue
+                tag_values = _condition_values(raw)
+                held = (
+                    held
+                    or bool(tag_values)
+                    and all(
+                        any(
+                            caller.lower() in MEMORY_CALLER_NAME_VARIABLES
+                            for caller in _memory_value_variables(tag_value)
+                        )
+                        and not (
+                            name == "stringlike"
+                            and bool(
+                                re.search(
+                                    r"[*?]", re.sub(r"\$\{[^}]*\}", "", tag_value)
+                                )
+                            )
+                        )
+                        for tag_value in tag_values
+                    )
+                )
+        if not held:
+            return True
+    return False
+
+
 def _trust_requires_session_tag(document: Any, tag_key: str) -> bool:
     """Whether every Allow statement of a trust policy that grants an AssumeRole
     action requires session tag `tag_key` with a value that differs per session.
@@ -16685,7 +16818,8 @@ def _memory_shared_variables(
     role's trust policy makes every caller name the session after itself
     (_trust_binds_session_name), and aws:PrincipalTag/<key> when it requires
     session tag <key> on every statement that grants an AssumeRole action
-    (_trust_requires_session_tag). Every other variable, and every variable on
+    (_trust_requires_session_tag) and no sts:AssumeRole caller picks its value
+    (_trust_lets_caller_choose_session_tag). Every other variable, and every variable on
     an IAM user, names something every caller of the principal shares. Each
     shared entry is a note naming the variable and why it is shared.
     """
@@ -16726,6 +16860,14 @@ def _memory_shared_variables(
                 document, variable[len(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX) :]
             ):
                 reason = "which every caller of the role shares"
+            elif _trust_lets_caller_choose_session_tag(
+                document, variable[len(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX) :]
+            ):
+                reason = (
+                    "whose trust policy does not hold the session tag to the "
+                    "sts:AssumeRole caller's ${aws:username} or ${aws:userid}, "
+                    "so the caller may choose its value"
+                )
             else:
                 reason = ""
         except (TypeError, ValueError) as error:
@@ -32330,10 +32472,17 @@ def _statement_names_evaluation_resource(
     literal partition and a literal account, and has to match `resource_arn`,
     so the documented `evaluator/*` and `batch-evaluate/*` patterns count and a
     pattern open in the account segment does not. With no `resource_arn`, any
-    bedrock-agentcore ARN in a literal partition and account counts.
+    bedrock-agentcore ARN in a literal partition and account counts. Under
+    StringEquals, StringEqualsIgnoreCase or ArnEquals a `*` or `?` is a literal
+    character that equals no resource ARN, and conditions are ANDed, so an
+    equality condition whose every value holds one names nothing, and a
+    wildcard value beside a literal one is dropped; only ArnLike and
+    StringLike values match as patterns.
     """
     target = (resource_arn or "").lower()
-    for values in _positive_condition_values(statement, key):
+    if _equality_wildcard_conditions(statement, key):
+        return False
+    for values in _matchable_condition_values(statement, key):
         bound = True
         for value in values:
             parts = value.split(":", 5)
@@ -32356,6 +32505,37 @@ def _statement_names_evaluation_resource(
     return False
 
 
+def _equality_wildcard_conditions(
+    statement: Dict[str, Any], key: str
+) -> List[Tuple[str, str]]:
+    """Return (operator, value) for the values on `key` of each StringEquals,
+    StringEqualsIgnoreCase or ArnEquals condition whose every value holds a
+    `*` or `?`. Either is a literal character under those operators, so such a
+    condition, and with it the statement, matches no request; a literal value
+    beside a wildcard one still matches. IfExists and ForAllValues forms are
+    left out, as _positive_condition_values leaves them out.
+    """
+    condition = statement.get("Condition")
+    found: List[Tuple[str, str]] = []
+    for operator, entries in condition.items() if isinstance(condition, dict) else []:
+        name = str(operator).strip().lower()
+        if not isinstance(entries, dict) or (
+            name.startswith("forallvalues:") or name.endswith("ifexists")
+        ):
+            continue
+        if _normalized_condition_operator(name) not in (
+            TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS
+        ):
+            continue
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != key:
+                continue
+            values = [value.strip() for value in _condition_values(raw)]
+            if values and all("*" in value or "?" in value for value in values):
+                found.extend((str(operator).strip(), value) for value in values)
+    return found
+
+
 def _evaluation_key_policy_gaps(
     policy_document: Any, resource_arn: str, key_arn: str, batch: bool
 ) -> List[str]:
@@ -32368,7 +32548,11 @@ def _evaluation_key_policy_gaps(
     to the bedrock-agentcore service principal reaching kms:Decrypt needs an
     aws:SourceArn naming bedrock-agentcore resources in one account, so the
     batch statement of a key shared with evaluators does not fail the
-    evaluator. A statement granting
+    evaluator. Under StringEquals, StringEqualsIgnoreCase or ArnEquals a `*`
+    or `?` in kms:ViaService or aws:SourceArn is a literal character, so that
+    statement grants nothing: it credits no caller leg, and a service
+    statement whose aws:SourceArn is such a value is named as granting no
+    decrypt rather than as an open grant. A statement granting
     kms:Decrypt with no condition, such as the account-root kms:* statement, is
     not subtracted.
     """
@@ -32392,7 +32576,8 @@ def _evaluation_key_policy_gaps(
         )
         and (
             batch
-            or any(
+            or not _equality_wildcard_conditions(statement, "kms:viaservice")
+            and any(
                 all(
                     value in (via_service, "bedrock-agentcore.*.amazonaws.com")
                     for value in values
@@ -32407,16 +32592,48 @@ def _evaluation_key_policy_gaps(
             + ("" if batch else f"kms:ViaService {via_service} and ")
             + f"{context_name} naming {resource_arn} in one account"
         )
-    if any(
-        AGENTCORE_SERVICE_PRINCIPAL
+    service_grants = [
+        statement
+        for statement in allows
+        if AGENTCORE_SERVICE_PRINCIPAL
         in [principal.lower() for principal in _statement_principals(statement)]
         and _statement_matches_action(statement, "kms:decrypt")
-        and not _statement_names_evaluation_resource(statement, "aws:sourcearn")
-        for statement in allows
+    ]
+    dead_grants = [
+        (statement, _equality_wildcard_conditions(statement, "aws:sourcearn"))
+        for statement in service_grants
+    ]
+    dead_grants = [(statement, found) for statement, found in dead_grants if found]
+    live_grants = [
+        statement
+        for statement in service_grants
+        if all(statement is not dead for dead, _ in dead_grants)
+    ]
+    if any(
+        not _statement_names_evaluation_resource(statement, "aws:sourcearn")
+        for statement in live_grants
     ):
         gaps.append(
             f"lets {AGENTCORE_SERVICE_PRINCIPAL} decrypt with no aws:SourceArn "
             "naming bedrock-agentcore resources in one account"
+        )
+    elif dead_grants and not live_grants:
+        named = [
+            (
+                f"statement {statement['Sid']}"
+                if isinstance(statement.get("Sid"), str) and statement["Sid"]
+                else "a statement"
+            )
+            + f" to {AGENTCORE_SERVICE_PRINCIPAL} conditions aws:SourceArn with "
+            + " and ".join(f"{operator} on {value}" for operator, value in found)
+            for statement, found in dead_grants
+        ]
+        gaps.append(
+            f"holds {'; '.join(named)}, a value containing * or ?, which is a "
+            "literal character under that operator, so the statement matches no "
+            "request and grants no decrypt, and no other statement to "
+            f"{AGENTCORE_SERVICE_PRINCIPAL} names bedrock-agentcore resources in "
+            "one account in aws:SourceArn"
         )
     if _kms_key_policy_allows_open_decrypt(policy_document):
         gaps.append(
