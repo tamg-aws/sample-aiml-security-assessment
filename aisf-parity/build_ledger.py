@@ -368,10 +368,15 @@ AI_SUBJECT_ROWS = [
         ["BR-42"],
         "BR-42 fails each cached role or user whose bedrock:InvokeModel, "
         "bedrock:InvokeModelWithResponseStream or bedrock-mantle:CreateInference "
-        "grant reaches every model, judges the service control policy leg, and "
+        "grant reaches a model it does not name, judges the service control "
+        "policy leg, and "
         "fails the management account, which service control policies never "
         "restrict. An identity policy document that cannot be parsed is named on an"
-        " N/A row and holds the would-be Passed row at N/A",
+        " N/A row and holds the would-be Passed row at N/A. An Allow whose every "
+        "Resource can match no model ARN, such as agent-alias/* or "
+        "knowledge-base/*, is not counted as a model grant, and the finding "
+        "claims every model in the account only for a Resource that matches "
+        "every model resource type",
         [],
         3,
     ),
@@ -405,7 +410,20 @@ AI_SUBJECT_ROWS = [
         [],
         3,
     ),
-    ("AIR-BDR-MDL-09", COVERED, None, "bedrock_assessments", ["BR-45"], "", [], 3),
+    (
+        "AIR-BDR-MDL-09",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-45"],
+        "BR-45 reads the LONG_TERM bearer token Deny from the attached service "
+        "control policies and from the identity policies and permissions boundary "
+        "of each IAM user holding an active key, credits the IAM leg only when "
+        "every holder carries it on both endpoints, names the holders without it "
+        "when it fails, and holds the row at N/A while a holder is unread",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-KB-05",
         COVERED,
@@ -1813,7 +1831,13 @@ AI_SUBJECT_ROWS = [
         "fails, and a Region where nothing applies a guardrail fails. A logged "
         "invocation whose CloudTrail event names no guardrail fails by requestId, "
         "unless an un-narrowed account-enforced configuration applies a guardrail "
-        "that screens the input; when that guardrail is unread it is N/A",
+        "that screens the input; when that guardrail is unread it is N/A. Every "
+        "InvokeModel, InvokeModelWithResponseStream, Converse and ConverseStream "
+        "call BR-34 reads from the invocation log is joined to its CloudTrail "
+        "event, the ones BR-27 and BR-34 did not join included. A capped or "
+        "failed read of those records, an unread logging configuration, a call "
+        "with no request ID and a call the LookupEvents page cap left unmatched "
+        "each hold Passed at N/A, named or counted",
         [],
         5,
     ),
@@ -2938,6 +2962,15 @@ FOUNDATION_ROWS = [
         "value in its cached policies or permissions boundary covers every AI "
         "service it grants; a covered one is named and keeps the row at N/A, "
         "because whether the provider sets that tag only after MFA is not read. "
+        "The PrincipalTag Deny is credited under StringNotEquals, "
+        "StringNotEqualsIgnoreCase or StringNotLike, their IfExists forms and a "
+        "ForAllValues: prefix, each true on an untagged session; ForAnyValue: is "
+        "false there and is not credited. An MFA or PrincipalTag Deny in a service "
+        "control policy attached to the account's path (organizations:ListPolicies, "
+        "ListTargetsForPolicy, ListParents) is credited as one in the identity's "
+        "own policies, except in the management account, which service control "
+        "policies do not restrict; while an attached policy is unread, a user, "
+        "role or permission set no Deny holds is N/A, not Failed. "
         "With an instance visible, an AWSReservedSSO_ role is judged through its "
         "permission set. That row "
         "names each permission set whose inline or AWS managed policies grant an "

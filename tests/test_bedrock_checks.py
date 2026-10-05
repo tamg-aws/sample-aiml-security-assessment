@@ -12806,7 +12806,7 @@ class TestBR42ModelAllowList:
         assert set(failed) == {"ModelIdRole", "NegatedModelIdRole"}
         assert "bedrock:modelid" in failed["ModelIdRole"]
         assert "never matches" in failed["ModelIdRole"]
-        assert "can invoke any foundation model" not in failed["ModelIdRole"]
+        assert "can invoke models not named one by one" not in failed["ModelIdRole"]
         assert "every model available in the account" in failed["NegatedModelIdRole"]
 
     def test_br42_model_arn_condition_with_a_wildcard_value_is_not_scoping(self):
@@ -13131,6 +13131,157 @@ class TestBR42ModelAllowList:
         passed = [f for f in findings if f["Status"] == "Passed"]
         assert len(passed) == 1
         assert "MantleScopedRole" in passed[0]["Finding_Details"]
+
+    # MDL-01: an Allow on a resource that cannot be a model, such as an agent
+    # alias or a knowledge base, was failed as a grant on every model.
+    def test_br42_an_allow_on_a_non_model_resource_is_not_a_model_grant(self):
+        alias = "arn:aws:bedrock:*:*:agent-alias/*"
+        knowledge_base = "arn:aws:bedrock:us-east-1:123456789012:knowledge-base/*"
+        result = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "AgentRole": [
+                        ("A", _allow("bedrock:Invoke*", [alias, knowledge_base]))
+                    ],
+                    "AsyncRole": [
+                        (
+                            "J",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*:*:async-invoke/*",
+                            ),
+                        )
+                    ],
+                    "ModelRole": [
+                        (
+                            "M",
+                            _allow(
+                                "bedrock:Invoke*",
+                                [alias, "arn:aws:bedrock:*::foundation-model/*"],
+                            ),
+                        )
+                    ],
+                }
+            ),
+            region="Global",
+            training_data=self.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert result["invocation_open"] == ["role 'ModelRole'"]
+        # An identity that can invoke no model is not in any row, Passed or not.
+        every_text = " ".join(f["Finding_Details"] for f in extract_csv_data(result))
+        assert "AgentRole" not in every_text
+        assert "AsyncRole" not in every_text
+        failed_text = self._failed_text(extract_csv_data(result))
+        assert "agent-alias" not in failed_text
+        assert (
+            "it allows bedrock:invokemodel on arn:aws:bedrock:*::foundation-model/*, "
+            "so every model those patterns match can be invoked without being named"
+        ) in failed_text
+        assert "every model available in the account" not in failed_text
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:bedrock:*:*:*",
+            "arn:aws:bedrock:*",
+            "arn:aws:bedrock:us-east-1:123456789012:${aws:username}",
+            "arn:*:bedrock:*:*:inference-profile/*",
+        ],
+    )
+    def test_br42_a_wildcard_that_can_match_a_model_still_widens(self, resource):
+        findings = self._run(
+            _identity_cache(
+                roles={"WideRole": [("W", _allow("bedrock:InvokeModel", resource))]}
+            )
+        )
+        assert "Role 'WideRole'" in self._failed_text(findings)
+
+    def test_br42_only_a_resource_on_every_model_claims_every_model(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "AllRole": [
+                        ("A", _allow("bedrock:InvokeModel", "arn:aws:bedrock:*"))
+                    ],
+                    "ProfileRole": [
+                        (
+                            "P",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*:*:inference-profile/*",
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+        rows = {
+            name: f["Finding_Details"]
+            for f in findings
+            for name in ("AllRole", "ProfileRole")
+            if f"Role '{name}'" in f["Finding_Details"]
+        }
+        assert "every model available in the account can be invoked" in rows["AllRole"]
+        assert "every model those patterns match" in rows["ProfileRole"]
+        assert "every model available in the account" not in rows["ProfileRole"]
+
+    def test_br42_the_stream_action_on_a_project_reaches_no_model(self):
+        # bedrock:InvokeModelWithResponseStream names no project resource type.
+        project = "arn:aws:bedrock:us-east-1:123456789012:project/*"
+        result = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "StreamRole": [
+                        ("S", _allow("bedrock:InvokeModelWithResponseStream", project))
+                    ],
+                    "InvokeRole": [("I", _allow("bedrock:InvokeModel", project))],
+                }
+            ),
+            region="Global",
+            training_data=self.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert result["invocation_open"] == ["role 'InvokeRole'"]
+
+    def test_br42_a_mantle_allow_on_a_non_project_resource_is_not_counted(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "MantleOtherRole": [
+                        (
+                            "MO",
+                            _allow(
+                                "bedrock-mantle:CreateInference",
+                                [
+                                    "arn:aws:bedrock:*:*:agent-alias/*",
+                                    "arn:aws:bedrock-mantle:*:*:customization/*",
+                                ],
+                            ),
+                        )
+                    ],
+                    "MantleProjectRole": [
+                        (
+                            "MP",
+                            _allow(
+                                "bedrock-mantle:CreateInference",
+                                [
+                                    "arn:aws:bedrock:*:*:agent-alias/*",
+                                    "arn:aws:bedrock-mantle:*:*:project/*",
+                                ],
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+        failed_text = self._failed_text(findings)
+        assert "MantleOtherRole" not in failed_text
+        assert "Role 'MantleProjectRole'" in failed_text
+        assert (
+            "allows bedrock-mantle:CreateInference on "
+            "arn:aws:bedrock-mantle:*:*:project/* with no"
+        ) in failed_text
 
     def test_br42_training_data_reached_through_a_bucket_wildcard_fails(self):
         training = {
@@ -15936,10 +16087,46 @@ class TestBR44MarketplaceModelControl:
         details = findings[0]["Finding_Details"]
         assert "role 'Guarded'" in details
         assert bedrock_app.MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE in details
-        assert "role 'Invoker' can invoke any model" in details
+        assert "role 'Invoker' can invoke a model outside named ARNs" in details
         assert "no attached service control policy denies invoking" in details
         assert findings[0]["Severity"] == "High"
         assert "bedrock:InvokeModel" in findings[0]["Resolution"]
+
+    # MDL-04: BR-44 read BR-42's invocation_open, which listed an identity whose
+    # only invoke grant was on an agent alias.
+    def test_br44_an_invoke_grant_on_an_agent_alias_does_not_open_invocation(self):
+        cache = _identity_cache(
+            roles={
+                "AgentInvoker": [
+                    (
+                        "A",
+                        _allow("bedrock:Invoke*", "arn:aws:bedrock:*:*:agent-alias/*"),
+                    )
+                ],
+                "ModelInvoker": [
+                    (
+                        "M",
+                        _allow(
+                            "bedrock:InvokeModel",
+                            "arn:aws:bedrock:*::foundation-model/*",
+                        ),
+                    )
+                ],
+            }
+        )
+        allow_list = bedrock_app.check_bedrock_model_allow_list(
+            cache,
+            region="Global",
+            training_data=TestBR42ModelAllowList.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        findings = self._run(
+            self._deny_only_cache(),
+            **{**self.OPEN_BR42, "allow_list_findings": allow_list},
+        )
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "role 'ModelInvoker' can invoke a model outside named ARNs" in details
+        assert "AgentInvoker" not in details
 
     @pytest.mark.parametrize(
         "leg, blocked",
@@ -17034,6 +17221,153 @@ class TestBR45ApiKeyGovernance:
         assert [f["Status"] for f in prevention] == ["Passed"]
         assert "schema version 2" in prevention[0]["Finding_Details"]
 
+    # MDL-09: the LONG_TERM token leg was read from service control policies
+    # only, so key holders that each carried their own Deny were failed with
+    # "so a long-term key can be used".
+    ACTIVE_KEY = [
+        {
+            "ServiceSpecificCredentialId": "ACCA-key",
+            "Status": "Active",
+            "CreateDate": "2026-09-01T00:00:00Z",
+            "ExpirationDate": "2026-09-30T00:00:00Z",
+        }
+    ]
+
+    def _token_policy(self, *denies):
+        return {
+            "Version": "2012-10-17",
+            "Statement": list(denies or self._token_denies()),
+        }
+
+    def _holders_run(self, cache, holders, all_users=True, inventory=None):
+        _, findings = self._run(
+            {name: list(self.ACTIVE_KEY) for name in holders},
+            inventory=inventory or self._scp_items(self._if_exists_cap()),
+            all_users=all_users,
+            cache=cache,
+        )
+        return self._by_name(findings, self.PREVENTION_FINDING)
+
+    def test_br45_a_token_deny_on_every_key_holder_is_credited(self):
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Bob": [],
+                "Reader": [],
+            }
+        )
+        cache["user_permissions"]["Bob"]["permissions_boundary"] = {
+            "document": self._token_policy()
+        }
+        prevention = self._holders_run(cache, ["Alice", "Bob"])
+
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        details = prevention[0]["Finding_Details"]
+        assert "each of the 2 IAM user(s) holding an active key" in details
+        assert "user 'Alice', user 'Bob'" in details
+        assert "Reader" not in details
+        assert "schema version 2" in details
+
+    def test_br45_a_key_holder_without_the_token_deny_is_named_in_the_failure(self):
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Bob": [("BedrockOnly", self._token_policy(self._token_denies()[0]))],
+                "Carol": [],
+            }
+        )
+        prevention = self._holders_run(cache, ["Alice", "Bob", "Carol"])
+
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        details = prevention[0]["Finding_Details"]
+        assert (
+            "nor does one in the own policies or permissions boundary of user 'Bob' "
+            "(only bedrock:callwithbearertoken is denied), user 'Carol', so the "
+            "long-term keys of those user(s) can be used"
+        ) in details
+        assert "Alice" not in details
+        assert "so a long-term key can be used" not in details
+
+    def test_br45_an_inactive_key_holder_needs_no_token_deny(self):
+        cache = _identity_cache(
+            users={"Alice": [("NoLongTerm", self._token_policy())], "Dormant": []}
+        )
+        _, findings = self._run(
+            {
+                "Alice": list(self.ACTIVE_KEY),
+                "Dormant": [dict(self.ACTIVE_KEY[0], Status="Inactive")],
+            },
+            inventory=self._scp_items(self._if_exists_cap()),
+            all_users=True,
+            cache=cache,
+        )
+        prevention = self._by_name(findings, self.PREVENTION_FINDING)
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        assert "Dormant" not in prevention[0]["Finding_Details"]
+
+    def test_br45_no_key_holder_is_not_an_identity_token_deny(self):
+        cache = _identity_cache(users={"Alice": [("NoLongTerm", self._token_policy())]})
+        prevention = self._holders_run(cache, [])
+
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert "so a long-term key can be used" in prevention[0]["Finding_Details"]
+
+    def test_br45_a_key_holder_outside_the_cache_holds_the_token_leg_at_na(self):
+        cache = _identity_cache(users={"Alice": [("NoLongTerm", self._token_policy())]})
+        prevention = self._holders_run(cache, ["Alice", "Ghost"])
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        details = prevention[0]["Finding_Details"]
+        assert "user 'Ghost' (not read into the IAM permissions cache)" in details
+        assert "can be used" not in details
+
+    def test_br45_a_key_holder_with_a_cache_error_holds_the_token_leg_at_na(self):
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Bob": [("NoLongTerm", self._token_policy())],
+            }
+        )
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "user",
+                "name": "Bob",
+                "stage": "group_policy",
+                "error": "Throttling",
+            }
+        ]
+        prevention = self._holders_run(cache, ["Alice", "Bob"])
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "user 'Bob' (not read into" in prevention[0]["Finding_Details"]
+
+    def test_br45_key_holders_listed_from_the_cache_only_hold_the_token_leg_at_na(
+        self,
+    ):
+        cache = _identity_cache(users={"Alice": [("NoLongTerm", self._token_policy())]})
+        prevention = self._holders_run(cache, ["Alice"], all_users=False)
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "the key holders were not all listed" in prevention[0]["Finding_Details"]
+
+    def test_br45_an_unread_token_leg_in_the_management_account_is_na(self):
+        creator = {
+            "Version": "2012-10-17",
+            "Statement": [
+                self.CREATE_KEYS["Statement"][0],
+                self._if_exists_cap(sid="OwnCap"),
+                *self._token_denies(),
+            ],
+        }
+        cache = _identity_cache(users={"Alice": [("Keys", creator)]})
+        inventory = self._scp_items(*self._token_denies())
+        inventory["management_account"] = True
+        prevention = self._holders_run(cache, ["Alice", "Ghost"], inventory=inventory)
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "user 'Ghost'" in prevention[0]["Finding_Details"]
+
     def test_br45_management_account_is_not_credited(self):
         inventory = self._scp_items(
             self._deny(
@@ -17851,14 +18185,64 @@ class TestBR46PromptPiiScreening:
         }
     }
 
-    def _run(self, guardrails=(), details=None, versions=None, joins=None, errors=()):
+    @staticmethod
+    def _log(calls=(), unread=(), logging=True, reason=None):
+        """BR-34's record of the invocation log: the calls it read, as
+        (request ID, operation) pairs, and the reads that failed."""
+        return {
+            "where": "/aws/bedrock/model-invocation-logs" if logging else None,
+            "logging": logging,
+            "reason": reason,
+            "calls": [
+                {
+                    "label": f"{request_id} ({operation} anthropic.test)",
+                    "request_id": request_id,
+                    "operation": operation,
+                    "time": (_dt.now(_tz.utc) - _td(hours=1)).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+                for request_id, operation in calls
+            ],
+            "unread": list(unread),
+        }
+
+    def _run(
+        self,
+        guardrails=(),
+        details=None,
+        versions=None,
+        joins=None,
+        errors=(),
+        trail=None,
+    ):
         """
         ``guardrails`` are the ListGuardrails ids, ``details`` maps an id or an
         (id, version) pair to a GetGuardrail answer or an exception, and
-        ``versions`` is the attachment inventory's versions map.
+        ``versions`` is the attachment inventory's versions map. ``joins``
+        without a "log" gets a log read in full that holds no call BR-27 and
+        BR-34 left unjoined. ``trail`` maps an event name to the CloudTrail
+        events LookupEvents returns for it.
         """
         details = details or {}
+        joins = {"resolved": {}} if joins is None else joins
+        joins = {**joins, "resolved": dict(joins.get("resolved") or {})}
+        joins.setdefault("log", self._log())
+        joins.setdefault("pages", 0)
         client = MagicMock()
+        self.lookups = []
+
+        def lookup_events(LookupAttributes, **kwargs):
+            name = LookupAttributes[0]["AttributeValue"]
+            self.lookups.append(name)
+            return {
+                "Events": [
+                    {"CloudTrailEvent": json.dumps(event)}
+                    for event in (trail or {}).get(name, [])
+                ]
+            }
+
+        client.lookup_events.side_effect = lookup_events
         client.list_guardrails.return_value = {
             "guardrails": [{"id": gid, "name": f"name-{gid}"} for gid in guardrails]
         }
@@ -18121,6 +18505,155 @@ class TestBR46PromptPiiScreening:
         (na,) = self._status(findings, "N/A")
         assert "2 guardrail(s) from 'name-g1' on" in na["Finding_Details"]
         assert bedrock_app.DEADLINE_STOP in na["Finding_Details"]
+
+    AGENT_SCREENS = {
+        ("g1", "1"): {
+            "surfaces": ["agent 'a' version 1"],
+            "narrowings": {},
+            "detail": INPUT_PII,
+            "error": "",
+            "region": "us-east-1",
+        }
+    }
+
+    def test_br46_prompt_an_unjoined_logged_invoke_call_is_joined_and_judged(self):
+        """BR-27 and BR-34 join no InvokeModel call without a guardrailAction,
+        so the leg joins every logged call they left: the one whose event names
+        no guardrail fails and the guarded one is credited."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={
+                "resolved": {},
+                "log": self._log(
+                    calls=[
+                        ("req-7", "InvokeModel"),
+                        ("req-8", "InvokeModelWithResponseStream"),
+                    ]
+                ),
+            },
+            trail={
+                "InvokeModel": [
+                    {"requestID": "req-7", "requestParameters": {"modelId": "m"}}
+                ],
+                "InvokeModelWithResponseStream": [
+                    {
+                        "requestID": "req-8",
+                        "requestParameters": {
+                            "modelId": "m",
+                            "guardrailIdentifier": "g1",
+                            "guardrailVersion": "1",
+                        },
+                    }
+                ],
+            },
+        )
+        assert sorted(self.lookups) == ["InvokeModel", "InvokeModelWithResponseStream"]
+        (failed,) = self._status(findings, "Failed")
+        assert "1 logged invocation(s) in us-east-1" in failed["Finding_Details"]
+        assert "req-7" in failed["Finding_Details"]
+        assert "req-8" not in failed["Finding_Details"]
+        (passed,) = self._status(findings, "Passed")
+        assert "logged invocation req-8" in passed["Finding_Details"]
+
+    def test_br46_prompt_a_call_joined_before_is_not_looked_up_again(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            joins={
+                "resolved": {"req-1": {"guardrail": "g1", "version": "1"}},
+                "log": self._log(calls=[("req-1", "Converse")]),
+            },
+        )
+        assert self.lookups == []
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "log, named",
+        [
+            (
+                {
+                    "unread": [
+                        "records matching an InvokeModel operation in lg past the "
+                        "first 250 (page cap; those logged from "
+                        "2026-10-04T01:00:00Z on were not all read)"
+                    ]
+                },
+                "records matching an InvokeModel operation in lg past the first 250",
+            ),
+            (
+                {
+                    "logging": None,
+                    "reason": "the invocation logging configuration was not read "
+                    "(bedrock:GetModelInvocationLoggingConfiguration, AccessDenied)",
+                },
+                "the invocation log: the invocation logging configuration was not read",
+            ),
+            (None, "no invocation log scan was shared with this leg"),
+        ],
+    )
+    def test_br46_prompt_an_unread_invocation_log_holds_passed_at_na(self, log, named):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={"resolved": {}, "log": None if log is None else self._log(**log)},
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert named in findings[0]["Finding_Details"]
+        assert "guardrail g1 version 1" in findings[0]["Finding_Details"]
+
+    def test_br46_prompt_a_join_past_the_page_cap_holds_passed_at_na(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={"resolved": {"req-5": {"capped": True}}},
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "1 logged invocation(s) were not matched to CloudTrail within the "
+            "LookupEvents page cap (50 pages per operation, 100 per region run)"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br46_prompt_a_logged_call_with_no_request_id_is_na(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={"resolved": {}, "log": self._log(calls=[(None, "InvokeModel")])},
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "1 logged call(s) that log no request ID to join to CloudTrail"
+            in findings[0]["Finding_Details"]
+        )
+        assert self.lookups == []
+
+    def test_br46_prompt_no_text_logging_is_named_in_the_passed_text(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={
+                "resolved": {},
+                "log": self._log(
+                    logging=False,
+                    reason="invocation logging does not deliver text "
+                    "(textDataDeliveryEnabled is False), so no request or "
+                    "response body is logged",
+                ),
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "No invocation log is read in us-east-1: invocation logging does not "
+            "deliver text (textDataDeliveryEnabled is False), so no request or "
+            "response body is logged, so a call whose request names no guardrail "
+            "is not seen." in findings[0]["Finding_Details"]
+        )
 
     def test_br46_prompt_list_failure_is_na(self):
         client_error = _make_client_error("AccessDeniedException")
@@ -34393,8 +34926,10 @@ class TestBR51AIUserConsoleMFA:
         role_trust=None,
         abac=None,
         set_names=None,
+        scp_inventory=None,
     ):
-        """`set_names` maps a permission set to the Name DescribePermissionSet
+        """`scp_inventory` is the attached service control policies read, by
+        default none attached and every read clean. `set_names` maps a permission set to the Name DescribePermissionSet
         returns, or an exception it raises; by default the ARN's last segment.
         `abac` is the DescribeInstanceAccessControlAttributeConfiguration
         response, or an exception it raises. `managed` maps a permission set to the AWS managed policy ARNs
@@ -34526,7 +35061,11 @@ class TestBR51AIUserConsoleMFA:
         self.iam = iam
         with patch("boto3.client", side_effect=client):
             result = bedrock_app.check_bedrock_ai_user_console_mfa(
-                cache, region="Global", identity_center_region="eu-west-1"
+                cache,
+                region="Global",
+                identity_center_region="eu-west-1",
+                scp_inventory=scp_inventory
+                or {"items": [], "errors": [], "list_error": None},
             )
         return result, extract_csv_data(result)
 
@@ -34638,7 +35177,7 @@ class TestBR51AIUserConsoleMFA:
             {"Effect": "Allow", "Principal": {"Federated": provider}, "Action": action}
         )
 
-    def _run_federated(self, roles, instances=None):
+    def _run_federated(self, roles, instances=None, **kwargs):
         """``roles`` maps a role name to (provider, action, statements)."""
         cache = _ai_user_cache()
         for role, (_, _, statements) in roles.items():
@@ -34655,6 +35194,7 @@ class TestBR51AIUserConsoleMFA:
                 role: self._federated_trust(provider, action)
                 for role, (provider, action, _) in roles.items()
             },
+            **kwargs,
         )
         return rows
 
@@ -35132,7 +35672,9 @@ class TestBR51AIUserConsoleMFA:
 
     def test_br51_principal_tag_deny_forms_that_do_not_fire_are_not_credited(self):
         forms = {
-            "ifexists": self._tag_deny(operator="StringNotEqualsIfExists"),
+            "set_ifexists": self._tag_deny(
+                operator="ForAnyValue:StringNotEqualsIfExists"
+            ),
             "set": self._tag_deny(operator="ForAnyValue:StringNotEquals"),
             "equals": self._tag_deny(operator="StringEquals"),
             "resource": self._tag_deny(Resource="arn:aws:bedrock:*:*:agent/*"),
@@ -35159,6 +35701,64 @@ class TestBR51AIUserConsoleMFA:
         assert len(failed) == len(forms)
         for arn in sets:
             assert sum(arn + " " in text for text in failed) == 1, arn
+
+    @pytest.mark.parametrize(
+        "operator",
+        [
+            "StringNotEqualsIfExists",
+            "StringNotEqualsIgnoreCaseIfExists",
+            "StringNotLikeIfExists",
+            "ForAllValues:StringNotEquals",
+        ],
+    )
+    def test_br51_a_principal_tag_deny_true_on_an_absent_tag_is_credited(
+        self, operator
+    ):
+        """An IfExists or ForAllValues: negated test is true on an untagged
+        session, so it denies it as the plain form does; the set without the
+        Deny beside it still fails."""
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(self._tag_deny(operator=operator)),
+                self.PS_LATE: self._grant_with(),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert self.PS_LATE in rows[1]["Finding_Details"]
+        assert self.PS_WRITE not in rows[1]["Finding_Details"]
+        assert "1 of them carry" in rows[0]["Finding_Details"]
+        assert (
+            f"{self.PS_WRITE} (bedrock): {operator} aws:PrincipalTag/authn mfa"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br51_a_scp_tag_deny_holds_a_permission_set_in_this_account_only(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(),
+                self.PS_LATE: self._grant_with(actions=("sagemaker:CreateEndpoint",)),
+            },
+            scp_inventory=TestBR51AIUserConsoleMFA._scps(
+                self._tag_deny(actions=("bedrock:*",))
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A", "Failed"]
+        held = rows[1]["Finding_Details"]
+        assert self.PS_WRITE in held
+        assert (
+            "The service control policies attached to this account deny them "
+            "(StringNotEquals aws:PrincipalTag/authn mfa in service control policy "
+            "'RequireMfa'), which holds the set's sessions in this account only" in held
+        )
+        failed = rows[2]["Finding_Details"]
+        assert self.PS_LATE in failed
+        assert (
+            "nor does one in the 1 service control policy attached to this account "
+            "over sagemaker, so a session that did not complete MFA is not denied"
+            in failed
+        )
 
     def test_br51_deny_over_one_service_fails_the_other_it_grants(self):
         _, rows = self._run_sets(
@@ -35785,7 +36385,11 @@ class TestBR51AIUserConsoleMFA:
         iam.list_instances.return_value = {"Instances": []}
         with patch("boto3.client", return_value=iam):
             rows = extract_csv_data(
-                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+                bedrock_app.check_bedrock_ai_user_console_mfa(
+                    cache,
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
             )
 
         failed = [r for r in rows if r["Status"] == "Failed"]
@@ -35845,7 +36449,11 @@ class TestBR51AIUserConsoleMFA:
         iam.list_instances.return_value = {"Instances": []}
         with patch("boto3.client", return_value=iam):
             rows = extract_csv_data(
-                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+                bedrock_app.check_bedrock_ai_user_console_mfa(
+                    cache,
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
             )
 
         failed = {
@@ -35940,7 +36548,11 @@ class TestBR51AIUserConsoleMFA:
         iam.list_instances.return_value = {"Instances": []}
         with patch("boto3.client", return_value=iam):
             rows = extract_csv_data(
-                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+                bedrock_app.check_bedrock_ai_user_console_mfa(
+                    cache,
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
             )
 
         failed = {
@@ -35960,6 +36572,137 @@ class TestBR51AIUserConsoleMFA:
         summary = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
         assert "3 of the 6 in-scope IAM role(s)" in summary[0]["Finding_Details"]
         assert "AnyChainRole, AnyHopChainRole, AnyRole" in summary[0]["Finding_Details"]
+
+    @staticmethod
+    def _scps(*statements, **inventory):
+        """An inventory holding one attached policy with these statements."""
+        base = {
+            "items": [
+                {
+                    "name": "RequireMfa",
+                    "id": "p-mfa",
+                    "content": json.dumps(
+                        {"Version": "2012-10-17", "Statement": list(statements)}
+                    ),
+                    "attached_to": ["root r-abc1"],
+                }
+            ]
+            if statements
+            else [],
+            "errors": [],
+            "list_error": None,
+            "detached": [],
+            "account": "123456789012",
+            "management_account": False,
+        }
+        base.update(inventory)
+        return base
+
+    SCP_MFA_DENY = {
+        "Effect": "Deny",
+        "Action": "bedrock:*",
+        "Resource": "*",
+        "Condition": {"BoolIfExists": {"aws:MultiFactorAuthPresent": "false"}},
+    }
+
+    def test_br51_an_attached_scp_mfa_deny_holds_each_user_it_covers(self):
+        """The SCP denies bedrock only, so alice (bedrock) is held and bob
+        (sagemaker) still fails, his text naming the SCP that was read."""
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            keys={"alice": [self.KEY], "bob": [self.KEY]},
+            scp_inventory=self._scps(self.SCP_MFA_DENY),
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "IAM user 'bob' has 1 active access key(s)" in failed[0]
+        assert (
+            "nor does one in the 1 service control policy attached to this "
+            "account, so the key signs AI changes without MFA" in failed[0]
+        )
+        (summary,) = [r for r in rows if r["Status"] == "N/A"]
+        assert (
+            "1 user(s) are held to MFA by a Deny (alice (service control policy "
+            "'RequireMfa'))" in summary["Finding_Details"]
+        )
+
+    def test_br51_an_unread_scp_holds_a_missing_deny_at_na(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"bob": "yes"},
+            keys={"alice": [self.KEY]},
+            scp_inventory=self._scps(
+                errors=["policy 'Guard' targets: AccessDenied"],
+            ),
+        )
+        assert "Failed" not in [r["Status"] for r in rows]
+        texts = [r["Finding_Details"] for r in rows]
+        for user, fact in (
+            ("alice", "has 1 active access key(s)"),
+            ("bob", "has a console password and no MFA device"),
+        ):
+            (text,) = [t for t in texts if f"IAM user '{user}' {fact}" in t]
+            assert (
+                "The service control policies attached to this account were not "
+                "all read (policy 'Guard' targets: AccessDenied), so a Deny there "
+                "that holds these writes to MFA is not ruled out." in text
+            )
+            assert "without MFA." not in text
+
+    @pytest.mark.parametrize(
+        "inventory, clause",
+        [
+            (
+                {"management_account": True},
+                "and service control policies do not restrict this organization "
+                "management account, so the key signs",
+            ),
+            (
+                {"not_in_use": True, "list_error": "not in use"},
+                "and AWS Organizations is not in use, so no service control policy "
+                "applies, so the key signs",
+            ),
+        ],
+    )
+    def test_br51_an_scp_that_cannot_restrict_the_account_is_not_credited(
+        self, inventory, clause
+    ):
+        _, rows = self._run(
+            _ai_user_cache(),
+            keys={"alice": [self.KEY], "bob": [self.KEY]},
+            scp_inventory=self._scps(self.SCP_MFA_DENY, **inventory),
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 2
+        assert all(clause in text for text in failed)
+
+    def test_br51_an_attached_scp_tag_deny_guards_the_federated_role_it_covers(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        rows = self._run_federated(
+            {
+                "OktaBedrock": (saml, "sts:AssumeRoleWithSAML", [self.WRITE]),
+                "OktaSage": (
+                    saml,
+                    "sts:AssumeRoleWithSAML",
+                    [{"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"}],
+                ),
+            },
+            scp_inventory=self._scps(self._tag_deny(actions=("bedrock:*",))),
+        )
+        (failed,) = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert "IAM role 'OktaSage'" in failed
+        assert (
+            "covers sagemaker (the PrincipalTag Deny it has, StringNotEquals "
+            "aws:PrincipalTag/authn mfa in service control policy 'RequireMfa', "
+            "covers only the other services), nor does one in the 1 service "
+            "control policy attached to this account, so a federated session" in failed
+        )
+        (summary,) = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert (
+            f"(OktaBedrock ({saml}; StringNotEquals aws:PrincipalTag/authn mfa in "
+            "service control policy 'RequireMfa'))" in summary["Finding_Details"]
+        )
 
     def test_br51_unread_principal_stops_a_passed_row(self):
         cache = _ai_user_cache()
@@ -40090,6 +40833,29 @@ class TestServiceControlPolicyInventory:
             }[service],
         ):
             return org_client, bedrock_app.get_service_control_policy_inventory()
+
+    @pytest.mark.parametrize(
+        "code, not_in_use",
+        [("AWSOrganizationsNotInUseException", True), ("AccessDeniedException", False)],
+    )
+    def test_organizations_not_in_use_is_told_apart_from_a_denied_read(
+        self, code, not_in_use
+    ):
+        org_client = MagicMock()
+        org_client.describe_organization.side_effect = _make_client_error(code)
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "222222222222"}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            inventory = bedrock_app.get_service_control_policy_inventory()
+        assert inventory["not_in_use"] is not_in_use
+        assert inventory["list_error"]
+        assert inventory["items"] == []
 
     PARENTS = {
         "222222222222": [{"Id": "ou-abc1-inner", "Type": "ORGANIZATIONAL_UNIT"}],
@@ -48157,6 +48923,53 @@ class TestInvocationLogGuardrailEvidence:
         assert "req-untagged (InvokeModel anthropic.test)" in detail
         for other in ("req-tagged", "req-converse", "req-unguarded"):
             assert other not in detail
+
+    def test_br34_records_every_logged_runtime_call_for_br46(self):
+        """An InvokeModel call with no guardrailAction is recorded too, so
+        BR-46 can join the calls BR-34 itself never joins."""
+        joins = {"resolved": {}, "pages": 0}
+        self._prompt(
+            {
+                bedrock_app.INVOKE_LOG_PATTERN: [
+                    [self._record("req-plain")],
+                    [self._guarded("req-g", True, "InvokeModelWithResponseStream")],
+                ],
+                bedrock_app.CONVERSE_LOG_PATTERN: [[self._record("req-c", "Converse")]],
+            },
+            joins=joins,
+        )
+        log = joins["log"]
+        assert log["logging"] is True
+        assert log["unread"] == []
+        assert sorted(
+            (call["request_id"], call["operation"]) for call in log["calls"]
+        ) == [
+            ("req-c", "Converse"),
+            ("req-g", "InvokeModelWithResponseStream"),
+            ("req-plain", "InvokeModel"),
+        ]
+
+    def test_br34_names_a_capped_runtime_call_scan_for_br46(self):
+        joins = {"resolved": {}, "pages": 0}
+        self._prompt({}, endless=True, joins=joins)
+        unread = joins["log"]["unread"]
+        assert len(unread) == 2
+        assert unread[0].startswith(
+            f"records matching an InvokeModel operation in {self.LOG_GROUP} past "
+            "the first 0 (page cap; those logged from "
+        )
+        assert unread[1].startswith("records matching a Converse operation in ")
+
+    def test_br34_records_a_log_with_no_text_for_br46(self):
+        joins = {"resolved": {}, "pages": 0}
+        self._prompt(
+            {},
+            config={"loggingConfig": {"textDataDeliveryEnabled": False}},
+            joins=joins,
+        )
+        assert joins["log"]["logging"] is False
+        assert joins["log"]["calls"] == []
+        assert "textDataDeliveryEnabled is False" in joins["log"]["reason"]
 
     def test_the_untagged_call_on_a_later_page_is_read(self):
         rows = self._prompt(

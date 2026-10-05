@@ -22367,6 +22367,11 @@ CONVERSE_LOG_PATTERN = (
     '{ ($.operation = "Converse") || ($.operation = "ConverseStream") }'
 )
 
+INVOKE_LOG_PATTERN = (
+    '{ ($.operation = "InvokeModel") || '
+    '($.operation = "InvokeModelWithResponseStream") }'
+)
+
 PROMPT_ATTACK_EVIDENCE_FINDING = "Guardrail Prompt Attack Invocation Evidence"
 
 GROUNDING_EVIDENCE_FINDING = "Guardrail Contextual Grounding Score Evidence"
@@ -23376,8 +23381,10 @@ def check_guardrail_prompt_attack_invocation_evidence(
     no guardrail input tag, which the prompt attack filter does not evaluate.
     A Converse call is guarded when its CloudTrail event names a guardrailConfig
     or its response reports a guardrail. ``joins`` is the region run's shared
-    CloudTrail join state. Only request IDs, operations and model IDs are
-    reported, never a body.
+    CloudTrail join state; its "log" holds every logged InvokeModel,
+    InvokeModelWithResponseStream, Converse and ConverseStream call and the
+    reads of them that failed, for BR-46 to join. Only request IDs, operations
+    and model IDs are reported, never a body.
     """
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html"
     findings = {
@@ -23403,6 +23410,14 @@ def check_guardrail_prompt_attack_invocation_evidence(
 
     try:
         source = _invocation_log_source(region)
+        if joins is not None:
+            joins["log"] = {
+                "where": source["where"],
+                "logging": source["logging"],
+                "reason": source["reason"],
+                "calls": [],
+                "unread": [],
+            }
         if not source["where"]:
             findings["status"] = "N/A"
             row(
@@ -23471,6 +23486,22 @@ def check_guardrail_prompt_attack_invocation_evidence(
                     "amazon-bedrock-guardrailConfig to match its input tag against"
                 )
 
+        # Every logged InvokeModel call, guarded or not, for BR-46 to join to
+        # its CloudTrail event, which names the guardrail the call applied.
+        invoke_log_calls = []
+
+        def visit_invoke_call(record):
+            if record.get("operation") not in INVOKE_GUARDRAIL_TAG_OPERATIONS:
+                return
+            invoke_log_calls.append(
+                {
+                    "label": label_of(record),
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                }
+            )
+
         # The logged request never names its guardrailConfig, so each call's
         # turn verdict is kept and its guardrail is read from CloudTrail below.
         def visit_converse(record):
@@ -23497,7 +23528,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 }
             )
 
-        catch_scan, tag_scan, converse_scan = _scan_invocation_legs(
+        catch_scan, tag_scan, converse_scan, invoke_scan = _scan_invocation_legs(
             region,
             source,
             [
@@ -23516,8 +23547,35 @@ def check_guardrail_prompt_attack_invocation_evidence(
                     lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
                     visit_converse,
                 ),
+                (
+                    INVOKE_LOG_PATTERN,
+                    lambda line, record: (
+                        record.get("operation") in INVOKE_GUARDRAIL_TAG_OPERATIONS
+                    ),
+                    visit_invoke_call,
+                ),
             ],
         )
+        if joins is not None:
+            joins["log"]["calls"] = invoke_log_calls + [
+                {key: call[key] for key in ("label", "request_id", "operation", "time")}
+                for call in converse_calls
+            ]
+            for scan, what in (
+                (invoke_scan, "an InvokeModel operation"),
+                (converse_scan, "a Converse operation"),
+            ):
+                if scan["error"]:
+                    joins["log"]["unread"].append(
+                        f"records matching {what} in {source['where']} "
+                        f"({scan['action']}, {scan['error']})"
+                    )
+                elif scan["capped"]:
+                    joins["log"]["unread"].append(
+                        f"records matching {what} in {source['where']} past the "
+                        f"first {scan['read']} ({scan.get('cap')}; those logged "
+                        f"from {scan['unread_from']} on were not all read)"
+                    )
         # One join state for this row's legs, so a call is looked up once.
         joins = joins if joins is not None else {"resolved": {}, "pages": 0}
         joined = _converse_call_guardrails(
@@ -29658,6 +29716,11 @@ def get_service_control_policy_inventory() -> Dict[str, Any]:
             orgs_client, inventory["account"]
         )
     except Exception as error:
+        inventory["not_in_use"] = (
+            isinstance(error, ClientError)
+            and error.response.get("Error", {}).get("Code")
+            == "AWSOrganizationsNotInUseException"
+        )
         inventory["list_error"] = (
             "the account's position in the organization could not be read "
             f"with organizations:ListParents ({get_assessment_error_label(error)}), "
@@ -29958,6 +30021,62 @@ def _names_one_model(value: Any) -> bool:
     )
 
 
+# Of the resource types bedrock:InvokeModel names, async-invoke is a job and
+# system-tool a tool, and neither is a model; InvokeModelWithResponseStream
+# names no async-invoke or project type (bedrock.json in the Service
+# Authorization Reference, read 2026-10-04). An Allow whose every Resource
+# matches no ARN of the remaining types, such as agent-alias/* or
+# knowledge-base/*, lets the action reach no model.
+NON_MODEL_INVOKE_RESOURCE_TYPES = ("async-invoke", "system-tool")
+
+STREAM_ABSENT_RESOURCE_TYPES = ("async-invoke", "project")
+
+# bedrock-mantle:CreateInference names only the project resource type
+# (bedrock-mantle.json, read 2026-10-04).
+MANTLE_PROJECT_ARN_PATTERN = "arn:*:bedrock-mantle:*:*:project/*"
+
+
+def _model_arn_patterns(action: str) -> List[str]:
+    """Return an ARN pattern, in any partition, Region and account, for each
+    resource type through which ``action`` can invoke a model."""
+    skipped = NON_MODEL_INVOKE_RESOURCE_TYPES + (
+        STREAM_ABSENT_RESOURCE_TYPES
+        if action == "bedrock:invokemodelwithresponsestream"
+        else ()
+    )
+    return [
+        template.replace("arn:aws:", "arn:*:", 1).format(
+            region="*", account="*", id="*"
+        )
+        for name, template in INVOKE_MODEL_RESOURCE_FORMATS
+        if name not in skipped
+    ]
+
+
+def _resource_can_name_model(resource: Any, arn_patterns: List[str]) -> bool:
+    """
+    Return True when a Resource pattern can match an ARN of one of
+    ``arn_patterns``, compared segment by segment, with a policy variable read
+    as *. A pattern with fewer than six segments whose last one holds a * spans
+    the rest.
+    """
+    if not isinstance(resource, str):
+        return False
+    pattern = re.sub(r"\$\{[^}]*\}", "*", resource.strip().lower())
+    segments = pattern.split(":", 5)
+    if len(segments) < 6:
+        if "*" not in segments[-1]:
+            return False
+        segments += ["*"] * (6 - len(segments))
+    return any(
+        all(
+            _globs_overlap(segment, part)
+            for segment, part in zip(segments, arn.split(":", 5))
+        )
+        for arn in arn_patterns
+    )
+
+
 def _condition_is_positive_match(operator: str) -> bool:
     """
     Return True for an operator that matches only when the key is present and
@@ -29975,13 +30094,21 @@ def _statement_invoke_scoping(
     """
     Describe how one Allow statement scopes one model invoke action.
 
-    Returns None when the statement does not allow the action. ``inert_keys``
-    names bedrock: keys the action does not define that the statement tests
-    positively; such a statement never applies to the action.
+    Returns None when the statement does not allow the action on a model:
+    it names another action, or every Resource is of a type that is not a
+    model, such as agent-alias/*. ``inert_keys`` names bedrock: keys the action
+    does not define that the statement tests positively; such a statement never
+    applies to the action.
     """
     if str(statement.get("Effect", "")).upper() != "ALLOW":
         return None
     if not _statement_matches_action(statement, action):
+        return None
+    model_arns = _model_arn_patterns(action)
+    if "NotResource" not in statement and not any(
+        _resource_can_name_model(resource, model_arns)
+        for resource in _as_list(statement.get("Resource"))
+    ):
         return None
 
     inert_keys = []
@@ -30017,7 +30144,7 @@ def _statement_invoke_scoping(
         resources = [
             resource
             for resource in _as_list(statement.get("Resource"))
-            if isinstance(resource, str)
+            if _resource_can_name_model(resource, model_arns)
         ]
         unscoped = [
             resource for resource in resources if not _names_one_model(resource)
@@ -30076,11 +30203,17 @@ def _boundary_named_resources(
 def _mantle_statement_scoping(statement: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Describe how one Allow statement scopes bedrock-mantle:CreateInference, or
-    None when it does not allow that action.
+    None when it does not allow that action on a bedrock-mantle project, the
+    only resource type the action names.
     """
     if str(statement.get("Effect", "")).upper() != "ALLOW":
         return None
     if not _statement_matches_action(statement, MANTLE_INFERENCE_ACTION):
+        return None
+    if "NotResource" not in statement and not any(
+        _resource_can_name_model(resource, [MANTLE_PROJECT_ARN_PATTERN])
+        for resource in _as_list(statement.get("Resource"))
+    ):
         return None
     models = []
     for operator, key, values in _condition_keys_by_operator(statement):
@@ -30090,7 +30223,11 @@ def _mantle_statement_scoping(statement: Dict[str, Any]) -> Optional[Dict[str, A
             continue
         if values and not any(char in str(value) for value in values for char in "*?"):
             models.extend(str(value) for value in values)
-    resources = [str(value) for value in _as_list(statement.get("Resource"))]
+    resources = [
+        str(value)
+        for value in _as_list(statement.get("Resource"))
+        if _resource_can_name_model(value, [MANTLE_PROJECT_ARN_PATTERN])
+    ]
     if "NotResource" in statement:
         resources = [
             "NotResource " + ", ".join(map(str, _as_list(statement["NotResource"])))
@@ -30467,13 +30604,27 @@ def _identity_model_access(
                     if scoping["loose_conditions"]
                     else ""
                 )
+                if "NotResource" in statement:
+                    reach = "every model it does not exclude can be invoked"
+                elif any(
+                    name not in NON_MODEL_INVOKE_RESOURCE_TYPES
+                    for name in _invocation_resources_uncovered(
+                        scoping["unscoped_resources"]
+                    )
+                ):
+                    reach = (
+                        "every model those patterns match can be invoked "
+                        "without being named"
+                    )
+                else:
+                    reach = "every model available in the account can be invoked"
                 access["unrestricted"].append(
-                    "policy '{}': it allows {} on {}{}, so every model available in "
-                    "the account can be invoked".format(
+                    "policy '{}': it allows {} on {}{}, so {}".format(
                         policy.get("name"),
                         action,
                         ", ".join(scoping["unscoped_resources"]),
                         loose,
+                        reach,
                     )
                 )
 
@@ -30589,7 +30740,7 @@ def check_bedrock_model_allow_list(
                 findings["invocation_open"].append(f"{identity_type} '{identity_name}'")
             if access["unrestricted"]:
                 reasons.append(
-                    "can invoke any foundation model because "
+                    "can invoke models not named one by one because "
                     + "; ".join(access["unrestricted"][:3])
                 )
             if access["mantle"]:
@@ -33196,9 +33347,8 @@ def _marketplace_invocation_block(
         state["unread"].append("the BR-42 identity model allow-list")
     elif allow_list_findings["invocation_open"]:
         state["open"].append(
-            "{} can invoke any model (BR-42 identity allow-list)".format(
-                ", ".join(allow_list_findings["invocation_open"][:5])
-            )
+            "{} can invoke a model outside named ARNs (BR-42 identity "
+            "allow-list)".format(", ".join(allow_list_findings["invocation_open"][:5]))
         )
     else:
         state["blocked_by"].append(
@@ -33966,6 +34116,61 @@ def _bedrock_api_key_iam_age_caps(permission_cache: Dict[str, Any]) -> Dict[str,
     }
 
 
+def _bedrock_api_key_iam_token_denies(
+    permission_cache: Dict[str, Any], holders: List[str]
+) -> Dict[str, Any]:
+    """
+    Judge the LONG_TERM bearer token Deny in the identity policies and
+    permissions boundary of each IAM user holding an active Bedrock API key. A
+    long-term key signs requests as its user, so a Deny there binds that
+    user's keys only. denied names the users with a credited Deny on both
+    bearer token actions, open the users without one, and unread the users
+    whose policies the cache does not hold in full. errored is None for a
+    version-1 cache, which records no read errors.
+    """
+    errored_users = {
+        error.get("name")
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict) and error.get("type") == "user"
+    }
+    users = permission_cache.get("user_permissions") or {}
+    denied, open_users, unread = [], [], []
+    for name in holders:
+        label = f"user '{name}'"
+        permissions = users.get(name)
+        if permissions is None or name in errored_users:
+            unread.append(f"{label} (not read into the IAM permissions cache)")
+            continue
+        try:
+            pairs = [
+                (policy.get("name") or source, statement)
+                for source, policy in _cached_identity_policies(permissions)
+                for statement in _policy_statements(policy.get("document"))
+            ]
+            pairs += [
+                ("permissions boundary", statement)
+                for statement in _policy_statements(_boundary_document(permissions))
+            ]
+        except (ValueError, TypeError, AttributeError):
+            unread.append(f"{label} (a policy could not be parsed)")
+            continue
+        token = _bedrock_api_key_scp_controls(pairs)["token"]
+        if len(token) == len(BEDROCK_BEARER_TOKEN_ACTIONS):
+            denied.append(label)
+        elif token:
+            open_users.append(
+                "{} (only {} is denied)".format(label, ", ".join(sorted(token)))
+            )
+        else:
+            open_users.append(label)
+    return {
+        "denied": denied,
+        "open": open_users,
+        "unread": unread,
+        "errored": _cache_principal_errors(permission_cache, ("user",)),
+    }
+
+
 def check_bedrock_api_key_governance(
     permission_cache,
     region: str = "",
@@ -34237,6 +34442,46 @@ def check_bedrock_api_key_governance(
             text for action in token_actions for text in controls["token"][action]
         ]
 
+        # The token Deny can also sit in the own policies of every IAM user
+        # holding an active key, which binds those users' keys only.
+        holders = sorted(
+            {
+                user_name
+                for user_name, credential in listed
+                if str(credential.get("Status", "")).lower() == "active"
+            }
+        )
+        holders_listed = not from_cache and not inventory_errors
+        iam_tokens = _bedrock_api_key_iam_token_denies(permission_cache, holders)
+        iam_token = (
+            not tokens_blocked
+            and holders_listed
+            and bool(iam_tokens["denied"])
+            and not iam_tokens["open"]
+            and not iam_tokens["unread"]
+        )
+        token_unread = (
+            not tokens_blocked
+            and not iam_token
+            and bool(holders)
+            and not iam_tokens["open"]
+        )
+        iam_token_note = ""
+        if iam_token:
+            iam_token_note = (
+                " The LONG_TERM bearer token Deny on both endpoints sits in the own "
+                "policies or permissions boundary of each of the {} IAM user(s) "
+                "holding an active key ({}); it binds those users only, so a user "
+                "given a key later without it can use that key.{}".format(
+                    len(iam_tokens["denied"]),
+                    ", ".join(iam_tokens["denied"][:5]),
+                    ""
+                    if iam_tokens["errored"] is not None
+                    else " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE,
+                )
+            )
+        tokens_ok = tokens_blocked or iam_token
+
         read_errors = list(inventory["errors"])
         if inventory["list_error"]:
             read_errors.append(
@@ -34250,8 +34495,7 @@ def check_bedrock_api_key_governance(
         )
 
         # An age cap can also sit in the identity policies of every principal
-        # allowed to create the credential. The bearer token leg is read from
-        # service control policies only.
+        # allowed to create the credential.
         iam_caps = _bedrock_api_key_iam_age_caps(permission_cache)
         iam_age = (
             not scp_age
@@ -34313,29 +34557,58 @@ def check_bedrock_api_key_governance(
                 "days on iam:CreateServiceSpecificCredential, so a Bedrock API key "
                 "can be created with no expiry".format(BEDROCK_API_KEY_MAX_AGE_DAYS)
             )
-        if not tokens_blocked:
+        if token_unread:
+            read_errors.append(
+                "whether each IAM user holding an active key carries the LONG_TERM "
+                "bearer token Deny in its own policies was not read: {}".format(
+                    "; ".join(
+                        (
+                            iam_tokens["unread"]
+                            if iam_tokens["unread"]
+                            else ["the key holders were not all listed"]
+                        )[:5]
+                    )
+                )
+            )
+        if not tokens_ok:
+            if iam_tokens["open"]:
+                reach = (
+                    ", nor does one in the own policies or permissions boundary of "
+                    "{}, so the long-term keys of those user(s) can be used".format(
+                        ", ".join(iam_tokens["open"][:5])
+                    )
+                )
+            elif token_unread:
+                reach = ""
+            else:
+                reach = ", so a long-term key can be used"
             missing.append(
-                "no credited Deny covers the LONG_TERM bearer token type on both "
+                "no credited Deny in the attached service control policies covers "
+                "the LONG_TERM bearer token type on both "
                 "bedrock:CallWithBearerToken and bedrock-mantle:CallWithBearerToken"
-                "{}, so a long-term key can be used".format(
+                "{}{}".format(
                     " (only {} is covered)".format(", ".join(token_actions))
                     if token_actions and not management
-                    else ""
+                    else "",
+                    reach,
                 )
             )
 
-        if age_ok and tokens_blocked:
+        if age_ok and tokens_ok:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
                         "Bedrock API keys are capped in age and LONG_TERM bearer "
-                        "tokens are denied on both endpoints by {} statement(s): "
-                        "{}.{}{} {}".format(
-                            len(preventive),
-                            "; ".join(preventive[:5]),
+                        "tokens are denied on both endpoints{}.{}{}{} {}".format(
+                            " by {} service control policy statement(s): {}".format(
+                                len(preventive), "; ".join(preventive[:5])
+                            )
+                            if preventive
+                            else "",
                             iam_age_note,
+                            iam_token_note,
                             gap_note,
                             scope_note,
                         )
@@ -34347,7 +34620,7 @@ def check_bedrock_api_key_governance(
                     region=region,
                 )
             )
-        elif read_errors and not management:
+        elif read_errors and (not management or (age_ok and token_unread)):
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-45",
@@ -34355,13 +34628,14 @@ def check_bedrock_api_key_governance(
                     finding_details=(
                         "A preventive control on Bedrock API keys is undetermined "
                         "because {} and the policies that could hold it were not "
-                        "all read: {}.{}{}{} {}".format(
+                        "all read: {}.{}{}{}{} {}".format(
                             "; ".join(missing),
                             "; ".join(read_errors[:5]),
                             " Credited: {}.".format("; ".join(preventive[:5]))
                             if preventive
                             else "",
                             iam_age_note,
+                            iam_token_note,
                             gap_note,
                             scope_note,
                         )
@@ -35701,12 +35975,17 @@ def _deny_statement_ai_services(statement: Dict[str, Any]) -> List[str]:
 PRINCIPAL_TAG_KEY_PREFIX = "aws:principaltag/"
 
 # Negated string tests evaluate true when the key is absent, so an untagged
-# session is denied too. The IfExists forms and set operators do not, and are
-# not credited (reference_policies_elements_condition_operators.html).
+# session is denied too. Their IfExists forms are also true on an absent key,
+# and so is a ForAllValues: test; a ForAnyValue: test is false on an absent key
+# and is not credited (reference_policies_elements_condition_operators.html,
+# reference_policies_condition-single-vs-multi-valued-context-keys.html).
 PRINCIPAL_TAG_DENY_OPERATORS = (
     "stringnotequals",
     "stringnotequalsignorecase",
     "stringnotlike",
+    "stringnotequalsifexists",
+    "stringnotequalsignorecaseifexists",
+    "stringnotlikeifexists",
 )
 
 
@@ -35718,8 +35997,8 @@ def _principal_tag_deny_statement(statement: Dict[str, Any]) -> Dict[str, Any]:
     This is how IAM Identity Center sessions are held to MFA: the identity
     source passes the authentication method as a tag, and a Deny keyed on
     aws:MultiFactorAuthPresent does not work for federated sessions. Only one
-    aws:PrincipalTag key under a plain negated string operator is credited; a
-    second key or operator narrows the Deny.
+    aws:PrincipalTag key under a negated string operator that is true on an
+    absent tag is credited; a second key or operator narrows the Deny.
     """
     empty = {"services": [], "test": ""}
     if str(statement.get("Effect", "")).upper() != "DENY":
@@ -35732,7 +36011,11 @@ def _principal_tag_deny_statement(statement: Dict[str, Any]) -> Dict[str, Any]:
     operator, key, values = conditions[0]
     if not key.startswith(PRINCIPAL_TAG_KEY_PREFIX) or key == PRINCIPAL_TAG_KEY_PREFIX:
         return empty
-    if operator not in PRINCIPAL_TAG_DENY_OPERATORS or not values:
+    if operator.startswith("foranyvalue:"):
+        return empty
+    if _strip_condition_set_operator(operator) not in PRINCIPAL_TAG_DENY_OPERATORS:
+        return empty
+    if not values:
         return empty
     written_operator, block = next(
         (name, keys)
@@ -35750,11 +36033,61 @@ def _principal_tag_deny_statement(statement: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _mfa_deny_source(permissions: Dict[str, Any], console: bool = True) -> str:
+def _attached_scp_sources(scp_inventory: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return the parsed service control policies that restrict this account, as
+    (label, document) sources for a Deny search, and the reads that failed.
+
+    Only policies get_service_control_policy_inventory found attached to the
+    root, an OU in the account's path or the account itself are sources. The
+    management account is restricted by none, so it gets no sources and no
+    failed read can change its verdict. With Organizations not in use no
+    policy can exist.
+    """
+    if scp_inventory.get("not_in_use"):
+        return {
+            "sources": [],
+            "unread": [],
+            "nor": "and AWS Organizations is not in use, so no service control "
+            "policy applies",
+        }
+    if scp_inventory.get("management_account"):
+        return {
+            "sources": [],
+            "unread": [],
+            "nor": "and service control policies do not restrict this "
+            "organization management account",
+        }
+    unread = list(scp_inventory.get("errors") or [])
+    if scp_inventory.get("list_error"):
+        unread.append(str(scp_inventory["list_error"]))
+    sources = []
+    for item in scp_inventory.get("items") or []:
+        try:
+            document = json.loads(item.get("content") or "{}")
+        except (ValueError, TypeError) as error:
+            unread.append(
+                f"policy '{item.get('name')}' could not be parsed "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        sources.append((f"service control policy '{item.get('name')}'", document))
+    return {
+        "sources": sources,
+        "unread": unread,
+        "nor": "nor does one in the {} service control polic{} attached to "
+        "this account".format(len(sources), "y" if len(sources) == 1 else "ies"),
+    }
+
+
+def _mfa_deny_source(
+    permissions: Dict[str, Any], console: bool = True, extra_sources: tuple = ()
+) -> str:
     """
     Name the Deny that requires MFA on every AI write service an identity holds,
-    from its own policies or its permissions boundary, or return "". With
-    console set, only a Deny that also fires for console sessions is named.
+    from its own policies, its permissions boundary or extra_sources (the
+    attached service control policies), or return "". With console set, only a
+    Deny that also fires for console sessions is named.
     """
     needed = set(_ai_write_services(permissions))
     if not needed:
@@ -35766,6 +36099,7 @@ def _mfa_deny_source(permissions: Dict[str, Any], console: bool = True) -> str:
     boundary = _boundary_document(permissions)
     if boundary is not None:
         sources.append(("permissions boundary", boundary))
+    sources.extend(extra_sources)
     covered = set()
     names = []
     for label, document in sources:
@@ -35951,13 +36285,16 @@ def _trust_federated_providers(trust_policy: Any) -> List[str]:
     return sorted(set(providers))
 
 
-def _federated_role_tag_deny(permissions: Dict[str, Any]) -> Dict[str, Any]:
+def _federated_role_tag_deny(
+    permissions: Dict[str, Any], extra_sources: tuple = ()
+) -> Dict[str, Any]:
     """
     Judge a role assumed through a federated identity provider as the role a
     permission set is provisioned as is judged: the AI services its cached
     policies grant writes in, and which of them a Deny keyed on one
-    aws:PrincipalTag value, in those policies or its permissions boundary,
-    covers. A policy that cannot be parsed raises ValueError or TypeError.
+    aws:PrincipalTag value, in those policies, its permissions boundary or
+    extra_sources (the attached service control policies), covers. A policy
+    that cannot be parsed raises ValueError or TypeError.
     """
     sources = [
         (f"{source} '{policy.get('name') or 'unnamed'}'", policy.get("document"))
@@ -35966,23 +36303,32 @@ def _federated_role_tag_deny(permissions: Dict[str, Any]) -> Dict[str, Any]:
     boundary = _boundary_document(permissions)
     if boundary is not None:
         sources.append(("permissions boundary", boundary))
+    sources.extend(extra_sources)
     services = _ai_write_services(permissions)
     denies = [
-        _principal_tag_deny_statement(statement)
-        for _, document in sources
+        (label, _principal_tag_deny_statement(statement))
+        for label, document in sources
         if document
         for statement in _policy_statements(document)
     ]
-    covered = {service for deny in denies for service in deny["services"]}
+    covered = {service for _, deny in denies for service in deny["services"]}
     return {
         "services": services,
         "uncovered": [service for service in services if service not in covered],
-        "tests": [deny["test"] for deny in denies if deny["services"]],
+        "tests": [
+            deny["test"]
+            + (f" in {label}" if label.startswith("service control policy") else "")
+            for label, deny in denies
+            if deny["services"]
+        ],
     }
 
 
 def check_bedrock_ai_user_console_mfa(
-    permission_cache, region: str = "", identity_center_region: str = ""
+    permission_cache,
+    region: str = "",
+    identity_center_region: str = "",
+    scp_inventory: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-51: Flag identities that can change Bedrock, bedrock-mantle, SageMaker AI or AgentCore
@@ -35991,9 +36337,11 @@ def check_bedrock_ai_user_console_mfa(
     an IAM role whose trust policy lets a user or account assume it
     without MFA, and an IAM role assumed through a federated identity provider
     (SAML, OIDC, or an AWSReservedSSO_ role when no Identity Center instance is
-    visible) with no aws:PrincipalTag Deny over its AI writes. An IAM Identity
-    Center instance visible in
-    identity_center_region keeps the IAM-only Passed row at N/A.
+    visible) with no aws:PrincipalTag Deny over its AI writes. A Deny in a
+    service control policy attached to this account is credited as one in the
+    identity's own policies, and while those policies are not all read no
+    identity is failed for lacking a Deny. An IAM Identity Center instance
+    visible in identity_center_region keeps the IAM-only Passed row at N/A.
     """
     logger.debug("Starting check for AI user console MFA")
     try:
@@ -36041,39 +36389,105 @@ def check_bedrock_ai_user_console_mfa(
             identity_center_region or os.environ.get("AWS_REGION", "us-east-1"),
             permission_cache,
         )
+        scp = _attached_scp_sources(
+            scp_inventory
+            if scp_inventory is not None
+            else get_service_control_policy_inventory()
+        )
+        scp_sources = tuple(scp["sources"])
+        scp_unread = (
+            ". The service control policies attached to this account were not "
+            "all read ({}), so a Deny there that holds these writes to MFA is "
+            "not ruled out.".format("; ".join(scp["unread"][:3]))
+            if scp["unread"]
+            else ""
+        )
+
+        def unguarded_row(fact, consequence, resolution):
+            """Fail an identity no Deny holds to MFA, or hold it at N/A while
+            an attached service control policy that could hold it is unread."""
+            if scp_unread:
+                return row(
+                    fact[0] + scp_unread + fact[1],
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            findings["status"] = "WARN"
+            return row(fact[0] + consequence + fact[1], resolution, "High", "Failed")
 
         def add_permission_set_failures():
+            scp_tag = [
+                (label, _principal_tag_deny_statement(statement))
+                for label, document in scp_sources
+                for statement in _policy_statements(document)
+            ]
+            scp_tag = [(label, deny) for label, deny in scp_tag if deny["services"]]
             for permission_set in identity_center["unguarded"]:
-                findings["status"] = "WARN"
-                findings["csv_data"].append(
-                    row(
-                        "IAM Identity Center permission set {} grants AI writes "
-                        "({}) in {}, and no policy of the permission set carries "
-                        "a Deny keyed on an aws:PrincipalTag authentication tag "
-                        "over {}{}, so a session that did not complete MFA is not "
-                        "denied those writes. A Deny on aws:MultiFactorAuthPresent "
-                        "does not hold federated sessions to MFA, because the key "
-                        "is not present for them. {}".format(
-                            permission_set["arn"]
-                            + (
-                                " as provisioned in this account as role "
-                                f"{permission_set['role']}"
-                                if permission_set.get("role")
-                                else ""
-                            ),
-                            ", ".join(permission_set["services"]),
-                            " and ".join(permission_set["sources"]),
-                            ", ".join(permission_set["uncovered"]),
-                            " (the PrincipalTag Deny it has, {}, covers only the "
-                            "other services)".format("; ".join(permission_set["tests"]))
-                            if permission_set["tests"]
-                            else "",
-                            "It references the customer managed policies {}, read "
-                            "from the role's policies in the IAM permissions cache; "
-                            "the role in each other account it is provisioned to "
-                            "is not read.".format(permission_set["references"])
+                uncovered = [
+                    service
+                    for service in permission_set["uncovered"]
+                    if not any(service in deny["services"] for _, deny in scp_tag)
+                ]
+                fact = (
+                    "IAM Identity Center permission set {} grants AI writes "
+                    "({}) in {}, and no policy of the permission set carries "
+                    "a Deny keyed on an aws:PrincipalTag authentication tag "
+                    "over {}{}".format(
+                        permission_set["arn"]
+                        + (
+                            " as provisioned in this account as role "
+                            f"{permission_set['role']}"
                             if permission_set.get("role")
-                            else "It references no customer managed policy.",
+                            else ""
+                        ),
+                        ", ".join(permission_set["services"]),
+                        " and ".join(permission_set["sources"]),
+                        ", ".join(permission_set["uncovered"]),
+                        " (the PrincipalTag Deny it has, {}, covers only the "
+                        "other services)".format("; ".join(permission_set["tests"]))
+                        if permission_set["tests"]
+                        else "",
+                    ),
+                    " A Deny on aws:MultiFactorAuthPresent "
+                    "does not hold federated sessions to MFA, because the key "
+                    "is not present for them. {}".format(
+                        "It references the customer managed policies {}, read "
+                        "from the role's policies in the IAM permissions cache; "
+                        "the role in each other account it is provisioned to "
+                        "is not read.".format(permission_set["references"])
+                        if permission_set.get("role")
+                        else "It references no customer managed policy."
+                    ),
+                )
+                if not uncovered:
+                    findings["csv_data"].append(
+                        row(
+                            fact[0]
+                            + ". The service control policies attached to this "
+                            "account deny them ({}), which holds the set's "
+                            "sessions in this account only; the service control "
+                            "policies of the other accounts it is provisioned to "
+                            "are not read, so whether its sessions there are held "
+                            "to MFA is not known.".format(
+                                "; ".join(
+                                    f"{deny['test']} in {label}"
+                                    for label, deny in scp_tag
+                                )
+                            )
+                            + fact[1],
+                            COULD_NOT_ASSESS_RESOLUTION,
+                            "Informational",
+                            "N/A",
+                        )
+                    )
+                    continue
+                findings["csv_data"].append(
+                    unguarded_row(
+                        fact,
+                        ", {} over {}, so a session that did not complete MFA is "
+                        "not denied those writes.".format(
+                            scp["nor"], ", ".join(uncovered)
                         ),
                         "Pass the authentication method from the identity source "
                         "as a session tag (attributes for access control), and add "
@@ -36081,8 +36495,6 @@ def check_bedrock_ai_user_console_mfa(
                         "AI and AgentCore write it grants, with StringNotEquals on "
                         "that aws:PrincipalTag key and the value your identity "
                         "source sends for MFA.",
-                        "High",
-                        "Failed",
                     )
                 )
 
@@ -36107,13 +36519,16 @@ def check_bedrock_ai_user_console_mfa(
         deny_protected = []
         for user_name, evidence in sorted(population["users"].items()):
             deny_source = _mfa_deny_source(
-                permission_cache["user_permissions"][user_name]
+                permission_cache["user_permissions"][user_name],
+                extra_sources=scp_sources,
             )
             if deny_source:
                 deny_protected.append(f"{user_name} ({deny_source})")
                 continue
             key_deny_source = _mfa_deny_source(
-                permission_cache["user_permissions"][user_name], console=False
+                permission_cache["user_permissions"][user_name],
+                console=False,
+                extra_sources=scp_sources,
             )
             try:
                 iam_client.get_login_profile(UserName=user_name)
@@ -36158,16 +36573,21 @@ def check_bedrock_ai_user_console_mfa(
                     continue
                 has_device = bool(devices)
                 if not has_device:
-                    findings["status"] = "WARN"
                     findings["csv_data"].append(
-                        row(
-                            f"IAM user '{user_name}' has a console password and no "
-                            f"MFA device. The user is in scope because {evidence[0]}. "
-                            f"{AI_USER_SCOPE_NOTE}",
+                        unguarded_row(
+                            (
+                                f"IAM user '{user_name}' has a console password and "
+                                "no MFA device, and no Deny in its policies or "
+                                "permissions boundary requires MFA (BoolIfExists "
+                                "aws:MultiFactorAuthPresent false) on its AI write "
+                                "services",
+                                f" The user is in scope because {evidence[0]}. "
+                                f"{AI_USER_SCOPE_NOTE}",
+                            ),
+                            ", {}, so its console session makes AI changes "
+                            "without MFA.".format(scp["nor"]),
                             "Assign an MFA device to the user, or remove the console "
                             "password and move the person to IAM Identity Center.",
-                            "High",
-                            "Failed",
                         )
                     )
             try:
@@ -36201,23 +36621,27 @@ def check_bedrock_ai_user_console_mfa(
                         "keys to MFA)"
                     )
             elif active:
-                findings["status"] = "WARN"
                 findings["csv_data"].append(
-                    row(
-                        f"IAM user '{user_name}' has {len(active)} active access "
-                        "key(s), and no Deny in its policies or permissions "
-                        "boundary requires MFA (BoolIfExists "
-                        "aws:MultiFactorAuthPresent false) on its AI write "
-                        "services, so the key signs AI changes without MFA"
-                        f"{' even though the user has an MFA device' if has_device else ''}. "
-                        f"The user is in scope because {evidence[0]}. "
-                        f"{AI_USER_SCOPE_NOTE}",
+                    unguarded_row(
+                        (
+                            f"IAM user '{user_name}' has {len(active)} active "
+                            "access key(s), and no Deny in its policies or "
+                            "permissions boundary requires MFA (BoolIfExists "
+                            "aws:MultiFactorAuthPresent false) on its AI write "
+                            "services",
+                            f" The user is in scope because {evidence[0]}. "
+                            f"{AI_USER_SCOPE_NOTE}",
+                        ),
+                        ", {}, so the key signs AI changes without MFA{}.".format(
+                            scp["nor"],
+                            " even though the user has an MFA device"
+                            if has_device
+                            else "",
+                        ),
                         "Remove the access key and use temporary credentials from "
                         "an IAM role or IAM Identity Center, or attach a Deny on "
                         "the AI write actions with BoolIfExists "
                         "aws:MultiFactorAuthPresent false.",
-                        "High",
-                        "Failed",
                     )
                 )
             elif has_device:
@@ -36328,7 +36752,7 @@ def check_bedrock_ai_user_console_mfa(
                     continue
                 try:
                     tag_deny = _federated_role_tag_deny(
-                        permission_cache["role_permissions"][role_name]
+                        permission_cache["role_permissions"][role_name], scp_sources
                     )
                 except (ValueError, TypeError, AttributeError) as error:
                     findings["csv_data"].append(
@@ -36347,38 +36771,37 @@ def check_bedrock_ai_user_console_mfa(
                     )
                     continue
                 if tag_deny["uncovered"]:
-                    findings["status"] = "WARN"
                     findings["csv_data"].append(
-                        row(
-                            "IAM role '{}' is assumed through the federated "
-                            "identity provider(s) {} and grants AI writes ({}) in "
-                            "its policies, and no Deny in its policies or "
-                            "permissions boundary keyed on an aws:PrincipalTag "
-                            "authentication tag covers {}{}, so a federated session "
-                            "that did not complete MFA is not denied those writes. "
-                            "A Deny on aws:MultiFactorAuthPresent does not hold "
-                            "federated sessions to MFA, because the key is not "
-                            "present for them. The role is in scope because "
-                            "{}.".format(
-                                role_name,
-                                provider_text,
-                                ", ".join(tag_deny["services"]),
-                                ", ".join(tag_deny["uncovered"]),
-                                " (the PrincipalTag Deny it has, {}, covers only "
-                                "the other services)".format(
-                                    "; ".join(tag_deny["tests"])
-                                )
-                                if tag_deny["tests"]
-                                else "",
-                                evidence[0],
+                        unguarded_row(
+                            (
+                                "IAM role '{}' is assumed through the federated "
+                                "identity provider(s) {} and grants AI writes ({}) "
+                                "in its policies, and no Deny in its policies or "
+                                "permissions boundary keyed on an aws:PrincipalTag "
+                                "authentication tag covers {}{}".format(
+                                    role_name,
+                                    provider_text,
+                                    ", ".join(tag_deny["services"]),
+                                    ", ".join(tag_deny["uncovered"]),
+                                    " (the PrincipalTag Deny it has, {}, covers "
+                                    "only the other services)".format(
+                                        "; ".join(tag_deny["tests"])
+                                    )
+                                    if tag_deny["tests"]
+                                    else "",
+                                ),
+                                " A Deny on aws:MultiFactorAuthPresent does not "
+                                "hold federated sessions to MFA, because the key "
+                                "is not present for them. The role is in scope "
+                                f"because {evidence[0]}.",
                             ),
+                            ", {}, so a federated session that did not complete "
+                            "MFA is not denied those writes.".format(scp["nor"]),
                             "Have the identity provider pass the authentication "
                             "method as a session tag, and add to the role a Deny "
                             "on every Bedrock, SageMaker AI and AgentCore write it "
                             "grants, with StringNotEquals on that aws:PrincipalTag "
                             "key and the value the provider sends for MFA.",
-                            "High",
-                            "Failed",
                         )
                     )
                     continue
@@ -37948,10 +38371,14 @@ def check_bedrock_prompt_pii_screening(
     input. A version is used on invocations when an agent, flow node,
     un-narrowed account-enforced configuration or guardrail condition pin in
     ``attachment_inventory`` applies it, or when a logged invocation joined to
-    CloudTrail through ``joins`` (BR-27 and BR-34's shared state) names it. Only
-    a used version passes; an unread one is N/A. A logged invocation whose
-    CloudTrail event names no guardrail fails, unless an un-narrowed
-    account-enforced configuration screens it; an unjoined one is N/A.
+    CloudTrail through ``joins`` (BR-27 and BR-34's shared state) names it.
+    Every InvokeModel, InvokeModelWithResponseStream, Converse and
+    ConverseStream call BR-34 read from the invocation log is joined here if
+    BR-27 and BR-34 did not join it. Only a used version passes; an unread one
+    is N/A. A logged invocation whose CloudTrail event names no guardrail
+    fails, unless an un-narrowed account-enforced configuration screens it; an
+    unjoined one is N/A, and so is the leg while the invocation log was not
+    read, or not read in full.
     """
     findings = {
         "check_name": PROMPT_PII_SCREENING_FINDING,
@@ -38035,7 +38462,39 @@ def check_bedrock_prompt_pii_screening(
                 "error": entry.get("error") or "no detail returned",
                 "region": entry.get("region") or region,
             }
+        log = (joins or {}).get("log")
+        log_note = ""
+        if log is None:
+            unread.append(
+                "no invocation log scan was shared with this leg, so logged calls "
+                "that name no guardrail were not judged"
+            )
+        elif log["logging"] is None:
+            unread.append(f"the invocation log: {log['reason']}")
+        elif log["logging"] is False:
+            log_note = (
+                f" No invocation log is read in {region}: {log['reason']}, so a "
+                "call whose request names no guardrail is not seen."
+            )
+        else:
+            unread.extend(log["unread"])
+            no_id = [call["label"] for call in log["calls"] if not call["request_id"]]
+            if no_id:
+                unread.append(
+                    "{} logged call(s) that log no request ID to join to "
+                    "CloudTrail, so which guardrail ran is not known: {}".format(
+                        len(no_id), ", ".join(no_id[:5])
+                    )
+                )
+            pending = [
+                call
+                for call in log["calls"]
+                if call["request_id"] and call["request_id"] not in joins["resolved"]
+            ]
+            if pending:
+                _invoke_call_guardrails(region, pending, joins)
         joins_unread = 0
+        joins_capped = 0
         unguarded_requests = []
         for request_id, resolved in sorted(
             ((joins or {}).get("resolved") or {}).items()
@@ -38055,8 +38514,19 @@ def check_bedrock_prompt_pii_screening(
                 entry["surfaces"].append(f"logged invocation {request_id}")
             elif resolved.get("unguarded"):
                 unguarded_requests.append(request_id)
+            elif resolved.get("capped"):
+                joins_capped += 1
             else:
                 joins_unread += 1
+        if joins_capped:
+            unread.append(
+                "{} logged invocation(s) were not matched to CloudTrail within the "
+                "LookupEvents page cap ({} pages per operation, {} per region "
+                "run) or before the invocation deadline, so which guardrail ran "
+                "is not known".format(
+                    joins_capped, GROUNDING_JOIN_MAX_PAGES, GROUNDING_JOIN_BUDGET_PAGES
+                )
+            )
         if joins_unread:
             unread.append(
                 f"{joins_unread} logged invocation(s) whose CloudTrail event was "
@@ -38171,6 +38641,7 @@ def check_bedrock_prompt_pii_screening(
             f" {len(drafts)} of {len(summaries)} guardrail(s) listed in {region} "
             "were read with GetGuardrail. A guardrail passed per request is seen "
             "only through a logged invocation joined to its CloudTrail event."
+            + log_note
         )
         for label in unscreened:
             findings["status"] = "WARN"
@@ -45772,6 +46243,7 @@ def lambda_handler(event, context):
                         permission_cache,
                         region=GLOBAL_REGION_LABEL,
                         identity_center_region=region,
+                        scp_inventory=scp_inventory,
                     )
                 )
 
