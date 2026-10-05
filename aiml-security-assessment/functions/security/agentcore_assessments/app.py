@@ -9264,7 +9264,9 @@ def _statement_binds_token_vault(
     The vault context has to name the bedrock-agentcore service and this
     vault's `token-vault/<id>` resource written out with no wildcard, as AC-12
     requires of a gateway context: `token-vault/*` lets every vault in the
-    account use the key. The account has to be either literal or held to the
+    account use the key. The Region has to be the key's own, written out: a
+    vault in another Region is another vault, and `*` names this vault id in
+    every Region. The account has to be either literal or held to the
     caller's own account by aws:ResourceAccount equal to ${aws:PrincipalAccount}
     in the same statement.
     """
@@ -9303,6 +9305,7 @@ def _statement_binds_token_vault(
                 parts[0] != "arn"
                 or any(wildcard in partition for wildcard in "*?")
                 or service != "bedrock-agentcore"
+                or parts[3] != region.lower()
                 or not resource.startswith("token-vault/")
                 or resource != target
                 or not (account.isdigit() and len(account) == 12 or account_held)
@@ -9333,7 +9336,7 @@ def _token_vault_key_policy_gaps(
             "has no statement allowing kms:Decrypt only with kms:ViaService "
             f"bedrock-agentcore-identity.{region}.amazonaws.com and "
             "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
-            f"token-vault-arn naming token-vault/{vault_id} in one account"
+            f"token-vault-arn naming token-vault/{vault_id} in {region} in one account"
         )
     if _kms_key_policy_allows_open_decrypt(policy_document):
         gaps.append(
@@ -16530,9 +16533,12 @@ MEMORY_SESSION_VARIABLE_RULE = (
     "service principal and requires sts:RoleSessionName to equal "
     "${aws:username} or ${aws:userid} of the caller, and "
     "${aws:PrincipalTag/<key>} when every such statement requires session tag "
-    "<key> with a wildcard or variable value; any other variable, and any "
-    "variable on an IAM user, names something every caller of the principal "
-    "shares."
+    "<key> with a wildcard or variable value and every statement granting "
+    "sts:AssumeRole to a principal that is not federated, which passes its "
+    "own tags, requires the tag value to carry ${aws:username} or "
+    "${aws:userid} of the caller with no wildcard; any other variable, and "
+    "any variable on an IAM user, names something every caller of the "
+    "principal shares."
 )
 
 MEMORY_ASSUME_ROLE_ACTIONS = (
@@ -16629,6 +16635,69 @@ def _trust_binds_session_name(document: Any) -> str:
     return ""
 
 
+def _trust_lets_caller_choose_session_tag(document: Any, tag_key: str) -> bool:
+    """Whether a statement granting sts:AssumeRole to a principal that is not
+    federated leaves the value of session tag `tag_key` to the caller.
+
+    On sts:AssumeRole the caller passes its own session tags, so a Null
+    `false` test or a wildcard value lets it pick any value, another caller's
+    included. Only a StringEquals or StringLike test (no IfExists form, no
+    ForAllValues prefix) whose every value carries ${aws:username} or
+    ${aws:userid}, with no `*` or `?` outside the variable under StringLike,
+    holds the tag to that caller. A SAML or web identity provider sets the
+    tags of the federated calls, which _trust_requires_session_tag judges.
+    """
+    request_key = f"aws:requesttag/{tag_key.lower()}"
+    for statement in _trust_granting_statements(document):
+        principal = statement.get("Principal")
+        if isinstance(principal, dict) and set(principal) == {"Federated"}:
+            continue
+        if not (
+            ("Action" not in statement and "NotAction" in statement)
+            or any(
+                _action_patterns_overlap(pattern, "sts:AssumeRole")
+                for pattern in _statement_actions(statement)
+            )
+        ):
+            continue
+        conditions = statement.get("Condition")
+        held = False
+        for operator, block in (
+            conditions.items() if isinstance(conditions, dict) else []
+        ):
+            if _operator_admits_an_absent_key(operator):
+                continue
+            name = _normalized_condition_operator(operator)
+            if name not in CONDITION_EQUALS_OPERATORS or not isinstance(block, dict):
+                continue
+            for key, raw in block.items():
+                if str(key).strip().lower() != request_key:
+                    continue
+                tag_values = _condition_values(raw)
+                held = (
+                    held
+                    or bool(tag_values)
+                    and all(
+                        any(
+                            caller.lower() in MEMORY_CALLER_NAME_VARIABLES
+                            for caller in _memory_value_variables(tag_value)
+                        )
+                        and not (
+                            name == "stringlike"
+                            and bool(
+                                re.search(
+                                    r"[*?]", re.sub(r"\$\{[^}]*\}", "", tag_value)
+                                )
+                            )
+                        )
+                        for tag_value in tag_values
+                    )
+                )
+        if not held:
+            return True
+    return False
+
+
 def _trust_requires_session_tag(document: Any, tag_key: str) -> bool:
     """Whether every Allow statement of a trust policy that grants an AssumeRole
     action requires session tag `tag_key` with a value that differs per session.
@@ -16685,7 +16754,8 @@ def _memory_shared_variables(
     role's trust policy makes every caller name the session after itself
     (_trust_binds_session_name), and aws:PrincipalTag/<key> when it requires
     session tag <key> on every statement that grants an AssumeRole action
-    (_trust_requires_session_tag). Every other variable, and every variable on
+    (_trust_requires_session_tag) and no sts:AssumeRole caller picks its value
+    (_trust_lets_caller_choose_session_tag). Every other variable, and every variable on
     an IAM user, names something every caller of the principal shares. Each
     shared entry is a note naming the variable and why it is shared.
     """
@@ -16726,6 +16796,14 @@ def _memory_shared_variables(
                 document, variable[len(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX) :]
             ):
                 reason = "which every caller of the role shares"
+            elif _trust_lets_caller_choose_session_tag(
+                document, variable[len(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX) :]
+            ):
+                reason = (
+                    "whose trust policy does not hold the session tag to the "
+                    "sts:AssumeRole caller's ${aws:username} or ${aws:userid}, "
+                    "so the caller may choose its value"
+                )
             else:
                 reason = ""
         except (TypeError, ValueError) as error:

@@ -6718,7 +6718,7 @@ def _provider(name, vault="default", kind="oauth2credentialprovider"):
 
 
 def _ac14_key_policy(
-    context="arn:aws:bedrock-agentcore:*:*:token-vault/default",
+    context="arn:aws:bedrock-agentcore:us-east-1:*:token-vault/default",
     via="bedrock-agentcore-identity.*.amazonaws.com",
     via_operator="StringLike",
     account_held=True,
@@ -7239,7 +7239,47 @@ class TestAC14VaultKeyPolicy:
         assert [f["Status"] for f in findings] == [status]
         if status == "Failed":
             assert (
-                "naming token-vault/default in one account"
+                "naming token-vault/default in us-east-1 in one account"
+                in (findings[0]["Finding_Details"])
+            )
+
+    @pytest.mark.parametrize(
+        ("region", "status"),
+        [
+            ("us-east-1", "Passed"),
+            ("eu-west-1", "Failed"),
+            ("*", "Failed"),
+            ("us-*", "Failed"),
+            ("us-east-?", "Failed"),
+            ("", "Failed"),
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vault_context_in_another_region_does_not_bind_this_vault(
+        self, mock_ac, mock_kms, region, status
+    ):
+        # AIR-ACR-ID-05: token-vault/default in eu-west-1 is another vault, and
+        # a wildcard Region names this vault id in every Region.
+        self._wire(
+            mock_ac,
+            mock_kms,
+            {
+                self._KEYS["default"]: _ac14_key_policy(
+                    context=(
+                        f"arn:aws:bedrock-agentcore:{region}:123456789012:"
+                        "token-vault/default"
+                    )
+                )
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == [status]
+        if status == "Failed":
+            assert (
+                "naming token-vault/default in us-east-1 in one account"
                 in (findings[0]["Finding_Details"])
             )
 
@@ -42787,11 +42827,17 @@ class TestAC23SessionVariables:
         }
         return client
 
+    _SAML = {"Federated": "arn:aws:iam::123456789012:saml-provider/idp"}
+
     @staticmethod
-    def _assume(condition=None, action="sts:AssumeRole"):
+    def _assume(
+        condition=None,
+        action="sts:AssumeRole",
+        principal={"AWS": "arn:aws:iam::123456789012:root"},
+    ):
         statement = {
             "Effect": "Allow",
-            "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+            "Principal": principal,
             "Action": [action, "sts:TagSession"],
         }
         if condition is not None:
@@ -42928,7 +42974,14 @@ class TestAC23SessionVariables:
     def test_a_principal_tag_is_per_session_only_when_the_trust_requires_it(
         self, statements, status
     ):
-        iam = self._trust(*(self._assume(condition) for condition in statements))
+        # Federated since round 12b: an IdP sets these tags, while an
+        # sts:AssumeRole caller passes its own (the test below).
+        iam = self._trust(
+            *(
+                self._assume(condition, "sts:AssumeRoleWithSAML", self._SAML)
+                for condition in statements
+            )
+        )
         findings = self._run(
             self._cache("/actors/${aws:PrincipalTag/actorId}/*"), iam=iam
         )
@@ -43028,6 +43081,87 @@ class TestAC23SessionVariables:
             "${aws:userid} (trust policy not read: iam:GetRole"
             in (findings[0]["Finding_Details"])
         )
+
+    _CHOSEN = (
+        "whose trust policy does not hold the session tag to the sts:AssumeRole caller"
+    )
+
+    @pytest.mark.parametrize(
+        ("statements", "status"),
+        [
+            (
+                [{"StringEquals": {"aws:RequestTag/actorId": "${aws:username}"}}],
+                "Passed",
+            ),
+            ([{"StringLike": {"aws:RequestTag/actorId": "u-${aws:userid}"}}], "Passed"),
+            ([{"Null": {"aws:RequestTag/actorId": "false"}}], "N/A"),
+            ([{"StringLike": {"aws:RequestTag/actorId": "*"}}], "N/A"),
+            ([{"StringLike": {"aws:RequestTag/actorId": "${aws:username}*"}}], "N/A"),
+            ([{"StringEquals": {"aws:RequestTag/actorId": "${saml:sub}"}}], "N/A"),
+            (
+                [
+                    {
+                        "Null": {"aws:RequestTag/actorId": "false"},
+                        "StringEqualsIfExists": {
+                            "aws:RequestTag/actorId": "${aws:username}"
+                        },
+                    },
+                ],
+                "N/A",
+            ),
+            (
+                [
+                    {"StringEquals": {"aws:RequestTag/actorId": "${aws:username}"}},
+                    {"Null": {"aws:RequestTag/actorId": "false"}},
+                ],
+                "N/A",
+            ),
+        ],
+        ids=[
+            "equals-username",
+            "like-userid",
+            "null-false",
+            "stringlike-wildcard",
+            "like-wildcard-suffix",
+            "federated-variable",
+            "if-exists",
+            "second-statement-caller-chosen",
+        ],
+    )
+    def test_a_principal_tag_an_assume_role_caller_chooses_is_na(
+        self, statements, status
+    ):
+        # AIR-ACR-MEM-01: on sts:AssumeRole the caller passes its own session
+        # tags, so a Null or wildcard requirement lets it take any partition.
+        iam = self._trust(*(self._assume(condition) for condition in statements))
+        findings = self._run(
+            self._cache("/actors/${aws:PrincipalTag/actorId}/*"), iam=iam
+        )
+        assert [f["Status"] for f in findings] == [status]
+        details = findings[0]["Finding_Details"]
+        if status == "N/A":
+            assert f"(${{aws:PrincipalTag/actorId}}, {self._CHOSEN}" in details
+        else:
+            assert "role reader (${aws:PrincipalTag/actorId})" in details
+
+    def test_a_federated_statement_beside_an_assume_role_one_is_judged_per_statement(
+        self,
+    ):
+        # The SAML statement's IdP-set tag passes alone; the sts:AssumeRole
+        # statement beside it lets its caller choose the tag.
+        iam = self._trust(
+            self._assume(
+                {"Null": {"aws:RequestTag/actorId": "false"}},
+                "sts:AssumeRoleWithSAML",
+                self._SAML,
+            ),
+            self._assume({"Null": {"aws:RequestTag/actorId": "false"}}),
+        )
+        findings = self._run(
+            self._cache("/actors/${aws:PrincipalTag/actorId}/*"), iam=iam
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert self._CHOSEN in findings[0]["Finding_Details"]
 
     def test_a_principal_tag_on_a_user_is_the_users_own_tag(self):
         findings = self._run(
