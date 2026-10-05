@@ -20032,6 +20032,7 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
                 others=others,
                 unread=unread,
                 read_arns=read_arns,
+                region=_arn_region(detail.get("gatewayArn")),
             )
         )
 
@@ -20805,6 +20806,7 @@ def _gateway_role_trust_findings(
     others: Iterable[Tuple[str, str, str]] = (),
     unread: Iterable[str] = (),
     read_arns: Iterable[str] = (),
+    region: str = "",
 ) -> List[Dict[str, Any]]:
     """Judge one gateway execution role's trust policy for a confused-deputy guard.
 
@@ -20820,6 +20822,8 @@ def _gateway_role_trust_findings(
     and `read_arns` holds the ARN of every gateway that was read. While one is
     unread, a Passed needs every aws:SourceArn value to be the literal ARN of a
     read gateway; a pattern or any other ARN may admit an unread one.
+    `region` is the Region of this gateway's ARN. Only that Region's gateways
+    are read, so an aws:SourceArn value naming another Region is not judged.
     """
     if not role_arn:
         return [
@@ -21003,6 +21007,45 @@ def _gateway_role_trust_findings(
             )
         ]
 
+    elsewhere = sorted(
+        {
+            value.strip()
+            for statement in service_statements
+            for operator, entries in (statement.get("Condition") or {}).items()
+            if isinstance(entries, dict)
+            for key, raw in entries.items()
+            if str(key).strip().lower() == "aws:sourcearn"
+            for value in _condition_values(raw)
+            if _arn_region(value.strip()) != region
+        }
+    )
+    if elsewhere:
+        regions = sorted({_arn_region(value) for value in elsewhere})
+        return findings + [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Role Trust Confused Deputy Guard",
+                finding_details=(
+                    f"{label} uses execution role {role_name}, whose trust policy "
+                    "aws:SourceArn admits no gateway that was read in "
+                    f"{region or 'this Region'} and runs with another role. "
+                    f"aws:SourceArn value {', '.join(elsewhere)} names Region "
+                    f"{', '.join(regions)}, whose gateways this check does not "
+                    "read, so whether it admits a gateway there that runs with "
+                    "another role was not judged."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on "
+                    "this result. Confirm that no gateway in "
+                    f"{', '.join(regions)} that runs with another role matches "
+                    "that value, or name only this gateway's ARN in aws:SourceArn."
+                ),
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
     unread = list(unread)
     known = set(read_arns)
     uncompared = sorted(
@@ -21059,11 +21102,10 @@ def _gateway_role_trust_findings(
                 f"{label} uses execution role {role_name}, whose "
                 f"{len(statements)} Allow statement(s) each carry an "
                 "aws:SourceArn condition whose every value names account "
-                f"{account_id}, a Region and a resource type with no wildcard, "
-                "and a gateway resource, or name no service or wildcard "
-                "principal. The "
-                "aws:SourceArn admits no other gateway in this Region that runs "
-                f"with another role.{unread_note}"
+                f"{account_id}, Region {region} and a resource type with no "
+                "wildcard, and a gateway resource, or name no service or "
+                "wildcard principal. The aws:SourceArn admits no other gateway "
+                f"in {region} that runs with another role.{unread_note}"
             ),
             resolution=(
                 "No action required. A gateway created later is not compared; "
