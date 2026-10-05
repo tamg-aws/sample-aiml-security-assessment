@@ -423,9 +423,11 @@ def get_guardrail_detail_inventory(region: str = "") -> Dict[str, Any]:
 
 GUARDRAIL_DEPLOYMENT_CEILING = (
     "A guardrail passed per request to InvokeModel, Converse, ApplyGuardrail or "
-    "RetrieveAndGenerate is recorded by no configuration API, so those callers are "
-    "not judged here, and neither is whether a caller marks untrusted input with "
-    "guardContent tags or grounding qualifiers."
+    "RetrieveAndGenerate is recorded by no configuration API, so this row does not "
+    "judge those callers, and neither does it judge whether a caller marks "
+    "untrusted input with guardContent tags or grounding qualifiers. The "
+    "CloudTrail management event of an InvokeModel, InvokeModelWithResponseStream "
+    "or Converse call does name the guardrail and version in requestParameters."
 )
 
 
@@ -849,6 +851,18 @@ def _deployed_guardrail_findings(
     rows = []
     passed = []
     unread = list(attachment_inventory.get("errors") or [])
+    # BR-34 and BR-27 judge, on their invocation evidence rows, each guardrail
+    # version a CloudTrail invocation event names.
+    event_rows = {
+        "BR-34": PROMPT_ATTACK_EVIDENCE_FINDING,
+        "BR-27": GROUNDING_EVIDENCE_FINDING,
+    }
+    ceiling = GUARDRAIL_DEPLOYMENT_CEILING + (
+        f" The '{event_rows[check_id]}' row of {check_id} judges each version "
+        "such an event names, for the calls logged in the last 24 hours."
+        if check_id in event_rows
+        else " That version is not judged by this check."
+    )
     for (identifier, version), entry in sorted(
         (attachment_inventory.get("versions") or {}).items()
     ):
@@ -873,7 +887,7 @@ def _deployed_guardrail_findings(
                             f"its own settings ({text}), but {surface} applies it "
                             f"only in part: {'; '.join(narrowed[surface])}. "
                             "Content outside that scope is not evaluated by it. "
-                            f"{GUARDRAIL_DEPLOYMENT_CEILING}"
+                            f"{ceiling}"
                         ),
                         resolution=(
                             "Set the account-enforced configuration to include ALL "
@@ -899,7 +913,7 @@ def _deployed_guardrail_findings(
                 create_finding(
                     check_id=check_id,
                     finding_name=finding_name,
-                    finding_details=f"The deployed {label} fails: {text} {GUARDRAIL_DEPLOYMENT_CEILING}",
+                    finding_details=f"The deployed {label} fails: {text} {ceiling}",
                     resolution=resolution,
                     reference=reference,
                     severity=severity,
@@ -924,7 +938,7 @@ def _deployed_guardrail_findings(
                     )
                     if unread
                     else "",
-                    GUARDRAIL_DEPLOYMENT_CEILING,
+                    ceiling,
                 ),
                 resolution="No action required."
                 if not unread
@@ -941,7 +955,7 @@ def _deployed_guardrail_findings(
                 check_id=check_id,
                 finding_name=finding_name,
                 finding_details="The deployed guardrail versions were not all judged: {}. {}".format(
-                    "; ".join(unread), GUARDRAIL_DEPLOYMENT_CEILING
+                    "; ".join(unread), ceiling
                 ),
                 resolution=COULD_NOT_ASSESS_RESOLUTION,
                 reference=reference,
@@ -959,7 +973,7 @@ def _deployed_guardrail_findings(
                     "No agent, flow node, account-enforced configuration, "
                     "Organizations Bedrock policy configuration or "
                     "bedrock:GuardrailIdentifier condition read for this Region "
-                    f"applies a guardrail. {GUARDRAIL_DEPLOYMENT_CEILING}"
+                    f"applies a guardrail. {ceiling}"
                 ),
                 resolution="No action required",
                 reference=reference,
@@ -13145,11 +13159,33 @@ GUARDRAIL_ORG_CONDITION_KEYS = {
 }
 
 
+def _org_condition_binds(
+    operator: str, key: str, values: List[Any], organization_id: str
+) -> bool:
+    """
+    True when one aws:PrincipalOrgID or aws:PrincipalOrgPaths condition admits
+    only principals of ``organization_id``, for BR-41. The operator must be
+    StringEquals or StringLike, without IfExists, which also admits a principal
+    in no organization, and without ForAllValues:, which is true when the key
+    is absent. Every aws:PrincipalOrgID value must be the organization id, and
+    every aws:PrincipalOrgPaths value must start with it and a slash, so a
+    wildcard or another organization's id binds nothing.
+    """
+    if not organization_id or not values:
+        return False
+    if operator.removeprefix("foranyvalue:") not in ("stringequals", "stringlike"):
+        return False
+    if key == "aws:principalorgid":
+        return all(str(value) == organization_id for value in values)
+    return all(str(value).startswith(f"{organization_id}/") for value in values)
+
+
 def _guardrail_share_grants(
     document: Any,
     owner_account: str,
     action: Optional[str] = GUARDRAIL_SHARE_ACTION,
     action_label: str = "bedrock:ApplyGuardrail",
+    organization_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Describe how a resource policy shares a resource with other accounts through
@@ -13161,8 +13197,14 @@ def _guardrail_share_grants(
     shares the resource with every AWS account. "org_scoped" lists the shares
     that carry one of the two keys; a share to named accounts reaches only
     those accounts.
+
+    With ``organization_id`` set (BR-41), a key counts only when
+    _org_condition_binds finds its value limits the share to that
+    organization; a wildcard or another organization's id is no organization
+    share. An empty ``organization_id`` means the id was not read, and such a
+    share is listed in "held" instead.
     """
-    observed = {"shared": [], "org_scoped": [], "unbounded": []}
+    observed = {"shared": [], "org_scoped": [], "unbounded": [], "held": []}
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "ALLOW":
             continue
@@ -13173,14 +13215,34 @@ def _guardrail_share_grants(
             principals = [str(item) for item in _as_list(principal.get("AWS"))]
         else:
             principals = [str(item) for item in _as_list(principal)]
+        org_conditions = [
+            (operator, key, values)
+            for operator, key, values in _condition_keys_by_operator(statement)
+            if key in GUARDRAIL_ORG_CONDITION_KEYS and "not" not in operator
+        ]
         org_scopes = [
             "{} {}".format(
                 GUARDRAIL_ORG_CONDITION_KEYS[key],
                 ", ".join(str(value) for value in values),
             )
-            for operator, key, values in _condition_keys_by_operator(statement)
-            if key in GUARDRAIL_ORG_CONDITION_KEYS and "not" not in operator
+            for _, key, values in org_conditions
         ]
+        unbound_scopes = ""
+        if organization_id is not None and org_scopes:
+            if not organization_id:
+                observed["held"].append(
+                    f"an Allow of {action_label} scoped by "
+                    + "; ".join(org_scopes)
+                    + ", whose value was not compared with the organization id, "
+                    "which organizations:DescribeOrganization did not return"
+                )
+                continue
+            if not any(
+                _org_condition_binds(operator, key, values, organization_id)
+                for operator, key, values in org_conditions
+            ):
+                unbound_scopes = "; ".join(org_scopes)
+                org_scopes = []
         others = [
             item
             for item in principals
@@ -13210,11 +13272,24 @@ def _guardrail_share_grants(
                     if "*" in open_principals
                     else ", ".join(open_principals[:5])
                 )
-                + " with no aws:PrincipalOrgID or aws:PrincipalOrgPaths condition"
+                + (
+                    f" scoped by {unbound_scopes}, which does not limit it to "
+                    f"organization {organization_id}"
+                    if unbound_scopes
+                    else " with no aws:PrincipalOrgID or aws:PrincipalOrgPaths "
+                    "condition"
+                )
             )
         elif others:
             observed["shared"].append(
-                f"an Allow of {action_label} to " + ", ".join(others[:5])
+                f"an Allow of {action_label} to "
+                + ", ".join(others[:5])
+                + (
+                    f" scoped by {unbound_scopes}, which does not limit it to "
+                    f"organization {organization_id}"
+                    if unbound_scopes
+                    else ""
+                )
             )
     return observed
 
@@ -13391,7 +13466,11 @@ def _bedrock_policy_guardrail_configs(document: Any) -> List[Dict[str, Any]]:
 
 
 def _guardrail_share_finding(
-    guardrail_arn: str, caller_account: str, reference: str, region: str
+    guardrail_arn: str,
+    caller_account: str,
+    reference: str,
+    region: str,
+    organization_id: str = "",
 ) -> Dict[str, Any]:
     """
     Judge whether a centrally enforced guardrail is shared with member accounts.
@@ -13436,12 +13515,14 @@ def _guardrail_share_finding(
         )
         response = client.get_resource_policy(resourceArn=guardrail_arn)
         observed = _guardrail_share_grants(
-            response.get("resourcePolicy") or "{}", owner
+            response.get("resourcePolicy") or "{}",
+            owner,
+            organization_id=organization_id,
         )
     except ClientError as error:
         code = error.response.get("Error", {}).get("Code", "")
         if code == "ResourceNotFoundException":
-            observed = {"shared": [], "org_scoped": [], "unbounded": []}
+            observed = {"shared": [], "org_scoped": [], "unbounded": [], "held": []}
         else:
             return row(
                 f"The resource policy of guardrail {guardrail_arn} could not be "
@@ -13460,13 +13541,23 @@ def _guardrail_share_finding(
             "Informational",
             "N/A",
         )
-    if observed["org_scoped"] and not observed["unbounded"]:
+    if observed["org_scoped"] and not observed["unbounded"] and not observed["held"]:
         return row(
-            f"Guardrail {guardrail_arn} is shared with member accounts through "
+            f"Guardrail {guardrail_arn} is shared with member accounts of "
+            f"organization {organization_id} through "
             f"{'; '.join(observed['org_scoped'][:3])}.",
             "No action required",
             "Medium",
             "Passed",
+        )
+    if observed["held"] and not observed["unbounded"]:
+        return row(
+            f"Whether guardrail {guardrail_arn} is shared only within the "
+            f"organization was not established: {'; '.join(observed['held'][:3])}.",
+            "Grant organizations:DescribeOrganization to the assessment role and "
+            "retry.",
+            "Informational",
+            "N/A",
         )
     if observed["unbounded"]:
         problem = "; ".join(observed["unbounded"])
@@ -13474,7 +13565,8 @@ def _guardrail_share_finding(
     elif observed["shared"]:
         problem = (
             "shares it only through {}, with no aws:PrincipalOrgID or "
-            "aws:PrincipalOrgPaths condition".format("; ".join(observed["shared"][:3]))
+            "aws:PrincipalOrgPaths condition limiting it to the "
+            "organization".format("; ".join(observed["shared"][:3]))
         )
         consequence = "that it does not name cannot apply the guardrail"
     else:
@@ -13846,7 +13938,11 @@ def check_bedrock_central_guardrail_enforcement(
                 {arn for arns in policy_credited.values() for arn in arns}
             ):
                 share_rows[guardrail_arn] = _guardrail_share_finding(
-                    guardrail_arn, caller_account, reference, region
+                    guardrail_arn,
+                    caller_account,
+                    reference,
+                    region,
+                    context.get("organization_id", ""),
                 )
 
         # The service control policy leg is read only for Regions no other
@@ -22194,23 +22290,33 @@ def _automated_reasoning_note(detail: Dict[str, Any]) -> str:
     )
 
 
-def _contextual_grounding_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
-    """Judge one guardrail version's GROUNDING and RELEVANCE filters."""
+def _contextual_grounding_verdict(
+    detail: Dict[str, Any], ceiling: bool = True
+) -> Tuple[str, str]:
+    """
+    Judge one guardrail version's GROUNDING and RELEVANCE filters. Without
+    ``ceiling`` the text names the filters only, for a version a CloudTrail
+    event names, whose callers that row judges itself.
+    """
     active_filters, missing_types, observed = _grounding_blocking_gaps(detail)
-    reasoning = f"{_automated_reasoning_note(detail)} {CONTEXTUAL_GROUNDING_CEILING}"
+    reasoning = (
+        f"{_automated_reasoning_note(detail)} {CONTEXTUAL_GROUNDING_CEILING}"
+        if ceiling
+        else ""
+    )
     if not active_filters:
         return (
             "Failed",
-            f"contextual grounding checks are not enabled, so an ungrounded or off-topic response is returned as is. {reasoning}",
+            f"contextual grounding checks are not enabled, so an ungrounded or off-topic response is returned as is. {reasoning}".rstrip(),
         )
     if missing_types:
         return (
             "Failed",
-            f"contextual grounding does not block on {', '.join(missing_types)} with a threshold in the 0-0.99 range (observed: {observed}), so an ungrounded or off-topic response is scored but still returned. {reasoning}",
+            f"contextual grounding does not block on {', '.join(missing_types)} with a threshold in the 0-0.99 range (observed: {observed}), so an ungrounded or off-topic response is scored but still returned. {reasoning}".rstrip(),
         )
     return (
         "Passed",
-        f"GROUNDING and RELEVANCE both block with thresholds in the 0-0.99 range ({observed}). {reasoning}",
+        f"GROUNDING and RELEVANCE both block with thresholds in the 0-0.99 range ({observed}). {reasoning}".rstrip(),
     )
 
 
@@ -22785,6 +22891,144 @@ def _converse_join_notes(
     return unread, note
 
 
+def _read_guardrail_version(
+    identifier: str, version: str, region: str, cache: Dict[tuple, Any]
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Read one guardrail version with bedrock:GetGuardrail, once per run of a
+    check, in the Region its identifier names. Returns (detail, "") or
+    (None, the not-read text).
+    """
+    key = (identifier, version)
+    if key not in cache:
+        reference = _parse_guardrail_reference(identifier, region)
+        try:
+            response = boto3.client(
+                "bedrock",
+                config=boto3_config,
+                region_name=reference["region"] or region,
+            ).get_guardrail(guardrailIdentifier=identifier, guardrailVersion=version)
+            detail = (
+                response.get("guardrail", response)
+                if isinstance(response, dict)
+                else None
+            )
+            if not isinstance(detail, dict):
+                raise TypeError("GetGuardrail returned no guardrail")
+            cache[key] = (detail, "")
+        except (ClientError, BotoCoreError, TypeError) as error:
+            cache[key] = (
+                None,
+                f"guardrail {identifier} version {version} was not read with "
+                f"bedrock:GetGuardrail ({_guardrail_read_error(error)})",
+            )
+    return cache[key]
+
+
+def _event_named_version_leg(
+    region: str,
+    calls: List[Dict[str, Any]],
+    joins: Optional[Dict[str, Any]],
+    judge: Callable[[Dict[str, Any]], Tuple[str, str]],
+    cache: Dict[tuple, Any],
+) -> Dict[str, Any]:
+    """
+    Judge, for BR-34 and BR-27, the guardrail version each guarded call ran
+    through. Each call {"label", "request_id", "operation", "time"} is joined
+    by requestID to its CloudTrail management event, whose requestParameters
+    (guardrailConfig for Converse) name guardrailIdentifier and
+    guardrailVersion, and each version named is read once and given to
+    ``judge``.
+
+    Returns {"failed", "passed", "unread", "recent", "unnamed"}: the failing
+    and passing versions with the calls through them, what was not judged (an
+    unmatched call, a capped join, an unread version, an undecided verdict),
+    the calls too recent for event history, and the calls whose event names no
+    guardrail, as an account-enforced guardrail's do. A call is never credited
+    without its version read and passed.
+    """
+    leg = {"failed": [], "passed": [], "unread": [], "recent": [], "unnamed": []}
+    if not calls:
+        return leg
+    joined = _converse_call_guardrails(region, calls, joins)
+    leg["recent"] = list(joined["recent"])
+    leg["unread"] = list(joined["unread"])
+    if joined["capped"]:
+        leg["unread"].insert(
+            0,
+            "{} guarded call(s) not matched to CloudTrail within the LookupEvents "
+            "page cap ({} pages per operation, {} per region run) or before the "
+            "invocation deadline, so the guardrail version they ran through was "
+            "not judged: {}".format(
+                len(joined["capped"]),
+                GROUNDING_JOIN_MAX_PAGES,
+                GROUNDING_JOIN_BUDGET_PAGES,
+                ", ".join(joined["capped"][:5]),
+            ),
+        )
+    by_version: Dict[tuple, List[str]] = {}
+    for call in calls:
+        entry = joined["guarded"].get(call["request_id"])
+        if entry is not None:
+            by_version.setdefault((entry["guardrail"], entry["version"]), []).append(
+                call["label"]
+            )
+        elif call["request_id"] in joined["unguarded"]:
+            leg["unnamed"].append(call["label"])
+    for (identifier, version), labels in sorted(by_version.items()):
+        named = "guardrail {} version {} ({} call(s): {})".format(
+            identifier, version, len(labels), ", ".join(labels[:3])
+        )
+        detail, error = _read_guardrail_version(identifier, version, region, cache)
+        if detail is None:
+            leg["unread"].append(error)
+            continue
+        status, text = judge(detail)
+        if status == "Failed":
+            leg["failed"].append(f"{named}: {text.rstrip('.')}")
+        elif status == "Passed":
+            leg["passed"].append(
+                f"guardrail {identifier} version {version} ({len(labels)} call(s))"
+            )
+        else:
+            leg["unread"].append(f"{named} could not be judged: {text}")
+    return leg
+
+
+def _event_named_version_notes(leg: Dict[str, Any], what: str) -> str:
+    """
+    Describe what _event_named_version_leg credited, and the calls it left out
+    because their event names no guardrail or is not in event history yet.
+    """
+    notes = []
+    if leg["passed"]:
+        notes.append(
+            "Each guardrail version named by the CloudTrail event of a guarded "
+            "call was read with bedrock:GetGuardrail and {}: {}.".format(
+                what, "; ".join(leg["passed"][:5])
+            )
+        )
+    if leg["unnamed"]:
+        notes.append(
+            "{} guarded call(s) have a CloudTrail event that names no guardrail, as "
+            "with an account-enforced guardrail, which the deployed guardrail row "
+            "judges, so no per-call version was judged for them: {}.".format(
+                len(leg["unnamed"]), ", ".join(leg["unnamed"][:5])
+            )
+        )
+    if leg["recent"]:
+        notes.append(
+            "{} guarded call(s) logged within the last {} minutes have no "
+            "CloudTrail event in event history yet, so the guardrail version they "
+            "ran through was not judged: {}.".format(
+                len(leg["recent"]),
+                int(INFERENCE_TRACE_SETTLE.total_seconds() // 60),
+                ", ".join(leg["recent"][:5]),
+            )
+        )
+    return "".join(f" {note}" for note in notes)
+
+
 def _tool_result_only(content: Any) -> bool:
     """True when a Converse user turn holds toolResult blocks and nothing else."""
     blocks = (
@@ -23179,6 +23423,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
         converse_partial = []
         tool_result_turns = [0]
         unread = []
+        invoke_guarded_calls = []
 
         def visit_catch(record):
             output = (record.get("output") or {}).get("outputBodyJson")
@@ -23205,6 +23450,14 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 return
             label = label_of(record)
             guarded.append(label)
+            invoke_guarded_calls.append(
+                {
+                    "label": label,
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                }
+            )
             body = (record.get("input") or {}).get("inputBodyJson")
             if body is None:
                 unread.append(f"{label}, whose request body is not inline")
@@ -23265,6 +23518,8 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 ),
             ],
         )
+        # One join state for this row's legs, so a call is looked up once.
+        joins = joins if joins is not None else {"resolved": {}, "pages": 0}
         joined = _converse_call_guardrails(
             region, [call for call in converse_calls if not call["log_guarded"]], joins
         )
@@ -23291,6 +23546,25 @@ def check_guardrail_prompt_attack_invocation_evidence(
             joined, "whether a guardrail ran"
         )
         unread.extend(join_unread)
+        # The guardrail version each guarded call ran through is named by its
+        # CloudTrail event, so that version's PROMPT_ATTACK filter is judged too.
+        version_leg = _event_named_version_leg(
+            region,
+            [
+                call
+                for call in converse_calls
+                if call["log_guarded"] or call["request_id"] in joined["guarded"]
+            ]
+            + invoke_guarded_calls,
+            joins,
+            _prompt_attack_verdict,
+            {},
+        )
+        unread.extend(version_leg["unread"])
+        recent_note += _event_named_version_notes(
+            version_leg,
+            "has a preventive PROMPT_ATTACK input filter on the STANDARD tier",
+        )
         where = source["where"]
         cap = "page cap" if source["log_group"] else "object cap"
         for scan, what in (
@@ -23330,9 +23604,19 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 tool_result_turns[0], recent_note
             )
         )
-        if untagged or converse_untagged or converse_partial:
+        if untagged or converse_untagged or converse_partial or version_leg["failed"]:
             findings["status"] = "FAIL"
             failures = []
+            if version_leg["failed"]:
+                failures.append(
+                    "{} guardrail version(s) named by the CloudTrail event of a "
+                    "guarded call logged in {} in the last 24 hours fail the "
+                    "prompt attack filter test: {}.".format(
+                        len(version_leg["failed"]),
+                        where,
+                        "; ".join(version_leg["failed"][:3]),
+                    )
+                )
             if untagged:
                 failures.append(
                     "{} of the {} guarded InvokeModel call(s) logged in {} in the "
@@ -23376,6 +23660,9 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 "{}{} {}{}".format(
                     " ".join(failures), tool_result_note, catch_note, unread_note
                 ),
+                "Give each guardrail version that callers pass per request a "
+                "PROMPT_ATTACK input filter that is enabled, blocks and is set to "
+                "LOW, MEDIUM or HIGH on the STANDARD tier. "
                 "Wrap the user-supplied part of each InvokeModel prompt in "
                 "amazon-bedrock-guardrails-guardContent_<tagSuffix> tags that "
                 "match the tagSuffix in amazon-bedrock-guardrailConfig, and mark "
@@ -23388,7 +23675,8 @@ def check_guardrail_prompt_attack_invocation_evidence(
             findings["status"] = "N/A"
             row(
                 "No guarded InvokeModel or Converse call read in {} sent untagged "
-                "input, but the records were not all read.{} {}{}".format(
+                "input or ran through a guardrail version that fails the prompt "
+                "attack filter test, but the records were not all read.{} {}{}".format(
                     where, tool_result_note, catch_note, unread_note
                 ),
                 COULD_NOT_ASSESS_RESOLUTION,
@@ -23527,39 +23815,19 @@ def check_guardrail_grounding_score_evidence(
         # The grounding filter scores a Converse call only when the caller
         # qualifies a grounding_source and a query, so each guarded call through
         # a guardrail version with grounding filters is read for both.
-        grounding_versions: Dict[tuple, Optional[bool]] = {}
+        version_details: Dict[tuple, Any] = {}
         grounded_calls = []
         unqualified = []
         unjudged = []
 
         def grounds(identifier: str, version: str) -> Optional[bool]:
-            key = (identifier, version)
-            if key not in grounding_versions:
-                reference = _parse_guardrail_reference(identifier, region)
-                try:
-                    response = boto3.client(
-                        "bedrock",
-                        config=boto3_config,
-                        region_name=reference["region"] or region,
-                    ).get_guardrail(
-                        guardrailIdentifier=identifier, guardrailVersion=version
-                    )
-                    detail = (
-                        response.get("guardrail", response)
-                        if isinstance(response, dict)
-                        else None
-                    )
-                    if not isinstance(detail, dict):
-                        raise TypeError("GetGuardrail returned no guardrail")
-                    grounding_versions[key] = bool(_grounding_blocking_gaps(detail)[0])
-                except (ClientError, BotoCoreError, TypeError) as error:
-                    grounding_versions[key] = None
-                    unjudged.append(
-                        f"guardrail {identifier} version {version} was not read "
-                        "with bedrock:GetGuardrail "
-                        f"({_guardrail_read_error(error)})"
-                    )
-            return grounding_versions[key]
+            detail, error = _read_guardrail_version(
+                identifier, version, region, version_details
+            )
+            if detail is None:
+                unjudged.append(error)
+                return None
+            return bool(_grounding_blocking_gaps(detail)[0])
 
         # The logged request never names its guardrailConfig, so a call whose
         # response shows no grounding assessment is joined to its CloudTrail
@@ -23603,6 +23871,7 @@ def check_guardrail_grounding_score_evidence(
         invoke_calls = []
         invoke_unqualified = []
         invoke_untagged = []
+        invoke_guarded_calls = []
 
         def visit_invoke(record):
             if record.get("operation") not in INVOKE_GUARDRAIL_TAG_OPERATIONS:
@@ -23616,6 +23885,14 @@ def check_guardrail_grounding_score_evidence(
                 record.get("requestId") or "no request ID",
                 record.get("operation"),
                 record.get("modelId") or "no model ID",
+            )
+            invoke_guarded_calls.append(
+                {
+                    "label": label,
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                }
             )
             body = (record.get("input") or {}).get("inputBodyJson")
             if body is None:
@@ -23682,6 +23959,8 @@ def check_guardrail_grounding_score_evidence(
                     "logged from "
                     f"{leg_scan['unread_from']} on were not all read)"
                 )
+        # One join state for this row's legs, so a call is looked up once.
+        joins = joins if joins is not None else {"resolved": {}, "pages": 0}
         joined = _converse_call_guardrails(
             region, [call for call in converse_calls if not call["assessed"]], joins
         )
@@ -23702,6 +23981,27 @@ def check_guardrail_grounding_score_evidence(
             joined, "which guardrail version ran"
         )
         unjudged.extend(join_unread)
+        # Each guardrail version a guarded call's CloudTrail event names gets
+        # the full GROUNDING and RELEVANCE verdict, so a version passed per
+        # request with no grounding filter fails.
+        version_leg = _event_named_version_leg(
+            region,
+            [
+                call
+                for call in converse_calls
+                if call["assessed"] or call["request_id"] in joined["guarded"]
+            ]
+            + invoke_guarded_calls,
+            joins,
+            lambda detail: _contextual_grounding_verdict(detail, ceiling=False),
+            version_details,
+        )
+        unjudged.extend(version_leg["unread"])
+        recent_note += _event_named_version_notes(
+            version_leg,
+            "has GROUNDING and RELEVANCE filters that both block with a threshold "
+            "in the 0-0.99 range",
+        )
         invoke_joins = (
             _invoke_call_guardrails(
                 region,
@@ -23744,9 +24044,20 @@ def check_guardrail_grounding_score_evidence(
                     ", ".join(invoke_joins["capped"][:5]),
                 ),
             )
-        if unqualified or invoke_unqualified:
+        unjudged[:] = list(dict.fromkeys(unjudged))
+        if unqualified or invoke_unqualified or version_leg["failed"]:
             findings["status"] = "FAIL"
             failures = []
+            if version_leg["failed"]:
+                failures.append(
+                    "{} guardrail version(s) named by the CloudTrail event of a "
+                    "guarded call logged in {} in the last 24 hours fail the "
+                    "contextual grounding test: {}.".format(
+                        len(version_leg["failed"]),
+                        log_group,
+                        "; ".join(version_leg["failed"][:3]),
+                    )
+                )
             if unqualified:
                 failures.append(
                     "{} of the {} guarded Converse call(s) logged in {} in the last "
@@ -23785,6 +24096,9 @@ def check_guardrail_grounding_score_evidence(
                     if unjudged
                     else "",
                 ),
+                "Give each guardrail version that callers pass per request GROUNDING "
+                "and RELEVANCE filters that block with a threshold above 0 and no "
+                "higher than 0.99. "
                 "Pass the reference source and the user query in guardContent "
                 "text blocks qualified grounding_source and query on each Converse "
                 "call through a guardrail with contextual grounding filters, and "
@@ -23797,7 +24111,9 @@ def check_guardrail_grounding_score_evidence(
             findings["status"] = "N/A"
             row(
                 "No guarded Converse or InvokeModel call read in {} omitted a "
-                "grounding source or query, but not every guarded call was judged: "
+                "grounding source or query or ran through a guardrail version that "
+                "fails the contextual grounding test, but not every guarded call "
+                "was judged: "
                 "{}.{}".format(log_group, "; ".join(unjudged[:5]), recent_note),
                 COULD_NOT_ASSESS_RESOLUTION,
                 "Informational",
@@ -29216,6 +29532,7 @@ def _organization_policy_context() -> Dict[str, Any]:
     try:
         org_info = orgs_client.describe_organization()
         master_account_id = org_info["Organization"]["MasterAccountId"]
+        context["organization_id"] = str(org_info["Organization"].get("Id") or "")
         context["account"] = boto3.client(
             "sts", config=boto3_config
         ).get_caller_identity()["Account"]
@@ -37524,8 +37841,11 @@ def check_bedrock_knowledge_base_source_classification(
                         "started after the job's last run, each object's "
                         "LastModified is compared with the two. An object written "
                         "before the last run is not ordered against each earlier "
-                        "read, because Macie returns only lastRunTime and not every "
-                        "run. Each knowledge base source document is paired with "
+                        "read, because this check reads only the job's lastRunTime "
+                        "(macie2:DescribeClassificationJob) and not the "
+                        "SCHEDULED_RUN_COMPLETED event Macie logs for each run to "
+                        "the /aws/macie/classificationjobs log group. Each "
+                        "knowledge base source document is paired with "
                         "its .metadata.json sidecar and the sidecar's "
                         "metadataAttributes is read; which attribute names the "
                         "classification in per-document metadata is not "
