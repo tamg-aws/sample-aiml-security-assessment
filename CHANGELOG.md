@@ -130,13 +130,21 @@ back `Passed` names what it could not read.
   instances and EC2 instances beside Lambda functions, and fails an AgentCore
   workload without a private DNS endpoint for the plane it calls. `BR-04`
   credits only a lifecycle rule over the log root, with noncurrent-version
-  expiration on a versioned bucket. `BR-10` counts a guardrail direction only
-  from a `BLOCK` content filter at `LOW` or above. `BR-26`, `BR-27` and `BR-34`
-  judge every guardrail version a `bedrock:GuardrailIdentifier` condition can
-  pin. `BR-32` sees composite alarms. `BR-33` judges per-function Inspector
-  coverage. `BR-37` fails a control-plane mode of `aws_review`. `BR-53`
-  compares the Resource Groups Tagging API with each listed resource type and
-  fails a resource it never returned as untagged.
+  expiration on a versioned bucket. `BR-07` reads the encryption key of every
+  numbered prompt version, so an older version with no
+  `customerEncryptionKeyArn` fails even when the latest version carries a
+  customer managed key, and an unread version is `N/A`. Its flow leg reads each
+  flow version an alias routes to (`ListFlowAliases`, `GetFlowVersion`) as
+  well as the working draft, so a deployed version that references an
+  unversioned prompt fails. The `Bedrock Prompt Variants Check` row is now an
+  Informational `N/A` advisory and no longer sets the check status to `WARN`.
+  `BR-10` counts a guardrail direction only from a `BLOCK` content filter at
+  `LOW` or above. `BR-26`, `BR-27` and `BR-34` judge every guardrail
+  version a `bedrock:GuardrailIdentifier` condition can pin. `BR-32` sees
+  composite alarms. `BR-33` judges per-function Inspector coverage. `BR-37`
+  fails a control-plane mode of `aws_review`. `BR-53` compares the Resource
+  Groups Tagging API with each listed resource type and fails a resource it
+  never returned as untagged.
 - **Amazon SageMaker AI.** `SM-02`, `SM-11` and `SM-35` add rows for API
   method authorization, Lambda function network boundary and per-Region
   delegated administrators. `SM-09` reads Studio user profiles and default
@@ -359,14 +367,6 @@ Upgrading is not a single step and is not fully backward compatible:
 
 ### Changed
 
-- `BR-07` now reads the encryption key of every numbered prompt version, so an
-  older version with no `customerEncryptionKeyArn` fails even when the latest
-  version carries a customer managed key, and an unread version is `N/A`. Its
-  flow leg reads each flow version an alias routes to (`ListFlowAliases`,
-  `GetFlowVersion`) as well as the working draft, so a deployed version that
-  references an unversioned prompt fails. The `Bedrock Prompt Variants Check`
-  row is now an Informational `N/A` advisory and no longer sets the check
-  status to `WARN`.
 - Hardened assessment deployment roles. `AIMLSecurityMemberRole` now contains
   only cross-account deployment, Step Functions polling, and report-retrieval
   permissions; assessment APIs remain exclusively on the SAM-created Lambda
