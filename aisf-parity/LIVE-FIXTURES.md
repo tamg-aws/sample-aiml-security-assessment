@@ -5,6 +5,13 @@ reaches both a Passed and a Failed verdict against a real account. Three rows co
 not reach both from the account's standing resources, so three fixtures exist
 purely to exercise the missing branch.
 
+The view now derives 3 rows: `AISF-05`, `AISF-07` and `AISF-08`. `AISF-01`, `AISF-02`,
+`AISF-03`, `AISF-04` and `AISF-06` were retired because the check each one restated
+asserts only part of its control, so the probe no longer measures them. The sections
+below that name a retired row are kept as the record of what was measured; the AISF-01,
+AISF-03 and AISF-04 fixtures now unblock no shipped row, and only the AISF-05 fixture
+still does.
+
 Account **ACCOUNT_ID**, region **us-east-1**. The id is redacted because this file
 ships in a public fork; the profile in the commands below resolves it. Every resource
 of the AISF-01 and AISF-05 fixtures is named with the `aisflive` prefix. Four of the seven that can carry tags also carry

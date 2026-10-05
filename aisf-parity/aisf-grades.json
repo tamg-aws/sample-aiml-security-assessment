@@ -1,0 +1,861 @@
+{
+  "graded": "2026-10-05",
+  "botocore": "1.43.108",
+  "controls": [
+    {
+      "control_id": "AIR-ACR-EVAL-01",
+      "grade": "full",
+      "checks": [
+        "AC-02"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-EVAL-02",
+      "grade": "full",
+      "checks": [
+        "AC-42"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-EVAL-03",
+      "grade": "full",
+      "checks": [
+        "AC-43",
+        "AC-44"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-EVAL-04",
+      "grade": "full",
+      "checks": [
+        "AC-44"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-EVAL-05",
+      "grade": "full",
+      "checks": [
+        "AC-17",
+        "AC-39"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-EVAL-06",
+      "grade": "full",
+      "checks": [
+        "AC-17",
+        "AC-40"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-EVAL-07",
+      "grade": "partial-ceiling",
+      "checks": [
+        "AC-41",
+        "AC-20",
+        "AC-26"
+      ],
+      "missing_field": "Batch evaluation tags: GetBatchEvaluationResponse and BatchEvaluationSummary have no tags member (bedrock-agentcore service-2.json; only StartBatchEvaluation takes tags as input), and a live ListTagsForResource on a batch-evaluation ARN returned AccessDenied to an admin role"
+    },
+    {
+      "control_id": "AIR-ACR-GW-01",
+      "grade": "partial-ceiling",
+      "checks": [
+        "AG-24",
+        "AG-25"
+      ],
+      "missing_field": "Interceptor deny-on-error: GatewayInterceptorConfiguration has only interceptor, interceptionPoints and inputConfiguration, and LambdaInterceptorConfiguration has only arn (bedrock-agentcore-control service-2.json)"
+    },
+    {
+      "control_id": "AIR-ACR-GW-02",
+      "grade": "full",
+      "checks": [
+        "AC-28"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-GW-03",
+      "grade": "partial",
+      "checks": [
+        "AC-10",
+        "AC-27"
+      ],
+      "remaining_gap": "An aws:SourceArn value naming another Region is held at N/A: gateways in other Regions are not compared, so whether that value admits a gateway that runs with another role is not judged."
+    },
+    {
+      "control_id": "AIR-ACR-GW-04",
+      "grade": "full",
+      "checks": [
+        "AC-08",
+        "AC-27"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-GW-05",
+      "grade": "full",
+      "checks": [
+        "AG-27",
+        "AC-24",
+        "AG-39"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-GW-08",
+      "grade": "full",
+      "checks": [
+        "AC-25"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-GW-10",
+      "grade": "full",
+      "checks": [
+        "AC-12",
+        "AC-18",
+        "AC-19",
+        "AC-20",
+        "AC-26"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-ID-04",
+      "grade": "full",
+      "checks": [
+        "AC-29"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-ID-05",
+      "grade": "full",
+      "checks": [
+        "AC-14",
+        "AC-34"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-ID-08",
+      "grade": "full",
+      "checks": [
+        "AC-30",
+        "AC-31"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-ID-10",
+      "grade": "full",
+      "checks": [
+        "AC-33"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-ID-11",
+      "grade": "partial",
+      "checks": [
+        "AC-30",
+        "AC-31",
+        "AC-32"
+      ],
+      "remaining_gap": "No check reads a bedrock-agentcore:userid condition on GetWorkloadAccessTokenForUserId, so a principal that mints user tokens without an identity provider is judged only through the JWT runtime role check."
+    },
+    {
+      "control_id": "AIR-ACR-MEM-01",
+      "grade": "partial",
+      "checks": [
+        "AC-07",
+        "AC-23"
+      ],
+      "remaining_gap": "No check reads an SCP that denies CreateMemory when bedrock-agentcore:KmsKeyArn is null, and the Gateway and Policy Engine customer managed key checks are not mapped to this control."
+    },
+    {
+      "control_id": "AIR-ACR-MEM-07",
+      "grade": "not_implementable",
+      "checks": []
+    },
+    {
+      "control_id": "AIR-ACR-MEM-12",
+      "grade": "partial",
+      "checks": [
+        "AC-18",
+        "AC-19"
+      ],
+      "remaining_gap": "No check reads CloudWatch alarms on the Memory Errors, System Errors, User Errors and Throttles metrics."
+    },
+    {
+      "control_id": "AIR-ACR-OBS-02",
+      "grade": "full",
+      "checks": [
+        "AC-18"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-OBS-03",
+      "grade": "full",
+      "checks": [
+        "AC-19"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-OBS-04",
+      "grade": "full",
+      "checks": [
+        "AC-20",
+        "AC-21"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-OBS-06",
+      "grade": "partial-ceiling",
+      "checks": [
+        "AC-22"
+      ],
+      "missing_field": "oam ListAttachedLinksItem has only Label, LinkArn, ResourceTypes; GetLink returns Arn, Id, Label, LabelTemplate, LinkConfiguration, ResourceTypes, SinkArn, Tags; no last-activity or usage member (botocore oam service-2.json)"
+    },
+    {
+      "control_id": "AIR-ACR-PAY-01",
+      "grade": "full",
+      "checks": [
+        "AC-02"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-POL-01",
+      "grade": "full",
+      "checks": [
+        "AG-25",
+        "AC-19",
+        "AC-35"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-POL-04",
+      "grade": "partial-ceiling",
+      "checks": [
+        "AC-11",
+        "AC-36"
+      ],
+      "missing_field": "break-glass key-recovery runbook: an operational document no AWS API returns"
+    },
+    {
+      "control_id": "AIR-ACR-POL-06",
+      "grade": "full",
+      "checks": [
+        "AC-37"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-POL-07",
+      "grade": "full",
+      "checks": [
+        "AG-25",
+        "AC-38"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-REG-02",
+      "grade": "full",
+      "checks": [
+        "AR-03",
+        "AR-09",
+        "AR-10"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-RT-03",
+      "grade": "full",
+      "checks": [
+        "AC-02",
+        "AC-45",
+        "AC-48"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-RT-04",
+      "grade": "partial-ceiling",
+      "checks": [
+        "AC-46"
+      ],
+      "missing_field": "bedrock-agentcore-control LifecycleConfiguration carries only idleRuntimeSessionTimeout and maxLifetime with documented defaults 900 and 28800, so an explicit setting equal to the default is indistinguishable; no API exposes an application-side per-user session cap"
+    },
+    {
+      "control_id": "AIR-ACR-RT-08",
+      "grade": "full",
+      "checks": [
+        "AC-01",
+        "AC-49"
+      ]
+    },
+    {
+      "control_id": "AIR-ACR-RT-09",
+      "grade": "partial-ceiling",
+      "checks": [
+        "AC-06"
+      ],
+      "missing_field": "CreateBrowser and GetBrowser (bedrock-agentcore-control) carry no Live View member; Live View exists only as BrowserSessionStream.liveViewStream.streamEndpoint on StartBrowserSession/GetBrowserSession output (bedrock-agentcore service-2.json), with no record of whether it is watched"
+    },
+    {
+      "control_id": "AIR-ACR-RT-13",
+      "grade": "partial",
+      "checks": [
+        "AC-01",
+        "AC-08",
+        "AC-10",
+        "AC-47",
+        "AC-27",
+        "AC-48"
+      ],
+      "remaining_gap": "The gateway-role trust leg holds an aws:SourceArn naming another Region at N/A: gateways in other Regions are not compared."
+    },
+    {
+      "control_id": "AIR-BDR-GRD-01",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-10"
+      ],
+      "missing_field": "bedrock-runtime ApplyGuardrailRequest has only guardrailIdentifier, guardrailVersion, source, content and outputScope, with no model or application member. Another account's guardrail versions cannot be listed: ListGuardrails refuses a guardrail from a different account."
+    },
+    {
+      "control_id": "AIR-BDR-GRD-02",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-34"
+      ],
+      "missing_field": "Per-turn InvokeGuardrailChecks records no management event, and tool-payload screening and filter strength tuning are not readable from any API."
+    },
+    {
+      "control_id": "AIR-BDR-GRD-03",
+      "grade": "partial",
+      "checks": [
+        "BR-26"
+      ],
+      "remaining_gap": "A guardrail version a caller passes per request is not judged for sensitive-information filters, although the CloudTrail event names it."
+    },
+    {
+      "control_id": "AIR-BDR-GRD-04",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-32"
+      ],
+      "missing_field": "No AWS API records whether a caller logs the detect-mode decisions it acted on. InvokeGuardrailChecks produced no CloudTrail management event and has no data-event resource type (live evidence, 2026-10-04)."
+    },
+    {
+      "control_id": "AIR-BDR-GRD-09",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-27"
+      ],
+      "missing_field": "RetrieveAndGenerate's GenerationConfiguration has no grounding-source member (additionalModelRequestFields, guardrailConfiguration, inferenceConfig, performanceConfig, promptTemplate only)."
+    },
+    {
+      "control_id": "AIR-BDR-GRD-10",
+      "grade": "full",
+      "checks": [
+        "BR-41"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-KB-01",
+      "grade": "partial",
+      "checks": [
+        "BR-46"
+      ],
+      "remaining_gap": "The Macie ordering reads only the classification job's lastRunTime, not each SCHEDULED_RUN_COMPLETED event, so an object written before an earlier run is not ordered against each ingestion."
+    },
+    {
+      "control_id": "AIR-BDR-KB-03",
+      "grade": "full",
+      "checks": [
+        "BR-20"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-KB-05",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-34"
+      ],
+      "missing_field": "No API records what a POST_CHUNKING transformation Lambda screens. bedrock-agent-runtime GenerationConfiguration.guardrailConfiguration has only guardrailId and guardrailVersion, with no member to tag retrieved chunks as guardContent."
+    },
+    {
+      "control_id": "AIR-BDR-KB-06",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-06"
+      ],
+      "missing_field": "RetrieveAndGenerate citations exist only in the API response; no Bedrock or CloudTrail configuration API exposes them."
+    },
+    {
+      "control_id": "AIR-BDR-KB-08",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-26"
+      ],
+      "missing_field": "A transformation Lambda's logic is not recorded, a Glue script job has no CodeGenConfigurationNodes, no API records that a Comprehend job wrote each object, and no configuration API records a guardrail passed per request to RetrieveAndGenerate."
+    },
+    {
+      "control_id": "AIR-BDR-MDL-01",
+      "grade": "full",
+      "checks": [
+        "BR-42"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-MDL-02",
+      "grade": "full",
+      "checks": [
+        "BR-04",
+        "BR-12"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-MDL-03",
+      "grade": "full",
+      "checks": [
+        "BR-43",
+        "BR-42"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-MDL-04",
+      "grade": "full",
+      "checks": [
+        "BR-44",
+        "BR-42",
+        "BR-43"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-MDL-07",
+      "grade": "full",
+      "checks": [
+        "BR-06"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-MDL-08",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-07"
+      ],
+      "missing_field": "InvokeModel and Converse CloudTrail requestParameters carry modelId but no prompt provenance, and RenderPrompt is a separate data event, so no field ties a call made with a foundation-model modelId to a catalog prompt. No AWS field names the role approved to release a version."
+    },
+    {
+      "control_id": "AIR-BDR-MDL-09",
+      "grade": "full",
+      "checks": [
+        "BR-45"
+      ]
+    },
+    {
+      "control_id": "AIR-BDR-MDL-10",
+      "grade": "partial",
+      "checks": [
+        "BR-37"
+      ],
+      "remaining_gap": "Not asserted: needs bedrock-mantle:ListModels, which this deployment does not grant, so each model's allowed_modes is not read."
+    },
+    {
+      "control_id": "AIR-FND-ACC-02",
+      "grade": "full",
+      "checks": [
+        "BR-43"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-ACC-09",
+      "grade": "full",
+      "checks": [
+        "SM-35"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DAT-01",
+      "grade": "full",
+      "checks": [
+        "BR-20",
+        "BR-11",
+        "BR-17",
+        "SM-03"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DAT-02",
+      "grade": "full",
+      "checks": [
+        "BR-47"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DAT-03",
+      "grade": "partial",
+      "checks": [
+        "BR-46"
+      ],
+      "remaining_gap": "With text delivery off, calls whose text is not logged are not judged from their CloudTrail guardrail field; an agent or flow node with no guardrail is not failed; the Macie ordering reads only lastRunTime."
+    },
+    {
+      "control_id": "AIR-FND-DAT-04",
+      "grade": "full",
+      "checks": [
+        "BR-43"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DAT-05",
+      "grade": "partial",
+      "checks": [
+        "BR-52"
+      ],
+      "remaining_gap": "Not asserted: needs backup:ListRecoveryPointsByResource and backup:DescribeRecoveryPoint, which this deployment does not grant."
+    },
+    {
+      "control_id": "AIR-FND-DAT-08",
+      "grade": "full",
+      "checks": [
+        "BR-04"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DAT-09",
+      "grade": "full",
+      "checks": [
+        "BR-48"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DAT-10",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-55"
+      ],
+      "missing_field": "No KMS, EC2 or Nitro Enclaves operation in botocore returns a per-workload data-classification determination or the enclave measurements a release pipeline published"
+    },
+    {
+      "control_id": "AIR-FND-DET-01",
+      "grade": "full",
+      "checks": [
+        "BR-04",
+        "BR-12",
+        "BR-06"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DET-02",
+      "grade": "full",
+      "checks": [
+        "SM-26",
+        "SM-04",
+        "SM-36"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DET-04",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-34",
+        "BR-41",
+        "BR-49",
+        "SM-26"
+      ],
+      "missing_field": "bedrock-runtime ApplyGuardrailRequest has members guardrailIdentifier, guardrailVersion, source (INPUT|OUTPUT), content, outputScope; none names a tool result or a retrieved document"
+    },
+    {
+      "control_id": "AIR-FND-DET-09",
+      "grade": "full",
+      "checks": [
+        "AC-26",
+        "BR-12"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-DET-10",
+      "grade": "partial-ceiling",
+      "checks": [
+        "AC-53"
+      ],
+      "missing_field": "bedrock-agentcore and bedrock-agentcore-control (botocore) have no workflow or topology operation, and CloudWatch ListMetrics returns no field naming which metrics belong to a workflow"
+    },
+    {
+      "control_id": "AIR-FND-GOV-02",
+      "grade": "full",
+      "checks": [
+        "BR-53"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-GOV-12",
+      "grade": "not_implementable",
+      "checks": []
+    },
+    {
+      "control_id": "AIR-FND-IAM-01",
+      "grade": "full",
+      "checks": [
+        "BR-42",
+        "SM-02"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-IAM-02",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-51"
+      ],
+      "missing_field": "No sso-admin operation or shape carries the Identity Center MFA mode."
+    },
+    {
+      "control_id": "AIR-FND-IAM-03",
+      "grade": "full",
+      "checks": [
+        "BR-45",
+        "BR-50"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-IAM-05",
+      "grade": "full",
+      "checks": [
+        "AC-43",
+        "AC-45",
+        "AC-02",
+        "AC-48",
+        "BR-57"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-IAM-09",
+      "grade": "full",
+      "checks": [
+        "BR-01",
+        "SM-02",
+        "AC-02",
+        "AR-01"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-NET-01",
+      "grade": "full",
+      "checks": [
+        "AC-01",
+        "SM-10",
+        "SM-11",
+        "SM-28",
+        "SM-33",
+        "BR-39"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-NET-02",
+      "grade": "partial",
+      "checks": [
+        "AC-08",
+        "BR-02"
+      ],
+      "remaining_gap": "Workloads whose role grants no Bedrock, AgentCore or SageMaker runtime action are not judged, and running transform jobs are not read."
+    },
+    {
+      "control_id": "AIR-FND-NET-03",
+      "grade": "partial",
+      "checks": [
+        "AC-49",
+        "AC-01",
+        "SM-39"
+      ],
+      "remaining_gap": "Studio domain security groups (DefaultUserSettings.SecurityGroups and DomainSettings.SecurityGroupIds) are not read."
+    },
+    {
+      "control_id": "AIR-FND-NET-04",
+      "grade": "partial",
+      "checks": [
+        "AG-27",
+        "AG-39",
+        "AC-49"
+      ],
+      "remaining_gap": "Egress IPS is judged only for AgentCore hosting VPCs, not SageMaker or Bedrock workload VPCs. Not asserted: needs wafv2:ListWebACLs and wafv2:ListResourcesForWebACL, which this deployment does not grant."
+    },
+    {
+      "control_id": "AIR-FND-NET-06",
+      "grade": "full",
+      "checks": [
+        "AC-01",
+        "AC-15",
+        "AC-49",
+        "AG-25",
+        "AC-35"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-NET-07",
+      "grade": "full",
+      "checks": [
+        "SM-04",
+        "SM-37"
+      ]
+    },
+    {
+      "control_id": "AIR-FND-NET-08",
+      "grade": "partial",
+      "checks": [
+        "AC-51",
+        "AG-39"
+      ],
+      "remaining_gap": "Not asserted: needs wafv2:ListWebACLs and wafv2:ListResourcesForWebACL, which this deployment does not grant, so API Gateway and Application Load Balancer front doors are not read."
+    },
+    {
+      "control_id": "AIR-PHY-EDG-01",
+      "grade": "full",
+      "checks": [
+        "SM-41"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-EP-01",
+      "grade": "full",
+      "checks": [
+        "SM-11"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-EP-02",
+      "grade": "full",
+      "checks": [
+        "SM-02"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-EP-03",
+      "grade": "partial-ceiling",
+      "checks": [
+        "SM-11",
+        "SM-14"
+      ],
+      "missing_field": "EnableInterContainerTrafficEncryption: botocore sagemaker 2017-07-24 defines it only on AutoMLSecurityConfig, CreateTrainingJobRequest, DescribeTrainingJobResponse, HyperParameterTrainingJobDefinition, MonitoringNetworkConfig, NetworkConfig and TrainingJob. DescribeEndpointConfig, DescribeModel, DescribeEndpoint and DescribeInferenceComponent have no such member"
+    },
+    {
+      "control_id": "AIR-SGM-EP-06",
+      "grade": "partial-ceiling",
+      "checks": [
+        "SM-23",
+        "SM-31"
+      ],
+      "missing_field": "DescribeMlflowApp and DescribeMlflowTrackingServer return no endpoint or model member, so the MLflow and Evidently replacement path is not readable."
+    },
+    {
+      "control_id": "AIR-SGM-EP-08",
+      "grade": "full",
+      "checks": [
+        "SM-18",
+        "SM-42"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-GOV-01",
+      "grade": "full",
+      "checks": [
+        "SM-22"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-GOV-10",
+      "grade": "full",
+      "checks": [
+        "SM-32"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-TRN-01",
+      "grade": "full",
+      "checks": [
+        "SM-33",
+        "SM-34"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-TRN-02",
+      "grade": "full",
+      "checks": [
+        "SM-03",
+        "SM-34"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-TRN-05",
+      "grade": "full",
+      "checks": [
+        "SM-09",
+        "SM-01",
+        "SM-03"
+      ]
+    },
+    {
+      "control_id": "AIR-SGM-TRN-08",
+      "grade": "full",
+      "checks": [
+        "SM-34"
+      ]
+    },
+    {
+      "control_id": "AIR-SLF-AGT-05",
+      "grade": "partial-ceiling",
+      "checks": [
+        "BR-57"
+      ],
+      "missing_field": "botocore lambda-microvms 2025-09-09 has no Get or List operation for issued auth tokens, and CreateMicrovmAuthTokenResponse holds only authToken, so allowedPorts and expiry are request-only. No ECS or Lambda member marks a role as an agent's"
+    },
+    {
+      "control_id": "AIR-SLF-CMP-01",
+      "grade": "partial",
+      "checks": [
+        "BR-33",
+        "AC-50"
+      ],
+      "remaining_gap": "No check reads a CodePipeline InspectorScan action's thresholds. Not asserted: needs codepipeline:ListPipelines and codepipeline:GetPipeline, which this deployment does not grant."
+    },
+    {
+      "control_id": "AIR-SLF-CMP-08",
+      "grade": "partial-ceiling",
+      "checks": [
+        "SM-43"
+      ],
+      "missing_field": "No SageMaker field records a SHA256 digest of model data (botocore S3ModelDataSource members re-listed: S3Uri, S3DataType, CompressionType, ModelAccessConfig, HubAccessConfig, ManifestS3Uri, ETag, ManifestEtag), and no API reports a load-time digest comparison or which artifact an ECS, EKS or EC2 workload loads"
+    },
+    {
+      "control_id": "AIR-SLF-RT-02",
+      "grade": "full",
+      "checks": [
+        "AC-01",
+        "SM-39"
+      ]
+    },
+    {
+      "control_id": "AIR-SLF-RT-04",
+      "grade": "full",
+      "checks": [
+        "SM-04",
+        "SM-38"
+      ]
+    },
+    {
+      "control_id": "AIR-SLF-RT-05",
+      "grade": "partial-ceiling",
+      "checks": [
+        "SM-39"
+      ],
+      "missing_field": "botocore eks 2017-11-01 has no operation returning Kubernetes NetworkPolicy or SecurityGroupPolicy objects (its only policy operations are AssociateAccessPolicy and DisassociateAccessPolicy). CreateMicrovmAuthToken allowedPorts is request-only: GetMicrovm returns only ingressNetworkConnectors and egressNetworkConnectors, and lambda-microvms has no token Get or List"
+    },
+    {
+      "control_id": "AIR-SLF-RT-06",
+      "grade": "partial-ceiling",
+      "checks": [
+        "SM-40"
+      ],
+      "missing_field": "Whether workload code re-fetches a rotated secret: Lambda GetFunction returns only an archive URL, and EventBridge ListTargetsByRule returns only a target ARN and input"
+    },
+    {
+      "control_id": "AIR-SLF-RT-08",
+      "grade": "full",
+      "checks": [
+        "BR-54"
+      ]
+    }
+  ]
+}

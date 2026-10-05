@@ -41,9 +41,11 @@ To send us a pull request, please:
    RUFF="$PWD/.venv/bin/ruff"
 
    $PYTHON -m pip install --upgrade pip
+   # Include the requirements.txt of any new Lambda package in this install.
    $PYTHON -m pip install ruff \
      -r tests/requirements.txt \
      -r aiml-security-assessment/functions/security/agentcore_assessments/requirements.txt \
+     -r aiml-security-assessment/functions/security/agent_registry_assessments/requirements.txt \
      -r aiml-security-assessment/functions/security/bedrock_assessments/requirements.txt \
      -r aiml-security-assessment/functions/security/cleanup_bucket/requirements.txt \
      -r aiml-security-assessment/functions/security/generate_consolidated_report/requirements.txt \
@@ -79,9 +81,28 @@ To send us a pull request, please:
    CloudFormation lint and SAM validation/build commands documented in the
    [Developer Guide](docs/DEVELOPER_GUIDE.md).
 
-5. Commit to your fork using clear commit messages.
-6. Send us a pull request, answering any default questions in the pull request interface.
-7. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
+5. For a new or changed assessment check, service, lens, or compliance standard,
+   complete the [check-authoring steps](docs/DEVELOPER_GUIDE.md#adding-a-new-check-inside-an-existing-service)
+   and the [review checklist](AGENTS.md#review-checklist-run-before-committing-changes-to-checks-or-iam)
+   before opening the PR. In particular:
+   - Confirm the documented control matches the AWS API response fields,
+     allowed values, resource scope, and successful empty-response behavior.
+   - Exercise SDK-shaped compliant, non-compliant, no-resource, access-denied,
+     unavailable, and unexpected-error cases; include later pages and
+     multiple regions when the inventory needs them.
+   - Check runtime IAM grants in both SAM templates for the Lambda making
+     each call, plus S3 write, list, and read permissions for every artifact
+     producer and consumer. Test that optional assessment flags and required
+     artifacts work through enabled, skipped, and error paths.
+   - Generate synthetic single- and multi-account HTML reports and inspect
+     routing, counts, scope, filters, and visual layout. Reconcile the README,
+     check catalogs, troubleshooting guide, changelog deployment impact, and
+     sample reports with the actual behavior.
+   For a new compliance standard, also follow the
+   [end-to-end walkthrough](docs/DEVELOPER_GUIDE.md#adding-a-compliance-standard-owasp-style).
+6. Commit to your fork using clear commit messages.
+7. Send us a pull request, answering any default questions in the pull request interface.
+8. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
 
 ### Automated CI Checks
 

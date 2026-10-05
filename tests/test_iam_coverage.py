@@ -184,6 +184,12 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListApiKeyCredentialProviders",
     "cloudtrail:GetTrail",
     "cloudtrail:GetTrailStatus",
+    # AC-18 reads the CloudTrail Lake event data stores beside the trails.
+    "cloudtrail:ListEventDataStores",
+    "cloudtrail:GetEventDataStore",
+    # AC-22 lists each sink's attached links and the organization's accounts.
+    "oam:ListAttachedLinks",
+    "organizations:ListAccounts",
     # AC-50 reads the registry scanning configuration.
     "ecr:GetRegistryScanningConfiguration",
     # AC-52 reads the Cognito user pools AgentCore JWT authorizers name.
@@ -418,6 +424,27 @@ def test_required_agentcore_actions_are_granted_to_the_agentcore_function(templa
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=lambda p: os.path.basename(p))
+def test_agentcore_managed_policy_reads_are_granted(template):
+    # AC-26 reads the archive chain and AC-06 the recording bucket's Object
+    # Ownership from the AgentCore function. The Bedrock
+    # function's own logs:DescribeSubscriptionFilters grant does not reach it,
+    # and the inline policy has no room, so the reads live in the managed
+    # policy attached only to the AgentCore function.
+    granted = _granted_actions_for_resource(template, "AgentCoreAssessmentReadsPolicy")
+    missing = sorted(
+        a
+        for a in (
+            "logs:DescribeSubscriptionFilters",
+            "firehose:DescribeDeliveryStream",
+            "s3:GetBucketObjectLockConfiguration",
+            "s3:GetBucketOwnershipControls",
+        )
+        if a not in granted
+    )
+    assert not missing
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=lambda p: os.path.basename(p))
 def test_required_agent_registry_actions_are_granted_to_the_registry_function(
     template,
 ):
@@ -549,6 +576,9 @@ def test_runtime_guidance_does_not_use_invalid_iam_identifiers():
 # for permissions. A new IAM-shaped token in remediation text must be reviewed
 # and added deliberately.
 _VERIFIED_REMEDIATION_IAM_ACTIONS = {
+    # aoss:APIAccessAll (resource type Collection) was read from the aoss
+    # service reference JSON on 2026-10-04.
+    "aoss:APIAccessAll",
     "aoss:ListCollections",
     "agent-registry:GetRegistry",
     "agent-registry:ListRegistries",
@@ -566,6 +596,10 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
     "bedrock-agentcore:ListGateways",
     "bedrock-agentcore:ListOnlineEvaluationConfigs",
     "bedrock-agentcore:ListPolicies",
+    # bedrock:ApplyGuardrail (IsWrite false, resource types guardrail and
+    # guardrail-profile) was read from the bedrock service reference JSON on
+    # 2026-10-04.
+    "bedrock:ApplyGuardrail",
     "bedrock:CreateModelInvocationJob",
     "bedrock:CreatePrompt",
     "bedrock:GetAgent",
@@ -720,6 +754,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "bedrock-agentcore:GetWorkloadAccessTokenForUserId"
 }
 
+# Verified on 2026-10-03 with an Access Analyzer validate-policy run for the
+# SM-02 API method authorization leg. Its negative control was one invented
+# action (execute-api:InvokeThatDoesNotExist), which was reported as
+# INVALID_ACTION, and the action below was not.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"execute-api:Invoke"}
+
 # Verified on 2026-09-25 with a third Access Analyzer validate-policy run for the
 # gateway controls AC-24 through AC-27. Its negative controls were four invented
 # actions (ec2:DescribeVpcEndpointsThatDoNotExist,
@@ -868,6 +908,15 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
 
 # Verified with the bedrock-mantle:CreateInference entry above.
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"bedrock-mantle:Model"}
+
+# Verified 2026-10-03 with ValidatePolicy (SERVICE_CONTROL_POLICY) on a Deny of
+# CreateGateway and UpdateGateway: bedrock-agentcore:DiscoveryUrlNotReal came
+# back INVALID_SERVICE_CONDITION_KEY, aws:SourceVpcNotReal came back
+# INVALID_GLOBAL_CONDITION_KEY, and neither key below raised a key finding.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "bedrock-agentcore:DiscoveryUrl",
+    "aws:SourceVpc",
+}
 
 # Verified the same way on 2026-09-25 for the SageMaker phase-3 checks. The
 # condition key was submitted in its qualified aws:ResourceTag/<key> form, which
@@ -1207,11 +1256,107 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"inspector2:ListCoverage"}
 # reference JSON.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:ListTrainingJobs"}
 
+# BR-47 transform, endpoint and evaluation job legs, 2026-10-03: validate-policy
+# reported the negative controls sagemaker:ListTransformJob and
+# bedrock:GetEvaluationJobs as INVALID_ACTION at statement index 1 and nothing
+# at index 0. Each name is also in its service reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "sagemaker:ListTransformJobs",
+    "sagemaker:DescribeTransformJob",
+    "sagemaker:ListEndpoints",
+    "sagemaker:DescribeEndpointConfig",
+    "bedrock:GetEvaluationJob",
+}
+
 # BR-33 asks for lambda:ListTags, without which GetFunction withholds a
 # function's tags. validate-policy on 2026-09-28 reported the negative control
 # lambda:ListTagz as INVALID_ACTION at Action index 1 of one statement and
 # nothing at index 0.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"lambda:ListTags"}
+
+# Verified on 2026-10-03 for SM-39's Lambda VPC guardrail with one
+# SERVICE_CONTROL_POLICY ValidatePolicy run. It reported INVALID_ACTION for the
+# negative controls lambda:CreateFunctionNotReal and the plausible
+# lambda:UpdateFunctionVpcConfig, and INVALID_SERVICE_CONDITION_KEY for
+# lambda:VpcIdsNotReal and lambda:SubnetIdNotReal, and none of the names below.
+# The lambda service-reference JSON lists the three keys as ActionConditionKeys
+# of both actions, lambda:VpcIds as String and the other two as ArrayOfString.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "lambda:CreateFunction",
+    "lambda:UpdateFunctionConfiguration",
+}
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "lambda:VpcIds",
+    "lambda:SubnetIds",
+    "lambda:SecurityGroupIds",
+}
+
+# Verified on 2026-10-04 for SM-39's Lambda network connector guardrail with one
+# SERVICE_CONTROL_POLICY ValidatePolicy run. It reported INVALID_ACTION for the
+# negative control lambda:CreateNetworkConnectorz at Action index 2 and nothing
+# at indexes 0 and 1. The lambda service-reference JSON lists both actions, and
+# lambda:SubnetIds and lambda:SecurityGroupIds as ActionConditionKeys of
+# CreateNetworkConnector only.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "lambda:CreateNetworkConnector",
+    "lambda:UpdateNetworkConnector",
+}
+
+# AC-18 reads CloudTrail Lake event data stores. validate-policy on 2026-10-03
+# reported the negative control cloudtrail:GetEventDataStorez as INVALID_ACTION
+# at Action index 2 and nothing at indexes 0 and 1. Both names are also in the
+# cloudtrail service reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "cloudtrail:ListEventDataStores",
+    "cloudtrail:GetEventDataStore",
+}
+
+# AC-22 lists each sink's attached links and the organization's accounts.
+# validate-policy on 2026-10-03 reported the negative control
+# oam:ListAttachedLinkz as INVALID_ACTION at Action index 2 and nothing at
+# indexes 0 and 1. Both names are also in the oam and organizations service
+# reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "oam:ListAttachedLinks",
+    "organizations:ListAccounts",
+}
+
+# AC-06 names s3:GetBucketOwnershipControls in its retry text. validate-policy
+# on 2026-10-03 reported nothing for it, in the same run that reported
+# INVALID_ACTION for the negative control logs:DescribeSubscriptionFilterz, and
+# it is in the s3 service reference JSON with the bucket resource type.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3:GetBucketOwnershipControls"}
+
+# AC-26 follows each log group's subscription filters to a Firehose stream and
+# its archive bucket. validate-policy on 2026-10-03 reported nothing for each
+# of these names alone and INVALID_ACTION for the negative control
+# logs:DescribeSubscriptionFilterz. All three are in the logs, firehose and s3
+# service reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "logs:DescribeSubscriptionFilters",
+    "firehose:DescribeDeliveryStream",
+    "s3:GetBucketObjectLockConfiguration",
+}
+
+# AC-26 follows a subscription filter to a CloudWatch Logs destination.
+# validate-policy on 2026-10-03 reported INVALID_ACTION only at Action index 1,
+# the negative control logs:DescribeDestinationz, and nothing at index 0. The
+# name is in the logs service reference JSON with no resource type.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"logs:DescribeDestinations"}
+
+# AC-49 reads where each reached firewall sends its ALERT log. validate-policy
+# on 2026-10-03 reported INVALID_ACTION only at Action index 1, the negative
+# control network-firewall:DescribeLoggingConfiguratioz, and nothing at index
+# 0. The name is in the network-firewall service reference JSON with the
+# Firewall resource type.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"network-firewall:DescribeLoggingConfiguration"}
+
+# AC-06 names s3:PutObject in the fix text of its recording write SCP row.
+# validate-policy on 2026-10-03 reported nothing at Action index 0 and
+# INVALID_ACTION for the negative control s3:PutObjectz at index 1 of the same
+# statement. It is in the s3 service reference JSON with the object resource
+# type.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3:PutObject"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

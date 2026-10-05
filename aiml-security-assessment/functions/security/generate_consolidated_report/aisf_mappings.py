@@ -7,7 +7,7 @@ for it. Every row in this module is a relabelling of a verdict an incumbent
 check already produced, computed at consolidation time by
 `derive_aisf_findings()`.
 
-Why derived rather than a producing module: all eight AISF controls handled here
+Why derived rather than a producing module: all three AISF controls handled here
 carry verdict `covered` in `aisf-parity/AISF-WORK-LEDGER.md`, which means an
 incumbent check already asserts the control exactly. There is nothing new to
 call. A control whose ledger verdict is `tighten` must NOT be added here: the
@@ -20,6 +20,9 @@ append-only: a new control takes the next free `AISF-` number. Reusing or
 resequencing an id silently rewrites the meaning of every archived report and
 CSV that already carries it. `AISF-00` is reserved for the coverage marker row
 emitted by `derive_aisf_findings()` and must never be allocated to a control.
+An id removed from the map moves to `RETIRED_AISF_IDS` and is never
+reallocated either, so the next control takes the number after the highest id
+in the two together.
 
 The control text (risk, severity, resolution, reference) is baked into the literal
 because the AISF repository is not on the Lambda's filesystem at runtime.
@@ -89,52 +92,35 @@ SEVERITY_COLLAPSE_NOTE = {
 # AGENTS.md:132: a row that asserts nothing must not carry High/Medium.
 NA_SEVERITY = "Informational"
 
+# Ids removed from AISF_DERIVED_MAP, each with the control it named and why.
+# Allocated for good: none of these may be given to another control. The five
+# below left the map when their ledger verdict became `tighten`, because a
+# restated Passed would claim the whole control.
+RETIRED_AISF_IDS: Dict[str, Dict[str, str]] = {
+    "AISF-01": {
+        "control": "AIR-ACR-GW-01",
+        "reason": "the incumbent asserts only part of the control",
+    },
+    "AISF-02": {
+        "control": "AIR-ACR-RT-09",
+        "reason": "the incumbent asserts only part of the control",
+    },
+    "AISF-03": {
+        "control": "AIR-BDR-GRD-01",
+        "reason": "the incumbent asserts only part of the control",
+    },
+    "AISF-04": {
+        "control": "AIR-BDR-GRD-03",
+        "reason": "the incumbent asserts only part of the control",
+    },
+    "AISF-06": {
+        "control": "AIR-BDR-MDL-10",
+        "reason": "the incumbent asserts only part of the control",
+    },
+}
+
 # Append-only. See the module docstring: ids are allocated once, never renumbered.
 AISF_DERIVED_MAP: List[Dict[str, Any]] = [
-    {
-        "check_id": "AISF-01",
-        "control": "AIR-ACR-GW-01",
-        # ledger verdict: covered. incumbents: AG-24
-        "sources": ["AG-24"],
-        "finding": "AISF AIR-ACR-GW-01: AgentCore Gateway Inbound Authorization",
-        "risk": "critical",
-        "severity": "High",
-        "resolution": "Require a real inbound authorizer on every production Gateway: set authorizerType to CUSTOM_JWT (CustomJWTAuthorizerConfiguration with an OIDC discoveryUrl plus allowedClients/allowedAudience/allowedScopes) for end-user apps, or AWS_IAM (SigV4, bedrock-agentcore:InvokeGateway) for AWS principals. Avoid NONE and AUTHENTICATE_ONLY in production — both offload authorization, so if used they REQUIRE a policy engine, interceptor, or downstream target to make the decision. Authorize the call itself with AgentCore Policy (Cedar) in ENFORCE default-deny (see AIR-ACR-POL-01) plus a fail-safe request interceptor, so tool access does not depend on the model behaving.",
-        "reference": "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-inbound-auth.html",
-    },
-    {
-        "check_id": "AISF-02",
-        "control": "AIR-ACR-RT-09",
-        # ledger verdict: covered. incumbents: AC-06
-        "sources": ["AC-06"],
-        "finding": "AISF AIR-ACR-RT-09: Agent Browser Session Forensic Record",
-        "risk": "medium",
-        "severity": "Medium",
-        "resolution": "Create the browser tool with session recording enabled — recording.enabled plus an s3Location (bucket + prefix) on CreateBrowser, and an execution role allowed to write there — because it is a create-time property of a custom browser, not something you can switch on after an incident. Recording captures far more than page URLs: session DOM changes and mutations, user actions including clicks, scrolls and form interactions, console logs and error messages, Chrome DevTools Protocol events, and network events and HTTP requests, which is what lets a responder reconstruct what the agent actually did rather than infer it. Add Live View for real-time monitoring of an in-flight session, including taking over or releasing control from the automation, which doubles as a containment step. Then treat the recording bucket as one of the most sensitive stores in the workload — it holds the rendered DOM and form input of authenticated sessions, laid out as s3://bucket/prefix/session-id/batch_N.ndjson.gz — so apply KMS encryption, Block Public Access, a TLS-only bucket policy, tight read access for responders only, and a retention/lifecycle rule. Do NOT plan on CloudTrail for the in-session detail: AgentCore's only data-event resource type is AWS::BedrockAgentCore::Gateway, so there are no Browser data events; CloudTrail gives you the control-plane and session-start record, and the recording plus CloudWatch spans give you the rest.",
-        "reference": "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/browser-session-recording.html",
-    },
-    {
-        "check_id": "AISF-03",
-        "control": "AIR-BDR-GRD-01",
-        # ledger verdict: covered. incumbents: BR-10
-        "sources": ["BR-10"],
-        "finding": "AISF AIR-BDR-GRD-01: Guardrail Enforced on Model Input and Output",
-        "risk": "critical",
-        "severity": "High",
-        "resolution": "Attach an Amazon Bedrock Guardrail to every production use case and enforce it on both the input and output path by passing guardrailIdentifier and guardrailVersion on each Converse or InvokeModel call — both are required together, and the request is rejected if contentType is not application/json. For self-hosted or third-party models that do not run through Bedrock inference, call the ApplyGuardrail API directly instead — once with source=INPUT before the model sees the prompt, and again with source=OUTPUT before the response reaches the user. Make enforcement mandatory rather than optional per application: deny bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream unless the bedrock:GuardrailIdentifier condition key matches your approved guardrail, so an application cannot simply omit the parameter.",
-        "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html",
-    },
-    {
-        "check_id": "AISF-04",
-        "control": "AIR-BDR-GRD-03",
-        # ledger verdict: covered. incumbents: BR-26
-        "sources": ["BR-26"],
-        "finding": "AISF AIR-BDR-GRD-03: Sensitive Data Output Filtering",
-        "risk": "critical",
-        "severity": "High",
-        "resolution": "Configure the Guardrail sensitive-information filter (sensitiveInformationPolicyConfig) with the required PII entity types (piiEntitiesConfig) set to BLOCK or ANONYMIZE on the output path, and add custom regexesConfig patterns for secrets, credentials, and internal identifiers not covered by the built-in PII types; enable the same checks on the input path to stop echoed exfiltration. Verify with an ApplyGuardrail call using source=OUTPUT that the entities are detected and masked or blocked. In tool-using workloads the filter does not reach every field: it does not evaluate toolUse input parameters, toolResult content, or a toolSpec description or input schema, so PII in those fields is neither blocked nor masked — redact tool inputs and results in your own code, or pass them through ApplyGuardrail explicitly, before treating the filter as complete coverage.",
-        "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html",
-    },
     {
         "check_id": "AISF-05",
         "control": "AIR-BDR-KB-03",
@@ -145,17 +131,6 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "severity": "High",
         "resolution": "Do not assume one customer managed key covers the whole knowledge base — the default is an AWS owned key, and how far a CMK reaches depends on the vector store. On a Bedrock Managed Knowledge Base the CMK set at creation covers transient ingestion storage and the managed vector store through a Bedrock-created KMS grant, so the creating identity needs kms:CreateGrant, kms:GenerateDataKey and kms:Decrypt on that key conditioned with kms:ViaService bedrock.<region>.amazonaws.com, while the knowledge base service role needs no KMS permissions at all. On a bring-your-own vector store the Bedrock CMK covers only transient ingestion storage and the retrieval session (kmsKeyArn on RetrieveAndGenerate); it reaches the index itself only where Bedrock created that store for you (quick create for OpenSearch Serverless or Amazon S3 Vectors). Otherwise encrypt each store on its own terms: an OpenSearch Serverless collection is always encrypted at rest but uses a CMK only when an encryption policy sets AWSOwnedKey false with KmsARN (or CreateCollection names the key), and the choice is immutable — changing it means recreating the collection. Aurora pgvector inherits the DB cluster's own StorageEncrypted KMS key. Pinecone, Redis Enterprise Cloud and MongoDB Atlas are third-party SaaS that AWS KMS does not encrypt, so the AWS-side controls there are a CMK on the Secrets Manager secret holding the credentials plus TLS in transit. Set serverSideEncryptionConfiguration.kmsKeyArn on each data source. Critically, the key is not the access boundary: OpenSearch Serverless does not check a caller's permissions on the CMK, so anyone a data access policy admits can query the encrypted vectors — restrict the index with the collection's data access policy and network policy plus aoss:APIAccessAll scoped to that one collection ARN.",
         "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html",
-    },
-    {
-        "check_id": "AISF-06",
-        "control": "AIR-BDR-MDL-10",
-        # ledger verdict: covered. incumbents: BR-37
-        "sources": ["BR-37"],
-        "finding": "AISF AIR-BDR-MDL-10: Bedrock Data Retention Mode Pinned",
-        "risk": "high",
-        "severity": "High",
-        "resolution": "Set the retention mode explicitly and pin it preventively; do not rely on defaults. The mode acts as a ceiling, not a floor — a model whose allowed_modes include none still runs at zero retention regardless of the account setting — but inherit is the default for new accounts and projects, so an unconfigured account has made no decision at all. Set each account with bedrock:PutAccountDataRetention (aws bedrock put-account-data-retention --mode none), whose valid values are default, none, provider_data_share and inherit, then attach an SCP that Denies the write actions unless the mode equals your approved value. Cover both endpoints, because they publish separate condition keys: Deny bedrock:PutAccountDataRetention on StringNotEquals bedrock:DataRetentionMode, and Deny bedrock-mantle:PutAccountDataRetention plus bedrock-mantle:CreateProject and bedrock-mantle:UpdateProject on StringNotEquals bedrock-mantle:DataRetentionMode — the project actions matter because bedrock-mantle allows a per-project override that would otherwise bypass the account-level setting. Verify with GetAccountDataRetention per account rather than by reading the SCP, and check a specific model's effective mode and allowed_modes to see which scope (project, account, or model default) is actually deciding. Both checks are API- or SDK-only, because there is no console UI for data retention at launch — an assessment that goes looking for a console setting will find nothing and wrongly record the control as absent. Understand the trade-off before pinning to none: models whose only allowed mode is provider_data_share (currently Claude Mythos 5 and Claude Fable 5) become unavailable org-wide, surfacing as status unavailable in the models list rather than as an invocation error, and on the Responses API store=true is rejected while background mode is unavailable — that is the intended consequence of requiring zero retention, not a misconfiguration. Where a specific model is genuinely needed under zero retention, the documented route is a per-account, per-model ZDR exception requested through your AWS account team (Anthropic manages eligibility for Claude models), after which none appears in that model's allowed_modes for the approved account only — so treat allowed_modes as an account-specific value to be read per account, not a fixed property of the model. Two residual limits to record rather than assume away: where cross-Region inference is enabled for a retaining model, retained inputs and outputs are stored in the destination Region that processed the request, so a data-residency review has to cover the whole destination set (see AIR-BDR-MDL-03); and AWS's abuse-detection page states, without qualifying it by retention mode, that apparent CSAM in image inputs is blocked and the flagged input or output may be stored and reviewed and reported to NCMEC — so none should not be presented to an auditor as an unqualified guarantee that no content is ever stored.",
-        "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html",
     },
     {
         "check_id": "AISF-07",

@@ -7,6 +7,7 @@
   - [Architecture Diagrams](#architecture-diagrams)
   - [Two-Phase Architecture](#two-phase-architecture)
   - [Assessment Execution Workflow](#assessment-execution-workflow)
+  - [Service Selection](#service-selection)
 - [Assessment Structure](#assessment-structure)
   - [AWS Lambda Functions](#aws-lambda-functions)
 - [Adding New AI/ML Service Assessments](#adding-new-aiml-service-assessments)
@@ -15,6 +16,7 @@
   - [Step 3: Update AWS Step Functions Definition](#step-3-update-aws-step-functions-definition)
   - [Step 4: Update AWS IAM Permissions](#step-4-update-aws-iam-permissions)
   - [Step 5: Test Locally](#step-5-test-locally)
+- [Adding a New Check Inside an Existing Service](#adding-a-new-check-inside-an-existing-service)
 - [Assessment Best Practices](#assessment-best-practices)
   - [1. Security Check Implementation](#1-security-check-implementation)
   - [2. Performance Optimization](#2-performance-optimization)
@@ -23,6 +25,7 @@
   - [1. Local Testing](#1-local-testing)
   - [2. Integration Testing](#2-integration-testing)
   - [3. Multi-Account Testing](#3-multi-account-testing)
+  - [4. Report Verification](#4-report-verification-required-before-opening-a-pr)
 - [Monitoring and Debugging](#monitoring-and-debugging)
 - [Development Roadmap](#development-roadmap)
   - [Current Status](#current-status)
@@ -32,6 +35,8 @@
   - [Shared Template Module](#shared-template-module)
   - [How It Works](#how-it-works)
   - [Modifying the Report Template](#modifying-the-report-template)
+- [Extending or Adding Lenses](#extending-or-adding-lenses)
+- [Adding a Compliance Standard (OWASP-style)](#adding-a-compliance-standard-owasp-style)
 - [Documentation and Screenshots](#documentation-and-screenshots)
   - [Updating Sample Reports](#updating-sample-reports)
   - [Documentation Best Practices](#documentation-best-practices)
@@ -277,6 +282,65 @@ sample-aiml-security-assessment/
 }
 ```
 
+### Service Selection
+
+`EnableBedrockAssessment`, `EnableSageMakerAssessment`,
+`EnableAgentCoreAssessment`, and `EnableAgentRegistryAssessment` are string
+parameters accepting `true` or `false`, defaulting to `true`. Both SAM templates
+substitute these values into the initial `Configure Service Assessments` Pass
+state. It writes `$.ServiceSelection` before cleanup and region resolution; the
+regional Choice gates read that map through `$.OriginalInput.ServiceSelection`.
+This keeps direct SAM executions consistent with CodeBuild deployments and
+prevents execution input from overriding a deployment's selected scope.
+
+Both top-level deployment templates expose the switches as `ENABLE_BEDROCK`,
+`ENABLE_SAGEMAKER`, `ENABLE_AGENTCORE`, and `ENABLE_AGENT_REGISTRY` CodeBuild
+variables. The root `buildspec.yml` validates and forwards them to all three SAM
+deployment sites (member, management, and single account). Its artifact checks
+require CSVs only for enabled services. No change to the member-role StackSet
+is needed; this feature adds no API calls or IAM permissions.
+
+The report Lambda validates every selected service's CSV for every resolved
+region, but does not require deselected artifacts. Missing selected artifacts
+still fail report generation. Both report modes label deselected areas
+**Not selected**, exclude their rows, and explain reduced lens coverage.
+An all-disabled selection may produce an HTML report without service CSVs.
+
+Agentic AI rows come only from selected source assessments (Bedrock, AgentCore,
+and Agent Registry). OWASP receives the same selection map and skips reads of
+deselected source CSVs, while preserving missing-artifact notices for selected
+sources. Its native checks and Responsible AI GRC dependency still run when
+OWASP is enabled. Responsible AI GRC remains independently controlled and can
+scan services omitted from the direct-service selection. Neither service
+selection nor a skipped branch removes deployed Lambdas or IAM policies.
+
+The post-build phase independently reapplies default-enabled flags for older
+CodeBuild projects with no service-selection environment variables. Artifact
+validation must still reject missing selected-service CSVs in that upgrade path.
+
+OWASP reads only BR/SM/AC direct evidence, never Agent Registry CSVs. For each
+OW ID whose mapped sources include a deselected service, it emits one
+N/A/Informational selection-coverage row per regional invocation. Existing rows
+from remaining sources are preserved; a sole-source control such as OW-07 stays
+visible as unassessed when Bedrock is off. Missing selected artifacts still use
+OW-00 and are not conflated with intentional deselection.
+
+GRC intentionally remains independent and can call deselected services' APIs.
+It also runs when OWASP alone is enabled. Disable both optional areas to run
+only the selected direct assessments. GRC remediation must be self-contained
+rather than refer to a direct-service check that might have been omitted.
+
+Direct-service scores exclude GRC, Agentic AI, and compliance rows. Changing
+selection changes the score denominator and can raise or lower the pass rate;
+compare reports with the same scope. Central buckets retain historical CSVs;
+downstream readers must filter by execution ID, as the consolidation path does.
+
+Catalog totals describe the available controls, not the number executed by every
+selection. The default sample reports still illustrate all services enabled.
+Regression coverage in `tests/test_service_selection.py` exercises all 16 direct
+service combinations, both deployment paths, artifact requirements, OWASP source
+selection, and single-/multi-account reporting.
+
 ## Assessment Structure
 
 The framework includes **162 core security checks** across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, plus **39 always-on Agentic AI Security checks**, **64 optional Responsible AI GRC checks** when `EnableResponsibleAIGRCAssessment` is enabled, and **12 optional OWASP Top 10 for LLM checks** when `EnableOWASPAssessment` is enabled. For the complete list of checks with descriptions, see the [Security Checks Reference](SECURITY_CHECKS.md).
@@ -454,8 +518,8 @@ def check_new_service_security(permission_cache, region: str = ""):
 
 ```txt
 # requirements.txt
-boto3==1.43.85
-botocore==1.43.85
+boto3==1.43.108
+botocore==1.43.108
 ```
 
 1. **Create Schema File**:
@@ -610,31 +674,34 @@ sam local invoke ComprehendSecurityAssessmentFunction --event testfile.json
 
 Most day-to-day contributions add or update individual security checks inside the existing assessment packages (Bedrock, SageMaker, AgentCore, or AWS Agent Registry) rather than creating an entire new service package.
 
-1. **Locate the target file**: Choose `bedrock_assessments/app.py`, `sagemaker_assessments/app.py`, `agentcore_assessments/app.py`, or `agent_registry_assessments/app.py`. New checks must follow the existing function structure and naming patterns inside that file.
+1. **Define the check contract before coding**: Record the `Check_ID`, exact resource and regional or account-global scope, AWS client and operation, response field and allowed values, successful empty-response behavior, and what evidence produces `Passed`, `Failed`, or `N/A`. Verify the request/response shape and enum values against the installed botocore service model and AWS documentation. An HTTP 200 or an empty response does not establish compliance; distinguish account-level policies from resource-level settings. Compare the resulting predicate with the catalog description and remediation before writing tests.
 
-2. **Implement the check**: Write a function that returns a dict with a `"csv_data"` list of findings. Always pass `region=region` (or the loop variable) to every `create_finding()` call. Use the shared `schema.py` helpers where present.
+2. **Locate the target file**: Choose `bedrock_assessments/app.py`, `sagemaker_assessments/app.py`, `agentcore_assessments/app.py`, or `agent_registry_assessments/app.py`. New checks must follow the existing function structure and naming patterns inside that file.
 
-3. **Status and severity semantics** (critical):
+3. **Implement the check**: Write a function that returns a dict with a `"csv_data"` list of findings. Always pass `region=region` (or the loop variable) to every `create_finding()` call. Use the shared `schema.py` helpers where present. Keep each check's ID consistent in normal findings and handler fallback/error findings.
+
+4. **Status and severity semantics** (critical):
    - Access-denied, region-unavailable, or "service not present" paths must return `status="N/A"`. Unsupported regional APIs and features are `Informational`; follow the target package's severity convention for access-denied and other could-not-assess results (Responsible AI GRC uses `Low`).
    - Use the `is_region_unsupported()` and `describe_api_error()` helpers in `bedrock_assessments/app.py` (or equivalent patterns) instead of raw string matching.
    - Never emit a row with `status="Failed"` and `resolution="No action required"`.
+   - A completed empty inventory needs an explicit `N/A` row for each affected check. An access-denied or partial inventory must not claim that no resources exist. Keep `Passed` resolution text free of remediation instructions.
    - For optional policy baselines (e.g., `REQUIRE_MARKETPLACE_ENDPOINT_CMK=false`), emit `N/A` + `Informational` when the hardening gap is observed; reserve `Passed` only for controls that were checked and satisfied.
 
-4. **Pagination and error isolation**: Use `get_paginator()` or the `_agentcore_list_all` pattern for list APIs. Wrap per-resource detail calls in individual try/except blocks so one throttle or delete-race does not abort the whole check.
+5. **Inventory scope, pagination, and error isolation**: Use `get_paginator()` or the `_agentcore_list_all` pattern for list APIs, and test a non-compliant item on a later page. If a safety cap or deadline truncates the list, retain the findings collected and add an `N/A` incomplete-inventory notice; do not claim "all resources" passed. Wrap per-resource detail calls in individual try/except blocks so one throttle or delete race does not erase other resources' findings. Run account-global inventories once or de-duplicate them with a truthful `Region` value.
 
-5. **Synthesized mappings** (if applicable): If the new check should also appear under the Agentic AI lens (AG- prefix) or an OWASP category, update the corresponding mapping dictionary. Values in `OWASP_CHECK_MAPPINGS` are lists because one source check can emit multiple OW- rows. Allocate new AG numbers by hand across the Bedrock, AgentCore, and Agent Registry mapping files and native checks to avoid collisions (current catalog ends at AG-38).
+6. **Synthesized mappings** (if applicable): If the new check should also appear under the Agentic AI lens (AG- prefix) or an OWASP category, update the corresponding mapping dictionary. Values in `OWASP_CHECK_MAPPINGS` are lists because one source check can emit multiple OW- rows. Allocate new AG numbers by hand across the Bedrock, AgentCore, and Agent Registry mapping files and native checks to avoid collisions (current catalog ends at AG-38).
 
-6. **Add tests**: Every new check requires at least four cases: compliant (Passed), non-compliant (Failed), no-resource (N/A), and access-denied / API-unavailable. Shared inventory checks also need list-error and per-resource detail-error tests. See `tests/test_bedrock_checks.py` and `tests/test_sagemaker_checks.py` for patterns.
+7. **Add tests**: Use SDK-shaped responses for compliant/pass, non-compliant/fail (or advisory `N/A` when that is the defined result), no-resource, access-denied, region-unavailable, and unexpected-error cases, including a successful empty response when the API can return one. Empty-inventory tests alone do not exercise a check's compliance predicate. Shared inventories need later-page, list-error, and per-resource detail-error cases; account-global inventories need a two-region case. Assert the exact `Check_ID` on fallback rows and that a failed check leaves the other checks' rows in the CSV. See `tests/test_bedrock_checks.py` and `tests/test_sagemaker_checks.py` for patterns.
 
-7. **Update documentation**: Add the check description, severity rationale, and remediation steps to `docs/SECURITY_CHECKS.md` (or the matching file under `docs/SECURITY_CHECKS_*.md`). Keep the check counts in README.md and DEVELOPER_GUIDE.md in sync.
+8. **Update documentation**: Align the check's actual evidence, resource scope, status behavior, severity, and remediation with `docs/SECURITY_CHECKS.md` and the applicable `docs/SECURITY_CHECKS_*.md` catalog. Review `README.md`, this guide, `docs/TROUBLESHOOTING.md`, `CHANGELOG.md`, and relevant scope, sample-report, and diagram documents; update every changed count, table-of-contents entry, prefix table, and deep link. Do not promise a control or report state the implementation does not establish.
 
-8. **Run the gates before committing**:
+9. **Run the gates before committing**:
    - `ruff check` and `ruff format --check` only on the changed `.py` files (match CI scope).
    - The three required pytest sessions: `tests/` (which includes `test_consolidate_responsible_ai_grc.py`), `responsible_ai_grc_tests/`, and the report-pipeline session.
    - `cfn-lint` on any edited templates.
-   - Full review checklist in [AGENTS.md](../AGENTS.md): validate each new assessment API grant in both SAM templates on the owning Lambda role, and do not add assessment-runtime APIs to deployment or member roles. Also review API names, status semantics, mapping drift, CSV schema, and the remaining checklist items.
+   - Full review checklist in [AGENTS.md](../AGENTS.md): validate each new assessment API grant in both SAM templates on the owning Lambda role. For a new Lambda, add it to IAM coverage tests; include every S3 artifact producer and list/read consumer. Do not add assessment-runtime APIs to deployment or member roles. Also review API names, status semantics, mapping drift, CSV schema, and the remaining checklist items.
 
-9. **Generate and verify the HTML report** (mandatory before opening a PR): Follow the Report Verification steps in the [Testing Your Extensions](#4-report-verification-required-before-opening-a-pr) section. Open the generated reports and confirm your new check renders correctly in the table, sidebar, filters, and both light/dark modes.
+10. **Generate and verify the HTML report** (mandatory before opening a PR): Follow the Report Verification steps in the [Testing Your Extensions](#4-report-verification-required-before-opening-a-pr) section. Open the generated reports and confirm your new check renders correctly in the table, sidebar, filters, and both light/dark modes.
 
 ## Assessment Best Practices
 
@@ -664,33 +731,21 @@ Most day-to-day contributions add or update individual security checks inside th
 
 ### 3. Error Handling
 
-```python
-try:
-    # Assessment logic
-    result = aws_client.describe_service()
-except ClientError as e:
-    # Access-denied and region-unsupported paths resolve to N/A, not Failed:
-    # the check could not run, which is not a confirmed misconfiguration.
-    if e.response["Error"]["Code"] in ACCESS_DENIED_ERROR_CODES:
-        logger.warning(f"Access denied for service check: {str(e)}")
-        return create_finding(
-            finding_name="Permission Check",
-            finding_details=describe_api_error(e, "Service check", region),
-            resolution="Grant required permissions to assessment role",
-            reference="https://docs.aws.amazon.com/service/permissions",
-            severity="Informational",
-            status="N/A",
-            region=region,
-        )
-    else:
-        # Handle other AWS errors
-        logger.error(f"AWS API error: {str(e)}")
-        raise
-except Exception as e:
-    # Handle unexpected errors
-    logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-    raise
-```
+- Handle expected access-denied, unsupported-region, empty-response, and
+  resource-deleted cases at the level where their meaning is known. Do not
+  classify credential failures or programming errors as region unavailability.
+- Isolate detail calls per resource. A transient error on one item should add
+  an `N/A` incomplete row for that item while preserving findings already
+  collected. A confirmed delete race may be skipped.
+- Wrap each check call in the handler so an unexpected exception becomes one
+  visible `N/A` "Incomplete" row under the **same `Check_ID`** and the handler
+  still writes its CSV. See `_run_check_safely()` in
+  `agent_registry_assessments/app.py`. An exception escaping at check scope
+  can abort every subsequent check.
+- Let an artifact-write failure raise after logging so Step Functions can
+  enter its `Catch` path. Returning `{"statusCode": 500}` without raising
+  makes the Lambda invocation appear successful and can leave the report
+  without a visible assessment result.
 
 ## Testing Your Extensions
 
@@ -740,6 +795,10 @@ The generated reports are written under `aiml-security-assessment/functions/secu
   - Core service checks (BR-*, SM-*, AC-*) appear under "By Service".
   - AG-* findings appear under "By Lens" → Agentic AI Security.
   - OW-*, and any new NR-*/EU-* standards appear under "By Compliance Standard".
+- For a new compliance standard, its sidebar link, filter option, dashboard
+  card, findings section, Assessment Scope chip, and source link use the same
+  report slug and show the right counts and scope. A disabled standard does
+  not appear as an empty or clean assessment.
 - Filters (region, severity, status, search) continue to work for both existing and new rows.
 - Long finding details or remediation text do not overflow or break the table layout.
 - Dark mode, responsive design, and the executive dashboard summary reflect the new content accurately.
@@ -819,15 +878,16 @@ The Agentic AI Security lens (AG-01 through AG-38) is **synthesized at runtime**
 - Native checks (currently AG-24 through AG-27) are implemented directly inside the AgentCore assessment package because they require the `bedrock-agentcore-control` client.
 - When adding new AG checks, manually allocate numbers to avoid collisions across all three mapping dictionaries and the native checks. The current high-water mark for the catalog is AG-39.
 - The HTML report routes the lens through the `AG-` prefix as its dedicated Agentic AI assessment area. `COMPLIANCE_STANDARDS` is the separate registry for OWASP and future compliance standards.
-- Follow the same seven-site wiring checklist as a new compliance standard (CloudFormation parameters are not required for the always-on Agentic lens, but any new native checks still need IAM grants in both SAM runtime templates).
+- Follow the same cross-file execution, artifact, and report checks as a new compliance standard (CloudFormation parameters are not required for the always-on Agentic lens, but any new native checks still need IAM grants in both SAM runtime templates).
 - Update `docs/SECURITY_CHECKS.md` and run the full mapping-drift, test-coverage, and gate checklist before merging.
 - **Generate and verify the HTML report** (mandatory before opening a PR): Follow the Report Verification steps in the [Testing Your Extensions](#4-report-verification-required-before-opening-a-pr) section. Confirm AG-* findings appear under the correct lens section, with proper severity and routing.
 
 ## Adding a Compliance Standard (OWASP-style)
 
-The "By Compliance Standard" sidebar section is **data-driven**. Adding a
-new standard such as NIST AI RMF or the EU AI Act follows the OWASP pattern
-end-to-end. Concrete steps:
+The HTML presentation under "By Compliance Standard" is **data-driven**.
+Adding a new standard such as NIST AI RMF or the EU AI Act follows the OWASP
+pattern, but the execution flag, artifact access, and required-artifact checks
+must also be wired. Concrete steps:
 
 1. **Choose a 2–3 letter prefix** that satisfies `^[A-Z]{2,3}-\d{2}$`:
    - OWASP → `OW-` (already implemented)
@@ -840,25 +900,41 @@ end-to-end. Concrete steps:
    - Author `app.py` following the OWASP pattern: read per-service CSVs
      from S3, apply your `<STANDARD>_CHECK_MAPPINGS` dict, run any native
      checks, write `<slug>_security_report_<execution>_<region>.csv`.
+   - For every native control, complete the
+     [check contract and test cases](#adding-a-new-check-inside-an-existing-service)
+     above. Do not treat a rendered row as proof that its AWS API predicate
+     is correct.
 
-3. **Wire the CloudFormation opt-in parameter** in seven places, following
-   the `EnableOWASPAssessment` model:
+3. **Wire the opt-in flag through deployment and execution**, following the
+   `EnableOWASPAssessment` deployment pattern:
    - `deployment/aiml-security-single-account.yaml` (parameter definition,
      parameter group, CodeBuild env var)
    - `deployment/2-aiml-security-codebuild.yaml` (parameter definition,
      parameter group, CodeBuild env var)
-   - `buildspec.yml` (`ENABLE_<STANDARD>` export and the three `aws
-     stepfunctions start-execution` calls)
+   - `buildspec.yml` (`ENABLE_<STANDARD>` export and every applicable
+     `aws stepfunctions start-execution` input)
    - `aiml-security-assessment/template.yaml` (new function resource,
-     `LambdaInvokePolicy`, definition-substitution entry)
+     `LambdaInvokePolicy`, definition-substitution entry, and any SAM-level
+     parameter exposed for direct deployments)
    - `aiml-security-assessment/template-multi-account.yaml` (same)
+   - `aiml-security-assessment/statemachine/assessments.asl.json` (flag
+     reference and enabled/skipped branches; see step 5)
+   Verify that any declared SAM parameter is consumed by the state machine.
+   A direct `StartExecution` must supply the flag in its input when the
+   state machine expects it; a CodeBuild environment variable alone does not
+   set that direct-execution input.
 
-4. **Add IAM grants** for any AWS APIs the new Lambda calls in the two SAM
-   runtime templates per [AGENTS.md](../AGENTS.md). Scope each grant correctly:
+4. **Add IAM grants for APIs and CSV artifacts** in the two SAM runtime
+   templates per [AGENTS.md](../AGENTS.md). Scope each grant correctly:
    - In `aiml-security-assessment/template.yaml` and
      `aiml-security-assessment/template-multi-account.yaml`, add the grant
      to the **specific function's `Policies` block** that actually makes
      the call — not to another function's policy.
+   - Grant the new Lambda write access to its exact CSV key pattern. For
+     each Lambda that consumes the CSV, including the report Lambda, add
+     `s3:ListBucket` on the relevant prefix when it lists keys and
+     `s3:GetObject` on the matching object ARN when it reads them. Check
+     both SAM templates and any source-CSV readers.
    - Do **not** add assessment-service read actions to
      `deployment/1-aiml-security-member-roles.yaml`,
      `deployment/2-aiml-security-codebuild.yaml`, or
@@ -878,21 +954,47 @@ end-to-end. Concrete steps:
      new function.
    - Chain: `Run Security Assessments (Parallel)` → `OWASP Enabled?` →
      ... → `<Standard> Enabled?` → ... → back to the region map end.
+     Replace `End: true` with `Next` on each preceding success, skipped, or
+     incomplete route that must reach the new choice.
+   - Preserve `OriginalInput`, `Execution`, `Region`, `RegionIndex`, and other
+     downstream fields across success, skipped, and caught-error paths.
+     Set `ResultPath` explicitly on result-producing Task/Pass states and
+     on `Catch`; a `Catch` `ResultPath` does not protect the success path.
+     Test each path through the next `Choice` and report-generation state.
 
 6. **Register the standard in the report** by appending a new dict to
    `COMPLIANCE_STANDARDS` in `report_template.py`. Each entry needs
    `slug`, `name`, `prefix`, `icon`, `icon_small`, `reference_url`,
-   `section_title`, and `scope_text`. Choose an icon colour that does not
-   clash with `--warning` (used by "By Lens"), `--accent` (used by "By
-   Industry"), or `--success` (used by OWASP).
+   `section_title`, and truthful `scope_text`. The `slug` and Check_ID
+   prefix must be unique. Choose an icon colour distinct from the existing
+   report navigation colours.
+   - The shared loop in `generate_html_report()` builds the "By Compliance
+     Standard" sidebar entry, filter option, dashboard card, findings
+     section and summary, Assessment Scope chip, and source link when
+     the standard has rows. Extend this registry instead of copying an
+     OWASP-specific HTML block.
+   - If the HTML structure itself must change, edit the shared loop and any
+     affected `get_html_template()` placeholders together. Keep one `slug` across
+     the section `id`, finding-row `data-service`, filter option value,
+     summary `data-filter-service`, and scope-chip `data-scope-service`.
+     Review affected CSS/JavaScript selectors. The Assessment Scope block
+     also uses exact `str.replace()` anchors after rendering; update those
+     anchors when changing their source markup, since a missed match fails
+     silently.
 
-7. **Wire up the two sites the loops do not cover.** Routing itself is
-   data-driven: the report generator
+7. **Check both routing and artifact completeness.** The report generator
    (`aiml-security-assessment/functions/security/generate_consolidated_report/app.py`)
    and the multi-account consolidator (`consolidate_html_reports.py`) both
    iterate `COMPLIANCE_STANDARDS` to initialise `service_stats` /
-   `service_findings` and to route by Check_ID prefix. Two things sit outside
-   those loops and must be handled by hand:
+   `service_findings` and to route rows by Check_ID prefix. This handles
+   presentation and row routing, but it does **not** add the new CSV to
+   the report Lambda's `per_region_categories` / `expected_artifacts`
+   validation or grant permission to list and read it. Extend those
+   selected-artifact checks, map any CSV filename fragment that differs
+   from the report slug, and verify CodeBuild stages the CSV for the
+   multi-account consolidator. A selected standard with a missing,
+   unreadable, or header-only CSV must be reported as incomplete, not
+   displayed with zero findings.
    - **The S3 read path.** `app.py` turns every registry slug into an
      `s3:ListBucket` prefix, and the report Lambda's `s3:prefix` condition in
      both SAM templates names the producing artifacts explicitly. A standard
@@ -901,11 +1003,6 @@ end-to-end. Concrete steps:
      `except ClientError` re-raises, and report generation fails for every
      category, not only the new one. `tests/test_sam_role_least_privilege.py`
      asserts the prefixes are present.
-   - **Artifact validation.** `validate_assessment_artifacts()` in `app.py`
-     builds its expected-CSV list from a hardcoded `per_region_categories`
-     dict plus the opt-in flags, not from the registry. A producing standard
-     that is not added there is never noticed as missing; its section simply
-     renders empty.
 
 8. **Update docs**: add a `SECURITY_CHECKS_<STANDARD>.md` in the OWASP
    style, bump the check count in `README.md` and `docs/SECURITY_CHECKS.md`.
@@ -934,11 +1031,22 @@ step 7 do not apply; instead:
   carries the registered prefix and is documented. See
   [SECURITY_CHECKS_AISF.md](SECURITY_CHECKS_AISF.md).
 
-9. **Add tests**: mapping emission, native-check behavior, routing, and
-   report-template rendering. See `tests/test_owasp_checks.py` and
+9. **Add tests**: mapping emission, native-check behavior, enabled/skipped
+   Step Functions paths, artifact completeness, routing, and report-template
+   rendering. Use representative synthetic CSVs with positive, negative,
+   N/A, and empty-inventory findings; test missing and unreadable artifacts
+   separately. Include IAM coverage assertions for the new Lambda and
+   report reader in both SAM templates. See `tests/test_owasp_checks.py` and
    `tests/test_report_template_owasp.py` as templates.
 
-10. **Generate and verify the HTML report** (mandatory before opening a PR): Follow the Report Verification steps in the [Testing Your Extensions](#4-report-verification-required-before-opening-a-pr) section. Because new standards are data-driven through `COMPLIANCE_STANDARDS`, confirm that the new prefix routes correctly into the "By Compliance Standard" sidebar, that findings appear with the expected severity, and that the report renders cleanly in both single- and multi-account modes.
+10. **Generate and verify the HTML report** (mandatory before opening a PR):
+    Follow the [Report Verification](#4-report-verification-required-before-opening-a-pr)
+    steps. In single- and multi-account output, check sidebar navigation,
+    filter behavior, card and section counts, severity and status, Assessment
+    Scope chips and source text, and desktop/mobile and light/dark rendering.
+    Test enabled, disabled, and empty-result cases. When changing the
+    Assessment Scope markup, verify the post-render insertion is actually
+    present in the generated HTML.
 
 ## Documentation and Screenshots
 

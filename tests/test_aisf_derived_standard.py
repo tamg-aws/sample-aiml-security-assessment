@@ -253,7 +253,7 @@ class TestRegistryEntry(unittest.TestCase):
         """
         ids = [m["check_id"] for m in aisf_mappings.AISF_DERIVED_MAP]
         ids.append(aisf_mappings.AISF_COVERAGE_CHECK_ID)
-        self.assertEqual(len(ids), 9)
+        self.assertEqual(len(ids), 4)
         for check_id in ids:
             self.assertRegex(check_id, AISF_ID_PATTERN)
             self.assertTrue(check_id.startswith(_entry("aisf")["prefix"]), check_id)
@@ -282,6 +282,101 @@ class TestRegistryEntry(unittest.TestCase):
                 severity="Low",
                 status="Passed",
             )
+
+
+class TestRetiredIds(unittest.TestCase):
+    """Five ids left the map when their controls' ledger verdict became `tighten`.
+
+    Each incumbent asserts only part of its control, so restating its Passed under
+    the AISF id would publish a pass the assessment never earned. The ids stay
+    allocated: an archived report that carries one must keep meaning that control.
+    """
+
+    RETIRED = {
+        "AISF-01": ("AIR-ACR-GW-01", ["AG-24"]),
+        "AISF-02": ("AIR-ACR-RT-09", ["AC-06"]),
+        "AISF-03": ("AIR-BDR-GRD-01", ["BR-10"]),
+        "AISF-04": ("AIR-BDR-GRD-03", ["BR-26"]),
+        "AISF-06": ("AIR-BDR-MDL-10", ["BR-37"]),
+    }
+    REMAINING = {
+        "AISF-05": ("AIR-BDR-KB-03", ["BR-20"]),
+        "AISF-07": ("AIR-SGM-EP-08", ["SM-18", "SM-42"]),
+        "AISF-08": ("AIR-SGM-TRN-05", ["SM-09", "SM-01", "SM-03"]),
+    }
+
+    def test_the_retired_ids_are_recorded_with_their_controls(self):
+        self.assertEqual(
+            {
+                cid: entry["control"]
+                for cid, entry in aisf_mappings.RETIRED_AISF_IDS.items()
+            },
+            {cid: control for cid, (control, _) in self.RETIRED.items()},
+        )
+        for cid, entry in aisf_mappings.RETIRED_AISF_IDS.items():
+            self.assertEqual(
+                entry["reason"],
+                "the incumbent asserts only part of the control",
+                msg=cid,
+            )
+
+    def test_no_retired_id_or_control_is_in_the_map(self):
+        ids = {m["check_id"] for m in aisf_mappings.AISF_DERIVED_MAP}
+        controls = {m["control"] for m in aisf_mappings.AISF_DERIVED_MAP}
+        for cid, entry in aisf_mappings.RETIRED_AISF_IDS.items():
+            self.assertNotIn(cid, ids)
+            self.assertNotIn(entry["control"], controls, msg=cid)
+        self.assertNotIn(
+            aisf_mappings.AISF_COVERAGE_CHECK_ID, aisf_mappings.RETIRED_AISF_IDS
+        )
+
+    def test_no_row_is_derived_from_a_retired_ids_sources(self):
+        """Every former source present at every status, and no AISF row at all."""
+        for status in ("Passed", "Failed", "N/A"):
+            rows = aisf_mappings.derive_aisf_findings(
+                [
+                    _source_row(source, status)
+                    for _, sources in self.RETIRED.values()
+                    for source in sources
+                ]
+            )
+            self.assertEqual(rows, [], msg=status)
+
+    def test_a_retired_id_is_not_derived_beside_the_remaining_ones(self):
+        every_source = [
+            source
+            for _, sources in (*self.RETIRED.values(), *self.REMAINING.values())
+            for source in sources
+        ]
+        emitted = {
+            r["Check_ID"]
+            for r in aisf_mappings.derive_aisf_findings(
+                [_source_row(source) for source in every_source]
+            )
+        }
+        self.assertEqual(emitted, set(self.REMAINING))
+        self.assertFalse(emitted & set(aisf_mappings.RETIRED_AISF_IDS))
+
+    def test_the_next_free_id_skips_the_retired_ones(self):
+        """Allocation reads both tables, so a retired number is never handed out."""
+        taken = {m["check_id"] for m in aisf_mappings.AISF_DERIVED_MAP} | set(
+            aisf_mappings.RETIRED_AISF_IDS
+        )
+        highest = max(int(cid.split("-")[1]) for cid in taken)
+        self.assertEqual(f"AISF-{highest + 1:02d}", "AISF-09")
+        self.assertFalse(
+            {m["check_id"] for m in aisf_mappings.AISF_DERIVED_MAP}
+            & set(aisf_mappings.RETIRED_AISF_IDS)
+        )
+
+    def test_the_remaining_three_keep_their_shape(self):
+        self.assertEqual(
+            {
+                m["check_id"]: (m["control"], m["sources"])
+                for m in aisf_mappings.AISF_DERIVED_MAP
+            },
+            self.REMAINING,
+        )
 
 
 class TestSectionRendering(unittest.TestCase):
@@ -316,7 +411,7 @@ class TestSectionRendering(unittest.TestCase):
 
     def test_one_derived_row_renders_nav_item_card_and_section(self):
         kwargs = self._kwargs()
-        row = aisf_mappings.derive_aisf_findings([_source_row("BR-10", "Failed")])
+        row = aisf_mappings.derive_aisf_findings([_source_row("BR-20", "Failed")])
         aisf_rows = [r for r in row if r["_service"] == "aisf"]
         self.assertTrue(aisf_rows)
         kwargs["all_findings"] = aisf_rows
@@ -339,19 +434,19 @@ class TestSectionRendering(unittest.TestCase):
         # The scope text is injected unescaped so the emphasis renders.
         self.assertIn("<strong>not</strong> counted", html)
         # The row itself reaches the findings table.
-        self.assertIn("AIR-BDR-GRD-01", html)
+        self.assertIn("AIR-BDR-KB-03", html)
 
     def test_derived_rows_do_not_inflate_open_action_items(self):
         """AISF rows are contextual, like OWASP: they restate other verdicts."""
         kwargs = self._kwargs()
-        direct = _source_row("BR-10", "Failed")
+        direct = _source_row("BR-20", "Failed")
         direct["_service"] = "bedrock"
         derived = [
             r
             for r in aisf_mappings.derive_aisf_findings(
-                [_source_row("BR-10", "Failed")]
+                [_source_row("BR-20", "Failed")]
             )
-            if r["Check_ID"] == "AISF-03"
+            if r["Check_ID"] == "AISF-05"
         ]
         self.assertEqual(len(derived), 1)
         kwargs["all_findings"] = [direct, *derived]
@@ -372,7 +467,7 @@ class TestSectionRendering(unittest.TestCase):
 class TestDerivedRowShape(unittest.TestCase):
     def test_rows_carry_exactly_the_keys_the_report_layer_reads(self):
         rows = aisf_mappings.derive_aisf_findings(
-            [_source_row("BR-10"), _source_row("SM-09")]
+            [_source_row("BR-20"), _source_row("SM-09")]
         )
         self.assertTrue(rows)
         for row in rows:
@@ -396,10 +491,10 @@ class TestDerivedRowShape(unittest.TestCase):
 
     def test_finding_name_identifies_the_control_not_the_incumbent(self):
         rows = _derived_by_id(
-            aisf_mappings.derive_aisf_findings([_source_row("BR-10")])
+            aisf_mappings.derive_aisf_findings([_source_row("BR-20")])
         )
-        self.assertIn("AIR-BDR-GRD-01", rows["AISF-03"]["Finding"])
-        self.assertNotIn("incumbent", rows["AISF-03"]["Finding"])
+        self.assertIn("AIR-BDR-KB-03", rows["AISF-05"]["Finding"])
+        self.assertNotIn("incumbent", rows["AISF-05"]["Finding"])
 
     def test_severity_comes_from_the_control_not_the_source_row(self):
         """BR-20's own severity is irrelevant: AISF-05 carries AISF's risk band."""
@@ -448,9 +543,9 @@ class TestDerivedRowShape(unittest.TestCase):
 
     def test_a_malformed_source_row_drops_only_itself(self):
         rows = aisf_mappings.derive_aisf_findings(
-            [None, _source_row("BR-10", "Failed"), 42]
+            [None, _source_row("BR-20", "Failed"), 42]
         )
-        self.assertIn("AISF-03", _derived_by_id(rows))
+        self.assertIn("AISF-05", _derived_by_id(rows))
 
 
 class TestSeverityCollapseDisclosure(unittest.TestCase):
@@ -463,19 +558,51 @@ class TestSeverityCollapseDisclosure(unittest.TestCase):
     disclosure that lives only in the constant has not reached anyone.
     """
 
-    # Pinned deliberately. A fourth control in a renamed band also changes the
-    # sentence in docs/SECURITY_CHECKS_AISF.md that names these three, so the
-    # addition should fail here until that sentence is updated.
-    CRITICAL_IDS = {"AISF-01", "AISF-03", "AISF-04"}
+    # Pinned deliberately. The three critical controls (AISF-01, -03, -04) were
+    # retired, so no shipped mapping is in a renamed band. A control added in one
+    # also changes the sentence in docs/SECURITY_CHECKS_AISF.md that says so, so
+    # the addition should fail here until that sentence is updated.
+    CRITICAL_IDS = set()
+
+    # The disclosure path is still shipped code, so it is exercised through a
+    # critical mapping built here and added beside the real ones for each test.
+    # Its source id is one no producer emits, so it cannot join a real leg.
+    SYNTHETIC = {
+        "check_id": "AISF-98",
+        "control": "AIR-TEST-CRIT-01",
+        "sources": ["ZZ-98"],
+        "finding": "AISF AIR-TEST-CRIT-01: Synthetic Critical Control",
+        "risk": "critical",
+        "severity": "High",
+        "resolution": "Synthetic resolution.",
+        "reference": "https://docs.aws.amazon.com/",
+    }
+
+    def setUp(self):
+        patcher = patch.object(
+            aisf_mappings,
+            "AISF_DERIVED_MAP",
+            [*aisf_mappings.AISF_DERIVED_MAP, self.SYNTHETIC],
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _critical(self):
         return [m for m in aisf_mappings.AISF_DERIVED_MAP if m["risk"] == "critical"]
 
-    def test_the_critical_controls_are_the_three_the_docs_name(self):
-        self.assertEqual({m["check_id"] for m in self._critical()}, self.CRITICAL_IDS)
+    def test_no_shipped_control_is_in_a_renamed_band(self):
+        with patch.object(
+            aisf_mappings,
+            "AISF_DERIVED_MAP",
+            [m for m in aisf_mappings.AISF_DERIVED_MAP if m is not self.SYNTHETIC],
+        ):
+            self.assertEqual(
+                {m["check_id"] for m in self._critical()}, self.CRITICAL_IDS
+            )
 
     def test_every_critical_row_names_its_pre_collapse_risk(self):
         note = aisf_mappings.SEVERITY_COLLAPSE_NOTE["critical"]
+        self.assertEqual(self._critical(), [self.SYNTHETIC])
         for status, expected_severity in (
             ("Passed", "High"),
             ("Failed", "High"),
@@ -489,9 +616,20 @@ class TestSeverityCollapseDisclosure(unittest.TestCase):
                 self.assertIn(note, row["Finding_Details"], msg=label)
                 self.assertIn("critical", row["Finding_Details"], msg=label)
 
+    def test_a_critical_mapping_bakes_the_collapse_of_its_risk(self):
+        # test_baked_severity_is_the_collapse_of_the_declared_risk reads shipped
+        # mappings only, and none is critical since the retirement, so the
+        # critical row of the collapse table is held here instead.
+        self.assertEqual(self._critical(), [self.SYNTHETIC])
+        collapsed = aisf_mappings.AISF_RISK_TO_SEVERITY["critical"]
+        self.assertIn(collapsed, ALLOWED_SEVERITIES)
+        for mapping in self._critical():
+            self.assertEqual(mapping["severity"], collapsed, msg=mapping["check_id"])
+
     def test_an_na_row_says_which_severity_it_is_carrying(self):
         """Otherwise "reported as High" reads as a claim about an Informational row."""
         rows = _derived_by_id(_all_mappings_derived("N/A"))
+        self.assertTrue(self._critical())
         for mapping in self._critical():
             details = rows[mapping["check_id"]]["Finding_Details"]
             self.assertIn("carries Informational", details, msg=mapping["check_id"])
@@ -692,7 +830,7 @@ class TestNotApplicableSeverity(unittest.TestCase):
         )
         self.assertNotIn(aisf_mappings.AISF_COVERAGE_CHECK_ID, _derived_by_id(full))
 
-        partial = aisf_mappings.derive_aisf_findings([_source_row("BR-10", "Passed")])
+        partial = aisf_mappings.derive_aisf_findings([_source_row("BR-20", "Passed")])
         coverage = _derived_by_id(partial)[aisf_mappings.AISF_COVERAGE_CHECK_ID]
         self.assertEqual(coverage["Status"], "N/A")
         self.assertEqual(coverage["Severity"], "Informational")
@@ -707,22 +845,22 @@ class TestNotApplicableSeverity(unittest.TestCase):
     def test_each_join_key_is_derived_independently(self):
         rows = aisf_mappings.derive_aisf_findings(
             [
-                _source_row("BR-10", "Passed", region="us-east-1"),
-                _source_row("BR-10", "Failed", region="eu-west-1"),
+                _source_row("BR-20", "Passed", region="us-east-1"),
+                _source_row("BR-20", "Failed", region="eu-west-1"),
             ]
         )
-        by_region = {r["Region"]: r for r in rows if r["Check_ID"] == "AISF-03"}
+        by_region = {r["Region"]: r for r in rows if r["Check_ID"] == "AISF-05"}
         self.assertEqual(by_region["us-east-1"]["Status"], "Passed")
         self.assertEqual(by_region["eu-west-1"]["Status"], "Failed")
 
     def test_accounts_do_not_share_a_join_key(self):
         rows = aisf_mappings.derive_aisf_findings(
             [
-                _source_row("BR-10", "Passed", account="111122223333"),
-                _source_row("BR-10", "Failed", account="444455556666"),
+                _source_row("BR-20", "Passed", account="111122223333"),
+                _source_row("BR-20", "Failed", account="444455556666"),
             ]
         )
-        by_account = {r["Account_ID"]: r for r in rows if r["Check_ID"] == "AISF-03"}
+        by_account = {r["Account_ID"]: r for r in rows if r["Check_ID"] == "AISF-05"}
         self.assertEqual(by_account["111122223333"]["Status"], "Passed")
         self.assertEqual(by_account["444455556666"]["Status"], "Failed")
 
@@ -730,10 +868,11 @@ class TestNotApplicableSeverity(unittest.TestCase):
 class TestGlobalSourceRows(unittest.TestCase):
     """A source check's `Global` rows are account-wide and reach every Region.
 
-    `BR-37` and `SM-09` each emit one leg once per account under `Global` and
-    another per Region. The live run `ed125508` produced a `Global` Failed plus
-    a `us-east-1` Passed for `BR-37`, so a join on the literal Region published
-    `AISF-06` as Passed for `us-east-1`.
+    `SM-09` emits one leg once per account under `Global` and another per Region.
+    The live run `ed125508` produced a `Global` Failed plus a `us-east-1` Passed
+    for `BR-37`, so a join on the literal Region published the then-derived
+    `AISF-06` as Passed for `us-east-1`. That id is retired, and the single-leg
+    cases here run through `AISF-05` (`BR-20`), which takes the same fold.
     """
 
     def _by_key(self, rows, check_id):
@@ -744,36 +883,36 @@ class TestGlobalSourceRows(unittest.TestCase):
     def test_a_global_failure_fails_the_regional_verdict(self):
         rows = aisf_mappings.derive_aisf_findings(
             [
-                _source_row("BR-37", "Failed", region="Global"),
-                _source_row("BR-37", "Passed", region="us-east-1"),
+                _source_row("BR-20", "Failed", region="Global"),
+                _source_row("BR-20", "Passed", region="us-east-1"),
             ]
         )
-        row = self._by_key(rows, "AISF-06")[("111122223333", "us-east-1")]
+        row = self._by_key(rows, "AISF-05")[("111122223333", "us-east-1")]
         self.assertEqual(row["Status"], "Failed")
-        self.assertIn("BR-37 (2 findings: 1 Failed, 1 Passed)", row["Finding_Details"])
+        self.assertIn("BR-20 (2 findings: 1 Failed, 1 Passed)", row["Finding_Details"])
         self.assertIn("reported under Global", row["Finding_Details"])
 
     def test_the_global_row_reaches_every_region_of_the_account(self):
         rows = aisf_mappings.derive_aisf_findings(
             [
-                _source_row("BR-37", "Passed", region="us-east-1"),
-                _source_row("BR-37", "Failed", region="Global"),
-                _source_row("BR-37", "Passed", region="eu-west-1"),
+                _source_row("BR-20", "Passed", region="us-east-1"),
+                _source_row("BR-20", "Failed", region="Global"),
+                _source_row("BR-20", "Passed", region="eu-west-1"),
             ]
         )
-        by_key = self._by_key(rows, "AISF-06")
+        by_key = self._by_key(rows, "AISF-05")
         self.assertEqual(by_key[("111122223333", "us-east-1")]["Status"], "Failed")
         self.assertEqual(by_key[("111122223333", "eu-west-1")]["Status"], "Failed")
 
     def test_a_global_pass_leaves_a_regional_failure_failed(self):
         rows = aisf_mappings.derive_aisf_findings(
             [
-                _source_row("BR-37", "Passed", region="Global"),
-                _source_row("BR-37", "Failed", region="us-east-1"),
-                _source_row("BR-37", "Passed", region="eu-west-1"),
+                _source_row("BR-20", "Passed", region="Global"),
+                _source_row("BR-20", "Failed", region="us-east-1"),
+                _source_row("BR-20", "Passed", region="eu-west-1"),
             ]
         )
-        by_key = self._by_key(rows, "AISF-06")
+        by_key = self._by_key(rows, "AISF-05")
         self.assertEqual(by_key[("111122223333", "us-east-1")]["Status"], "Failed")
         self.assertEqual(by_key[("111122223333", "eu-west-1")]["Status"], "Passed")
 
@@ -804,21 +943,21 @@ class TestGlobalSourceRows(unittest.TestCase):
 
     def test_an_account_with_only_global_rows_keeps_its_global_key(self):
         rows = aisf_mappings.derive_aisf_findings(
-            [_source_row("BR-37", "Failed", region="Global")]
+            [_source_row("BR-20", "Failed", region="Global")]
         )
-        row = self._by_key(rows, "AISF-06")[("111122223333", "Global")]
+        row = self._by_key(rows, "AISF-05")[("111122223333", "Global")]
         self.assertEqual(row["Status"], "Failed")
         self.assertNotIn("reported under Global", row["Finding_Details"])
 
     def test_a_global_row_does_not_cross_accounts(self):
         rows = aisf_mappings.derive_aisf_findings(
             [
-                _source_row("BR-37", "Failed", region="Global", account="111122223333"),
-                _source_row("BR-37", "Passed", account="111122223333"),
-                _source_row("BR-37", "Passed", account="444455556666"),
+                _source_row("BR-20", "Failed", region="Global", account="111122223333"),
+                _source_row("BR-20", "Passed", account="111122223333"),
+                _source_row("BR-20", "Passed", account="444455556666"),
             ]
         )
-        by_key = self._by_key(rows, "AISF-06")
+        by_key = self._by_key(rows, "AISF-05")
         self.assertEqual(by_key[("111122223333", "us-east-1")]["Status"], "Failed")
         self.assertEqual(by_key[("444455556666", "us-east-1")]["Status"], "Passed")
         self.assertNotIn(
@@ -918,21 +1057,30 @@ class TestSingleAccountRouting(unittest.TestCase):
                 "account_id": "111122223333",
                 "bedrock": {
                     "bedrock_security_report_exec_us-east-1": [
-                        _source_row("BR-10", "Failed"),
                         _source_row("BR-20", "Passed"),
+                    ]
+                },
+                "sagemaker": {
+                    "sagemaker_security_report_exec_us-east-1": [
+                        _source_row("SM-18", "Failed"),
+                        _source_row("SM-42", "Passed"),
                     ]
                 },
             }
         )
         derived = _derived_by_id(captured["service_findings"]["aisf"])
-        self.assertEqual(derived["AISF-03"]["Status"], "Failed")
+        self.assertEqual(derived["AISF-07"]["Status"], "Failed")
         self.assertEqual(derived["AISF-05"]["Status"], "Passed")
         self.assertEqual(captured["service_stats"]["aisf"]["failed"], 1)
         self.assertEqual(captured["service_stats"]["aisf"]["passed"], 1)
         # And the source rows keep their own service.
         self.assertEqual(
             {f["Check_ID"] for f in captured["service_findings"]["bedrock"]},
-            {"BR-10", "BR-20"},
+            {"BR-20"},
+        )
+        self.assertEqual(
+            {f["Check_ID"] for f in captured["service_findings"]["sagemaker"]},
+            {"SM-18", "SM-42"},
         )
 
     def test_an_ai_prefixed_csv_row_routes_to_aisf_not_the_csv_category(self):
@@ -956,21 +1104,21 @@ class TestSingleAccountRouting(unittest.TestCase):
                 "account_id": "111122223333",
                 "bedrock": {
                     "bedrock_security_report_exec_us-east-1": [
-                        _source_row("BR-10", "Failed")
+                        _source_row("BR-20", "Failed")
                     ],
                     # The same CSV listed twice, as an overlapping sync would.
                     "bedrock_security_report_exec_us-east-1_copy": [
-                        _source_row("BR-10", "Failed")
+                        _source_row("BR-20", "Failed")
                     ],
                 },
             }
         )
-        ai_03 = [
+        ai_05 = [
             f
             for f in captured["service_findings"]["aisf"]
-            if f["Check_ID"] == "AISF-03"
+            if f["Check_ID"] == "AISF-05"
         ]
-        self.assertEqual(len(ai_03), 1)
+        self.assertEqual(len(ai_05), 1)
 
 
 class TestMultiAccountConsolidator(unittest.TestCase):
@@ -1014,16 +1162,16 @@ class TestMultiAccountConsolidator(unittest.TestCase):
         return captured
 
     def test_lowercase_keyed_rows_derive_correctly(self):
-        row = _source_row("BR-26", "Failed")
+        row = _source_row("BR-20", "Failed")
         row.pop("Account_ID")
         self._write("bedrock_security_report_exec_us-east-1.csv", [row])
 
         captured = self._consolidate()
 
         derived = _derived_by_id(captured["service_findings"]["aisf"])
-        self.assertEqual(derived["AISF-04"]["Status"], "Failed")
-        self.assertEqual(derived["AISF-04"]["Account_ID"], self.ACCT)
-        self.assertEqual(derived["AISF-04"]["Region"], "us-east-1")
+        self.assertEqual(derived["AISF-05"]["Status"], "Failed")
+        self.assertEqual(derived["AISF-05"]["Account_ID"], self.ACCT)
+        self.assertEqual(derived["AISF-05"]["Region"], "us-east-1")
         self.assertEqual(captured["service_stats"]["aisf"]["failed"], 1)
 
     def test_multi_leg_aggregation_survives_the_lowercase_path(self):

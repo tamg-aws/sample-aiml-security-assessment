@@ -115,16 +115,19 @@ def test_every_function_naming_a_shipped_source_is_reached_by_a_producer():
 
 
 def test_the_scan_reports_a_global_producer_the_table_drops():
-    # Control in the direction that would flatter the table: BR-37's Global rows
+    # Control in the direction that would flatter the table: SM-09's Global rows
     # come from a second function, and a table naming only the regional one
-    # must be reported.
+    # must be reported. SM-09 and not BR-37: BR-37 is no longer a shipped
+    # source since AISF-06 was retired, so the scan does not read it.
     probe = load_probe()
     table = copy.deepcopy(probe.INCUMBENTS)
-    table["BR-37"] = tuple(
-        p for p in table["BR-37"] if p[1] != "check_bedrock_data_retention_scp"
+    table["SM-09"] = tuple(
+        p
+        for p in table["SM-09"]
+        if p[1] != "check_sagemaker_notebook_access_guardrails"
     )
     assert uncovered_emitters(table, shipped_sources()) == [
-        ("BR-37", "bedrock_assessments", "check_bedrock_data_retention_scp")
+        ("SM-09", "sagemaker_assessments", "check_sagemaker_notebook_access_guardrails")
     ]
 
 
@@ -223,7 +226,7 @@ def test_both_producers_of_one_source_feed_the_row(monkeypatch, tmp_path, capsys
 
     probe = load_probe()
     calls = []
-    rc, out = _run_main(probe, monkeypatch, {"AISF-06": ["BR-37"]}, calls, tmp_path)
+    rc, out = _run_main(probe, monkeypatch, {"AISF-X": ["BR-37"]}, calls, tmp_path)
     capsys.readouterr()
     assert calls == [
         ("check_bedrock_account_data_retention", {"region": "us-east-1"}),
@@ -235,8 +238,8 @@ def test_both_producers_of_one_source_feed_the_row(monkeypatch, tmp_path, capsys
     report = json.loads(out.read_text())
     # The regional producer alone reaches Passed; the Failed comes from the
     # Global one, so a probe that ran one producer reads ONE_ONLY here.
-    assert report["rows"]["AISF-06"]["verdict"] == "BOTH"
-    assert report["rows"]["AISF-06"]["findings"] == 2
+    assert report["rows"]["AISF-X"]["verdict"] == "BOTH"
+    assert report["rows"]["AISF-X"]["findings"] == 2
     assert set(report["producer_reachability"]) == {
         "BR-37 check_bedrock_account_data_retention",
         "BR-37 check_bedrock_data_retention_scp",
