@@ -376,7 +376,10 @@ AI_SUBJECT_ROWS = [
         "Resource can match no model ARN, such as agent-alias/* or "
         "knowledge-base/*, is not counted as a model grant, and the finding "
         "claims every model in the account only for a Resource that matches "
-        "every model resource type",
+        "every model resource type. An Allow whose NotResource matches every ARN "
+        "of each model resource type the action can reach, such as "
+        "arn:aws:bedrock:*, is not counted either; bedrock-mantle:CreateInference "
+        "is judged the same way against project ARNs",
         [],
         3,
     ),
@@ -406,7 +409,12 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-44", "BR-42", "BR-43"],
-        "",
+        "BR-44 holds an unbounded Subscribe or Unsubscribe grant at N/A, not "
+        "Failed, while an attached service control policy is unread, except in "
+        "the management account, which no service control policy restricts. When "
+        "BR-42's organization leg does not block invocation, the row says what it "
+        "found: no attached model list, a list that covers only some invoke "
+        "actions, or a list that does not restrict the management account",
         [],
         3,
     ),
@@ -419,8 +427,12 @@ AI_SUBJECT_ROWS = [
         "BR-45 reads the LONG_TERM bearer token Deny from the attached service "
         "control policies and from the identity policies and permissions boundary "
         "of each IAM user holding an active key, credits the IAM leg only when "
-        "every holder carries it on both endpoints, names the holders without it "
-        "when it fails, and holds the row at N/A while a holder is unread",
+        "every holder is held on both endpoints, names the holders without it "
+        "when it fails, and holds the row at N/A while a holder is unread. Each "
+        "endpoint of each holder is held by an attached service control policy "
+        "Deny, the holder's own Deny, or no grant of the action (_granted_actions), "
+        "so an SCP Deny on one endpoint combines with a holder's own on the other "
+        "and a holder granted neither action is not named as able to use a key",
         [],
         3,
     ),
@@ -2954,7 +2966,11 @@ FOUNDATION_ROWS = [
         "condition (a ForAllValues: test is true on an absent key and is not "
         "credited), or admits a role principal without it whose trust, followed "
         "role by role, lets a user or an account in without MFA; a chained role "
-        "in another account or with an unread trust policy is N/A. BR-51 lists the "
+        "in another account or with an unread trust policy is N/A. A role whose "
+        "own policies, permissions boundary or attached service control policies "
+        "carry a BoolIfExists aws:MultiFactorAuthPresent false Deny over every AI "
+        "service it grants is held to MFA and not failed for its trust, because a "
+        "role session carries the key. BR-51 lists the "
         "Regions enabled for the account (account:ListRegions, ENABLED and "
         "ENABLED_BY_DEFAULT) and calls sso:ListInstances in each. When any "
         "Region returns an instance the Passed row is N/A, partial, ceiling "

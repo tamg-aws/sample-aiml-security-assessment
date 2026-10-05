@@ -13244,6 +13244,136 @@ class TestBR42ModelAllowList:
         )
         assert result["invocation_open"] == ["role 'InvokeRole'"]
 
+    @staticmethod
+    def _not_resource_allow(action, not_resource):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": action, "NotResource": not_resource}
+            ],
+        }
+
+    # MDL-01: an Allow whose NotResource excluded every model ARN was failed as
+    # able to invoke every model it does not exclude.
+    def test_br42_a_not_resource_excluding_every_model_is_not_a_grant(self):
+        every_type_but_project = [
+            template.format(region="*", account="*", id="*")
+            for name, template in bedrock_app.INVOKE_MODEL_RESOURCE_FORMATS
+            if name != "project"
+        ]
+        result = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "NotBedrockRole": [
+                        (
+                            "NB",
+                            self._not_resource_allow("bedrock:*", "arn:aws:bedrock:*"),
+                        )
+                    ],
+                    "AnyPartitionRole": [
+                        (
+                            "AP",
+                            self._not_resource_allow(
+                                "bedrock:Invoke*", "arn:*:bedrock:*:*:*"
+                            ),
+                        )
+                    ],
+                    # Action * also grants bedrock-mantle:CreateInference, whose
+                    # project ARNs arn:aws:bedrock:* does not exclude.
+                    "EveryActionRole": [
+                        ("EA", self._not_resource_allow("*", "arn:aws:bedrock:*"))
+                    ],
+                    "StreamRole": [
+                        (
+                            "S",
+                            self._not_resource_allow(
+                                "bedrock:InvokeModelWithResponseStream",
+                                every_type_but_project,
+                            ),
+                        )
+                    ],
+                    "InvokeRole": [
+                        (
+                            "I",
+                            self._not_resource_allow(
+                                "bedrock:InvokeModel", every_type_but_project
+                            ),
+                        )
+                    ],
+                    "OneRegionRole": [
+                        (
+                            "R",
+                            self._not_resource_allow(
+                                "bedrock:InvokeModel", "arn:aws:bedrock:us-east-1:*"
+                            ),
+                        )
+                    ],
+                    "FoundationOnlyRole": [
+                        (
+                            "F",
+                            self._not_resource_allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*::foundation-model/*",
+                            ),
+                        )
+                    ],
+                }
+            ),
+            region="Global",
+            training_data=self.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert sorted(result["invocation_open"]) == [
+            "role 'EveryActionRole'",
+            "role 'FoundationOnlyRole'",
+            "role 'InvokeRole'",
+            "role 'OneRegionRole'",
+        ]
+        rows = extract_csv_data(result)
+        every_text = " ".join(f["Finding_Details"] for f in rows)
+        for name in ("NotBedrockRole", "AnyPartitionRole", "StreamRole"):
+            assert name not in every_text
+        every_action = [
+            f["Finding_Details"]
+            for f in rows
+            if "Role 'EveryActionRole'" in f["Finding_Details"]
+        ]
+        assert len(every_action) == 1
+        assert "bedrock-mantle endpoint" in every_action[0]
+        assert "can invoke models not named one by one" not in every_action[0]
+        assert "every model it does not exclude can be invoked" in every_text
+
+    def test_br42_a_mantle_not_resource_excluding_every_project_is_not_counted(
+        self,
+    ):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "MantleExcludedRole": [
+                        (
+                            "ME",
+                            self._not_resource_allow(
+                                "bedrock-mantle:CreateInference",
+                                "arn:aws:bedrock-mantle:*",
+                            ),
+                        )
+                    ],
+                    "MantleOneRegionRole": [
+                        (
+                            "MR",
+                            self._not_resource_allow(
+                                "bedrock-mantle:CreateInference",
+                                "arn:aws:bedrock-mantle:us-east-1:*:project/*",
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+        every_text = " ".join(f["Finding_Details"] for f in findings)
+        assert "MantleExcludedRole" not in every_text
+        assert "Role 'MantleOneRegionRole'" in self._failed_text(findings)
+
     def test_br42_a_mantle_allow_on_a_non_project_resource_is_not_counted(self):
         findings = self._run(
             _identity_cache(
@@ -16055,7 +16185,19 @@ class TestBR44MarketplaceModelControl:
     # passes only beside a BR-42 block on invocation.
     OPEN_BR42 = {
         "allow_list_findings": {"invocation_open": ["role 'Invoker'"], "csv_data": []},
-        "org_allow_list_findings": {"csv_data": [{"Status": "Failed"}]},
+        "org_allow_list_findings": {
+            "csv_data": [{"Status": "Failed"}],
+            "model_list": {
+                "enforcing": 0,
+                "covered": [],
+                "uncovered": [
+                    "bedrock:invokemodel",
+                    "bedrock:invokemodelwithresponsestream",
+                    "bedrock-mantle:createinference",
+                ],
+                "management": False,
+            },
+        },
     }
 
     def _deny_only_cache(self):
@@ -16094,6 +16236,146 @@ class TestBR44MarketplaceModelControl:
 
     # MDL-04: BR-44 read BR-42's invocation_open, which listed an identity whose
     # only invoke grant was on an agent alias.
+    # MDL-04: a role whose only invoke grant is a NotResource Allow excluding
+    # every model reached the gate as able to invoke a model.
+    def test_br44_a_not_resource_excluding_every_model_does_not_open_invocation(
+        self,
+    ):
+        allow_list = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "NotBedrock": [
+                        (
+                            "N",
+                            TestBR42ModelAllowList._not_resource_allow(
+                                "bedrock:*", "arn:aws:bedrock:*"
+                            ),
+                        )
+                    ]
+                }
+            ),
+            region="Global",
+            training_data=TestBR42ModelAllowList.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert allow_list["invocation_open"] == []
+        findings = self._run(
+            self._deny_only_cache(),
+            **{**self.OPEN_BR42, "allow_list_findings": allow_list},
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "NotBedrock" not in findings[0]["Finding_Details"]
+
+    # MDL-04: the gate said no attached SCP denies invoking outside a named
+    # list while one was attached, in the management account or on one action.
+    @staticmethod
+    def _model_list_inventory(actions, management=False):
+        return {
+            "items": [
+                {
+                    "name": "ApprovedModels",
+                    "id": "p-1",
+                    "content": json.dumps(
+                        {
+                            "Statement": [
+                                {
+                                    "Effect": "Deny",
+                                    "Action": actions,
+                                    "NotResource": [TestBR42ModelAllowList.MODEL_ARN],
+                                }
+                            ]
+                        }
+                    ),
+                    "attached_to": ["root r-1"],
+                }
+            ],
+            "errors": [],
+            "list_error": None,
+            "detached": [],
+            "account": "123456789012",
+            "path": [],
+            "management_account": management,
+        }
+
+    @pytest.mark.parametrize(
+        "actions, management, found",
+        [
+            (
+                ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+                True,
+                "an attached service control policy denies invoking a model "
+                "outside a named list, but this is the management account",
+            ),
+            (
+                ["bedrock:InvokeModel"],
+                False,
+                "deny invoking a model outside a named list on bedrock:invokemodel "
+                "only, not on bedrock:invokemodelwithresponsestream, "
+                "bedrock-mantle:createinference",
+            ),
+            (
+                ["bedrock:ListFoundationModels"],
+                False,
+                "no attached service control policy denies invoking a model "
+                "outside a named list",
+            ),
+        ],
+    )
+    def test_br44_the_gate_says_what_the_organization_leg_found(
+        self, actions, management, found
+    ):
+        with patch.object(
+            bedrock_app,
+            "_organization_policy_context",
+            return_value={"readable": True},
+        ):
+            org = bedrock_app.check_bedrock_approved_model_control(
+                region="Global",
+                scp_inventory=self._model_list_inventory(actions, management),
+                check_id="BR-42",
+            )
+        findings = self._run(
+            self._deny_only_cache(),
+            **{**self.OPEN_BR42, "org_allow_list_findings": org},
+        )
+        details = findings[0]["Finding_Details"]
+        assert found in details
+        if found.startswith("no attached"):
+            assert [f["Status"] for f in findings] == ["Failed"]
+        else:
+            assert "no attached service control policy denies invoking" not in details
+
+    # MDL-04: an identity grant was Failed with "No attached service control
+    # policy bounds the action by product" while SCP documents went unread.
+    def test_br44_an_unbounded_grant_is_na_while_an_scp_is_unread(self):
+        cache = _identity_cache(
+            roles={"OpenRole": [("O", _allow("aws-marketplace:Subscribe", "*"))]}
+        )
+        inventory = self._scp()
+        inventory["errors"] = ["policy 'Other': AccessDenied"]
+        unread = self._run(cache, scp_inventory=inventory)
+        assert [f["Status"] for f in unread] == ["N/A"]
+        assert (
+            "No attached service control policy bounds"
+            not in (unread[0]["Finding_Details"])
+        )
+        assert "was not read" in unread[0]["Finding_Details"]
+
+        read = self._run(cache, scp_inventory=self._scp())
+        assert [f["Status"] for f in read] == ["Failed"]
+        assert (
+            "No attached service control policy bounds the action by product"
+            in (read[0]["Finding_Details"])
+        )
+
+        inventory["management_account"] = True
+        management = self._run(cache, scp_inventory=inventory)
+        assert [f["Status"] for f in management] == ["Failed"]
+        assert (
+            "never restrict this account, the management account"
+            in (management[0]["Finding_Details"])
+        )
+
     def test_br44_an_invoke_grant_on_an_agent_alias_does_not_open_invocation(self):
         cache = _identity_cache(
             roles={
@@ -17233,10 +17515,16 @@ class TestBR45ApiKeyGovernance:
         }
     ]
 
+    # Both bearer token actions, granted so a holder's Deny is what decides.
+    TOKEN_GRANT = _allow(
+        ["bedrock:CallWithBearerToken", "bedrock-mantle:CallWithBearerToken"], "*"
+    )
+
     def _token_policy(self, *denies):
         return {
             "Version": "2012-10-17",
-            "Statement": list(denies or self._token_denies()),
+            "Statement": [self.TOKEN_GRANT["Statement"][0]]
+            + list(denies or self._token_denies()),
         }
 
     def _holders_run(self, cache, holders, all_users=True, inventory=None):
@@ -17252,19 +17540,23 @@ class TestBR45ApiKeyGovernance:
         cache = _identity_cache(
             users={
                 "Alice": [("NoLongTerm", self._token_policy())],
-                "Bob": [],
+                "Bob": [("Use", self.TOKEN_GRANT)],
                 "Reader": [],
             }
         )
-        cache["user_permissions"]["Bob"]["permissions_boundary"] = {
-            "document": self._token_policy()
-        }
+        # The cache stores a boundary as the policy document itself.
+        cache["user_permissions"]["Bob"]["permissions_boundary"] = self._token_policy()
         prevention = self._holders_run(cache, ["Alice", "Bob"])
 
         assert [f["Status"] for f in prevention] == ["Passed"]
         details = prevention[0]["Finding_Details"]
-        assert "each of the 2 IAM user(s) holding an active key" in details
-        assert "user 'Alice', user 'Bob'" in details
+        assert "Each of the 2 IAM user(s) holding an active key" in details
+        assert (
+            "user 'Alice' (bedrock-mantle:callwithbearertoken: own Deny; "
+            "bedrock:callwithbearertoken: own Deny), user 'Bob' "
+            "(bedrock-mantle:callwithbearertoken: own Deny; "
+            "bedrock:callwithbearertoken: own Deny)"
+        ) in details
         assert "Reader" not in details
         assert "schema version 2" in details
 
@@ -17273,7 +17565,7 @@ class TestBR45ApiKeyGovernance:
             users={
                 "Alice": [("NoLongTerm", self._token_policy())],
                 "Bob": [("BedrockOnly", self._token_policy(self._token_denies()[0]))],
-                "Carol": [],
+                "Carol": [("Use", self.TOKEN_GRANT)],
             }
         )
         prevention = self._holders_run(cache, ["Alice", "Bob", "Carol"])
@@ -17282,15 +17574,84 @@ class TestBR45ApiKeyGovernance:
         details = prevention[0]["Finding_Details"]
         assert (
             "nor does one in the own policies or permissions boundary of user 'Bob' "
-            "(only bedrock:callwithbearertoken is denied), user 'Carol', so the "
-            "long-term keys of those user(s) can be used"
+            "(granted bedrock-mantle:callwithbearertoken with no LONG_TERM Deny on "
+            "it), user 'Carol' (granted bedrock-mantle:callwithbearertoken, "
+            "bedrock:callwithbearertoken with no LONG_TERM Deny on it), so those "
+            "user(s) can use a long-term key on the action named"
         ) in details
         assert "Alice" not in details
         assert "so a long-term key can be used" not in details
 
+    # MDL-09: a holder granted no bearer token action was named as able to use
+    # a long-term key.
+    def test_br45_a_key_holder_granted_no_bearer_token_action_is_not_named(self):
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Nina": [("Models", _allow("bedrock:InvokeModel", "*"))],
+                "Bounded": [("Use", self.TOKEN_GRANT)],
+                "Open": [("Use", self.TOKEN_GRANT)],
+            }
+        )
+        cache["user_permissions"]["Bounded"]["permissions_boundary"] = _allow(
+            "bedrock:InvokeModel", "*"
+        )
+        passed = self._holders_run(cache, ["Alice", "Bounded", "Nina"])
+        assert [f["Status"] for f in passed] == ["Passed"]
+        details = passed[0]["Finding_Details"]
+        assert (
+            "user 'Nina' (bedrock-mantle:callwithbearertoken: not granted; "
+            "bedrock:callwithbearertoken: not granted)"
+        ) in details
+        assert "user 'Bounded' (bedrock-mantle:callwithbearertoken: not granted" in (
+            details
+        )
+
+        failed = self._holders_run(cache, ["Alice", "Nina", "Open"])
+        assert [f["Status"] for f in failed] == ["Failed"]
+        details = failed[0]["Finding_Details"]
+        assert "user 'Open' (granted" in details
+        assert "Nina" not in details
+
+    # MDL-09: an SCP Deny on one endpoint and each holder's own Deny on the
+    # other were not combined, so the pair was failed as no control.
+    def test_br45_an_scp_deny_on_one_endpoint_combines_with_a_holders_own_deny(self):
+        bedrock_deny, mantle_deny = self._token_denies()
+        cache = _identity_cache(
+            users={
+                "Mira": [("MantleOnly", self._token_policy(mantle_deny))],
+                "Ben": [("BedrockOnly", self._token_policy(bedrock_deny))],
+            }
+        )
+        inventory = self._scp_items(self._if_exists_cap(), bedrock_deny)
+        combined = self._holders_run(cache, ["Mira"], inventory=inventory)
+        assert [f["Status"] for f in combined] == ["Passed"]
+        assert (
+            "user 'Mira' (bedrock-mantle:callwithbearertoken: own Deny; "
+            "bedrock:callwithbearertoken: service control policy Deny)"
+        ) in combined[0]["Finding_Details"]
+
+        same_side = self._holders_run(cache, ["Mira", "Ben"], inventory=inventory)
+        assert [f["Status"] for f in same_side] == ["Failed"]
+        assert (
+            "user 'Ben' (granted bedrock-mantle:callwithbearertoken with no "
+            "LONG_TERM Deny on it)"
+        ) in same_side[0]["Finding_Details"]
+
+        inventory["management_account"] = True
+        management = self._holders_run(cache, ["Mira"], inventory=inventory)
+        assert [f["Status"] for f in management] == ["Failed"]
+        assert (
+            "user 'Mira' (granted bedrock:callwithbearertoken with no LONG_TERM "
+            "Deny on it)"
+        ) in management[0]["Finding_Details"]
+
     def test_br45_an_inactive_key_holder_needs_no_token_deny(self):
         cache = _identity_cache(
-            users={"Alice": [("NoLongTerm", self._token_policy())], "Dormant": []}
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Dormant": [("Use", self.TOKEN_GRANT)],
+            }
         )
         _, findings = self._run(
             {
@@ -36499,7 +36860,8 @@ class TestBR51AIUserConsoleMFA:
             "IAM role 'ChainRole' can be reached without MFA through a chain of "
             "roles: role 'ChainRole' trusts role 'HopRole', whose statement 'Trust' "
             "trusts arn:aws:iam::123456789012:user/dev with no Bool "
-            "aws:MultiFactorAuthPresent true condition."
+            "aws:MultiFactorAuthPresent true condition, and no Deny in its "
+            "policies or permissions boundary requires MFA"
         ) in failed["ChainRole"]
         assert (
             "role 'DeepRole' trusts role 'FarHop', which trusts role 'HopRole', "
@@ -36528,6 +36890,139 @@ class TestBR51AIUserConsoleMFA:
     # was credited as requiring MFA, but it is true when the key is absent, so
     # a user calling with long-term keys assumed the role. ForAnyValue: is false
     # on an absent key and stays credited, on a direct trust and on a chain hop.
+    # IAM-02: a role whose trust lacked an MFA condition was failed even when
+    # a BoolIfExists aws:MultiFactorAuthPresent false Deny in its own policies,
+    # boundary or an attached SCP held every session made without MFA.
+    def _role_trust_rows(self, permissions, scp_inventory=None):
+        account = "arn:aws:iam::123456789012"
+        trusts = {
+            "OpenRole": {"AWS": f"{account}:user/dev"},
+            "ChainRole": {"AWS": f"{account}:role/HopRole"},
+            "HopRole": {"AWS": f"{account}:user/dev"},
+        }
+        cache = {"role_permissions": permissions, "user_permissions": {}}
+        iam = MagicMock()
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "Arn": f"{account}:role/{RoleName}",
+                "AssumeRolePolicyDocument": _policy(
+                    {
+                        "Effect": "Allow",
+                        "Principal": trusts.get(RoleName, trusts["OpenRole"]),
+                        "Action": "sts:AssumeRole",
+                    }
+                ),
+            }
+        }
+        iam.list_instances.return_value = {"Instances": []}
+        with patch("boto3.client", return_value=iam):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_console_mfa(
+                    cache,
+                    region="Global",
+                    scp_inventory=scp_inventory
+                    or {"items": [], "errors": [], "list_error": None},
+                )
+            )
+
+    ROLE_AI_WRITE = _customer_policy(
+        "Write",
+        {"Effect": "Allow", "Action": ["bedrock:*", "sagemaker:*"], "Resource": "*"},
+    )
+
+    def test_br51_a_role_mfa_deny_holds_a_trust_without_mfa(self):
+        permissions = {
+            "OpenRole": _identity(attached=[self.ROLE_AI_WRITE, self._mfa_deny()]),
+            "ChainRole": _identity(attached=[self.ROLE_AI_WRITE]),
+            "BoundaryRole": _identity(attached=[self.ROLE_AI_WRITE]),
+            "PartialRole": _identity(
+                attached=[self.ROLE_AI_WRITE, self._mfa_deny(Action="bedrock:*")]
+            ),
+            "PlainBoolRole": _identity(
+                attached=[self.ROLE_AI_WRITE, self._mfa_deny(operator="Bool")]
+            ),
+            "BareRole": _identity(attached=[self.ROLE_AI_WRITE]),
+        }
+        permissions["ChainRole"]["inline_policies"] = [self._mfa_deny()]
+        permissions["BoundaryRole"]["permissions_boundary"] = _policy(
+            {"Effect": "Allow", "Action": "*", "Resource": "*"},
+            self._mfa_deny()["document"]["Statement"][0],
+        )
+        rows = self._role_trust_rows(permissions)
+
+        failed = sorted(
+            r["Finding_Details"].split("'")[1] for r in rows if r["Status"] == "Failed"
+        )
+        assert failed == ["BareRole", "PartialRole", "PlainBoolRole"]
+        (bare,) = [
+            r["Finding_Details"]
+            for r in rows
+            if r["Finding_Details"].startswith("IAM role 'BareRole'")
+        ]
+        assert (
+            "with no Bool aws:MultiFactorAuthPresent true condition, and no Deny in "
+            "its policies or permissions boundary requires MFA (BoolIfExists "
+            "aws:MultiFactorAuthPresent false) on its AI write services, nor does "
+            "one in the 0 service control policies attached to this account, so "
+            "its sessions make AI changes without MFA."
+        ) in bare
+        (summary,) = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert (
+            "and 3 are held to MFA by a Deny (BoundaryRole (permissions boundary); "
+            "ChainRole (inline policy 'RequireMfa'); OpenRole (attached policy "
+            "'RequireMfa'))"
+        ) in summary["Finding_Details"]
+
+    def test_br51_an_attached_scp_mfa_deny_holds_a_role_trust_without_mfa(self):
+        permissions = {
+            "BedrockRole": _identity(
+                attached=[
+                    _customer_policy(
+                        "Write",
+                        {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"},
+                    )
+                ]
+            ),
+            "BothRole": _identity(attached=[self.ROLE_AI_WRITE]),
+        }
+        rows = self._role_trust_rows(
+            permissions, scp_inventory=self._scps(self.SCP_MFA_DENY)
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1 and failed[0].startswith("IAM role 'BothRole'")
+        assert "nor does one in the 1 service control policy attached" in failed[0]
+        (summary,) = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert (
+            "BedrockRole (service control policy 'RequireMfa')"
+            in summary["Finding_Details"]
+        )
+
+    def test_br51_a_role_trust_without_mfa_is_na_while_an_scp_is_unread(self):
+        rows = self._role_trust_rows(
+            {"BareRole": _identity(attached=[self.ROLE_AI_WRITE])},
+            scp_inventory=self._scps(errors=["policy 'Guard' targets: AccessDenied"]),
+        )
+        (row,) = [r for r in rows if r["Finding_Details"].startswith("IAM role")]
+        assert row["Status"] == "N/A"
+        assert "can be assumed without MFA" in row["Finding_Details"]
+        assert (
+            "were not all read (policy 'Guard' targets: AccessDenied)"
+            in (row["Finding_Details"])
+        )
+        assert "without MFA." not in row["Finding_Details"]
+
+    def test_br51_a_role_policy_that_cannot_be_parsed_is_na(self):
+        broken = {"name": "Broken", "arn": "arn:aws:iam::1:policy/B", "document": "{"}
+        rows = self._role_trust_rows(
+            {"BrokenRole": _identity(attached=[self.ROLE_AI_WRITE, broken])}
+        )
+        (row,) = [r for r in rows if r["Finding_Details"].startswith("IAM role")]
+        assert row["Status"] == "N/A"
+        assert (
+            "whether a Deny holds its sessions to MFA is not known"
+            in (row["Finding_Details"])
+        )
+
     def test_br51_for_all_values_mfa_trust_is_not_credited(self):
         cache = {"role_permissions": {}, "user_permissions": {}}
         write = [
