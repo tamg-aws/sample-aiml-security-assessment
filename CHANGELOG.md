@@ -226,8 +226,21 @@ back `Passed` names what it could not read.
   `AC-23`, `AC-32` and `AC-33` decides the literal characters around each `*`
   before the full comparison and reuses repeated answers. Results are
   unchanged.
+- The Bedrock assessment Lambda's timeout is 900 seconds, the Lambda maximum,
+  up from 600, so its per-read deadline stops 60 seconds before 900 instead of
+  before 600.
+- The AgentCore assessment Lambda's timeout is 900 seconds, up from 600, and
+  its guard stops 60 seconds before the invocation's remaining time, read from
+  the Lambda context, instead of at a fixed 540 seconds. At 540 seconds the
+  guard had skipped 19 checks, `AC-35` to `AC-53`, as `N/A` in an account with
+  19 runtimes. `AC-34` reads three code archives or images at once and
+  downloads an image that several tags name once.
 
 ### Deployment impact
+
+- **Lambda timeouts:** `template.yaml` and `template-multi-account.yaml` raise
+  the Bedrock and AgentCore assessment functions' `Timeout` to 900. A CodeBuild
+  run of this revision deploys them. No IAM permission changes.
 
 - **Service selection:** Update `deployment/aiml-security-single-account.yaml`
   for single-account deployments or `deployment/2-aiml-security-codebuild.yaml`

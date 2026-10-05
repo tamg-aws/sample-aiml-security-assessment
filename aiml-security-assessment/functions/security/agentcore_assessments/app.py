@@ -15,9 +15,12 @@ import os
 import posixpath
 import re
 import tarfile
+import threading
 import time
 import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from fnmatch import fnmatchcase
 from io import BytesIO, StringIO
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -1108,6 +1111,15 @@ AUTHENTICATION_ERROR_CODES = {
 # Execution tracking
 start_time = None
 
+# The AgentCore function's Timeout in template.yaml and
+# template-multi-account.yaml, the budget's base when lambda_handler is called
+# with no Lambda context.
+LAMBDA_TIMEOUT_SECONDS = 900
+
+# Seconds this invocation may run, which lambda_handler reads from the Lambda
+# context at entry, because a warm container keeps module state.
+lambda_budget_seconds = LAMBDA_TIMEOUT_SECONDS
+
 
 def _is_valid_permissions_cache(cache: Any) -> bool:
     """Return whether cache has the IAM inventory shape produced upstream."""
@@ -1577,10 +1589,12 @@ def check_timeout() -> bool:
 
     elapsed = time.time() - start_time
 
-    if elapsed > 480:  # 8 minutes
+    # Warn 120 s and stop 60 s before the Lambda timeout: 480 s and 540 s of a
+    # 600 s budget, as before the budget came from the context.
+    if elapsed > lambda_budget_seconds - 120:
         logger.warning(f"Approaching timeout: {elapsed}s elapsed")
 
-    return elapsed < 540  # 9 minutes hard stop
+    return elapsed < lambda_budget_seconds - 60
 
 
 def _agentcore_list_all(
@@ -25767,9 +25781,9 @@ AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
 # unpacked), 19.7 MiB/s on 250 MiB of base64 and 23.3 MiB/s on 250 MiB of
 # assignment-dense code, the slowest being incompressible text. At the slowest
 # rates an archive at both bounds takes 3.6 s to fetch (64 MiB) and 13.2 s to
-# scan (256 MiB), 16.8 s in all, so 35 such archives fit in the 600 s Lambda
-# timeout; 15 of that account's 19 runtimes run a code archive, 12 distinct,
-# the largest 39.8 MiB. The service's own maxima for a direct code deployment
+# scan (256 MiB), 16.8 s in all, so 35 such archives fit in 600 s, two
+# thirds of the Lambda timeout; 15 of that account's 19 runtimes run a code
+# archive, 12 distinct, the largest 39.8 MiB. The service's own maxima for a direct code deployment
 # package, 250 MB compressed and 750 MB uncompressed (bedrock-agentcore-limits
 # .html), would cost 13.4 s and 36.9 s, 50.3 s per archive, leaving room for 11
 # in a run that also holds every other AgentCore check, and would hold up to
@@ -25820,13 +25834,18 @@ ECR_IMAGE_CONFIG_TIMEOUT_SECONDS = 10
 # (198.2 MiB compressed, 256 MiB unpacked) ran at 16.8 MiB/s of unpacked bytes.
 # At those rates an image at both bounds takes 59.5 s to fetch and 61.0 s to
 # scan, about 125 s with 8 platforms' reads, so 4 such distinct images fit in
-# the 600 s Lambda timeout; the three distinct images that account runs took
-# 47.9 s in all, the largest under a third of either bound. An image is read
+# 600 s, two thirds of the Lambda timeout; the three distinct images that
+# account runs took 47.9 s in all, the largest under a third of either bound. An image is read
 # once per digest however many runtimes or versions name it. An image past
 # either bound is named in the row, which is then N/A, never Passed.
 AC34_IMAGE_LAYERS_MAX_BYTES = 512 * 1024 * 1024
 AC34_IMAGE_UNPACKED_MAX_BYTES = 1024 * 1024 * 1024
 ECR_IMAGE_LAYER_TIMEOUT_SECONDS = 30
+# Code archives and images AC-34 reads at once. Most of a read is waiting on
+# S3 or ECR (50 s of CPU in a 308 s local read of 12 archives and 3 images), so
+# reads overlap that wait. Reading a code archive can hold twice its 64 MiB
+# bound, so three at once hold at most 384 MiB of the function's 1024 MB.
+AC34_PARALLEL_READS = 3
 
 
 def _value_is_a_credential_literal(value: str) -> bool:
@@ -26540,6 +26559,24 @@ def _streamed_file_credentials(
     return list(found)
 
 
+def _read_each_once(read: Callable[[Any], Any], keys: Iterable[Any]) -> Dict[Any, Any]:
+    """Run read(key) once for each distinct key, AC34_PARALLEL_READS at a time.
+
+    Returns each key's result, or the exception its read raised, which the
+    caller raises where it would have called read itself.
+    """
+    unique = list(dict.fromkeys(keys))
+
+    def attempt(key: Any) -> Any:
+        try:
+            return read(key)
+        except Exception as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=AC34_PARALLEL_READS) as pool:
+        return dict(zip(unique, pool.map(attempt, unique)))
+
+
 def _agentcore_runtime_code_credential_findings(
     codes: Dict[str, Set[Tuple[str, str, str]]],
     unread_versions: Optional[Dict[str, List[str]]] = None,
@@ -26573,6 +26610,12 @@ def _agentcore_runtime_code_credential_findings(
         "are not read; every file of an archive read is scanned whole."
     )
     findings: List[Dict[str, Any]] = []
+    reads = _read_each_once(
+        lambda location: _code_archive_credentials(
+            location[0], location[1], location[2] or None
+        ),
+        (location for locations in codes.values() for location in sorted(locations)),
+    )
     for label, locations in codes.items():
         found: List[str] = []
         unread: List[str] = list(unread_versions.get(label, []))
@@ -26582,9 +26625,10 @@ def _agentcore_runtime_code_credential_findings(
                 f" (version {version_id})" if version_id else ""
             )
             try:
-                credentials, files = _code_archive_credentials(
-                    bucket, key, version_id or None
-                )
+                outcome = reads[(bucket, key, version_id)]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                credentials, files = outcome
             except (BotoCoreError, ClientError, ValueError) as error:
                 # A ValueError is raised by this scan with a message naming
                 # only a size, a bound or a file name, never file content.
@@ -26650,11 +26694,19 @@ def _agentcore_runtime_code_credential_findings(
     return findings
 
 
+# boto3's default session is not thread-safe, and AC-34 reads images in threads.
+_ECR_CLIENT_LOCK = threading.Lock()
+# One lock per image digest, so two tags of one image read at once download it
+# once: the second waits for the first's entry in scans.
+_IMAGE_SCAN_LOCKS: Dict[Tuple[str, str, str], threading.Lock] = {}
+
+
 def _ecr_client_for(region_name: str) -> Any:
     """Return an ECR client for the Region an image URI names."""
     if ecr_client is not None and ecr_client.meta.region_name == region_name:
         return ecr_client
-    return boto3.client("ecr", config=boto3_config, region_name=region_name)
+    with _ECR_CLIENT_LOCK:
+        return boto3.client("ecr", config=boto3_config, region_name=region_name)
 
 
 def _fetch_image_config(download_url: str) -> Dict[str, Any]:
@@ -26757,21 +26809,26 @@ def _image_config_credentials(
 
     media_type, document, image_digest = manifest(image_id)
     key = (registry, region_name, image_digest)
-    if image_digest and key in scans:
-        if isinstance(scans[key], Exception):
-            raise scans[key]
-        return scans[key]
-    try:
-        result = _image_contents_credentials(
-            client, registry, repository, media_type, document, manifest
-        )
-    except (BotoCoreError, ClientError, OSError, ValueError) as error:
+    with (
+        _IMAGE_SCAN_LOCKS.setdefault(key, threading.Lock())
+        if image_digest
+        else nullcontext()
+    ):
+        if image_digest and key in scans:
+            if isinstance(scans[key], Exception):
+                raise scans[key]
+            return scans[key]
+        try:
+            result = _image_contents_credentials(
+                client, registry, repository, media_type, document, manifest
+            )
+        except (BotoCoreError, ClientError, OSError, ValueError) as error:
+            if image_digest:
+                scans[key] = error
+            raise
         if image_digest:
-            scans[key] = error
-        raise
-    if image_digest:
-        scans[key] = result
-    return result
+            scans[key] = result
+        return result
 
 
 def _image_contents_credentials(
@@ -26893,6 +26950,22 @@ def _agentcore_runtime_image_credential_findings(
     )
     findings: List[Dict[str, Any]] = []
     scans: Dict[Tuple[str, str, str], Any] = {}
+
+    def image_key(account: str, uri: str) -> Optional[Tuple[str, str, str, str]]:
+        match = ECR_IMAGE_URI_PATTERN.match(uri)
+        if not match or (account and match.group(1) != account):
+            return None
+        return (*match.groups(), uri[match.end() :])
+
+    reads = _read_each_once(
+        lambda image: _image_config_credentials(*image, scans),
+        (
+            image
+            for account, uris in images.values()
+            for uri in sorted(uris)
+            if (image := image_key(account, uri))
+        ),
+    )
     for label, (account, uris) in images.items():
         found: List[str] = []
         unread: List[str] = list(unread_versions.get(label, []))
@@ -26910,15 +26983,12 @@ def _agentcore_runtime_image_credential_findings(
                 )
                 continue
             try:
-                (
-                    credentials,
-                    variables,
-                    platforms,
-                    layers,
-                    files,
-                ) = _image_config_credentials(
-                    registry, image_region, repository, uri[match.end() :], scans
-                )
+                outcome = reads[
+                    (registry, image_region, repository, uri[match.end() :])
+                ]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                credentials, variables, platforms, layers, files = outcome
             except (BotoCoreError, ClientError, OSError, ValueError) as error:
                 # A ValueError is raised by this scan with a message naming
                 # only a count, a size or a shape, never image content.
@@ -44314,6 +44384,7 @@ def lambda_handler(event, context):
         Response with status and S3 URL
     """
     global start_time, iam_client, ec2_client, ecr_client, logs_client
+    global lambda_budget_seconds
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
     global wafv2_client, route53resolver_client, cognito_client, events_client
@@ -44321,6 +44392,11 @@ def lambda_handler(event, context):
     global agentcore_data_client, network_firewall_client, inspector2_client
     global cloudfront_client, shield_client, apigateway_client
     start_time = time.time()
+    lambda_budget_seconds = (
+        context.get_remaining_time_in_millis() / 1000
+        if context is not None
+        else LAMBDA_TIMEOUT_SECONDS
+    )
 
     try:
         # Extract target region from Step Functions Map state
