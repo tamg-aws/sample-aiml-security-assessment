@@ -20941,6 +20941,42 @@ def _gateway_resource_policy_findings(
     return findings
 
 
+def _source_arn_values_outside_region(
+    statement: Dict[str, Any], region: str
+) -> List[str]:
+    """Return the aws:SourceArn values that can admit a gateway outside `region`.
+
+    Only the guard operators match a value, so a negated, IfExists or Null
+    entry admits nothing. Condition entries are ANDed, so one entry whose every
+    value names `region` confines the statement to it and the others add no
+    gateway. A value with no Region, or that is no ARN, matches no Regional
+    gateway; a statement holding only such values is Not Scoped earlier.
+    """
+    entries = []
+    for operator, block in (statement.get("Condition") or {}).items():
+        if not isinstance(block, dict):
+            continue
+        name = str(operator).strip().lower()
+        if name.startswith("foranyvalue:"):
+            name = name[len("foranyvalue:") :]
+        if name not in CONFUSED_DEPUTY_GUARD_OPERATORS:
+            continue
+        for key, raw in block.items():
+            if str(key).strip().lower() == "aws:sourcearn":
+                entries.append([value.strip() for value in _condition_values(raw)])
+    if any(
+        values and all(_arn_region(value) == region for value in values)
+        for values in entries
+    ):
+        return []
+    return [
+        value
+        for values in entries
+        for value in values
+        if _arn_region(value) and _arn_region(value) != region
+    ]
+
+
 def _gateway_role_trust_findings(
     label: str,
     role_arn: Any,
@@ -21151,14 +21187,9 @@ def _gateway_role_trust_findings(
 
     elsewhere = sorted(
         {
-            value.strip()
+            value
             for statement in service_statements
-            for operator, entries in (statement.get("Condition") or {}).items()
-            if isinstance(entries, dict)
-            for key, raw in entries.items()
-            if str(key).strip().lower() == "aws:sourcearn"
-            for value in _condition_values(raw)
-            if _arn_region(value.strip()) != region
+            for value in _source_arn_values_outside_region(statement, region)
         }
     )
     if elsewhere:

@@ -910,8 +910,12 @@ AI_SUBJECT_ROWS = [
         "gateway unread, a role trust passes only when every aws:SourceArn "
         "value is the literal ARN of a gateway that was read; a pattern or another "
         "ARN is N/A naming the unread gateways. Only the gateway's own Region is "
-        "read, so a role trust whose aws:SourceArn names another Region is N/A "
-        "naming that Region",
+        "read, so a role trust whose ArnLike, ArnEquals, StringLike, StringEquals or "
+        "StringEqualsIgnoreCase "
+        "aws:SourceArn admits another Region is N/A naming that Region, unless "
+        "another such entry, ANDed with it, names only the gateway's Region. A "
+        "negated, IfExists or Null entry admits no Region, and an ARN with no "
+        "Region matches no gateway",
         [],
         4,
     ),
@@ -951,7 +955,7 @@ AI_SUBJECT_ROWS = [
         "trust-policy hardening the gateway-role restriction requires is judged on "
         "each gateway's execution role: AC-27 fails a service or wildcard statement "
         "whose aws:SourceArn does not name a gateway, or admits another gateway that "
-        "runs with a different role, and holds at N/A one whose aws:SourceArn names "
+        "runs with a different role, and holds at N/A one whose aws:SourceArn admits "
         "another Region, whose gateways it does not read. AC-48 fails a missing "
         "deputy guard, another "
         "service principal and an account-root principal on it. "
