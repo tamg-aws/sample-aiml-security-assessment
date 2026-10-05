@@ -895,7 +895,9 @@ AI_SUBJECT_ROWS = [
         "ForAllValues and wildcard values do not count. While GetGateway leaves any "
         "gateway unread, a role trust passes only when every aws:SourceArn "
         "value is the literal ARN of a gateway that was read; a pattern or another "
-        "ARN is N/A naming the unread gateways",
+        "ARN is N/A naming the unread gateways. Only the gateway's own Region is "
+        "read, so a role trust whose aws:SourceArn names another Region is N/A "
+        "naming that Region",
         [],
         4,
     ),
@@ -935,7 +937,9 @@ AI_SUBJECT_ROWS = [
         "trust-policy hardening the gateway-role restriction requires is judged on "
         "each gateway's execution role: AC-27 fails a service or wildcard statement "
         "whose aws:SourceArn does not name a gateway, or admits another gateway that "
-        "runs with a different role, and AC-48 fails a missing deputy guard, another "
+        "runs with a different role, and holds at N/A one whose aws:SourceArn names "
+        "another Region, whose gateways it does not read. AC-48 fails a missing "
+        "deputy guard, another "
         "service principal and an account-root principal on it. "
         "AC-10 fails an Allow that opens the runtime to any principal without binding "
         "the caller's account or organization. AC-01's VPC Placement Guardrail fails "

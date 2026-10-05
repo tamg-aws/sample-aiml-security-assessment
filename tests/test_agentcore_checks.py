@@ -40670,7 +40670,7 @@ class TestAC27RoleTrustSourceArnNamesTheGateway:
             findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
         )
         assert [p["Status"] for p in passed] == ["Passed", "Passed"]
-        assert "no other gateway in this Region" in passed[0]["Finding_Details"]
+        assert "no other gateway in us-east-1" in passed[0]["Finding_Details"]
         assert not self._named(
             findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
         )
@@ -40737,6 +40737,59 @@ class TestAC27RoleTrustSourceArnNamesTheGateway:
         )
         assert [row["Status"] for row in rows] == ["Passed", "Passed"]
         assert "could not be read" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "values, status, regions",
+        [
+            (["us-east-1:gateway/gw-a", "us-west-2:gateway/*"], "N/A", ["us-west-2"]),
+            (["us-west-2:gateway/gw-a"], "N/A", ["us-west-2"]),
+            (
+                ["us-west-2:gateway/*", "eu-west-1:gateway/gw-x"],
+                "N/A",
+                ["eu-west-1", "us-west-2"],
+            ),
+            (["us-east-1:gateway/*"], "Passed", []),
+        ],
+        ids=["own-plus-west-star", "west-literal", "two-regions", "own-region-only"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_arn_in_another_region_is_held_at_na(
+        self, mock_ac, mock_iam, values, status, regions
+    ):
+        # A Passed said aws:SourceArn admits no other gateway while a us-west-2
+        # pattern, never compared, admitted every gateway there.
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-c": "RoleA"},
+            {
+                "RoleA": self._arn_trust(
+                    [
+                        f"arn:aws:bedrock-agentcore:{v.split(':')[0]}:{_ACCOUNT}:"
+                        f"{v.split(':')[1]}"
+                        for v in values
+                    ]
+                )
+            },
+        )
+
+        rows = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert [row["Status"] for row in rows] == [status, status]
+        for row in rows:
+            assert_finding_schema(row)
+            details = row["Finding_Details"]
+            if status == "N/A":
+                assert f"names Region {', '.join(regions)}," in details
+                assert "us-east-1:" not in details.split("aws:SourceArn value")[1]
+                assert "was not judged" in details
+            else:
+                assert "admits no other gateway in us-east-1" in details
+        assert not self._named(
+            findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
+        )
 
 
 class TestAC43EvaluationRoleTrustByValue:
