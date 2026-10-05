@@ -515,7 +515,7 @@ section.
   `HeadObject` cap with further `ListObjectsV2` pages and names that count in
   its not-read row, as a lower bound when the run's 50-page counting budget
   ends first. The code comment records the live latency both caps were set
-  from (account 178113193057, us-east-1, 2026-10-04).
+  from (a test account, us-east-1, 2026-10-04).
 - `SM-38` adds a `Lambda MicroVM Runtime Detection Tier` row for each Region
   with a MicroVM that has not ended. Runtime Monitoring does not cover
   MicroVMs, so they were outside `SM-38` before. The row fails an egress

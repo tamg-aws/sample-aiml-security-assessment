@@ -162,8 +162,7 @@ def test_a_deep_prefix_belongs_to_the_prefix_and_the_module_starts_after_it():
 # The shapes one bucket holds, written out as literal keys instead of built by the
 # helper above. A helper that constructs both sides of a comparison agrees with
 # itself, and all three defects here were defects in reading a literal key. Measured
-# against account 178113193057, bucket
-# aiml-sec-178113193057-aimlassessmentbucket-gywyxnvqxpvx, where the run named below
+# against a test account's assessment bucket, where the run named below
 # wrote six report CSVs and every one of them missed the pattern.
 RAW_KEYS = [
     (
@@ -354,7 +353,7 @@ def test_a_named_execution_is_measured_and_not_only_parsed(monkeypatch, capsys):
     as an empty bucket, and a pattern fix that left the grouping key wrong would still
     print that refusal.
     """
-    prefix = "178113193057/"
+    prefix = "777788889999/"
     fake = install_s3(
         monkeypatch,
         {
@@ -383,7 +382,7 @@ def test_a_producer_found_only_under_a_regionless_key_is_named_in_the_refusal(
     reason, because "no execution has a CSV for all of" reads as a run that never
     finished, and the repair is in the key shape.
     """
-    prefix = "178113193057/"
+    prefix = "777788889999/"
     orphan, *rest = probe.PRODUCERS
     stamped = {report_key(prefix, m): STAMP for m in rest}
     stamped[report_key(prefix, orphan, region=None)] = STAMP
@@ -414,7 +413,7 @@ def test_a_regionless_key_does_not_join_two_regions_of_one_run_name(monkeypatch)
     region-bearing sets are complete on their own and the region-less key is a group of
     one that completes nothing.
     """
-    prefix = "178113193057/"
+    prefix = "777788889999/"
     stamped = {
         report_key(prefix, m, region=region): STAMP
         for region in ("us-east-1", "eu-west-1")
@@ -440,7 +439,7 @@ def test_the_region_filter_counts_the_keys_it_excluded(monkeypatch, capsys):
     """A filter that removes everything and a bucket that held nothing print the same
     refusal otherwise, and only one of them is repaired by passing a different
     --region."""
-    prefix = "178113193057/"
+    prefix = "777788889999/"
     fake = install_s3(
         monkeypatch,
         {report_key(prefix, m, region="us-east-1"): STAMP for m in probe.PRODUCERS},

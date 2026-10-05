@@ -4975,7 +4975,7 @@ LOG_EVENT_DELETION_GRACE = timedelta(hours=72)
 # filter pattern and limit 1 the first page holding an event returns it, and a
 # group with nothing before the cutoff returns no nextToken: the cutoff query
 # took 195 ms on the Bedrock invocation log group and 55 ms on an 82 GB group in
-# account 178113193057, us-east-1, on 2026-10-04. A scan that matches nothing
+# a test account, us-east-1, on 2026-10-04. A scan that matches nothing
 # paged at 5,195 ms at the slowest on that 82 GB group, so 5 pages take at most
 # 26 s. The deployed function's slowest of 25 runs in the 30 days to 2026-10-04
 # took 420 s of its 600 s timeout. A search that reaches the cap is reported
@@ -5258,7 +5258,7 @@ def _replica_buckets(s3_client: Any, bucket_name: str) -> List[str]:
 # HeadObject is read for at most this many invocation log objects in one
 # bucket; the rest are reported as not read. HeadObject took 57 ms at the
 # median and 110 ms at the slowest of 20 calls on invocation log objects in
-# account 178113193057, us-east-1, on 2026-10-04, so 500 calls take 29 s at the
+# a test account, us-east-1, on 2026-10-04, so 500 calls take 29 s at the
 # median. The deployed function's slowest of 25 runs in the 30 days to
 # 2026-10-04 took 420 s of its 600 s timeout. The verdict does not rest on the
 # objects past the cap: an object a FAILED status holds back past its rule is
@@ -5329,7 +5329,7 @@ LIFECYCLE_DELETION_GRACE_DAYS = 2
 # ListObjectsV2 or ListObjectVersions calls one search for a bucket's oldest
 # object or noncurrent version may make. With Delimiter '/', ListObjectsV2 took
 # 60 ms at the median and 74 ms at the slowest of ten calls, and
-# ListObjectVersions 58 ms and 65 ms, in account 178113193057, us-east-1, on
+# ListObjectVersions 58 ms and 65 ms, in a test account, us-east-1, on
 # 2026-10-04, so 200 calls take 15 s at the slowest. The deployed function's
 # slowest of 25 runs in the 30 days to 2026-10-04 took 420 s of its 600 s
 # timeout. A search that reaches the cap names the root it did not finish, and
@@ -9159,7 +9159,7 @@ PROMPT_ARN_MODEL_ID = re.compile(
 
 # Event history pages read per operation, at 50 events a page. Measured with
 # this function's adaptive retry config over the last 24 hours of the four
-# operations (account 178113193057, us-east-1, 2026-10-04): 13 pages took 0.44 s
+# operations (a test account, us-east-1, 2026-10-04): 13 pages took 0.44 s
 # on average and 1.05 s at most, and 57 back-to-back pages 1.6 s at most, so 40
 # pages cost at most about 64 s of the 600 s timeout. That account logged 8,454
 # InvokeModelWithResponseStream calls in those 24 hours, more than the 500 read.
@@ -21634,7 +21634,7 @@ def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
 
 # ListObjectsV2 returns 1,000 keys a page, so a source is listed up to 100,000
 # objects; a longer listing is reported as not read, never as clean. Measured
-# 2026-10-04 in account 178113193057, us-east-1: 100 full pages took mean
+# 2026-10-04 in a test account, us-east-1: 100 full pages took mean
 # 0.215 s, p90 0.248 s, max 0.547 s, 21.5 s in all, so one capped listing
 # costs about 25 s of the 600 s Lambda timeout.
 REDACTION_SOURCE_LIST_PAGE_CAP = 100
@@ -22343,7 +22343,7 @@ CONTEXTUAL_GROUNDING_CEILING = (
 # to 100 KB each, so the page size bounds the memory one page takes.
 INVOCATION_LOG_SCAN_PAGE_SIZE = 25
 
-# Measured on /aws/bedrock/model-invocation-logs (account 178113193057,
+# Measured on /aws/bedrock/model-invocation-logs (a test account,
 # us-east-1, 2026-10-04): 72 filtered pages over the last 24 hours took 0.55 s
 # on average, 0.96 s at the 90th percentile and 1.69 s at most, and the first
 # call of a cold client 3.24 s. That group logged 8,454 records in those 24
@@ -22453,7 +22453,7 @@ def _scan_invocation_log(
 # record objects, each a gzip file of JSON lines under the hour folder of
 # AWSLogs/<account>/BedrockModelInvocationLogs/<region>/YYYY/MM/DD/HH/.
 # Measured on the large-data objects under that layout in
-# soc-cloudtrail-logs-178113193057-useast1 (account 178113193057, us-east-1,
+# a CloudTrail log bucket (a test account, us-east-1,
 # 2026-10-04; the account delivers no record objects to S3): ListObjectsV2 of
 # an hour folder took 0.12 s on average and 0.97 s at most (30 calls), and
 # GetObject plus gunzip of a 100 KB object 0.15 s on average and 0.61 s at most
@@ -22653,7 +22653,7 @@ def _invoke_grounding_tags(body: Any) -> Optional[Set[str]]:
 # operation name, over the span of the calls widened by this window. A Converse
 # call's guardrailConfig is absent from its logged request body too, and its
 # event carries it as requestParameters.guardrailConfig (record and event
-# f5561a4b, account 178113193057, us-east-1, read 2026-10-04), so Converse and
+# f5561a4b, a test account, us-east-1, read 2026-10-04), so Converse and
 # ConverseStream calls are joined the same way.
 GROUNDING_JOIN_WINDOW = timedelta(minutes=5)
 
@@ -22667,7 +22667,7 @@ GROUNDING_JOIN_MAX_PAGES = 50
 # Every join of one region's run, BR-27's and BR-34's, draws on this many
 # pages, so joining Converse calls keeps the run at the 100 pages BR-27 alone
 # could read before. Measured again with this function's adaptive retry config
-# (account 178113193057, us-east-1, 2026-10-04): 57 back-to-back pages over the
+# (a test account, us-east-1, 2026-10-04): 57 back-to-back pages over the
 # four runtime operations took 0.41 s on average and 1.6 s at most, so 100
 # pages cost about 41 s and at most about 160 s of the 600 s timeout. One page
 # of 13 in an earlier run with the default retry config took 17.7 s.
@@ -37815,7 +37815,7 @@ def _classification_order(
 # BR-46 reads at most this many .metadata.json sidecars and lists at most this
 # many ListObjectsV2 pages across all its sources in one region run; a source
 # with a sidecar or an object past either budget is held N/A with a count.
-# Measured 2026-10-04 in account 178113193057, us-east-1: GetObject on 200
+# Measured 2026-10-04 in a test account, us-east-1: GetObject on 200
 # objects under 4 KB took mean 0.126 s, p90 0.169 s, max 0.296 s, so 300 reads
 # cost about 38 s (51 s at p90); 150 list pages at the measured 0.215 s mean,
 # 0.248 s p90 cost about 32 s (37 s at p90).
@@ -39456,7 +39456,7 @@ def _customization_job_locations(region: str = "") -> Dict[str, Any]:
 
 # Describe calls are one per job, so the most recent jobs a bulk read does not
 # return are described, newest first, and the rest are counted as unread, which
-# holds every check reading them at N/A. Measured in account 178113193057,
+# holds every check reading them at N/A. Measured in a test account,
 # us-east-1, on 2026-10-04 over ten calls each: DescribeTrainingJob 122 ms at
 # the median and 459 ms at the slowest, DescribeTransformJob 88 ms and 172 ms,
 # and DescribeProcessingJob, on a missing job name because the account holds no
@@ -42767,7 +42767,7 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
 
 
 # LookupEvents pages read per attestation-bound key, 50 events a page. Paging
-# LookupEvents by ResourceName for five KMS keys in account 178113193057,
+# LookupEvents by ResourceName for five KMS keys in a test account,
 # us-east-1, on 2026-10-04 took 159 ms a page at the median and 528 ms at the
 # slowest, and sustained paging under the two-calls-a-second throttle took
 # 591 ms a page, so 20 pages take about 12 s a key. The deployed function's
@@ -43140,7 +43140,7 @@ LLM_JACKING_LOOKBACK = timedelta(minutes=1440)
 LOOKUP_EVENTS_PAGE_SIZE = 50
 
 # LookupEvents is throttled near two calls per second per account and Region.
-# Paging 20 calls by EventName over 24 hours in account 178113193057,
+# Paging 20 calls by EventName over 24 hours in a test account,
 # us-east-1, on 2026-10-04 took 386 ms a page in wall time for AssumeRole and
 # 416 ms for Decrypt, and an EventSource lookup took 591 ms a page with its
 # slowest page at 3,821 ms under throttling. At 591 ms a page BR-56's 14 event

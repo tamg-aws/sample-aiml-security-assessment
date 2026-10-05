@@ -2351,7 +2351,7 @@ def _agentcore_managed_tool_egress_findings(
     The managed tools attach no customer security group, so the principals
     that can start a session on one are the agents whose egress it carries.
     GetBrowser and GetCodeInterpreter return no networkConfiguration for them
-    (live, account 178113193057, us-east-1, 2026-10-04), although the model
+    (live, a test account, us-east-1, 2026-10-04), although the model
     marks it required, and the devguide says the browser "supports the public
     network mode", which "allows the tool to access public internet
     resources", but they do not state the mode of the managed tools. PUBLIC
@@ -8177,7 +8177,7 @@ def _managed_browser_recording_findings(
     """AC-06 for the AWS managed browser: name who can start an unrecorded session.
 
     GetBrowser on aws.browser.v1 returns no recording member (live, account
-    178113193057, us-east-1, 2026-10-04) and the customer cannot set one, so a
+    a test account, us-east-1, 2026-10-04) and the customer cannot set one, so a
     session on it leaves no recording. Each cached principal that can start a
     session on it fails, named. A browser nobody can start passes.
     """
@@ -17289,7 +17289,7 @@ def _gateway_rate_limit_summary(rate_limit: Dict[str, Any]) -> str:
 
 # The gateway's Throttles metric (observability-gateway-metrics.html) and its
 # WafBlocks, WafFailOpens and WafFailCloses metrics (gateway-waf.html) are
-# published in AWS/Bedrock-AgentCore. ListMetrics on account 178113193057 in
+# published in AWS/Bedrock-AgentCore. ListMetrics on a test account in
 # us-east-1 on 2026-10-04 listed gateway Throttles only with
 # Operation=InvokeGateway, in dimension sets with and without
 # Resource=<gateway ARN>; a set with no Resource counts every gateway in the
@@ -25679,7 +25679,7 @@ CREDENTIAL_PLACEHOLDER_FRAGMENTS = (
 # and documentation, so assignments are not matched under these directories,
 # nor in a file a package's .dist-info RECORD lists: a code archive for
 # AgentCore holds its dependencies at the archive root, beside the agent's own
-# code (an archive read in 178113193057 on 2026-10-04 held botocore, whose
+# code (an archive read in a test account on 2026-10-04 held botocore, whose
 # examples assign Password and GrantToken, at its root with 98 RECORD files).
 # Access key IDs and private key blocks still are matched in both.
 CODE_DEPENDENCY_PATH_SEGMENTS = ("site-packages", "dist-packages", "node_modules")
@@ -25702,7 +25702,7 @@ AC34_CODE_FINDING = "AgentCore Runtime Code Inline Credentials"
 # a 4096-bit RSA key's block is about 3.2 KiB, well inside the 64 KiB overlap.
 #
 # The bounds are set from measurement on 2026-10-04. Download: s3:GetObject in
-# account 178113193057, us-east-1, of two runtime code archives there (39.8
+# a test account, us-east-1, of two runtime code archives there (39.8
 # MiB unpacking to 92.7 MiB, and 34.4 MiB unpacking to 76.6 MiB) ran at 17.8
 # to 27.9 MiB/s, from a workstation and not from the function. Scan:
 # _code_archive_credentials over synthetic archives on Python 3.12 ran at
@@ -25735,7 +25735,7 @@ ECR_IMAGE_INDEX_TYPES = (
 )
 # Each platform an image index names costs one BatchGetImage, one
 # GetDownloadUrlForLayer and one configuration fetch before any layer is
-# read. Measured on 2026-10-04 in account 178113193057, us-east-1, from a
+# read. Measured on 2026-10-04 in a test account, us-east-1, from a
 # workstation and not from the function, over the three images that account's
 # runtimes run: BatchGetImage took 112 to 194 ms warm and 1305 ms on the first
 # call, GetDownloadUrlForLayer 69 to 178 ms on average, so 8 platforms cost
@@ -25751,7 +25751,7 @@ ECR_IMAGE_CONFIG_TIMEOUT_SECONDS = 10
 # manifest declares before anything is fetched, and an image over either is
 # not read.
 #
-# The bounds are set from measurement on 2026-10-04 in account 178113193057,
+# The bounds are set from measurement on 2026-10-04 in a test account,
 # us-east-1, from a workstation and not from the function. Download:
 # GetDownloadUrlForLayer plus an HTTPS read of every layer of the two largest
 # runtime images there (117.5 MiB and 114.0 MiB compressed) ran at 8.6 MiB/s
@@ -36039,7 +36039,7 @@ def _agentcore_session_count_alarms() -> List[str]:
 
 
 # AgentCore's value on the Cost Explorer SERVICE dimension, read with
-# ce:GetDimensionValues SERVICE on account 178113193057 in us-east-1 on
+# ce:GetDimensionValues SERVICE on a test account in us-east-1 on
 # 2026-10-04. A CUSTOM monitor naming it tracks AgentCore spend.
 AGENTCORE_COST_EXPLORER_SERVICE = "Amazon Bedrock AgentCore"
 
