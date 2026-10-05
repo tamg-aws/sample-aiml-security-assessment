@@ -12710,7 +12710,7 @@ class TestBR42ModelAllowList:
         assert set(failed) == {"ModelIdRole", "NegatedModelIdRole"}
         assert "bedrock:modelid" in failed["ModelIdRole"]
         assert "never matches" in failed["ModelIdRole"]
-        assert "can invoke any foundation model" not in failed["ModelIdRole"]
+        assert "can invoke models not named one by one" not in failed["ModelIdRole"]
         assert "every model available in the account" in failed["NegatedModelIdRole"]
 
     def test_br42_model_arn_condition_with_a_wildcard_value_is_not_scoping(self):
@@ -13035,6 +13035,157 @@ class TestBR42ModelAllowList:
         passed = [f for f in findings if f["Status"] == "Passed"]
         assert len(passed) == 1
         assert "MantleScopedRole" in passed[0]["Finding_Details"]
+
+    # MDL-01: an Allow on a resource that cannot be a model, such as an agent
+    # alias or a knowledge base, was failed as a grant on every model.
+    def test_br42_an_allow_on_a_non_model_resource_is_not_a_model_grant(self):
+        alias = "arn:aws:bedrock:*:*:agent-alias/*"
+        knowledge_base = "arn:aws:bedrock:us-east-1:123456789012:knowledge-base/*"
+        result = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "AgentRole": [
+                        ("A", _allow("bedrock:Invoke*", [alias, knowledge_base]))
+                    ],
+                    "AsyncRole": [
+                        (
+                            "J",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*:*:async-invoke/*",
+                            ),
+                        )
+                    ],
+                    "ModelRole": [
+                        (
+                            "M",
+                            _allow(
+                                "bedrock:Invoke*",
+                                [alias, "arn:aws:bedrock:*::foundation-model/*"],
+                            ),
+                        )
+                    ],
+                }
+            ),
+            region="Global",
+            training_data=self.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert result["invocation_open"] == ["role 'ModelRole'"]
+        # An identity that can invoke no model is not in any row, Passed or not.
+        every_text = " ".join(f["Finding_Details"] for f in extract_csv_data(result))
+        assert "AgentRole" not in every_text
+        assert "AsyncRole" not in every_text
+        failed_text = self._failed_text(extract_csv_data(result))
+        assert "agent-alias" not in failed_text
+        assert (
+            "it allows bedrock:invokemodel on arn:aws:bedrock:*::foundation-model/*, "
+            "so every model those patterns match can be invoked without being named"
+        ) in failed_text
+        assert "every model available in the account" not in failed_text
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:bedrock:*:*:*",
+            "arn:aws:bedrock:*",
+            "arn:aws:bedrock:us-east-1:123456789012:${aws:username}",
+            "arn:*:bedrock:*:*:inference-profile/*",
+        ],
+    )
+    def test_br42_a_wildcard_that_can_match_a_model_still_widens(self, resource):
+        findings = self._run(
+            _identity_cache(
+                roles={"WideRole": [("W", _allow("bedrock:InvokeModel", resource))]}
+            )
+        )
+        assert "Role 'WideRole'" in self._failed_text(findings)
+
+    def test_br42_only_a_resource_on_every_model_claims_every_model(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "AllRole": [
+                        ("A", _allow("bedrock:InvokeModel", "arn:aws:bedrock:*"))
+                    ],
+                    "ProfileRole": [
+                        (
+                            "P",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*:*:inference-profile/*",
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+        rows = {
+            name: f["Finding_Details"]
+            for f in findings
+            for name in ("AllRole", "ProfileRole")
+            if f"Role '{name}'" in f["Finding_Details"]
+        }
+        assert "every model available in the account can be invoked" in rows["AllRole"]
+        assert "every model those patterns match" in rows["ProfileRole"]
+        assert "every model available in the account" not in rows["ProfileRole"]
+
+    def test_br42_the_stream_action_on_a_project_reaches_no_model(self):
+        # bedrock:InvokeModelWithResponseStream names no project resource type.
+        project = "arn:aws:bedrock:us-east-1:123456789012:project/*"
+        result = bedrock_app.check_bedrock_model_allow_list(
+            _identity_cache(
+                roles={
+                    "StreamRole": [
+                        ("S", _allow("bedrock:InvokeModelWithResponseStream", project))
+                    ],
+                    "InvokeRole": [("I", _allow("bedrock:InvokeModel", project))],
+                }
+            ),
+            region="Global",
+            training_data=self.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        assert result["invocation_open"] == ["role 'InvokeRole'"]
+
+    def test_br42_a_mantle_allow_on_a_non_project_resource_is_not_counted(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "MantleOtherRole": [
+                        (
+                            "MO",
+                            _allow(
+                                "bedrock-mantle:CreateInference",
+                                [
+                                    "arn:aws:bedrock:*:*:agent-alias/*",
+                                    "arn:aws:bedrock-mantle:*:*:customization/*",
+                                ],
+                            ),
+                        )
+                    ],
+                    "MantleProjectRole": [
+                        (
+                            "MP",
+                            _allow(
+                                "bedrock-mantle:CreateInference",
+                                [
+                                    "arn:aws:bedrock:*:*:agent-alias/*",
+                                    "arn:aws:bedrock-mantle:*:*:project/*",
+                                ],
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+        failed_text = self._failed_text(findings)
+        assert "MantleOtherRole" not in failed_text
+        assert "Role 'MantleProjectRole'" in failed_text
+        assert (
+            "allows bedrock-mantle:CreateInference on "
+            "arn:aws:bedrock-mantle:*:*:project/* with no"
+        ) in failed_text
 
     def test_br42_training_data_reached_through_a_bucket_wildcard_fails(self):
         training = {
@@ -15840,10 +15991,46 @@ class TestBR44MarketplaceModelControl:
         details = findings[0]["Finding_Details"]
         assert "role 'Guarded'" in details
         assert bedrock_app.MARKETPLACE_AUTO_SUBSCRIPTION_QUOTE in details
-        assert "role 'Invoker' can invoke any model" in details
+        assert "role 'Invoker' can invoke a model outside named ARNs" in details
         assert "no attached service control policy denies invoking" in details
         assert findings[0]["Severity"] == "High"
         assert "bedrock:InvokeModel" in findings[0]["Resolution"]
+
+    # MDL-04: BR-44 read BR-42's invocation_open, which listed an identity whose
+    # only invoke grant was on an agent alias.
+    def test_br44_an_invoke_grant_on_an_agent_alias_does_not_open_invocation(self):
+        cache = _identity_cache(
+            roles={
+                "AgentInvoker": [
+                    (
+                        "A",
+                        _allow("bedrock:Invoke*", "arn:aws:bedrock:*:*:agent-alias/*"),
+                    )
+                ],
+                "ModelInvoker": [
+                    (
+                        "M",
+                        _allow(
+                            "bedrock:InvokeModel",
+                            "arn:aws:bedrock:*::foundation-model/*",
+                        ),
+                    )
+                ],
+            }
+        )
+        allow_list = bedrock_app.check_bedrock_model_allow_list(
+            cache,
+            region="Global",
+            training_data=TestBR42ModelAllowList.NO_TRAINING_DATA,
+            bucket_policies={"policies": {}, "errors": []},
+        )
+        findings = self._run(
+            self._deny_only_cache(),
+            **{**self.OPEN_BR42, "allow_list_findings": allow_list},
+        )
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "role 'ModelInvoker' can invoke a model outside named ARNs" in details
+        assert "AgentInvoker" not in details
 
     @pytest.mark.parametrize(
         "leg, blocked",

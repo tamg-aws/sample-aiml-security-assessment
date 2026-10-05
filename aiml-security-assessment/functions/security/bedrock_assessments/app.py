@@ -29704,6 +29704,62 @@ def _names_one_model(value: Any) -> bool:
     )
 
 
+# Of the resource types bedrock:InvokeModel names, async-invoke is a job and
+# system-tool a tool, and neither is a model; InvokeModelWithResponseStream
+# names no async-invoke or project type (bedrock.json in the Service
+# Authorization Reference, read 2026-10-04). An Allow whose every Resource
+# matches no ARN of the remaining types, such as agent-alias/* or
+# knowledge-base/*, lets the action reach no model.
+NON_MODEL_INVOKE_RESOURCE_TYPES = ("async-invoke", "system-tool")
+
+STREAM_ABSENT_RESOURCE_TYPES = ("async-invoke", "project")
+
+# bedrock-mantle:CreateInference names only the project resource type
+# (bedrock-mantle.json, read 2026-10-04).
+MANTLE_PROJECT_ARN_PATTERN = "arn:*:bedrock-mantle:*:*:project/*"
+
+
+def _model_arn_patterns(action: str) -> List[str]:
+    """Return an ARN pattern, in any partition, Region and account, for each
+    resource type through which ``action`` can invoke a model."""
+    skipped = NON_MODEL_INVOKE_RESOURCE_TYPES + (
+        STREAM_ABSENT_RESOURCE_TYPES
+        if action == "bedrock:invokemodelwithresponsestream"
+        else ()
+    )
+    return [
+        template.replace("arn:aws:", "arn:*:", 1).format(
+            region="*", account="*", id="*"
+        )
+        for name, template in INVOKE_MODEL_RESOURCE_FORMATS
+        if name not in skipped
+    ]
+
+
+def _resource_can_name_model(resource: Any, arn_patterns: List[str]) -> bool:
+    """
+    Return True when a Resource pattern can match an ARN of one of
+    ``arn_patterns``, compared segment by segment, with a policy variable read
+    as *. A pattern with fewer than six segments whose last one holds a * spans
+    the rest.
+    """
+    if not isinstance(resource, str):
+        return False
+    pattern = re.sub(r"\$\{[^}]*\}", "*", resource.strip().lower())
+    segments = pattern.split(":", 5)
+    if len(segments) < 6:
+        if "*" not in segments[-1]:
+            return False
+        segments += ["*"] * (6 - len(segments))
+    return any(
+        all(
+            _globs_overlap(segment, part)
+            for segment, part in zip(segments, arn.split(":", 5))
+        )
+        for arn in arn_patterns
+    )
+
+
 def _condition_is_positive_match(operator: str) -> bool:
     """
     Return True for an operator that matches only when the key is present and
@@ -29721,13 +29777,21 @@ def _statement_invoke_scoping(
     """
     Describe how one Allow statement scopes one model invoke action.
 
-    Returns None when the statement does not allow the action. ``inert_keys``
-    names bedrock: keys the action does not define that the statement tests
-    positively; such a statement never applies to the action.
+    Returns None when the statement does not allow the action on a model:
+    it names another action, or every Resource is of a type that is not a
+    model, such as agent-alias/*. ``inert_keys`` names bedrock: keys the action
+    does not define that the statement tests positively; such a statement never
+    applies to the action.
     """
     if str(statement.get("Effect", "")).upper() != "ALLOW":
         return None
     if not _statement_matches_action(statement, action):
+        return None
+    model_arns = _model_arn_patterns(action)
+    if "NotResource" not in statement and not any(
+        _resource_can_name_model(resource, model_arns)
+        for resource in _as_list(statement.get("Resource"))
+    ):
         return None
 
     inert_keys = []
@@ -29763,7 +29827,7 @@ def _statement_invoke_scoping(
         resources = [
             resource
             for resource in _as_list(statement.get("Resource"))
-            if isinstance(resource, str)
+            if _resource_can_name_model(resource, model_arns)
         ]
         unscoped = [
             resource for resource in resources if not _names_one_model(resource)
@@ -29822,11 +29886,17 @@ def _boundary_named_resources(
 def _mantle_statement_scoping(statement: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Describe how one Allow statement scopes bedrock-mantle:CreateInference, or
-    None when it does not allow that action.
+    None when it does not allow that action on a bedrock-mantle project, the
+    only resource type the action names.
     """
     if str(statement.get("Effect", "")).upper() != "ALLOW":
         return None
     if not _statement_matches_action(statement, MANTLE_INFERENCE_ACTION):
+        return None
+    if "NotResource" not in statement and not any(
+        _resource_can_name_model(resource, [MANTLE_PROJECT_ARN_PATTERN])
+        for resource in _as_list(statement.get("Resource"))
+    ):
         return None
     models = []
     for operator, key, values in _condition_keys_by_operator(statement):
@@ -29836,7 +29906,11 @@ def _mantle_statement_scoping(statement: Dict[str, Any]) -> Optional[Dict[str, A
             continue
         if values and not any(char in str(value) for value in values for char in "*?"):
             models.extend(str(value) for value in values)
-    resources = [str(value) for value in _as_list(statement.get("Resource"))]
+    resources = [
+        str(value)
+        for value in _as_list(statement.get("Resource"))
+        if _resource_can_name_model(value, [MANTLE_PROJECT_ARN_PATTERN])
+    ]
     if "NotResource" in statement:
         resources = [
             "NotResource " + ", ".join(map(str, _as_list(statement["NotResource"])))
@@ -30213,13 +30287,27 @@ def _identity_model_access(
                     if scoping["loose_conditions"]
                     else ""
                 )
+                if "NotResource" in statement:
+                    reach = "every model it does not exclude can be invoked"
+                elif any(
+                    name not in NON_MODEL_INVOKE_RESOURCE_TYPES
+                    for name in _invocation_resources_uncovered(
+                        scoping["unscoped_resources"]
+                    )
+                ):
+                    reach = (
+                        "every model those patterns match can be invoked "
+                        "without being named"
+                    )
+                else:
+                    reach = "every model available in the account can be invoked"
                 access["unrestricted"].append(
-                    "policy '{}': it allows {} on {}{}, so every model available in "
-                    "the account can be invoked".format(
+                    "policy '{}': it allows {} on {}{}, so {}".format(
                         policy.get("name"),
                         action,
                         ", ".join(scoping["unscoped_resources"]),
                         loose,
+                        reach,
                     )
                 )
 
@@ -30335,7 +30423,7 @@ def check_bedrock_model_allow_list(
                 findings["invocation_open"].append(f"{identity_type} '{identity_name}'")
             if access["unrestricted"]:
                 reasons.append(
-                    "can invoke any foundation model because "
+                    "can invoke models not named one by one because "
                     + "; ".join(access["unrestricted"][:3])
                 )
             if access["mantle"]:
@@ -32942,9 +33030,8 @@ def _marketplace_invocation_block(
         state["unread"].append("the BR-42 identity model allow-list")
     elif allow_list_findings["invocation_open"]:
         state["open"].append(
-            "{} can invoke any model (BR-42 identity allow-list)".format(
-                ", ".join(allow_list_findings["invocation_open"][:5])
-            )
+            "{} can invoke a model outside named ARNs (BR-42 identity "
+            "allow-list)".format(", ".join(allow_list_findings["invocation_open"][:5]))
         )
     else:
         state["blocked_by"].append(

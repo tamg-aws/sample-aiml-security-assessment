@@ -355,10 +355,15 @@ AI_SUBJECT_ROWS = [
         ["BR-42"],
         "BR-42 fails each cached role or user whose bedrock:InvokeModel, "
         "bedrock:InvokeModelWithResponseStream or bedrock-mantle:CreateInference "
-        "grant reaches every model, judges the service control policy leg, and "
+        "grant reaches a model it does not name, judges the service control "
+        "policy leg, and "
         "fails the management account, which service control policies never "
         "restrict. An identity policy document that cannot be parsed is named on an"
-        " N/A row and holds the would-be Passed row at N/A",
+        " N/A row and holds the would-be Passed row at N/A. An Allow whose every "
+        "Resource can match no model ARN, such as agent-alias/* or "
+        "knowledge-base/*, is not counted as a model grant, and the finding "
+        "claims every model in the account only for a Resource that matches "
+        "every model resource type",
         [],
         3,
     ),
