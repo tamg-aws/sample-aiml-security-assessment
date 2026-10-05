@@ -14864,6 +14864,102 @@ class TestAC28GatewayAuthorizerSCP:
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Finding"].endswith("Missing")
 
+    @pytest.mark.parametrize(
+        "statements, targets, verdict",
+        [
+            ([{"Effect": "Allow", "Action": "*", "Resource": "*"}], None, "Missing"),
+            (
+                [
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:CreateGateway",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ],
+                None,
+                "Partial",
+            ),
+            (
+                [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ],
+                {"p-0": [], "p-1": []},
+                "Unattached",
+            ),
+            (
+                [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "Null": {"bedrock-agentcore:GatewayAuthorizerType": "true"}
+                        },
+                    }
+                ],
+                None,
+                "Ineffective",
+            ),
+        ],
+        ids=["missing", "partial", "unattached", "ineffective"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_an_unread_policy_holds_every_failed_verdict_at_na(
+        self, mock_orgs, statements, targets, verdict
+    ):
+        # A policy DescribePolicy could not read only added an N/A row, and the
+        # Failed beside it counted that policy as read and lacking the Deny.
+        self._wire(mock_orgs, {"Second": statements, "Readable": statements}, targets)
+        with_both = agentcore_app.check_agentcore_gateway_authorizer_scp()
+        failed = [f for f in with_both if f["Status"] == "Failed"]
+        assert [f["Finding"] for f in failed] == [
+            f"AgentCore Gateway Authorizer Guardrail {verdict}"
+        ]
+        if verdict == "Missing":
+            assert (
+                "None of the 2 service control policy(s) read"
+                in (failed[0]["Finding_Details"])
+            )
+
+        self._wire(mock_orgs, {"Hidden": [], "Readable": statements}, targets)
+        readable = mock_orgs.describe_policy.side_effect
+
+        def describe_policy(PolicyId):
+            if PolicyId == "p-0":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return readable(PolicyId)
+
+        mock_orgs.describe_policy.side_effect = describe_policy
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert {f["Status"] for f in findings} == {"N/A"}
+        held = [f for f in findings if f["Finding"].endswith("Incomplete")]
+        assert len(held) == 1
+        assert (
+            "None of the 1 service control policy(s) read"
+            in (held[0]["Finding_Details"])
+        )
+        assert (
+            "Service control policy Hidden could not be read"
+            in (held[0]["Finding_Details"])
+        )
+        assert_finding_schema(held[0])
+
     @patch("agentcore_app.organizations_client", None)
     def test_no_client_is_na(self):
         findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
@@ -30123,8 +30219,10 @@ class TestManagedToolSessionHolders:
         assert len(egress) == 1 and len(recording) == 1
         if holds:
             assert egress[0]["Status"] == "Failed"
-            assert egress[0]["Finding"] == "AgentCore Egress Unrestricted"
-            assert egress[0]["Severity"] == "High"
+            # No document states the managed tool's mode, so an absent one is
+            # read as SANDBOX is, not as PUBLIC.
+            assert egress[0]["Finding"] == "AgentCore Egress Not Customer Filtered"
+            assert egress[0]["Severity"] == "Medium"
             assert "reports no networkConfiguration" in egress[0]["Finding_Details"]
             assert recording[0]["Status"] == "Failed"
             assert "reports no session recording" in recording[0]["Finding_Details"]
@@ -30239,8 +30337,8 @@ class TestManagedToolSessionHolders:
         [
             (
                 None,
-                "AgentCore Egress Unrestricted",
-                "High",
+                "AgentCore Egress Not Customer Filtered",
+                "Medium",
                 "reports no networkConfiguration",
             ),
             (
@@ -40520,22 +40618,68 @@ class TestAC27RoleTrustSourceArnNamesTheGateway:
             findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
         )
 
+    @pytest.mark.parametrize(
+        "value, status",
+        [
+            ("gateway/*", "N/A"),
+            ("gateway/gw-?", "N/A"),
+            ("gateway/gw-a*", "N/A"),
+            ("gateway/gw-x", "N/A"),
+            (["gateway/gw-a", "gateway/gw-c"], "Passed"),
+            ("gateway/gw-a", "Passed"),
+        ],
+        ids=["star", "question", "prefix", "unknown-arn", "two-read", "own-arn"],
+    )
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
-    def test_an_unread_gateway_is_named_in_the_passed_text(self, mock_ac, mock_iam):
+    def test_an_unread_gateway_holds_a_pattern_at_na(
+        self, mock_ac, mock_iam, value, status
+    ):
+        # A Passed said aws:SourceArn admits no other gateway while gw-b, never
+        # read, could match the pattern.
+        values = [value] if isinstance(value, str) else value
         findings = self._run(
             mock_ac,
             mock_iam,
-            {"gw-a": "RoleA", "gw-b": "RoleB"},
-            {"RoleA": self._arn_trust(self._GW + "*")},
+            {"gw-a": "RoleA", "gw-b": "RoleB", "gw-c": "RoleA"},
+            {
+                "RoleA": self._arn_trust(
+                    [
+                        f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:{v}"
+                        for v in values
+                    ]
+                )
+            },
             unread=("gw-b",),
         )
 
-        passed = self._named(
+        rows = self._named(
             findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
         )
-        assert len(passed) == 1
-        assert "1 gateway(s) could not be read" in passed[0]["Finding_Details"]
+        assert [row["Status"] for row in rows] == [status, status]
+        for row in rows:
+            assert_finding_schema(row)
+            if status == "N/A":
+                assert "Gateway 'gw-b' (gw-b)" in row["Finding_Details"]
+                assert values[0] in row["Finding_Details"]
+            else:
+                assert "1 gateway(s) could not be read" in row["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pattern_with_every_gateway_read_still_passes(self, mock_ac, mock_iam):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA", "gw-c": "RoleA"},
+            {"RoleA": self._arn_trust(self._GW + "*")},
+        )
+
+        rows = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert [row["Status"] for row in rows] == ["Passed", "Passed"]
+        assert "could not be read" not in rows[0]["Finding_Details"]
 
 
 class TestAC43EvaluationRoleTrustByValue:

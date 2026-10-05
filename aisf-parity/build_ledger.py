@@ -861,7 +861,10 @@ AI_SUBJECT_ROWS = [
         "has no IAM identity to name, a Principal '*' statement passes when an Allow "
         "condition or a restricting Deny bounds the caller to aws:SourceVpc or "
         "aws:SourceVpce with an equals operator and no wildcard value. IfExists, "
-        "ForAllValues and wildcard values do not count",
+        "ForAllValues and wildcard values do not count. While GetGateway leaves any "
+        "gateway unread, a role trust passes only when every aws:SourceArn "
+        "value is the literal ARN of a gateway that was read; a pattern or another "
+        "ARN is N/A naming the unread gateways",
         [],
         4,
     ),
@@ -1168,8 +1171,9 @@ AI_SUBJECT_ROWS = [
         "evaluation order and passes only when the first rule over * is a BLOCK "
         "that names no query type and the firewall config has FirewallFailOpen "
         "DISABLED. AC-01 also lists the AWS managed browser and Code Interpreter "
-        "(type SYSTEM) and reads each with its get call: absent or PUBLIC network "
-        "mode fails at High and SANDBOX at Medium, naming each cached role and user "
+        "(type SYSTEM) and reads each with its get call: PUBLIC network mode fails "
+        "at High, and SANDBOX or no networkConfiguration at Medium, since no page "
+        "states the managed tools' mode, naming each cached role and user "
         "whose Allow reaches StartBrowserSession or StartCodeInterpreterSession on "
         "the tool's ARN with no unconditioned Deny or boundary removing it; a tool "
         "none can start passes, and an unread cache or principal is N/A",
@@ -1299,7 +1303,9 @@ AI_SUBJECT_ROWS = [
         "the root, read with organizations:ListParents and "
         "organizations:ListTargetsForPolicy: a guard attached elsewhere fails as "
         "Unattached, the management account fails as Not Enforced because no SCP "
-        "restricts it, and an unreadable parent chain or attachment list is N/A. The "
+        "restricts it, and an unreadable parent chain or attachment list is N/A, as "
+        "is every Failed verdict while a policy DescribePolicy could not read may "
+        "hold the Deny. The "
         "condition key carries a documentation drift: the AgentCore devguide wires "
         "GatewayAuthorizerType to CreateGateway and UpdateGateway and shows sibling "
         "gateway keys used this way in SCPs, while the machine-readable service "
