@@ -9226,19 +9226,21 @@ TOKEN_VAULT_CONTEXT_OPERATORS = (
     "stringlike",
 )
 
-# Under the equality operators a `*` or `?` is a literal character, not a
-# wildcard (reference_policies_elements_condition_operators.html).
+# Under StringEquals and StringEqualsIgnoreCase a `*` or `?` is a literal
+# character, not a wildcard. ArnEquals and ArnLike behave identically and read
+# both as wildcards in each ARN component
+# (reference_policies_elements_condition_operators.html).
 TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS = (
-    "arnequals",
     "stringequals",
     "stringequalsignorecase",
 )
-TOKEN_VAULT_CONTEXT_PATTERN_OPERATORS = ("arnlike", "stringlike")
+TOKEN_VAULT_CONTEXT_PATTERN_OPERATORS = ("arnequals", "arnlike", "stringlike")
 
 
 def _matchable_condition_values(statement: Dict[str, Any], key: str) -> List[List[str]]:
     """Return the lowercased value lists on `key` that can match a request:
-    each ArnLike or StringLike list whole, and each equality list without its
+    each ArnLike, ArnEquals or StringLike list whole, and each StringEquals or
+    StringEqualsIgnoreCase list without its
     values holding a `*` or `?`, which are literal characters there and
     equal no ARN. A list left empty is dropped; _equality_wildcard_conditions
     names the statement such a list makes match nothing.
@@ -9305,9 +9307,9 @@ def _statement_binds_token_vault(
     names this vault id in every Region it matches. The account has to be
     either literal or held to the caller's own account by aws:ResourceAccount
     equal to ${aws:PrincipalAccount} in the same statement. Under StringEquals
-    or ArnEquals every segment is compared literally, so a `*` or `?` in any
-    of them never equals the vault's context and binds nothing: only
-    StringLike and ArnLike match patterns. The same holds for the
+    or StringEqualsIgnoreCase every segment is compared literally, so a `*` or
+    `?` in any of them never equals the vault's context and binds nothing:
+    StringLike, ArnLike and ArnEquals match patterns. The same holds for the
     kms:ViaService value. Conditions are ANDed, so an equality condition whose
     every value holds one makes the whole statement bind nothing, and a
     wildcard value beside a literal one is dropped.
@@ -32431,10 +32433,10 @@ def _statement_names_evaluation_resource(
     so the documented `evaluator/*` and `batch-evaluate/*` patterns count and a
     pattern open in the account segment does not. With no `resource_arn`, any
     bedrock-agentcore ARN in a literal partition and account counts. Under
-    StringEquals, StringEqualsIgnoreCase or ArnEquals a `*` or `?` is a literal
+    StringEquals or StringEqualsIgnoreCase a `*` or `?` is a literal
     character that equals no resource ARN, and conditions are ANDed, so an
     equality condition whose every value holds one names nothing, and a
-    wildcard value beside a literal one is dropped; only ArnLike and
+    wildcard value beside a literal one is dropped; ArnLike, ArnEquals and
     StringLike values match as patterns.
     """
     target = (resource_arn or "").lower()
@@ -32466,8 +32468,8 @@ def _statement_names_evaluation_resource(
 def _equality_wildcard_conditions(
     statement: Dict[str, Any], key: str
 ) -> List[Tuple[str, str]]:
-    """Return (operator, value) for the values on `key` of each StringEquals,
-    StringEqualsIgnoreCase or ArnEquals condition whose every value holds a
+    """Return (operator, value) for the values on `key` of each StringEquals
+    or StringEqualsIgnoreCase condition whose every value holds a
     `*` or `?`. Either is a literal character under those operators, so such a
     condition, and with it the statement, matches no request; a literal value
     beside a wildcard one still matches. IfExists and ForAllValues forms are
@@ -32506,7 +32508,7 @@ def _evaluation_key_policy_gaps(
     to the bedrock-agentcore service principal reaching kms:Decrypt needs an
     aws:SourceArn naming bedrock-agentcore resources in one account, so the
     batch statement of a key shared with evaluators does not fail the
-    evaluator. Under StringEquals, StringEqualsIgnoreCase or ArnEquals a `*`
+    evaluator. Under StringEquals or StringEqualsIgnoreCase a `*`
     or `?` in kms:ViaService or aws:SourceArn is a literal character, so that
     statement grants nothing: it credits no caller leg, and a service
     statement whose aws:SourceArn is such a value is named as granting no
