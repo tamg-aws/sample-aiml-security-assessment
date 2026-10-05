@@ -41156,6 +41156,62 @@ class TestAC27RoleTrustSourceArnNamesTheGateway:
         else:
             assert "admits no other gateway in us-east-1" in details
 
+    @pytest.mark.parametrize(
+        "values, regionless",
+        [
+            ([_EAST], []),
+            (
+                [_EAST, f"arn:aws:bedrock-agentcore::{_ACCOUNT}:gateway/gw-a"],
+                [f"arn:aws:bedrock-agentcore::{_ACCOUNT}:gateway/gw-a"],
+            ),
+            (
+                [
+                    _EAST,
+                    _NO_REGION,
+                    f"arn:aws:bedrock-agentcore::{_ACCOUNT}:gateway/gw-a",
+                ],
+                sorted(
+                    [_NO_REGION, f"arn:aws:bedrock-agentcore::{_ACCOUNT}:gateway/gw-a"]
+                ),
+            ),
+        ],
+        ids=["every-value-regional", "one-regionless", "two-regionless"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_regionless_source_arn_is_not_said_to_name_the_region(
+        self, mock_ac, mock_iam, values, regionless
+    ):
+        # The Passed said every aws:SourceArn value names Region us-east-1 while
+        # one value named no Region; it matches no gateway, so only the text
+        # was wrong.
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA"},
+            {"RoleA": self._arn_trust(values)},
+        )
+
+        rows = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert [row["Status"] for row in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        if regionless:
+            assert (
+                "whose every value that can match a gateway names account "
+                f"{_ACCOUNT}, Region us-east-1"
+            ) in details
+            assert (
+                f" {len(regionless)} aws:SourceArn value(s) name no Region and "
+                f"match no gateway: {', '.join(regionless)}."
+            ) in details
+        else:
+            assert (
+                f"whose every value names account {_ACCOUNT}, Region us-east-1"
+            ) in details
+            assert "name no Region" not in details
+
 
 class TestAC43EvaluationRoleTrustByValue:
     """AC-43 fails the evaluation role whose guard names another account."""

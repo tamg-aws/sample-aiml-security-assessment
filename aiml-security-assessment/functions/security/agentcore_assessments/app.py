@@ -21269,6 +21269,28 @@ def _gateway_role_trust_findings(
         if unread
         else ""
     )
+    # A value with no Region matches no Regional gateway, so it leaves the
+    # verdict alone but is not a value that names this Region.
+    regionless = sorted(
+        {
+            value.strip()
+            for statement in service_statements
+            for operator, block in (statement.get("Condition") or {}).items()
+            if isinstance(block, dict)
+            and str(operator).strip().lower().removeprefix("foranyvalue:")
+            in CONFUSED_DEPUTY_GUARD_OPERATORS
+            for key, raw in block.items()
+            if str(key).strip().lower() == "aws:sourcearn"
+            for value in _condition_values(raw)
+            if not _arn_region(value.strip())
+        }
+    )
+    regionless_note = (
+        f" {len(regionless)} aws:SourceArn value(s) name no Region and match no "
+        f"gateway: {', '.join(regionless)}."
+        if regionless
+        else ""
+    )
     return findings + [
         create_finding(
             check_id="AC-27",
@@ -21276,11 +21298,13 @@ def _gateway_role_trust_findings(
             finding_details=(
                 f"{label} uses execution role {role_name}, whose "
                 f"{len(statements)} Allow statement(s) each carry an "
-                "aws:SourceArn condition whose every value names account "
-                f"{account_id}, Region {region} and a resource type with no "
-                "wildcard, and a gateway resource, or name no service or "
-                "wildcard principal. The aws:SourceArn admits no other gateway "
-                f"in {region} that runs with another role.{unread_note}"
+                "aws:SourceArn condition whose every value "
+                f"{'that can match a gateway ' if regionless else ''}names "
+                f"account {account_id}, Region {region} and a resource type "
+                "with no wildcard, and a gateway resource, or name no service "
+                "or wildcard principal. The aws:SourceArn admits no other "
+                f"gateway in {region} that runs with another role."
+                f"{regionless_note}{unread_note}"
             ),
             resolution=(
                 "No action required. A gateway created later is not compared; "
