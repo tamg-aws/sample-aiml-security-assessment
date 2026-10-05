@@ -38010,7 +38010,15 @@ class TestBR52DataPathObjectLock:
             {"a": ["kb"]},
             {"a": self.GOVERNED},
             recovery_points={"a": [self._point("vault-c", 20)]},
-            vault_details={"vault-c": self._vault(lock_days_ago=365)},
+            # _point dates are fixed in September 2026, so the lock is dated
+            # from that point and not from now, or it would pass the point.
+            vault_details={
+                "vault-c": self._vault(
+                    lock_days_ago=(
+                        _dt.now(_tz.utc) - _dt(2026, 9, 19, tzinfo=_tz.utc)
+                    ).days
+                )
+            },
         )
         assert [r["Status"] for r in rows] == ["Passed"]
         assert self.backup.describe_recovery_point.call_count == 0
@@ -51199,10 +51207,14 @@ class TestInvocationLogGuardrailEvidence:
 
     def test_a_capped_log_scan_names_the_time_it_stopped_at(self, monkeypatch):
         monkeypatch.setattr(bedrock_app, "INVOCATION_LOG_SCAN_MAX_PAGES", 1)
+        # Inside the check's 24-hour lookback; a fixed date ages out of it.
+        stopped_at = (_dt.now(_tz.utc) - _td(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         early = self._guarded("req-a", True)
-        early["timestamp"] = "2026-10-04T13:40:00Z"
+        early["timestamp"] = (_dt.now(_tz.utc) - _td(minutes=10)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         late = self._guarded("req-b", True)
-        late["timestamp"] = "2026-10-04T13:45:07Z"
+        late["timestamp"] = stopped_at
         unread = self._guarded("req-c", False)
         rows = self._prompt(
             {
@@ -51214,8 +51226,8 @@ class TestInvocationLogGuardrailEvidence:
         assert [row["Status"] for row in rows] == ["N/A"]
         assert (
             "records matching amazon-bedrock-guardrailAction in "
-            "/aws/bedrock/model-invocation-logs past the first 2 (page cap; those logged from 2026-10-04T13:45:07Z on "
-            "were not all read)"
+            "/aws/bedrock/model-invocation-logs past the first 2 (page cap; those logged from "
+            f"{stopped_at} on were not all read)"
         ) in rows[0]["Finding_Details"]
 
 
