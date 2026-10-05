@@ -219,6 +219,13 @@ back `Passed` names what it could not read.
   pass with nothing to judge.
 - `AR-10` no longer credits a rule filtered on a top-level field it does not
   read as routing every approval transition.
+- The AgentCore assessment no longer exceeds its 600-second Lambda timeout in
+  an account with about 100 principals holding AgentCore actions. `AC-03`
+  starts every principal's IAM service last accessed job before reading any,
+  and reads each job before waiting on it. The IAM pattern comparison behind
+  `AC-23`, `AC-32` and `AC-33` decides the literal characters around each `*`
+  before the full comparison and reuses repeated answers. Results are
+  unchanged.
 
 ### Deployment impact
 

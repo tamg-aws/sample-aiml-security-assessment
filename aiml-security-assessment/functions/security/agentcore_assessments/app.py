@@ -1227,17 +1227,40 @@ def _action_patterns_overlap(first: str, second: str, ignore_case: bool = True) 
     if ignore_case:
         first = first.lower()
         second = second.lower()
+    return _patterns_overlap_exact(first, second)
+
+
+@lru_cache(maxsize=131072)
+def _patterns_overlap_exact(first: str, second: str) -> bool:
+    # Every position before the first `*` in either pattern, and after the
+    # last, matches exactly one character, so those positions must agree pair
+    # by pair. Only the middle needs the table.
+    head = min(first.find("*") % (len(first) + 1), second.find("*") % (len(second) + 1))
+    for left, right in zip(first[:head], second[:head]):
+        if left != right and left != "?" and right != "?":
+            return False
+    first = first[head:]
+    second = second[head:]
+    tail = min(len(first) - 1 - first.rfind("*"), len(second) - 1 - second.rfind("*"))
+    for left, right in zip(first[len(first) - tail :], second[len(second) - tail :]):
+        if left != right and left != "?" and right != "?":
+            return False
+    first = first[: len(first) - tail]
+    second = second[: len(second) - tail]
+
+    first_length = len(first)
+    second_length = len(second)
     # below[j] answers whether first[i + 1:] overlaps second[j:]; row[j] is the
     # same for first[i:].
-    below = bytearray(len(second) + 1)
-    for i in range(len(first), -1, -1):
-        row = bytearray(len(second) + 1)
-        for j in range(len(second), -1, -1):
-            if i == len(first) and j == len(second):
+    below = bytearray(second_length + 1)
+    for i in range(first_length, -1, -1):
+        row = bytearray(second_length + 1)
+        for j in range(second_length, -1, -1):
+            if i == first_length and j == second_length:
                 row[j] = 1
                 continue
-            left = first[i] if i < len(first) else ""
-            right = second[j] if j < len(second) else ""
+            left = first[i] if i < first_length else ""
+            right = second[j] if j < second_length else ""
             if left == "*" and below[j]:
                 row[j] = 1
             elif right == "*" and row[j + 1]:
@@ -5495,52 +5518,87 @@ def check_stale_agentcore_access(
         stale_principals = []
         never_accessed_principals = []
 
+        # Start every principal's job before polling any, so IAM generates the
+        # reports concurrently instead of one principal per poll cycle.
+        pending_jobs = []
+        generated_through = len(agentcore_principals)
+
         for principal_index, principal in enumerate(agentcore_principals):
-            principal_arn = principal["arn"]
             principal_name = principal["name"]
             principal_type = principal["type"]
 
             if not check_timeout():
-                remaining_principals = len(agentcore_principals) - principal_index
-                logger.warning(
-                    "Stopping stale-access checks with "
-                    f"{remaining_principals} principal(s) remaining because the "
-                    "Lambda timeout is approaching"
-                )
-                findings.append(
-                    create_finding(
-                        check_id="AC-03",
-                        finding_name="AgentCore Stale Access Check Incomplete",
-                        finding_details=(
-                            f"Stopped before completing the assessment of "
-                            f"{remaining_principals} IAM principal(s) because the "
-                            "Lambda timeout was approaching"
-                        ),
-                        resolution="Re-run the assessment to evaluate the remaining principals",
-                        reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html",
-                        severity=SeverityEnum.INFORMATIONAL,
-                        status=StatusEnum.NA,
-                    )
-                )
+                generated_through = principal_index
                 break
 
             try:
-                # Generate service last accessed details
                 logger.info(
                     f"Generating service last accessed details for {principal_type} {principal_name}"
                 )
-
                 generate_response = iam_client.generate_service_last_accessed_details(
-                    Arn=principal_arn
+                    Arn=principal["arn"]
                 )
-                job_id = generate_response["JobId"]
+                pending_jobs.append((principal, generate_response["JobId"]))
 
-                # Wait for job completion (max 30 seconds)
+            except ClientError as e:
+                error_code = e.response["Error"]["Code"]
+                if error_code == "NoSuchEntity":
+                    logger.warning(f"Principal {principal_name} no longer exists")
+                elif error_code == "AccessDenied":
+                    logger.error(f"Access denied when checking {principal_name}: {e}")
+                    findings.append(
+                        _incomplete_check_finding(
+                            check_id="AC-03",
+                            finding_name="AgentCore Stale Access Check",
+                            error=e,
+                            reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html",
+                        )
+                    )
+                    return findings
+                else:
+                    logger.error(
+                        f"Error checking {principal_type} {principal_name}: {e}"
+                    )
+                    unread_principals.append(
+                        f"{principal_type} {principal_name} ({error_code})"
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error checking {principal_type} {principal_name}: {e}"
+                )
+                unread_principals.append(
+                    f"{principal_type} {principal_name} ({type(e).__name__})"
+                )
+
+        # Principals never started plus jobs never read; set when the Lambda
+        # timeout stops the check. A timeout while starting jobs reads none.
+        remaining_principals = None
+        if generated_through < len(agentcore_principals):
+            remaining_principals = len(agentcore_principals) - generated_through
+            remaining_principals += len(pending_jobs)
+            pending_jobs = []
+
+        for job_index, (principal, job_id) in enumerate(pending_jobs):
+            principal_name = principal["name"]
+            principal_type = principal["type"]
+
+            if not check_timeout():
+                remaining_principals = len(pending_jobs) - job_index
+                break
+
+            try:
+                # Read the job first, then wait only while it runs (max 30
+                # seconds of waiting per principal).
                 max_wait_time = 30
                 wait_interval = 2
                 elapsed_time = 0
-                job_status = "IN_PROGRESS"
                 lambda_timeout_approaching = False
+
+                get_response = iam_client.get_service_last_accessed_details(
+                    JobId=job_id
+                )
+                job_status = get_response["JobStatus"]
 
                 while job_status == "IN_PROGRESS" and elapsed_time < max_wait_time:
                     if not check_timeout():
@@ -5559,122 +5617,99 @@ def check_stale_agentcore_access(
                     )
                     job_status = get_response["JobStatus"]
 
-                    if job_status == "COMPLETED":
-                        # Check for AgentCore service access across every page
-                        # of the report.
-                        services = list(get_response.get("ServicesLastAccessed", []))
-                        page = get_response
-                        while page.get("IsTruncated") and page.get("Marker"):
-                            page = iam_client.get_service_last_accessed_details(
-                                JobId=job_id, Marker=page["Marker"]
-                            )
-                            services.extend(page.get("ServicesLastAccessed", []))
+                if lambda_timeout_approaching:
+                    logger.warning(
+                        "Stopping stale-access checks while assessing "
+                        f"{principal_type} {principal_name} because the Lambda "
+                        "timeout is approaching"
+                    )
+                    remaining_principals = len(pending_jobs) - job_index
+                    break
 
-                        matching_services = []
-                        for service in services:
-                            service_name = service.get("ServiceName", "")
-                            service_namespace = service.get("ServiceNamespace", "")
+                if job_status == "COMPLETED":
+                    # Check for AgentCore service access across every page
+                    # of the report.
+                    services = list(get_response.get("ServicesLastAccessed", []))
+                    page = get_response
+                    while page.get("IsTruncated") and page.get("Marker"):
+                        page = iam_client.get_service_last_accessed_details(
+                            JobId=job_id, Marker=page["Marker"]
+                        )
+                        services.extend(page.get("ServicesLastAccessed", []))
 
-                            # Look for AgentCore service
-                            if (
-                                "agentcore" in service_name.lower()
-                                or "agentcore" in service_namespace.lower()
-                                or "bedrock-agentcore" in service_namespace.lower()
-                            ):
-                                matching_services.append(service)
+                    matching_services = []
+                    for service in services:
+                        service_name = service.get("ServiceName", "")
+                        service_namespace = service.get("ServiceNamespace", "")
 
-                        if matching_services:
-                            last_authenticated_values = [
-                                service.get("LastAuthenticated")
-                                for service in matching_services
-                                if service.get("LastAuthenticated")
-                            ]
+                        # Look for AgentCore service
+                        if (
+                            "agentcore" in service_name.lower()
+                            or "agentcore" in service_namespace.lower()
+                            or "bedrock-agentcore" in service_namespace.lower()
+                        ):
+                            matching_services.append(service)
 
-                            if last_authenticated_values:
-                                # Calculate days since last access
-                                last_access_dates = []
-                                for last_authenticated in last_authenticated_values:
-                                    last_access_date = datetime.fromisoformat(
-                                        str(last_authenticated).replace("Z", "+00:00")
+                    if matching_services:
+                        last_authenticated_values = [
+                            service.get("LastAuthenticated")
+                            for service in matching_services
+                            if service.get("LastAuthenticated")
+                        ]
+
+                        if last_authenticated_values:
+                            # Calculate days since last access
+                            last_access_dates = []
+                            for last_authenticated in last_authenticated_values:
+                                last_access_date = datetime.fromisoformat(
+                                    str(last_authenticated).replace("Z", "+00:00")
+                                )
+                                if last_access_date.tzinfo is None:
+                                    last_access_date = last_access_date.replace(
+                                        tzinfo=timezone.utc
                                     )
-                                    if last_access_date.tzinfo is None:
-                                        last_access_date = last_access_date.replace(
-                                            tzinfo=timezone.utc
-                                        )
-                                    last_access_dates.append(last_access_date)
-                                last_access_date = max(last_access_dates)
-                                current_date = datetime.now(timezone.utc)
-                                days_since_access = (
-                                    current_date - last_access_date
-                                ).days
+                                last_access_dates.append(last_access_date)
+                            last_access_date = max(last_access_dates)
+                            current_date = datetime.now(timezone.utc)
+                            days_since_access = (current_date - last_access_date).days
 
-                                if days_since_access > 60:
-                                    stale_principals.append(
-                                        {
-                                            "type": principal_type,
-                                            "name": principal_name,
-                                            "days": days_since_access,
-                                        }
-                                    )
-                                    logger.info(
-                                        f"{principal_type} {principal_name} last accessed AgentCore {days_since_access} days ago"
-                                    )
-                            else:
-                                # Never accessed
-                                never_accessed_principals.append(
-                                    {"type": principal_type, "name": principal_name}
+                            if days_since_access > 60:
+                                stale_principals.append(
+                                    {
+                                        "type": principal_type,
+                                        "name": principal_name,
+                                        "days": days_since_access,
+                                    }
                                 )
                                 logger.info(
-                                    f"{principal_type} {principal_name} has never accessed AgentCore"
+                                    f"{principal_type} {principal_name} last accessed AgentCore {days_since_access} days ago"
                                 )
                         else:
-                            # AgentCore service not in the list - treat as never accessed
+                            # Never accessed
                             never_accessed_principals.append(
                                 {"type": principal_type, "name": principal_name}
                             )
                             logger.info(
-                                f"{principal_type} {principal_name} has AgentCore permissions but service not in access history"
+                                f"{principal_type} {principal_name} has never accessed AgentCore"
                             )
-
-                        break
-
-                    elif job_status == "FAILED":
-                        logger.error(
-                            f"Job failed for {principal_type} {principal_name}"
+                    else:
+                        # AgentCore service not in the list - treat as never accessed
+                        never_accessed_principals.append(
+                            {"type": principal_type, "name": principal_name}
                         )
-                        job_error = get_response.get("Error") or {}
-                        unread_principals.append(
-                            f"{principal_type} {principal_name} (last-accessed job "
-                            f"FAILED: {job_error.get('Code', 'no error code')})"
+                        logger.info(
+                            f"{principal_type} {principal_name} has AgentCore permissions but service not in access history"
                         )
-                        break
 
-                if lambda_timeout_approaching:
-                    remaining_principals = len(agentcore_principals) - principal_index
-                    logger.warning(
-                        "Stopping stale-access checks while assessing "
-                        f"{principal_type} {principal_name}, with "
-                        f"{remaining_principals} principal(s) incomplete, because "
-                        "the Lambda timeout is approaching"
+                elif job_status == "FAILED":
+                    logger.error(f"Job failed for {principal_type} {principal_name}")
+                    job_error = get_response.get("Error") or {}
+                    unread_principals.append(
+                        f"{principal_type} {principal_name} (last-accessed job "
+                        f"FAILED: {job_error.get('Code', 'no error code')})"
                     )
-                    findings.append(
-                        create_finding(
-                            check_id="AC-03",
-                            finding_name="AgentCore Stale Access Check Incomplete",
-                            finding_details=(
-                                f"Stopped before completing the assessment of "
-                                f"{remaining_principals} IAM principal(s) because "
-                                "the Lambda timeout was approaching"
-                            ),
-                            resolution="Re-run the assessment to evaluate the remaining principals",
-                            reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html",
-                            severity=SeverityEnum.INFORMATIONAL,
-                            status=StatusEnum.NA,
-                        )
-                    )
-                    break
 
-                if job_status == "IN_PROGRESS":
+                elif job_status == "IN_PROGRESS":
                     logger.warning(
                         f"Job timed out for {principal_type} {principal_name} after {max_wait_time}s"
                     )
@@ -5720,6 +5755,28 @@ def check_stale_agentcore_access(
                 unread_principals.append(
                     f"{principal_type} {principal_name} ({type(e).__name__})"
                 )
+
+        if remaining_principals is not None:
+            logger.warning(
+                "Stopping stale-access checks with "
+                f"{remaining_principals} principal(s) remaining because the "
+                "Lambda timeout is approaching"
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-03",
+                    finding_name="AgentCore Stale Access Check Incomplete",
+                    finding_details=(
+                        f"Stopped before completing the assessment of "
+                        f"{remaining_principals} IAM principal(s) because the "
+                        "Lambda timeout was approaching"
+                    ),
+                    resolution="Re-run the assessment to evaluate the remaining principals",
+                    reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html",
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
 
         if unread_principals:
             findings.append(

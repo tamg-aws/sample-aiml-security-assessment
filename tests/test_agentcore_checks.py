@@ -2867,7 +2867,7 @@ class TestAC03StaleAccess:
         mock_iam.generate_service_last_accessed_details.assert_not_called()
         mock_check_timeout.assert_called_once()
 
-    @patch("agentcore_app.check_timeout", side_effect=[True, True, False])
+    @patch("agentcore_app.check_timeout", side_effect=[True, True, True, False])
     @patch("agentcore_app.time.sleep")
     @patch("agentcore_app.boto3.client")
     @patch("agentcore_app.iam_client")
@@ -2883,6 +2883,9 @@ class TestAC03StaleAccess:
         }
         mock_iam.generate_service_last_accessed_details.return_value = {
             "JobId": "job-1"
+        }
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "IN_PROGRESS"
         }
         permission_cache = {
             "role_permissions": {
@@ -2914,10 +2917,14 @@ class TestAC03StaleAccess:
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Severity"] == "Informational"
         assert "2 IAM principal(s)" in findings[0]["Finding_Details"]
-        mock_iam.generate_service_last_accessed_details.assert_called_once()
-        mock_iam.get_service_last_accessed_details.assert_not_called()
-        mock_sleep.assert_called_once_with(2)
-        assert mock_check_timeout.call_count == 3
+        # Both jobs start; the first is read once, still running, and the
+        # timeout stops the wait before it sleeps or reads the second.
+        assert mock_iam.generate_service_last_accessed_details.call_count == 2
+        mock_iam.get_service_last_accessed_details.assert_called_once_with(
+            JobId="job-1"
+        )
+        mock_sleep.assert_not_called()
+        assert mock_check_timeout.call_count == 4
 
     @patch(
         "agentcore_app.check_timeout",
@@ -2989,11 +2996,11 @@ class TestAC03StaleAccess:
         assert "StaleRuntimeReader" in stale_finding["Finding_Details"]
         assert "1 IAM principal(s)" in incomplete_finding["Finding_Details"]
         assert incomplete_finding["Severity"] == "Informational"
-        mock_iam.generate_service_last_accessed_details.assert_called_once()
+        assert mock_iam.generate_service_last_accessed_details.call_count == 2
         mock_iam.get_service_last_accessed_details.assert_called_once_with(
             JobId="job-1"
         )
-        mock_sleep.assert_called_once_with(2)
+        mock_sleep.assert_not_called()
         assert mock_check_timeout.call_count == 4
 
     @patch("agentcore_app.check_timeout", return_value=True)
@@ -3037,9 +3044,131 @@ class TestAC03StaleAccess:
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Severity"] == "Informational"
         assert "IAM job timed out after 30s" in findings[0]["Finding_Details"]
-        assert mock_iam.get_service_last_accessed_details.call_count == 15
+        # One read before waiting, then one after each of 15 two-second waits.
+        assert mock_iam.get_service_last_accessed_details.call_count == 16
         assert mock_sleep.call_count == 15
-        assert mock_check_timeout.call_count == 31
+        assert mock_check_timeout.call_count == 32
+
+    @staticmethod
+    def _two_reader_cache():
+        return {
+            "role_permissions": {
+                name: {
+                    "attached_policies": [
+                        _agent_platform_policy(
+                            "AgentCoreReadOnly",
+                            "bedrock-agentcore:ListAgentRuntimes",
+                        )
+                    ],
+                    "inline_policies": [],
+                }
+                for name in ("FirstReader", "SecondReader")
+            },
+            "user_permissions": {},
+        }
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_ac03_starts_every_job_before_reading_any(
+        self, mock_iam, mock_boto_client, mock_sleep
+    ):
+        mock_boto_client.return_value.get_caller_identity.return_value = {
+            "Account": "123456789012"
+        }
+        mock_iam.generate_service_last_accessed_details.side_effect = [
+            {"JobId": "job-1"},
+            {"JobId": "job-2"},
+        ]
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [
+                {
+                    "ServiceName": "Amazon Bedrock AgentCore",
+                    "ServiceNamespace": "bedrock-agentcore",
+                    "LastAuthenticated": agentcore_app.get_current_utc_date(),
+                }
+            ],
+        }
+
+        findings = agentcore_app.check_stale_agentcore_access(self._two_reader_cache())
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert [name for name, _, _ in mock_iam.method_calls] == [
+            "generate_service_last_accessed_details",
+            "generate_service_last_accessed_details",
+            "get_service_last_accessed_details",
+            "get_service_last_accessed_details",
+        ]
+        assert [
+            c.kwargs for c in mock_iam.get_service_last_accessed_details.call_args_list
+        ] == [{"JobId": "job-1"}, {"JobId": "job-2"}]
+        # A job already complete at its first read costs no wait.
+        mock_sleep.assert_not_called()
+
+    @patch("agentcore_app.check_timeout", side_effect=[True, False])
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_ac03_timeout_while_starting_jobs_reads_none(
+        self, mock_iam, mock_boto_client, mock_sleep, mock_check_timeout
+    ):
+        mock_boto_client.return_value.get_caller_identity.return_value = {
+            "Account": "123456789012"
+        }
+        mock_iam.generate_service_last_accessed_details.return_value = {
+            "JobId": "job-1"
+        }
+
+        findings = agentcore_app.check_stale_agentcore_access(self._two_reader_cache())
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding"] == "AgentCore Stale Access Check Incomplete"
+        # The started job and the unstarted principal are both unassessed.
+        assert "2 IAM principal(s)" in findings[0]["Finding_Details"]
+        mock_iam.generate_service_last_accessed_details.assert_called_once()
+        mock_iam.get_service_last_accessed_details.assert_not_called()
+        mock_sleep.assert_not_called()
+        assert mock_check_timeout.call_count == 2
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_ac03_waits_only_while_job_runs(
+        self, mock_iam, mock_boto_client, mock_sleep
+    ):
+        mock_boto_client.return_value.get_caller_identity.return_value = {
+            "Account": "123456789012"
+        }
+        mock_iam.generate_service_last_accessed_details.side_effect = [
+            {"JobId": "job-1"},
+            {"JobId": "job-2"},
+        ]
+        completed = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [
+                {
+                    "ServiceName": "Amazon Bedrock AgentCore",
+                    "ServiceNamespace": "bedrock-agentcore",
+                    "LastAuthenticated": "2020-01-01T00:00:00+00:00",
+                }
+            ],
+        }
+        mock_iam.get_service_last_accessed_details.side_effect = [
+            {"JobStatus": "IN_PROGRESS"},
+            completed,
+            completed,
+        ]
+
+        findings = agentcore_app.check_stale_agentcore_access(self._two_reader_cache())
+
+        stale = next(f for f in findings if f["Finding"] == "AgentCore Stale Access")
+        assert stale["Status"] == "Failed"
+        assert "FirstReader" in stale["Finding_Details"]
+        assert "SecondReader" in stale["Finding_Details"]
+        mock_sleep.assert_called_once_with(2)
+        assert mock_iam.get_service_last_accessed_details.call_count == 3
 
     @patch("agentcore_app.time.sleep")
     @patch("agentcore_app.boto3.client")
@@ -47817,9 +47946,10 @@ class TestActionPatternOverlapLength:
     """
 
     @staticmethod
-    def _recursive_overlap(first, second):
+    def _recursive_overlap(first, second, ignore_case=True):
         """The recursive form the helper had, kept as the exactness oracle."""
-        first, second = first.lower(), second.lower()
+        if ignore_case:
+            first, second = first.lower(), second.lower()
         memo = {}
 
         def overlap(i, j):
@@ -47858,6 +47988,52 @@ class TestActionPatternOverlapLength:
             assert agentcore_app._action_patterns_overlap(
                 first, second
             ) is self._recursive_overlap(first, second), (first, second)
+
+    @pytest.mark.parametrize("ignore_case", [True, False])
+    def test_every_short_pair_matches_the_recursive_form(self, ignore_case):
+        # Every pattern up to four characters, so each placement of a literal,
+        # `?` and `*` before, between and after the others is compared, in
+        # both case modes the head and tail comparison must honor.
+        import itertools
+
+        patterns = [
+            "".join(chars)
+            for length in range(5)
+            for chars in itertools.product("aB*?", repeat=length)
+        ]
+        for first in patterns:
+            for second in patterns:
+                assert agentcore_app._action_patterns_overlap(
+                    first, second, ignore_case
+                ) is self._recursive_overlap(first, second, ignore_case), (
+                    first,
+                    second,
+                    ignore_case,
+                )
+
+    def test_long_literal_heads_and_tails_match_the_recursive_form(self):
+        # Literal runs around the wildcards, as in real actions and ARNs, so
+        # a head or tail mismatch is decided before the table.
+        import random
+
+        rng = random.Random(20261005)
+        pieces = ["bedrock-agentcore:", "get", "Get", "memory", "*", "?", ":", "/"]
+        for _ in range(3000):
+            first = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 6)))
+            second = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 6)))
+            for ignore_case in (True, False):
+                assert agentcore_app._action_patterns_overlap(
+                    first, second, ignore_case
+                ) is self._recursive_overlap(first, second, ignore_case), (
+                    first,
+                    second,
+                    ignore_case,
+                )
+
+    def test_a_cached_answer_keeps_the_case_mode(self):
+        assert agentcore_app._action_patterns_overlap("Get*", "get*") is True
+        assert agentcore_app._action_patterns_overlap("Get*", "get*", False) is False
+        assert agentcore_app._action_patterns_overlap("Get*", "get*") is True
 
     @pytest.mark.parametrize(
         "pattern, expected",
