@@ -22261,6 +22261,11 @@ CONVERSE_LOG_PATTERN = (
     '{ ($.operation = "Converse") || ($.operation = "ConverseStream") }'
 )
 
+INVOKE_LOG_PATTERN = (
+    '{ ($.operation = "InvokeModel") || '
+    '($.operation = "InvokeModelWithResponseStream") }'
+)
+
 PROMPT_ATTACK_EVIDENCE_FINDING = "Guardrail Prompt Attack Invocation Evidence"
 
 GROUNDING_EVIDENCE_FINDING = "Guardrail Contextual Grounding Score Evidence"
@@ -23132,8 +23137,10 @@ def check_guardrail_prompt_attack_invocation_evidence(
     no guardrail input tag, which the prompt attack filter does not evaluate.
     A Converse call is guarded when its CloudTrail event names a guardrailConfig
     or its response reports a guardrail. ``joins`` is the region run's shared
-    CloudTrail join state. Only request IDs, operations and model IDs are
-    reported, never a body.
+    CloudTrail join state; its "log" holds every logged InvokeModel,
+    InvokeModelWithResponseStream, Converse and ConverseStream call and the
+    reads of them that failed, for BR-46 to join. Only request IDs, operations
+    and model IDs are reported, never a body.
     """
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html"
     findings = {
@@ -23159,6 +23166,14 @@ def check_guardrail_prompt_attack_invocation_evidence(
 
     try:
         source = _invocation_log_source(region)
+        if joins is not None:
+            joins["log"] = {
+                "where": source["where"],
+                "logging": source["logging"],
+                "reason": source["reason"],
+                "calls": [],
+                "unread": [],
+            }
         if not source["where"]:
             findings["status"] = "N/A"
             row(
@@ -23218,6 +23233,22 @@ def check_guardrail_prompt_attack_invocation_evidence(
                     "amazon-bedrock-guardrailConfig to match its input tag against"
                 )
 
+        # Every logged InvokeModel call, guarded or not, for BR-46 to join to
+        # its CloudTrail event, which names the guardrail the call applied.
+        invoke_log_calls = []
+
+        def visit_invoke_call(record):
+            if record.get("operation") not in INVOKE_GUARDRAIL_TAG_OPERATIONS:
+                return
+            invoke_log_calls.append(
+                {
+                    "label": label_of(record),
+                    "request_id": record.get("requestId"),
+                    "operation": record.get("operation"),
+                    "time": record.get("timestamp"),
+                }
+            )
+
         # The logged request never names its guardrailConfig, so each call's
         # turn verdict is kept and its guardrail is read from CloudTrail below.
         def visit_converse(record):
@@ -23244,7 +23275,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
                 }
             )
 
-        catch_scan, tag_scan, converse_scan = _scan_invocation_legs(
+        catch_scan, tag_scan, converse_scan, invoke_scan = _scan_invocation_legs(
             region,
             source,
             [
@@ -23263,8 +23294,35 @@ def check_guardrail_prompt_attack_invocation_evidence(
                     lambda line, record: record.get("operation") in CONVERSE_OPERATIONS,
                     visit_converse,
                 ),
+                (
+                    INVOKE_LOG_PATTERN,
+                    lambda line, record: (
+                        record.get("operation") in INVOKE_GUARDRAIL_TAG_OPERATIONS
+                    ),
+                    visit_invoke_call,
+                ),
             ],
         )
+        if joins is not None:
+            joins["log"]["calls"] = invoke_log_calls + [
+                {key: call[key] for key in ("label", "request_id", "operation", "time")}
+                for call in converse_calls
+            ]
+            for scan, what in (
+                (invoke_scan, "an InvokeModel operation"),
+                (converse_scan, "a Converse operation"),
+            ):
+                if scan["error"]:
+                    joins["log"]["unread"].append(
+                        f"records matching {what} in {source['where']} "
+                        f"({scan['action']}, {scan['error']})"
+                    )
+                elif scan["capped"]:
+                    joins["log"]["unread"].append(
+                        f"records matching {what} in {source['where']} past the "
+                        f"first {scan['read']} ({scan.get('cap')}; those logged "
+                        f"from {scan['unread_from']} on were not all read)"
+                    )
         joined = _converse_call_guardrails(
             region, [call for call in converse_calls if not call["log_guarded"]], joins
         )
@@ -37782,10 +37840,14 @@ def check_bedrock_prompt_pii_screening(
     input. A version is used on invocations when an agent, flow node,
     un-narrowed account-enforced configuration or guardrail condition pin in
     ``attachment_inventory`` applies it, or when a logged invocation joined to
-    CloudTrail through ``joins`` (BR-27 and BR-34's shared state) names it. Only
-    a used version passes; an unread one is N/A. A logged invocation whose
-    CloudTrail event names no guardrail fails, unless an un-narrowed
-    account-enforced configuration screens it; an unjoined one is N/A.
+    CloudTrail through ``joins`` (BR-27 and BR-34's shared state) names it.
+    Every InvokeModel, InvokeModelWithResponseStream, Converse and
+    ConverseStream call BR-34 read from the invocation log is joined here if
+    BR-27 and BR-34 did not join it. Only a used version passes; an unread one
+    is N/A. A logged invocation whose CloudTrail event names no guardrail
+    fails, unless an un-narrowed account-enforced configuration screens it; an
+    unjoined one is N/A, and so is the leg while the invocation log was not
+    read, or not read in full.
     """
     findings = {
         "check_name": PROMPT_PII_SCREENING_FINDING,
@@ -37869,7 +37931,39 @@ def check_bedrock_prompt_pii_screening(
                 "error": entry.get("error") or "no detail returned",
                 "region": entry.get("region") or region,
             }
+        log = (joins or {}).get("log")
+        log_note = ""
+        if log is None:
+            unread.append(
+                "no invocation log scan was shared with this leg, so logged calls "
+                "that name no guardrail were not judged"
+            )
+        elif log["logging"] is None:
+            unread.append(f"the invocation log: {log['reason']}")
+        elif log["logging"] is False:
+            log_note = (
+                f" No invocation log is read in {region}: {log['reason']}, so a "
+                "call whose request names no guardrail is not seen."
+            )
+        else:
+            unread.extend(log["unread"])
+            no_id = [call["label"] for call in log["calls"] if not call["request_id"]]
+            if no_id:
+                unread.append(
+                    "{} logged call(s) that log no request ID to join to "
+                    "CloudTrail, so which guardrail ran is not known: {}".format(
+                        len(no_id), ", ".join(no_id[:5])
+                    )
+                )
+            pending = [
+                call
+                for call in log["calls"]
+                if call["request_id"] and call["request_id"] not in joins["resolved"]
+            ]
+            if pending:
+                _invoke_call_guardrails(region, pending, joins)
         joins_unread = 0
+        joins_capped = 0
         unguarded_requests = []
         for request_id, resolved in sorted(
             ((joins or {}).get("resolved") or {}).items()
@@ -37889,8 +37983,19 @@ def check_bedrock_prompt_pii_screening(
                 entry["surfaces"].append(f"logged invocation {request_id}")
             elif resolved.get("unguarded"):
                 unguarded_requests.append(request_id)
+            elif resolved.get("capped"):
+                joins_capped += 1
             else:
                 joins_unread += 1
+        if joins_capped:
+            unread.append(
+                "{} logged invocation(s) were not matched to CloudTrail within the "
+                "LookupEvents page cap ({} pages per operation, {} per region "
+                "run) or before the invocation deadline, so which guardrail ran "
+                "is not known".format(
+                    joins_capped, GROUNDING_JOIN_MAX_PAGES, GROUNDING_JOIN_BUDGET_PAGES
+                )
+            )
         if joins_unread:
             unread.append(
                 f"{joins_unread} logged invocation(s) whose CloudTrail event was "
@@ -38005,6 +38110,7 @@ def check_bedrock_prompt_pii_screening(
             f" {len(drafts)} of {len(summaries)} guardrail(s) listed in {region} "
             "were read with GetGuardrail. A guardrail passed per request is seen "
             "only through a logged invocation joined to its CloudTrail event."
+            + log_note
         )
         for label in unscreened:
             findings["status"] = "WARN"

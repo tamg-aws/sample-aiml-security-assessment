@@ -17735,14 +17735,64 @@ class TestBR46PromptPiiScreening:
         }
     }
 
-    def _run(self, guardrails=(), details=None, versions=None, joins=None, errors=()):
+    @staticmethod
+    def _log(calls=(), unread=(), logging=True, reason=None):
+        """BR-34's record of the invocation log: the calls it read, as
+        (request ID, operation) pairs, and the reads that failed."""
+        return {
+            "where": "/aws/bedrock/model-invocation-logs" if logging else None,
+            "logging": logging,
+            "reason": reason,
+            "calls": [
+                {
+                    "label": f"{request_id} ({operation} anthropic.test)",
+                    "request_id": request_id,
+                    "operation": operation,
+                    "time": (_dt.now(_tz.utc) - _td(hours=1)).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+                for request_id, operation in calls
+            ],
+            "unread": list(unread),
+        }
+
+    def _run(
+        self,
+        guardrails=(),
+        details=None,
+        versions=None,
+        joins=None,
+        errors=(),
+        trail=None,
+    ):
         """
         ``guardrails`` are the ListGuardrails ids, ``details`` maps an id or an
         (id, version) pair to a GetGuardrail answer or an exception, and
-        ``versions`` is the attachment inventory's versions map.
+        ``versions`` is the attachment inventory's versions map. ``joins``
+        without a "log" gets a log read in full that holds no call BR-27 and
+        BR-34 left unjoined. ``trail`` maps an event name to the CloudTrail
+        events LookupEvents returns for it.
         """
         details = details or {}
+        joins = {"resolved": {}} if joins is None else joins
+        joins = {**joins, "resolved": dict(joins.get("resolved") or {})}
+        joins.setdefault("log", self._log())
+        joins.setdefault("pages", 0)
         client = MagicMock()
+        self.lookups = []
+
+        def lookup_events(LookupAttributes, **kwargs):
+            name = LookupAttributes[0]["AttributeValue"]
+            self.lookups.append(name)
+            return {
+                "Events": [
+                    {"CloudTrailEvent": json.dumps(event)}
+                    for event in (trail or {}).get(name, [])
+                ]
+            }
+
+        client.lookup_events.side_effect = lookup_events
         client.list_guardrails.return_value = {
             "guardrails": [{"id": gid, "name": f"name-{gid}"} for gid in guardrails]
         }
@@ -18005,6 +18055,155 @@ class TestBR46PromptPiiScreening:
         (na,) = self._status(findings, "N/A")
         assert "2 guardrail(s) from 'name-g1' on" in na["Finding_Details"]
         assert bedrock_app.DEADLINE_STOP in na["Finding_Details"]
+
+    AGENT_SCREENS = {
+        ("g1", "1"): {
+            "surfaces": ["agent 'a' version 1"],
+            "narrowings": {},
+            "detail": INPUT_PII,
+            "error": "",
+            "region": "us-east-1",
+        }
+    }
+
+    def test_br46_prompt_an_unjoined_logged_invoke_call_is_joined_and_judged(self):
+        """BR-27 and BR-34 join no InvokeModel call without a guardrailAction,
+        so the leg joins every logged call they left: the one whose event names
+        no guardrail fails and the guarded one is credited."""
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={
+                "resolved": {},
+                "log": self._log(
+                    calls=[
+                        ("req-7", "InvokeModel"),
+                        ("req-8", "InvokeModelWithResponseStream"),
+                    ]
+                ),
+            },
+            trail={
+                "InvokeModel": [
+                    {"requestID": "req-7", "requestParameters": {"modelId": "m"}}
+                ],
+                "InvokeModelWithResponseStream": [
+                    {
+                        "requestID": "req-8",
+                        "requestParameters": {
+                            "modelId": "m",
+                            "guardrailIdentifier": "g1",
+                            "guardrailVersion": "1",
+                        },
+                    }
+                ],
+            },
+        )
+        assert sorted(self.lookups) == ["InvokeModel", "InvokeModelWithResponseStream"]
+        (failed,) = self._status(findings, "Failed")
+        assert "1 logged invocation(s) in us-east-1" in failed["Finding_Details"]
+        assert "req-7" in failed["Finding_Details"]
+        assert "req-8" not in failed["Finding_Details"]
+        (passed,) = self._status(findings, "Passed")
+        assert "logged invocation req-8" in passed["Finding_Details"]
+
+    def test_br46_prompt_a_call_joined_before_is_not_looked_up_again(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII, ("g1", "1"): self.INPUT_PII},
+            joins={
+                "resolved": {"req-1": {"guardrail": "g1", "version": "1"}},
+                "log": self._log(calls=[("req-1", "Converse")]),
+            },
+        )
+        assert self.lookups == []
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "log, named",
+        [
+            (
+                {
+                    "unread": [
+                        "records matching an InvokeModel operation in lg past the "
+                        "first 250 (page cap; those logged from "
+                        "2026-10-04T01:00:00Z on were not all read)"
+                    ]
+                },
+                "records matching an InvokeModel operation in lg past the first 250",
+            ),
+            (
+                {
+                    "logging": None,
+                    "reason": "the invocation logging configuration was not read "
+                    "(bedrock:GetModelInvocationLoggingConfiguration, AccessDenied)",
+                },
+                "the invocation log: the invocation logging configuration was not read",
+            ),
+            (None, "no invocation log scan was shared with this leg"),
+        ],
+    )
+    def test_br46_prompt_an_unread_invocation_log_holds_passed_at_na(self, log, named):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={"resolved": {}, "log": None if log is None else self._log(**log)},
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert named in findings[0]["Finding_Details"]
+        assert "guardrail g1 version 1" in findings[0]["Finding_Details"]
+
+    def test_br46_prompt_a_join_past_the_page_cap_holds_passed_at_na(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={"resolved": {"req-5": {"capped": True}}},
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "1 logged invocation(s) were not matched to CloudTrail within the "
+            "LookupEvents page cap (50 pages per operation, 100 per region run)"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br46_prompt_a_logged_call_with_no_request_id_is_na(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={"resolved": {}, "log": self._log(calls=[(None, "InvokeModel")])},
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "1 logged call(s) that log no request ID to join to CloudTrail"
+            in findings[0]["Finding_Details"]
+        )
+        assert self.lookups == []
+
+    def test_br46_prompt_no_text_logging_is_named_in_the_passed_text(self):
+        findings = self._run(
+            guardrails=["g1"],
+            details={"g1": self.INPUT_PII},
+            versions=self.AGENT_SCREENS,
+            joins={
+                "resolved": {},
+                "log": self._log(
+                    logging=False,
+                    reason="invocation logging does not deliver text "
+                    "(textDataDeliveryEnabled is False), so no request or "
+                    "response body is logged",
+                ),
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "No invocation log is read in us-east-1: invocation logging does not "
+            "deliver text (textDataDeliveryEnabled is False), so no request or "
+            "response body is logged, so a call whose request names no guardrail "
+            "is not seen." in findings[0]["Finding_Details"]
+        )
 
     def test_br46_prompt_list_failure_is_na(self):
         client_error = _make_client_error("AccessDeniedException")
@@ -48158,6 +48357,53 @@ class TestInvocationLogGuardrailEvidence:
         assert "req-untagged (InvokeModel anthropic.test)" in detail
         for other in ("req-tagged", "req-converse", "req-unguarded"):
             assert other not in detail
+
+    def test_br34_records_every_logged_runtime_call_for_br46(self):
+        """An InvokeModel call with no guardrailAction is recorded too, so
+        BR-46 can join the calls BR-34 itself never joins."""
+        joins = {"resolved": {}, "pages": 0}
+        self._prompt(
+            {
+                bedrock_app.INVOKE_LOG_PATTERN: [
+                    [self._record("req-plain")],
+                    [self._guarded("req-g", True, "InvokeModelWithResponseStream")],
+                ],
+                bedrock_app.CONVERSE_LOG_PATTERN: [[self._record("req-c", "Converse")]],
+            },
+            joins=joins,
+        )
+        log = joins["log"]
+        assert log["logging"] is True
+        assert log["unread"] == []
+        assert sorted(
+            (call["request_id"], call["operation"]) for call in log["calls"]
+        ) == [
+            ("req-c", "Converse"),
+            ("req-g", "InvokeModelWithResponseStream"),
+            ("req-plain", "InvokeModel"),
+        ]
+
+    def test_br34_names_a_capped_runtime_call_scan_for_br46(self):
+        joins = {"resolved": {}, "pages": 0}
+        self._prompt({}, endless=True, joins=joins)
+        unread = joins["log"]["unread"]
+        assert len(unread) == 2
+        assert unread[0].startswith(
+            f"records matching an InvokeModel operation in {self.LOG_GROUP} past "
+            "the first 0 (page cap; those logged from "
+        )
+        assert unread[1].startswith("records matching a Converse operation in ")
+
+    def test_br34_records_a_log_with_no_text_for_br46(self):
+        joins = {"resolved": {}, "pages": 0}
+        self._prompt(
+            {},
+            config={"loggingConfig": {"textDataDeliveryEnabled": False}},
+            joins=joins,
+        )
+        assert joins["log"]["logging"] is False
+        assert joins["log"]["calls"] == []
+        assert "textDataDeliveryEnabled is False" in joins["log"]["reason"]
 
     def test_the_untagged_call_on_a_later_page_is_read(self):
         rows = self._prompt(

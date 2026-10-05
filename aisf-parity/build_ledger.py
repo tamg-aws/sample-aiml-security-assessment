@@ -1790,7 +1790,13 @@ AI_SUBJECT_ROWS = [
         "fails, and a Region where nothing applies a guardrail fails. A logged "
         "invocation whose CloudTrail event names no guardrail fails by requestId, "
         "unless an un-narrowed account-enforced configuration applies a guardrail "
-        "that screens the input; when that guardrail is unread it is N/A",
+        "that screens the input; when that guardrail is unread it is N/A. Every "
+        "InvokeModel, InvokeModelWithResponseStream, Converse and ConverseStream "
+        "call BR-34 reads from the invocation log is joined to its CloudTrail "
+        "event, the ones BR-27 and BR-34 did not join included. A capped or "
+        "failed read of those records, an unread logging configuration, a call "
+        "with no request ID and a call the LookupEvents page cap left unmatched "
+        "each hold Passed at N/A, named or counted",
         [],
         5,
     ),
