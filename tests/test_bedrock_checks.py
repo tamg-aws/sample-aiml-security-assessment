@@ -16345,6 +16345,57 @@ class TestBR44MarketplaceModelControl:
         else:
             assert "no attached service control policy denies invoking" not in details
 
+    # MDL-04: a list on one action beside an unread attached SCP read "not on"
+    # the others and failed BR-44, and BR-42's org row omitted the unread SCP.
+    @pytest.mark.parametrize(
+        "unread, management", [(True, False), (True, True), (False, False)]
+    )
+    def test_br44_a_one_action_list_beside_an_unread_scp_is_not_known(
+        self, unread, management
+    ):
+        inventory = self._model_list_inventory(["bedrock:InvokeModel"], management)
+        if unread:
+            inventory["errors"] = ["policy 'Other': AccessDenied"]
+        with patch.object(
+            bedrock_app,
+            "_organization_policy_context",
+            return_value={"readable": True},
+        ):
+            org = bedrock_app.check_bedrock_approved_model_control(
+                region="Global", scp_inventory=inventory, check_id="BR-42"
+            )
+        org_details = " ".join(f["Finding_Details"] for f in org["csv_data"])
+        findings = self._run(
+            self._deny_only_cache(),
+            **{**self.OPEN_BR42, "org_allow_list_findings": org},
+        )
+        details = findings[0]["Finding_Details"]
+        if unread and not management:
+            assert [f["Status"] for f in org["csv_data"]] == ["N/A"]
+            assert (
+                "A Deny on bedrock:invokemodelwithresponsestream, "
+                "bedrock-mantle:createinference was not found in the service "
+                "control policies read, with 1 attached service control policy "
+                "unread (policy 'Other': AccessDenied)"
+            ) in org_details
+            assert [f["Status"] for f in findings] == ["N/A"]
+            assert (
+                "bedrock-mantle:createinference was not found in the service "
+                "control policies read, with 1 attached service control policy "
+                "unread"
+            ) in details
+            assert "not on" not in details
+        elif management:
+            assert [f["Status"] for f in findings] == ["Failed"]
+            assert "but this is the management account" in details
+        else:
+            assert [f["Status"] for f in org["csv_data"]] == ["Failed"]
+            assert [f["Status"] for f in findings] == ["Failed"]
+            assert (
+                "on bedrock:invokemodel only, not on "
+                "bedrock:invokemodelwithresponsestream" in details
+            )
+
     # MDL-04: an identity grant was Failed with "No attached service control
     # policy bounds the action by product" while SCP documents went unread.
     def test_br44_an_unbounded_grant_is_na_while_an_scp_is_unread(self):
@@ -17612,6 +17663,64 @@ class TestBR45ApiKeyGovernance:
         details = failed[0]["Finding_Details"]
         assert "user 'Open' (granted" in details
         assert "Nina" not in details
+
+    # MDL-09: the Passed lead said an age-cap SCP denied LONG_TERM tokens on
+    # both endpoints, though each holder was held by its own Deny or no grant.
+    def test_br45_the_passed_lead_names_each_source_for_what_it_holds(self):
+        bedrock_deny, mantle_deny = self._token_denies()
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Nina": [("Models", _allow("bedrock:InvokeModel", "*"))],
+                "Half": [
+                    (
+                        "BedrockOnly",
+                        _policy(
+                            _allow("bedrock:CallWithBearerToken", "*")["Statement"][0],
+                            bedrock_deny,
+                        ),
+                    )
+                ],
+            }
+        )
+        details = self._holders_run(cache, ["Alice", "Nina", "Half"])[0][
+            "Finding_Details"
+        ]
+        assert details.startswith(
+            "Bedrock API keys are capped in age by 1 service control policy "
+            "statement(s): policy 'KeyGuard' statement 'Cap'"
+        )
+        assert (
+            "and each of the 3 IAM user(s) holding an active key is held from a "
+            "LONG_TERM bearer token call on both endpoints: 1 by a Deny (user "
+            "'Alice'); 1 by no grant of either bearer token action (user 'Nina'); "
+            "1 by a Deny on one bearer token action and no grant of the other "
+            "(user 'Half')."
+        ) in details
+        assert "tokens are denied on both endpoints" not in details
+
+        scp = self._holders_run(
+            cache,
+            ["Nina"],
+            inventory=self._scp_items(self._if_exists_cap(), bedrock_deny, mantle_deny),
+        )[0]["Finding_Details"]
+        assert (
+            "and LONG_TERM bearer tokens are denied on both endpoints by 2 service "
+            "control policy statement(s): policy 'KeyGuard' statement 'Mantle'"
+        ) in scp
+        assert "1 by no grant" not in scp
+
+        one_endpoint = self._holders_run(
+            cache,
+            ["Alice", "Nina"],
+            inventory=self._scp_items(self._if_exists_cap(), bedrock_deny),
+        )[0]["Finding_Details"]
+        assert (
+            "1 by a Deny (user 'Alice'); 1 by a Deny on one bearer token action "
+            "and no grant of the other (user 'Nina'); the service control policy "
+            "statement(s) denying LONG_TERM tokens on bedrock:callwithbearertoken "
+            "only: policy 'KeyGuard' statement 'Bedrock'"
+        ) in one_endpoint
 
     # MDL-09: an SCP Deny on one endpoint and each holder's own Deny on the
     # other were not combined, so the pair was failed as no control.
@@ -36953,7 +37062,7 @@ class TestBR51AIUserConsoleMFA:
         failed = sorted(
             r["Finding_Details"].split("'")[1] for r in rows if r["Status"] == "Failed"
         )
-        assert failed == ["BareRole", "PartialRole", "PlainBoolRole"]
+        assert failed == ["BareRole", "PartialRole"]
         (bare,) = [
             r["Finding_Details"]
             for r in rows
@@ -36961,17 +37070,54 @@ class TestBR51AIUserConsoleMFA:
         ]
         assert (
             "with no Bool aws:MultiFactorAuthPresent true condition, and no Deny in "
-            "its policies or permissions boundary requires MFA (BoolIfExists "
-            "aws:MultiFactorAuthPresent false) on its AI write services, nor does "
-            "one in the 0 service control policies attached to this account, so "
-            "its sessions make AI changes without MFA."
+            "its policies or permissions boundary requires MFA (Bool or "
+            "BoolIfExists aws:MultiFactorAuthPresent false) on its AI write "
+            "services, nor does one in the 0 service control policies attached to "
+            "this account, so its sessions make AI changes without MFA."
         ) in bare
         (summary,) = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
         assert (
-            "and 3 are held to MFA by a Deny (BoundaryRole (permissions boundary); "
-            "ChainRole (inline policy 'RequireMfa'); OpenRole (attached policy "
-            "'RequireMfa'))"
+            "and 4 are held to MFA by a Deny (BoundaryRole (permissions boundary, "
+            "BoolIfExists aws:MultiFactorAuthPresent false); ChainRole (inline "
+            "policy 'RequireMfa', BoolIfExists aws:MultiFactorAuthPresent false); "
+            "OpenRole (attached policy 'RequireMfa', BoolIfExists "
+            "aws:MultiFactorAuthPresent false); PlainBoolRole (attached policy "
+            "'RequireMfa', Bool aws:MultiFactorAuthPresent false))"
         ) in summary["Finding_Details"]
+
+    # IAM-02: a role session made without MFA carries aws:MultiFactorAuthPresent
+    # as false, so a plain Bool false Deny fires for it; a Bool true test on the
+    # Allow side of the role's own policy is not a Deny and holds nothing.
+    def test_br51_a_role_bool_false_deny_is_credited_and_an_allow_side_bool_is_not(
+        self,
+    ):
+        allow_side = _customer_policy(
+            "Write",
+            {
+                "Effect": "Allow",
+                "Action": ["bedrock:*", "sagemaker:*"],
+                "Resource": "*",
+                "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "true"}},
+            },
+        )
+        rows = self._role_trust_rows(
+            {
+                "OpenRole": _identity(
+                    attached=[self.ROLE_AI_WRITE, self._mfa_deny(operator="Bool")]
+                ),
+            }
+        )
+        assert [r["Status"] for r in rows if r["Status"] == "Failed"] == []
+        (summary,) = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert (
+            "OpenRole (attached policy 'RequireMfa', Bool aws:MultiFactorAuthPresent "
+            "false)" in summary["Finding_Details"]
+        )
+
+        rows = self._role_trust_rows({"OpenRole": _identity(attached=[allow_side])})
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1 and failed[0].startswith("IAM role 'OpenRole'")
+        assert "so its sessions make AI changes without MFA" in failed[0]
 
     def test_br51_an_attached_scp_mfa_deny_holds_a_role_trust_without_mfa(self):
         permissions = {
@@ -36993,8 +37139,8 @@ class TestBR51AIUserConsoleMFA:
         assert "nor does one in the 1 service control policy attached" in failed[0]
         (summary,) = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
         assert (
-            "BedrockRole (service control policy 'RequireMfa')"
-            in summary["Finding_Details"]
+            "BedrockRole (service control policy 'RequireMfa', BoolIfExists "
+            "aws:MultiFactorAuthPresent false)" in summary["Finding_Details"]
         )
 
     def test_br51_a_role_trust_without_mfa_is_na_while_an_scp_is_unread(self):

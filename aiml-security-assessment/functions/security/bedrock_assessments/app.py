@@ -33049,6 +33049,7 @@ def check_bedrock_approved_model_control(
             ],
             "uncovered": uncovered,
             "management": bool(inventory.get("management_account")),
+            "unread": read_errors,
         }
         scope_note = (
             "The approved model list is the customer's decision and is not judged "
@@ -33092,6 +33093,30 @@ def check_bedrock_approved_model_control(
                     "No action required",
                     "Medium",
                     "Passed",
+                )
+            )
+        elif enforcing and read_errors and not inventory.get("management_account"):
+            # An unread attached policy may hold the Deny the read ones lack.
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) deny model invocation "
+                    "outside a named list ({}). A Deny on {} was not found in the "
+                    "service control policies read, with {} attached service "
+                    "control polic{} unread ({}), so whether one covers {} is not "
+                    "known. {}".format(
+                        len(enforcing),
+                        "; ".join(enforcing[:5]),
+                        ", ".join(uncovered),
+                        len(read_errors),
+                        "y" if len(read_errors) == 1 else "ies",
+                        "; ".join(read_errors[:5]),
+                        "it" if len(uncovered) == 1 else "them",
+                        scope_note,
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
                 )
             )
         elif enforcing:
@@ -33436,7 +33461,27 @@ def _marketplace_invocation_block(
         row.get("Status")
         for row in (org_allow_list_findings or {}).get("csv_data") or []
     }
-    if not statuses or "N/A" in statuses:
+    model_list = (org_allow_list_findings or {}).get("model_list")
+    if (
+        statuses
+        and model_list is not None
+        and model_list["enforcing"]
+        and model_list["uncovered"]
+        and model_list.get("unread")
+        and not model_list["management"]
+    ):
+        state["unread"].append(
+            "the BR-42 organization model allow-list, whose attached service "
+            "control policies deny invoking a model outside a named list on {}; "
+            "{} was not found in the service control policies read, with {} "
+            "attached service control polic{} unread".format(
+                ", ".join(model_list["covered"]),
+                ", ".join(model_list["uncovered"]),
+                len(model_list["unread"]),
+                "y" if len(model_list["unread"]) == 1 else "ies",
+            )
+        )
+    elif not statuses or "N/A" in statuses:
         state["unread"].append("the BR-42 organization model allow-list")
     elif statuses == {"Passed"}:
         state["blocked_by"].append(
@@ -33444,7 +33489,6 @@ def _marketplace_invocation_block(
             "outside a named list (BR-42 organization allow-list)"
         )
     else:
-        model_list = (org_allow_list_findings or {}).get("model_list")
         if model_list is None:
             found = "its organization leg did not pass"
         elif model_list["enforcing"] and model_list["management"]:
@@ -34246,6 +34290,8 @@ def _bedrock_api_key_iam_token_denies(
     of the action at all. denied names the users held on both actions, with
     what holds each action, open the users granted an action nothing denies,
     and unread the users whose policies the cache does not hold in full.
+    by_deny, by_no_grant and by_both split the denied users by whether a Deny,
+    no grant, or each on a different action holds them.
     errored is None for a version-1 cache, which records no read errors.
     """
     errored_users = {
@@ -34256,6 +34302,7 @@ def _bedrock_api_key_iam_token_denies(
     users = permission_cache.get("user_permissions") or {}
     actions = sorted(BEDROCK_BEARER_TOKEN_ACTIONS)
     denied, open_users, unread = [], [], []
+    by_deny, by_no_grant, by_both = [], [], []
     for name in holders:
         label = f"user '{name}'"
         permissions = users.get(name)
@@ -34297,8 +34344,18 @@ def _bedrock_api_key_iam_token_denies(
             )
         else:
             denied.append("{} ({})".format(label, "; ".join(held)))
+            kinds = {reason.endswith(": not granted") for reason in held}
+            if kinds == {False}:
+                by_deny.append(label)
+            elif kinds == {True}:
+                by_no_grant.append(label)
+            else:
+                by_both.append(label)
     return {
         "denied": denied,
+        "by_deny": by_deny,
+        "by_no_grant": by_no_grant,
+        "by_both": by_both,
         "open": open_users,
         "unread": unread,
         "errored": _cache_principal_errors(permission_cache, ("user",)),
@@ -34687,6 +34744,56 @@ def check_bedrock_api_key_governance(
             )
         age_texts = age_controls if scp_age else []
         preventive = age_texts + (token_texts if not management else [])
+        # Name each source in the lead only for what it established: an SCP age
+        # cap as a cap, an SCP token statement as a token Deny, and each key
+        # holder as held by a Deny or by no grant.
+        if scp_age:
+            age_lead = (
+                "capped in age by {} service control policy statement(s): {}".format(
+                    len(age_controls), "; ".join(age_controls[:5])
+                )
+            )
+        else:
+            age_lead = "capped in age by the identity policies of each principal allowed to create one"
+        if tokens_blocked:
+            token_lead = (
+                "LONG_TERM bearer tokens are denied on both endpoints by {} service "
+                "control policy statement(s): {}".format(
+                    len(token_texts), "; ".join(token_texts[:5])
+                )
+            )
+        else:
+            held_by = [
+                "{} by a Deny ({})".format(len(users), ", ".join(users[:5]))
+                for users in [iam_tokens["by_deny"]]
+                if users
+            ]
+            held_by += [
+                "{} by no grant of either bearer token action ({})".format(
+                    len(users), ", ".join(users[:5])
+                )
+                for users in [iam_tokens["by_no_grant"]]
+                if users
+            ]
+            held_by += [
+                "{} by a Deny on one bearer token action and no grant of the "
+                "other ({})".format(len(users), ", ".join(users[:5]))
+                for users in [iam_tokens["by_both"]]
+                if users
+            ]
+            token_lead = (
+                "each of the {} IAM user(s) holding an active key is held from a "
+                "LONG_TERM bearer token call on both endpoints: {}{}".format(
+                    len(iam_tokens["denied"]),
+                    "; ".join(held_by),
+                    "; the service control policy statement(s) denying LONG_TERM "
+                    "tokens on {} only: {}".format(
+                        ", ".join(token_actions), "; ".join(token_texts[:5])
+                    )
+                    if token_texts and not management
+                    else "",
+                )
+            )
 
         missing = []
         if not age_ok:
@@ -34737,13 +34844,9 @@ def check_bedrock_api_key_governance(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
-                        "Bedrock API keys are capped in age and LONG_TERM bearer "
-                        "tokens are denied on both endpoints{}.{}{}{} {}".format(
-                            " by {} service control policy statement(s): {}".format(
-                                len(preventive), "; ".join(preventive[:5])
-                            )
-                            if preventive
-                            else "",
+                        "Bedrock API keys are {}, and {}.{}{}{} {}".format(
+                            age_lead,
+                            token_lead,
                             iam_age_note,
                             iam_token_note,
                             gap_note,
@@ -36051,7 +36154,7 @@ def _ai_write_services(permissions: Dict[str, Any]) -> List[str]:
 
 
 def _mfa_deny_statement_services(
-    statement: Dict[str, Any], console: bool = True
+    statement: Dict[str, Any], console: bool = True, session: bool = False
 ) -> List[str]:
     """
     Return the AI services whose every action a Deny statement blocks when the
@@ -36061,8 +36164,10 @@ def _mfa_deny_statement_services(
     credited: a request signed with a long-term access key carries no such key,
     so a plain Bool false test never fires for it. A console session carries the
     key as false, so Null true never fires for it, and with console set only
-    BoolIfExists false is credited. A second condition key narrows the Deny and
-    is not credited.
+    BoolIfExists false is credited. A role session carries the key, as false
+    when the AssumeRole call was made without MFA, so with session set a plain
+    Bool false is credited too. A second condition key narrows the Deny and is
+    not credited.
     """
     if str(statement.get("Effect", "")).upper() != "DENY":
         return []
@@ -36076,6 +36181,8 @@ def _mfa_deny_statement_services(
             return []
         base = _strip_condition_set_operator(operator)
         wanted = {"boolifexists": "false", "null": "true"}.get(base)
+        if session and base == "bool":
+            wanted = "false"
         if console and base == "null":
             return []
         if wanted is None or not values:
@@ -36218,13 +36325,18 @@ def _attached_scp_sources(scp_inventory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _mfa_deny_source(
-    permissions: Dict[str, Any], console: bool = True, extra_sources: tuple = ()
+    permissions: Dict[str, Any],
+    console: bool = True,
+    extra_sources: tuple = (),
+    session: bool = False,
 ) -> str:
     """
     Name the Deny that requires MFA on every AI write service an identity holds,
     from its own policies, its permissions boundary or extra_sources (the
     attached service control policies), or return "". With console set, only a
-    Deny that also fires for console sessions is named.
+    Deny that also fires for console sessions is named. With session set, for
+    a role, a plain Bool false is credited too and each label names its
+    operator.
     """
     needed = set(_ai_write_services(permissions))
     if not needed:
@@ -36241,10 +36353,22 @@ def _mfa_deny_source(
     names = []
     for label, document in sources:
         for statement in _policy_statements(document):
-            services = set(_mfa_deny_statement_services(statement, console)) & needed
+            services = (
+                set(_mfa_deny_statement_services(statement, console, session)) & needed
+            )
             if services - covered:
                 covered |= services
-                names.append(label)
+                name = label
+                if session:
+                    operator = _strip_condition_set_operator(
+                        _condition_keys_by_operator(statement)[0][0]
+                    )
+                    name = "{}, {} {} false".format(
+                        label,
+                        "Bool" if operator == "bool" else "BoolIfExists",
+                        "aws:MultiFactorAuthPresent",
+                    )
+                names.append(name)
     return ", ".join(names) if covered >= needed else ""
 
 
@@ -36832,13 +36956,14 @@ def check_bedrock_ai_user_console_mfa(
                     chained_trusts,
                 )
             if open_statements or chain["chains"]:
-                # A role session carries aws:MultiFactorAuthPresent, so a
-                # BoolIfExists false Deny over the role's AI writes holds every
-                # session made without MFA, however the trust is written.
+                # A role session carries aws:MultiFactorAuthPresent, so a Bool
+                # or BoolIfExists false Deny over the role's AI writes holds
+                # every session made without MFA, however the trust is written.
                 try:
                     role_deny = _mfa_deny_source(
                         permission_cache["role_permissions"].get(role_name) or {},
                         extra_sources=scp_sources,
+                        session=True,
                     )
                 except (ValueError, TypeError, AttributeError) as error:
                     findings["csv_data"].append(
@@ -36859,8 +36984,8 @@ def check_bedrock_ai_user_console_mfa(
                     continue
             no_role_deny = (
                 ", and no Deny in its policies or permissions boundary requires "
-                "MFA (BoolIfExists aws:MultiFactorAuthPresent false) on its AI "
-                "write services"
+                "MFA (Bool or BoolIfExists aws:MultiFactorAuthPresent false) on "
+                "its AI write services"
             )
             if open_statements:
                 findings["csv_data"].append(
