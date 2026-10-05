@@ -378,6 +378,7 @@ _EXPECTED_ACTIONS = {
         "s3:GetBucketObjectLockConfiguration",
         "s3:GetBucketOwnershipControls",
         "s3:GetObject",
+        "s3:GetObjectVersion",
         "shield:DescribeSubscription",
         "shield:GetSubscriptionState",
         "shield:ListProtections",
@@ -2288,6 +2289,13 @@ _AGENTCORE_MANAGED_GRANTS = [
     (
         "Allow",
         "s3:GetObject",
+        json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*/*"}),
+    ),
+    # AC-34 reads a code archive pinned by versionId with VersionId, which
+    # the GetObject API reference says needs s3:GetObjectVersion; same scope.
+    (
+        "Allow",
+        "s3:GetObjectVersion",
         json.dumps({"Fn::Sub": "arn:${AWS::Partition}:s3:::*/*"}),
     ),
     # Moved from the inline policy with its custom-tool ARNs, plus the AWS

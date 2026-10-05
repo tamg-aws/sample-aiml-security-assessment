@@ -9261,10 +9261,12 @@ def _statement_binds_token_vault(
     kms:ViaService has to name bedrock-agentcore-identity in the key's region;
     the documented `bedrock-agentcore-identity.*.amazonaws.com` is accepted
     because a key policy governs only its own key, which lives in one region.
-    The vault context has to name the bedrock-agentcore service and a
-    `token-vault/` resource matching this vault, and an account that is either
-    literal or held to the caller's own account by aws:ResourceAccount equal to
-    ${aws:PrincipalAccount} in the same statement.
+    The vault context has to name the bedrock-agentcore service and this
+    vault's `token-vault/<id>` resource written out with no wildcard, as AC-12
+    requires of a gateway context: `token-vault/*` lets every vault in the
+    account use the key. The account has to be either literal or held to the
+    caller's own account by aws:ResourceAccount equal to ${aws:PrincipalAccount}
+    in the same statement.
     """
     via_service = f"bedrock-agentcore-identity.{region}.amazonaws.com"
     if not any(
@@ -9302,7 +9304,7 @@ def _statement_binds_token_vault(
                 or any(wildcard in partition for wildcard in "*?")
                 or service != "bedrock-agentcore"
                 or not resource.startswith("token-vault/")
-                or not fnmatchcase(target, resource)
+                or resource != target
                 or not (account.isdigit() and len(account) == 12 or account_held)
             ):
                 bound = False
@@ -16508,20 +16510,29 @@ def _memory_read_scope(statement: Dict[str, Any], action: str) -> Tuple[str, Lis
 MEMORY_LITERAL_CHARACTER_VARIABLES = {"*", "?", "$"}
 
 # aws:userid is role-id:caller-specified-role-name on an assumed-role session,
-# so it differs per session. On an IAM user it is the user's unique ID, the
-# same for every call (reference_policies_variables.html, "Principal key
-# values"), and aws:username, aws:PrincipalArn and aws:PrincipalAccount name
-# the principal itself, so every caller of the principal shares them.
+# so it differs per caller only when the trust policy makes each caller name
+# the session after itself (_trust_binds_session_name). On an IAM user it is
+# the user's unique ID, the same for every call (reference_policies_variables.html,
+# "Principal key values"), and aws:username, aws:PrincipalArn and
+# aws:PrincipalAccount name the principal itself, so every caller of the
+# principal shares them.
 MEMORY_ROLE_SESSION_VARIABLES = {"aws:userid"}
+
+# Variables that name the IAM user or role session calling AssumeRole, so a
+# session name required to equal one of them is that caller's own.
+MEMORY_CALLER_NAME_VARIABLES = {"aws:username", "aws:userid"}
 
 MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX = "aws:principaltag/"
 
 MEMORY_SESSION_VARIABLE_RULE = (
-    "A variable is credited as per session only on a role: ${aws:userid}, and "
-    "${aws:PrincipalTag/<key>} when every trust policy statement granting an "
-    "AssumeRole action requires session tag <key> with a wildcard or variable "
-    "value; any other variable, and any variable on an IAM user, names "
-    "something every caller of the principal shares."
+    "A variable is credited as per session only on a role: ${aws:userid} when "
+    "every trust policy statement granting an AssumeRole action names no "
+    "service principal and requires sts:RoleSessionName to equal "
+    "${aws:username} or ${aws:userid} of the caller, and "
+    "${aws:PrincipalTag/<key>} when every such statement requires session tag "
+    "<key> with a wildcard or variable value; any other variable, and any "
+    "variable on an IAM user, names something every caller of the principal "
+    "shares."
 )
 
 MEMORY_ASSUME_ROLE_ACTIONS = (
@@ -16547,6 +16558,77 @@ def _memory_value_variables(value: str) -> List[str]:
     ]
 
 
+def _trust_granting_statements(document: Any) -> List[Dict[str, Any]]:
+    """Return the Allow statements of a trust policy that grant an AssumeRole
+    action. A NotAction statement counts as granting."""
+    return [
+        statement
+        for statement in _allow_statements({"document": document})
+        if ("Action" not in statement and "NotAction" in statement)
+        or any(
+            _action_patterns_overlap(pattern, action)
+            for pattern in _statement_actions(statement)
+            for action in MEMORY_ASSUME_ROLE_ACTIONS
+        )
+    ]
+
+
+def _trust_binds_session_name(document: Any) -> str:
+    """Return why ${aws:userid} of a role's session does not name one caller,
+    or an empty string when every caller must name the session after itself.
+
+    aws:userid on a session is role-id:session-name, and the caller picks the
+    session name. It names one caller only when every statement granting an
+    AssumeRole action names no service principal (the service names its own
+    sessions) and requires sts:RoleSessionName, under StringEquals or
+    StringLike with no IfExists form or ForAllValues prefix, with every value
+    carrying ${aws:username} or ${aws:userid} of the caller. Under StringLike
+    a `*` or `?` lets a caller take a longer name, another caller's included.
+    """
+    granting = _trust_granting_statements(document)
+    if not granting:
+        return "whose trust policy grants no AssumeRole action"
+    for statement in granting:
+        principal = statement.get("Principal")
+        if isinstance(principal, dict) and "Service" in principal:
+            return "on a role a service principal assumes, which names its own sessions"
+        conditions = statement.get("Condition")
+        named = False
+        for operator, block in (
+            conditions.items() if isinstance(conditions, dict) else []
+        ):
+            if _operator_admits_an_absent_key(operator) or not isinstance(block, dict):
+                continue
+            name = _normalized_condition_operator(operator)
+            if name not in CONDITION_EQUALS_OPERATORS:
+                continue
+            for key, raw in block.items():
+                if str(key).strip().lower() != "sts:rolesessionname":
+                    continue
+                values = _condition_values(raw)
+                named = (
+                    named
+                    or bool(values)
+                    and all(
+                        any(
+                            variable.lower() in MEMORY_CALLER_NAME_VARIABLES
+                            for variable in _memory_value_variables(value)
+                        )
+                        and not (
+                            name == "stringlike"
+                            and re.search(r"[*?]", re.sub(r"\$\{[^}]*\}", "", value))
+                        )
+                        for value in values
+                    )
+                )
+        if not named:
+            return (
+                "whose trust policy does not require each caller to name the "
+                "session after itself"
+            )
+    return ""
+
+
 def _trust_requires_session_tag(document: Any, tag_key: str) -> bool:
     """Whether every Allow statement of a trust policy that grants an AssumeRole
     action requires session tag `tag_key` with a value that differs per session.
@@ -16560,17 +16642,7 @@ def _trust_requires_session_tag(document: Any, tag_key: str) -> bool:
     key, so neither requires it. A NotAction statement counts as granting.
     """
     request_key = f"aws:requesttag/{tag_key.lower()}"
-    granting = [
-        statement
-        for statement in _allow_statements({"document": document})
-        if ("Action" not in statement and "NotAction" in statement)
-        or any(
-            _action_patterns_overlap(pattern, action)
-            for pattern in _statement_actions(statement)
-            for action in MEMORY_ASSUME_ROLE_ACTIONS
-        )
-    ]
-    for statement in granting:
+    for statement in _trust_granting_statements(document):
         conditions = statement.get("Condition")
         required = False
         for operator, block in (
@@ -16609,11 +16681,13 @@ def _memory_shared_variables(
     """Return the variables of bound partition values that every caller of the
     principal shares, and those whose trust policy could not be judged.
 
-    A variable resolves per session only on a role: aws:userid always, and
-    aws:PrincipalTag/<key> when the role's trust policy requires session tag
-    <key> on every statement that grants an AssumeRole action
+    A variable resolves per session only on a role: aws:userid when the
+    role's trust policy makes every caller name the session after itself
+    (_trust_binds_session_name), and aws:PrincipalTag/<key> when it requires
+    session tag <key> on every statement that grants an AssumeRole action
     (_trust_requires_session_tag). Every other variable, and every variable on
-    an IAM user, names something every caller of the principal shares.
+    an IAM user, names something every caller of the principal shares. Each
+    shared entry is a note naming the variable and why it is shared.
     """
     shared: List[str] = []
     unread: List[str] = []
@@ -16625,9 +16699,9 @@ def _memory_shared_variables(
             name in MEMORY_ROLE_SESSION_VARIABLES
             or name.startswith(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX)
         ):
-            shared.append(f"${{{variable}}}")
-            continue
-        if name in MEMORY_ROLE_SESSION_VARIABLES:
+            shared.append(
+                f"${{{variable}}}, which every caller of the {principal_kind} shares"
+            )
             continue
         if principal_name not in trust_cache:
             if iam_client is None:
@@ -16646,14 +16720,19 @@ def _memory_shared_variables(
             unread.append(f"${{{variable}}} (trust policy not read: {document})")
             continue
         try:
-            requires = _trust_requires_session_tag(
+            if name in MEMORY_ROLE_SESSION_VARIABLES:
+                reason = _trust_binds_session_name(document)
+            elif not _trust_requires_session_tag(
                 document, variable[len(MEMORY_PRINCIPAL_TAG_VARIABLE_PREFIX) :]
-            )
+            ):
+                reason = "which every caller of the role shares"
+            else:
+                reason = ""
         except (TypeError, ValueError) as error:
             unread.append(f"${{{variable}}} (trust policy not parsed: {error})")
             continue
-        if not requires:
-            shared.append(f"${{{variable}}}")
+        if reason:
+            shared.append(f"${{{variable}}}, {reason}")
     return shared, unread
 
 
@@ -16741,10 +16820,7 @@ def _principals_reading_memory_records(
         if "unscoped" in scopes:
             unscoped.append(label)
         elif "fixed" in scopes or shared or trust_unread:
-            notes = (["a fixed literal"] if "fixed" in scopes else []) + [
-                f"{variable}, which every caller of the {principal_kind} shares"
-                for variable in shared
-            ]
+            notes = (["a fixed literal"] if "fixed" in scopes else []) + shared
             fixed.append(f"{label} ({'; '.join(notes + trust_unread)})")
         elif "bound" in scopes:
             variables = sorted(
