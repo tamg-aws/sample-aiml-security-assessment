@@ -34219,8 +34219,10 @@ class TestBR51AIUserConsoleMFA:
         role_trust=None,
         abac=None,
         set_names=None,
+        scp_inventory=None,
     ):
-        """`set_names` maps a permission set to the Name DescribePermissionSet
+        """`scp_inventory` is the attached service control policies read, by
+        default none attached and every read clean. `set_names` maps a permission set to the Name DescribePermissionSet
         returns, or an exception it raises; by default the ARN's last segment.
         `abac` is the DescribeInstanceAccessControlAttributeConfiguration
         response, or an exception it raises. `managed` maps a permission set to the AWS managed policy ARNs
@@ -34352,7 +34354,11 @@ class TestBR51AIUserConsoleMFA:
         self.iam = iam
         with patch("boto3.client", side_effect=client):
             result = bedrock_app.check_bedrock_ai_user_console_mfa(
-                cache, region="Global", identity_center_region="eu-west-1"
+                cache,
+                region="Global",
+                identity_center_region="eu-west-1",
+                scp_inventory=scp_inventory
+                or {"items": [], "errors": [], "list_error": None},
             )
         return result, extract_csv_data(result)
 
@@ -34464,7 +34470,7 @@ class TestBR51AIUserConsoleMFA:
             {"Effect": "Allow", "Principal": {"Federated": provider}, "Action": action}
         )
 
-    def _run_federated(self, roles, instances=None):
+    def _run_federated(self, roles, instances=None, **kwargs):
         """``roles`` maps a role name to (provider, action, statements)."""
         cache = _ai_user_cache()
         for role, (_, _, statements) in roles.items():
@@ -34481,6 +34487,7 @@ class TestBR51AIUserConsoleMFA:
                 role: self._federated_trust(provider, action)
                 for role, (provider, action, _) in roles.items()
             },
+            **kwargs,
         )
         return rows
 
@@ -34958,7 +34965,9 @@ class TestBR51AIUserConsoleMFA:
 
     def test_br51_principal_tag_deny_forms_that_do_not_fire_are_not_credited(self):
         forms = {
-            "ifexists": self._tag_deny(operator="StringNotEqualsIfExists"),
+            "set_ifexists": self._tag_deny(
+                operator="ForAnyValue:StringNotEqualsIfExists"
+            ),
             "set": self._tag_deny(operator="ForAnyValue:StringNotEquals"),
             "equals": self._tag_deny(operator="StringEquals"),
             "resource": self._tag_deny(Resource="arn:aws:bedrock:*:*:agent/*"),
@@ -34985,6 +34994,64 @@ class TestBR51AIUserConsoleMFA:
         assert len(failed) == len(forms)
         for arn in sets:
             assert sum(arn + " " in text for text in failed) == 1, arn
+
+    @pytest.mark.parametrize(
+        "operator",
+        [
+            "StringNotEqualsIfExists",
+            "StringNotEqualsIgnoreCaseIfExists",
+            "StringNotLikeIfExists",
+            "ForAllValues:StringNotEquals",
+        ],
+    )
+    def test_br51_a_principal_tag_deny_true_on_an_absent_tag_is_credited(
+        self, operator
+    ):
+        """An IfExists or ForAllValues: negated test is true on an untagged
+        session, so it denies it as the plain form does; the set without the
+        Deny beside it still fails."""
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(self._tag_deny(operator=operator)),
+                self.PS_LATE: self._grant_with(),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert self.PS_LATE in rows[1]["Finding_Details"]
+        assert self.PS_WRITE not in rows[1]["Finding_Details"]
+        assert "1 of them carry" in rows[0]["Finding_Details"]
+        assert (
+            f"{self.PS_WRITE} (bedrock): {operator} aws:PrincipalTag/authn mfa"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br51_a_scp_tag_deny_holds_a_permission_set_in_this_account_only(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(),
+                self.PS_LATE: self._grant_with(actions=("sagemaker:CreateEndpoint",)),
+            },
+            scp_inventory=TestBR51AIUserConsoleMFA._scps(
+                self._tag_deny(actions=("bedrock:*",))
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A", "Failed"]
+        held = rows[1]["Finding_Details"]
+        assert self.PS_WRITE in held
+        assert (
+            "The service control policies attached to this account deny them "
+            "(StringNotEquals aws:PrincipalTag/authn mfa in service control policy "
+            "'RequireMfa'), which holds the set's sessions in this account only" in held
+        )
+        failed = rows[2]["Finding_Details"]
+        assert self.PS_LATE in failed
+        assert (
+            "nor does one in the 1 service control policy attached to this account "
+            "over sagemaker, so a session that did not complete MFA is not denied"
+            in failed
+        )
 
     def test_br51_deny_over_one_service_fails_the_other_it_grants(self):
         _, rows = self._run_sets(
@@ -35611,7 +35678,11 @@ class TestBR51AIUserConsoleMFA:
         iam.list_instances.return_value = {"Instances": []}
         with patch("boto3.client", return_value=iam):
             rows = extract_csv_data(
-                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+                bedrock_app.check_bedrock_ai_user_console_mfa(
+                    cache,
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
             )
 
         failed = [r for r in rows if r["Status"] == "Failed"]
@@ -35671,7 +35742,11 @@ class TestBR51AIUserConsoleMFA:
         iam.list_instances.return_value = {"Instances": []}
         with patch("boto3.client", return_value=iam):
             rows = extract_csv_data(
-                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+                bedrock_app.check_bedrock_ai_user_console_mfa(
+                    cache,
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
             )
 
         failed = {
@@ -35766,7 +35841,11 @@ class TestBR51AIUserConsoleMFA:
         iam.list_instances.return_value = {"Instances": []}
         with patch("boto3.client", return_value=iam):
             rows = extract_csv_data(
-                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+                bedrock_app.check_bedrock_ai_user_console_mfa(
+                    cache,
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
             )
 
         failed = {
@@ -35786,6 +35865,137 @@ class TestBR51AIUserConsoleMFA:
         summary = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
         assert "3 of the 6 in-scope IAM role(s)" in summary[0]["Finding_Details"]
         assert "AnyChainRole, AnyHopChainRole, AnyRole" in summary[0]["Finding_Details"]
+
+    @staticmethod
+    def _scps(*statements, **inventory):
+        """An inventory holding one attached policy with these statements."""
+        base = {
+            "items": [
+                {
+                    "name": "RequireMfa",
+                    "id": "p-mfa",
+                    "content": json.dumps(
+                        {"Version": "2012-10-17", "Statement": list(statements)}
+                    ),
+                    "attached_to": ["root r-abc1"],
+                }
+            ]
+            if statements
+            else [],
+            "errors": [],
+            "list_error": None,
+            "detached": [],
+            "account": "123456789012",
+            "management_account": False,
+        }
+        base.update(inventory)
+        return base
+
+    SCP_MFA_DENY = {
+        "Effect": "Deny",
+        "Action": "bedrock:*",
+        "Resource": "*",
+        "Condition": {"BoolIfExists": {"aws:MultiFactorAuthPresent": "false"}},
+    }
+
+    def test_br51_an_attached_scp_mfa_deny_holds_each_user_it_covers(self):
+        """The SCP denies bedrock only, so alice (bedrock) is held and bob
+        (sagemaker) still fails, his text naming the SCP that was read."""
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            keys={"alice": [self.KEY], "bob": [self.KEY]},
+            scp_inventory=self._scps(self.SCP_MFA_DENY),
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "IAM user 'bob' has 1 active access key(s)" in failed[0]
+        assert (
+            "nor does one in the 1 service control policy attached to this "
+            "account, so the key signs AI changes without MFA" in failed[0]
+        )
+        (summary,) = [r for r in rows if r["Status"] == "N/A"]
+        assert (
+            "1 user(s) are held to MFA by a Deny (alice (service control policy "
+            "'RequireMfa'))" in summary["Finding_Details"]
+        )
+
+    def test_br51_an_unread_scp_holds_a_missing_deny_at_na(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"bob": "yes"},
+            keys={"alice": [self.KEY]},
+            scp_inventory=self._scps(
+                errors=["policy 'Guard' targets: AccessDenied"],
+            ),
+        )
+        assert "Failed" not in [r["Status"] for r in rows]
+        texts = [r["Finding_Details"] for r in rows]
+        for user, fact in (
+            ("alice", "has 1 active access key(s)"),
+            ("bob", "has a console password and no MFA device"),
+        ):
+            (text,) = [t for t in texts if f"IAM user '{user}' {fact}" in t]
+            assert (
+                "The service control policies attached to this account were not "
+                "all read (policy 'Guard' targets: AccessDenied), so a Deny there "
+                "that holds these writes to MFA is not ruled out." in text
+            )
+            assert "without MFA." not in text
+
+    @pytest.mark.parametrize(
+        "inventory, clause",
+        [
+            (
+                {"management_account": True},
+                "and service control policies do not restrict this organization "
+                "management account, so the key signs",
+            ),
+            (
+                {"not_in_use": True, "list_error": "not in use"},
+                "and AWS Organizations is not in use, so no service control policy "
+                "applies, so the key signs",
+            ),
+        ],
+    )
+    def test_br51_an_scp_that_cannot_restrict_the_account_is_not_credited(
+        self, inventory, clause
+    ):
+        _, rows = self._run(
+            _ai_user_cache(),
+            keys={"alice": [self.KEY], "bob": [self.KEY]},
+            scp_inventory=self._scps(self.SCP_MFA_DENY, **inventory),
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 2
+        assert all(clause in text for text in failed)
+
+    def test_br51_an_attached_scp_tag_deny_guards_the_federated_role_it_covers(self):
+        saml = "arn:aws:iam::123456789012:saml-provider/Okta"
+        rows = self._run_federated(
+            {
+                "OktaBedrock": (saml, "sts:AssumeRoleWithSAML", [self.WRITE]),
+                "OktaSage": (
+                    saml,
+                    "sts:AssumeRoleWithSAML",
+                    [{"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"}],
+                ),
+            },
+            scp_inventory=self._scps(self._tag_deny(actions=("bedrock:*",))),
+        )
+        (failed,) = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert "IAM role 'OktaSage'" in failed
+        assert (
+            "covers sagemaker (the PrincipalTag Deny it has, StringNotEquals "
+            "aws:PrincipalTag/authn mfa in service control policy 'RequireMfa', "
+            "covers only the other services), nor does one in the 1 service "
+            "control policy attached to this account, so a federated session" in failed
+        )
+        (summary,) = [r for r in rows if "in-scope IAM role(s)" in r["Finding_Details"]]
+        assert (
+            f"(OktaBedrock ({saml}; StringNotEquals aws:PrincipalTag/authn mfa in "
+            "service control policy 'RequireMfa'))" in summary["Finding_Details"]
+        )
 
     def test_br51_unread_principal_stops_a_passed_row(self):
         cache = _ai_user_cache()
@@ -39916,6 +40126,29 @@ class TestServiceControlPolicyInventory:
             }[service],
         ):
             return org_client, bedrock_app.get_service_control_policy_inventory()
+
+    @pytest.mark.parametrize(
+        "code, not_in_use",
+        [("AWSOrganizationsNotInUseException", True), ("AccessDeniedException", False)],
+    )
+    def test_organizations_not_in_use_is_told_apart_from_a_denied_read(
+        self, code, not_in_use
+    ):
+        org_client = MagicMock()
+        org_client.describe_organization.side_effect = _make_client_error(code)
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "222222222222"}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            inventory = bedrock_app.get_service_control_policy_inventory()
+        assert inventory["not_in_use"] is not_in_use
+        assert inventory["list_error"]
+        assert inventory["items"] == []
 
     PARENTS = {
         "222222222222": [{"Id": "ou-abc1-inner", "Type": "ORGANIZATIONAL_UNIT"}],
