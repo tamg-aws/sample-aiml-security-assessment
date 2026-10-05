@@ -32414,9 +32414,21 @@ def _statement_names_evaluation_resource(
     literal partition and a literal account, and has to match `resource_arn`,
     so the documented `evaluator/*` and `batch-evaluate/*` patterns count and a
     pattern open in the account segment does not. With no `resource_arn`, any
-    bedrock-agentcore ARN in a literal partition and account counts.
+    bedrock-agentcore ARN in a literal partition and account counts. Under
+    StringEquals, StringEqualsIgnoreCase or ArnEquals a `*` or `?` is a literal
+    character that equals no resource ARN, and conditions are ANDed, so such a
+    value names nothing; only ArnLike and StringLike values match as patterns.
     """
     target = (resource_arn or "").lower()
+    if any(
+        wildcard in value
+        for values in _positive_condition_values(
+            statement, key, TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS
+        )
+        for value in values
+        for wildcard in "*?"
+    ):
+        return False
     for values in _positive_condition_values(statement, key):
         bound = True
         for value in values:

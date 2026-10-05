@@ -1326,7 +1326,8 @@ AI_SUBJECT_ROWS = [
         "policy allows kms:Decrypt with an encryption context naming that evaluator "
         "or batch evaluation in one account, with kms:ViaService for an evaluator, "
         "while a grant to the AgentCore service principal needs aws:SourceArn and an "
-        "open decrypt grant fails",
+        "open decrypt grant fails. Under StringEquals or ArnEquals a * or ? in the "
+        "context or aws:SourceArn value is a literal character and names nothing",
         [],
         4,
     ),

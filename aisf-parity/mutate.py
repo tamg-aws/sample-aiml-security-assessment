@@ -7497,6 +7497,13 @@ MUTATIONS = [
         "replace": "TOKEN_VAULT_CONTEXT_EQUALITY_OPERATORS = (\n",
     },
     {
+        "name": "AC-41 reads a StringEquals or ArnEquals wildcard as a pattern",
+        "file": AGENTCORE,
+        "defect": "under StringEquals an evaluator/* encryption context or aws:SourceArn is a literal character string that names no evaluator, and it passed",
+        "find": '        for wildcard in "*?"\n    ):\n        return False\n    for values in _positive_condition_values(statement, key):\n',
+        "replace": '        for wildcard in "*?"\n    ):\n        pass\n    for values in _positive_condition_values(statement, key):\n',
+    },
+    {
         "name": "AC-23 credits a session tag an sts:AssumeRole caller chooses",
         "file": AGENTCORE,
         "defect": "a Null false requirement on aws:RequestTag lets an sts:AssumeRole caller pass any tag value, and a PrincipalTag partition passed",
@@ -8863,6 +8870,7 @@ GROUPS: dict[str, str] = {
     "AC-14 reads a StringEquals or ArnEquals wildcard as a pattern": "in the AgentCore verdict legs",
     "AC-14 reads a StringEquals kms:ViaService wildcard as a pattern": "in the AgentCore verdict legs",
     "AC-14 reads an ArnEquals wildcard as a pattern": "in the AgentCore verdict legs",
+    "AC-41 reads a StringEquals or ArnEquals wildcard as a pattern": "in the AgentCore verdict legs",
     "AC-23 credits a session tag an sts:AssumeRole caller chooses": "in the AgentCore verdict legs",
     "AC-23 exempts every principal from the caller-chosen session tag rule": "in the AgentCore verdict legs",
     "AC-23 skips sts:AssumeRole statements in the caller-chosen session tag rule": "in the AgentCore verdict legs",
