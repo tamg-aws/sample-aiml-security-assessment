@@ -15905,7 +15905,7 @@ def _regional_admin(
     )
 
 
-# Live answers of account 178113193057 on 2026-10-04, a member with Macie
+# Live answers of a test account on 2026-10-04, a member with Macie
 # enabled in us-east-1 and not in us-west-1 or eu-north-1: GetAdministratorAccount
 # raised ResourceNotFoundException where Macie had no administrator and
 # AccessDeniedException "Macie is not enabled" where Macie was off, and
@@ -16001,7 +16001,7 @@ def _detective_regional_admin(region: str, account_id: str):
             try:
                 detective.describe_organization_configuration(GraphArn=graph["Arn"])
             except ClientError as error:
-                # Live on 2026-10-04 (account 178113193057, us-east-1), a
+                # Live on 2026-10-04 (a test account, us-east-1), a
                 # graph that is not the organization graph answered
                 # ValidationException "...a delegated administrator account
                 # has not been enabled".
@@ -17530,7 +17530,7 @@ MODEL_ARTIFACT_INSTANCE_RESOLUTION = (
     "move the model read to the workload's own role, such as an ECS task role "
     "or an EKS Pod Identity role, so the instance role cannot read the weights."
 )
-# AIR-SLF-CMP-08 read caps, measured on account 178113193057 in us-east-1 on
+# AIR-SLF-CMP-08 read caps, measured on a test account in us-east-1 on
 # 2026-10-04 from outside AWS, so in-Region calls from the Lambda are at most
 # this slow: 1,000 sequential HeadObject calls took 60.4 s (median 53 ms, p95
 # 91 ms, slowest 1.8 s), and 10 ListObjectsV2 pages of 1,000 keys took a

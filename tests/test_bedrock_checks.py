@@ -11191,8 +11191,8 @@ class TestBR41CentralGuardrailEnforcement:
         client = MagicMock()
         with patch("bedrock_app.boto3.client", return_value=client):
             row = bedrock_app._guardrail_share_finding(
-                "arn:aws:bedrock:us-east-1:523402589643:guardrail/gr-org",
-                "178113193057",
+                "arn:aws:bedrock:us-east-1:444455556666:guardrail/gr-org",
+                "111122223333",
                 "https://example.com",
                 "us-east-1",
             )
@@ -11201,7 +11201,7 @@ class TestBR41CentralGuardrailEnforcement:
         assert (
             "can allow only bedrock:ApplyGuardrail and bedrock:GetGuardrail"
             in row["Finding_Details"]
-            and "no policy can let account 178113193057 call "
+            and "no policy can let account 111122223333 call "
             "bedrock:GetResourcePolicy on it"
             in row["Finding_Details"]
         )
@@ -49325,7 +49325,7 @@ class TestInvocationLogGuardrailEvidence:
         """
         Record the CloudTrail event of a Converse call as event history holds
         it: the guardrail sits under requestParameters.guardrailConfig (live
-        event f5561a4b, account 178113193057, us-east-1), never in the logged
+        event f5561a4b, a test account, us-east-1), never in the logged
         request body.
         """
         parameters = {"modelId": "anthropic.test", "inferenceConfig": {}}
@@ -49361,7 +49361,7 @@ class TestInvocationLogGuardrailEvidence:
 
     # A guarded InvokeModel call's CloudTrail event names its guardrail in
     # requestParameters (live events at 14:19:19Z and 14:38:51Z, account
-    # 178113193057, us-east-1, 2026-10-04). By default it names PASSING, a
+    # a test account, us-east-1, 2026-10-04). By default it names PASSING, a
     # version that passes both the prompt attack and the grounding test.
     PASSING = ("gr-pass", "1")
     PASSING_DETAIL = {

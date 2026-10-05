@@ -20789,7 +20789,7 @@ class TestAC34RuntimeCode:
 
     def test_a_private_key_header_alone_in_code_is_not_a_key(self):
         """Formerly Failed: cryptography's serialization/ssh.py holds the
-        OpenSSH header as a constant, and a live archive in 178113193057
+        OpenSSH header as a constant, and a live archive in a test account
         failed on it. The header with no base64 body is not a key.
         """
         source = (
@@ -20854,7 +20854,7 @@ class TestAC34RuntimeCode:
         """A code archive holds its dependencies at the root beside the agent.
 
         Before this fix every assignment in a vendored package was matched,
-        so a live archive in 178113193057 failed on botocore's examples.
+        so a live archive in a test account failed on botocore's examples.
         Only the file the RECORD lists is spared, and only its assignments.
         """
         source = 'CLIENT_SECRET = "Zx9kP2mQ7rT4vW1y"\n'
@@ -30293,7 +30293,7 @@ class TestManagedToolSessionHolders:
     population, so an agent on the managed browser was never judged for open
     egress or for an unrecorded session. GetBrowser and GetCodeInterpreter
     return neither networkConfiguration nor recording for them (live,
-    178113193057, us-east-1, 2026-10-04), which is the shape used here.
+    a test account, us-east-1, 2026-10-04), which is the shape used here.
     """
 
     _BR_ARN = "arn:aws:bedrock-agentcore:us-east-1:aws:browser/aws.browser.v1"
@@ -35605,7 +35605,7 @@ class TestAC49DnsEgressControl:
         ends in when read on 2026-09-26.
 
         fail_open is the FirewallFailOpen every VPC reports, or a dict of it by
-        VPC id; DISABLED is what all 9 firewall configs in 178113193057 reported
+        VPC id; DISABLED is what all 9 firewall configs in a test account reported
         on 2026-09-26. None omits the field.
         """
         mock_ac.list_agent_runtimes.return_value = {
@@ -36845,7 +36845,7 @@ class TestAG39GatewayWafRuleCoverage:
         """Stub one gateway and its web ACL.
 
         FAIL_CLOSE is what GetGateway returned for the one gateway with a web
-        ACL in 178113193057 on 2026-09-27; a failure_mode of None omits
+        ACL in a test account on 2026-09-27; a failure_mode of None omits
         wafConfiguration, which the other fifteen gateways there returned.
         """
         mock_ac.list_gateways.return_value = {
