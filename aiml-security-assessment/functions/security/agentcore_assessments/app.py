@@ -2354,8 +2354,10 @@ def _agentcore_managed_tool_egress_findings(
     (live, account 178113193057, us-east-1, 2026-10-04), although the model
     marks it required, and the devguide says the browser "supports the public
     network mode", which "allows the tool to access public internet
-    resources". An absent or PUBLIC mode fails each holder, and SANDBOX fails
-    under the same rule as a custom tool. A tool nobody can start passes.
+    resources", but they do not state the mode of the managed tools. PUBLIC
+    fails each holder at High. SANDBOX fails at Medium under the same rule as a
+    custom tool, and so does an absent mode, whose text says no
+    networkConfiguration was returned. A tool nobody can start passes.
     """
     tools, errors = _agentcore_managed_tools()
     findings = _agentcore_tool_read_findings(
@@ -2404,9 +2406,9 @@ def _agentcore_managed_tool_egress_findings(
                 create_finding(
                     check_id="AC-01",
                     finding_name=(
-                        "AgentCore Egress Not Customer Filtered"
-                        if network_mode == AGENTCORE_SANDBOX_NETWORK_MODE
-                        else "AgentCore Egress Unrestricted"
+                        "AgentCore Egress Unrestricted"
+                        if network_mode == AGENTCORE_PUBLIC_NETWORK_MODE
+                        else "AgentCore Egress Not Customer Filtered"
                     ),
                     finding_details=(
                         f"{label} {mode_text} and attaches no customer security "
@@ -2426,9 +2428,9 @@ def _agentcore_managed_tool_egress_findings(
                     ),
                     reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
                     severity=(
-                        SeverityEnum.MEDIUM
-                        if network_mode == AGENTCORE_SANDBOX_NETWORK_MODE
-                        else SeverityEnum.HIGH
+                        SeverityEnum.HIGH
+                        if network_mode == AGENTCORE_PUBLIC_NETWORK_MODE
+                        else SeverityEnum.MEDIUM
                     ),
                     status=StatusEnum.FAILED,
                 )
@@ -19902,6 +19904,7 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
     trust_cache: Dict[str, Any] = {}
     endpoint_cache: Dict[str, Any] = {}
     held: List[Tuple[str, str, Dict[str, Any]]] = []
+    unread: List[str] = []
     for gateway in gateways:
         gateway_id = gateway.get("gatewayId", "unknown")
         gateway_name = gateway.get("name", gateway_id)
@@ -19910,6 +19913,7 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
         try:
             detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
         except Exception as error:
+            unread.append(label)
             findings.append(
                 create_finding(
                     check_id="AC-27",
@@ -19926,7 +19930,7 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
             continue
         held.append((gateway_id, label, detail))
 
-    unread = len(gateways) - len(held)
+    read_arns = {str(d.get("gatewayArn")) for _, _, d in held if d.get("gatewayArn")}
     for gateway_id, label, detail in held:
         role_arn = detail.get("roleArn")
         others = [
@@ -19946,7 +19950,12 @@ def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
         )
         findings.extend(
             _gateway_role_trust_findings(
-                label, role_arn, trust_cache, others=others, unread=unread
+                label,
+                role_arn,
+                trust_cache,
+                others=others,
+                unread=unread,
+                read_arns=read_arns,
             )
         )
 
@@ -20718,7 +20727,8 @@ def _gateway_role_trust_findings(
     role_arn: Any,
     trust_cache: Dict[str, Any],
     others: Iterable[Tuple[str, str, str]] = (),
-    unread: int = 0,
+    unread: Iterable[str] = (),
+    read_arns: Iterable[str] = (),
 ) -> List[Dict[str, Any]]:
     """Judge one gateway execution role's trust policy for a confused-deputy guard.
 
@@ -20730,7 +20740,10 @@ def _gateway_role_trust_findings(
     Region that runs with a different role. An aws:SourceArn that names a
     gateway resource can still be a pattern, such as gateway/*, that admits
     those gateways too; each held ARN is matched against it by value. `unread`
-    counts the gateways GetGateway could not read, whose ARNs were not compared.
+    names the gateways GetGateway could not read, whose ARNs were not compared,
+    and `read_arns` holds the ARN of every gateway that was read. While one is
+    unread, a Passed needs every aws:SourceArn value to be the literal ARN of a
+    read gateway; a pattern or any other ARN may admit an unread one.
     """
     if not role_arn:
         return [
@@ -20914,9 +20927,51 @@ def _gateway_role_trust_findings(
             )
         ]
 
+    unread = list(unread)
+    known = set(read_arns)
+    uncompared = sorted(
+        {
+            value.strip()
+            for statement in service_statements
+            if isinstance(statement.get("Condition"), dict)
+            for entries in statement["Condition"].values()
+            if isinstance(entries, dict)
+            for key, raw in entries.items()
+            if str(key).strip().lower() == "aws:sourcearn"
+            for value in _condition_values(raw)
+            if "*" in value or "?" in value or value.strip() not in known
+        }
+        if unread
+        else ()
+    )
+    if uncompared:
+        return findings + [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Role Trust Confused Deputy Guard",
+                finding_details=(
+                    f"{label} uses execution role {role_name}, whose trust policy "
+                    "aws:SourceArn admits no gateway that was read in this Region "
+                    "and runs with another role. These gateways could not be "
+                    f"read: {', '.join(unread)}, and aws:SourceArn value "
+                    f"{', '.join(uncompared)} is a pattern or names no gateway "
+                    "that was read, so whether it admits one of them was not "
+                    "judged."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on "
+                    "this result. Grant bedrock-agentcore:GetGateway and rerun "
+                    "the assessment."
+                ),
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
     unread_note = (
-        f" {unread} gateway(s) could not be read, so their ARNs were not "
-        "compared with the pattern."
+        f" {len(unread)} gateway(s) could not be read, and every aws:SourceArn "
+        "value is the ARN of a gateway that was read."
         if unread
         else ""
     )
@@ -20928,8 +20983,9 @@ def _gateway_role_trust_findings(
                 f"{label} uses execution role {role_name}, whose "
                 f"{len(statements)} Allow statement(s) each carry an "
                 "aws:SourceArn condition whose every value names account "
-                f"{account_id}, a Region and a gateway resource with no "
-                "wildcard, or name no service or wildcard principal. The "
+                f"{account_id}, a Region and a resource type with no wildcard, "
+                "and a gateway resource, or name no service or wildcard "
+                "principal. The "
                 "aws:SourceArn admits no other gateway in this Region that runs "
                 f"with another role.{unread_note}"
             ),
@@ -21602,6 +21658,37 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
         )
         return findings
 
+    # A policy DescribePolicy could not read may hold the missing Deny, so no
+    # Missing, Partial, Unattached or Ineffective verdict is reported.
+    if read_errors:
+        denied_note = (
+            f" {', '.join(sorted(GATEWAY_WRITE_ACTIONS[a] for a in covered_actions))}"
+            f" is denied by service control policy {guarding_label}."
+            if covered_actions
+            else ""
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail Incomplete",
+                finding_details=(
+                    f"None of the {len(policies) - len(read_errors)} service "
+                    "control policy(s) read from this account that binds it "
+                    f"denies {' and '.join(missing)} when "
+                    "bedrock-agentcore:GatewayAuthorizerType is NONE."
+                    f"{denied_note} Service control policy "
+                    f"{', '.join(sorted(name for name, _ in read_errors))} could "
+                    "not be read and may hold that Deny, so no verdict is "
+                    "reported."
+                ),
+                resolution="Grant organizations:DescribePolicy and retry.",
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
     if covered_actions:
         covered_label = ", ".join(
             sorted(GATEWAY_WRITE_ACTIONS[action] for action in covered_actions)
@@ -21679,9 +21766,10 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
             check_id="AC-28",
             finding_name="AgentCore Gateway Authorizer Guardrail Missing",
             finding_details=(
-                f"None of the {len(policies)} service control policy(s) readable "
-                "from this account denies CreateGateway or UpdateGateway when "
-                "bedrock-agentcore:GatewayAuthorizerType is NONE, so the next "
+                f"None of the {len(policies) - len(read_errors)} service control "
+                "policy(s) read from this account denies CreateGateway or "
+                "UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is "
+                "NONE, so the next "
                 "gateway created can accept unauthenticated requests."
             ),
             resolution=(
