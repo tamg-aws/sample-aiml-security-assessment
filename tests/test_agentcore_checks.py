@@ -40992,6 +40992,122 @@ class TestAC27RoleTrustSourceArnNamesTheGateway:
             findings, "AgentCore Gateway Role Trust Source ARN Reaches Other Gateways"
         )
 
+    _EAST = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/gw-a"
+    _WEST = f"arn:aws:bedrock-agentcore:us-west-2:{_ACCOUNT}:gateway/*"
+    _NO_REGION = f"arn:aws:bedrock-agentcore::{_ACCOUNT}:gateway/*"
+
+    @pytest.mark.parametrize(
+        "condition, status",
+        [
+            (
+                {
+                    "ArnLike": {"aws:SourceArn": _EAST},
+                    "Null": {"aws:SourceArn": "false"},
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "ArnLike": {"aws:SourceArn": _EAST},
+                    "ArnNotLike": {"aws:SourceArn": _WEST},
+                },
+                "Passed",
+            ),
+            # A gateway call always carries aws:SourceArn, so the IfExists entry
+            # matches like ArnLike, and ANDed with the gw-a entry it admits
+            # only a value matching both, which no us-west-2 gateway is.
+            (
+                {
+                    "ArnLike": {"aws:SourceArn": _EAST},
+                    "ArnLikeIfExists": {"aws:SourceArn": _WEST},
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "ArnLike": {
+                        "aws:SourceArn": [
+                            _EAST,
+                            _NO_REGION,
+                        ]
+                    }
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "ArnLike": {"aws:SourceArn": _EAST},
+                    "StringLike": {"aws:SourceArn": _WEST},
+                },
+                "Passed",
+            ),
+            # The ArnLike entry also names an ARN with no Region, so it does not
+            # confine the statement to us-east-1 and the negated entry alone
+            # decides whether us-west-2 is read as admitted.
+            (
+                {
+                    "ArnLike": {"aws:SourceArn": [_EAST, _NO_REGION]},
+                    "ArnNotLike": {"aws:SourceArn": _WEST},
+                },
+                "Passed",
+            ),
+            (
+                {
+                    "ArnLike": {"aws:SourceArn": [_EAST, _NO_REGION]},
+                    "ArnLikeIfExists": {"aws:SourceArn": _WEST},
+                },
+                "Passed",
+            ),
+            ({"ArnEquals": {"aws:SourceArn": [_EAST, _WEST]}}, "N/A"),
+            ({"StringLike": {"aws:SourceArn": [_EAST, _WEST]}}, "N/A"),
+            ({"ForAnyValue:ArnLike": {"aws:SourceArn": [_EAST, _WEST]}}, "N/A"),
+        ],
+        ids=[
+            "null-false",
+            "arnnotlike-west",
+            "ifexists-west",
+            "empty-region",
+            "anded-west",
+            "arnnotlike-west-unconfined",
+            "ifexists-west-unconfined",
+            "arnequals-west",
+            "stringlike-west",
+            "foranyvalue-west",
+        ],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_a_matching_operator_admits_another_region(
+        self, mock_ac, mock_iam, condition, status
+    ):
+        # The other-Region hold read every operator's value as an ARN, so a
+        # Null "false" named Region "" and an ArnNotLike value was read as
+        # admitting the gateways it excludes.
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            {"gw-a": "RoleA"},
+            {
+                "RoleA": _service_trust(
+                    {"StringEquals": {"aws:SourceAccount": _ACCOUNT}, **condition}
+                )
+            },
+        )
+
+        rows = self._named(
+            findings, "AgentCore Gateway Role Trust Confused Deputy Guard"
+        )
+        assert [row["Status"] for row in rows] == [status]
+        assert_finding_schema(rows[0])
+        details = rows[0]["Finding_Details"]
+        assert "names Region ," not in details
+        if status == "N/A":
+            assert (
+                f"aws:SourceArn value {self._WEST} names Region us-west-2," in details
+            )
+        else:
+            assert "admits no other gateway in us-east-1" in details
+
 
 class TestAC43EvaluationRoleTrustByValue:
     """AC-43 fails the evaluation role whose guard names another account."""
