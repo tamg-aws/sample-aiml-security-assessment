@@ -7300,10 +7300,11 @@ class TestAC14VaultKeyPolicy:
             ("*:*", "ArnLike", "*", "StringLike", "Passed"),
             ("*:*", "StringLike", "*", "StringLike", "Passed"),
             ("*:*", "StringEquals", "*", "StringLike", "Failed"),
-            ("*:*", "ArnEquals", "*", "StringLike", "Failed"),
+            ("*:*", "ArnEquals", "*", "StringLike", "Passed"),
             ("*:*", "StringEqualsIgnoreCase", "*", "StringLike", "Failed"),
-            ("us-east-1:*", "ArnEquals", "*", "StringLike", "Failed"),
-            ("us-east-?:123456789012", "ArnEquals", "*", "StringLike", "Failed"),
+            ("us-east-1:*", "StringEquals", "*", "StringLike", "Failed"),
+            ("us-east-?:123456789012", "StringEquals", "*", "StringLike", "Failed"),
+            ("us-east-?:123456789012", "ArnEquals", "*", "StringLike", "Passed"),
             ("us-east-1:123456789012", "ArnEquals", "*", "StringLike", "Passed"),
             ("us-east-1:123456789012", "StringEquals", "*", "StringEquals", "Failed"),
             (
@@ -7320,7 +7321,8 @@ class TestAC14VaultKeyPolicy:
             "stringequals-wildcards",
             "arnequals-wildcards",
             "stringequalsignorecase-wildcards",
-            "arnequals-account-wildcard",
+            "stringequals-account-wildcard",
+            "stringequals-region-question-mark",
             "arnequals-region-question-mark",
             "arnequals-literal",
             "stringequals-viaservice-wildcard",
@@ -7332,9 +7334,10 @@ class TestAC14VaultKeyPolicy:
     def test_an_equality_operator_reads_a_wildcard_as_a_literal_character(
         self, mock_ac, mock_kms, context, context_operator, via, via_operator, status
     ):
-        # AIR-ACR-ID-05: under StringEquals or ArnEquals a * or ? is a literal
-        # character, so the condition never equals the vault's real context and
-        # KMS denies Decrypt to the vault; only ArnLike and StringLike match.
+        # AIR-ACR-ID-05: under StringEquals or StringEqualsIgnoreCase a * or ?
+        # is a literal character, so the condition never equals the vault's
+        # real context and KMS denies Decrypt to the vault. ArnEquals behaves
+        # as ArnLike and matches patterns.
         self._wire(
             mock_ac,
             mock_kms,
@@ -7397,10 +7400,15 @@ class TestAC14VaultKeyPolicy:
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "for this vault." in findings[0]["Finding_Details"]
 
+    @pytest.mark.parametrize("context_operator", ["ArnLike", "ArnEquals"])
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
-    def test_the_identity_guide_example_key_policy_passes(self, mock_ac, mock_kms):
+    def test_the_identity_guide_example_key_policy_passes(
+        self, mock_ac, mock_kms, context_operator
+    ):
         # kms-key-policy-configuration.html, "Set customer managed key policy".
+        # ArnEquals and ArnLike behave identically, so the ArnEquals copy of the
+        # guide's policy binds the same wildcard Region.
         policy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -7420,7 +7428,7 @@ class TestAC14VaultKeyPolicy:
                                 "bedrock-agentcore-identity.*.amazonaws.com"
                             )
                         },
-                        "ArnLike": {
+                        context_operator: {
                             "kms:EncryptionContext:aws-crypto-ec:aws:"
                             "bedrock-agentcore-identity:token-vault-arn": (
                                 "arn:aws:bedrock-agentcore:*:*:token-vault/default"
@@ -45911,15 +45919,16 @@ class TestAC41EvaluationKeyPolicy:
             ("StringLike", "Passed"),
             ("StringEquals", "Failed"),
             ("StringEqualsIgnoreCase", "Failed"),
-            ("ArnEquals", "Failed"),
+            ("ArnEquals", "Passed"),
         ],
     )
     @patch("agentcore_app.agentcore_client")
     def test_an_equality_operator_reads_a_wildcard_context_as_a_literal(
         self, mock_ac, op, status
     ):
-        # Under StringEquals or ArnEquals evaluator/* is a literal character
-        # string, so it equals no evaluator ARN and KMS denies Decrypt.
+        # Under StringEquals evaluator/* is a literal character string, so it
+        # equals no evaluator ARN and KMS denies Decrypt; ArnEquals matches it
+        # as ArnLike does.
         policy = _evaluation_key_policy(
             _evaluation_caller_statement(
                 "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*", op=op
@@ -45956,11 +45965,12 @@ class TestAC41EvaluationKeyPolicy:
         ("op", "source_arn", "status"),
         [
             ("ArnLike", f"{_EVAL_ARN_PREFIX}evaluator/*", "Passed"),
-            ("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/*", "Failed"),
+            ("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/*", "Passed"),
+            ("StringEquals", f"{_EVAL_ARN_PREFIX}evaluator/*", "Failed"),
             ("StringEquals", f"{_EVAL_ARN_PREFIX}evaluator/judge-?", "Failed"),
             ("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/judge-1", "Passed"),
             (
-                "ArnEquals",
+                "StringEquals",
                 [
                     f"{_EVAL_ARN_PREFIX}evaluator/*",
                     f"{_EVAL_ARN_PREFIX}evaluator/judge-1",
@@ -45971,9 +45981,10 @@ class TestAC41EvaluationKeyPolicy:
         ids=[
             "arnlike-wildcard",
             "arnequals-wildcard",
+            "stringequals-wildcard",
             "stringequals-question",
             "arnequals-literal",
-            "arnequals-wildcard-beside-literal",
+            "stringequals-wildcard-beside-literal",
         ],
     )
     @patch("agentcore_app.agentcore_client")
@@ -45999,19 +46010,39 @@ class TestAC41EvaluationKeyPolicy:
             ) in rows[0][1]
 
     @patch("agentcore_app.agentcore_client")
+    def test_an_arnequals_source_arn_wildcard_is_judged_as_arnlike(self, mock_ac):
+        # ArnEquals and ArnLike behave identically
+        # (reference_policies_elements_condition_operators.html).
+        results = {}
+        for op in ("ArnLike", "ArnEquals"):
+            policy = _evaluation_key_policy(
+                _evaluation_caller_statement(
+                    "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
+                ),
+                self._service(op, f"{_EVAL_ARN_PREFIX}evaluator/*"),
+            )
+            results[op] = self._run(
+                mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy}
+            )
+
+        assert [row[0] for row in results["ArnEquals"]] == ["Passed"]
+        assert results["ArnEquals"] == results["ArnLike"]
+        assert self._DEAD not in results["ArnEquals"][0][1]
+
+    @patch("agentcore_app.agentcore_client")
     def test_a_dead_service_grant_is_named_by_its_sid(self, mock_ac):
         policy = _evaluation_key_policy(
             _evaluation_caller_statement(
                 "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
             ),
-            self._service("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/*", sid="Svc"),
+            self._service("StringEquals", f"{_EVAL_ARN_PREFIX}evaluator/*", sid="Svc"),
         )
         rows = self._run(mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy})
 
         assert [row[0] for row in rows] == ["Failed"]
         assert (
             "holds statement Svc to bedrock-agentcore.amazonaws.com conditions "
-            "aws:SourceArn with ArnEquals"
+            "aws:SourceArn with StringEquals"
         ) in rows[0][1]
 
     @pytest.mark.parametrize(
@@ -46030,7 +46061,7 @@ class TestAC41EvaluationKeyPolicy:
             _evaluation_caller_statement(
                 "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
             ),
-            self._service("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/*"),
+            self._service("StringEquals", f"{_EVAL_ARN_PREFIX}evaluator/*"),
             self._service(*live),
         )
         rows = self._run(mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy})
@@ -46044,16 +46075,18 @@ class TestAC41EvaluationKeyPolicy:
     def test_an_equality_wildcard_beside_a_matching_pattern_kills_the_statement(
         self, mock_ac
     ):
-        # Conditions are ANDed: ArnLike evaluator/* matches, but ArnEquals
+        # Conditions are ANDed: ArnLike evaluator/* matches, but StringEquals
         # evaluator/* on the same key equals no ARN, so KMS denies Decrypt.
         caller = _evaluation_caller_statement(
             "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*", op="ArnLike"
         )
-        caller["Condition"]["ArnEquals"] = {
-            "kms:EncryptionContext:aws:bedrock-agentcore:evaluatorArn": (
-                f"{_EVAL_ARN_PREFIX}evaluator/*"
-            )
-        }
+        caller["Condition"].setdefault("StringEquals", {}).update(
+            {
+                "kms:EncryptionContext:aws:bedrock-agentcore:evaluatorArn": (
+                    f"{_EVAL_ARN_PREFIX}evaluator/*"
+                )
+            }
+        )
         policy = _evaluation_key_policy(
             caller, _evaluation_service_statement(f"{_EVAL_ARN_PREFIX}evaluator/*")
         )
