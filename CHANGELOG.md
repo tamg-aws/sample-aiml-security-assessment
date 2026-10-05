@@ -134,28 +134,43 @@ back `Passed` names what it could not read.
   numbered prompt version, so an older version with no
   `customerEncryptionKeyArn` fails even when the latest version carries a
   customer managed key, and an unread version is `N/A`. Its flow leg reads each
-  flow version an alias routes to (`ListFlowAliases`, `GetFlowVersion`) as
-  well as the working draft, so a deployed version that references an
-  unversioned prompt fails. The `Bedrock Prompt Variants Check` row is now an
-  Informational `N/A` advisory and no longer sets the check status to `WARN`.
-  `BR-10` counts a guardrail direction only from a `BLOCK` content filter at
-  `LOW` or above. `BR-26`, `BR-27` and `BR-34` judge every guardrail
-  version a `bedrock:GuardrailIdentifier` condition can pin. `BR-32` sees
-  composite alarms. `BR-33` judges per-function Inspector coverage. `BR-37`
-  fails a control-plane mode of `aws_review`. `BR-53` compares the Resource
-  Groups Tagging API with each listed resource type and fails a resource it
-  never returned as untagged.
-- **Amazon SageMaker AI.** `SM-02`, `SM-11` and `SM-35` add rows for API
-  method authorization, Lambda function network boundary and per-Region
-  delegated administrators. `SM-09` reads Studio user profiles and default
-  space roles. `SM-10` fails a VPC notebook whose `DirectInternetAccess` is not
-  `Disabled`. `SM-22`, `SM-23` and `SM-31` read shadow variants, batch
-  transform models, monitoring baselines and capture options. `SM-34` holds
-  every SageMaker action that defines a guardrail key in the service
+  flow version an alias routes to (`ListFlowAliases`, `GetFlowVersion`) as well
+  as the working draft, so a deployed version that references an unversioned
+  prompt fails. The `Bedrock Prompt Variants Check` row is now an Informational
+  `N/A` advisory and no longer sets the check status to `WARN`. `BR-10` counts a
+  guardrail direction only from a `BLOCK` content filter at `LOW` or above.
+  `BR-12` reads the CloudWatch Logs destination and the large-data delivery
+  bucket beside the S3 destination, so an account that logs only to CloudWatch
+  Logs is judged where it reported `N/A`: the log group needs a customer managed
+  key and deletion protection. A `Bedrock Invocation Log WORM Archive` row
+  requires each destination to reach an Object Lock `COMPLIANCE` bucket in
+  another account, the log group through an unfiltered subscription filter and
+  Firehose. `BR-26`, `BR-27` and `BR-34` judge every guardrail version a
+  `bedrock:GuardrailIdentifier` condition can pin. `BR-32` sees composite
+  alarms. `BR-33` judges per-function Inspector coverage. `BR-37` fails a
+  control-plane mode of `aws_review`. `BR-39` adds rows for customization and
+  batch inference job VPCs and for every `BR-02` workload granted an AI service,
+  judged on its VPC and subnet routes. `BR-53` compares the Resource Groups
+  Tagging API with each listed resource type and fails a resource it never
+  returned as untagged.
+- **Amazon SageMaker AI.** `SM-02`, `SM-11` and `SM-35` add rows for API method
+  authorization, Lambda function network boundary and per-Region delegated
+  administrators. `SM-04` adds rows for whether GuardDuty findings reach
+  Security Hub and an EventBridge rule with a target, and fails an `ACTIVE`
+  finding left at workflow status `NEW` for more than 30 days. `SM-09` reads
+  Studio user profiles and default space roles. `SM-10` fails a VPC notebook
+  whose `DirectInternetAccess` is not `Disabled`. `SM-14` judges every container
+  of the models an endpoint or inference component serves, so an unserved model
+  is no longer `Failed`, and a Region with no served model is `N/A`. `SM-22`,
+  `SM-23` and `SM-31` read shadow variants, batch transform models, monitoring
+  baselines and capture options. `SM-26` adds an organization auto-enable row:
+  the delegated administrator must report `ALL` for both members and the
+  `AI_PROTECTION` feature, and the row is `N/A` in any other account. `SM-34`
+  holds every SageMaker action that defines a guardrail key in the service
   authorization reference. `SM-37`, `SM-38` and `SM-39` judge AgentCore
   runtimes, EKS Fargate profiles and node counts, MicroVMs, and the egress of
-  every VPC a SageMaker workload runs in. `SM-40` fails a rotation gap over
-  90 days. `SM-43` fails an artifact bucket under an AWS managed key.
+  every VPC a SageMaker workload runs in. `SM-40` fails a rotation gap over 90
+  days. `SM-43` fails an artifact bucket under an AWS managed key.
 - **Amazon Bedrock AgentCore.** Checks read every runtime version an endpoint
   serves, not only the latest. `AC-01` and `AC-08` read prefix list entries
   and require a `bedrock-agentcore` endpoint in each runtime's own VPC.
@@ -204,6 +219,13 @@ back `Passed` names what it could not read.
   pass with nothing to judge.
 - `AR-10` no longer credits a rule filtered on a top-level field it does not
   read as routing every approval transition.
+- The AgentCore assessment no longer exceeds its 600-second Lambda timeout in
+  an account with about 100 principals holding AgentCore actions. `AC-03`
+  starts every principal's IAM service last accessed job before reading any,
+  and reads each job before waiting on it. The IAM pattern comparison behind
+  `AC-23`, `AC-32` and `AC-33` decides the literal characters around each `*`
+  before the full comparison and reuses repeated answers. Results are
+  unchanged.
 
 ### Deployment impact
 
