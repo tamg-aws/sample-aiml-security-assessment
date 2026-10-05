@@ -2009,10 +2009,13 @@ Resources:
             # in S3.
             # Each is read by its exact key within a byte bound; no bucket is
             # listed. The bucket is any the customer names, so the resource
-            # cannot be narrower.
+            # cannot be narrower. A code archive pinned by versionId is read
+            # with VersionId, which needs s3:GetObjectVersion (GetObject API
+            # reference, Permissions).
             Effect: Allow
             Action:
               - s3:GetObject # AC-34, AC-35
+              - s3:GetObjectVersion # AC-34
             Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
           - Sid: TransitGatewayEgressRead
             # AC-49 follows a hosting subnet's internet route through a transit

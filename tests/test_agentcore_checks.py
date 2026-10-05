@@ -6786,11 +6786,23 @@ class TestAC14TokenVaultPopulation:
         mock_kms.describe_key.return_value = {
             "KeyMetadata": {"KeyState": state, "KeyManager": manager}
         }
-        mock_kms.get_key_policy.return_value = {
-            "Policy": _ac14_key_policy(
-                context="arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/*"
-            )
-        }
+        # One Identity statement per vault: a token-vault/* context binds none.
+        policy = json.loads(_ac14_key_policy())
+        policy["Statement"] += [
+            {
+                **policy["Statement"][1],
+                "Condition": json.loads(
+                    _ac14_key_policy(
+                        context=(
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                            f"token-vault/{vault}"
+                        )
+                    )
+                )["Statement"][1]["Condition"],
+            }
+            for vault in ("team-vault", "pay-vault", "vault-b")
+        ]
+        mock_kms.get_key_policy.return_value = {"Policy": json.dumps(policy)}
 
     def _vaults(self, mock_ac, configs):
         def get(tokenVaultId):
@@ -7195,6 +7207,42 @@ class TestAC14VaultKeyPolicy:
         assert "kms:GetKeyPolicy" in by_vault["team-vault"]["Finding_Details"]
         assert "kms:GetKeyPolicy" in by_vault["team-vault"]["Resolution"]
 
+    @pytest.mark.parametrize(
+        ("resource", "status"),
+        [
+            ("token-vault/default", "Passed"),
+            ("token-vault/*", "Failed"),
+            ("token-vault/def*", "Failed"),
+            ("token-vault/defaul?", "Failed"),
+            ("token-vault/default*", "Failed"),
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_vault_context_does_not_bind_this_vault(
+        self, mock_ac, mock_kms, resource, status
+    ):
+        # AIR-ACR-ID-05: token-vault/* lets every vault in the account use the
+        # key, so it binds no one vault, as AC-12 rules for gateway/*.
+        self._wire(
+            mock_ac,
+            mock_kms,
+            {
+                self._KEYS["default"]: _ac14_key_policy(
+                    context=f"arn:aws:bedrock-agentcore:us-east-1:123456789012:{resource}"
+                )
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == [status]
+        if status == "Failed":
+            assert (
+                "naming token-vault/default in one account"
+                in (findings[0]["Finding_Details"])
+            )
+
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
     def test_a_shared_key_policy_is_read_once_and_judged_per_vault(
@@ -7227,9 +7275,13 @@ class TestProposedAgentCoreChecks:
         mock_kms.describe_key.return_value = {
             "KeyMetadata": {"KeyState": "Enabled", "KeyManager": "CUSTOMER"}
         }
+        # Stricter since round 12: this passed on a token-vault/* context,
+        # which lets every vault in the account use the key.
         mock_kms.get_key_policy.return_value = {
             "Policy": _ac14_key_policy(
-                context="arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/*"
+                context=(
+                    "arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/default"
+                )
             )
         }
         mock_ac.get_token_vault.return_value = {
@@ -7256,7 +7308,10 @@ class TestProposedAgentCoreChecks:
         }
         mock_kms.get_key_policy.return_value = {
             "Policy": _ac14_key_policy(
-                context="arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/*"
+                context=(
+                    "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                    "token-vault/team-security-vault"
+                )
             )
         }
         mock_ac.get_token_vault.return_value = {
@@ -10909,7 +10964,9 @@ class TestAC23MemoryRecordAccessScope:
             ("/actors/a-1/sessions/*", "N/A"),
             ("/users/alice/*", "N/A"),
             ("/actors/a-1/sessions/s-1", "N/A"),
-            ("/actors/${aws:userid}/*", "Passed"),
+            # Tightened from Passed in round 12: the SAML trust policy does not
+            # bind the session name, which the caller picks, to the caller.
+            ("/actors/${aws:userid}/*", "N/A"),
         ],
     )
     def test_a_stringlike_namespace_that_spans_callers_is_unscoped(
@@ -42651,8 +42708,13 @@ class TestAC23SessionVariables:
         )
         assert "resolves per caller" not in details
 
+    _NAMED_SESSION = {"StringEquals": {"sts:RoleSessionName": "${aws:username}"}}
+
     def test_userid_resolves_per_session_on_a_role_but_not_on_a_user(self):
-        role = self._run(self._cache("/actors/${aws:userid}/*"))
+        role = self._run(
+            self._cache("/actors/${aws:userid}/*"),
+            iam=self._trust(self._assume(self._NAMED_SESSION)),
+        )
         user = self._run(self._cache("/actors/${aws:userid}/*", kind="user"))
         assert [f["Status"] for f in role] == ["Passed"]
         assert "role reader (${aws:userid})" in role[0]["Finding_Details"]
@@ -42734,6 +42796,95 @@ class TestAC23SessionVariables:
             )
         iam.get_role.assert_called_once_with(RoleName="reader")
 
+    @pytest.mark.parametrize(
+        ("statements", "status", "reason"),
+        [
+            (
+                [{"StringEquals": {"sts:RoleSessionName": "${aws:username}"}}],
+                "Passed",
+                "",
+            ),
+            ([{"StringLike": {"sts:RoleSessionName": "${aws:userid}"}}], "Passed", ""),
+            ([None], "N/A", "whose trust policy does not require each caller"),
+            (
+                [{"StringEquals": {"sts:RoleSessionName": "alice"}}],
+                "N/A",
+                "whose trust policy does not require each caller",
+            ),
+            (
+                [{"StringLike": {"sts:RoleSessionName": "${aws:username}*"}}],
+                "N/A",
+                "whose trust policy does not require each caller",
+            ),
+            (
+                [{"StringEqualsIfExists": {"sts:RoleSessionName": "${aws:username}"}}],
+                "N/A",
+                "whose trust policy does not require each caller",
+            ),
+            (
+                [{"StringEquals": {"sts:RoleSessionName": "${aws:PrincipalAccount}"}}],
+                "N/A",
+                "whose trust policy does not require each caller",
+            ),
+            (
+                [{"StringEquals": {"sts:SourceIdentity": "${aws:username}"}}],
+                "N/A",
+                "whose trust policy does not require each caller",
+            ),
+            (
+                [{"StringEquals": {"sts:RoleSessionName": "${aws:username}"}}, None],
+                "N/A",
+                "whose trust policy does not require each caller",
+            ),
+            ("service", "N/A", "on a role a service principal assumes"),
+        ],
+        ids=[
+            "equals-username",
+            "like-userid",
+            "no-condition",
+            "literal-name",
+            "like-wildcard-suffix",
+            "if-exists",
+            "shared-variable",
+            "source-identity-only",
+            "second-statement-unconditioned",
+            "service-principal",
+        ],
+    )
+    def test_userid_is_per_session_only_when_the_trust_binds_the_session_name(
+        self, statements, status, reason
+    ):
+        if statements == "service":
+            iam = self._trust(
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": self._NAMED_SESSION,
+                }
+            )
+        else:
+            iam = self._trust(*(self._assume(condition) for condition in statements))
+        findings = self._run(self._cache("/actors/${aws:userid}/*"), iam=iam)
+        assert [f["Status"] for f in findings] == [status]
+        details = findings[0]["Finding_Details"]
+        if status == "N/A":
+            assert f"role reader (${{aws:userid}}, {reason}" in details
+            assert "which every caller of the role shares" not in details
+        else:
+            assert "role reader (${aws:userid})" in details
+        iam.get_role.assert_called_once_with(RoleName="reader")
+
+    def test_an_unread_trust_policy_holds_userid_at_na(self):
+        iam = MagicMock()
+        iam.get_role.side_effect = _make_client_error("AccessDenied", "no")
+        findings = self._run(self._cache("/actors/${aws:userid}/*"), iam=iam)
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "${aws:userid} (trust policy not read: iam:GetRole"
+            in (findings[0]["Finding_Details"])
+        )
+
     def test_a_principal_tag_on_a_user_is_the_users_own_tag(self):
         findings = self._run(
             self._cache("/actors/${aws:PrincipalTag/actorId}/*", kind="user"),
@@ -42763,7 +42914,7 @@ class TestAC23SessionVariables:
                 "role_permissions"
             ]
         )
-        findings = self._run(cache)
+        findings = self._run(cache, iam=self._trust(self._assume(self._NAMED_SESSION)))
         assert [f["Status"] for f in findings] == ["N/A", "Passed"]
         assert "role shared (" in findings[0]["Finding_Details"]
         assert "per-session" not in findings[0]["Finding_Details"]
