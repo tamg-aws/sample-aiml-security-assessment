@@ -7354,6 +7354,51 @@ class TestAC14VaultKeyPolicy:
 
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
+    def test_an_equality_wildcard_beside_a_matching_pattern_kills_the_statement(
+        self, mock_ac, mock_kms
+    ):
+        # Conditions are ANDed: the ArnLike context matches, but StringEquals
+        # on the same *:* value equals no context, so KMS denies Decrypt.
+        policy = json.loads(_ac14_key_policy())
+        policy["Statement"][1]["Condition"].setdefault("StringEquals", {})[
+            "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
+            "token-vault-arn"
+        ] = "arn:aws:bedrock-agentcore:*:*:token-vault/default"
+        self._wire(mock_ac, mock_kms, {self._KEYS["default"]: json.dumps(policy)})
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_equality_wildcard_beside_a_literal_value_is_dropped(
+        self, mock_ac, mock_kms
+    ):
+        # Values of one condition are ORed: the literal ARN still matches the
+        # vault's context, and the * value equals nothing.
+        self._wire(
+            mock_ac,
+            mock_kms,
+            {
+                self._KEYS["default"]: _ac14_key_policy(
+                    context=[
+                        "arn:aws:bedrock-agentcore:*:*:token-vault/default",
+                        "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                        "token-vault/default",
+                    ],
+                    context_operator="StringEquals",
+                )
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "for this vault." in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
     def test_the_identity_guide_example_key_policy_passes(self, mock_ac, mock_kms):
         # kms-key-policy-configuration.html, "Set customer managed key policy".
         policy = {
@@ -45721,6 +45766,23 @@ class TestAC41EvaluationKeyPolicy:
                 f"{_EVAL_ARN_PREFIX}evaluator/judge-1 in one account"
             ) in rows[0][1]
 
+    _DEAD = (
+        "a value containing * or ?, which is a literal character under that "
+        "operator, so the statement matches no request and grants no decrypt, "
+        "and no other statement to bedrock-agentcore.amazonaws.com names "
+        "bedrock-agentcore resources in one account in aws:SourceArn"
+    )
+    _OPEN = "lets bedrock-agentcore.amazonaws.com decrypt with no aws:SourceArn"
+
+    @staticmethod
+    def _service(op=None, source_arn=None, sid=None):
+        service = _evaluation_service_statement()
+        if op:
+            service["Condition"].setdefault(op, {})["aws:SourceArn"] = source_arn
+        if sid:
+            service["Sid"] = sid
+        return service
+
     @pytest.mark.parametrize(
         ("op", "source_arn", "status"),
         [
@@ -45728,34 +45790,155 @@ class TestAC41EvaluationKeyPolicy:
             ("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/*", "Failed"),
             ("StringEquals", f"{_EVAL_ARN_PREFIX}evaluator/judge-?", "Failed"),
             ("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/judge-1", "Passed"),
+            (
+                "ArnEquals",
+                [
+                    f"{_EVAL_ARN_PREFIX}evaluator/*",
+                    f"{_EVAL_ARN_PREFIX}evaluator/judge-1",
+                ],
+                "Passed",
+            ),
         ],
         ids=[
             "arnlike-wildcard",
             "arnequals-wildcard",
             "stringequals-question",
             "arnequals-literal",
+            "arnequals-wildcard-beside-literal",
         ],
     )
     @patch("agentcore_app.agentcore_client")
     def test_an_equality_operator_reads_a_wildcard_source_arn_as_a_literal(
         self, mock_ac, op, source_arn, status
     ):
-        service = _evaluation_service_statement()
-        service["Condition"][op] = {"aws:SourceArn": source_arn}
         policy = _evaluation_key_policy(
             _evaluation_caller_statement(
                 "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
             ),
-            service,
+            self._service(op, source_arn),
+        )
+        rows = self._run(mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy})
+
+        assert [row[0] for row in rows] == [status]
+        if status == "Failed":
+            # The statement grants nothing, so it is not called an open grant.
+            assert self._OPEN not in rows[0][1]
+            assert (
+                "whose key policy holds a statement to "
+                f"bedrock-agentcore.amazonaws.com conditions aws:SourceArn with {op} "
+                f"on {source_arn}, {self._DEAD}"
+            ) in rows[0][1]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_dead_service_grant_is_named_by_its_sid(self, mock_ac):
+        policy = _evaluation_key_policy(
+            _evaluation_caller_statement(
+                "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
+            ),
+            self._service("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/*", sid="Svc"),
+        )
+        rows = self._run(mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy})
+
+        assert [row[0] for row in rows] == ["Failed"]
+        assert (
+            "holds statement Svc to bedrock-agentcore.amazonaws.com conditions "
+            "aws:SourceArn with ArnEquals"
+        ) in rows[0][1]
+
+    @pytest.mark.parametrize(
+        ("live", "status", "text"),
+        [
+            (("ArnLike", f"{_EVAL_ARN_PREFIX}evaluator/*"), "Passed", None),
+            ((None, None), "Failed", "lets"),
+        ],
+        ids=["live-bound-grant", "live-open-grant"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_dead_service_grant_beside_a_live_one_is_judged_by_the_live_one(
+        self, mock_ac, live, status, text
+    ):
+        policy = _evaluation_key_policy(
+            _evaluation_caller_statement(
+                "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*"
+            ),
+            self._service("ArnEquals", f"{_EVAL_ARN_PREFIX}evaluator/*"),
+            self._service(*live),
+        )
+        rows = self._run(mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy})
+
+        assert [row[0] for row in rows] == [status]
+        assert self._DEAD not in rows[0][1]
+        if text == "lets":
+            assert self._OPEN in rows[0][1]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_equality_wildcard_beside_a_matching_pattern_kills_the_statement(
+        self, mock_ac
+    ):
+        # Conditions are ANDed: ArnLike evaluator/* matches, but ArnEquals
+        # evaluator/* on the same key equals no ARN, so KMS denies Decrypt.
+        caller = _evaluation_caller_statement(
+            "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*", op="ArnLike"
+        )
+        caller["Condition"]["ArnEquals"] = {
+            "kms:EncryptionContext:aws:bedrock-agentcore:evaluatorArn": (
+                f"{_EVAL_ARN_PREFIX}evaluator/*"
+            )
+        }
+        policy = _evaluation_key_policy(
+            caller, _evaluation_service_statement(f"{_EVAL_ARN_PREFIX}evaluator/*")
+        )
+        rows = self._run(mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy})
+
+        assert [row[0] for row in rows] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        ("op", "via", "status"),
+        [
+            ("StringLike", "bedrock-agentcore.*.amazonaws.com", "Passed"),
+            ("StringEquals", "bedrock-agentcore.*.amazonaws.com", "Failed"),
+            (
+                "StringEqualsIgnoreCase",
+                "bedrock-agentcore.*.amazonaws.com",
+                "Failed",
+            ),
+            ("StringEquals", "bedrock-agentcore.us-east-1.amazonaws.com", "Passed"),
+            (
+                "StringEquals",
+                [
+                    "bedrock-agentcore.*.amazonaws.com",
+                    "bedrock-agentcore.us-east-1.amazonaws.com",
+                ],
+                "Passed",
+            ),
+        ],
+        ids=[
+            "stringlike-wildcard",
+            "stringequals-wildcard",
+            "stringequalsignorecase-wildcard",
+            "stringequals-literal",
+            "stringequals-wildcard-beside-literal",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_equality_operator_reads_a_wildcard_via_service_as_a_literal(
+        self, mock_ac, op, via, status
+    ):
+        caller = _evaluation_caller_statement(
+            "evaluatorArn", f"{_EVAL_ARN_PREFIX}evaluator/*", via_service=False
+        )
+        caller["Condition"].setdefault(op, {})["kms:ViaService"] = via
+        policy = _evaluation_key_policy(
+            caller, _evaluation_service_statement(f"{_EVAL_ARN_PREFIX}evaluator/*")
         )
         rows = self._run(mock_ac, {"judge-1": _EVAL_KEY}, {_EVAL_KEY: policy})
 
         assert [row[0] for row in rows] == [status]
         if status == "Failed":
             assert (
-                "lets bedrock-agentcore.amazonaws.com decrypt with no aws:SourceArn"
-                in rows[0][1]
-            )
+                "has no statement allowing kms:Decrypt only with kms:ViaService "
+                "bedrock-agentcore.us-east-1.amazonaws.com"
+            ) in rows[0][1]
 
     @patch("agentcore_app.agentcore_client")
     def test_a_service_grant_without_source_arn_fails(self, mock_ac):

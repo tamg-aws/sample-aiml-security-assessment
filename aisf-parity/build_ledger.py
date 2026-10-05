@@ -997,7 +997,9 @@ AI_SUBJECT_ROWS = [
         "Region binds no vault, and a wildcard Region, as in the guide's "
         "example, binds with the row naming every Region it matches. Under "
         "StringEquals or ArnEquals a * or ? in the context or kms:ViaService "
-        "value is a literal character, so that statement binds nothing. The policy "
+        "value is a literal character: a condition whose every value holds one "
+        "makes the statement bind nothing, and such a value beside a literal "
+        "one is dropped. The policy "
         "must not let every principal decrypt with no "
         "caller condition; an unread key policy is N/A. AC-34 adds the secret-scan "
         "leg over every definition that can carry a credential: GetAgentRuntime."
@@ -1327,7 +1329,11 @@ AI_SUBJECT_ROWS = [
         "or batch evaluation in one account, with kms:ViaService for an evaluator, "
         "while a grant to the AgentCore service principal needs aws:SourceArn and an "
         "open decrypt grant fails. Under StringEquals or ArnEquals a * or ? in the "
-        "context or aws:SourceArn value is a literal character and names nothing",
+        "context, kms:ViaService or aws:SourceArn value is a literal character: a "
+        "condition whose every value holds one makes the statement grant nothing, "
+        "such a value beside a literal one is dropped, and a service grant that "
+        "grants nothing is named as such and fails only when no other service "
+        "grant exists",
         [],
         4,
     ),
