@@ -33799,6 +33799,61 @@ def _bedrock_api_key_iam_age_caps(permission_cache: Dict[str, Any]) -> Dict[str,
     }
 
 
+def _bedrock_api_key_iam_token_denies(
+    permission_cache: Dict[str, Any], holders: List[str]
+) -> Dict[str, Any]:
+    """
+    Judge the LONG_TERM bearer token Deny in the identity policies and
+    permissions boundary of each IAM user holding an active Bedrock API key. A
+    long-term key signs requests as its user, so a Deny there binds that
+    user's keys only. denied names the users with a credited Deny on both
+    bearer token actions, open the users without one, and unread the users
+    whose policies the cache does not hold in full. errored is None for a
+    version-1 cache, which records no read errors.
+    """
+    errored_users = {
+        error.get("name")
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict) and error.get("type") == "user"
+    }
+    users = permission_cache.get("user_permissions") or {}
+    denied, open_users, unread = [], [], []
+    for name in holders:
+        label = f"user '{name}'"
+        permissions = users.get(name)
+        if permissions is None or name in errored_users:
+            unread.append(f"{label} (not read into the IAM permissions cache)")
+            continue
+        try:
+            pairs = [
+                (policy.get("name") or source, statement)
+                for source, policy in _cached_identity_policies(permissions)
+                for statement in _policy_statements(policy.get("document"))
+            ]
+            pairs += [
+                ("permissions boundary", statement)
+                for statement in _policy_statements(_boundary_document(permissions))
+            ]
+        except (ValueError, TypeError, AttributeError):
+            unread.append(f"{label} (a policy could not be parsed)")
+            continue
+        token = _bedrock_api_key_scp_controls(pairs)["token"]
+        if len(token) == len(BEDROCK_BEARER_TOKEN_ACTIONS):
+            denied.append(label)
+        elif token:
+            open_users.append(
+                "{} (only {} is denied)".format(label, ", ".join(sorted(token)))
+            )
+        else:
+            open_users.append(label)
+    return {
+        "denied": denied,
+        "open": open_users,
+        "unread": unread,
+        "errored": _cache_principal_errors(permission_cache, ("user",)),
+    }
+
+
 def check_bedrock_api_key_governance(
     permission_cache,
     region: str = "",
@@ -34070,6 +34125,46 @@ def check_bedrock_api_key_governance(
             text for action in token_actions for text in controls["token"][action]
         ]
 
+        # The token Deny can also sit in the own policies of every IAM user
+        # holding an active key, which binds those users' keys only.
+        holders = sorted(
+            {
+                user_name
+                for user_name, credential in listed
+                if str(credential.get("Status", "")).lower() == "active"
+            }
+        )
+        holders_listed = not from_cache and not inventory_errors
+        iam_tokens = _bedrock_api_key_iam_token_denies(permission_cache, holders)
+        iam_token = (
+            not tokens_blocked
+            and holders_listed
+            and bool(iam_tokens["denied"])
+            and not iam_tokens["open"]
+            and not iam_tokens["unread"]
+        )
+        token_unread = (
+            not tokens_blocked
+            and not iam_token
+            and bool(holders)
+            and not iam_tokens["open"]
+        )
+        iam_token_note = ""
+        if iam_token:
+            iam_token_note = (
+                " The LONG_TERM bearer token Deny on both endpoints sits in the own "
+                "policies or permissions boundary of each of the {} IAM user(s) "
+                "holding an active key ({}); it binds those users only, so a user "
+                "given a key later without it can use that key.{}".format(
+                    len(iam_tokens["denied"]),
+                    ", ".join(iam_tokens["denied"][:5]),
+                    ""
+                    if iam_tokens["errored"] is not None
+                    else " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE,
+                )
+            )
+        tokens_ok = tokens_blocked or iam_token
+
         read_errors = list(inventory["errors"])
         if inventory["list_error"]:
             read_errors.append(
@@ -34083,8 +34178,7 @@ def check_bedrock_api_key_governance(
         )
 
         # An age cap can also sit in the identity policies of every principal
-        # allowed to create the credential. The bearer token leg is read from
-        # service control policies only.
+        # allowed to create the credential.
         iam_caps = _bedrock_api_key_iam_age_caps(permission_cache)
         iam_age = (
             not scp_age
@@ -34146,29 +34240,58 @@ def check_bedrock_api_key_governance(
                 "days on iam:CreateServiceSpecificCredential, so a Bedrock API key "
                 "can be created with no expiry".format(BEDROCK_API_KEY_MAX_AGE_DAYS)
             )
-        if not tokens_blocked:
+        if token_unread:
+            read_errors.append(
+                "whether each IAM user holding an active key carries the LONG_TERM "
+                "bearer token Deny in its own policies was not read: {}".format(
+                    "; ".join(
+                        (
+                            iam_tokens["unread"]
+                            if iam_tokens["unread"]
+                            else ["the key holders were not all listed"]
+                        )[:5]
+                    )
+                )
+            )
+        if not tokens_ok:
+            if iam_tokens["open"]:
+                reach = (
+                    ", nor does one in the own policies or permissions boundary of "
+                    "{}, so the long-term keys of those user(s) can be used".format(
+                        ", ".join(iam_tokens["open"][:5])
+                    )
+                )
+            elif token_unread:
+                reach = ""
+            else:
+                reach = ", so a long-term key can be used"
             missing.append(
-                "no credited Deny covers the LONG_TERM bearer token type on both "
+                "no credited Deny in the attached service control policies covers "
+                "the LONG_TERM bearer token type on both "
                 "bedrock:CallWithBearerToken and bedrock-mantle:CallWithBearerToken"
-                "{}, so a long-term key can be used".format(
+                "{}{}".format(
                     " (only {} is covered)".format(", ".join(token_actions))
                     if token_actions and not management
-                    else ""
+                    else "",
+                    reach,
                 )
             )
 
-        if age_ok and tokens_blocked:
+        if age_ok and tokens_ok:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
                         "Bedrock API keys are capped in age and LONG_TERM bearer "
-                        "tokens are denied on both endpoints by {} statement(s): "
-                        "{}.{}{} {}".format(
-                            len(preventive),
-                            "; ".join(preventive[:5]),
+                        "tokens are denied on both endpoints{}.{}{}{} {}".format(
+                            " by {} service control policy statement(s): {}".format(
+                                len(preventive), "; ".join(preventive[:5])
+                            )
+                            if preventive
+                            else "",
                             iam_age_note,
+                            iam_token_note,
                             gap_note,
                             scope_note,
                         )
@@ -34180,7 +34303,7 @@ def check_bedrock_api_key_governance(
                     region=region,
                 )
             )
-        elif read_errors and not management:
+        elif read_errors and (not management or (age_ok and token_unread)):
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-45",
@@ -34188,13 +34311,14 @@ def check_bedrock_api_key_governance(
                     finding_details=(
                         "A preventive control on Bedrock API keys is undetermined "
                         "because {} and the policies that could hold it were not "
-                        "all read: {}.{}{}{} {}".format(
+                        "all read: {}.{}{}{}{} {}".format(
                             "; ".join(missing),
                             "; ".join(read_errors[:5]),
                             " Credited: {}.".format("; ".join(preventive[:5]))
                             if preventive
                             else "",
                             iam_age_note,
+                            iam_token_note,
                             gap_note,
                             scope_note,
                         )

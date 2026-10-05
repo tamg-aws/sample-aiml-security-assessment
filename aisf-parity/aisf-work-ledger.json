@@ -412,7 +412,7 @@
         "Bedrock API Key Inventory",
         "Bedrock API Key Age And Token Type Control"
       ],
-      "gap": "",
+      "gap": "BR-45 reads the LONG_TERM bearer token Deny from the attached service control policies and from the identity policies and permissions boundary of each IAM user holding an active key, credits the IAM leg only when every holder carries it on both endpoints, names the holders without it when it fails, and holds the row at N/A while a holder is unread",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",

@@ -17125,6 +17125,153 @@ class TestBR45ApiKeyGovernance:
         assert [f["Status"] for f in prevention] == ["Passed"]
         assert "schema version 2" in prevention[0]["Finding_Details"]
 
+    # MDL-09: the LONG_TERM token leg was read from service control policies
+    # only, so key holders that each carried their own Deny were failed with
+    # "so a long-term key can be used".
+    ACTIVE_KEY = [
+        {
+            "ServiceSpecificCredentialId": "ACCA-key",
+            "Status": "Active",
+            "CreateDate": "2026-09-01T00:00:00Z",
+            "ExpirationDate": "2026-09-30T00:00:00Z",
+        }
+    ]
+
+    def _token_policy(self, *denies):
+        return {
+            "Version": "2012-10-17",
+            "Statement": list(denies or self._token_denies()),
+        }
+
+    def _holders_run(self, cache, holders, all_users=True, inventory=None):
+        _, findings = self._run(
+            {name: list(self.ACTIVE_KEY) for name in holders},
+            inventory=inventory or self._scp_items(self._if_exists_cap()),
+            all_users=all_users,
+            cache=cache,
+        )
+        return self._by_name(findings, self.PREVENTION_FINDING)
+
+    def test_br45_a_token_deny_on_every_key_holder_is_credited(self):
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Bob": [],
+                "Reader": [],
+            }
+        )
+        cache["user_permissions"]["Bob"]["permissions_boundary"] = {
+            "document": self._token_policy()
+        }
+        prevention = self._holders_run(cache, ["Alice", "Bob"])
+
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        details = prevention[0]["Finding_Details"]
+        assert "each of the 2 IAM user(s) holding an active key" in details
+        assert "user 'Alice', user 'Bob'" in details
+        assert "Reader" not in details
+        assert "schema version 2" in details
+
+    def test_br45_a_key_holder_without_the_token_deny_is_named_in_the_failure(self):
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Bob": [("BedrockOnly", self._token_policy(self._token_denies()[0]))],
+                "Carol": [],
+            }
+        )
+        prevention = self._holders_run(cache, ["Alice", "Bob", "Carol"])
+
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        details = prevention[0]["Finding_Details"]
+        assert (
+            "nor does one in the own policies or permissions boundary of user 'Bob' "
+            "(only bedrock:callwithbearertoken is denied), user 'Carol', so the "
+            "long-term keys of those user(s) can be used"
+        ) in details
+        assert "Alice" not in details
+        assert "so a long-term key can be used" not in details
+
+    def test_br45_an_inactive_key_holder_needs_no_token_deny(self):
+        cache = _identity_cache(
+            users={"Alice": [("NoLongTerm", self._token_policy())], "Dormant": []}
+        )
+        _, findings = self._run(
+            {
+                "Alice": list(self.ACTIVE_KEY),
+                "Dormant": [dict(self.ACTIVE_KEY[0], Status="Inactive")],
+            },
+            inventory=self._scp_items(self._if_exists_cap()),
+            all_users=True,
+            cache=cache,
+        )
+        prevention = self._by_name(findings, self.PREVENTION_FINDING)
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        assert "Dormant" not in prevention[0]["Finding_Details"]
+
+    def test_br45_no_key_holder_is_not_an_identity_token_deny(self):
+        cache = _identity_cache(users={"Alice": [("NoLongTerm", self._token_policy())]})
+        prevention = self._holders_run(cache, [])
+
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert "so a long-term key can be used" in prevention[0]["Finding_Details"]
+
+    def test_br45_a_key_holder_outside_the_cache_holds_the_token_leg_at_na(self):
+        cache = _identity_cache(users={"Alice": [("NoLongTerm", self._token_policy())]})
+        prevention = self._holders_run(cache, ["Alice", "Ghost"])
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        details = prevention[0]["Finding_Details"]
+        assert "user 'Ghost' (not read into the IAM permissions cache)" in details
+        assert "can be used" not in details
+
+    def test_br45_a_key_holder_with_a_cache_error_holds_the_token_leg_at_na(self):
+        cache = _identity_cache(
+            users={
+                "Alice": [("NoLongTerm", self._token_policy())],
+                "Bob": [("NoLongTerm", self._token_policy())],
+            }
+        )
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "user",
+                "name": "Bob",
+                "stage": "group_policy",
+                "error": "Throttling",
+            }
+        ]
+        prevention = self._holders_run(cache, ["Alice", "Bob"])
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "user 'Bob' (not read into" in prevention[0]["Finding_Details"]
+
+    def test_br45_key_holders_listed_from_the_cache_only_hold_the_token_leg_at_na(
+        self,
+    ):
+        cache = _identity_cache(users={"Alice": [("NoLongTerm", self._token_policy())]})
+        prevention = self._holders_run(cache, ["Alice"], all_users=False)
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "the key holders were not all listed" in prevention[0]["Finding_Details"]
+
+    def test_br45_an_unread_token_leg_in_the_management_account_is_na(self):
+        creator = {
+            "Version": "2012-10-17",
+            "Statement": [
+                self.CREATE_KEYS["Statement"][0],
+                self._if_exists_cap(sid="OwnCap"),
+                *self._token_denies(),
+            ],
+        }
+        cache = _identity_cache(users={"Alice": [("Keys", creator)]})
+        inventory = self._scp_items(*self._token_denies())
+        inventory["management_account"] = True
+        prevention = self._holders_run(cache, ["Alice", "Ghost"], inventory=inventory)
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "user 'Ghost'" in prevention[0]["Finding_Details"]
+
     def test_br45_management_account_is_not_credited(self):
         inventory = self._scp_items(
             self._deny(

@@ -397,7 +397,20 @@ AI_SUBJECT_ROWS = [
         [],
         3,
     ),
-    ("AIR-BDR-MDL-09", COVERED, None, "bedrock_assessments", ["BR-45"], "", [], 3),
+    (
+        "AIR-BDR-MDL-09",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-45"],
+        "BR-45 reads the LONG_TERM bearer token Deny from the attached service "
+        "control policies and from the identity policies and permissions boundary "
+        "of each IAM user holding an active key, credits the IAM leg only when "
+        "every holder carries it on both endpoints, names the holders without it "
+        "when it fails, and holds the row at N/A while a holder is unread",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-KB-05",
         COVERED,
