@@ -18060,6 +18060,27 @@ class TestBR46KnowledgeBaseSourceClassification:
             "none of them ingests from an S3 bucket" in findings[1]["Finding_Details"]
         )
 
+    def test_br46_no_source_text_names_the_failed_reads(self):
+        # DAT-03 round 12b: with a source read failed, the no-source row must
+        # not say no knowledge base ingests from S3; it names the failed read.
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-1", "name": "web-kb"}],
+            data_source_error=_make_client_error("AccessDeniedException"),
+        )
+
+        no_source = [f for f in findings if "source bucket" in f["Finding_Details"]]
+        assert [f["Status"] for f in no_source] == ["N/A"]
+        detail = no_source[0]["Finding_Details"]
+        assert "none of them ingests" not in detail
+        assert (
+            "No S3 source bucket was found among the 1 knowledge base(s), model "
+            "customization jobs, batch inference jobs and SageMaker training jobs "
+            "read in us-east-1, but 1 source read(s) failed, so whether a source "
+            "bucket exists is not known: "
+        ) in detail
+        assert "AccessDeniedException" in detail
+        assert no_source[0]["Resolution"] == bedrock_app.COULD_NOT_ASSESS_RESOLUTION
+
     def test_br46_data_source_read_failure_is_reported_as_partial(self):
         findings = self._two_bucket_estate(
             data_source_error=_make_client_error("AccessDeniedException"),
@@ -22932,9 +22953,10 @@ class TestKnowledgeBaseScreening:
             in (rows[1]["Finding_Details"])
         )
 
-    def test_br26_redaction_job_naming_some_entity_types_is_not_credited(self):
-        # KB-08: a job that redacts only NAME leaves every other entity type
-        # in the ingested text.
+    def test_br26_redaction_job_naming_some_entity_types_is_credited(self):
+        # KB-08 round 12b ruling: the control names no entity list, and the Glue
+        # leg and guardrail layer credit any types, so a completed job naming
+        # NAME alone screens its source, and the row names the type.
         partial = dict(
             self.REDACT_ALL,
             JobName="names-only",
@@ -22953,12 +22975,23 @@ class TestKnowledgeBaseScreening:
                 ]
             ),
             jobs=[self.REDACT_ALL, partial],
-            ingestions={"a": ["2026-09-02T00:00:00Z"], "n": ["2026-09-02T00:00:00Z"]},
+            ingestions={
+                "a": ["2026-09-02T00:00:00Z"],
+                "n": ["2026-09-02T00:00:00Z"],
+            },
         )
-        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
         assert "'redact-docs'" in rows[0]["Finding_Details"]
-        assert "knowledge base 'kb-names'" in rows[1]["Finding_Details"]
-        assert "names-only" not in rows[1]["Finding_Details"]
+        assert "redacts ALL PII entity types" in rows[0]["Finding_Details"]
+        assert "cover the PII the source holds" not in rows[0]["Finding_Details"]
+        assert (
+            "Comprehend PII redaction job 'names-only' (s3://docs/names/), which "
+            "redacts PII entity type(s) NAME with MaskMode MASK"
+        ) in rows[1]["Finding_Details"]
+        assert (
+            "and whether those entity types cover the PII the source holds is not "
+            "judged"
+        ) in rows[1]["Finding_Details"]
 
     def test_br26_ingestion_before_the_redaction_job_ended_is_not_credited(self):
         # KB-08: the latest ingestion started before the job completed, so
@@ -50292,6 +50325,60 @@ class TestInvocationLogGuardrailEvidence:
 
         assert [row["Status"] for row in rows] == ["N/A"]
         assert phrase in rows[0]["Finding_Details"]
+        # Every record was read; what was not judged is the version.
+        assert "records were not all read" not in rows[0]["Finding_Details"]
+        assert (
+            "but not every record, CloudTrail event and guardrail version was read "
+            "and judged."
+        ) in rows[0]["Finding_Details"]
+
+    # GRD-02 and GRD-09 round 12b: the passing versions are named as passing
+    # only, beside a failing one, and a list cut at five gives its total.
+    @pytest.mark.parametrize("row", ["prompt", "grounding"])
+    def test_passing_named_versions_are_counted_beside_a_failing_one(self, row):
+        failing = (
+            self.NO_PROMPT_ATTACK
+            if row == "prompt"
+            else {"contextualGroundingPolicy": {"filters": []}}
+        )
+        calls = [
+            self._guarded(f"req-ok-{index}", True, guardrail=(f"gr-ok-{index}", "1"))
+            for index in range(6)
+        ] + [self._guarded("req-bad", True, guardrail=("gr-bad", "1"))]
+        if row == "grounding":
+            calls = [
+                dict(
+                    call,
+                    input={
+                        "inputBodyJson": {
+                            "prompt": "".join(
+                                f"<amazon-bedrock-guardrails-{tag}_xyz>x"
+                                f"</amazon-bedrock-guardrails-{tag}_xyz>"
+                                for tag in ("groundingSource", "query")
+                            ),
+                            "amazon-bedrock-guardrailConfig": {"tagSuffix": "xyz"},
+                        }
+                    },
+                )
+                for call in calls
+            ]
+        run = self._prompt if row == "prompt" else self._grounding
+        pages = {self.GUARDED: [calls]}
+        pages[self.PROMPT if row == "prompt" else self.GROUNDING] = [
+            [self._catch("req-catch") if row == "prompt" else self._scored("req-s")]
+        ]
+        rows = run(pages, guardrails={("gr-bad", "1"): {"guardrail": failing}})
+
+        assert [r["Status"] for r in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "guardrail gr-bad version 1 (1 call(s): req-bad" in detail
+        assert (
+            "6 guardrail version(s) named by the CloudTrail event of a guarded call "
+            "were read with bedrock:GetGuardrail and pass, with "
+        ) in detail
+        assert "gr-ok-4 version 1 (1 call(s)) (5 of 6 shown)." in detail
+        assert "gr-ok-5" not in detail
+        assert "Each guardrail version" not in detail
 
     def test_br34_a_call_whose_event_names_no_guardrail_is_noted_not_held(self):
         rows = self._prompt(

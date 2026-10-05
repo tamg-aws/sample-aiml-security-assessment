@@ -21928,9 +21928,11 @@ def check_bedrock_guardrail_pii_filters(
                 return None
             latest = window["latest"]
             for job in redaction_outputs:
-                if not _redaction_job_covers(job, source) or (
-                    job["kind"] == "comprehend" and "ALL" not in job["types"]
-                ):
+                # The control names no entity list, so a job naming any PII
+                # entity type is credited, as the Glue leg credits any type. An
+                # ONLY_REDACTION job always names some: StartPiiEntitiesDetectionJob
+                # requires RedactionConfig.PiiEntityTypes in that mode.
+                if not _redaction_job_covers(job, source):
                     continue
                 if latest is not None:
                     lead = _days_between(job["end"], latest)
@@ -22012,17 +22014,26 @@ def check_bedrock_guardrail_pii_filters(
                 )
             return (
                 f"ingests only the output of Comprehend PII redaction job "
-                f"'{job['name']}' ({job['uri']}), which redacts ALL PII entity "
-                f"types with MaskMode {job['mask_mode']} and completed "
+                f"'{job['name']}' ({job['uri']}), which redacts "
+                + (
+                    "ALL PII entity types"
+                    if "ALL" in job["types"]
+                    else f"PII entity type(s) {', '.join(job['types'])}"
+                )
+                + f" with MaskMode {job['mask_mode']} and completed "
                 + (
                     "before the latest ingestion job started"
                     if latest is not None
                     else "with no ingestion job recorded for the source"
                 )
                 + "; s3:ListBucket lists {} object(s) the source ingests, none "
-                "last modified after the job completed, and whether each was "
-                "written by the job is not recorded by any API".format(
-                    listing["listed"]
+                "last modified after the job completed, whether each was "
+                "written by the job is not recorded by any API{}".format(
+                    listing["listed"],
+                    ""
+                    if "ALL" in job["types"]
+                    else ", and whether those entity types cover the PII the "
+                    "source holds is not judged",
                 )
             )
 
@@ -23003,14 +23014,21 @@ def _event_named_version_leg(
 def _event_named_version_notes(leg: Dict[str, Any], what: str) -> str:
     """
     Describe what _event_named_version_leg credited, and the calls it left out
-    because their event names no guardrail or is not in event history yet.
+    because their event names no guardrail or is not in event history yet. The
+    passing versions are named as passing only, since the same row can list a
+    failing or unread version, and a list cut at five says how many there are.
     """
+
+    def first_five(items: List[str], sep: str) -> str:
+        shown = sep.join(items[:5])
+        return shown if len(items) <= 5 else f"{shown} (5 of {len(items)} shown)"
+
     notes = []
     if leg["passed"]:
         notes.append(
-            "Each guardrail version named by the CloudTrail event of a guarded "
-            "call was read with bedrock:GetGuardrail and {}: {}.".format(
-                what, "; ".join(leg["passed"][:5])
+            "{} guardrail version(s) named by the CloudTrail event of a guarded "
+            "call were read with bedrock:GetGuardrail and pass, with {}: {}.".format(
+                len(leg["passed"]), what, first_five(leg["passed"], "; ")
             )
         )
     if leg["unnamed"]:
@@ -23018,7 +23036,7 @@ def _event_named_version_notes(leg: Dict[str, Any], what: str) -> str:
             "{} guarded call(s) have a CloudTrail event that names no guardrail, as "
             "with an account-enforced guardrail, which the deployed guardrail row "
             "judges, so no per-call version was judged for them: {}.".format(
-                len(leg["unnamed"]), ", ".join(leg["unnamed"][:5])
+                len(leg["unnamed"]), first_five(leg["unnamed"], ", ")
             )
         )
     if leg["recent"]:
@@ -23028,7 +23046,7 @@ def _event_named_version_notes(leg: Dict[str, Any], what: str) -> str:
             "ran through was not judged: {}.".format(
                 len(leg["recent"]),
                 int(INFERENCE_TRACE_SETTLE.total_seconds() // 60),
-                ", ".join(leg["recent"][:5]),
+                first_five(leg["recent"], ", "),
             )
         )
     return "".join(f" {note}" for note in notes)
@@ -23621,7 +23639,7 @@ def check_guardrail_prompt_attack_invocation_evidence(
         unread.extend(version_leg["unread"])
         recent_note += _event_named_version_notes(
             version_leg,
-            "has a preventive PROMPT_ATTACK input filter on the STANDARD tier",
+            "a preventive PROMPT_ATTACK input filter on the STANDARD tier",
         )
         where = source["where"]
         cap = "page cap" if source["log_group"] else "object cap"
@@ -23734,7 +23752,8 @@ def check_guardrail_prompt_attack_invocation_evidence(
             row(
                 "No guarded InvokeModel or Converse call read in {} sent untagged "
                 "input or ran through a guardrail version that fails the prompt "
-                "attack filter test, but the records were not all read.{} {}{}".format(
+                "attack filter test, but not every record, CloudTrail event and "
+                "guardrail version was read and judged.{} {}{}".format(
                     where, tool_result_note, catch_note, unread_note
                 ),
                 COULD_NOT_ASSESS_RESOLUTION,
@@ -24057,7 +24076,7 @@ def check_guardrail_grounding_score_evidence(
         unjudged.extend(version_leg["unread"])
         recent_note += _event_named_version_notes(
             version_leg,
-            "has GROUNDING and RELEVANCE filters that both block with a threshold "
+            "GROUNDING and RELEVANCE filters that both block with a threshold "
             "in the 0-0.99 range",
         )
         invoke_joins = (
@@ -37894,14 +37913,31 @@ def check_bedrock_knowledge_base_source_classification(
                     check_id="BR-46",
                     finding_name=check_name,
                     finding_details=(
-                        "{} knowledge base(s) exist in {} and none of them ingests "
-                        "from an S3 bucket, and no model customization job or "
-                        "SageMaker training job reads one, so there is no source "
-                        "bucket to classify.".format(
+                        # A failed source read leaves the list incomplete, so the
+                        # text claims only what was read and names what was not.
+                        "No S3 source bucket was found among the {} knowledge "
+                        "base(s), model customization jobs, batch inference jobs "
+                        "and SageMaker training jobs read in {}, but {} source "
+                        "read(s) failed, so whether a source bucket exists is not "
+                        "known: {}.".format(
+                            knowledge_base_count,
+                            region or "this region",
+                            len(read_errors),
+                            "; ".join(read_errors[:5]),
+                        )
+                        if read_errors
+                        else "{} knowledge base(s) exist in {} and none of them "
+                        "ingests from an S3 bucket, and no model customization "
+                        "job, batch inference job or SageMaker training job reads "
+                        "one, so there is no source bucket to classify.".format(
                             knowledge_base_count, region or "this region"
                         )
                     ),
-                    resolution="No action required",
+                    resolution=(
+                        COULD_NOT_ASSESS_RESOLUTION
+                        if read_errors
+                        else "No action required"
+                    ),
                     reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
                     severity="Informational",
                     status="N/A",
