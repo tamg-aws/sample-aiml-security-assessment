@@ -36791,6 +36791,15 @@ def check_bedrock_ai_user_console_mfa(
                 console=False,
                 extra_sources=scp_sources,
             )
+            # A console session uses temporary credentials that carry
+            # aws:MultiFactorAuthPresent, false without MFA, so a plain Bool
+            # false Deny holds it; a long-term key request carries no such key.
+            console_deny_source = _mfa_deny_source(
+                permission_cache["user_permissions"][user_name],
+                extra_sources=scp_sources,
+                session=True,
+            )
+            console_held = ""
             try:
                 iam_client.get_login_profile(UserName=user_name)
                 console = True
@@ -36833,15 +36842,17 @@ def check_bedrock_ai_user_console_mfa(
                     )
                     continue
                 has_device = bool(devices)
-                if not has_device:
+                if not has_device and console_deny_source:
+                    console_held = console_deny_source
+                elif not has_device:
                     findings["csv_data"].append(
                         unguarded_row(
                             (
                                 f"IAM user '{user_name}' has a console password and "
                                 "no MFA device, and no Deny in its policies or "
-                                "permissions boundary requires MFA (BoolIfExists "
-                                "aws:MultiFactorAuthPresent false) on its AI write "
-                                "services",
+                                "permissions boundary requires MFA (Bool or "
+                                "BoolIfExists aws:MultiFactorAuthPresent false) on "
+                                "its AI write services",
                                 f" The user is in scope because {evidence[0]}. "
                                 f"{AI_USER_SCOPE_NOTE}",
                             ),
@@ -36875,11 +36886,19 @@ def check_bedrock_ai_user_console_mfa(
                 )
                 continue
             active = [key for key in keys if key.get("Status") == "Active"]
+            console_note = (
+                f"{console_held}, which holds its console session to MFA"
+                if console_held
+                else ""
+            )
             if active and key_deny_source:
-                if has_device or not console:
+                if has_device or not console or console_held:
                     deny_protected.append(
-                        f"{user_name} ({key_deny_source}, which holds its access "
-                        "keys to MFA)"
+                        "{} ({}{}, which holds its access keys to MFA)".format(
+                            user_name,
+                            f"{console_note}; " if console_note else "",
+                            key_deny_source,
+                        )
                     )
             elif active:
                 findings["csv_data"].append(
@@ -36890,8 +36909,18 @@ def check_bedrock_ai_user_console_mfa(
                             "permissions boundary requires MFA (BoolIfExists "
                             "aws:MultiFactorAuthPresent false) on its AI write "
                             "services",
-                            f" The user is in scope because {evidence[0]}. "
-                            f"{AI_USER_SCOPE_NOTE}",
+                            "{} The user is in scope because {}. {}".format(
+                                " Its console session is held to MFA by {}, but "
+                                "a long-term access key request carries no "
+                                "aws:MultiFactorAuthPresent, so a Bool test never "
+                                "fires on it and the access-key leg is open.".format(
+                                    console_held
+                                )
+                                if console_held
+                                else "",
+                                evidence[0],
+                                AI_USER_SCOPE_NOTE,
+                            ),
                         ),
                         ", {}, so the key signs AI changes without MFA{}.".format(
                             scp["nor"],
@@ -36905,6 +36934,8 @@ def check_bedrock_ai_user_console_mfa(
                         "aws:MultiFactorAuthPresent false.",
                     )
                 )
+            elif console_held:
+                deny_protected.append(f"{user_name} ({console_note})")
             elif has_device:
                 protected.append(user_name)
             elif not console:

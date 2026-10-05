@@ -36761,6 +36761,75 @@ class TestBR51AIUserConsoleMFA:
             if policy["document"]["Statement"][0]["Action"] != "bedrock:*":
                 assert "IAM user 'alice'" in names
 
+    # IAM-02: a console session carries aws:MultiFactorAuthPresent as false
+    # without MFA, so a plain Bool false Deny holds it; a long-term access key
+    # request carries no such key, so the same Deny leaves the key leg open.
+    def test_br51_a_plain_bool_deny_holds_the_console_leg_only(self):
+        def user():
+            return _identity(
+                attached=[
+                    _customer_policy(
+                        "BedrockWrite",
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock:CreateAgent",
+                            "Resource": "*",
+                        },
+                    ),
+                    self._mfa_deny(operator="Bool"),
+                ]
+            )
+
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "console": user(),
+                "keyonly": user(),
+                "both": user(),
+                "keynull": user(),
+            },
+        }
+        cache["user_permissions"]["keynull"]["attached_policies"].append(
+            _customer_policy(
+                "KeyMfa",
+                {
+                    "Effect": "Deny",
+                    "Action": ["bedrock:*", "sagemaker:*"],
+                    "Resource": "*",
+                    "Condition": {"Null": {"aws:MultiFactorAuthPresent": "true"}},
+                },
+            )
+        )
+        _, rows = self._run(
+            cache,
+            login={"console": "yes", "both": "yes", "keynull": "yes"},
+            keys={"keyonly": [self.KEY], "both": [self.KEY], "keynull": [self.KEY]},
+        )
+        failed = {
+            r["Finding_Details"].split("'")[1]: r["Finding_Details"]
+            for r in rows
+            if r["Status"] == "Failed"
+        }
+        assert sorted(failed) == ["both", "keyonly"]
+        for name in failed:
+            assert f"IAM user '{name}' has 1 active access key(s)" in failed[name]
+            assert "console password" not in failed[name]
+        assert (
+            "Its console session is held to MFA by attached policy 'RequireMfa', "
+            "Bool aws:MultiFactorAuthPresent false, but a long-term access key "
+            "request carries no aws:MultiFactorAuthPresent, so a Bool test never "
+            "fires on it and the access-key leg is open."
+        ) in failed["both"]
+        assert "Its console session is held" not in failed["keyonly"]
+        (summary,) = [r for r in rows if r["Status"] != "Failed"]
+        assert (
+            "held to MFA by a Deny (console (attached policy 'RequireMfa', Bool "
+            "aws:MultiFactorAuthPresent false, which holds its console session to "
+            "MFA); keynull (attached policy 'RequireMfa', Bool "
+            "aws:MultiFactorAuthPresent false, which holds its console session to "
+            "MFA; attached policy 'KeyMfa', which holds its access keys to MFA))"
+        ) in summary["Finding_Details"]
+
     def test_br51_not_action_mfa_deny_is_credited(self):
         cache = _ai_user_cache()
         policy = self._mfa_deny(
@@ -36773,12 +36842,16 @@ class TestBR51AIUserConsoleMFA:
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "2 user(s) are held to MFA by a Deny" in rows[0]["Finding_Details"]
 
-    @pytest.mark.parametrize("operator,value", [("Null", "true"), ("Bool", "false")])
+    @pytest.mark.parametrize(
+        "operator,value", [("Null", "true"), ("Bool", "true"), ("BoolIfExists", "true")]
+    )
     def test_br51_a_deny_that_skips_console_sessions_does_not_cover_a_password(
         self, operator, value
     ):
         # Null true fires only when the key is absent, which is the access key
-        # case; a console session carries the key as false.
+        # case; a console session carries the key as false. A true test denies
+        # the sessions that did complete MFA. A plain Bool false Deny does hold
+        # a console session (test_br51_a_plain_bool_deny_holds_the_console_leg_only).
         cache = _ai_user_cache()
         for user in ("alice", "bob"):
             cache["user_permissions"][user]["attached_policies"].append(
