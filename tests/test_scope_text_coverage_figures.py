@@ -79,7 +79,7 @@ def test_each_figure_raised_by_one_is_named_against_the_ledger():
 def test_a_deleted_sentence_reports_every_figure_absent():
     text = scope_text()
     start = text.index("A row is a narrower claim")
-    end = text.index("instead.", start) + len("instead.")
+    end = text.index("(partial) tag.", start) + len("(partial) tag.")
     _, found, computed, problems = drift(text[:start] + text[end:])
     assert all(found[label] == [] for label in LABELS)
     assert problems == [

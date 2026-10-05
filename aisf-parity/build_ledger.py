@@ -35,11 +35,23 @@ FOUNDATION = "foundation"  # the account or runtime an AI workload sits on
 # (control, verdict, disposition, module, incumbents, gap, extra_iam, phase)
 AI_SUBJECT_ROWS = [
     # ---------------- BDR: 19 controls, bedrock_assessments ----------------
-    ("AIR-BDR-GRD-01", COVERED, None, "bedrock_assessments", ["BR-10"], "", [], 3),
+    (
+        "AIR-BDR-GRD-01",
+        TIGHTEN,
+        EXTEND,
+        "bedrock_assessments",
+        ["BR-10"],
+        "AWS limit: an ApplyGuardrail request carries only guardrailIdentifier,"
+        " guardrailVersion, source, content and outputScope, with no model or "
+        "application member, and another account's guardrail versions cannot be"
+        " listed.",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-GRD-03",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-26"],
         "BR-26 judges entity and regex actions on the input and output sides of each "
@@ -58,7 +70,10 @@ AI_SUBJECT_ROWS = [
         "supplies its guardrail per request, so a screened knowledge base is N/A. A guardrail another account owns, such as an "
         "organization-enforced guardrail, is read with a cross-account "
         "bedrock:GetGuardrail grant, and a read its owner's resource policy "
-        "denies is N/A naming that policy",
+        "denies is N/A naming that policy"
+        ". Not yet asserted: a guardrail version a caller passes per request is"
+        " not judged for sensitive-information filters, although the CloudTrail"
+        " event names it.",
         [],
         3,
     ),
@@ -147,8 +162,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-BDR-MDL-10",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-37"],
         "BR-37 reads bedrock:GetAccountDataRetention for the control plane, and the "
@@ -157,14 +172,16 @@ AI_SUBJECT_ROWS = [
         "even with no project listed, each project's effective mode is judged, and "
         "only none passes. Each model's allowed_modes are not read: GET /v1/models "
         "returns them, but bedrock-mantle:ListModels is not granted, a missing "
-        "grant held for approval and not an API limit, and every row says so",
+        "grant held for approval and not an API limit, and every row says so"
+        ". Not asserted: needs bedrock-mantle:ListModels, which this deployment"
+        " does not grant, so each model's allowed_modes is not read.",
         [],
         3,
     ),
     (
         "AIR-BDR-GRD-02",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-34"],
         "BR-34 requires a PROMPT_ATTACK filter with inputEnabled, BLOCK and a LOW, "
@@ -202,14 +219,17 @@ AI_SUBJECT_ROWS = [
         "which the filter never evaluates, is runtime behaviour no API reports. A guardrail another account owns, such as an "
         "organization-enforced guardrail, is read with a cross-account "
         "bedrock:GetGuardrail grant, and a read its owner's resource policy "
-        "denies is N/A naming that policy",
+        "denies is N/A naming that policy"
+        ". AWS limit: a per-turn InvokeGuardrailChecks call records no "
+        "management event, and tool-payload screening and filter strength "
+        "tuning are not readable from any API.",
         [],
         3,
     ),
     (
         "AIR-BDR-GRD-04",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-32"],
         "BR-32 credits an alarm on the guardrail intervention metric, or on a "
@@ -226,14 +246,17 @@ AI_SUBJECT_ROWS = [
         "notifications (s3:GetBucketNotification): a queue, topic or Lambda "
         "configuration sending s3:ObjectCreated:* for every object under the "
         "Region's BedrockModelInvocationLogs root counts as the forward, and "
-        "whether that destination reaches a SIEM is not read",
+        "whether that destination reaches a SIEM is not read"
+        ". AWS limit: no AWS API records whether a caller logs the detect-mode "
+        "decisions it acted on. InvokeGuardrailChecks produces no CloudTrail "
+        "management event and has no data-event resource type.",
         [],
         3,
     ),
     (
         "AIR-BDR-GRD-09",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-27"],
         "BR-27 requires active GROUNDING and RELEVANCE filters with BLOCK and a "
@@ -263,15 +286,19 @@ AI_SUBJECT_ROWS = [
         "Automated Reasoning checks are reported, not judged. A guardrail another account owns, such as an "
         "organization-enforced guardrail, is read with a cross-account "
         "bedrock:GetGuardrail grant, and a read its owner's resource policy "
-        "denies is N/A naming that policy",
+        "denies is N/A naming that policy"
+        ". AWS limit: RetrieveAndGenerate's GenerationConfiguration has no "
+        "grounding-source member. It carries only additionalModelRequestFields,"
+        " guardrailConfiguration, inferenceConfig, performanceConfig and "
+        "promptTemplate.",
         [],
         3,
     ),
     ("AIR-BDR-GRD-10", COVERED, None, "bedrock_assessments", ["BR-41"], "", [], 3),
     (
         "AIR-BDR-KB-06",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-06"],
         "BR-06 credits retrieval traceability only when a trail or event data store "
@@ -281,7 +308,9 @@ AI_SUBJECT_ROWS = [
         "text, and every S3 source bucket has versioning Enabled "
         "(s3:GetBucketVersioning); an unread data source or bucket is N/A. The "
         "RetrieveAndGenerate citations are not read, and sources outside S3 are not "
-        "judged for versioning",
+        "judged for versioning"
+        ". AWS limit: RetrieveAndGenerate citations exist only in the API "
+        "response, and no Bedrock or CloudTrail configuration API exposes them.",
         [],
         3,
     ),
@@ -338,8 +367,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-BDR-KB-01",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-46"],
         "BR-46 passes a knowledge base S3 source only when a recurring, full-depth "
@@ -356,7 +385,11 @@ AI_SUBJECT_ROWS = [
         "A region run reads at most 300 sidecars and 150 ListObjectsV2 pages, "
         "budgets measured against the Lambda timeout, and a source past either, "
         "or one whose read stopped at the invocation deadline a fixed margin "
-        "before that timeout, is N/A with a count",
+        "before that timeout, is N/A with a count"
+        ". Not yet asserted: the Macie ordering reads only the classification "
+        "job's lastRunTime, not each SCHEDULED_RUN_COMPLETED event, so an "
+        "object written before an earlier run is not ordered against each "
+        "ingestion.",
         [],
         3,
     ),
@@ -438,8 +471,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-BDR-KB-05",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-34"],
         "partial, ceiling reached. BR-34 reads every data source with GetDataSource"
@@ -457,14 +490,18 @@ AI_SUBJECT_ROWS = [
         "Lambda's logic is opaque, the bedrock-agent KnowledgeBase shape has no "
         "guardrail member, and guardrailConfiguration is a GenerationConfiguration "
         "request member of RetrieveAndGenerate, so no read can show that retrieved "
-        "chunks are screened",
+        "chunks are screened"
+        ". AWS limit: no API records what a POST_CHUNKING transformation Lambda"
+        " screens, and RetrieveAndGenerate's guardrailConfiguration has only "
+        "guardrailId and guardrailVersion, with no member that tags retrieved "
+        "chunks as guardContent.",
         [],
         3,
     ),
     (
         "AIR-BDR-KB-08",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-26"],
         "partial, ceiling reached. BR-26 fails a knowledge base that ingests a "
@@ -500,14 +537,18 @@ AI_SUBJECT_ROWS = [
         "Lambda's logic and a Glue script job's code are not recorded (only a "
         "visual job carries CodeGenConfigurationNodes), and guardrailConfiguration "
         "is a GenerationConfiguration request member of RetrieveAndGenerate, absent"
-        " from the bedrock-agent KnowledgeBase shape",
+        " from the bedrock-agent KnowledgeBase shape"
+        ". AWS limit: a transformation Lambda's logic is not recorded, a Glue "
+        "script job has no CodeGenConfigurationNodes, no API records that a "
+        "Comprehend job wrote each object, and no configuration API records a "
+        "guardrail passed per request to RetrieveAndGenerate.",
         [],
         3,
     ),
     (
         "AIR-BDR-MDL-08",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-07"],
         "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero"
@@ -537,7 +578,11 @@ AI_SUBJECT_ROWS = [
         "account, because both return the draft. Partial, ceiling reached: a prompt"
         " held in application code has no AWS record, and no AWS field names the "
         "role approved to release a version, so which of the scoped roles should "
-        "release a version, beside the RenderPrompt roles, is not judged",
+        "release a version, beside the RenderPrompt roles, is not judged"
+        ". AWS limit: InvokeModel and Converse CloudTrail events carry the "
+        "modelId but no prompt provenance, and RenderPrompt is a separate data "
+        "event, so no field ties a foundation-model call to a catalog prompt. "
+        "No AWS field names the role approved to release a version.",
         [],
         4,
     ),
@@ -580,13 +625,16 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-SGM-EP-06",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "sagemaker_assessments",
         ["SM-23", "SM-31"],
         "SM-23 fails an InService endpoint with no Model Monitor schedule, or with "
         "no DataQuality or no ModelQuality schedule, and a schedule that is not "
-        "Scheduled",
+        "Scheduled"
+        ". AWS limit: DescribeMlflowApp and DescribeMlflowTrackingServer return"
+        " no endpoint or model member, so a drift-monitoring path built on "
+        "MLflow or Evidently is not readable.",
         [],
         3,
     ),
@@ -609,8 +657,8 @@ AI_SUBJECT_ROWS = [
     ("AIR-SGM-TRN-08", COVERED, None, "sagemaker_assessments", ["SM-34"], "", [], 3),
     (
         "AIR-SGM-EP-03",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "sagemaker_assessments",
         ["SM-11", "SM-14"],
         "SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint "
@@ -622,15 +670,19 @@ AI_SUBJECT_ROWS = [
         "DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, "
         "DescribeModel, DescribeEndpoint or DescribeInferenceComponent (botocore "
         "1.43.85). The AISF slug sagemaker_endpoint_intercontainer_encryption_enabled "
-        "names that absent field and should be fixed in the AISF repo",
+        "names that absent field and should be fixed in the AISF repo"
+        ". AWS limit: EnableInterContainerTrafficEncryption exists only on "
+        "training, AutoML, tuning and monitoring network configurations. "
+        "DescribeEndpointConfig, DescribeModel, DescribeEndpoint and "
+        "DescribeInferenceComponent have no such member.",
         [],
         3,
     ),
     # ---------------- ACR: 37 controls, agentcore_assessments ----------------
     (
         "AIR-ACR-GW-01",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AG-24"],
         "AG-24 passes authorizerType AWS_IAM, AUTHENTICATE_ONLY with a policy engine "
@@ -646,14 +698,18 @@ AI_SUBJECT_ROWS = [
         "could not read is N/A. "
         "Whether the interceptor denies when it errors is not readable: "
         "GatewayInterceptorConfiguration has only interceptor, interceptionPoints and "
-        "inputConfiguration, so the fail-safe half is a ceiling",
+        "inputConfiguration, so the fail-safe half is a ceiling"
+        ". AWS limit: whether a gateway interceptor denies a request when it "
+        "errors is not readable. GatewayInterceptorConfiguration has only "
+        "interceptor, interceptionPoints and inputConfiguration, and "
+        "LambdaInterceptorConfiguration has only arn.",
         [],
         4,
     ),
     (
         "AIR-ACR-RT-09",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-06"],
         "AC-06 judges every custom browser's recording destination as well as recording.enabled and "
@@ -702,7 +758,10 @@ AI_SUBJECT_ROWS = [
         "cached role and user whose Allow reaches StartBrowserSession on its ARN, a "
         "pattern in any segment included, with no unconditioned Deny or boundary "
         "removing it; it passes when none can, and is N/A when the cache or a "
-        "principal in it was not read",
+        "principal in it was not read"
+        ". AWS limit: CreateBrowser and GetBrowser carry no Live View member. "
+        "Live View exists only as a stream endpoint on StartBrowserSession and "
+        "GetBrowserSession output, with no record of whether anyone watches it.",
         [],
         4,
     ),
@@ -883,8 +942,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-ACR-GW-03",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-10", "AC-27"],
         "AC-10 fails an Allow statement on a gateway or runtime resource policy that "
@@ -915,14 +974,18 @@ AI_SUBJECT_ROWS = [
         "aws:SourceArn admits another Region is N/A naming that Region, unless "
         "another such entry, ANDed with it, names only the gateway's Region. A "
         "negated, IfExists or Null entry admits no Region, and an ARN with no "
-        "Region matches no gateway",
+        "Region matches no gateway"
+        ". Not yet asserted: an aws:SourceArn value naming another Region is "
+        "held at N/A, because gateways in other Regions are not compared, so "
+        "whether that value admits a gateway that runs with another role is not"
+        " judged.",
         [],
         4,
     ),
     (
         "AIR-ACR-RT-13",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-01", "AC-08", "AC-10", "AC-47", "AC-27", "AC-48"],
         "AC-47 passes the network leg only on a resource policy Deny that refuses the "
@@ -963,7 +1026,10 @@ AI_SUBJECT_ROWS = [
         "the caller's account or organization. AC-01's VPC Placement Guardrail fails "
         "unless an attached SCP denies CreateAgentRuntime, UpdateAgentRuntime, "
         "CreateCodeInterpreter and CreateBrowser when bedrock-agentcore:subnets or bedrock-agentcore:securityGroups is Null, so a "
-        "runtime cannot be created outside the VPC",
+        "runtime cannot be created outside the VPC"
+        ". Not yet asserted: the gateway-role trust leg holds an aws:SourceArn "
+        "naming another Region at N/A, because gateways in other Regions are "
+        "not compared.",
         [],
         4,
     ),
@@ -1056,8 +1122,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-ACR-MEM-01",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-07", "AC-23"],
         "AC-07 reads the key each memory names with kms:DescribeKey and passes only a "
@@ -1085,14 +1151,18 @@ AI_SUBJECT_ROWS = [
         "variable. A bare Action "
         '"*", a NotAction and group policies count, a grant the principal\'s own Deny '
         "or boundary removes does not, and a principal the IAM cache could not read is "
-        "N/A",
+        "N/A"
+        ". Not yet asserted: an SCP that denies CreateMemory when "
+        "bedrock-agentcore:KmsKeyArn is null is not read, and the Gateway and "
+        "Policy Engine customer managed key checks are not mapped to this "
+        "control.",
         [],
         4,
     ),
     (
         "AIR-ACR-POL-04",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-11", "AC-36"],
         "AC-11 asserts the engine names a customer managed key that DescribeKey reports "
@@ -1108,7 +1178,9 @@ AI_SUBJECT_ROWS = [
         "or a metric-filter alarm on DisableKey and ScheduleKeyDeletion, crediting a "
         "filter only on the log group of a logging trail that records this region's "
         "kms.amazonaws.com write management events, and the break-glass runbook is "
-        "not readable, which AC-36's passing resolution says",
+        "not readable, which AC-36's passing resolution says"
+        ". AWS limit: a break-glass key-recovery runbook is an operational "
+        "document that no AWS API returns.",
         [],
         4,
     ),
@@ -1318,8 +1390,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-ACR-EVAL-07",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-20", "AC-26", "AC-41"],
         "AC-41 anchors on the log group each configuration's outputConfig names and "
@@ -1355,7 +1427,11 @@ AI_SUBJECT_ROWS = [
         "condition whose every value holds one makes the statement grant nothing, "
         "such a value beside a literal one is dropped, and a service grant that "
         "grants nothing is named as such and fails only when no other service "
-        "grant exists",
+        "grant exists"
+        ". AWS limit: no API returns a batch evaluation's tags. "
+        "GetBatchEvaluation and BatchEvaluationSummary have no tags member, and"
+        " StartBatchEvaluation takes tags only as input, so PII in batch "
+        "evaluation tags is not read.",
         [],
         4,
     ),
@@ -1503,8 +1579,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-ACR-ID-11",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-31", "AC-32", "AC-30"],
         "AC-30 asks the allow-list layer of each runtime, since a runtime invoked "
@@ -1532,7 +1608,11 @@ AI_SUBJECT_ROWS = [
         "cache could not read is N/A. The preventive layer is judged too: an "
         "attached SCP must deny CreateGateway and UpdateGateway on every gateway when "
         "bedrock-agentcore:DiscoveryUrl names a URL it does not list. Which URLs it "
-        "approves is not compared with the gateways'",
+        "approves is not compared with the gateways'"
+        ". Not yet asserted: a bedrock-agentcore:userid condition on "
+        "GetWorkloadAccessTokenForUserId is not read, so a principal that mints"
+        " user tokens without an identity provider is judged only through the "
+        "JWT runtime role check.",
         [],
         4,
     ),
@@ -1579,8 +1659,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-ACR-MEM-12",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-18", "AC-19"],
         "AC-18 requires a CloudTrail advanced event selector that logs data events for "
@@ -1599,7 +1679,9 @@ AI_SUBJECT_ROWS = [
         "when MultiRegionEnabled is true; a store homed in a Region that was not "
         "assessed is not listed. AC-19 requires "
         "each memory's APPLICATION_LOGS delivery, which carries "
-        "the extraction and consolidation logs of long-term memory processing",
+        "the extraction and consolidation logs of long-term memory processing"
+        ". Not yet asserted: CloudWatch alarms on the Memory Errors, System "
+        "Errors, User Errors and Throttles metrics are not read.",
         [],
         4,
     ),
@@ -1660,8 +1742,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-ACR-OBS-06",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-22"],
         "AC-22 reads each Allow statement on an OAM sink policy by value. A statement "
@@ -1682,7 +1764,10 @@ AI_SUBJECT_ROWS = [
         "named create, put, update, delete, tag, untag, associate or disassociate "
         "action of logs, cloudwatch, xray or oam, or a log read on Resource '*', "
         "NotResource or a wildcard-only log-group name. Service-linked roles are not "
-        "judged, and an unparsable policy is N/A",
+        "judged, and an unparsable policy is N/A"
+        ". AWS limit: no Observability Access Manager API reports when a link "
+        "was last used. ListAttachedLinks returns only Label, LinkArn and "
+        "ResourceTypes, and GetLink has no last-activity or usage member.",
         [],
         4,
     ),
@@ -1715,8 +1800,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-ACR-RT-04",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-46"],
         "AC-46 fails a runtime that sets idleRuntimeSessionTimeout or maxLifetime at the "
@@ -1738,7 +1823,12 @@ AI_SUBJECT_ROWS = [
         "GetAgentRuntime reports the defaults of 900 and 28800 seconds for a runtime that "
         "sets neither field, so whether the owner chose the values is not readable, and every "
         "verdict says which values it found so the workload owner can judge whether the bound "
-        "suits the task",
+        "suits the task"
+        ". AWS limit: LifecycleConfiguration carries only "
+        "idleRuntimeSessionTimeout and maxLifetime, with documented defaults of"
+        " 900 and 28800 seconds, so an explicit setting equal to a default "
+        "cannot be told apart from an omitted one, and no API exposes an "
+        "application-side per-user session cap.",
         [],
         4,
     ),
@@ -1825,8 +1915,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-FND-DAT-03",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-46"],
         "BR-46 judges the per-object leg by value on every AI source bucket: each "
@@ -1873,7 +1963,11 @@ AI_SUBJECT_ROWS = [
         "event, the ones BR-27 and BR-34 did not join included. A capped or "
         "failed read of those records, an unread logging configuration, a call "
         "with no request ID and a call the LookupEvents page cap left unmatched "
-        "each hold Passed at N/A, named or counted",
+        "each hold Passed at N/A, named or counted"
+        ". Not yet asserted: with text delivery off, calls whose text is not "
+        "logged are not judged from their CloudTrail guardrail field, an agent "
+        "or flow node with no guardrail is not failed, and the Macie ordering "
+        "reads only the job's lastRunTime.",
         [],
         5,
     ),
@@ -1930,8 +2024,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-FND-DET-04",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         ["bedrock_assessments", "sagemaker_assessments"],
         ["BR-34", "BR-41", "BR-49", "SM-26"],
         "three Bedrock checks, one per enforcement surface, and one detection "
@@ -1973,7 +2067,11 @@ AI_SUBJECT_ROWS = [
         "ConverseStream as well; the Converse operations have no IAM action of "
         "their own. Ceiling: whether an application runs ApplyGuardrail over "
         "retrieved and tool-returned content is runtime behaviour that no "
-        "configuration API reports",
+        "configuration API reports"
+        ". AWS limit: an ApplyGuardrail request carries only "
+        "guardrailIdentifier, guardrailVersion, source, content and "
+        "outputScope, and none names a tool result or a retrieved document, so "
+        "whether that content is screened is not readable.",
         [],
         5,
     ),
@@ -2090,8 +2188,8 @@ AI_SUBJECT_ROWS = [
     ),
     (
         "AIR-FND-NET-02",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         [
             "agentcore_assessments",
             "bedrock_assessments",
@@ -2149,14 +2247,17 @@ AI_SUBJECT_ROWS = [
         "with no wildcard outside a trailing /*. Which service account a pod runs "
         "as is held by the Kubernetes API, so an IRSA role is judged in its "
         "cluster's VPC whether or not a pod uses it, and an unread role list "
-        "withholds Passed",
+        "withholds Passed"
+        ". Not yet asserted: workloads whose role grants no Bedrock, AgentCore "
+        "or SageMaker runtime action are not judged, and running transform jobs"
+        " are not read.",
         [],
         5,
     ),
     (
         "AIR-FND-NET-04",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AG-27", "AG-39", "AC-49"],
         "AG-27 asserts association: a gateway names a webAclArn. AG-39 reads the rule "
@@ -2193,7 +2294,11 @@ AI_SUBJECT_ROWS = [
         "logging configuration or category list is not read makes the row Not "
         "Applicable. The Passed text reports the newest detection in a CloudWatch Logs "
         "ALERT group, read with DescribeLogStreams, and names an S3 or Firehose "
-        "destination as not read. VPCs hosting no AgentCore resource are not read",
+        "destination as not read. VPCs hosting no AgentCore resource are not read"
+        ". Not yet asserted: egress IPS is judged only for AgentCore hosting "
+        "VPCs, not SageMaker or Bedrock workload VPCs. Not asserted: needs "
+        "wafv2:ListWebACLs and wafv2:ListResourcesForWebACL on the role that "
+        "runs this check, which this deployment does not grant to that role.",
         [],
         5,
     ),
@@ -2321,8 +2426,8 @@ FOUNDATION_ROWS = [
     ),
     (
         "AIR-FND-NET-03",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         ["agentcore_assessments", "sagemaker_assessments"],
         ["AC-49", "AC-01", "SM-39"],
         "AC-01 is the security-group port leg: on each VPC-mode AgentCore runtime, "
@@ -2392,7 +2497,10 @@ FOUNDATION_ROWS = [
         "the walled garden pattern: the domains allowed by earlier rules are the "
         "allow-list and every other name is refused. It fails an ALLOW or ALERT "
         'over "*", and a VPC whose DNS Firewall fails open. The same check covers '
-        "AIR-FND-NET-06",
+        "AIR-FND-NET-06"
+        ". Not yet asserted: Studio domain security groups "
+        "(DefaultUserSettings.SecurityGroups and "
+        "DomainSettings.SecurityGroupIds) are not read.",
         [],
         6,
     ),
@@ -2706,8 +2814,8 @@ FOUNDATION_ROWS = [
     ),
     (
         "AIR-SLF-CMP-01",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         [
             "bedrock_assessments",
             "agentcore_assessments",
@@ -2760,7 +2868,10 @@ FOUNDATION_ROWS = [
         "says so. AC-50 also requires an enabled EventBridge rule with a "
         "target that matches Inspector2 Finding events for container images. "
         "What the target does with a finding is not read, because no AWS API "
-        "records whether a pipeline stage fails on an Inspector finding",
+        "records whether a pipeline stage fails on an Inspector finding"
+        ". Not yet asserted: a CodePipeline InspectorScan action's thresholds "
+        "are not read. Not asserted: needs codepipeline:ListPipelines and "
+        "codepipeline:GetPipeline, which this deployment does not grant.",
         [],
         6,
     ),
@@ -2854,8 +2965,8 @@ FOUNDATION_ROWS = [
     ),
     (
         "AIR-FND-DAT-05",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-52"],
         "BR-52 reads GetObjectLockConfiguration on each bucket on the Bedrock data "
@@ -2877,14 +2988,16 @@ FOUNDATION_ROWS = [
         "backup:ListRecoveryPointsByResource nor backup:DescribeRecoveryPoint, so "
         "a bucket without the Object Lock stays Failed and its row says whether a "
         "backup covers it is unknown, naming the action as not granted. That is a "
-        "missing grant, not a ceiling: both APIs return the fields the check judges",
+        "missing grant, not a ceiling: both APIs return the fields the check judges"
+        ". Not asserted: needs backup:ListRecoveryPointsByResource and "
+        "backup:DescribeRecoveryPoint, which this deployment does not grant.",
         [],
         6,
     ),
     (
         "AIR-FND-DAT-10",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-55"],
         "BR-55 reads the default key policy of each customer-managed KMS key. A "
@@ -2918,7 +3031,10 @@ FOUNDATION_ROWS = [
         "--attach-console enclave presents, fails the key; an unread or capped "
         "history is N/A. Which workloads must be "
         "enclave-bound is the customer's decision, and no API records it, so a key "
-        "without the condition is never failed",
+        "without the condition is never failed"
+        ". AWS limit: no KMS, EC2 or Nitro Enclaves operation returns which "
+        "workloads the customer has classified as needing enclave-bound "
+        "decryption, or the enclave measurements a release pipeline published.",
         [],
         6,
     ),
@@ -2966,8 +3082,8 @@ FOUNDATION_ROWS = [
     ),
     (
         "AIR-FND-IAM-02",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-51"],
         "BR-51 reads each cached IAM user whose attached, inline or group "
@@ -3031,14 +3147,16 @@ FOUNDATION_ROWS = [
         "sso:DescribePermissionSet), whose cached policies carry the AI write "
         "grant and PrincipalTag Deny tests as for any permission set; a set whose "
         "role is absent from the IAM permissions cache or unread there is named "
-        "and not judged, and the role in each other account is not read",
+        "and not judged, and the role in each other account is not read"
+        ". AWS limit: no IAM Identity Center administration API returns the "
+        "instance's MFA mode.",
         [],
         6,
     ),
     (
         "AIR-FND-NET-08",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-51", "AG-39"],
         "AC-51 judges the web ACL on each AgentCore gateway for the AWS "
@@ -3072,7 +3190,11 @@ FOUNDATION_ROWS = [
         "Region that holds a gateway, fails an ACTIVE Shield Advanced subscription "
         "whose ProactiveEngagementStatus is not ENABLED and is Not Applicable with "
         "no active subscription. AG-39 is the request-rate leg: it fails "
-        "a gateway web ACL with no rate-based rule whose action is Block",
+        "a gateway web ACL with no rate-based rule whose action is Block"
+        ". Not asserted: needs wafv2:ListWebACLs and "
+        "wafv2:ListResourcesForWebACL on the role that runs this check, which "
+        "this deployment does not grant to that role, so API Gateway and "
+        "Application Load Balancer front doors are not read.",
         [],
         6,
     ),
@@ -3100,8 +3222,8 @@ FOUNDATION_ROWS = [
     ),
     (
         "AIR-SLF-RT-05",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "sagemaker_assessments",
         ["SM-39"],
         "SM-39 reads the managed vpc-cni add-on of each EKS cluster and passes "
@@ -3123,14 +3245,18 @@ FOUNDATION_ROWS = [
         "in a customer-managed prefix list, and a MicroVM with no egress "
         "connector. It fails a MicroVM that has not ended whose ingress "
         "connectors name SHELL_INGRESS; the ports an auth token allows are fixed at token "
-        "creation and are not readable",
+        "creation and are not readable"
+        ". AWS limit: no EKS API returns Kubernetes NetworkPolicy or "
+        "SecurityGroupPolicy objects, and a MicroVM auth token's allowedPorts "
+        "are request-only: GetMicrovm returns only its ingress and egress "
+        "connectors, and no API gets or lists tokens.",
         [],
         6,
     ),
     (
         "AIR-SLF-RT-06",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "sagemaker_assessments",
         ["SM-40"],
         "SM-40 lists Secrets Manager secrets, skipping those another service "
@@ -3148,7 +3274,10 @@ FOUNDATION_ROWS = [
         "version whose hooks.microvmHooks.resume is not ENABLED; the image's "
         "code artifact is not read, so what the hook runs is not judged. "
         "A Lambda function is not graded on propagation: its code is not read, "
-        "so whether it re-fetches a secret per invocation is not judged",
+        "so whether it re-fetches a secret per invocation is not judged"
+        ". AWS limit: whether workload code re-fetches a rotated secret is not "
+        "recorded. Lambda GetFunction returns only an archive URL, and "
+        "EventBridge ListTargetsByRule returns only a target ARN and input.",
         [],
         6,
     ),
@@ -3178,8 +3307,8 @@ FOUNDATION_ROWS = [
     ),
     (
         "AIR-SLF-AGT-05",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-57"],
         "BR-57 takes the agent roles to be the roles Bedrock agents run as, from "
@@ -3217,14 +3346,18 @@ FOUNDATION_ROWS = [
         "Lambda function roles host an agent, a JWT authorizer names the tokens a "
         "runtime accepts and not which agent presented one, no lambda-microvms API "
         "lists the auth tokens CreateMicrovmAuthToken issued or their allowedPorts, "
-        "and a role in another account that trusts an agent role is not read",
+        "and a role in another account that trusts an agent role is not read"
+        ". AWS limit: Lambda MicroVMs has no Get or List operation for issued "
+        "auth tokens, and CreateMicrovmAuthToken returns only the token, so its"
+        " allowedPorts and expiry are request-only. No ECS or Lambda field "
+        "marks a role as an agent's.",
         [],
         6,
     ),
     (
         "AIR-SLF-CMP-08",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "sagemaker_assessments",
         ["SM-43"],
         "SM-43 judges every serving container of each InService endpoint, "
@@ -3267,14 +3400,17 @@ FOUNDATION_ROWS = [
         "in an artifact bucket fails when its MetadataOptions HttpTokens is not "
         "required and its metadata endpoint is enabled. Weights fetched by "
         "container startup code, and which model a workload on ECS, EKS or EC2 "
-        "loads, are not read",
+        "loads, are not read"
+        ". AWS limit: no SageMaker field records a SHA256 digest of model data,"
+        " and no API reports a load-time digest comparison or which artifact an"
+        " ECS, EKS or EC2 workload loads.",
         [],
         6,
     ),
     (
         "AIR-FND-DET-10",
-        COVERED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "agentcore_assessments",
         ["AC-53"],
         "AC-53 takes the agent pairs from Application Signals: ListMetrics on the "
@@ -3296,7 +3432,10 @@ FOUNDATION_ROWS = [
         "reached: "
         "runtimes not instrumented with Application Signals publish no pair, and "
         "no AWS API records workflow execution frequency, per-workflow metric "
-        "definitions, or whether a new pair raises an alert",
+        "definitions, or whether a new pair raises an alert"
+        ". AWS limit: the AgentCore APIs have no workflow or topology "
+        "operation, and CloudWatch ListMetrics returns no field naming which "
+        "metrics belong to a workflow.",
         [],
         6,
     ),

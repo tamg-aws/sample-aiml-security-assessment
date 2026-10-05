@@ -304,6 +304,14 @@ section.
 
 ### Fixed
 
+- The AWS AI Security Framework view no longer restates `AISF-01`, `AISF-02`,
+  `AISF-03`, `AISF-04` or `AISF-06`. Each row copied the verdict of one check
+  under a whole AISF control, and that check asserts only part of the control,
+  so a Passed row claimed more than was read. The view now derives 3 rows
+  (`AISF-05`, `AISF-07`, `AISF-08`), the five ids are recorded as retired and
+  are not reused, and the checks behind them still run and still report under
+  their own ids with an `AISF <control> (partial)` tag.
+
 - AgentCore checks that passed on a partial read now fail or hold back
   `Passed`:
   - `AC-27` and `AC-47` credit a network-path Deny only when it is keyed on

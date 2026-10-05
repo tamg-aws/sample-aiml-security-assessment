@@ -222,7 +222,10 @@ def test_two_producers_in_one_interpreter_keep_their_own_maps(schemas):
     """
     bedrock = schemas["bedrock_assessments"]
     sagemaker = schemas["sagemaker_assessments"]
-    assert _finding(bedrock, "BR-10")["Compliance_Frameworks"] == "AISF AIR-BDR-GRD-01"
+    assert (
+        _finding(bedrock, "BR-10")["Compliance_Frameworks"]
+        == "AISF AIR-BDR-GRD-01 (partial)"
+    )
     assert (
         _finding(sagemaker, "SM-18")["Compliance_Frameworks"]
         == "AISF AIR-SGM-EP-08 (1 of 2 checks)"
@@ -234,9 +237,10 @@ def test_two_producers_in_one_interpreter_keep_their_own_maps(schemas):
 
 def test_sm43_carries_the_control_it_moved_off_not_implementable(schemas, ledger):
     # AIR-SLF-CMP-08 was not_implementable until SM-43 shipped. The ledger row
-    # and the tag on SM-43's CSV rows have to move together.
+    # and the tag on SM-43's CSV rows have to move together. SM-43 asserts the
+    # control in part, so the row is tighten and the tag carries (partial).
     row = next(r for r in ledger if r["control"] == "AIR-SLF-CMP-08")
-    assert (row["verdict"], row["incumbents"]) == ("covered", ["SM-43"])
+    assert (row["verdict"], row["incumbents"]) == ("tighten", ["SM-43"])
     # ContainerDefinition has no ModelDataETag, so the text must name the route a
     # plain model does have, or it reads as a failure no customer can clear.
     assert "ModelDataSource.S3DataSource.ETag" in row["gap"]
@@ -244,7 +248,7 @@ def test_sm43_carries_the_control_it_moved_off_not_implementable(schemas, ledger
     text = _csv_rows("sagemaker_assessments", sagemaker, [_finding(sagemaker, "SM-43")])
     assert (
         next(csv.DictReader(StringIO(text)))["Compliance_Frameworks"]
-        == "AISF AIR-SLF-CMP-08"
+        == "AISF AIR-SLF-CMP-08 (partial)"
     )
 
 

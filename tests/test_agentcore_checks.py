@@ -17809,7 +17809,7 @@ class TestAC30RuntimeInboundAuthorization:
         findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
 
         assert findings[0]["Status"] == "Failed"
-        assert "AISF AIR-ACR-ID-11 (1 of 3 checks)" in (
+        assert "AISF AIR-ACR-ID-11 (partial)" in (
             _ac_compliance.aisf_frameworks(findings[0]["Check_ID"]).split(" | ")
         )
 
@@ -34808,7 +34808,7 @@ class TestAC48ExecutionRoleTrustAndSharing:
         assert failed[0]["Severity"] == "High"
         assert "WideRole" in failed[0]["Finding_Details"]
         assert "[runtime family]" in failed[0]["Finding_Details"]
-        assert "AISF AIR-ACR-RT-13 (1 of 6 checks)" in (
+        assert "AISF AIR-ACR-RT-13 (partial)" in (
             _ac_compliance.aisf_frameworks(failed[0]["Check_ID"]).split(" | ")
         )
         assert not self._named(findings, "AgentCore Execution Role Trust Guard Missing")
@@ -40771,7 +40771,7 @@ class TestAC27RoleTrustSourceArnNamesTheGateway:
         assert_finding_schema(reach[0])
         # AIR-ACR-RT-13's gateway-role restriction needs this role's trust
         # hardened, so the row carries the control.
-        assert "AISF AIR-ACR-RT-13 (1 of 6 checks)" in (
+        assert "AISF AIR-ACR-RT-13 (partial)" in (
             _ac_compliance.aisf_frameworks(reach[0]["Check_ID"]).split(" | ")
         )
         passed = self._named(

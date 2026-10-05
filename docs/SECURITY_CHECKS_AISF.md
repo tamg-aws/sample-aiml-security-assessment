@@ -11,25 +11,29 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   needs no deployment parameter and adds no scan time.
 - **Report location:** the "By Compliance Standard" sidebar section, alongside
   OWASP Top 10 for LLM.
-- **Coverage:** 8 of the 105 in-scope AISF controls carry a derived `AISF-` row;
-  the remaining 97 are not yet rendered as a row. The scope is every
+- **Coverage:** 3 of the 105 in-scope AISF controls carry a derived `AISF-` row;
+  the remaining 102 are not yet rendered as a row. The scope is every
   machine-checkable AISF control, including the foundation controls, which assert
   over the account or runtime an AI workload sits on, and the ledger marks each
   foundation row. A row is a narrower claim than
-  coverage, so read this figure with the ledger census below it: 103 of the 105 are
-  `covered`, all 8 rows sit on `covered` controls, and the other 95 `covered`
+  coverage, so read this figure with the ledger census below it: 64 of the 105 are
+  `covered`, all 3 rows sit on `covered` controls, and the other 61 `covered`
   controls are named by the `Compliance_Frameworks` tag column until each is
   walked through [Adding a control](#adding-a-control), which allocates an id and
-  writes a per-control section. The 97 without a row are 95 `covered`, 0
+  writes a per-control section. The 102 without a row are 61 `covered`, 39
   `tighten`, 0 `new` and 2 `not_implementable`, with no control left
   `unassessed`. Each `not_implementable` control asks about evidence no AWS
   API returns, and the ledger names the reason for each. The parity analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
-- **Traceability:** 0 controls are `tighten`. A `tighten` control is covered
-  too partly to earn an `AISF-` row at all, and its ledger row names the
-  incumbent extension or the new check that closes it. The `Compliance_Frameworks` CSV
-  column names all 103 taggable controls on the producer rows themselves, the 103
-  `covered` and the 0 `tighten`, and is described under
+  Five ids, `AISF-01`, `AISF-02`, `AISF-03`, `AISF-04` and `AISF-06`, are
+  retired: each restated a check that asserts only part of its control, so the
+  view no longer derives them, and the ids are never reallocated.
+- **Traceability:** 39 controls are `tighten`. A `tighten` control is covered
+  too partly to earn an `AISF-` row at all, and its ledger row says what is not
+  asserted: outstanding work, a grant this deployment does not hold, or an AWS
+  limit no API can read past. The `Compliance_Frameworks` CSV
+  column names all 103 taggable controls on the producer rows themselves, the 64
+  `covered` and the 39 `tighten`, and is described under
   [Traceability column on producer rows](#traceability-column-on-producer-rows).
   A tag carries no verdict.
 
@@ -122,69 +126,19 @@ bands and this framework's `SeverityEnum` has four, so `critical` and `high`
 both report as `High`, following section 6 of
 [SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md](SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md),
 which keeps four levels and accepts that a genuinely critical risk is reported
-as `High`. The three controls AISF rates `critical` (`AISF-01`, `AISF-03`,
-`AISF-04`) name that band and the downgrade in their `Finding_Details`, so a
-reader who sees `High` against a critical control learns why from the finding
-itself. A row with `Status=N/A` always reports `Informational`.
+as `High`. No derived control is rated `critical`: the three that were
+(`AISF-01`, `AISF-03`, `AISF-04`) are retired. A control in that band names the
+band and the downgrade in its `Finding_Details`, so a reader who sees `High`
+against a critical control learns why from the finding itself. A row with `Status=N/A` always reports `Informational`.
 
 ## Check catalogue
 
 | Check | AISF control | Severity | Source checks |
 | ------- | -------------- | ---------- | --------------- |
 | AISF-00 | none (coverage marker) | Informational | none |
-| AISF-01 | AIR-ACR-GW-01 | High | `AG-24` |
-| AISF-02 | AIR-ACR-RT-09 | Medium | `AC-06` |
-| AISF-03 | AIR-BDR-GRD-01 | High | `BR-10` |
-| AISF-04 | AIR-BDR-GRD-03 | High | `BR-26` |
 | AISF-05 | AIR-BDR-KB-03 | High | `BR-20` |
-| AISF-06 | AIR-BDR-MDL-10 | High | `BR-37` |
 | AISF-07 | AIR-SGM-EP-08 | High | `SM-18`, `SM-42` |
 | AISF-08 | AIR-SGM-TRN-05 | Medium | `SM-09`, `SM-01`, `SM-03` |
-
-### AISF-01 AIR-ACR-GW-01 Gateway Inbound Authorization
-
-When the gateway exposes tools or APIs to a model, does it enforce its own
-inbound authentication and authorization, independent of what the model
-requests?
-
-| Source | Signal |
-| -------- | -------- |
-| AG-24 | Agentic AI Gateway Inbound Authorization (`CUSTOM_JWT` / `AWS_IAM` authorizer configured and enforced) |
-
-Reference: <https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-inbound-auth.html>
-
-### AISF-02 AIR-ACR-RT-09 Agent Browser Session Forensic Record
-
-For browser-based agent tools, is there a forensic record of what the agent did
-in the browser session (pages visited, actions taken)?
-
-| Source | Signal |
-| -------- | -------- |
-| AC-06 | AgentCore Browser Session Recording (capture and replay configured) |
-
-Reference: <https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/browser-session-recording.html>
-
-### AISF-03 AIR-BDR-GRD-01 Guardrail Enforced on Model Input and Output
-
-Is a content-safety guardrail applied to model input and output for every
-production use case, instead of being left optional per application?
-
-| Source | Signal |
-| -------- | -------- |
-| BR-10 | Bedrock Guardrail IAM Enforcement Check (guardrail attachment enforced on the invocation path) |
-
-Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html>
-
-### AISF-04 AIR-BDR-GRD-03 Sensitive Data Output Filtering
-
-Is leakage of sensitive data types (PII, secrets, credentials) through model
-output specifically checked for and blocked or redacted?
-
-| Source | Signal |
-| -------- | -------- |
-| BR-26 | Guardrail Sensitive Information Filter Check (PII and regex filter policy) |
-
-Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html>
 
 ### AISF-05 AIR-BDR-KB-03 Knowledge Base Vector Store Encryption
 
@@ -196,18 +150,6 @@ access-restricted the same way as the source data it was built from?
 | BR-20 | Knowledge Base Customer-Managed KMS Encryption Check |
 
 Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html>
-
-### AISF-06 AIR-BDR-MDL-10 Bedrock Data Retention Mode Pinned
-
-Is the Amazon Bedrock data-retention mode explicitly set and pinned org-wide,
-so no account or project can opt into sharing prompts and outputs with a model
-provider?
-
-| Source | Signal |
-| -------- | -------- |
-| BR-37 | Bedrock Account Data Retention (`GetAccountDataRetention` mode explicitly set) |
-
-Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html>
 
 ### AISF-07 AIR-SGM-EP-08 Batch Inference Network and Encryption Parity
 
@@ -239,6 +181,24 @@ leg.
 
 Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admin-best-practices/permissions-management.html>
 
+### Retired ids
+
+These ids were derived once and are not derived now. Each restated an incumbent
+check that the ledger grades as asserting only part of its control, so a
+restated `Passed` would have claimed the whole control. The ids stay allocated
+in `RETIRED_AISF_IDS` and are never given to another control, so an archived
+report that carries one still means the control below. The incumbent checks
+still run, and their producer rows still name the control in the
+`Compliance_Frameworks` column with a `(partial)` tag.
+
+| Id | AISF control | Incumbent | Why retired |
+| ---- | -------------- | ----------- | ------------- |
+| AISF-01 | AIR-ACR-GW-01 | `AG-24` | the incumbent asserts only part of the control |
+| AISF-02 | AIR-ACR-RT-09 | `AC-06` | the incumbent asserts only part of the control |
+| AISF-03 | AIR-BDR-GRD-01 | `BR-10` | the incumbent asserts only part of the control |
+| AISF-04 | AIR-BDR-GRD-03 | `BR-26` | the incumbent asserts only part of the control |
+| AISF-06 | AIR-BDR-MDL-10 | `BR-37` | the incumbent asserts only part of the control |
+
 ## Traceability column on producer rows
 
 The `AISF-` rows above are derived verdicts. The `Compliance_Frameworks` column
@@ -262,14 +222,14 @@ trusting the literal in the file:
 
 | Tag | Means |
 | ----- | ------- |
-| `AISF AIR-BDR-GRD-01` | this check alone asserts the whole control |
+| `AISF AIR-BDR-KB-03` | this check alone asserts the whole control |
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 54 bare, 0 `(partial)`, 132
-joint. The 54 bare tags plus the 49 jointly covered controls account for the 103
+Census at the current head, also printed by gate 14: 30 bare, 64 `(partial)`, 92
+joint. The 30 bare tags plus the 34 jointly covered controls account for the 64
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
-incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
+incumbent, so the 39 `tighten` controls carry more tags than there are controls. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
 dropped `(1 of N)`, fails gate 14 with the row's verdict and incumbent count
 named.
 
@@ -280,9 +240,9 @@ on `AIR-ACR-EVAL-01` and on `AIR-ACR-PAY-01`, and joint on
 `AIR-ACR-RT-03 (1 of 3 checks)`, `AIR-FND-IAM-05 (1 of 5 checks)` and
 `AIR-FND-IAM-09 (1 of 4 checks)`.
 
-Mixing a `(partial)` with a tag of another form inside one value is no longer the
-common case, 0 of those 41, because no `tighten` control is left to carry a
-`(partial)`. A foundational control such as `AIR-FND-NET-01` is asserted jointly by
+Mixing a `(partial)` with a tag of another form inside one value is a
+common case, 18 of those 41, because a check that asserts one control in full
+often asserts only part of another. A foundational control such as `AIR-FND-NET-01` is asserted jointly by
 checks whose own service control they fully assert, so the same check carries a
 bare tag and a `(1 of N checks)` one. Nothing in the vocabulary forbids a mix,
 and gate 14 derives each element's form from that element's own ledger row, so a
@@ -437,7 +397,8 @@ timestamp and `--csv-dir` says it cannot.
    `aisf-parity/aisf-work-ledger.json`. A `tighten` verdict means the incumbent
    asserts less than the control does; close the gap in the incumbent check
    first.
-2. Append an entry to `AISF_DERIVED_MAP` with the next free `AISF-` number, the
+2. Append an entry to `AISF_DERIVED_MAP` with the next free `AISF-` number,
+   counting the ids in `RETIRED_AISF_IDS` as taken, the
    incumbent `Check_ID`s exactly as the ledger row names them, and the
    control's `risk`, `rec`, and first `src` URL copied from the AISF control
    YAML.
