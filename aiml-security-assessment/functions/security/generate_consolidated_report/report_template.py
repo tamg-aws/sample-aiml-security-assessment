@@ -159,8 +159,8 @@ def _join_words(words: List[str]) -> str:
 # `tests/test_aisf_derived_standard.py` pins covered and partial to the
 # producers' `aisf_compliance_*.py` tag maps, and pins the documents that repeat
 # these figures to them.
-AISF_COVERED_CONTROLS = 64
-AISF_PARTIAL_CONTROLS = 39
+AISF_COVERED_CONTROLS = 60
+AISF_PARTIAL_CONTROLS = 42
 AISF_UNIMPLEMENTABLE_CONTROLS = 2
 AISF_IN_SCOPE_CONTROLS = (
     AISF_COVERED_CONTROLS + AISF_PARTIAL_CONTROLS + AISF_UNIMPLEMENTABLE_CONTROLS

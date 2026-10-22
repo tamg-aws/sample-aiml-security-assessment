@@ -251,6 +251,62 @@ def test_the_tag_survives_the_csv_round_trip(schemas, module_dir):
     assert row["Compliance_Frameworks"] == mapping[check_id]
 
 
+@pytest.mark.parametrize("status", ["Passed", "Failed", "N/A"])
+@pytest.mark.parametrize(
+    "check_id, expected_tags",
+    [
+        (
+            "AC-17",
+            "AISF AIR-ACR-EVAL-05 (1 of 2 checks) | AISF AIR-ACR-EVAL-06 (partial)",
+        ),
+        (
+            "AC-18",
+            "AISF AIR-ACR-GW-10 (1 of 5 checks) | AISF AIR-ACR-MEM-12 (partial) | "
+            "AISF AIR-ACR-OBS-02 (partial)",
+        ),
+        (
+            "AC-20",
+            "AISF AIR-ACR-EVAL-07 (partial) | AISF AIR-ACR-GW-10 (1 of 5 checks)",
+        ),
+        ("AC-21", ""),
+        ("AC-40", "AISF AIR-ACR-EVAL-06 (partial)"),
+        (
+            "AC-44",
+            "AISF AIR-ACR-EVAL-03 (1 of 2 checks) | AISF AIR-ACR-EVAL-04 (partial)",
+        ),
+    ],
+)
+def test_agentcore_component_evidence_keeps_native_verdict_without_overclaiming_aisf(
+    schemas, check_id, expected_tags, status
+):
+    schema_module = schemas["agentcore_assessments"]
+    finding = schema_module.create_finding(
+        check_id=check_id,
+        finding_name="AgentCore configuration evidence",
+        finding_details="The native check assessed its configured component.",
+        resolution="",
+        reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/",
+        severity=(
+            schema_module.SeverityEnum.INFORMATIONAL
+            if status == "N/A"
+            else schema_module.SeverityEnum.MEDIUM
+        ),
+        status=status,
+        region="us-east-1",
+    )
+
+    rows = list(
+        csv.DictReader(
+            StringIO(_csv_rows("agentcore_assessments", schema_module, [finding]))
+        )
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["Check_ID"] == check_id
+    assert rows[0]["Status"] == status
+    assert rows[0]["Compliance_Frameworks"] == expected_tags
+
+
 @pytest.mark.parametrize("module_dir", PRODUCERS)
 def test_writing_a_finding_does_not_raise_on_an_unknown_column(schemas, module_dir):
     """DictWriter defaults to extrasaction="raise".

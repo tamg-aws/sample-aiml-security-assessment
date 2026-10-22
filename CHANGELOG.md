@@ -53,8 +53,8 @@ section.
   full by M checks together and this is one of them, and
   `AISF <control> (partial)` when the check asserts less than the control
   requires. A check that maps to several controls carries them pipe-joined.
-  The column names 103 of the 105 machine-checkable AISF controls. Of the 105,
-  64 are asserted in full, 39 in part, and 2 are not implementable from
+  The column names 102 of the 104 machine-checkable AISF controls. Of the 104,
+  60 are asserted in full, 42 in part, and 2 are not implementable from
   configuration. See
   [the tag vocabulary](docs/SECURITY_CHECKS_AISF.md#the-qualifier-is-what-makes-a-partly-asserted-control-safe-to-name)
   in `docs/SECURITY_CHECKS_AISF.md`. Behavior worth knowing:
@@ -235,6 +235,20 @@ section.
   `N/A` Informational row naming the parameter.
 
 ### Changed
+
+- **AgentCore AISF evidence boundaries.** `AC-18` now tags `AIR-ACR-OBS-02`
+  as partial because CloudTrail selector configuration does not prove event
+  delivery. `AC-44` tags `AIR-ACR-EVAL-04` as partial because model scoping does
+  not establish approved processing geography. `AC-17` and `AC-40` tag
+  `AIR-ACR-EVAL-06` as partial: the existing alarm check does not judge its
+  comparison operator or threshold. `AIR-ACR-OBS-04` is excluded from the
+  machine-checkable scope; its tags are removed from `AC-20` and `AC-21`,
+  whose log protection and unmask checks continue to run. Those checks do
+  not establish redaction before telemetry export. Report totals now read
+  60 full, 42 partial and 2 not implementable out of 104 controls. Native
+  checks, status rules, the three derived AISF rows and the 277-check total
+  are unchanged. See the
+  [evidence boundaries](docs/SECURITY_CHECKS_AISF.md#agentcore-control-evidence-boundaries).
 
 Existing checks judge the values they read and the whole population they
 cover, where many used to pass on the presence of a field or on a partial
@@ -505,6 +519,11 @@ back `Passed` names what it could not read.
 
 ### Deployment impact
 
+- **AgentCore AISF evidence boundaries:** Rerun CodeBuild to redeploy the
+  AgentCore assessment and report generation Lambdas, then run a new
+  assessment to produce updated CSV tags and HTML scope figures. Direct
+  AWS SAM users redeploy the template for their deployment mode. This
+  correction adds no template, IAM or member-role StackSet update.
 - **Service selection:** Update `deployment/aiml-security-single-account.yaml`
   for single-account deployments or `deployment/2-aiml-security-codebuild.yaml`
   for multi-account central infrastructure, set the desired service switches,

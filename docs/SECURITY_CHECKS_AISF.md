@@ -15,12 +15,12 @@ ids. They are distinct from Prowler's `AISF-AI-06`-style requirement ids, which
   needs no deployment parameter and adds no scan time.
 - **Report location:** the "By Compliance Standard" sidebar section, alongside
   OWASP Top 10 for LLM.
-- **Coverage:** 3 of the 105 in-scope AISF controls carry a derived `AISF-` row;
-  the remaining 102 are not yet rendered as a row. The scope is every
+- **Coverage:** 3 of the 104 in-scope AISF controls carry a derived `AISF-` row;
+  the remaining 101 are not yet rendered as a row. The scope is every
   machine-checkable AISF control, including the foundation controls, which assert
   over the account or runtime an AI workload sits on. A row is a narrower claim
-  than coverage: 64 of the 105 are covered by checks that already ship and assert
-  the whole control, 39 are asserted only in part, and 2 are not implementable
+  than coverage: 60 of the 104 are covered by checks that already ship and assert
+  the whole control, 42 are asserted only in part, and 2 are not implementable
   from configuration, because each asks about evidence no AWS API returns. These
   are the figures the report's own scope text states. The report counts the
   derived controls from `AISF_DERIVED_MAP`, and
@@ -226,6 +226,19 @@ A check that contributes to several controls carries them pipe-joined, with the
 complete token. One value may mix forms, because a check that asserts one
 control in full often asserts only part of another, so read each element on its
 own and never the value as a whole.
+
+### AgentCore control evidence boundaries
+
+The following controls require evidence beyond the configuration these checks
+read. Their native findings keep their own verdicts; none creates an `AISF-`
+derived verdict.
+
+| AISF control | Native checks | Coverage and remaining evidence |
+| --- | --- | --- |
+| `AIR-ACR-OBS-02` | `AC-18` | Partial. Trail and event data store selectors provide configuration evidence. Exercise the relevant operations and verify their delivered CloudTrail records; a selector alone does not prove delivery or payload coverage. |
+| `AIR-ACR-EVAL-04` | `AC-44` | Partial. Model grants and attached custom evaluators provide model-scope evidence. The check accepts wildcard Region segments and does not establish that the processing geography is approved for the scored data. |
+| `AIR-ACR-EVAL-06` | `AC-17`, `AC-40` | Partial. Runtime sampling, evaluator categories and alarm metric/action linkage are checked. `AC-40` does not judge `ComparisonOperator` or `Threshold`, so it cannot prove that a quality drop triggers an alert; verify the alarm's direction, threshold and delivery with representative scores. |
+| `AIR-ACR-OBS-04` | `AC-20`, `AC-21` | Excluded from the 104-control machine-checkable scope and from the tag maps. These native checks still provide supporting evidence for stored-log protection and `logs:Unmask` restriction. They do not verify redaction before export across log and span fields, including attributes, events and links. CloudWatch masking leaves the original data stored, so verify capture and export redaction separately. |
 
 ### One map module per producer
 

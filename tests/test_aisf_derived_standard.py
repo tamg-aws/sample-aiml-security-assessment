@@ -1024,7 +1024,7 @@ class TestScopeTextNamesOmittedControls(unittest.TestCase):
         html = self._html({"sagemaker": False})
         self.assertIn(self.SAGEMAKER_NOTE, html)
         self.assertIn(
-            "3 of the 105 in-scope AISF controls carry a derived AISF- row, "
+            "3 of the 104 in-scope AISF controls carry a derived AISF- row, "
             "and 1 of them is in scope for this report",
             html,
         )
@@ -1155,21 +1155,21 @@ class TestScopeTextCountsComeFromTheData(unittest.TestCase):
         with _with_fourth_derived_control():
             html = self._html({})
         self.assertIn(
-            "Scope: 4 of the 105 in-scope AISF controls carry a derived AISF- "
-            "row; the remaining 101 are not yet rendered as rows",
+            "Scope: 4 of the 104 in-scope AISF controls carry a derived AISF- "
+            "row; the remaining 100 are not yet rendered as rows",
             html,
         )
-        self.assertIn("the 60 covered controls without a row", html)
+        self.assertIn("the 56 covered controls without a row", html)
 
     def test_a_fourth_derived_control_moves_the_count_shown_with_sagemaker_off(self):
         with _with_fourth_derived_control():
             html = self._html({"sagemaker": False})
         self.assertIn(
-            "4 of the 105 in-scope AISF controls carry a derived AISF- row, "
+            "4 of the 104 in-scope AISF controls carry a derived AISF- row, "
             "and 2 of them are in scope for this report",
             html,
         )
-        self.assertIn("The remaining 101 are not yet rendered", html)
+        self.assertIn("The remaining 100 are not yet rendered", html)
 
     def test_the_single_account_report_passes_the_derived_count(self):
         with _with_fourth_derived_control():
@@ -1185,7 +1185,7 @@ class TestScopeTextCountsComeFromTheData(unittest.TestCase):
                 service_selection={"sagemaker": "false"},
             )
         self.assertIn(
-            "4 of the 105 in-scope AISF controls carry a derived AISF- row, "
+            "4 of the 104 in-scope AISF controls carry a derived AISF- row, "
             "and 2 of them are in scope for this report",
             html,
         )
@@ -1203,6 +1203,33 @@ class TestScopeTextCountsComeFromTheData(unittest.TestCase):
         # only while every derived control is one the tags call covered.
         for mapping in aisf_mappings.AISF_DERIVED_MAP:
             self.assertIn(mapping["control"], covered, mapping["check_id"])
+
+    def test_revised_agentcore_controls_are_not_counted_as_fully_covered(self):
+        covered, partial = _aisf_tag_sets()
+        for control in (
+            "AIR-ACR-OBS-02",
+            "AIR-ACR-EVAL-04",
+            "AIR-ACR-EVAL-06",
+        ):
+            self.assertIn(control, partial)
+            self.assertNotIn(control, covered)
+        self.assertNotIn("AIR-ACR-OBS-04", covered | partial)
+
+    def test_component_verdicts_do_not_create_unsupported_aisf_rows(self):
+        affected_sources = ("AC-17", "AC-18", "AC-20", "AC-21", "AC-40", "AC-44")
+        unaffected_sources = ("BR-20", "SM-18", "SM-42", "SM-09", "SM-01", "SM-03")
+        for status in ("Passed", "Failed", "N/A"):
+            with self.subTest(status=status):
+                component_rows = [_source_row(cid, status) for cid in affected_sources]
+                self.assertEqual(aisf_mappings.derive_aisf_findings(component_rows), [])
+                rows = aisf_mappings.derive_aisf_findings(
+                    component_rows
+                    + [_source_row(cid, status) for cid in unaffected_sources]
+                )
+                self.assertEqual(
+                    {row["Check_ID"]: row["Status"] for row in rows},
+                    {"AISF-05": status, "AISF-07": status, "AISF-08": status},
+                )
 
     def _expected(self):
         derived = len(aisf_mappings.AISF_DERIVED_MAP)
@@ -1796,8 +1823,8 @@ class TestMultiAccountConsolidator(unittest.TestCase):
             captured = self._consolidate()
             html = report_template.generate_html_report(**captured)
         self.assertIn(
-            "Scope: 4 of the 105 in-scope AISF controls carry a derived AISF- "
-            "row; the remaining 101",
+            "Scope: 4 of the 104 in-scope AISF controls carry a derived AISF- "
+            "row; the remaining 100",
             html,
         )
 
