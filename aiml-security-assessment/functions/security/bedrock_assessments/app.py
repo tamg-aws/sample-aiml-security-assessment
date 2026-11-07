@@ -48021,7 +48021,7 @@ def lambda_handler(event, context):
             "statusCode": 200,
             "body": {
                 "message": "Security checks completed successfully",
-                "findings": all_findings,
+                "row_count": sum(len(f.get("csv_data", [])) for f in all_findings),
                 "report_url": s3_url,
             },
         }

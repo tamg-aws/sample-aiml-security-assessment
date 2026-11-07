@@ -13771,9 +13771,12 @@ def check_agentcore_gateway_encryption() -> List[Dict[str, Any]]:
                             f"{'; '.join(gateways_unreadable)}."
                         ),
                         resolution=(
-                            "Grant the action named on the gateway or its key and "
-                            "retry. A gateway deleted during the assessment reads "
-                            "as ResourceNotFoundException and clears on the next run."
+                            "For NotFoundException or ResourceNotFoundException, verify "
+                            "the referenced gateway or key ARN, account, Region and "
+                            "resource existence; correct stale references and rerun. "
+                            "For AccessDenied, grant only the named read action on that "
+                            "resource and rerun. Resolve other reported read errors "
+                            "before rerunning the assessment."
                         ),
                         reference=AGENTCORE_GATEWAY_ENCRYPTION_REFERENCE_URL,
                         severity=SeverityEnum.INFORMATIONAL,
@@ -38908,7 +38911,13 @@ def check_agentcore_execution_role_trust_and_sharing(
                         f"{used_by} runs as {role_name}, whose trust policy could "
                         f"not be read: {_assessment_error_label(error)}."
                     ),
-                    resolution="Grant iam:GetRole on the role and retry.",
+                    resolution=(
+                        "For NoSuchEntity, verify the referenced role ARN, account, "
+                        "path and role existence, including the AgentCore resource's "
+                        "Region; correct stale references and rerun. For AccessDenied, "
+                        "grant iam:GetRole on that role and rerun. Resolve other "
+                        "reported read errors before retrying."
+                    ),
                     reference=reference,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
