@@ -56,7 +56,8 @@ a check, lens, standard, or report UI changes.
   `Configure Service Assessments` Step Functions state, CSV requirements, OWASP source reads,
   and report scope.
   Deselected services appear as **Not selected**, never clean or `N/A`. Optional Responsible AI
-  GRC and OWASP remain independent. See the guide's [Service
+  GRC and OWASP remain independent when `EnableAISFAssessment=false`. The AISF preset
+  enables all six source collectors. See the guide's [Service
   Selection](docs/DEVELOPER_GUIDE.md#service-selection) section.
 - When adding an optional Step Functions branch, preserve `OriginalInput`, `Execution`,
   `Region`, `RegionIndex`, and selection flags through success, skipped, and caught-error paths.

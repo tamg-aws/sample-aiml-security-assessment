@@ -84,8 +84,8 @@ after the run's results are in the central `AssessmentBucket`:
   and only if the Step Functions execution succeeded. The run record is
   written first, whether the execution succeeded or not.
 - **Multi-account:** once per account, after the multi-account report step
-  (which is skipped when any account failed) and before the build's failure
-  summary. Accounts whose run failed
+  (which now retains failed accounts in an incomplete diagnostic report) and
+  before the build's failure summary. Accounts whose run failed
   get no changes report; the build log names them and gives the reasons from
   the build's failure list.
 
@@ -107,6 +107,13 @@ It can't fail an assessment run:
 It reads only the findings CSVs already in the bucket and, in single-account
 mode, the run records. It does not modify the scanners, the AWS SAM templates,
 the Step Functions workflow, or the IAM roles.
+
+The AISF catalog register is derived at report time and adds no findings CSV
+producer. Its 218-control inventory is separate from this source-finding change
+history. Existing check identities and archived samples remain unchanged; the
+new AISF examples have separate fixtures and provenance. A canonical control
+with partial or missing proof must not be read as resolved because a source
+check passed.
 
 ## Which run is "the previous run"
 

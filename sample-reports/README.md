@@ -4,9 +4,68 @@ This directory contains sample AI/ML security assessment reports and documentati
 
 ## Contents
 
-### Sample HTML Reports
+### Current AISF examples
 
-Interactive HTML reports demonstrating the assessment output:
+These deterministic examples use the actual single-account and multi-account
+consolidators. Both HTML reports and their exports show actual AI check results
+and their reviewed AISF mappings. The complete canonical catalog is reference
+data; unobserved controls do not create report entries or manual-review tasks.
+
+- [Single-account HTML](aisf_single_account.html) and [JSON](aisf_single_account.json).
+- [Multi-account HTML](aisf_multi_account.html) and [JSON](aisf_multi_account.json).
+- [Input/output provenance](aisf-provenance.json).
+- [Synthetic scope and fixed clock](fixtures/aisf/scope.json) and
+  [source CSV fixtures](fixtures/aisf/accounts/).
+
+The fixtures use only fake accounts `111122223333` and `444455556666`,
+`us-east-1`, `us-west-2`, and explicit Global evidence. All four direct services,
+GRC, and OWASP are selected. Failed BR, SM, AC, AR, native AG, FS, and native OW
+checks appear under their reviewed AISF relationships in both reports and exports.
+`OW-01` projects `FS-51`; it appears as a presentation of that source evidence.
+Original `FS-57/58` advice retains its `N/A` status and source limitations.
+`AG-26` appears as an additional AI check with no reviewed AISF mapping.
+
+The first account deliberately lacks its selected AgentCore west artifact.
+The second account has an interrupted SageMaker west CSV and failed assessment
+status. Fixtures also retain conflicting pass/fail observations, denial,
+unsupported scope, no-resource discovery, and Global deduplication. These are
+intentionally incomplete assessments. Collected findings retain their actual
+`Passed`, `Failed`, or `N/A` results while missing inputs remain visible.
+They demonstrate report behavior, not live AWS validation.
+
+Open **By Compliance Standard → AWS AI Security Framework**. Filter for failed
+results to find the original checks and their actions, or search a native check
+ID such as `FS-51`. Open a result to inspect its evidence, scope, and mappings.
+JSON and CSV downloads retain all included check results regardless of display
+filters. A source check passing does not claim whole-control AISF compliance.
+
+From the repository root, regenerate or check both modes without AWS access:
+
+```bash
+.venv/bin/python tools/generate_aisf_samples.py
+.venv/bin/python tools/generate_aisf_samples.py --check
+```
+
+The fixed timestamp is `2026-11-06T12:00:00+00:00`. Provenance records canonical
+revision `5df3295024713ac3ce88130c549bbc4fb2cebd53`, catalog/mapping,
+fixture, generator, and output SHA-256 hashes. A byte mismatch fails `--check`.
+See the [catalog update flow and report contract](../docs/SECURITY_CHECKS_AISF.md).
+
+The older tracked samples and the previously reviewed public report are distinct
+historical artifacts, not expected current AISF results. `aisf-provenance.json`
+records the original tracked hashes, the reviewed public hash, and the current
+tracked hashes after adding navigation notices. The historical HTML files are
+authoritative static samples: edit their notices there, then regenerate provenance
+with the command above. This generator does not rewrite those pages. Their
+findings, assessment dates, scripts, and assessment-history goldens are preserved.
+
+Inspect these new reports without running the older screenshot helper, which
+can rewrite HTML. Browser verification must compare HTML digests before and
+after capture.
+
+### Historical sample HTML reports
+
+Earlier interactive HTML reports demonstrating the assessment output:
 
 - **[security_assessment_single_account.html](security_assessment_single_account.html)** - Example report for a single AWS account showing 653 finding rows across Bedrock, SageMaker AI, AgentCore, AWS Agent Registry, Agentic AI Security, Responsible AI GRC, and OWASP Top 10 for LLM
 - **[security_assessment_multi_account.html](security_assessment_multi_account.html)** - Example consolidated report for 3 AWS accounts showing 2,072 finding rows
